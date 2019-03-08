@@ -1,0 +1,100 @@
+#!/bin/bash
+#
+# nspawn - nspawn is a wrapper around machinectl pull
+#
+# Copyright (c) 2019 by Christian Rebischke <chris@nullday.de>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http: #www.gnu.org/licenses/
+#
+#======================================================================
+# Author: Christian Rebischke
+# Email : chris@nullday.de
+# Github: www.github.com/shibumi
+
+set -e
+BASEURL="https://nspawn.org/storage/"
+TYPES=("raw" "tar")
+DISTRIBUTIONS=("archlinux" "debian" "ubuntu" "fedora" "centos")
+RELEASES=("archlinux" "jessie" "stretch" "28" "29" "30" "7" "6" "xenial"
+  "bionic")
+MASTERKEY="575DE88794A45D84456D8897A232A512E7D0BA83"
+
+if [ "$EUID" -ne 0 ]; then
+  echo "nspawn needs to be run as root for machinectl"
+  exit 1
+fi
+
+if ! [ -f "/etc/systemd/import-pubring.gpg" ]; then
+  echo "/etc/systemd/import-pubring.gpg does not exist"
+  read -rp "Do you want to create it [y/n]" choice
+  case "$choice" in
+    y | Y)
+      gpg --export "$MASTERKEY" >/etc/systemd/import-pubring.gpg
+      ;;
+    n | N)
+      exit 2
+      ;;
+    *)
+      exit 2
+      ;;
+  esac
+fi
+
+array_contains() {
+  local e match="$1"
+  shift
+  for e; do [[ "$e" == "$match" ]] && return 0; done
+  return 1
+}
+
+helpout() {
+  echo "usage: nspawn init <distribution>/<release>/<type>"
+}
+
+init() {
+  distribution=$(echo "$1" | cut -d"/" -f1)
+  release=$(echo "$1" | cut -d"/" -f2)
+  type=$(basename "$1")
+  if array_contains "$type" "${TYPES[@]}"; then
+    if array_contains "$distribution" "${DISTRIBUTIONS[@]}"; then
+      if array_contains "$release" "${RELEASES[@]}"; then
+        machinectl pull-"$type" "$BASEURL$distribution/$release/$type/image.$type.xz" "$distribution-$release"
+      else
+        echo "release wrong"
+      fi
+    else
+      echo "distribution wrong"
+    fi
+  else
+    echo "type wrong"
+  fi
+
+}
+
+configure() {
+  echo "configure"
+}
+
+case $1 in
+  init)
+    if [ $# -eq 2 ]; then
+      init "$2"
+    else
+      helpout
+    fi
+    ;;
+  *)
+    helpout
+    ;;
+esac
