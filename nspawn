@@ -69,7 +69,7 @@ init() {
   if array_contains "$type" "${TYPES[@]}"; then
     if array_contains "$distribution" "${DISTRIBUTIONS[@]}"; then
       if array_contains "$release" "${RELEASES[@]}"; then
-        machinectl pull-"$type" "$BASEURL$distribution/$release/$type/image.$type.xz" "$distribution-$release"
+        machinectl pull-"$type" "$BASEURL$distribution/$release/$type/image.$type.xz" "$distribution-$release-$type"
       else
         echo "release wrong"
       fi
