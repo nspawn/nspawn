@@ -41,7 +41,8 @@ if ! [ -f "/etc/systemd/import-pubring.gpg" ]; then
   read -rp "Do you want to create it [y/n]" choice
   case "$choice" in
     y | Y)
-      gpg --export "$MASTERKEY" >/etc/systemd/import-pubring.gpg
+      gpg --no-default-keyring --keyring=/etc/systemd/import-pubring.gpg --fingerprint
+      gpg --no-default-keyring --keyring=/etc/systemd/import-pubring.gpg --search "$MASTERKEY"
       ;;
     n | N)
       exit 2
