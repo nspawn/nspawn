@@ -24,6 +24,7 @@
 
 set -e
 BASEURL="https://nspawn.org/storage/"
+LISTURL="https://nspawn.org/storage/list"
 TYPES=("raw" "tar")
 DISTRIBUTIONS=("archlinux" "debian" "ubuntu" "fedora" "centos")
 RELEASES=("archlinux" "jessie" "stretch" "28" "29" "30" "7" "6" "xenial"
@@ -59,13 +60,19 @@ array_contains() {
 }
 
 helpout() {
-  echo "usage: nspawn init <distribution>/<release>/<type>"
+  echo "nspawn {COMMAND} [PARAMETER]"
   echo ""
-  echo "Initializes an image for systemd-nspawn in /var/lib/machines."
+  echo "Wrapper around systemd-machined and https://nspawn.org"
   echo ""
-  echo -e "<distribution>\tOne out of (archlinux,centos,debian,fedora,ubuntu)"
-  echo -e "<release>     \tThe release of the distribution"
-  echo -e "<type>        \tOne out of (raw,tar)"
+  echo "Commands:"
+  echo -e "  init          \tInitializes an image for systemd-machined with the following parameters: <distribution>/<release>/<type>"
+  echo -e "  list          \tLists all available images"
+  echo -e "  help          \tPrints this help message"
+  echo ""
+  echo "Parameters:"
+  echo -e "  <distribution>\tOne out of (archlinux,centos,debian,fedora,ubuntu)"
+  echo -e "  <release>     \tThe release of the distribution"
+  echo -e "  <type>        \tOne out of (raw,tar)"
 
 }
 
@@ -89,6 +96,10 @@ init() {
 
 }
 
+list() {
+  curl "$LISTURL"
+}
+
 case $1 in
   init)
     if [ $# -eq 2 ]; then
@@ -96,6 +107,9 @@ case $1 in
     else
       helpout
     fi
+    ;;
+  list)
+    list
     ;;
   *)
     helpout
