@@ -60,6 +60,13 @@ array_contains() {
 
 helpout() {
   echo "usage: nspawn init <distribution>/<release>/<type>"
+  echo ""
+  echo "Initializes an image for systemd-nspawn in /var/lib/machines."
+  echo ""
+  echo -e "<distribution>\tOne out of (archlinux,centos,debian,fedora,ubuntu)"
+  echo -e "<release>     \tThe release of the distribution"
+  echo -e "<type>        \tOne out of (raw,tar)"
+
 }
 
 init() {
@@ -80,10 +87,6 @@ init() {
     echo "type wrong"
   fi
 
-}
-
-configure() {
-  echo "configure"
 }
 
 case $1 in
