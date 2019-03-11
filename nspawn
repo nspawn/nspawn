@@ -32,11 +32,11 @@ RELEASES=("archlinux" "jessie" "stretch" "28" "29" "30" "7" "6" "xenial"
   "bionic")
 
 escalate_privilege() {
-if [ "$EUID" -ne 0 ]; then
-  echo "nspawn needs root privileges for the following action:"
-  echo "  $1"
-  exit 1
-fi
+  if [ "$EUID" -ne 0 ]; then
+    echo "nspawn needs root privileges for the following action:"
+    echo "  $1"
+    exit 1
+  fi
 }
 
 if ! [ -f "/etc/systemd/import-pubring.gpg" ]; then
