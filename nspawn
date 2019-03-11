@@ -25,11 +25,11 @@
 set -e
 BASEURL="https://nspawn.org/storage/"
 LISTURL="https://nspawn.org/storage/list.txt"
+KEYLOCATION="https://nspawn.org/storage/masterkey.pgp"
 TYPES=("raw" "tar")
 DISTRIBUTIONS=("archlinux" "debian" "ubuntu" "fedora" "centos")
 RELEASES=("archlinux" "jessie" "stretch" "28" "29" "30" "7" "6" "xenial"
   "bionic")
-MASTERKEY="575DE88794A45D84456D8897A232A512E7D0BA83"
 
 if [ "$EUID" -ne 0 ]; then
   echo "nspawn needs to be run as root for machinectl"
@@ -38,11 +38,13 @@ fi
 
 if ! [ -f "/etc/systemd/import-pubring.gpg" ]; then
   echo "/etc/systemd/import-pubring.gpg does not exist"
-  read -rp "Do you want to create it [y/n]" choice
+  read -rp "Do you want to create it [y/n]: " choice
   case "$choice" in
     y | Y)
       gpg --no-default-keyring --keyring=/etc/systemd/import-pubring.gpg --fingerprint
-      gpg --no-default-keyring --keyring=/etc/systemd/import-pubring.gpg --search "$MASTERKEY"
+      tfile=$(mktemp -u /tmp/masterkey.nspawn.org.XXXXXXXXXXX)
+      curl "$KEYLOCATION" -o "$tfile"
+      gpg --no-default-keyring --keyring=/etc/systemd/import-pubring.gpg --import "$tfile"
       ;;
     n | N)
       exit 2
