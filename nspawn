@@ -91,7 +91,7 @@ init() {
     if array_contains "$distribution" "${DISTRIBUTIONS[@]}"; then
       if array_contains "$release" "${RELEASES[@]}"; then
         escalate_privilege "pulling the image via machinectl-$type"
-        machinectl pull-"$type" "$BASEURL$distribution/$release/$type/image.$type.xz" "$distribution-$release-$type"
+        machinectl pull-"$type" "$BASEURL$distribution/$release/$type/image.$type.xz" "$distribution-$release-$type" 2> /dev/null
       else
         echo "Wrong release, try 'nspawn list' to list all possible releases for this distribution"
       fi
