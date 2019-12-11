@@ -28,8 +28,8 @@ LISTURL="https://nspawn.org/storage/list.txt"
 KEYLOCATION="https://nspawn.org/storage/masterkey.pgp"
 TYPES=("raw" "tar")
 DISTRIBUTIONS=("archlinux" "debian" "ubuntu" "fedora" "centos")
-RELEASES=("archlinux" "jessie" "stretch" "28" "29" "30" "7" "6" "xenial"
-  "bionic")
+RELEASES=("archlinux" "buster" "jessie" "stretch" "28" "29" "30" "7" "6"
+  "xenial" "bionic")
 
 escalate_privilege() {
   if [ "$EUID" -ne 0 ]; then
