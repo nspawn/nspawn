@@ -122,9 +122,9 @@ build_image() {
     exit 1
   fi
 
-  # Create mkosi.build/ dir if flag is set
-  if [ ! -d "$mkosi_build" ] && [[ -n $CREATE_MKOSI_CACHE_DIR ]]; then
-    mkdir "$mkosi_build"
+  # Create mkosi.cache/ dir if flag is set
+  if [ ! -d "$mkosi_cache" ] && [[ -n $CREATE_MKOSI_CACHE_DIR ]]; then
+    mkdir "$mkosi_cache"
   fi
 
   # Static options
