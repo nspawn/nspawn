@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+#
+# nspawn-builder - nspawn-builder is a wrapper around mkosi that helps
+# to generate images dinamically.
+#
+# Copyright (c) 2021 by Eduard Tolosa <edu4rdshl@protonmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http: #www.gnu.org/licenses/
+#
+#======================================================================
+# Author: Eduard Tolosa
+# Email: edu4rdshl@protonmail.com
+# Github: www.github.com/edu4rdshl
+
+set -e
+VERSION="0.1"
+STATIC_NAME="Nspawn Builder (https://nspawn.org)"
+
+# Mkosi
+MKOSI_CMD=$(command -v mkosi)
+MKOSI_IMAGE_TYPES=()
+MKOSI_ARGS=" --force"
+
+# Enable/Disable specific format builds, leave empty to build in the specified format
+DISABLE_TAR=""
+DISABLE_RAW=""
+
+# Create mkosi.cache/ directory if no exists, leave empty if you don't want it to be created
+CREATE_MKOSI_CACHE_DIR="yes"
+
+ctrl_c() {
+  echo "Keyboard Interrupt detected, leaving."
+  exit
+}
+
+trap ctrl_c 2
+
+
+version() {
+  echo "$STATIC_NAME $VERSION"
+}
+
+check_mkosi() {
+  if [[ -z "$MKOSI_CMD" ]]; then
+      echo "mkosi was not found in PATH, please install it https://github.com/systemd/mkosi"
+      exit 1
+  fi
+}
+
+helpout() {
+  echo "Menu usage for $STATIC_NAME $VERSION"
+  echo
+  echo "$0 {COMMAND} [PARAMETER]"
+  echo
+  echo "Wrapper around mkosi for creating images in https://nspawn.org"
+  echo "If you find an issue, report it to: https://github.com/nspawn/nspawn"
+  echo
+  echo "Commands:"
+  echo -e "  -n/--name          \tBuild an image with the following parameters: <scripts-name>"
+  echo -e "  -h/--help          \tPrints this help message"
+  echo -e "  -v/--version       \tPrints version info"
+  echo
+  echo "Parameters:"
+  echo -e "  <scripts-name>     \tBase name of the scripts to use."
+}
+
+if [[ $# -eq 0 ]]; then
+  helpout
+  exit
+fi
+
+check_root() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "This script requires root privileges to work, leaving."
+    exit 1
+  fi
+}
+
+build_image() {
+  check_mkosi
+  check_root
+
+  scripts_name="$1"
+  tar_default="${scripts_name}-tar.default"
+  raw_default="${scripts_name}-raw.default"
+  mkosi_extra="${scripts_name}.extra"
+  mkosi_skeleton="${scripts_name}.skeleton"
+  mkosi_build="${scripts_name}.build"
+  mkosi_prepare="${scripts_name}.prepare"
+  mkosi_postinst="${scripts_name}.postinst"
+  mkosi_finalize="${scripts_name}.finalize"
+  mkosi_mksquashfs_tool="${scripts_name}.mksquashfs-tool"
+  mkosi_nspawn="${scripts_name}.nspawn"
+  mkosi_cache="${scripts_name}.cache"
+  mkosi_buildir="${scripts_name}.builddir"
+  # mkosi_rootpw="${scripts_name}.rootpw"
+  # mkosi_passphrase="${scripts_name}.passphrase"
+  mkosi_secure_boot_crt="${scripts_name}.secure-boot.crt"
+  mkosi_output="${scripts_name}.output"
+
+  # Create images array
+  if [ -f "$tar_default" ] && [[ -z $DISABLE_TAR ]]; then
+    MKOSI_IMAGE_TYPES+=(" --default $tar_default")
+  fi
+  if [ -f "$raw_default" ] && [[ -z $DISABLE_RAW ]]; then
+    MKOSI_IMAGE_TYPES+=(" --default $raw_default")
+  fi
+
+  if [ ${#MKOSI_IMAGE_TYPES[@]} -eq 0 ]; then
+    echo "No $tar_default or $raw_default are available for the scripts name $scripts_name, leaving."
+    exit 1
+  fi
+
+  # Create mkosi.cache/ dir if flag is set
+  if [ ! -d "$mkosi_cache" ] && [[ -n $CREATE_MKOSI_CACHE_DIR ]]; then
+    mkdir "$mkosi_cache"
+  fi
+
+  # Static options
+  if [ -d "$mkosi_extra" ]; then
+    MKOSI_ARGS+=" --extra-tree=$mkosi_extra"
+  fi
+  if [ -d "$mkosi_skeleton" ]; then
+    MKOSI_ARGS+=" --skeleton-tree=$mkosi_skeleton"
+  fi
+  if [ -f "$mkosi_build" ]; then
+    MKOSI_ARGS+=" --build-script=$mkosi_build"
+  fi
+  if [ -f "$mkosi_prepare" ]; then
+    MKOSI_ARGS+=" --prepare-script=$mkosi_prepare"
+  fi
+  if [ -f "$mkosi_postinst" ]; then
+    MKOSI_ARGS+=" --postinst-script=$mkosi_postinst"
+  fi
+  if [ -f "$mkosi_finalize" ]; then
+    MKOSI_ARGS+=" --finalize-script=$mkosi_finalize"
+  fi
+  if [ -f "$mkosi_mksquashfs_tool" ]; then
+    MKOSI_ARGS+=" --mksquashfs=$mkosi_mksquashfs_tool"
+  fi
+  if [ -f "$mkosi_nspawn" ]; then
+    MKOSI_ARGS+=" --settings=$mkosi_nspawn"
+  fi
+  if [ -d "$mkosi_cache" ]; then
+    MKOSI_ARGS+=" --cache=$mkosi_cache"
+  fi
+  if [ -d "$mkosi_buildir" ]; then
+    MKOSI_ARGS+=" --build-dir=$mkosi_buildir"
+  fi
+  if [ -f "$mkosi_secure_boot_crt" ]; then
+    MKOSI_ARGS+=" --secure-boot-certificate=$mkosi_secure_boot_crt"
+  fi
+  if [ -d "$mkosi_output" ]; then
+    MKOSI_ARGS+=" --output-dir=$mkosi_output"
+  fi
+
+  # Build each image
+  echo "Building mkosi images, it may take a while."
+  for image in "${MKOSI_IMAGE_TYPES[@]}"; do
+    $MKOSI_CMD $image $MKOSI_ARGS
+  done
+}
+
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  key="$1"
+  case $key in
+  -v | --version)
+    version
+    exit
+    ;;
+  -h | --help)
+    helpout
+    exit
+    ;;
+  -n | --name)
+    build_image "$2"
+    shift
+    shift
+    ;;
+  *)
+    POSITIONAL+=("$1")
+    shift
+    ;;
+  esac
+done
+set -- "${POSITIONAL[@]}"

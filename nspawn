@@ -1,8 +1,8 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # nspawn - nspawn is a wrapper around machinectl pull
 #
-# Copyright (c) 2019 by Christian Rebischke <chris@nullday.de>
+# Copyright (c) 2021 by Christian Rebischke <chris@nullday.de>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -21,6 +21,9 @@
 # Author: Christian Rebischke
 # Email : chris@nullday.de
 # Github: www.github.com/shibumi
+# Contributor: Eduard Tolosa
+# Email: edu4rdshl@protonmail.com
+# Github: www.github.com/edu4rdshl
 
 set -e
 VERSION="0.1"
@@ -32,8 +35,6 @@ KEYLOCATION="https://nspawn.org/storage/masterkey.pgp"
 
 ctrl_c() {
   echo "Keyboard Interrupt detected, leaving."
-  echo
-  summary
   exit
 }
 
