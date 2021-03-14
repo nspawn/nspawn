@@ -192,6 +192,7 @@ while [[ $# -gt 0 ]]; do
     ;;
   *)
     POSITIONAL+=("$1")
+    echo "Ivalid argument(s): $POSITIONAL"
     shift
     ;;
   esac
