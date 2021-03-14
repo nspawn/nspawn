@@ -68,6 +68,8 @@ helpout() {
   echo
   echo "Commands:"
   echo -e "  -n/--name          \tBuild an image with the following parameters: <scripts-name>"
+  echo -e " --notar             \tDo not build the TAR image."
+  echo -e " --noraw             \tDo not build the RAW image."
   echo -e "  -h/--help          \tPrints this help message"
   echo -e "  -v/--version       \tPrints version info"
   echo
@@ -184,6 +186,14 @@ while [[ $# -gt 0 ]]; do
   -h | --help)
     helpout
     exit
+    ;;
+  --notar )
+    DISABLE_TAR="yes"
+    shift
+    ;;
+  --noraw )
+    DISABLE_RAW="yes"
+    shift
     ;;
   -n | --name)
     build_image "$2"
