@@ -29,9 +29,9 @@ set -e
 VERSION="0.1"
 STATIC_NAME="Nspawn (https://nspawn.org)"
 
-BASEURL="https://nspawn.org/storage"
-LISTURL="https://nspawn.org/storage/list.txt"
-KEYLOCATION="https://nspawn.org/storage/masterkey.pgp"
+BASEURL="https://hub.nspawn.org/storage"
+LISTURL="https://hub.nspawn.org/storage/list.txt"
+KEYLOCATION="https://hub.nspawn.org/storage/masterkey.pgp"
 
 ctrl_c() {
   echo "Keyboard Interrupt detected, leaving."
