@@ -27,5 +27,5 @@ You can use `nspawn --init <distribution>/<release>/<type>` to pull an image.
 
 ## Examples
 
-`nspawn --init fedora/28/tar` will pull a tar archive with a `fedora 28` directory.  
-You can instantly start it via `machinectl start fedora-28-tar`.
+`nspawn --init fedora/34/tar` will pull a tar archive with a `fedora 34` directory.  
+You can instantly start it via `machinectl start fedora-34-tar`.
