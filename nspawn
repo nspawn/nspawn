@@ -77,6 +77,8 @@ escalate_privilege() {
   fi
 }
 
+check_pubring() {
+
 if ! [ -f "/etc/systemd/import-pubring.gpg" ]; then
   echo "/etc/systemd/import-pubring.gpg does not exist"
   read -rp "Do you want to create it [y/n]: " choice
@@ -96,12 +98,14 @@ if ! [ -f "/etc/systemd/import-pubring.gpg" ]; then
     ;;
   esac
 fi
+}
 
 list() {
   curl "$LISTURL"
 }
 
 init() {
+  check_pubring
   distribution=$(echo "$1" | cut -d"/" -f1)
   release=$(echo "$1" | cut -d"/" -f2)
   type=$(basename "$1")
