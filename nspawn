@@ -127,7 +127,7 @@ init() {
       echo "Error while deploying image."
     fi
   else
-    echo "Error: $check_image_location. Wrong type, distribution or release in $output_image. Try 'nspawn list'."
+    echo "Error: $check_image_location. Wrong type, distribution or release in $output_image. Try 'nspawn --list'."
   fi
 }
 
