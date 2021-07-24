@@ -23,7 +23,6 @@
 # Email: edu4rdshl@protonmail.com
 # Github: www.github.com/edu4rdshl
 
-set -e
 VERSION="0.1"
 STATIC_NAME="Nspawn Builder (https://nspawn.org)"
 
@@ -38,6 +37,8 @@ DISABLE_RAW=""
 
 # Create mkosi.cache/ directory if no exists, leave empty if you don't want it to be created
 CREATE_MKOSI_CACHE_DIR="yes"
+
+set -e
 
 ctrl_c() {
   echo "Keyboard Interrupt detected, leaving."
