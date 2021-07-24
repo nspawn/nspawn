@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # nspawn-builder - nspawn-builder is a wrapper around mkosi that helps
-# to generate images dinamically.
+# to generate images dynamically.
 #
 # Copyright (c) 2021 by Eduard Tolosa <edu4rdshl@protonmail.com>
 #
