@@ -117,7 +117,7 @@ init() {
       exit
     fi
     escalate_privilege "Pulling the image via machinectl-$type..."
-    if machinectl pull-"$type" "$image_url" "$output_image" 2>/dev/null; then
+    if machinectl pull-"$type" "$image_url" "$output_image"; then
       echo
       echo "Image deployed locally as $output_image, details:"
       echo
