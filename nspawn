@@ -47,7 +47,7 @@ version() {
 helpout() {
   echo "Menu usage for $STATIC_NAME $VERSION"
   echo
-  echo "$0 {COMMAND} [PARAMETER]"
+  echo "${0##*/} {COMMAND} [PARAMETER]"
   echo
   echo "Wrapper around systemd-machined and https://nspawn.org"
   echo

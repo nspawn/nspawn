@@ -62,7 +62,7 @@ check_mkosi() {
 helpout() {
   echo "Menu usage for $STATIC_NAME $VERSION"
   echo
-  echo "$0 {COMMAND} [PARAMETER]"
+  echo "${0##*/} {COMMAND} [PARAMETER]"
   echo
   echo "Wrapper around mkosi for creating images in https://nspawn.org"
   echo "If you find an issue, report it to: https://github.com/nspawn/nspawn"
