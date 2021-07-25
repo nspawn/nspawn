@@ -8,14 +8,15 @@ nspawn {COMMAND} [PARAMETER]
 Wrapper around systemd-machined and https://nspawn.org
 
 Commands:
-  --init          	Initializes an image for systemd-machined with the following parameters: <distribution>/<release>/<type>
-  --list          	Lists all available images
-  --help          	Prints this help message
+  --init                Initializes an image for systemd-machined  
+                        with the following parameters: <distribution>/<release>/<type>
+  --list                Lists all available images
+  --help                Prints this help message
 
 Parameters:
   <distribution>	One out of (archlinux,centos,debian,fedora,ubuntu)
-  <release>     	The release of the distribution
-  <type>        	One out of (raw,tar)
+  <release>             The release of the distribution
+  <type>                One out of (raw,tar)
 ```
 
 On the first start `nspawn` will try to set up the `/etc/systemd/import-pubring.gpg` keyring.  
