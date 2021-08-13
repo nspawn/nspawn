@@ -26,7 +26,7 @@
 # Github: www.github.com/edu4rdshl
 
 set -e
-VERSION="0.1"
+VERSION="0.2"
 STATIC_NAME="Nspawn (https://nspawn.org)"
 
 BASEURL="https://hub.nspawn.org/storage"
@@ -45,9 +45,10 @@ version() {
 }
 
 helpout() {
+  local program="${0##*/}"
   echo "Menu usage for $STATIC_NAME $VERSION"
   echo
-  echo "${0##*/} {COMMAND} [PARAMETER]"
+  echo "$program {COMMAND} [PARAMETER]"
   echo
   echo "Wrapper around systemd-machined and https://nspawn.org"
   echo
@@ -58,7 +59,7 @@ helpout() {
   echo -e "  -v/--version       \tPrints version info"
   echo
   echo "Parameters:"
-  echo -e "  <distribution>\tOne out of (archlinux,centos,debian,fedora,ubuntu)"
+  echo -e "  <distribution>\tOne out of (archlinux,blackarch,centos,debian,fedora,kali,opensuse,parrot,ubuntu). Run $program -l/--list for more information."
   echo -e "  <release>     \tThe release of the distribution"
   echo -e "  <type>        \tOne out of (raw,tar)"
 
