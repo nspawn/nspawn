@@ -45,7 +45,7 @@ KEYLOCATION="https://hub.nspawn.org/storage/masterkey.pgp"
 
 LOCAL_CONFIGS=( "/etc/nspawn.conf" "$( dirname "${BASH_SOURCE[0]}" )/nspawn.conf")
 
-for local_config in ${LOCAL_CONFIGS[@]}; do
+for local_config in "${LOCAL_CONFIGS[@]}"; do
   [[ -f "${local_config}" ]] && source "${local_config}"
 done
 
