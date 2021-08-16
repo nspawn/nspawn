@@ -29,9 +29,25 @@ set -e
 VERSION="0.2"
 STATIC_NAME="Nspawn (https://nspawn.org)"
 
+#
+# Defaults
+#
+
 BASEURL="https://hub.nspawn.org/storage"
 LISTURL="https://hub.nspawn.org/storage/list.txt"
 KEYLOCATION="https://hub.nspawn.org/storage/masterkey.pgp"
+
+#
+# Get vars from local configs if they exist - overriding the defaults
+# Last found config file wins
+# e.g. can be used for local mirrors without changing this file
+#
+
+LOCAL_CONFIGS=( "/etc/nspawn.conf" "$( dirname "${BASH_SOURCE[0]}" )/nspawn.conf")
+
+for local_config in "${LOCAL_CONFIGS[@]}"; do
+  [[ -f "${local_config}" ]] && source "${local_config}"
+done
 
 ctrl_c() {
   echo "Keyboard Interrupt detected, leaving."
@@ -102,6 +118,9 @@ fi
 }
 
 list() {
+  echo
+  echo -e "\t$LISTURL"
+  echo
   curl "$LISTURL"
 }
 
