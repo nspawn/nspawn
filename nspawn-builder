@@ -59,6 +59,16 @@ check_mkosi() {
   fi
 }
 
+check_and_create_dir() {
+  local output_dir=""
+  output_dir=$(grep "^Output=" "$1")
+  output_dir=${output_dir/Output=/}
+  output_dir=${output_dir/image.$2.xz/}
+  if [ ! -d "$output_dir" ]; then
+    mkdir -p "$output_dir"
+  fi
+}
+
 helpout() {
   echo "Menu usage for $STATIC_NAME $VERSION"
   echo
@@ -112,11 +122,16 @@ build_image() {
   mkosi_secure_boot_crt="${scripts_name}.secure-boot.crt"
   mkosi_output="${scripts_name}.output"
 
-  # Create images array
+  # Verify that Output= directory exists, and, if not then create it.
+  # Also create images array
   if [ -f "$tar_default" ] && [[ -z $DISABLE_TAR ]]; then
+    echo "Verifying that output directory for tar image exists..."
+    check_and_create_dir "$tar_default" "tar"
     MKOSI_IMAGE_TYPES+=(" --default $tar_default")
   fi
   if [ -f "$raw_default" ] && [[ -z $DISABLE_RAW ]]; then
+    echo "Verifying that output directory for raw image exists..."
+    check_and_create_dir "$raw_default" "raw"
     MKOSI_IMAGE_TYPES+=(" --default $raw_default")
   fi
 
