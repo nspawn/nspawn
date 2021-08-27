@@ -62,8 +62,8 @@ check_mkosi() {
 check_and_create_dir() {
   local output_dir=""
   output_dir=$(grep "^Output=" "$1")
-  output_dir=${output_dir/Output=/}
-  output_dir=${output_dir/image.$2.xz/}
+  output_dir=${output_dir#*=}
+  output_dir=${output_dir%/*}/
   if [ ! -d "$output_dir" ]; then
     mkdir -p "$output_dir"
   fi
@@ -126,12 +126,12 @@ build_image() {
   # Also create images array
   if [ -f "$tar_default" ] && [[ -z $DISABLE_TAR ]]; then
     echo "Verifying that output directory for tar image exists..."
-    check_and_create_dir "$tar_default" "tar"
+    check_and_create_dir "$tar_default"
     MKOSI_IMAGE_TYPES+=(" --default $tar_default")
   fi
   if [ -f "$raw_default" ] && [[ -z $DISABLE_RAW ]]; then
     echo "Verifying that output directory for raw image exists..."
-    check_and_create_dir "$raw_default" "raw"
+    check_and_create_dir "$raw_default"
     MKOSI_IMAGE_TYPES+=(" --default $raw_default")
   fi
 
