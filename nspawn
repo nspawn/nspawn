@@ -26,7 +26,7 @@
 # Github: www.github.com/edu4rdshl
 
 set -e
-VERSION="0.3"
+VERSION="0.4"
 STATIC_NAME="Nspawn (https://nspawn.org)"
 
 #
@@ -143,10 +143,13 @@ init() {
     escalate_privilege "Pulling the image via machinectl-$type..."
     if machinectl pull-"$type" "$image_url" "$output_image" 2>/dev/null; then
       echo
-      echo "Image deployed locally as $output_image. Details:"
-      echo
-      machinectl show-image "$output_image"
-      echo
+      echo "Removing read-only flag if present from image $output_image..."
+      if machinectl read-only "$output_image" false &>/dev/null; then
+        echo "Image deployed locally as $output_image. Details:"
+        echo
+        machinectl show-image "$output_image"
+        echo
+      fi
     else
       echo "Error while deploying image."
     fi
