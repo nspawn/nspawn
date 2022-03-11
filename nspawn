@@ -26,7 +26,7 @@
 # Github: www.github.com/edu4rdshl
 
 set -e
-VERSION="0.5"
+VERSION="0.6"
 STATIC_NAME="Nspawn (https://nspawn.org)"
 
 #
@@ -129,15 +129,7 @@ init() {
   distribution=$(echo "$1" | cut -d"/" -f1)
   release=$(echo "$1" | cut -d"/" -f2)
   type=$(basename "$1")
-  local image_url=""
-  if [[ "$type" == "tar" ]]; then
-    image_url="$BASEURL/$distribution/$release/$type/image.$type.zstd"
-  elif [[ "$type" == "raw" ]]; then
-    image_url="$BASEURL/$distribution/$release/$type/image.$type.xz"
-  else
-    echo "Unknown image type: $type. Leaving..."
-    exit 2
-  fi
+  image_url="$BASEURL/$distribution/$release/$type/image.$type.xz"
   output_image="$distribution-$release-$type"
   check_image_location=$(curl -o /dev/null -sIw '%{http_code}' "$image_url")
   if [[ $check_image_location -eq 200 ]]; then
