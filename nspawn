@@ -75,7 +75,7 @@ helpout() {
   echo -e "  -v/--version       \tPrints version info"
   echo
   echo "Parameters:"
-  echo -e "  <distribution>\tOne out of (archlinux,blackarch,centos,debian,fedora,kali,opensuse,garuda,nixos,ubuntu). Run $program -l/--list for more information."
+  echo -e "  <distribution>\tCheck $program -l/--list for more information and which distribution names to use.
   echo -e "  <release>     \tThe release of the distribution"
   echo -e "  <type>        \tOne out of (raw,tar)"
 
