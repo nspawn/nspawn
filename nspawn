@@ -128,7 +128,7 @@ init() {
   check_pubring
   distribution=$(echo "$1" | cut -d"/" -f1)
   release=$(echo "$1" | cut -d"/" -f2)
-  type=$(basename "$1")
+  type=$(echo "$1" | cut -d"/" -f3)
   image_url="$BASEURL/$distribution/$release/$type/image.$type.xz"
   output_image="$distribution-$release-$type"
   check_image_location=$(curl -o /dev/null -sIw '%{http_code}' "$image_url")
