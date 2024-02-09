@@ -1,7 +1,5 @@
-use chrono::{NaiveDateTime, Utc};
-
 use {
-    chrono::DateTime,
+    chrono::{NaiveDateTime, TimeZone},
     serde::{Deserialize, Serialize},
 };
 
@@ -14,7 +12,7 @@ pub struct Image {
     #[serde(rename = "type")]
     pub type_field: String,
     pub ro: bool,
-    pub usage: Option<String>,
+    pub usage: Option<i64>,
     pub created: i64,
     pub modified: i64,
 }
@@ -28,8 +26,11 @@ impl Image {
         if self.created == 0 {
             "-".to_string()
         } else {
-            DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(self.created, 0), Utc)
-                .to_string()
+            TimeZone::from_utc_datetime(
+                &chrono::Local,
+                &NaiveDateTime::from_timestamp_opt(self.created, 0).unwrap(),
+            )
+            .to_string()
         }
     }
 
@@ -41,8 +42,19 @@ impl Image {
         if self.modified == 0 {
             "-".to_string()
         } else {
-            DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(self.modified, 0), Utc)
-                .to_string()
+            TimeZone::from_utc_datetime(
+                &chrono::Local,
+                &NaiveDateTime::from_timestamp_opt(self.modified, 0).unwrap(),
+            )
+            .to_string()
+        }
+    }
+
+    pub fn get_usage_in_gb(&mut self) -> String {
+        if let Some(usage) = self.usage {
+            format!("{:.2} GB", usage as f64 / 1_000_000_000.0)
+        } else {
+            "-".to_string()
         }
     }
 }

@@ -13,7 +13,7 @@ pub struct Machine {
 
 pub type InterfacesConfigs = Vec<InterfaceConfig>;
 
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InterfaceConfig {
     pub ifindex: i64,
@@ -38,7 +38,7 @@ pub struct InterfaceConfig {
     pub link_netnsid: Option<i64>,
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddrInfo {
     pub family: String,
@@ -53,4 +53,6 @@ pub struct AddrInfo {
     pub metric: Option<i64>,
     pub broadcast: Option<String>,
     pub dynamic: Option<bool>,
+    pub noprefixroute: Option<bool>,
+    pub protocol: Option<String>,
 }

@@ -1,5 +1,6 @@
 use crate::error_msg;
 
+#[must_use]
 pub fn opt_string_eval(value: &Option<String>) -> String {
     if let Some(value) = value {
         value.to_string()

@@ -23,9 +23,11 @@ use crate::{
 
 pub fn handle_arguments(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     match arguments.cmd {
-        Commands::Images(images_args) => manage_images(images_args, arguments.width)?,
-        Commands::Machines(machines_args) => manage_machines(machines_args, arguments.width)?,
+        Some(Commands::Images(images_args)) => manage_images(images_args, arguments.width)?,
+        Some(Commands::Machines(machines_args)) => manage_machines(machines_args, arguments.width)?,
+        None => (),
     };
+
     Ok(())
 }
 
@@ -414,7 +416,10 @@ pub fn manage_machines(
         }
         MachineCommands::Network(network) => {
             if let Some(machine) = network.machine {
-                get_network_config(&machine)?;
+                println!(
+                    "{}",
+                    create_network_configs_table(&machine, &get_network_config(&machine)?)
+                );
             } else if network.all {
                 warn_msg!("Warning, getting network info for all machines...");
                 list_active_machines()?.into_iter().for_each(|machine| {
