@@ -1,8 +1,6 @@
-use crate::modules::data_structs::InterfacesConfigs;
-
 use {
     super::Machines,
-    crate::modules::utilities::{BIN_PATH, MACHINECTL, OUTPUT_ARGUMENTS},
+    crate::modules::{utilities::{BIN_PATH, MACHINECTL, OUTPUT_ARGUMENTS}, data_structs::InterfacesConfigs},
     std::process::Command,
 };
 
@@ -65,7 +63,10 @@ pub fn exec_machine(
     Ok(())
 }
 
-pub fn get_network_config(name: &str) -> Result<InterfacesConfigs, Box<dyn std::error::Error>> {
+pub fn get_network_config(
+    name: &str,
+    with_loopback: bool,
+) -> Result<InterfacesConfigs, Box<dyn std::error::Error>> {
     let configs = String::from_utf8(
         Command::new(MACHINECTL)
             .args(["--quiet", "shell", name, "/usr/bin/ip", "-j", "a"])
@@ -73,7 +74,11 @@ pub fn get_network_config(name: &str) -> Result<InterfacesConfigs, Box<dyn std::
             .stdout,
     )?;
 
-    let configs: InterfacesConfigs = serde_json::from_str(&configs)?;
+    let mut configs: InterfacesConfigs = serde_json::from_str(&configs)?;
+
+    if !with_loopback {
+        configs.retain(|config| !config.is_loopback());
+    }
 
     Ok(configs)
 }

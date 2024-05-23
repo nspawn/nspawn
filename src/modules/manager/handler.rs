@@ -418,13 +418,13 @@ pub fn manage_machines(
             if let Some(machine) = network.machine {
                 println!(
                     "{}",
-                    create_network_configs_table(&machine, &get_network_config(&machine)?)
+                    create_network_configs_table(&machine, &get_network_config(&machine, network.loopback)?)
                 );
             } else if network.all {
                 warn_msg!("Warning, getting network info for all machines...");
                 list_active_machines()?.into_iter().for_each(|machine| {
                     let machine = opt_string_eval(&machine.machine);
-                    if let Ok(ifaces_config) = get_network_config(&machine) {
+                    if let Ok(ifaces_config) = get_network_config(&machine, network.loopback) {
                         println!("{}", create_network_configs_table(&machine, &ifaces_config));
                     } else {
                         error_msg!("Error getting network info for machine: {}", machine);
@@ -438,7 +438,7 @@ pub fn manage_machines(
                 list_active_machines()?.into_iter().for_each(|machine| {
                     let machine = opt_string_eval(&machine.machine);
                     if machine.to_lowercase().contains(&pattern.to_lowercase()) {
-                        if let Ok(ifaces_config) = get_network_config(&machine) {
+                        if let Ok(ifaces_config) = get_network_config(&machine, network.loopback) {
                             println!("{}", create_network_configs_table(&machine, &ifaces_config));
                         } else {
                             error_msg!("Error getting network info for machine: {}", machine);

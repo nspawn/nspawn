@@ -56,3 +56,9 @@ pub struct AddrInfo {
     pub noprefixroute: Option<bool>,
     pub protocol: Option<String>,
 }
+
+impl InterfaceConfig {
+    pub fn is_loopback(&self) -> bool {
+        self.flags.contains(&"LOOPBACK".to_string())
+    }
+}

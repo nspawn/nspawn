@@ -110,7 +110,7 @@ pub struct Reboot {
     pub machine: Option<String>,
 }
 
-#[derive(Parser, Clone)]
+#[derive(Parser, Clone, Default)]
 pub struct Network {
     /// Name of the machine to work with.
     pub machine: Option<String>,
@@ -120,4 +120,7 @@ pub struct Network {
     /// Get the network configuration for machines matching the specified pattern.
     #[arg(short, long, default_value = None)]
     pub pattern: Option<String>,
+    /// Include the loopback interface(s) in the output.
+    #[arg(short, long, default_value_t = false)]
+    pub loopback: bool,
 }
