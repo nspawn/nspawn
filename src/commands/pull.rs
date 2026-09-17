@@ -53,7 +53,7 @@ pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
         }
     }
 
-    install(
+    let mode = install(
         &store,
         &sd,
         backend,
@@ -64,9 +64,13 @@ pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
             manifest: &manifest,
             manifest_digest: &manifest_digest,
             origin: "pull",
+            mode: args.mode.to_mode(),
         },
     )
     .await?;
-    println!("image {name} is ready: nspawn start {name}");
+    println!(
+        "image {name} ({} image) is ready: nspawn start {name}",
+        mode.name()
+    );
     Ok(())
 }

@@ -34,9 +34,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             MachinesCommand::Ls => machines::ls().await,
         },
         Command::Start(args) => machines::start(args, &config).await,
-        Command::Stop(args) => machines::stop(args).await,
-        Command::Exec(args) => machines::exec(args).await,
-        Command::Shell(args) => machines::shell(args).await,
+        Command::Stop(args) => machines::stop(args, &config).await,
+        Command::Exec(args) => machines::exec(args, &config).await,
+        Command::Shell(args) => machines::shell(args, &config).await,
     }
 }
 

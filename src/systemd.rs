@@ -9,6 +9,7 @@ use zbus::Connection;
 use zbus_systemd::{machine1, systemd1};
 
 pub struct Systemd {
+    conn: Connection,
     machined: machine1::ManagerProxy<'static>,
     manager: systemd1::ManagerProxy<'static>,
 }
@@ -39,7 +40,11 @@ impl Systemd {
         let manager = systemd1::ManagerProxy::new(&conn)
             .await
             .context("connecting to systemd")?;
-        Ok(Systemd { machined, manager })
+        Ok(Systemd {
+            conn,
+            machined,
+            manager,
+        })
     }
 
     pub async fn version(&self) -> Result<String> {
@@ -105,6 +110,32 @@ impl Systemd {
         self.start_unit(&unit)
             .await
             .with_context(|| format!("machine {name} failed to start; see journalctl -u {unit}"))
+    }
+
+    /// PID of the machine's leader (its PID 1 as seen from the host).
+    pub async fn machine_leader(&self, name: &str) -> Result<u32> {
+        let path = self
+            .machined
+            .get_machine(name.to_string())
+            .await
+            .with_context(|| format!("looking up machine {name}"))?;
+        let machine = machine1::MachineProxy::builder(&self.conn)
+            .path(path)?
+            .build()
+            .await
+            .with_context(|| format!("connecting to machine {name}"))?;
+        machine
+            .leader()
+            .await
+            .with_context(|| format!("reading the leader of {name}"))
+    }
+
+    /// Sends `signal` to the leader or to all processes ("all") of a machine.
+    pub async fn kill_machine(&self, name: &str, who: &str, signal: i32) -> Result<()> {
+        self.machined
+            .kill_machine(name.to_string(), who.to_string(), signal)
+            .await
+            .with_context(|| format!("signalling {name}"))
     }
 
     /// Asks the machine to power off cleanly (SIGRTMIN+4 to its init, like machinectl poweroff).

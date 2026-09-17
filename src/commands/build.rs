@@ -101,7 +101,7 @@ pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
         manifest.layers.len(),
         backend.name()
     );
-    install(
+    let mode = install(
         &store,
         &sd,
         backend,
@@ -112,6 +112,7 @@ pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
             manifest: &manifest,
             manifest_digest: &manifest_digest,
             origin: "build",
+            mode: args.mode.to_mode(),
         },
     )
     .await?;
@@ -120,7 +121,10 @@ pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
     } else {
         let _ = fs::remove_dir_all(&output_dir);
     }
-    println!("image {name} is ready: nspawn start {name}, nspawn push {name}");
+    println!(
+        "image {name} ({} image) is ready: nspawn start {name}, nspawn push {name}",
+        mode.name()
+    );
     Ok(())
 }
 
@@ -177,6 +181,7 @@ mod tests {
             release: Some("44".into()),
             profile: vec!["web".into()],
             backend: BackendChoice::Auto,
+            mode: crate::cli::ModeChoice::Auto,
             force: false,
             keep_output: false,
             mkosi_args: vec!["--debug".into()],

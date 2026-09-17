@@ -1,13 +1,16 @@
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
-use crate::backend::{ensure_mstack_settings, MANAGED_NS_SOCKETS};
+use crate::backend::MANAGED_NS_SOCKETS;
 use crate::cli::{BackendChoice, ExecArgs, ShellArgs, StartArgs, StopArgs};
 use crate::config::Config;
+use crate::nsenter;
+use crate::oci::Mode;
 use crate::output::table;
 use crate::pty;
-use crate::store::Store;
+use crate::settings::{self, MachineSettings};
+use crate::store::{ImageRecord, Store};
 use crate::systemd::Systemd;
 
 pub async fn ls() -> Result<()> {
@@ -33,22 +36,55 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
         bail!("machine {} is already running", args.name);
     }
     let store = Store::new(&config.machines_dir, &config.state_dir);
-    if let Some(record) = store.load_image(&args.name)? {
-        if record.backend == BackendChoice::Mstack {
-            // Managed user namespaces come from nsresourced, which is socket activated but
-            // not necessarily enabled; the settings file is written again if it went missing.
-            ensure_mstack_settings(&args.name)?;
-            for unit in MANAGED_NS_SOCKETS {
-                sd.start_unit(unit).await?;
+    match store.load_image(&args.name)? {
+        Some(mut record) => {
+            if let Some(network) = args.network {
+                record.network = network;
+                store.record_image(&record)?;
+            }
+            if !args.command.is_empty() && record.mode == Mode::Boot {
+                bail!("{} boots an init system; a command can only replace the entrypoint of an app image", args.name);
+            }
+            // The settings file is regenerated every time: it carries the command override
+            // and comes back if it went missing.
+            settings::write(&MachineSettings {
+                name: &args.name,
+                managed_userns: record.backend == BackendChoice::Mstack,
+                mode: record.mode,
+                run: &record.run,
+                command_override: if args.command.is_empty() {
+                    None
+                } else {
+                    Some(&args.command)
+                },
+                network: record.network,
+            })?;
+            if record.backend == BackendChoice::Mstack {
+                // Managed user namespaces come from socket activated services that
+                // distributions ship disabled.
+                for unit in MANAGED_NS_SOCKETS {
+                    sd.start_unit(unit).await?;
+                }
             }
         }
+        None if !args.command.is_empty() => {
+            bail!(
+                "{} is not an image managed by nspawn; a command override needs one",
+                args.name
+            )
+        }
+        None => {}
     }
     sd.start_machine(&args.name).await?;
     if args.wait {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !sd.machine_exists(&args.name).await? {
             if Instant::now() > deadline {
-                bail!("machine {} did not register within 30 seconds; see journalctl -u systemd-nspawn@{}", args.name, args.name);
+                bail!(
+                    "machine {} did not register within 30 seconds; see journalctl -u systemd-nspawn@{}",
+                    args.name,
+                    args.name
+                );
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -57,26 +93,42 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub async fn stop(args: StopArgs) -> Result<()> {
+pub async fn stop(args: StopArgs, config: &Config) -> Result<()> {
     let sd = Systemd::connect().await?;
     if !sd.machine_exists(&args.name).await? {
         bail!("machine {} is not running", args.name);
     }
+    let store = Store::new(&config.machines_dir, &config.state_dir);
+    let record = store.load_image(&args.name)?;
     if args.force {
         sd.terminate_machine(&args.name).await?;
     } else {
-        sd.poweroff_machine(&args.name).await?;
+        match record.as_ref().map(|r| r.mode) {
+            // Like docker stop: the image's stop signal to every process, then the hammer.
+            Some(Mode::App) => {
+                let signal = record
+                    .as_ref()
+                    .and_then(|r| r.run.stop_signal.clone())
+                    .unwrap_or_else(|| "SIGTERM".to_string());
+                sd.kill_machine(&args.name, "all", signal_number(&signal)?)
+                    .await?;
+                if !wait_gone(&sd, &args.name, Duration::from_secs(args.timeout)).await? {
+                    eprintln!(
+                        "{} ignored {signal} for {} seconds; terminating it",
+                        args.name, args.timeout
+                    );
+                    sd.terminate_machine(&args.name).await?;
+                }
+            }
+            _ => sd.poweroff_machine(&args.name).await?,
+        }
     }
     if args.wait {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while sd.machine_exists(&args.name).await? {
-            if Instant::now() > deadline {
-                bail!(
-                    "machine {} is still running after 60 seconds; use --force",
-                    args.name
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
+        if !wait_gone(&sd, &args.name, Duration::from_secs(60)).await? {
+            bail!(
+                "machine {} is still running after 60 seconds; use --force",
+                args.name
+            );
         }
         // Let the service finish its own teardown so that the image can be removed right away.
         sd.stop_unit(&format!("systemd-nspawn@{}.service", args.name))
@@ -86,29 +138,87 @@ pub async fn stop(args: StopArgs) -> Result<()> {
     Ok(())
 }
 
-pub async fn exec(args: ExecArgs) -> Result<()> {
+async fn wait_gone(sd: &Systemd, name: &str, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    while sd.machine_exists(name).await? {
+        if Instant::now() > deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(true)
+}
+
+fn signal_number(name: &str) -> Result<i32> {
+    let upper = name.to_ascii_uppercase();
+    let full = if upper.starts_with("SIG") {
+        upper
+    } else {
+        format!("SIG{upper}")
+    };
+    let signal: nix::sys::signal::Signal = full
+        .parse()
+        .map_err(|_| anyhow::anyhow!("unknown signal {name}"))?;
+    Ok(signal as i32)
+}
+
+pub async fn exec(args: ExecArgs, config: &Config) -> Result<()> {
     let sd = Systemd::connect().await?;
     if !sd.machine_exists(&args.machine).await? {
         bail!("machine {} is not running", args.machine);
     }
+    let store = Store::new(&config.machines_dir, &config.state_dir);
+    let record = store.load_image(&args.machine)?;
+    if args.nsenter || record.as_ref().is_some_and(|r| r.mode == Mode::App) {
+        let code = exec_in_namespaces(
+            &sd,
+            &args.machine,
+            &args.command,
+            &args.user,
+            record.as_ref(),
+        )
+        .await?;
+        std::process::exit(code);
+    }
     let path = args.command[0].clone();
     if !path.starts_with('/') {
-        bail!(
-            "the command must be an absolute path inside the machine, for example /usr/bin/{path}"
-        );
+        bail!("the command must be an absolute path inside the machine, for example /usr/bin/{path} (or use --nsenter)");
     }
     let (fd, _pty) =
         open_shell_when_ready(&sd, &args.machine, &args.user, &path, args.command.clone()).await?;
     pty::run_session(fd)
 }
 
-pub async fn shell(args: ShellArgs) -> Result<()> {
+pub async fn shell(args: ShellArgs, config: &Config) -> Result<()> {
     let sd = Systemd::connect().await?;
     if !sd.machine_exists(&args.machine).await? {
         bail!("machine {} is not running", args.machine);
     }
+    let store = Store::new(&config.machines_dir, &config.state_dir);
+    let record = store.load_image(&args.machine)?;
+    if record.as_ref().is_some_and(|r| r.mode == Mode::App) {
+        let shell = vec!["/bin/sh".to_string()];
+        let code =
+            exec_in_namespaces(&sd, &args.machine, &shell, &args.user, record.as_ref()).await?;
+        std::process::exit(code);
+    }
     let (fd, _pty) = open_shell_when_ready(&sd, &args.machine, &args.user, "", Vec::new()).await?;
     pty::run_session(fd)
+}
+
+/// docker exec: no D-Bus needed inside the machine. Returns the command's exit code.
+async fn exec_in_namespaces(
+    sd: &Systemd,
+    machine: &str,
+    command: &[String],
+    user: &str,
+    record: Option<&ImageRecord>,
+) -> Result<i32> {
+    let leader = sd.machine_leader(machine).await?;
+    let user = if user == "root" { None } else { Some(user) };
+    let working_dir = record.and_then(|r| r.run.working_dir.as_deref());
+    tokio::task::block_in_place(|| nsenter::exec(leader, command, user, working_dir))
+        .with_context(|| format!("running a command inside {machine}"))
 }
 
 /// A machine that has just been started has no D-Bus yet for a few seconds; retry

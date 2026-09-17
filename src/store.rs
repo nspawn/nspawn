@@ -7,10 +7,12 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use nix::sys::stat::{mknod, Mode, SFlag};
+use nix::sys::stat::{mknod, Mode as FileMode, SFlag};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::BackendChoice;
+use crate::oci::{Mode, RunSpec};
+use crate::settings::Network;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageRecord {
@@ -23,6 +25,22 @@ pub struct ImageRecord {
     /// "pull" or "build".
     #[serde(default = "default_origin")]
     pub origin: String,
+    /// Booted with an init system, or a single program under nspawn's stub init.
+    #[serde(default = "default_mode")]
+    pub mode: Mode,
+    /// Command, environment and friends from the OCI config.
+    #[serde(default)]
+    pub run: RunSpec,
+    #[serde(default = "default_network")]
+    pub network: Network,
+}
+
+fn default_mode() -> Mode {
+    Mode::Boot
+}
+
+fn default_network() -> Network {
+    Network::Veth
 }
 
 fn default_origin() -> String {
@@ -492,7 +510,7 @@ fn handle_whiteout(
                     .with_context(|| format!("creating {}", parent.display()))?;
             }
             remove_any(&node)?;
-            mknod(&node, SFlag::S_IFCHR, Mode::empty(), 0)
+            mknod(&node, SFlag::S_IFCHR, FileMode::empty(), 0)
                 .with_context(|| format!("creating whiteout {}", node.display()))?;
             if owner.is_some() {
                 std::os::unix::fs::lchown(&node, owner, owner)
@@ -735,6 +753,9 @@ mod tests {
             backend: BackendChoice::Overlay,
             created: 1,
             origin: "pull".into(),
+            mode: Mode::Boot,
+            run: RunSpec::default(),
+            network: Network::Veth,
         };
         store.record_image(&rec).unwrap();
         assert_eq!(
@@ -770,6 +791,9 @@ mod tests {
             backend: BackendChoice::Flat,
             created: 1,
             origin: "build".into(),
+            mode: Mode::App,
+            run: RunSpec::default(),
+            network: Network::Host,
         };
         store.record_image(&rec).unwrap();
         store

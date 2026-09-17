@@ -26,6 +26,28 @@ nspawn push app-1 --to team/app:2   # push a local image under another tag
 `--profile` and anything after `--` are passed through. The result is stored like a pulled
 image (blobs, manifest, assembled machine) and can be started right away or pushed.
 
+## Machines and apps
+
+Images that ship an init system (systemd) and whose entrypoint is that init are booted with
+`--boot`, like `machinectl start` does; `exec` and `shell` go through machined's
+`OpenMachineShell`. Any other image, for example anything from Docker Hub, is an "app":
+its entrypoint runs as PID 2 under nspawn's stub init, with the environment, working
+directory, user and stop signal from the OCI config, and shares the host's network
+(`--network veth` switches to a virtual ethernet pair). `exec` and `shell` then enter the
+machine's namespaces directly, so no D-Bus is needed inside, and `stop` sends the image's
+stop signal to every process before terminating the machine after `--timeout` seconds.
+
+```
+nspawn pull docker.io/library/busybox
+nspawn start busybox -- /bin/sleep infinity   # replace the entrypoint for this start
+nspawn exec busybox -- /bin/sh -c 'uname -n'  # exit code is propagated
+nspawn stop busybox
+```
+
+Detection can be forced with `--mode boot|app` on `pull` and `build`. Everything nspawn
+decides for a machine ends up in `/etc/systemd/nspawn/<name>.nspawn`, which the stock
+`systemd-nspawn@.service` template honours through `--settings=override`.
+
 ## How images are stored
 
 `pull` fetches the manifest (multi-arch indexes are resolved for the host platform),

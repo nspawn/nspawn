@@ -21,7 +21,9 @@ grep -qx "${IMAGE##*:}" /tmp/e2e-tags.txt || fail "tag ${IMAGE##*:} missing"
 for backend in overlay flat; do
   name=e2e-$backend
   step "pull $IMAGE --backend $backend"
-  $NSPAWN pull "$IMAGE" --name "$name" --backend "$backend" --force || { fail "pull ($backend)"; continue; }
+  $NSPAWN pull "$IMAGE" --name "$name" --backend "$backend" --force > /tmp/e2e-pull.txt 2>&1 || { cat /tmp/e2e-pull.txt; fail "pull ($backend)"; continue; }
+  cat /tmp/e2e-pull.txt
+  grep -q "(boot image)" /tmp/e2e-pull.txt || fail "$IMAGE not detected as a boot image"
   step "images ls"
   $NSPAWN images ls | tee /tmp/e2e-img.txt
   grep -q "^ *$name " /tmp/e2e-img.txt || fail "$name not listed"
@@ -91,6 +93,29 @@ if command -v mkosi >/dev/null 2>&1; then
 else
   echo "mkosi not installed: skipping the build round trip"
 fi
+
+step "app images without an init system (docker-style)"
+app=e2e-busybox
+$NSPAWN pull docker.io/library/busybox:latest --name $app --backend overlay --force > /tmp/e2e-app.txt 2>&1 || fail "pull busybox from Docker Hub"
+cat /tmp/e2e-app.txt
+grep -q "(app image)" /tmp/e2e-app.txt || fail "busybox not detected as an app image"
+grep -q "Boot=no" /etc/systemd/nspawn/$app.nspawn || fail "settings file does not disable --boot"
+grep -q "ProcessTwo=yes" /etc/systemd/nspawn/$app.nspawn || fail "settings file does not use a stub init"
+$NSPAWN start $app -- /bin/sleep 300 || fail "start busybox with a command override"
+grep -q "Parameters=/bin/sleep 300" /etc/systemd/nspawn/$app.nspawn || fail "command override not written"
+$NSPAWN machines ls | tee /tmp/e2e-m.txt
+grep -q "^ *$app " /tmp/e2e-m.txt || fail "busybox machine not running"
+out=$($NSPAWN exec $app -- /bin/sh -c 'echo inside:$(uname -n); cat /etc/os-release | head -1' </dev/null | tr -d '\r')
+echo "$out"
+echo "$out" | grep -q "inside:$app" || fail "exec via namespaces did not run inside the machine"
+[ "$($NSPAWN exec $app -- id -u </dev/null | tr -d '\r')" = "0" ] || fail "exec does not run as the machine's root"
+[ "$($NSPAWN exec $app --user 65534 -- id -u </dev/null | tr -d '\r')" = "65534" ] || fail "exec --user ignored"
+$NSPAWN exec $app -- /bin/false </dev/null; [ $? -eq 1 ] || fail "exec did not propagate the exit code"
+$NSPAWN stop $app || fail "stop busybox"
+retry 15 bash -c "! $NSPAWN machines ls | grep -q '^ *$app '" || fail "busybox still running after stop"
+$NSPAWN images rm $app || fail "rm busybox"
+[ -e /etc/systemd/nspawn/$app.nspawn ] && fail "settings file left behind for $app"
+grep -q "(boot image)" /tmp/e2e-hub.txt 2>/dev/null || true
 
 step "pipelines: a reader that closes early must not make nspawn fail"
 $NSPAWN hub ls | head -c 1 >/dev/null; rc=${PIPESTATUS[0]}

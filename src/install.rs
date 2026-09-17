@@ -1,10 +1,15 @@
-//! Turns blobs in the store into a usable local image: assembly with a backend plus the
-//! record and manifest that `images ls`, `images rm` and `push` rely on.
+//! Turns blobs in the store into a usable local image: assembly with a backend, the
+//! settings file nspawn boots it with, and the record that `images ls`, `images rm`, `start`
+//! and `push` rely on.
 
-use anyhow::Result;
+use std::fs;
+
+use anyhow::{Context, Result};
 use oci_client::manifest::OciImageManifest;
 
 use crate::backend::{Assembler, Backend, Layer};
+use crate::oci::{detect_mode, has_init, Mode, RunSpec};
+use crate::settings::{self, MachineSettings, Network};
 use crate::store::{now_unix, ImageRecord, Store};
 use crate::systemd::Systemd;
 
@@ -15,15 +20,17 @@ pub struct Install<'a> {
     pub manifest: &'a OciImageManifest,
     pub manifest_digest: &'a str,
     pub origin: &'a str,
+    /// Force boot or app instead of detecting it from the image.
+    pub mode: Option<Mode>,
 }
 
-/// All blobs named in the manifest must already be in the store.
+/// All blobs named in the manifest (layers and config) must already be in the store.
 pub async fn install(
     store: &Store,
     sd: &Systemd,
     backend: Backend,
     spec: Install<'_>,
-) -> Result<()> {
+) -> Result<Mode> {
     let layers: Vec<Layer> = spec
         .manifest
         .layers
@@ -35,7 +42,28 @@ pub async fn install(
         })
         .collect();
     let assembler = Assembler { store, sd };
-    assembler.assemble(backend, spec.name, &layers).await?;
+    let trees = assembler.assemble(backend, spec.name, &layers).await?;
+
+    let config_path = store.blob_path(&spec.manifest.config.digest);
+    let config =
+        fs::read(&config_path).with_context(|| format!("reading {}", config_path.display()))?;
+    let run = RunSpec::from_config(&config)?;
+    let mode = spec
+        .mode
+        .unwrap_or_else(|| detect_mode(has_init(&trees), &run.command));
+    // App images have no network stack of their own worth configuring; share the host's.
+    let network = match mode {
+        Mode::Boot => Network::Veth,
+        Mode::App => Network::Host,
+    };
+    settings::write(&MachineSettings {
+        name: spec.name,
+        managed_userns: backend == Backend::Mstack,
+        mode,
+        run: &run,
+        command_override: None,
+        network,
+    })?;
     store.save_manifest(spec.name, spec.manifest_bytes)?;
     store.record_image(&ImageRecord {
         name: spec.name.to_string(),
@@ -50,8 +78,11 @@ pub async fn install(
         backend: backend.as_choice(),
         created: now_unix(),
         origin: spec.origin.to_string(),
+        mode,
+        run,
+        network,
     })?;
-    Ok(())
+    Ok(mode)
 }
 
 /// Removes an existing image with the same name, or refuses when it is running or

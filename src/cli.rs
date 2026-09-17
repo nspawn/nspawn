@@ -86,6 +86,9 @@ pub struct PullArgs {
     /// How to assemble the image on this host.
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     pub backend: BackendChoice,
+    /// Whether the image boots an init system or runs a single program.
+    #[arg(long, value_enum, default_value_t = ModeChoice::Auto)]
+    pub mode: ModeChoice,
     /// Replace an existing image with the same name.
     #[arg(long, short = 'f')]
     pub force: bool,
@@ -114,6 +117,9 @@ pub struct BuildArgs {
     /// How to assemble the image on this host.
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     pub backend: BackendChoice,
+    /// Whether the image boots an init system or runs a single program.
+    #[arg(long, value_enum, default_value_t = ModeChoice::Auto)]
+    pub mode: ModeChoice,
     /// Replace an existing image with the same name.
     #[arg(long, short = 'f')]
     pub force: bool,
@@ -132,6 +138,26 @@ pub struct PushArgs {
     /// Push under a different reference than the one recorded for the image.
     #[arg(long)]
     pub to: Option<String>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ModeChoice {
+    /// Boot when the image has an init system and no other entrypoint, app otherwise.
+    Auto,
+    /// Boot the image's init system (systemd machines).
+    Boot,
+    /// Run the image's entrypoint under nspawn's stub init (docker-style images).
+    App,
+}
+
+impl ModeChoice {
+    pub fn to_mode(self) -> Option<crate::oci::Mode> {
+        match self {
+            ModeChoice::Auto => None,
+            ModeChoice::Boot => Some(crate::oci::Mode::Boot),
+            ModeChoice::App => Some(crate::oci::Mode::App),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum, serde::Deserialize, serde::Serialize)]
@@ -189,6 +215,12 @@ pub struct StartArgs {
     /// Wait until the machine is registered before returning.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub wait: bool,
+    /// Network setup, remembered for the image: veth (needs systemd-networkd on the host) or host.
+    #[arg(long, value_enum)]
+    pub network: Option<crate::settings::Network>,
+    /// For app images: run this command instead of the image's entrypoint (after --).
+    #[arg(last = true)]
+    pub command: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -201,6 +233,9 @@ pub struct StopArgs {
     /// Wait until the machine is gone before returning.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub wait: bool,
+    /// App images: seconds to wait after the stop signal before terminating the machine.
+    #[arg(long, short = 't', default_value_t = 10)]
+    pub timeout: u64,
 }
 
 #[derive(Args, Debug)]
@@ -210,6 +245,10 @@ pub struct ExecArgs {
     /// User inside the machine.
     #[arg(long, short = 'u', default_value = "root")]
     pub user: String,
+    /// Enter the machine's namespaces directly instead of asking its systemd for a shell
+    /// (the default for app images; works without D-Bus inside).
+    #[arg(long)]
+    pub nsenter: bool,
     /// Command and arguments.
     #[arg(required = true, trailing_var_arg = true)]
     pub command: Vec<String>,
