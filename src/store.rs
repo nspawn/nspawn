@@ -1,13 +1,16 @@
 //! Local state under the state directory (/var/lib/nspawn by default): extracted layers,
 //! image records, downloads in flight and per-machine writable directories.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::net::Ipv4Addr;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use nix::sys::stat::{mknod, Mode as FileMode, SFlag};
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +44,10 @@ pub struct ImageRecord {
     /// Ports published on the host, like docker -p (bridge network only).
     #[serde(default)]
     pub ports: Vec<PortMap>,
+    /// For app machines: the command remembered from create or start instead of the
+    /// image's entrypoint (docker fixes it when the container is created).
+    #[serde(default)]
+    pub command: Vec<String>,
 }
 
 fn default_mode() -> Mode {
@@ -60,7 +67,7 @@ fn default_origin() -> String {
 pub const FOREIGN_UID_BASE: u32 = 2_147_352_576;
 
 /// Who owns the files of an extracted layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ownership {
     /// UIDs and GIDs as recorded in the image (root is 0); what overlay and flat images use.
@@ -88,6 +95,9 @@ pub fn foreign_id(id: u32) -> u32 {
     }
 }
 
+/// Exclusive hold on the store; see `Store::lock`.
+pub struct StoreLock(#[allow(dead_code)] Flock<File>);
+
 #[derive(Debug, Clone)]
 pub struct Store {
     pub machines_dir: PathBuf,
@@ -99,6 +109,26 @@ impl Store {
         Store {
             machines_dir: machines_dir.to_path_buf(),
             root: state_dir.to_path_buf(),
+        }
+    }
+
+    /// Serialises the commands that change the store (pull, create, build, rm, the
+    /// preparation done by start and the unit hooks), so that two of them never hand out
+    /// the same address or extract the same layer at once. Released when dropped.
+    pub fn lock(&self) -> Result<StoreLock> {
+        fs::create_dir_all(&self.root)
+            .with_context(|| format!("creating {}", self.root.display()))?;
+        let path = self.root.join(".lock");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        match Flock::lock(file, FlockArg::LockExclusive) {
+            Ok(lock) => Ok(StoreLock(lock)),
+            Err((_, errno)) => bail!("locking {}: {errno}", path.display()),
         }
     }
 
@@ -203,6 +233,12 @@ impl Store {
         for entry in fs::read_dir(self.blobs_dir())? {
             let entry = entry?;
             let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with(".part-") {
+                // A download or copy that never finished; the store is locked, so nobody
+                // is writing it now.
+                let _ = fs::remove_file(entry.path());
+                continue;
+            }
             if file_name.starts_with('.') || referenced.contains(&file_name) {
                 continue;
             }
@@ -325,24 +361,39 @@ impl Store {
             .find(|r| r.reference == wanted))
     }
 
-    /// Deletes layers that no image record references. Returns the digests removed.
+    /// Deletes layers that no image record references, in each layer store separately:
+    /// overlay machines use the root-owned copies, mstack machines the foreign-owned ones
+    /// and flat machines none at all. Returns the digests removed.
     pub fn gc_layers(&self) -> Result<Vec<String>> {
-        let referenced: std::collections::HashSet<String> = self
-            .list_images()?
-            .into_iter()
-            .flat_map(|r| r.layers)
-            .map(|d| layer_dir_name(&d))
-            .collect();
+        let mut referenced: HashMap<Ownership, HashSet<String>> = HashMap::new();
+        for record in self.list_images()? {
+            let ownership = match record.backend {
+                BackendChoice::Overlay => Ownership::Root,
+                BackendChoice::Mstack => Ownership::Foreign,
+                BackendChoice::Flat | BackendChoice::Auto => continue,
+            };
+            referenced
+                .entry(ownership)
+                .or_default()
+                .extend(record.layers.iter().map(|d| layer_dir_name(d)));
+        }
         let mut removed = Vec::new();
         for ownership in [Ownership::Root, Ownership::Foreign] {
             let dir = self.layers_dir(ownership);
             if !dir.is_dir() {
                 continue;
             }
+            let used = referenced.remove(&ownership).unwrap_or_default();
             for entry in fs::read_dir(&dir)? {
                 let entry = entry?;
                 let file_name = entry.file_name().to_string_lossy().to_string();
-                if file_name.starts_with('.') || referenced.contains(&file_name) {
+                if file_name.starts_with(".tmp-") {
+                    // An extraction that never finished; the store is locked, so nobody
+                    // is writing it now.
+                    let _ = fs::remove_dir_all(entry.path());
+                    continue;
+                }
+                if file_name.starts_with('.') || used.contains(&file_name) {
                     continue;
                 }
                 fs::remove_dir_all(entry.path())
@@ -474,9 +525,33 @@ pub fn extract_layer(
             handle_whiteout(target, whiteout, mode, ownership)?;
             continue;
         }
+        let header = entry.header();
         // Malformed numeric fields are treated as root, like GNU tar does.
-        let uid = entry.header().uid().unwrap_or(0) as u32;
-        let gid = entry.header().gid().unwrap_or(0) as u32;
+        let uid = header.uid().unwrap_or(0) as u32;
+        let gid = header.gid().unwrap_or(0) as u32;
+        let file_mode = header.mode().unwrap_or(0o644) & 0o7777;
+        let kind = header.entry_type();
+        let capabilities = file_capabilities(&mut entry)?;
+        if mode == WhiteoutMode::Apply {
+            // A later layer may turn a file into a directory or the other way round; tar
+            // only knows how to overwrite like with like.
+            match resolve_inside(target, &path, true)? {
+                Some(dest) => {
+                    if let Ok(meta) = fs::symlink_metadata(&dest) {
+                        if kind.is_dir() != meta.is_dir() {
+                            remove_any(&dest)?;
+                        }
+                    }
+                }
+                None => {
+                    eprintln!(
+                        "warning: skipping {} in layer: a symlink on its path leads outside",
+                        path.display()
+                    );
+                    continue;
+                }
+            }
+        }
         if !entry
             .unpack_in(target)
             .with_context(|| format!("unpacking {}", path.display()))?
@@ -487,14 +562,102 @@ pub fn extract_layer(
             let unpacked = target.join(&path);
             std::os::unix::fs::lchown(&unpacked, Some(foreign_id(uid)), Some(foreign_id(gid)))
                 .with_context(|| format!("shifting ownership of {}", unpacked.display()))?;
+            // chown clears setuid/setgid bits and file capabilities, for root too.
+            if !kind.is_symlink() {
+                fs::set_permissions(&unpacked, fs::Permissions::from_mode(file_mode))
+                    .with_context(|| format!("restoring the mode of {}", unpacked.display()))?;
+                if let Some(caps) = &capabilities {
+                    xattr::set(&unpacked, "security.capability", caps).with_context(|| {
+                        format!("restoring the capabilities of {}", unpacked.display())
+                    })?;
+                }
+            }
         }
         count += 1;
     }
     if ownership == Ownership::Foreign {
-        std::os::unix::fs::lchown(target, Some(FOREIGN_UID_BASE), Some(FOREIGN_UID_BASE))
-            .with_context(|| format!("shifting ownership of {}", target.display()))?;
+        // Directories tar created implicitly for entries without a parent entry, and the
+        // target itself, are still root's.
+        shift_remaining(target)?;
     }
     Ok(count)
+}
+
+/// The file capabilities an entry carries in its PAX extended header, if any.
+fn file_capabilities<R: Read>(entry: &mut tar::Entry<'_, R>) -> Result<Option<Vec<u8>>> {
+    let Some(extensions) = entry.pax_extensions()? else {
+        return Ok(None);
+    };
+    for extension in extensions.flatten() {
+        if extension.key_bytes() == b"SCHILY.xattr.security.capability" {
+            return Ok(Some(extension.value_bytes().to_vec()));
+        }
+    }
+    Ok(None)
+}
+
+/// Moves whatever is still owned below the foreign range into it.
+fn shift_remaining(dir: &Path) -> Result<()> {
+    let shift = |path: &Path, meta: &fs::Metadata| -> Result<()> {
+        if meta.uid() < FOREIGN_UID_BASE || meta.gid() < FOREIGN_UID_BASE {
+            std::os::unix::fs::lchown(
+                path,
+                Some(foreign_id(meta.uid())),
+                Some(foreign_id(meta.gid())),
+            )
+            .with_context(|| format!("shifting ownership of {}", path.display()))?;
+            if !meta.is_dir() && !meta.file_type().is_symlink() {
+                fs::set_permissions(path, fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+            }
+        }
+        Ok(())
+    };
+    shift(dir, &fs::symlink_metadata(dir)?)?;
+    for child in fs::read_dir(dir)? {
+        let child = child?;
+        let meta = child.metadata()?; // does not follow symlinks
+        if meta.is_dir() {
+            shift_remaining(&child.path())?;
+        } else {
+            shift(&child.path(), &meta)?;
+        }
+    }
+    Ok(())
+}
+
+/// `target/relative`, unless a symlink sits on the way: a symlink from this or an
+/// earlier layer would take a deletion or a marker outside the layer, up to the host's
+/// root. The last component may be a symlink when `symlink_leaf` allows it.
+fn resolve_inside(target: &Path, relative: &Path, symlink_leaf: bool) -> Result<Option<PathBuf>> {
+    let names: Vec<_> = relative
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+    let mut path = target.to_path_buf();
+    for (i, name) in names.iter().enumerate() {
+        path.push(name);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                if symlink_leaf && i + 1 == names.len() {
+                    return Ok(Some(path));
+                }
+                return Ok(None);
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Nothing below exists yet; whatever gets created will be real.
+                for rest in &names[i + 1..] {
+                    path.push(rest);
+                }
+                return Ok(Some(path));
+            }
+            Err(e) => return Err(e).with_context(|| format!("inspecting {}", path.display())),
+        }
+    }
+    Ok(Some(path))
 }
 
 fn handle_whiteout(
@@ -507,24 +670,35 @@ fn handle_whiteout(
         Ownership::Root => None,
         Ownership::Foreign => Some(FOREIGN_UID_BASE),
     };
+    let (relative, is_file) = match &whiteout {
+        Whiteout::Opaque(dir) => (dir.clone(), false),
+        Whiteout::File(path) => (path.clone(), true),
+    };
+    let Some(node) = resolve_inside(target, &relative, is_file)? else {
+        eprintln!(
+            "warning: skipping whiteout of {} in layer: a symlink on its path leads outside",
+            relative.display()
+        );
+        return Ok(());
+    };
     match (mode, whiteout) {
-        (WhiteoutMode::Apply, Whiteout::Opaque(dir)) => {
-            let dir = target.join(dir);
-            if dir.is_dir() {
-                for child in fs::read_dir(&dir)? {
+        (WhiteoutMode::Apply, Whiteout::Opaque(_)) => {
+            if fs::symlink_metadata(&node)
+                .map(|m| m.is_dir())
+                .unwrap_or(false)
+            {
+                for child in fs::read_dir(&node)? {
                     remove_any(&child?.path())?;
                 }
             }
         }
-        (WhiteoutMode::Apply, Whiteout::File(path)) => remove_any(&target.join(path))?,
-        (WhiteoutMode::OverlayLower, Whiteout::Opaque(dir)) => {
-            let dir = target.join(dir);
-            fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            xattr::set(&dir, "trusted.overlay.opaque", b"y")
-                .with_context(|| format!("marking {} as opaque", dir.display()))?;
+        (WhiteoutMode::Apply, Whiteout::File(_)) => remove_any(&node)?,
+        (WhiteoutMode::OverlayLower, Whiteout::Opaque(_)) => {
+            fs::create_dir_all(&node).with_context(|| format!("creating {}", node.display()))?;
+            xattr::set(&node, "trusted.overlay.opaque", b"y")
+                .with_context(|| format!("marking {} as opaque", node.display()))?;
         }
-        (WhiteoutMode::OverlayLower, Whiteout::File(path)) => {
-            let node = target.join(path);
+        (WhiteoutMode::OverlayLower, Whiteout::File(_)) => {
             if let Some(parent) = node.parent() {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("creating {}", parent.display()))?;
@@ -778,6 +952,7 @@ mod tests {
             network: Network::Veth,
             address: None,
             ports: Vec::new(),
+            command: Vec::new(),
         };
         store.record_image(&rec).unwrap();
         assert_eq!(
@@ -818,6 +993,7 @@ mod tests {
             network: Network::Host,
             address: None,
             ports: Vec::new(),
+            command: Vec::new(),
         };
         store.record_image(&rec).unwrap();
         store
@@ -850,5 +1026,230 @@ mod tests {
             .is_none());
         store.remove_record("img").unwrap();
         assert!(store.load_manifest("img").is_err());
+    }
+
+    fn tar_with_symlink(entries: &[(&str, &str)], files: &[(&str, Option<&str>)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, target) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_link_name(target).unwrap();
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, Cursor::new(&[][..]))
+                .unwrap();
+        }
+        let rest = tar_with(files);
+        let mut inner = tar::Archive::new(Cursor::new(rest));
+        for entry in inner.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            let mut header = entry.header().clone();
+            let path = entry.path().unwrap().into_owned();
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data).unwrap();
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, Cursor::new(data))
+                .unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn whiteouts_never_reach_outside_through_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(outside.join("etc")).unwrap();
+        fs::write(outside.join("etc/passwd"), "root").unwrap();
+        fs::write(outside.join("victim"), "keep me").unwrap();
+        let blob = tmp.path().join("layer.tar");
+        // usr -> /outside, then whiteouts below usr: they must not touch /outside.
+        fs::write(
+            &blob,
+            tar_with_symlink(
+                &[("usr", outside.to_str().unwrap())],
+                &[
+                    ("usr/.wh.victim", Some("")),
+                    ("usr/etc/.wh..wh..opq", Some("")),
+                    ("usr/.wh..wh..opq", Some("")),
+                ],
+            ),
+        )
+        .unwrap();
+        for mode in [WhiteoutMode::Apply, WhiteoutMode::OverlayLower] {
+            let target = tmp.path().join(format!("target-{mode:?}"));
+            fs::create_dir_all(&target).unwrap();
+            extract_layer(
+                &blob,
+                "application/vnd.oci.image.layer.v1.tar",
+                &target,
+                mode,
+                Ownership::Root,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read_to_string(outside.join("victim")).unwrap(),
+                "keep me"
+            );
+            assert_eq!(
+                fs::read_to_string(outside.join("etc/passwd")).unwrap(),
+                "root"
+            );
+            assert!(!outside.join("etc").join(".wh.victim").exists());
+            assert!(fs::symlink_metadata(target.join("usr"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        // Deleting a symlink itself is legitimate.
+        let blob2 = tmp.path().join("layer2.tar");
+        fs::write(&blob2, tar_with(&[(".wh.usr", Some(""))])).unwrap();
+        let target = tmp.path().join("target-Apply");
+        extract_layer(
+            &blob2,
+            "application/vnd.oci.image.layer.v1.tar",
+            &target,
+            WhiteoutMode::Apply,
+            Ownership::Root,
+        )
+        .unwrap();
+        assert!(fs::symlink_metadata(target.join("usr")).is_err());
+        assert!(outside.join("victim").exists());
+    }
+
+    #[test]
+    fn flat_extraction_lets_a_later_layer_change_an_entry_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("root");
+        fs::create_dir_all(&target).unwrap();
+        let first = tmp.path().join("1.tar");
+        let second = tmp.path().join("2.tar");
+        let third = tmp.path().join("3.tar");
+        fs::write(
+            &first,
+            tar_with(&[("a", Some("file")), ("d", None), ("d/x", Some("x"))]),
+        )
+        .unwrap();
+        // a becomes a directory, d becomes a file.
+        fs::write(
+            &second,
+            tar_with(&[("a", None), ("a/b", Some("b")), ("d", Some("now a file"))]),
+        )
+        .unwrap();
+        for blob in [&first, &second] {
+            extract_layer(
+                blob,
+                "application/vnd.oci.image.layer.v1.tar",
+                &target,
+                WhiteoutMode::Apply,
+                Ownership::Root,
+            )
+            .unwrap();
+        }
+        assert_eq!(fs::read_to_string(target.join("a/b")).unwrap(), "b");
+        assert_eq!(fs::read_to_string(target.join("d")).unwrap(), "now a file");
+        // And a symlink over a directory.
+        fs::write(&third, tar_with_symlink(&[("a", "d")], &[])).unwrap();
+        extract_layer(
+            &third,
+            "application/vnd.oci.image.layer.v1.tar",
+            &target,
+            WhiteoutMode::Apply,
+            Ownership::Root,
+        )
+        .unwrap();
+        assert!(fs::symlink_metadata(target.join("a"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn layer_gc_keeps_each_store_apart_and_drops_leftovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        store.init().unwrap();
+        let record = |name: &str, backend: BackendChoice| ImageRecord {
+            name: name.into(),
+            reference: "hub/x:1".into(),
+            manifest_digest: "sha256:m".into(),
+            layers: vec!["sha256:shared".into()],
+            backend,
+            created: 1,
+            origin: "pull".into(),
+            mode: Mode::Boot,
+            run: RunSpec::default(),
+            network: Network::Bridge,
+            address: None,
+            ports: Vec::new(),
+            command: Vec::new(),
+        };
+        store
+            .record_image(&record("ovl", BackendChoice::Overlay))
+            .unwrap();
+        store
+            .record_image(&record("flat", BackendChoice::Flat))
+            .unwrap();
+        for ownership in [Ownership::Root, Ownership::Foreign] {
+            fs::create_dir_all(store.layer_dir("sha256:shared", ownership)).unwrap();
+            fs::create_dir_all(store.layers_dir(ownership).join(".tmp-sha256-abandoned")).unwrap();
+        }
+        // The overlay record pins the root copy only; the flat one pins nothing.
+        assert_eq!(
+            store.gc_layers().unwrap(),
+            vec!["sha256:shared".to_string()]
+        );
+        assert!(store.layer_dir("sha256:shared", Ownership::Root).is_dir());
+        assert!(!store
+            .layer_dir("sha256:shared", Ownership::Foreign)
+            .exists());
+        assert!(!store
+            .layers_dir(Ownership::Root)
+            .join(".tmp-sha256-abandoned")
+            .exists());
+        store
+            .record_image(&record("ms", BackendChoice::Mstack))
+            .unwrap();
+        fs::create_dir_all(store.layer_dir("sha256:shared", Ownership::Foreign)).unwrap();
+        assert!(store.gc_layers().unwrap().is_empty());
+        store.remove_record("ovl").unwrap();
+        assert_eq!(
+            store.gc_layers().unwrap(),
+            vec!["sha256:shared".to_string()]
+        );
+        assert!(store
+            .layer_dir("sha256:shared", Ownership::Foreign)
+            .is_dir());
+        // Abandoned partial blobs go too, finished ones stay.
+        fs::write(store.blobs_dir().join(".part-sha256-x"), b"half").unwrap();
+        fs::write(store.blob_path("sha256:m"), b"manifest?").unwrap();
+        store.gc_blobs().unwrap();
+        assert!(!store.blobs_dir().join(".part-sha256-x").exists());
+    }
+
+    #[test]
+    fn store_lock_is_exclusive_between_holders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let first = store.lock().unwrap();
+        let path = tmp.path().join("state/.lock");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(
+            Flock::lock(file, FlockArg::LockExclusiveNonblock).is_err(),
+            "a second holder must wait"
+        );
+        drop(first);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(Flock::lock(file, FlockArg::LockExclusiveNonblock).is_ok());
     }
 }

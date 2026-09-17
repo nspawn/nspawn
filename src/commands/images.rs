@@ -66,22 +66,36 @@ pub async fn rm(args: ImagesRmArgs, config: &Config) -> Result<()> {
         store: &store,
         sd: &sd,
     };
-    for name in &args.names {
-        if sd.machine_exists(name).await? {
-            bail!("machine {name} is running; stop it first");
-        }
-        match store.load_image(name)? {
-            Some(rec) => {
-                assembler.remove(name, rec.backend).await?;
-                store.remove_machine_files(name)?;
-                bridge::delete_netns(name);
-                store.remove_record(name)?;
+    let _lock = store.lock()?;
+    let outcome: Result<()> = async {
+        for name in &args.names {
+            if sd.machine_exists(name).await? {
+                bail!("machine {name} is running; stop it first");
             }
-            None => sd.remove_image(name).await?,
+            match store.load_image(name)? {
+                Some(rec) => {
+                    assembler.remove(name, rec.backend).await?;
+                    store.remove_machine_files(name)?;
+                    bridge::delete_netns(name);
+                    store.remove_record(name)?;
+                }
+                None => {
+                    // Not recorded: an image machined knows, or leftovers of ours.
+                    assembler.remove_leftovers(name).await?;
+                    if sd.list_images().await?.iter().any(|i| i.name == *name) {
+                        sd.remove_image(name).await?;
+                    }
+                }
+            }
+            println!("removed {name}");
         }
-        println!("removed {name}");
+        Ok(())
     }
+    .await;
+    // Whatever happened above, what was removed must not pin anything, and a machine that
+    // died on its own must not keep its ports.
     bridge::write_hosts_files(&store, config)?;
+    bridge::sync_ports(&store, &sd).await?;
     let gone = store.gc_layers()?;
     if !gone.is_empty() {
         println!("freed {} unused layer(s)", gone.len());
@@ -90,5 +104,5 @@ pub async fn rm(args: ImagesRmArgs, config: &Config) -> Result<()> {
     if !blobs.is_empty() {
         println!("freed {} unused blob(s)", blobs.len());
     }
-    Ok(())
+    outcome
 }

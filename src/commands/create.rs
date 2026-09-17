@@ -7,7 +7,8 @@ use crate::cli::{BackendChoice, CreateArgs};
 use crate::commands::require_root;
 use crate::config::Config;
 use crate::hub::short_digest;
-use crate::install::{install, replace_existing, Install};
+use crate::install::{ensure_replaceable, install, remove_existing, Install};
+use crate::oci::Mode;
 use crate::reference::validate_machine_name;
 use crate::store::Store;
 use crate::systemd::Systemd;
@@ -20,6 +21,8 @@ pub async fn run(args: CreateArgs, config: &Config) -> Result<()> {
     let sd = Systemd::connect().await?;
     let store = Store::new(&config.machines_dir, &config.state_dir);
     store.init()?;
+    let _lock = store.lock()?;
+    ensure_replaceable(&store, &sd, &args.name, args.force).await?;
     let source = store
         .find_image(&args.source, &config.registry)?
         .with_context(|| {
@@ -50,13 +53,13 @@ pub async fn run(args: CreateArgs, config: &Config) -> Result<()> {
             );
         }
     }
-    replace_existing(&store, &sd, &args.name, args.force).await?;
     let choice = if args.backend == BackendChoice::Auto {
         source.backend
     } else {
         args.backend
     };
     let backend = Backend::choose(choice, &sd).await?;
+    remove_existing(&store, &sd, &args.name).await?;
     println!(
         "{}: {} layer(s) shared with {}, assembling as {}",
         args.name,
@@ -85,6 +88,15 @@ pub async fn run(args: CreateArgs, config: &Config) -> Result<()> {
         .context("the record of the new machine is missing")?;
     record.network = args.network.unwrap_or(source.network);
     record.ports = bridge::parse_publish(&args.publish)?;
+    if !args.command.is_empty() {
+        if mode == Mode::Boot {
+            bail!(
+                "{} boots an init system; a command can only replace the entrypoint of an app image",
+                args.name
+            );
+        }
+        record.command = args.command.clone();
+    }
     store.record_image(&record)?;
     println!(
         "machine {} ({} image) is ready: nspawn start {}",

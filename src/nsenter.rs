@@ -35,17 +35,20 @@ const NAMESPACES: [(&str, CloneFlags); 7] = [
     ("mnt", CloneFlags::CLONE_NEWNS),
 ];
 
-/// Runs `argv` inside the machine whose leader is `leader`, attached to the local terminal.
-/// Returns the command's exit code.
+/// Runs `argv` inside the machine whose leader is `leader`, attached to the local terminal,
+/// with `env` (the image's environment) plus PATH and TERM when missing. Returns the
+/// command's exit code.
 pub fn exec(
     leader: u32,
     argv: &[String],
     user: Option<&str>,
     working_dir: Option<&str>,
+    image_env: &[String],
 ) -> Result<i32> {
     if argv.is_empty() {
         bail!("no command given");
     }
+    let cgroup = leader_cgroup(leader);
     let mut ns_fds = Vec::new();
     for (name, flag) in NAMESPACES {
         // Namespaces the machine shares with us (the host's network namespace for app
@@ -64,10 +67,16 @@ pub fn exec(
         .iter()
         .map(|a| CString::new(a.as_str()))
         .collect::<Result<_, _>>()?;
-    let mut env = vec![
-        CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")?,
-        CString::new("HOME=/root")?,
-    ];
+    let mut env: Vec<CString> = image_env
+        .iter()
+        .filter(|v| !v.starts_with("HOME="))
+        .map(|v| CString::new(v.as_str()))
+        .collect::<Result<_, _>>()?;
+    if !image_env.iter().any(|v| v.starts_with("PATH=")) {
+        env.push(CString::new(
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        )?);
+    }
     if let Ok(term) = std::env::var("TERM") {
         env.push(CString::new(format!("TERM={term}"))?);
     }
@@ -88,20 +97,42 @@ pub fn exec(
         }
         ForkResult::Child => {
             drop(pty.master);
-            let code = helper(&ns_fds, &pty.slave, &c_argv, &env, &c_cwd, user.as_deref());
+            let code = helper(
+                &ns_fds,
+                cgroup.as_deref(),
+                &pty.slave,
+                &c_argv,
+                &env,
+                &c_cwd,
+                user.as_deref(),
+            );
             unsafe { libc::_exit(code) }
         }
     }
 }
 
+/// The cgroup of the machine's leader, so that what we run is accounted to the machine
+/// and dies with it (KillMachine signals the cgroup).
+fn leader_cgroup(leader: u32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{leader}/cgroup")).ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| format!("/sys/fs/cgroup{path}/cgroup.procs"))
+}
+
 fn helper(
     ns_fds: &[(&str, CloneFlags, OwnedFd)],
+    cgroup: Option<&str>,
     slave: &OwnedFd,
     argv: &[CString],
     env: &[CString],
     cwd: &CString,
     user: Option<&str>,
 ) -> i32 {
+    if let Some(procs) = cgroup {
+        // Best effort: cgroup v1 hosts or delegation quirks must not stop exec.
+        let _ = std::fs::write(procs, std::process::id().to_string());
+    }
     for (name, flag, fd) in ns_fds {
         if let Err(e) = setns(fd, *flag) {
             // Joining the user namespace we are already in is refused with EINVAL; that is
@@ -158,22 +189,28 @@ fn grandchild(
         return 126;
     }
     // After joining the user namespace our host UID is unmapped and we would run as
-    // nobody; become the machine's root (or the requested user) explicitly.
-    let (uid, gid) = match user {
-        None => (Uid::from_raw(0), Gid::from_raw(0)),
-        Some(user) => match resolve_user(user) {
-            Some(ids) => ids,
-            None => {
-                eprintln!("error: unknown user {user} inside the machine");
-                return 126;
-            }
-        },
-    };
-    if setgroups(&[]).is_err() || setgid(gid).is_err() || setuid(uid).is_err() {
-        eprintln!("error: cannot switch to uid {} inside the machine", uid);
+    // nobody. Become the machine's root first: only a root-to-user change makes the
+    // kernel drop capabilities, so a requested user ends up without any.
+    if setgid(Gid::from_raw(0)).is_err() || setuid(Uid::from_raw(0)).is_err() {
+        eprintln!("error: cannot become root inside the machine");
         return 126;
     }
-    match execvpe(&argv[0], argv, env) {
+    let mut env: Vec<CString> = env.to_vec();
+    match user {
+        None => env.push(CString::new("HOME=/root").expect("no NUL")),
+        Some(user) => {
+            let Some((uid, gid, home)) = resolve_user(user) else {
+                eprintln!("error: unknown user {user} inside the machine");
+                return 126;
+            };
+            if setgroups(&[]).is_err() || setgid(gid).is_err() || setuid(uid).is_err() {
+                eprintln!("error: cannot switch to uid {} inside the machine", uid);
+                return 126;
+            }
+            env.push(CString::new(format!("HOME={home}")).expect("no NUL"));
+        }
+    }
+    match execvpe(&argv[0], argv, &env) {
         Ok(_) => 0,
         Err(e) => {
             eprintln!("error: cannot execute {}: {e}", argv[0].to_string_lossy());
@@ -182,25 +219,28 @@ fn grandchild(
     }
 }
 
-/// Looks a user up in the machine's /etc/passwd (we are inside its mount namespace).
-/// Accepts numeric "uid" or "uid:gid" as well.
-fn resolve_user(user: &str) -> Option<(Uid, Gid)> {
+/// Looks a user up in the machine's /etc/passwd (we are inside its mount namespace):
+/// uid, gid and home. Accepts numeric "uid" or "uid:gid" as well.
+fn resolve_user(user: &str) -> Option<(Uid, Gid, String)> {
     if let Some((u, g)) = user.split_once(':') {
         return Some((
             Uid::from_raw(u.parse().ok()?),
             Gid::from_raw(g.parse().ok()?),
+            "/".to_string(),
         ));
     }
     if let Ok(uid) = user.parse::<u32>() {
-        return Some((Uid::from_raw(uid), Gid::from_raw(uid)));
+        return Some((Uid::from_raw(uid), Gid::from_raw(uid), "/".to_string()));
     }
     let file = File::open("/etc/passwd").ok()?;
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 4 && fields[0] == user {
+        if fields.len() >= 6 && fields[0] == user {
+            let home = if fields[5].is_empty() { "/" } else { fields[5] };
             return Some((
                 Uid::from_raw(fields[2].parse().ok()?),
                 Gid::from_raw(fields[3].parse().ok()?),
+                home.to_string(),
             ));
         }
     }
@@ -232,11 +272,11 @@ mod tests {
     fn numeric_users_do_not_need_passwd() {
         assert_eq!(
             resolve_user("1000:100"),
-            Some((Uid::from_raw(1000), Gid::from_raw(100)))
+            Some((Uid::from_raw(1000), Gid::from_raw(100), "/".to_string()))
         );
         assert_eq!(
             resolve_user("65534"),
-            Some((Uid::from_raw(65534), Gid::from_raw(65534)))
+            Some((Uid::from_raw(65534), Gid::from_raw(65534), "/".to_string()))
         );
         assert_eq!(resolve_user("1000:x"), None);
     }

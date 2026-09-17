@@ -2,11 +2,12 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::thread;
 
 use anyhow::{Context, Result};
 use nix::libc;
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::pty::Winsize;
 use nix::sys::termios::{self, LocalFlags, SetArg, Termios};
 use nix::unistd::{dup, isatty};
@@ -61,15 +62,42 @@ fn pump(pty: OwnedFd) -> Result<()> {
             }
         }
     });
-    // stdin -> PTY. This thread may stay blocked in read(2) after the session ends; the
-    // process exits shortly after, which is what machinectl does as well.
+    // stdin -> PTY. Polling with a timeout lets the thread notice terminal resizes; on
+    // stdin's EOF the slave gets the line discipline's end-of-file character, what a user
+    // would type as Ctrl-D, so that a command reading its input finishes.
     thread::spawn(move || {
         let mut to_pty = File::from(pty);
-        let mut stdin = io::stdin().lock();
+        let stdin = io::stdin();
+        let mut last_size = window_size();
         let mut buf = [0u8; 8192];
         loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
+            let mut fds = [PollFd::new(stdin.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut fds, PollTimeout::from(250u16)) {
+                Ok(0) => {
+                    let size = window_size();
+                    if size != last_size {
+                        last_size = size;
+                        if let Some((rows, cols)) = size {
+                            let ws = Winsize {
+                                ws_row: rows,
+                                ws_col: cols,
+                                ws_xpixel: 0,
+                                ws_ypixel: 0,
+                            };
+                            let _ = unsafe { tiocswinsz(to_pty.as_raw_fd(), &ws) };
+                        }
+                    }
+                    continue;
+                }
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(_) => break,
+                Ok(_) => {}
+            }
+            match stdin.lock().read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    send_eof(&mut to_pty);
+                    break;
+                }
                 Ok(n) => {
                     if to_pty.write_all(&buf[..n]).is_err() {
                         break;
@@ -85,6 +113,19 @@ fn pump(pty: OwnedFd) -> Result<()> {
 }
 
 fn propagate_window_size(pty: &OwnedFd) {
+    if let Some((rows, cols)) = window_size() {
+        let ws = Winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let _ = unsafe { tiocswinsz(pty.as_raw_fd(), &ws) };
+    }
+}
+
+/// The local terminal's size, when standard output is one.
+fn window_size() -> Option<(u16, u16)> {
     let stdout = io::stdout();
     let mut ws = Winsize {
         ws_row: 0,
@@ -92,8 +133,18 @@ fn propagate_window_size(pty: &OwnedFd) {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    if unsafe { tiocgwinsz(stdout.as_raw_fd(), &mut ws) }.is_ok() && ws.ws_row > 0 {
-        let _ = unsafe { tiocswinsz(pty.as_raw_fd(), &ws) };
+    (unsafe { tiocgwinsz(stdout.as_raw_fd(), &mut ws) }.is_ok() && ws.ws_row > 0)
+        .then_some((ws.ws_row, ws.ws_col))
+}
+
+/// Delivers end-of-file to the slave: its VEOF character while the line discipline is
+/// canonical; a raw-mode program reads bytes and would only see a stray control byte.
+fn send_eof(pty: &mut File) {
+    if let Ok(attrs) = termios::tcgetattr(&*pty) {
+        if attrs.local_flags.contains(LocalFlags::ICANON) {
+            let eof = attrs.control_chars[termios::SpecialCharacterIndices::VEOF as usize];
+            let _ = pty.write_all(&[eof]);
+        }
     }
 }
 

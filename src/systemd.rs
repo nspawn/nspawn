@@ -204,11 +204,18 @@ impl Systemd {
             .with_context(|| format!("powering off {name}"))
     }
 
-    pub async fn terminate_machine(&self, name: &str) -> Result<()> {
-        self.machined
-            .terminate_machine(name.to_string())
-            .await
-            .with_context(|| format!("terminating {name}"))
+    /// Clears the "failed" state a unit keeps after its process died of a signal, so that
+    /// a docker-style stop does not leave every app machine listed by systemctl --failed.
+    pub async fn reset_failed(&self, unit: &str) -> Result<()> {
+        match self.manager.reset_failed_unit(unit.to_string()).await {
+            Ok(()) => Ok(()),
+            Err(zbus::Error::MethodError(name, _, _))
+                if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).with_context(|| format!("resetting {unit}")),
+        }
     }
 
     pub async fn remove_image(&self, name: &str) -> Result<()> {

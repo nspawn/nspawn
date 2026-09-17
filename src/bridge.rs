@@ -56,6 +56,15 @@ impl Subnet {
         u32::from(addr) & self.mask() == u32::from(self.network)
     }
 
+    /// An address a machine may keep: inside the subnet and not the network, the gateway
+    /// or the broadcast address (the subnet may have changed since it was given).
+    pub fn usable(&self, addr: Ipv4Addr) -> bool {
+        self.contains(addr)
+            && addr != self.network
+            && addr != self.gateway()
+            && u32::from(addr) != (u32::from(self.network) | !self.mask())
+    }
+
     /// The lowest address not in `used`, leaving out the network, the gateway and the
     /// broadcast address.
     pub fn allocate(&self, used: &[Ipv4Addr]) -> Result<Ipv4Addr> {
@@ -197,6 +206,7 @@ pub async fn up(config: &Config, sd: &Systemd) -> Result<()> {
     }
     let address = format!("{}/{}", subnet.gateway(), subnet.prefix);
     run("ip", &["addr", "replace", &address, "dev", name])?;
+    prune_addresses(name, &address)?;
     run("ip", &["link", "set", name, "up"])?;
     sysctl("net/ipv4/ip_forward", "1")?;
     sysctl(&format!("net/ipv4/conf/{name}/route_localnet"), "1")?;
@@ -220,8 +230,22 @@ fn allow_forwarding_past_iptables(bridge: &str) -> Result<()> {
     } else {
         return Ok(());
     };
-    for direction in ["-i", "-o"] {
-        let rule = [direction, bridge, "-j", "ACCEPT"];
+    // Out of the bridge: anything. Into the bridge: only what was published (DNAT) or
+    // belongs to a connection a machine opened, like docker does.
+    let rules: [Vec<&str>; 2] = [
+        vec!["-i", bridge, "-j", "ACCEPT"],
+        vec![
+            "-o",
+            bridge,
+            "-m",
+            "conntrack",
+            "--ctstate",
+            "DNAT,RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+        ],
+    ];
+    for rule in &rules {
         if !iptables(&[&["-C", chain][..], &rule[..]].concat()) {
             run("iptables", &[&["-w", "-I", chain][..], &rule[..]].concat()).with_context(
                 || format!("letting the bridge's traffic through the {chain} chain"),
@@ -258,7 +282,10 @@ fn forward_policy_is_drop() -> bool {
 }
 
 /// The nftables table: DNAT of published ports (from outside and from the host itself,
-/// loopback included) and masquerading of what leaves the bridge.
+/// loopback included), masquerading of what leaves the bridge, hairpin masquerading when
+/// a machine reaches a published port through the host's address (otherwise the reply
+/// would bypass the NAT), and a guard so that route_localnet does not let a machine at
+/// the host's loopback-only services.
 pub fn base_ruleset(bridge: &str, subnet: Subnet) -> String {
     format!(
         "table ip {TABLE} {{
@@ -274,16 +301,43 @@ pub fn base_ruleset(bridge: &str, subnet: Subnet) -> String {
 	chain postrouting {{
 		type nat hook postrouting priority srcnat; policy accept;
 	}}
+	chain input {{
+		type filter hook input priority filter; policy accept;
+	}}
 }}
 flush chain ip {TABLE} prerouting
 flush chain ip {TABLE} output
 flush chain ip {TABLE} postrouting
+flush chain ip {TABLE} input
 add rule ip {TABLE} prerouting fib daddr type local dnat ip to meta l4proto . th dport map @ports
 add rule ip {TABLE} output fib daddr type local dnat ip to meta l4proto . th dport map @ports
 add rule ip {TABLE} postrouting ip saddr {subnet} oifname != \"{bridge}\" masquerade
+add rule ip {TABLE} postrouting ip saddr {subnet} oifname \"{bridge}\" ct status dnat masquerade
 add rule ip {TABLE} postrouting ip saddr 127.0.0.0/8 oifname \"{bridge}\" masquerade
+add rule ip {TABLE} input iifname \"{bridge}\" ct status & dnat == 0 ip saddr 127.0.0.0/8 drop
+add rule ip {TABLE} input iifname \"{bridge}\" ct status & dnat == 0 ip daddr 127.0.0.0/8 drop
 "
     )
+}
+
+/// Drops IPv4 addresses the bridge carries from an earlier subnet setting.
+fn prune_addresses(bridge: &str, wanted: &str) -> Result<()> {
+    let output = Command::new("ip")
+        .args(["-4", "-o", "addr", "show", "dev", bridge])
+        .output()
+        .context("running ip")?;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut words = line.split_whitespace();
+        if words.nth(2) != Some("inet") {
+            continue;
+        }
+        if let Some(addr) = words.next() {
+            if addr != wanted {
+                run("ip", &["addr", "del", addr, "dev", bridge])?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run(program: &str, args: &[&str]) -> Result<()> {
@@ -479,7 +533,8 @@ fn nameservers(resolv_conf: &str) -> Vec<IpAddr> {
                 .flatten()
         })
         .filter_map(|word| word.parse::<IpAddr>().ok())
-        .filter(|addr| !addr.is_loopback())
+        // The bridge carries no IPv6, so only IPv4 servers are reachable from a machine.
+        .filter(|addr| addr.is_ipv4() && !addr.is_loopback())
         .collect()
 }
 
@@ -490,7 +545,7 @@ pub fn prepare_machine(
     config: &Config,
     record: &mut ImageRecord,
 ) -> Result<Ipv4Addr> {
-    let addr = match record.address.filter(|a| config.subnet.contains(*a)) {
+    let addr = match record.address.filter(|a| config.subnet.usable(*a)) {
         Some(addr) => addr,
         None => {
             let used: Vec<Ipv4Addr> = store
@@ -565,7 +620,8 @@ async fn ports_in_use(
     Ok(used)
 }
 
-/// Fails when a port the machine wants to publish is taken by another running machine.
+/// Fails when a port the machine wants to publish is taken by another running machine
+/// or by a service of the host itself (the DNAT would silently hijack it).
 pub async fn check_port_conflicts(store: &Store, sd: &Systemd, record: &ImageRecord) -> Result<()> {
     let used = ports_in_use(store, sd, &record.name).await?;
     for p in &record.ports {
@@ -576,17 +632,38 @@ pub async fn check_port_conflicts(store: &Store, sd: &Systemd, record: &ImageRec
                 p.protocol.name()
             );
         }
+        if !host_port_free(*p) {
+            bail!(
+                "host port {}/{} is in use by a service on the host",
+                p.host,
+                p.protocol.name()
+            );
+        }
     }
     Ok(())
 }
 
+/// Whether nothing on the host listens on the port: a bind test on every address.
+fn host_port_free(port: PortMap) -> bool {
+    match port.protocol {
+        Protocol::Tcp => std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port.host)).is_ok(),
+        Protocol::Udp => std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port.host)).is_ok(),
+    }
+}
+
 /// Rebuilds the DNAT map from the machines that are running on the bridge.
 pub async fn sync_ports(store: &Store, sd: &Systemd) -> Result<()> {
+    sync_ports_except(store, sd, "").await
+}
+
+/// Like `sync_ports`, leaving out a machine that machined may still list while it is
+/// closing.
+pub async fn sync_ports_except(store: &Store, sd: &Systemd, except: &str) -> Result<()> {
     if !table_exists() {
         return Ok(());
     }
     let mut script = format!("flush map ip {TABLE} ports\n");
-    for ((protocol, host), (_, addr, container)) in ports_in_use(store, sd, "").await? {
+    for ((protocol, host), (_, addr, container)) in ports_in_use(store, sd, except).await? {
         script.push_str(&format!(
             "add element ip {TABLE} ports {{ {} . {host} : {addr} . {container} }}\n",
             protocol.name()
@@ -606,6 +683,11 @@ mod tests {
         assert_eq!(s.gateway(), Ipv4Addr::new(10, 99, 0, 1));
         assert!(s.contains(Ipv4Addr::new(10, 99, 0, 200)));
         assert!(!s.contains(Ipv4Addr::new(10, 99, 1, 1)));
+        assert!(s.usable(Ipv4Addr::new(10, 99, 0, 2)));
+        assert!(!s.usable(Ipv4Addr::new(10, 99, 0, 1)), "the gateway");
+        assert!(!s.usable(Ipv4Addr::new(10, 99, 0, 0)), "the network");
+        assert!(!s.usable(Ipv4Addr::new(10, 99, 0, 255)), "the broadcast");
+        assert!(!s.usable(Ipv4Addr::new(10, 98, 0, 2)), "outside");
         assert_eq!(s.allocate(&[]).unwrap(), Ipv4Addr::new(10, 99, 0, 2));
         let used = [Ipv4Addr::new(10, 99, 0, 2), Ipv4Addr::new(10, 99, 0, 4)];
         assert_eq!(s.allocate(&used).unwrap(), Ipv4Addr::new(10, 99, 0, 3));
@@ -700,10 +782,8 @@ mod tests {
         let text = "# comment\nnameserver 127.0.0.53\nnameserver 192.168.122.1\nsearch lan\nnameserver ::1\nnameserver fe80::1\n";
         assert_eq!(
             nameservers(text),
-            vec![
-                "192.168.122.1".parse::<IpAddr>().unwrap(),
-                "fe80::1".parse().unwrap()
-            ]
+            vec!["192.168.122.1".parse::<IpAddr>().unwrap()],
+            "loopback and IPv6 servers are left out"
         );
         assert!(nameservers("nameserver 127.0.0.1\n").is_empty());
         let configured = vec!["10.0.0.53".parse().unwrap()];

@@ -6,7 +6,7 @@ use crate::cli::PullArgs;
 use crate::commands::require_root;
 use crate::config::Config;
 use crate::hub::{short_digest, Hub};
-use crate::install::{install, replace_existing, Install};
+use crate::install::{ensure_replaceable, install, remove_existing, Install};
 use crate::reference::{validate_machine_name, ImageRef};
 use crate::store::Store;
 use crate::systemd::Systemd;
@@ -21,7 +21,8 @@ pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
     let sd = Systemd::connect().await?;
     let store = Store::new(&config.machines_dir, &config.state_dir);
     store.init()?;
-    replace_existing(&store, &sd, &name, args.force).await?;
+    let _lock = store.lock()?;
+    ensure_replaceable(&store, &sd, &name, args.force).await?;
 
     let choice = if args.backend == BackendChoice::Auto {
         config.backend
@@ -53,6 +54,8 @@ pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
         }
     }
 
+    // Only now, with everything downloaded, does the old image go.
+    remove_existing(&store, &sd, &name).await?;
     let mode = install(
         &store,
         &sd,

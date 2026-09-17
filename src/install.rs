@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use oci_client::manifest::OciImageManifest;
 
 use crate::backend::{Assembler, Backend, Layer};
+use crate::cli::BackendChoice;
 use crate::oci::{detect_mode, has_init, Mode, RunSpec};
 use crate::settings::{self, MachineSettings, Network};
 use crate::store::{now_unix, ImageRecord, Store};
@@ -57,10 +58,21 @@ pub async fn install(
         backend
     };
     let assembler = Assembler { store, sd };
+    let mut backend = backend;
     let trees = assembler.assemble(backend, spec.name, &layers).await?;
     let mode = spec
         .mode
         .unwrap_or_else(|| detect_mode(has_init(&trees), &run.command));
+    if mode == Mode::App && backend == Backend::Mstack {
+        // Only known now, without a command in the config: no init inside.
+        eprintln!(
+            "note: {} has no init system; reassembling it as overlay, since mstack machines cannot join the bridge network",
+            spec.name
+        );
+        assembler.remove(spec.name, BackendChoice::Mstack).await?;
+        backend = Backend::Overlay;
+        assembler.assemble(backend, spec.name, &layers).await?;
+    }
     // Both kinds join the bridge, like docker; --network host is one flag away.
     let network = Network::Bridge;
     settings::write(&MachineSettings {
@@ -91,13 +103,19 @@ pub async fn install(
         network,
         address: None,
         ports: Vec::new(),
+        command: Vec::new(),
     })?;
     Ok(mode)
 }
 
-/// Removes an existing image with the same name, or refuses when it is running or
-/// `force` is not set.
-pub async fn replace_existing(store: &Store, sd: &Systemd, name: &str, force: bool) -> Result<()> {
+/// Refuses early when an image with this name exists and `force` is not set, or when
+/// its machine is running. The removal itself waits until the replacement is at hand.
+pub async fn ensure_replaceable(
+    store: &Store,
+    sd: &Systemd,
+    name: &str,
+    force: bool,
+) -> Result<()> {
     let existing_record = store.load_image(name)?;
     let existing_image = sd.list_images().await?.into_iter().any(|i| i.name == name);
     if existing_record.is_none() && !existing_image {
@@ -111,12 +129,28 @@ pub async fn replace_existing(store: &Store, sd: &Systemd, name: &str, force: bo
     if sd.machine_exists(name).await? {
         anyhow::bail!("machine {name} is running; stop it before replacing its image");
     }
-    match existing_record {
+    Ok(())
+}
+
+/// Removes whatever exists under this name: a recorded image with its backend's files,
+/// or leftovers without a record (a failed install, a hand-deleted record).
+pub async fn remove_existing(store: &Store, sd: &Systemd, name: &str) -> Result<()> {
+    if sd.machine_exists(name).await? {
+        anyhow::bail!("machine {name} is running; stop it before replacing its image");
+    }
+    let assembler = Assembler { store, sd };
+    match store.load_image(name)? {
         Some(rec) => {
-            Assembler { store, sd }.remove(name, rec.backend).await?;
+            assembler.remove(name, rec.backend).await?;
             store.remove_record(name)?;
         }
-        None => sd.remove_image(name).await?,
+        None => {
+            assembler.remove_leftovers(name).await?;
+            if sd.list_images().await?.into_iter().any(|i| i.name == name) {
+                sd.remove_image(name).await?;
+            }
+        }
     }
+    store.remove_machine_files(name)?;
     Ok(())
 }

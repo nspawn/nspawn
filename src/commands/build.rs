@@ -10,7 +10,7 @@ use crate::cli::BuildArgs;
 use crate::commands::require_root;
 use crate::config::Config;
 use crate::hub::short_digest;
-use crate::install::{install, replace_existing, Install};
+use crate::install::{ensure_replaceable, install, remove_existing, Install};
 use crate::layout::{sha256_digest, sha256_file, Layout};
 use crate::reference::{validate_machine_name, ImageRef};
 use crate::store::{now_unix, Store};
@@ -34,7 +34,7 @@ pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
     let sd = Systemd::connect().await?;
     let store = Store::new(&config.machines_dir, &config.state_dir);
     store.init()?;
-    replace_existing(&store, &sd, &name, args.force).await?;
+    ensure_replaceable(&store, &sd, &name, args.force).await?;
     let choice = if args.backend == BackendChoice::Auto {
         config.backend
     } else {
@@ -57,8 +57,12 @@ pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
         .status()
         .with_context(|| format!("running {}", mkosi.display()))?;
     if !status.success() {
+        if !args.keep_output {
+            let _ = fs::remove_dir_all(&output_dir);
+        }
         bail!("mkosi failed with {status}");
     }
+    let _lock = store.lock()?;
 
     let layout = Layout::find_below(&output_dir)?;
     let mut manifest = layout.manifest.clone();
@@ -92,7 +96,10 @@ pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
         }
         let dest = store.blob_path(&descriptor.digest);
         if !dest.exists() {
-            fs::copy(&source, &dest).with_context(|| format!("copying {}", source.display()))?;
+            let part = crate::hub::part_path(&dest);
+            fs::copy(&source, &part).with_context(|| format!("copying {}", source.display()))?;
+            fs::rename(&part, &dest)
+                .with_context(|| format!("moving {} into place", dest.display()))?;
         }
     }
     println!(
@@ -101,6 +108,7 @@ pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
         manifest.layers.len(),
         backend.name()
     );
+    remove_existing(&store, &sd, &name).await?;
     let mode = install(
         &store,
         &sd,

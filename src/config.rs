@@ -48,6 +48,8 @@ pub struct Config {
     pub bridge: String,
     pub subnet: Subnet,
     pub dns: Vec<IpAddr>,
+    /// The file given with --config, so that unit hooks can use the same one.
+    pub config_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -68,7 +70,9 @@ impl Config {
                 }
             }
         };
-        Self::merge(file, registry, ca_cert)
+        let mut config = Self::merge(file, registry, ca_cert)?;
+        config.config_path = path.map(Path::to_path_buf);
+        Ok(config)
     }
 
     fn read_file(path: &Path) -> Result<FileConfig> {
@@ -89,6 +93,15 @@ impl Config {
             .unwrap_or(DEFAULT_SUBNET)
             .parse()
             .context("subnet in the configuration")?;
+        let bridge = file.bridge.unwrap_or_else(|| DEFAULT_BRIDGE.to_string());
+        if bridge.is_empty()
+            || bridge.len() > 15
+            || !bridge
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            anyhow::bail!("bridge name {bridge:?}: 1 to 15 letters, digits, - or _");
+        }
         Ok(Config {
             registry: registry
                 .or(file.registry)
@@ -101,9 +114,10 @@ impl Config {
             state_dir: file
                 .state_dir
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
-            bridge: file.bridge.unwrap_or_else(|| DEFAULT_BRIDGE.to_string()),
+            bridge,
             subnet,
             dns: file.dns.unwrap_or_default(),
+            config_path: None,
         })
     }
 }
@@ -147,5 +161,7 @@ mod tests {
         assert!(toml::from_str::<FileConfig>("registri = \"x\"\n").is_err());
         let bad: FileConfig = toml::from_str("subnet = \"10.0.0.0/33\"\n").unwrap();
         assert!(Config::merge(bad, None, None).is_err());
+        let long: FileConfig = toml::from_str("bridge = \"nspawn-machines0\"\n").unwrap();
+        assert!(Config::merge(long, None, None).is_err());
     }
 }

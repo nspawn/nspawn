@@ -1,7 +1,7 @@
 //! Registry client: catalog, tags, manifest resolution and verified layer downloads.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -130,32 +130,54 @@ impl Hub {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
-        let mut file = tokio::fs::File::create(dest)
+        // Written next to its final name and renamed once verified, so that an interrupted
+        // download never passes for a complete blob.
+        let part = part_path(dest);
+        let mut file = tokio::fs::File::create(&part)
             .await
-            .with_context(|| format!("creating {}", dest.display()))?;
+            .with_context(|| format!("creating {}", part.display()))?;
         let mut hasher = Sha256::new();
         let mut stream = sized.stream;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.with_context(|| format!("downloading layer {}", layer.digest))?;
-            hasher.update(&chunk);
-            file.write_all(&chunk)
-                .await
-                .with_context(|| format!("writing {}", dest.display()))?;
-            bar.inc(chunk.len() as u64);
-        }
-        file.flush().await?;
+        let transfer = async {
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.with_context(|| format!("downloading layer {}", layer.digest))?;
+                hasher.update(&chunk);
+                file.write_all(&chunk)
+                    .await
+                    .with_context(|| format!("writing {}", part.display()))?;
+                bar.inc(chunk.len() as u64);
+            }
+            file.flush().await?;
+            Ok::<String, anyhow::Error>(hex::encode(hasher.finalize()))
+        };
+        let outcome = transfer.await;
         bar.finish_and_clear();
-
-        let actual = hex::encode(hasher.finalize());
+        let actual = match outcome {
+            Ok(actual) => actual,
+            Err(e) => {
+                let _ = fs::remove_file(&part);
+                return Err(e);
+            }
+        };
         if actual != expected {
-            let _ = fs::remove_file(dest);
+            let _ = fs::remove_file(&part);
             bail!(
                 "layer {} failed verification: downloaded sha256:{actual}",
                 layer.digest
             );
         }
+        fs::rename(&part, dest).with_context(|| format!("moving {} into place", dest.display()))?;
         Ok(())
     }
+}
+
+/// Where a blob is written while it is incomplete (".part-<name>", skipped by the store).
+pub fn part_path(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "blob".to_string());
+    dest.with_file_name(format!(".part-{name}"))
 }
 
 impl Hub {

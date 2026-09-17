@@ -216,8 +216,6 @@ impl Assembler<'_> {
                     );
                 }
                 let _ = fs::remove_file(Path::new(UNIT_DIR).join(&unit));
-                let _ = fs::remove_dir_all(dropin_dir(name));
-                self.sd.reload().await?;
                 let _ = fs::remove_dir_all(self.store.machines_private_dir().join(name));
                 remove_dir_if_exists(&mountpoint)?;
             }
@@ -225,13 +223,37 @@ impl Assembler<'_> {
             BackendChoice::Mstack => remove_dir_if_exists(&self.mstack_dir(name))?,
             BackendChoice::Auto => bail!("image record for {name} has no concrete backend"),
         }
+        // Every backend gets the unit hooks, overlay also a mount dependency.
+        remove_dropins(name);
+        self.sd.reload().await?;
         crate::settings::remove(name);
         Ok(())
     }
+
+    /// Best-effort removal of whatever any backend may have left for `name` when no
+    /// record says which one made it: the overlay path also covers a flat directory
+    /// (same mount point) and refuses while something is still mounted there.
+    pub async fn remove_leftovers(&self, name: &str) -> Result<()> {
+        self.remove(name, BackendChoice::Overlay).await?;
+        remove_dir_if_exists(&self.mstack_dir(name))
+    }
 }
 
-fn dropin_dir(name: &str) -> PathBuf {
+pub fn dropin_dir(name: &str) -> PathBuf {
     Path::new(UNIT_DIR).join(format!("systemd-nspawn@{name}.service.d"))
+}
+
+/// Drop-in files nspawn writes for a machine's unit.
+pub const DROPINS: [&str; 2] = ["nspawn-overlay.conf", "nspawn-hooks.conf"];
+
+/// Removes nspawn's own drop-ins, and the directory when nothing else is left in it, so
+/// that an administrator's drop-ins survive.
+pub fn remove_dropins(name: &str) {
+    let dir = dropin_dir(name);
+    for file in DROPINS {
+        let _ = fs::remove_file(dir.join(file));
+    }
+    let _ = fs::remove_dir(&dir);
 }
 
 fn remove_dir_if_exists(path: &Path) -> Result<()> {

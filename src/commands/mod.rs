@@ -45,6 +45,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Network(args) => match args.command {
             NetworkCommand::Up => network::up(&config).await,
             NetworkCommand::Ls => network::ls(&config).await,
+            NetworkCommand::Prepare { name } => network::prepare(&config, &name).await,
+            NetworkCommand::Publish { name } => network::publish(&config, &name).await,
+            NetworkCommand::Release { name } => network::release(&config, &name).await,
         },
     }
 }

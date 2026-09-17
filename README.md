@@ -35,9 +35,24 @@ Images that ship an init system (systemd) and whose entrypoint is that init are 
 `OpenMachineShell`. Any other image, for example anything from Docker Hub, is an "app":
 its entrypoint runs as PID 2 under nspawn's stub init, with the environment, working
 directory, user and stop signal from the OCI config, and joins the bridge network like
-any other machine (see Networking). `exec` and `shell` then enter the
-machine's namespaces directly, so no D-Bus is needed inside, and `stop` sends the image's
-stop signal to every process before terminating the machine after `--timeout` seconds.
+any other machine (see Networking). The command given to `create` or `start` after `--`
+is remembered, like the command of a docker container; `start --image-command` goes back
+to the image's own entrypoint.
+
+`exec` enters the machine's namespaces for both kinds of machine, like docker exec: the
+exit code comes back, the image's environment applies and nothing is needed inside (no
+D-Bus, no PAM); `shell` opens machined's login session on booted machines and a plain
+shell on apps. `stop` sends the image's stop signal to the program of an app machine and
+SIGKILLs it after `--timeout` seconds, or asks a booted machine to power off; `--force`
+kills at once. Stopping a machine that already ended is not an error: it only drops what
+the machine left behind.
+
+Every machine's unit gets a drop-in that calls nspawn around its life (ExecStartPre,
+ExecStartPost, ExecStopPost), so `machinectl start`, an enabled unit at boot, a program
+that exits on its own or a crash all prepare and release the network the same way as
+`nspawn start` and `nspawn stop`. The drop-in names the nspawn binary that wrote it, so
+install nspawn where a system service may run it (`/usr/bin` or `/usr/local/bin`; on
+SELinux hosts a binary below a home directory is refused with "Permission denied").
 
 One image, as many machines as you like: `nspawn create SOURCE NAME` makes another
 machine from an image that is already local, without touching the registry. It shares the
@@ -72,14 +87,18 @@ app images are assembled with the overlay backend even where mstack is available
 
 Ports are published like docker: `nspawn start web -p 8080:80 -p 5353:53/udp`. Each one
 is a DNAT entry in the same nftables table, reachable from other hosts, from the host's
-own addresses and from 127.0.0.1, and it goes away when the machine stops. The list is
-remembered for the image; `-p none` forgets it. With firewalld running, the bridge is
-bound to the trusted zone at runtime, which also lets published ports through.
+own addresses and from 127.0.0.1, and it goes away when the machine stops. A port another
+running machine publishes, or one a service of the host listens on, is refused. The list
+is remembered for the image; `-p none` forgets it. With firewalld running, the bridge is
+bound to the trusted zone at runtime, which also lets published ports through; the
+binding does not survive `firewall-cmd --reload`, the next `start` or `nspawn network up`
+puts it back.
 
 Hosts running docker (in its default iptables mode) or ufw have a FORWARD policy of
-DROP; `start` then adds accept rules for the bridge to the DOCKER-USER chain, which
-docker reserves for that, or to FORWARD itself. A hand-written nftables firewall with a
-drop policy on forward needs the same exception by hand.
+DROP; `start` then adds two rules to the DOCKER-USER chain, which docker reserves for
+that, or to FORWARD itself: anything out of the bridge, and into the bridge only what was
+published or belongs to a connection a machine opened. A hand-written nftables firewall
+with a drop policy on forward needs the same exception by hand.
 
 `--network host` shares the host's network instead, and `--network veth` keeps the classic
 systemd-nspawn setup: a virtual ethernet pair configured by systemd-networkd on the host

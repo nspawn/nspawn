@@ -11,6 +11,20 @@ networkd_was=$(systemctl is-active systemd-networkd)
 fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
 step() { echo; echo "### $*"; }
 retry() { local n=$1; shift; local i; for i in $(seq 1 "$n"); do "$@" && return 0; sleep 2; done; return 1; }
+nonce=$$
+# Leftovers of an aborted run would make pulls and creates fail; the same at the end.
+cleanup() {
+  local m
+  for m in e2e-overlay e2e-flat e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox; do
+    $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
+    $NSPAWN images rm "$m" >/dev/null 2>&1 || true
+  done
+  if [ "$networkd_was" != active ]; then
+    systemctl stop systemd-networkd.service systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-resolve-hook.socket >/dev/null 2>&1 || true
+  fi
+}
+cleanup
+trap cleanup EXIT
 
 step "hub ls"
 $NSPAWN hub ls | tee /tmp/e2e-hub.txt || fail "hub ls exited non-zero"
@@ -38,10 +52,12 @@ for backend in overlay flat; do
   $NSPAWN machines ls | tee /tmp/e2e-m.txt
   grep -q "^ *$name " /tmp/e2e-m.txt || fail "$name not running"
   step "exec"
-  out=$(retry 10 $NSPAWN exec "$name" -- /usr/bin/systemctl is-system-running --wait </dev/null | tr -d '\r')
+  out=$($NSPAWN exec "$name" -- /usr/bin/systemctl is-system-running --wait </dev/null | tr -d '\r' || true)
   echo "is-system-running: $out"
   echo "$out" | grep -qE "running|degraded|starting" || fail "exec did not reach systemd inside $name"
   $NSPAWN exec "$name" -- /usr/bin/cat /etc/os-release </dev/null | tr -d '\r' | grep -q PRETTY_NAME || fail "exec cat os-release"
+  $NSPAWN exec "$name" -- /bin/false </dev/null; [ $? -eq 1 ] || fail "exec did not propagate the exit code of a booted machine"
+  $NSPAWN exec "$name" -- /bin/sh -c 'echo $PATH' </dev/null | tr -d '\r' | grep -q "/usr/bin" || fail "exec has no PATH"
   step "network through the nspawn bridge"
   if [ "$networkd_was" != active ]; then
     systemctl is-active systemd-networkd >/dev/null && fail "systemd-networkd got started on the host; the bridge must not need it"
@@ -101,7 +117,7 @@ grep -q "freed" /tmp/e2e-rmc.txt && fail "removing the created machine freed a l
 step "two machines on the bridge: names and published ports"
 $NSPAWN start e2e-a || fail "start e2e-a"
 $NSPAWN start e2e-b -p 18080:80 || fail "start e2e-b with a published port"
-retry 10 $NSPAWN exec e2e-b -- /usr/bin/systemctl is-system-running --wait </dev/null >/dev/null 2>&1
+$NSPAWN exec e2e-b -- /usr/bin/systemctl is-system-running --wait </dev/null >/dev/null 2>&1 || true
 # An echo service on port 80 inside e2e-b, from socket activation: no extra packages needed.
 $NSPAWN exec e2e-b -- /bin/sh -c 'printf "[Socket]\nListenStream=80\nAccept=yes\n" > /etc/systemd/system/echo.socket; printf "[Service]\nExecStart=/usr/bin/cat\nStandardInput=socket\n" > /etc/systemd/system/echo@.service; systemctl daemon-reload; systemctl start echo.socket && echo ECHO-UP' </dev/null | tr -d '\r' | grep -q ECHO-UP || fail "echo service inside e2e-b"
 b_addr=$($NSPAWN network ls | awk '$1 == "e2e-b" {print $2}')
@@ -135,7 +151,7 @@ if command -v mkosi >/dev/null 2>&1; then
   $NSPAWN images ls | tee /tmp/e2e-img.txt
   grep "^ *$built " /tmp/e2e-img.txt | grep -qw "build" || fail "built image not listed with origin build"
   $NSPAWN start $built || fail "start built image"
-  out=$(retry 10 $NSPAWN exec $built -- /usr/bin/systemctl is-system-running --wait </dev/null | tr -d '\r')
+  out=$($NSPAWN exec $built -- /usr/bin/systemctl is-system-running --wait </dev/null | tr -d '\r' || true)
   echo "built image is-system-running: $out"
   echo "$out" | grep -qE "running|degraded|starting" || fail "built image did not boot"
   $NSPAWN stop $built || fail "stop built image"
@@ -166,10 +182,10 @@ cat /tmp/e2e-app.txt
 grep -q "(app image)" /tmp/e2e-app.txt || fail "busybox not detected as an app image"
 grep -q "Boot=no" /etc/systemd/nspawn/$app.nspawn || fail "settings file does not disable --boot"
 grep -q "ProcessTwo=yes" /etc/systemd/nspawn/$app.nspawn || fail "settings file does not use a stub init"
-$NSPAWN start $app -p 18081:80 -- /bin/sh -c 'echo hello-from-app; echo to-stderr >&2; mkdir -p /www; echo app-web > /www/index.html; exec /bin/httpd -f -p 80 -h /www' || fail "start busybox with a command override and a published port"
+$NSPAWN start $app -p 18081:80 -- /bin/sh -c "echo hello-from-app-$nonce; echo to-stderr-$nonce >&2; mkdir -p /www; echo app-web > /www/index.html; exec /bin/httpd -f -p 80 -h /www" || fail "start busybox with a command override and a published port"
 grep -q "Parameters=/bin/sh -c" /etc/systemd/nspawn/$app.nspawn || fail "command override not written"
-retry 10 bash -c "$NSPAWN logs $app > /tmp/e2e-logs.txt; grep -q hello-from-app /tmp/e2e-logs.txt" || fail "logs do not show the app's stdout"
-grep -q to-stderr /tmp/e2e-logs.txt || fail "logs do not show the app's stderr"
+retry 10 bash -c "$NSPAWN logs $app > /tmp/e2e-logs.txt; grep -q hello-from-app-$nonce /tmp/e2e-logs.txt" || fail "logs do not show the app's stdout"
+grep -q to-stderr-$nonce /tmp/e2e-logs.txt || fail "logs do not show the app's stderr"
 grep -q "Started systemd-nspawn" /tmp/e2e-logs.txt && fail "logs include systemd's unit messages without --all"
 $NSPAWN logs $app --all > /tmp/e2e-logs.txt; grep -q "Started systemd-nspawn" /tmp/e2e-logs.txt || fail "logs --all misses the unit messages"
 $NSPAWN machines ls | tee /tmp/e2e-m.txt
@@ -186,13 +202,39 @@ echo "$app has address $app_addr"
 echo "$app_addr" | grep -q "^10\.99\.0\." || fail "no bridge address for the app"
 $NSPAWN exec $app -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep -q "$app_addr/24" || fail "host0 not configured inside the app"
 $NSPAWN exec $app -- cat /etc/hosts </dev/null | tr -d '\r' | grep -q "host.nspawn.internal" || fail "generated /etc/hosts missing in the app"
-$NSPAWN exec $app -- nslookup download.opensuse.org </dev/null | tr -d '\r' | grep -qi "address" || fail "DNS does not work inside the app"
+$NSPAWN exec $app -- nslookup download.opensuse.org </dev/null >/dev/null 2>&1 || fail "DNS does not work inside the app"
 $NSPAWN exec $app -- wget -qO- -T 5 http://detectportal.firefox.com/success.txt </dev/null | tr -d '\r' | grep -q success || fail "no internet from the app"
 curl -sf -m 5 http://127.0.0.1:18081/ | grep -q app-web || fail "published app port not reachable on 127.0.0.1"
 $NSPAWN ps | grep "^ *$app " | grep -q "18081->80/tcp" || fail "app port not shown by ps"
 $NSPAWN stop $app || fail "stop busybox"
 retry 15 bash -c "! $NSPAWN machines ls | grep -q '^ *$app '" || fail "busybox still running after stop"
 [ -e /run/netns/nspawn-$app ] && fail "network namespace left behind for $app"
+systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit left in failed state after stop"
+
+step "stop: a program that ignores its stop signal is killed after --timeout"
+$NSPAWN start $app -- /bin/sh -c 'trap "" TERM; exec /bin/sleep 300' || fail "start stubborn app"
+t0=$(date +%s)
+$NSPAWN stop $app -t 2 || fail "stop of a stubborn app"
+[ $(( $(date +%s) - t0 )) -lt 20 ] || fail "stop of a stubborn app took too long"
+retry 5 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "stubborn app still running"
+
+step "the remembered command, the unit hooks and an app that exits on its own"
+$NSPAWN start $app -p 18081:80 -- /bin/sh -c 'mkdir -p /www; echo app-web > /www/index.html; exec /bin/httpd -f -p 80 -h /www' || fail "start httpd app"
+$NSPAWN stop $app >/dev/null || fail "stop httpd app"
+$NSPAWN start $app || fail "start without a command"
+retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep -q app-web" || fail "the remembered command did not run"
+$NSPAWN stop $app >/dev/null || fail "stop remembered app"
+machinectl start $app || fail "machinectl start of an app (the hooks must prepare its network)"
+retry 10 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep -q app-web" || fail "no network or ports after machinectl start"
+$NSPAWN stop $app || fail "stop after machinectl start"
+$NSPAWN start $app -- /bin/sh -c 'sleep 1' || fail "start short-lived app"
+retry 10 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "short-lived app still listed"
+sleep 1
+[ -e /run/netns/nspawn-$app ] && fail "namespace left behind by an app that exited on its own"
+nft list map ip nspawn ports | grep -q 18081 && fail "ports of an exited app still mapped"
+out=$($NSPAWN stop $app 2>&1); echo "$out" | grep -q "was not running" || fail "stop of a stopped machine is not a no-op: $out"
+out=$($NSPAWN start $app -p 22:80 2>&1); echo "$out" | grep -q "in use by a service on the host" || fail "publishing the host's ssh port was not refused: $out"
+$NSPAWN ps -a | grep "^ *$app " | grep -q "22->80" && fail "a refused port was remembered"
 $NSPAWN images rm $app || fail "rm busybox"
 [ -e /etc/systemd/nspawn/$app.nspawn ] && fail "settings file left behind for $app"
 grep -q "(boot image)" /tmp/e2e-hub.txt 2>/dev/null || true
@@ -209,7 +251,7 @@ echo "$out" | grep -qi "manifest" || fail "missing image error does not mention 
 out=$($NSPAWN start e2e-nonexistent 2>&1); rc=$?
 echo "$out"
 [ $rc -ne 0 ] || fail "start of an unknown image succeeded"
-echo "$out" | grep -q "journalctl" || fail "start of unknown image gave no hint"
+echo "$out" | grep -q "no image named" || fail "start of an unknown image gave no hint"
 out=$($NSPAWN stop e2e-nonexistent 2>&1); [ $? -ne 0 ] && echo "$out" | grep -q "not running" || fail "stop of unknown machine"
 
 echo

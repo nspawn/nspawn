@@ -1,6 +1,7 @@
 //! What an OCI image config says about running the image, and whether the image boots an
 //! init system (a "machine") or runs a single program (an "app", the docker case).
 
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -67,12 +68,17 @@ const INIT_PATHS: [&str; 4] = [
     "usr/sbin/init",
 ];
 
-/// Whether any of the given trees (layers or a flat root) ships an init program.
+/// Whether the image ships an init program. `trees` are the layers from the base up (or
+/// one flat root); the topmost layer that mentions a path decides, and a whiteout there
+/// (a character device 0:0) means the path was deleted.
 pub fn has_init(trees: &[PathBuf]) -> bool {
-    trees.iter().any(|tree| {
-        INIT_PATHS
+    INIT_PATHS.iter().any(|p| {
+        trees
             .iter()
-            .any(|p| tree.join(p).symlink_metadata().is_ok())
+            .rev()
+            .find_map(|tree| tree.join(p).symlink_metadata().ok())
+            .map(|meta| !(meta.file_type().is_char_device() && meta.rdev() == 0))
+            .unwrap_or(false)
     })
 }
 

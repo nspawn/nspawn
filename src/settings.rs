@@ -81,8 +81,10 @@ pub fn render(s: &MachineSettings) -> String {
                 }
                 _ => {}
             }
-            let signal = s.run.stop_signal.as_deref().unwrap_or("SIGTERM");
-            out.push_str(&format!("KillSignal={signal}\n"));
+            // What nspawn forwards to the stub init when the unit is stopped: a poweroff
+            // request, which the stub answers with SIGTERM to the program and waits. The
+            // image's own stop signal is what `nspawn stop` sends to the program itself.
+            out.push_str("KillSignal=SIGRTMIN+4\n");
         }
     }
     match s.network {
@@ -231,7 +233,7 @@ mod tests {
         assert!(app.contains("Boot=no\nProcessTwo=yes\n"));
         assert!(app.contains("Parameters=nginx -g \"daemon off;\"\n"));
         assert!(app.contains("Environment=PATH=/usr/bin\nEnvironment=\"GREETING=hello world\"\n"));
-        assert!(app.contains("WorkingDirectory=/srv\nUser=nginx\nKillSignal=SIGQUIT\n"));
+        assert!(app.contains("WorkingDirectory=/srv\nUser=nginx\nKillSignal=SIGRTMIN+4\n"));
         assert!(app.ends_with("[Network]\nVirtualEthernet=no\n"));
 
         let numeric_user = RunSpec {
@@ -248,7 +250,7 @@ mod tests {
             bridge: None,
         });
         assert!(!text.contains("User="));
-        assert!(text.contains("Parameters=/bin/sleep infinity\nKillSignal=SIGTERM\n"));
+        assert!(text.contains("Parameters=/bin/sleep infinity\nKillSignal=SIGRTMIN+4\n"));
         assert!(!text.contains("[Network]"));
     }
 }
