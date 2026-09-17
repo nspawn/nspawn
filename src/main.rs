@@ -8,6 +8,7 @@ mod backend;
 mod cli;
 mod commands;
 mod config;
+mod hostnet;
 mod hub;
 mod install;
 mod layout;

@@ -5,11 +5,12 @@ use anyhow::{bail, Context, Result};
 use crate::backend::MANAGED_NS_SOCKETS;
 use crate::cli::{BackendChoice, ExecArgs, LogsArgs, PsArgs, ShellArgs, StartArgs, StopArgs};
 use crate::config::Config;
+use crate::hostnet;
 use crate::nsenter;
 use crate::oci::Mode;
 use crate::output::{human_duration, table};
 use crate::pty;
-use crate::settings::{self, MachineSettings};
+use crate::settings::{self, MachineSettings, Network};
 use crate::store::{now_unix, ImageRecord, Store};
 use crate::systemd::Systemd;
 
@@ -113,7 +114,7 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
         bail!("machine {} is already running", args.name);
     }
     let store = Store::new(&config.machines_dir, &config.state_dir);
-    match store.load_image(&args.name)? {
+    let network = match store.load_image(&args.name)? {
         Some(mut record) => {
             if let Some(network) = args.network {
                 record.network = network;
@@ -143,6 +144,7 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
                     sd.start_unit(unit).await?;
                 }
             }
+            record.network
         }
         None if !args.command.is_empty() => {
             bail!(
@@ -150,10 +152,17 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
                 args.name
             )
         }
-        None => {}
+        // Not ours: the stock systemd-nspawn@.service template uses --network-veth.
+        None => Network::Veth,
+    };
+    let veth = network == Network::Veth;
+    if veth {
+        hostnet::ensure_networkd(&sd).await?;
     }
+    // firewalld only knows the interface once the machine is registered.
+    let firewalld = veth && hostnet::firewalld_running(&sd).await;
     sd.start_machine(&args.name).await?;
-    if args.wait {
+    if args.wait || firewalld {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !sd.machine_exists(&args.name).await? {
             if Instant::now() > deadline {
@@ -166,6 +175,9 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
+    if firewalld {
+        hostnet::admit(&sd, &args.name).await?;
+    }
     println!("started {}", args.name);
     Ok(())
 }
@@ -177,6 +189,13 @@ pub async fn stop(args: StopArgs, config: &Config) -> Result<()> {
     }
     let store = Store::new(&config.machines_dir, &config.state_dir);
     let record = store.load_image(&args.name)?;
+    let admitted = if hostnet::firewalld_running(&sd).await {
+        hostnet::machine_interfaces(&sd, &args.name)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     if args.force {
         sd.terminate_machine(&args.name).await?;
     } else {
@@ -210,6 +229,7 @@ pub async fn stop(args: StopArgs, config: &Config) -> Result<()> {
         // Let the service finish its own teardown so that the image can be removed right away.
         sd.stop_unit(&format!("systemd-nspawn@{}.service", args.name))
             .await?;
+        hostnet::release(&sd, &admitted).await;
     }
     println!("stopped {}", args.name);
     Ok(())

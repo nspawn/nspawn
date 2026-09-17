@@ -38,6 +38,21 @@ directory, user and stop signal from the OCI config, and shares the host's netwo
 machine's namespaces directly, so no D-Bus is needed inside, and `stop` sends the image's
 stop signal to every process before terminating the machine after `--timeout` seconds.
 
+## Networking
+
+Booted machines get a virtual ethernet pair (`host0` inside, `ve-<name>` on the host);
+`--network host` shares the host's network instead. systemd-nspawn only creates the pair:
+the host end is brought up, addressed, served by a DHCP server and masqueraded by
+systemd-networkd through the stock `80-container-ve.network`, and inside the machine
+systemd-networkd asks for a lease on `host0` (`80-container-host0.network`). `start`
+therefore activates systemd-networkd on the host when it is not running, but only if
+`/etc/systemd/network` and `/run/systemd/network` hold no `.network` files of the host's
+own: on such hosts (typically NetworkManager users with old networkd configuration) it
+stops with an explanation instead of taking over interfaces. NetworkManager itself ignores
+veth interfaces, so both can coexist. When firewalld is running, the machine's `ve-<name>`
+is bound to the trusted zone at runtime while the machine runs, otherwise firewalld drops
+its DHCP requests; the binding goes away with `stop`.
+
 ```
 nspawn pull docker.io/library/busybox
 nspawn start busybox -- /bin/sleep infinity   # replace the entrypoint for this start
@@ -101,8 +116,9 @@ becomes the local image `fedora-44`, `debian` (tag `latest`) becomes `debian`.
   tested), overlayfs for the `overlay` backend and cgroup v2.
 - `pull` and `images rm` need root because they write below `/var/lib/machines`,
   `/var/lib/nspawn` and `/etc/systemd/system`. Everything else goes through D-Bus and polkit.
-- Images must boot systemd (the hub images do): `exec` and `shell` use
-  `OpenMachineShell`, which needs D-Bus inside the machine.
+- Booted machines use `OpenMachineShell` for `exec` and `shell`, which needs D-Bus inside
+  the machine (the hub images have it); app images are entered through their namespaces.
+- Virtual ethernet networking needs systemd-networkd on the host (see Networking above).
 
 ## Development
 

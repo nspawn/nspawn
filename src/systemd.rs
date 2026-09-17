@@ -52,6 +52,35 @@ impl Systemd {
         })
     }
 
+    pub fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Load state and active state of a unit; unknown units read as not-found/inactive.
+    pub async fn unit_state(&self, unit: &str) -> Result<(String, String)> {
+        let units = self
+            .manager
+            .list_units_by_names(vec![unit.to_string()])
+            .await
+            .with_context(|| format!("querying the state of {unit}"))?;
+        Ok(units
+            .into_iter()
+            .next()
+            .map(|u| (u.2, u.3))
+            .unwrap_or_else(|| ("not-found".to_string(), "inactive".to_string())))
+    }
+
+    /// True when `name` is owned on the system bus, i.e. that service is running.
+    pub async fn name_has_owner(&self, name: &str) -> bool {
+        let Ok(dbus) = zbus::fdo::DBusProxy::new(&self.conn).await else {
+            return false;
+        };
+        let Ok(name) = zbus::names::BusName::try_from(name) else {
+            return false;
+        };
+        dbus.name_has_owner(name).await.unwrap_or(false)
+    }
+
     pub async fn version(&self) -> Result<String> {
         self.manager
             .version()
@@ -115,17 +144,21 @@ impl Systemd {
 
     /// State ("opening", "running", "closing"), leader PID and start time (unix seconds)
     /// of a machine.
-    pub async fn machine_details(&self, name: &str) -> Result<MachineDetails> {
+    async fn machine(&self, name: &str) -> Result<machine1::MachineProxy<'static>> {
         let path = self
             .machined
             .get_machine(name.to_string())
             .await
             .with_context(|| format!("looking up machine {name}"))?;
-        let machine = machine1::MachineProxy::builder(&self.conn)
+        machine1::MachineProxy::builder(&self.conn)
             .path(path)?
             .build()
             .await
-            .with_context(|| format!("connecting to machine {name}"))?;
+            .with_context(|| format!("connecting to machine {name}"))
+    }
+
+    pub async fn machine_details(&self, name: &str) -> Result<MachineDetails> {
+        let machine = self.machine(name).await?;
         Ok(MachineDetails {
             state: machine.state().await.unwrap_or_else(|_| "-".to_string()),
             leader: machine.leader().await.unwrap_or(0),
@@ -139,20 +172,20 @@ impl Systemd {
 
     /// PID of the machine's leader (its PID 1 as seen from the host).
     pub async fn machine_leader(&self, name: &str) -> Result<u32> {
-        let path = self
-            .machined
-            .get_machine(name.to_string())
-            .await
-            .with_context(|| format!("looking up machine {name}"))?;
-        let machine = machine1::MachineProxy::builder(&self.conn)
-            .path(path)?
-            .build()
-            .await
-            .with_context(|| format!("connecting to machine {name}"))?;
-        machine
+        self.machine(name)
+            .await?
             .leader()
             .await
             .with_context(|| format!("reading the leader of {name}"))
+    }
+
+    /// Interface indices of the machine's host-side network interfaces.
+    pub async fn machine_interfaces(&self, name: &str) -> Result<Vec<i32>> {
+        self.machine(name)
+            .await?
+            .network_interfaces()
+            .await
+            .with_context(|| format!("reading the network interfaces of {name}"))
     }
 
     /// Sends `signal` to the leader or to all processes ("all") of a machine.

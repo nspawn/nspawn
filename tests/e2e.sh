@@ -41,9 +41,19 @@ for backend in overlay flat; do
   echo "is-system-running: $out"
   echo "$out" | grep -qE "running|degraded|starting" || fail "exec did not reach systemd inside $name"
   $NSPAWN exec "$name" -- /usr/bin/cat /etc/os-release </dev/null | tr -d '\r' | grep -q PRETTY_NAME || fail "exec cat os-release"
+  step "network through the veth"
+  systemctl is-active systemd-networkd >/dev/null || fail "start did not activate systemd-networkd on the host"
+  if firewall-cmd --state >/dev/null 2>&1; then
+    [ "$(firewall-cmd --get-zone-of-interface="ve-$name")" = trusted ] || fail "ve-$name is not in the trusted zone of firewalld"
+  fi
+  retry 15 bash -c "$NSPAWN exec $name -- /bin/sh -c 'curl -sf -m 5 -o /dev/null https://download.opensuse.org/ && echo NET-OK' </dev/null | tr -d '\r' | grep -q NET-OK" \
+    || fail "no network inside $name"
   step "stop"
   $NSPAWN stop "$name" || fail "stop ($backend)"
   retry 15 bash -c "! $NSPAWN machines ls | grep -q '^ *$name '" || fail "$name still running after stop"
+  if firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --zone=trusted --list-interfaces | grep -qw "ve-$name" && fail "ve-$name still bound in firewalld after stop"
+  fi
   step "images rm"
   $NSPAWN images rm "$name" || fail "images rm ($backend)"
   $NSPAWN images ls > /tmp/e2e-img.txt; grep -q "^ *$name " /tmp/e2e-img.txt && fail "$name still listed after rm"
