@@ -101,8 +101,10 @@ impl Systemd {
     }
 
     pub async fn start_machine(&self, name: &str) -> Result<()> {
-        self.start_unit(&format!("systemd-nspawn@{name}.service"))
+        let unit = format!("systemd-nspawn@{name}.service");
+        self.start_unit(&unit)
             .await
+            .with_context(|| format!("machine {name} failed to start; see journalctl -u {unit}"))
     }
 
     /// Asks the machine to power off cleanly (SIGRTMIN+4 to its init, like machinectl poweroff).

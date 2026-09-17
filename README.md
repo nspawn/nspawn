@@ -36,11 +36,16 @@ stays safe.
 
 | Backend | Requirements | What it creates |
 |---|---|---|
-| `mstack` | systemd 261 or newer with systemd-nsresourced installed | `<name>.mstack/` with `layer@N` symlinks and `rw/`, plus `/etc/systemd/nspawn/<name>.nspawn` setting `PrivateUsers=managed` (the stock template's `-U` is rejected by `--mstack=`); `start` activates `systemd-nsresourced.socket` and `systemd-mountfsd.socket` |
+| `mstack` | systemd 261 or newer with systemd-nsresourced and systemd-mountfsd installed | `<name>.mstack/` with `layer@N` symlinks and `rw/`, plus `/etc/systemd/nspawn/<name>.nspawn` setting `PrivateUsers=managed` (the stock template's `-U` is rejected by `--mstack=`); `start` activates `systemd-nsresourced.socket` and `systemd-mountfsd.socket` |
 | `overlay` | any systemd with overlayfs | a `.mount` unit that overlays the layers with a writable upper directory, plus a drop-in so `systemd-nspawn@<name>.service` requires it |
 | `flat` | nothing | the layers extracted into `/var/lib/machines/<name>` |
 
-`--backend auto` (the default) picks the first one the host supports. Whiteouts of
+`--backend auto` (the default) picks the first one the host supports. mstack layers are
+extracted into `/var/lib/nspawn/layers-foreign/` with their UIDs shifted into systemd's
+foreign UID range (2147352576 and up): systemd-mountfsd maps that range into the managed
+user namespace of the machine, while root-owned directories would be mounted without any
+mapping and stay unwritable inside. The other backends keep the image's own IDs under
+`/var/lib/nspawn/layers/`. Whiteouts of
 multi-layer images are honoured (converted to overlayfs whiteouts for `overlay` and
 `mstack`, applied directly for `flat`).
 

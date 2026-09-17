@@ -29,6 +29,39 @@ fn default_origin() -> String {
     "pull".to_string()
 }
 
+/// First UID/GID of systemd's "foreign UID range" (see UIDS-GIDS.md): directory images
+/// that belong to this range are mapped by systemd-mountfsd into managed user namespaces.
+pub const FOREIGN_UID_BASE: u32 = 2_147_352_576;
+
+/// Who owns the files of an extracted layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Ownership {
+    /// UIDs and GIDs as recorded in the image (root is 0); what overlay and flat images use.
+    Root,
+    /// Shifted into the foreign UID range; required by mstack images booted with managed
+    /// user namespaces.
+    Foreign,
+}
+
+impl Ownership {
+    pub fn layers_subdir(self) -> &'static str {
+        match self {
+            Ownership::Root => "layers",
+            Ownership::Foreign => "layers-foreign",
+        }
+    }
+}
+
+/// Maps an image UID/GID into the foreign range; ids beyond the 64K range become nobody.
+pub fn foreign_id(id: u32) -> u32 {
+    if id < 0x10000 {
+        FOREIGN_UID_BASE + id
+    } else {
+        FOREIGN_UID_BASE + 0xFFFE
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Store {
     pub machines_dir: PathBuf,
@@ -45,7 +78,8 @@ impl Store {
 
     pub fn init(&self) -> Result<()> {
         for d in [
-            self.layers_dir(),
+            self.layers_dir(Ownership::Root),
+            self.layers_dir(Ownership::Foreign),
             self.blobs_dir(),
             self.images_dir(),
             self.machines_private_dir(),
@@ -57,8 +91,8 @@ impl Store {
         check_writable(&self.machines_dir)
     }
 
-    pub fn layers_dir(&self) -> PathBuf {
-        self.root.join("layers")
+    pub fn layers_dir(&self, ownership: Ownership) -> PathBuf {
+        self.root.join(ownership.layers_subdir())
     }
     pub fn blobs_dir(&self) -> PathBuf {
         self.root.join("blobs")
@@ -73,8 +107,8 @@ impl Store {
 
     /// Directory of an extracted layer. Colons are avoided on purpose: overlayfs uses them
     /// as separators in lowerdir=.
-    pub fn layer_dir(&self, digest: &str) -> PathBuf {
-        self.layers_dir().join(layer_dir_name(digest))
+    pub fn layer_dir(&self, digest: &str, ownership: Ownership) -> PathBuf {
+        self.layers_dir(ownership).join(layer_dir_name(digest))
     }
 
     /// Compressed blobs (layers and configs) as served by registries, kept for pushing.
@@ -143,20 +177,32 @@ impl Store {
     /// Extracts a downloaded blob into the layer store, ready to be used as an overlayfs
     /// lower directory. The extraction happens in a temporary directory that is renamed at
     /// the end, so a crash never leaves a half layer behind.
-    pub fn import_layer(&self, digest: &str, media_type: &str, blob: &Path) -> Result<PathBuf> {
-        let dest = self.layer_dir(digest);
+    pub fn import_layer(
+        &self,
+        digest: &str,
+        media_type: &str,
+        blob: &Path,
+        ownership: Ownership,
+    ) -> Result<PathBuf> {
+        let dest = self.layer_dir(digest, ownership);
         if dest.is_dir() {
             return Ok(dest);
         }
         let tmp = self
-            .layers_dir()
+            .layers_dir(ownership)
             .join(format!(".tmp-{}", layer_dir_name(digest)));
         if tmp.exists() {
             fs::remove_dir_all(&tmp).with_context(|| format!("removing {}", tmp.display()))?;
         }
         fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-        extract_layer(blob, media_type, &tmp, WhiteoutMode::OverlayLower)
-            .with_context(|| format!("extracting layer {digest}"))?;
+        extract_layer(
+            blob,
+            media_type,
+            &tmp,
+            WhiteoutMode::OverlayLower,
+            ownership,
+        )
+        .with_context(|| format!("extracting layer {digest}"))?;
         fs::rename(&tmp, &dest)
             .with_context(|| format!("moving layer into place at {}", dest.display()))?;
         Ok(dest)
@@ -250,18 +296,21 @@ impl Store {
             .map(|d| layer_dir_name(&d))
             .collect();
         let mut removed = Vec::new();
-        if !self.layers_dir().is_dir() {
-            return Ok(removed);
-        }
-        for entry in fs::read_dir(self.layers_dir())? {
-            let entry = entry?;
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            if file_name.starts_with('.') || referenced.contains(&file_name) {
+        for ownership in [Ownership::Root, Ownership::Foreign] {
+            let dir = self.layers_dir(ownership);
+            if !dir.is_dir() {
                 continue;
             }
-            fs::remove_dir_all(entry.path())
-                .with_context(|| format!("removing layer {file_name}"))?;
-            removed.push(file_name.replacen("sha256-", "sha256:", 1));
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if file_name.starts_with('.') || referenced.contains(&file_name) {
+                    continue;
+                }
+                fs::remove_dir_all(entry.path())
+                    .with_context(|| format!("removing layer {file_name}"))?;
+                removed.push(file_name.replacen("sha256-", "sha256:", 1));
+            }
         }
         Ok(removed)
     }
@@ -363,9 +412,13 @@ pub fn extract_layer(
     media_type: &str,
     target: &Path,
     mode: WhiteoutMode,
+    ownership: Ownership,
 ) -> Result<u64> {
     let reader = open_decompressed(blob, media_type)?;
     let root = nix::unistd::geteuid().is_root();
+    if ownership == Ownership::Foreign && !root {
+        bail!("shifting a layer into the foreign UID range needs root");
+    }
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
     archive.set_unpack_xattrs(true);
@@ -380,18 +433,42 @@ pub fn extract_layer(
             continue;
         }
         if let Some(whiteout) = classify(&path) {
-            handle_whiteout(target, whiteout, mode)?;
+            handle_whiteout(target, whiteout, mode, ownership)?;
             continue;
         }
-        entry
+        // Malformed numeric fields are treated as root, like GNU tar does.
+        let uid = entry.header().uid().unwrap_or(0) as u32;
+        let gid = entry.header().gid().unwrap_or(0) as u32;
+        if !entry
             .unpack_in(target)
-            .with_context(|| format!("unpacking {}", path.display()))?;
+            .with_context(|| format!("unpacking {}", path.display()))?
+        {
+            continue;
+        }
+        if ownership == Ownership::Foreign {
+            let unpacked = target.join(&path);
+            std::os::unix::fs::lchown(&unpacked, Some(foreign_id(uid)), Some(foreign_id(gid)))
+                .with_context(|| format!("shifting ownership of {}", unpacked.display()))?;
+        }
         count += 1;
+    }
+    if ownership == Ownership::Foreign {
+        std::os::unix::fs::lchown(target, Some(FOREIGN_UID_BASE), Some(FOREIGN_UID_BASE))
+            .with_context(|| format!("shifting ownership of {}", target.display()))?;
     }
     Ok(count)
 }
 
-fn handle_whiteout(target: &Path, whiteout: Whiteout, mode: WhiteoutMode) -> Result<()> {
+fn handle_whiteout(
+    target: &Path,
+    whiteout: Whiteout,
+    mode: WhiteoutMode,
+    ownership: Ownership,
+) -> Result<()> {
+    let owner = match ownership {
+        Ownership::Root => None,
+        Ownership::Foreign => Some(FOREIGN_UID_BASE),
+    };
     match (mode, whiteout) {
         (WhiteoutMode::Apply, Whiteout::Opaque(dir)) => {
             let dir = target.join(dir);
@@ -417,6 +494,10 @@ fn handle_whiteout(target: &Path, whiteout: Whiteout, mode: WhiteoutMode) -> Res
             remove_any(&node)?;
             mknod(&node, SFlag::S_IFCHR, Mode::empty(), 0)
                 .with_context(|| format!("creating whiteout {}", node.display()))?;
+            if owner.is_some() {
+                std::os::unix::fs::lchown(&node, owner, owner)
+                    .with_context(|| format!("shifting ownership of {}", node.display()))?;
+            }
         }
     }
     Ok(())
@@ -501,6 +582,23 @@ mod tests {
     }
 
     #[test]
+    fn foreign_ids_stay_inside_the_range() {
+        assert_eq!(foreign_id(0), FOREIGN_UID_BASE);
+        assert_eq!(foreign_id(1000), FOREIGN_UID_BASE + 1000);
+        assert_eq!(foreign_id(65535), FOREIGN_UID_BASE + 65535);
+        assert_eq!(foreign_id(70000), FOREIGN_UID_BASE + 0xFFFE);
+        assert_eq!(FOREIGN_UID_BASE, 0x7FFE0000);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("m"), &tmp.path().join("s"));
+        assert!(store
+            .layer_dir("sha256:x", Ownership::Foreign)
+            .ends_with("layers-foreign/sha256-x"));
+        assert!(store
+            .layer_dir("sha256:x", Ownership::Root)
+            .ends_with("layers/sha256-x"));
+    }
+
+    #[test]
     fn applies_whiteouts_on_top_of_previous_layers() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("root");
@@ -528,6 +626,7 @@ mod tests {
             "application/vnd.oci.image.layer.v1.tar",
             &target,
             WhiteoutMode::Apply,
+            Ownership::Root,
         )
         .unwrap();
         assert_eq!(n, 4);
@@ -569,6 +668,7 @@ mod tests {
             "application/vnd.oci.image.layer.v1.tar",
             &target,
             WhiteoutMode::Apply,
+            Ownership::Root,
         )
         .unwrap();
         assert_eq!(n, 1);
@@ -593,6 +693,7 @@ mod tests {
             "application/vnd.oci.image.layer.v1.tar+gzip",
             &t1,
             WhiteoutMode::Apply,
+            Ownership::Root,
         )
         .unwrap();
         assert_eq!(fs::read_to_string(t1.join("f")).unwrap(), "data");
@@ -606,11 +707,19 @@ mod tests {
             "application/vnd.oci.image.layer.v1.tar+zstd",
             &t2,
             WhiteoutMode::Apply,
+            Ownership::Root,
         )
         .unwrap();
         assert_eq!(fs::read_to_string(t2.join("f")).unwrap(), "data");
 
-        assert!(extract_layer(&zs, "application/x-unknown", &t2, WhiteoutMode::Apply).is_err());
+        assert!(extract_layer(
+            &zs,
+            "application/x-unknown",
+            &t2,
+            WhiteoutMode::Apply,
+            Ownership::Root
+        )
+        .is_err());
     }
 
     #[test]
@@ -633,10 +742,10 @@ mod tests {
             "hub/fedora:44"
         );
         assert_eq!(store.list_images().unwrap().len(), 1);
-        fs::create_dir_all(store.layer_dir("sha256:aaa")).unwrap();
-        fs::create_dir_all(store.layer_dir("sha256:bbb")).unwrap();
+        fs::create_dir_all(store.layer_dir("sha256:aaa", Ownership::Root)).unwrap();
+        fs::create_dir_all(store.layer_dir("sha256:bbb", Ownership::Foreign)).unwrap();
         assert_eq!(store.gc_layers().unwrap(), vec!["sha256:bbb".to_string()]);
-        assert!(store.layer_dir("sha256:aaa").is_dir());
+        assert!(store.layer_dir("sha256:aaa", Ownership::Root).is_dir());
         store.remove_record("fedora-44").unwrap();
         assert!(store.load_image("fedora-44").unwrap().is_none());
         assert_eq!(store.gc_layers().unwrap(), vec!["sha256:aaa".to_string()]);

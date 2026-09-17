@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::cli::BackendChoice;
-use crate::store::{extract_layer, Store, WhiteoutMode};
+use crate::store::{extract_layer, Ownership, Store, WhiteoutMode, FOREIGN_UID_BASE};
 use crate::systemd::Systemd;
 use crate::unitname;
 
@@ -30,6 +30,15 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// mstack images are mounted by systemd-mountfsd for a managed user namespace, which
+    /// maps the foreign UID range; the other backends keep the image's own IDs.
+    pub fn ownership(self) -> Ownership {
+        match self {
+            Backend::Mstack => Ownership::Foreign,
+            Backend::Overlay | Backend::Flat => Ownership::Root,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Backend::Overlay => "overlay",
@@ -157,8 +166,14 @@ impl Assembler<'_> {
                 let dir = self.machine_dir(name);
                 fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
                 for layer in layers {
-                    extract_layer(&layer.blob, &layer.media_type, &dir, WhiteoutMode::Apply)
-                        .with_context(|| format!("extracting layer {}", layer.digest))?;
+                    extract_layer(
+                        &layer.blob,
+                        &layer.media_type,
+                        &dir,
+                        WhiteoutMode::Apply,
+                        Ownership::Root,
+                    )
+                    .with_context(|| format!("extracting layer {}", layer.digest))?;
                 }
             }
             Backend::Overlay | Backend::Mstack => {
@@ -168,6 +183,7 @@ impl Assembler<'_> {
                         &layer.digest,
                         &layer.media_type,
                         &layer.blob,
+                        backend.ownership(),
                     )?);
                 }
                 if backend == Backend::Overlay {
@@ -290,7 +306,14 @@ pub fn write_mstack(dir: &Path, layer_dirs: &[PathBuf]) -> Result<()> {
         let link = dir.join(format!("layer@{i}"));
         symlink(layer, &link).with_context(|| format!("creating {}", link.display()))?;
     }
-    fs::create_dir_all(dir.join("rw")).with_context(|| format!("creating {}/rw", dir.display()))?;
+    let rw = dir.join("rw");
+    fs::create_dir_all(&rw).with_context(|| format!("creating {}", rw.display()))?;
+    // The writable layer must belong to the foreign range too, or mountfsd maps it as
+    // identity and the container's root cannot write to it.
+    if nix::unistd::geteuid().is_root() {
+        std::os::unix::fs::chown(&rw, Some(FOREIGN_UID_BASE), Some(FOREIGN_UID_BASE))
+            .with_context(|| format!("shifting ownership of {}", rw.display()))?;
+    }
     Ok(())
 }
 
