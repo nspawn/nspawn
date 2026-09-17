@@ -69,6 +69,11 @@ own addresses and from 127.0.0.1, and it goes away when the machine stops. The l
 remembered for the image; `-p none` forgets it. With firewalld running, the bridge is
 bound to the trusted zone at runtime, which also lets published ports through.
 
+Hosts running docker (in its default iptables mode) or ufw have a FORWARD policy of
+DROP; `start` then adds accept rules for the bridge to the DOCKER-USER chain, which
+docker reserves for that, or to FORWARD itself. A hand-written nftables firewall with a
+drop policy on forward needs the same exception by hand.
+
 `--network host` shares the host's network instead, and `--network veth` keeps the classic
 systemd-nspawn setup: a virtual ethernet pair configured by systemd-networkd on the host
 through `80-container-ve.network`. In that mode `start` activates systemd-networkd when

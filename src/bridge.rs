@@ -201,10 +201,60 @@ pub async fn up(config: &Config, sd: &Systemd) -> Result<()> {
     sysctl("net/ipv4/ip_forward", "1")?;
     sysctl(&format!("net/ipv4/conf/{name}/route_localnet"), "1")?;
     nft(&base_ruleset(name, subnet))?;
+    allow_forwarding_past_iptables(name)?;
     if hostnet::firewalld_running(sd).await {
         hostnet::trust_interface(sd, name).await?;
     }
     Ok(())
+}
+
+/// Docker (in its default iptables mode) and ufw set the FORWARD policy to DROP, which
+/// would silence every machine on the bridge. Docker reserves the DOCKER-USER chain for
+/// rules like ours and never flushes it; without docker, a DROP policy gets the accept
+/// rules at the top of FORWARD itself. Nothing happens on hosts without iptables.
+fn allow_forwarding_past_iptables(bridge: &str) -> Result<()> {
+    let chain = if iptables(&["-S", "DOCKER-USER"]) {
+        "DOCKER-USER"
+    } else if iptables(&["-S", "FORWARD"]) && forward_policy_is_drop() {
+        "FORWARD"
+    } else {
+        return Ok(());
+    };
+    for direction in ["-i", "-o"] {
+        let rule = [direction, bridge, "-j", "ACCEPT"];
+        if !iptables(&[&["-C", chain][..], &rule[..]].concat()) {
+            run("iptables", &[&["-w", "-I", chain][..], &rule[..]].concat()).with_context(
+                || format!("letting the bridge's traffic through the {chain} chain"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Runs iptables quietly; false when it is missing or the command fails.
+fn iptables(args: &[&str]) -> bool {
+    Command::new("iptables")
+        .arg("-w")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn forward_policy_is_drop() -> bool {
+    Command::new("iptables")
+        .args(["-w", "-S", "FORWARD"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .next()
+                .map(str::trim)
+                == Some("-P FORWARD DROP")
+        })
+        .unwrap_or(false)
 }
 
 /// The nftables table: DNAT of published ports (from outside and from the host itself,
