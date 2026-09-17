@@ -115,7 +115,8 @@ impl Assembler<'_> {
         self.store.machines_dir.join(format!("{name}.mstack"))
     }
 
-    /// Makes the image `name` available to machinectl. Blobs are consumed.
+    /// Makes the image `name` available to machinectl. Blobs stay in the store so that the
+    /// image can be pushed later.
     pub async fn assemble(&self, backend: Backend, name: &str, layers: &[Layer]) -> Result<()> {
         match backend {
             Backend::Flat => {
@@ -141,9 +142,6 @@ impl Assembler<'_> {
                     write_mstack(&self.mstack_dir(name), &dirs)?;
                 }
             }
-        }
-        for layer in layers {
-            let _ = fs::remove_file(&layer.blob);
         }
         Ok(())
     }

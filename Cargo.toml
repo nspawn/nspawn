@@ -13,14 +13,16 @@ flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
 indicatif = "0.18"
-nix = { version = "0.31", features = ["term", "user", "fs", "ioctl"] }
+nix = { version = "0.31", features = ["term", "user", "fs", "ioctl", "signal"] }
 oci-client = { version = "0.17", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 tar = "0.4"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "process"] }
+tokio-util = { version = "0.7", features = ["io"] }
+bytes = "1"
 toml = "1"
 xattr = "1"
 zbus = { version = "5", default-features = false, features = ["tokio"] }

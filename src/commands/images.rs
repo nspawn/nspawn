@@ -24,17 +24,19 @@ pub async fn ls(config: &Config) -> Result<()> {
     let rows = images
         .into_iter()
         .map(|i| {
-            let (backend, source) = match records.get(&i.name) {
+            let (backend, origin, source) = match records.get(&i.name) {
                 Some(r) => (
                     format!("{:?}", r.backend).to_lowercase(),
+                    r.origin.clone(),
                     r.reference.clone(),
                 ),
-                None => ("-".to_string(), "-".to_string()),
+                None => ("-".to_string(), "-".to_string(), "-".to_string()),
             };
             vec![
                 i.name,
                 i.kind,
                 backend,
+                origin,
                 source,
                 i.usage.map(human_bytes).unwrap_or_else(|| "-".to_string()),
                 if i.read_only {
@@ -47,7 +49,10 @@ pub async fn ls(config: &Config) -> Result<()> {
         .collect();
     println!(
         "{}",
-        table(&["NAME", "TYPE", "BACKEND", "SOURCE", "SIZE", "RO"], rows)
+        table(
+            &["NAME", "TYPE", "BACKEND", "ORIGIN", "SOURCE", "SIZE", "RO"],
+            rows
+        )
     );
     Ok(())
 }
@@ -76,6 +81,10 @@ pub async fn rm(args: ImagesRmArgs, config: &Config) -> Result<()> {
     let gone = store.gc_layers()?;
     if !gone.is_empty() {
         println!("freed {} unused layer(s)", gone.len());
+    }
+    let blobs = store.gc_blobs()?;
+    if !blobs.is_empty() {
+        println!("freed {} unused blob(s)", blobs.len());
     }
     Ok(())
 }

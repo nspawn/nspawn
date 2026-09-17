@@ -14,8 +14,17 @@ nspawn machines ls
 nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
 nspawn shell fedora-44
 nspawn stop fedora-44
-nspawn images rm fedora-44          # also frees layers nobody references any more
+nspawn images rm fedora-44          # also frees layers and blobs nobody references
+
+nspawn build -t team/app:1 ./app    # mkosi -t oci on ./app, imported as a local image
+nspawn push team/app:1              # upload it to the hub (layers already there are skipped)
+nspawn push app-1 --to team/app:2   # push a local image under another tag
 ```
+
+`build` runs `mkosi` in the given directory with `--format=oci`, so the same
+`mkosi.conf` tree that works on its own works here; `--distribution`, `--release`,
+`--profile` and anything after `--` are passed through. The result is stored like a pulled
+image (blobs, manifest, assembled machine) and can be started right away or pushed.
 
 ## How images are stored
 
@@ -75,6 +84,7 @@ NSPAWN=./target/release/nspawn sudo -E tests/e2e.sh   # end-to-end against a reg
 ```
 
 `tests/e2e.sh` pulls an image with both the `overlay` and the `flat` backend, boots it,
-runs commands inside through the PTY, stops it, removes it and checks that layers are shared
-and garbage collected. It expects `NSPAWN_REGISTRY` (and `NSPAWN_CA_CERT` for a private
+runs commands inside through the PTY, stops it, removes it, checks that layers are shared
+and garbage collected, and (when mkosi is installed) builds `tests/build-context`, pushes
+it, pulls it back and pushes it again under another tag. It expects `NSPAWN_REGISTRY` (and `NSPAWN_CA_CERT` for a private
 CA) to point at a registry that serves the image given in `IMAGE` (default `fedora:44`).

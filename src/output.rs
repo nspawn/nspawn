@@ -1,11 +1,18 @@
 //! Table rendering shared by the listing commands.
 
+use std::io::IsTerminal;
+
 use comfy_table::{presets::NOTHING, Cell, ContentArrangement, Table};
 
 pub fn table(headers: &[&str], rows: Vec<Vec<String>>) -> String {
     let mut t = Table::new();
     t.load_style(NOTHING)
-        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_content_arrangement(if std::io::stdout().is_terminal() {
+            ContentArrangement::Dynamic
+        } else {
+            // One line per row when piped, so that scripts can grep the output.
+            ContentArrangement::Disabled
+        })
         .set_header(headers.iter().map(Cell::new));
     for row in rows {
         t.add_row(row.into_iter().map(Cell::new));

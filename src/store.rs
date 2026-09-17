@@ -20,6 +20,13 @@ pub struct ImageRecord {
     pub layers: Vec<String>,
     pub backend: BackendChoice,
     pub created: u64,
+    /// "pull" or "build".
+    #[serde(default = "default_origin")]
+    pub origin: String,
+}
+
+fn default_origin() -> String {
+    "pull".to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -68,12 +75,66 @@ impl Store {
         self.layers_dir().join(layer_dir_name(digest))
     }
 
-    pub fn has_layer(&self, digest: &str) -> bool {
-        self.layer_dir(digest).is_dir()
-    }
-
+    /// Compressed blobs (layers and configs) as served by registries, kept for pushing.
     pub fn blob_path(&self, digest: &str) -> PathBuf {
         self.blobs_dir().join(layer_dir_name(digest))
+    }
+
+    pub fn has_blob(&self, digest: &str) -> bool {
+        self.blob_path(digest).is_file()
+    }
+
+    pub fn manifests_dir(&self) -> PathBuf {
+        self.root.join("manifests")
+    }
+
+    /// The manifest exactly as fetched or built, so its digest stays valid when pushing.
+    pub fn save_manifest(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        fs::create_dir_all(self.manifests_dir())?;
+        let path = self.manifests_dir().join(format!("{name}.json"));
+        fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))
+    }
+
+    pub fn load_manifest(&self, name: &str) -> Result<Vec<u8>> {
+        let path = self.manifests_dir().join(format!("{name}.json"));
+        fs::read(&path).with_context(|| format!("reading {}", path.display()))
+    }
+
+    /// Digests of every blob some image still needs: its layers and its config.
+    fn referenced_blobs(&self) -> Result<std::collections::HashSet<String>> {
+        let mut set = std::collections::HashSet::new();
+        for record in self.list_images()? {
+            for layer in &record.layers {
+                set.insert(layer_dir_name(layer));
+            }
+            if let Ok(bytes) = self.load_manifest(&record.name) {
+                if let Ok(manifest) =
+                    serde_json::from_slice::<oci_client::manifest::OciImageManifest>(&bytes)
+                {
+                    set.insert(layer_dir_name(&manifest.config.digest));
+                }
+            }
+        }
+        Ok(set)
+    }
+
+    /// Deletes compressed blobs no image references. Returns the digests removed.
+    pub fn gc_blobs(&self) -> Result<Vec<String>> {
+        let referenced = self.referenced_blobs()?;
+        let mut removed = Vec::new();
+        if !self.blobs_dir().is_dir() {
+            return Ok(removed);
+        }
+        for entry in fs::read_dir(self.blobs_dir())? {
+            let entry = entry?;
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with('.') || referenced.contains(&file_name) {
+                continue;
+            }
+            fs::remove_file(entry.path()).with_context(|| format!("removing blob {file_name}"))?;
+            removed.push(file_name.replacen("sha256-", "sha256:", 1));
+        }
+        Ok(removed)
     }
 
     /// Extracts a downloaded blob into the layer store, ready to be used as an overlayfs
@@ -144,12 +205,37 @@ impl Store {
     }
 
     pub fn remove_record(&self, name: &str) -> Result<()> {
-        let path = self.images_dir().join(format!("{name}.json"));
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        for path in [
+            self.images_dir().join(format!("{name}.json")),
+            self.manifests_dir().join(format!("{name}.json")),
+        ] {
+            match fs::remove_file(&path) {
+                Ok(()) | Err(_) if !path.exists() => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+                Ok(()) => {}
+            }
         }
+        Ok(())
+    }
+
+    /// Finds a record by local name or by the reference it was pulled from or built as.
+    pub fn find_image(
+        &self,
+        name_or_reference: &str,
+        default_registry: &str,
+    ) -> Result<Option<ImageRecord>> {
+        if let Some(record) = self.load_image(name_or_reference)? {
+            return Ok(Some(record));
+        }
+        let wanted = match crate::reference::ImageRef::parse(name_or_reference, default_registry) {
+            Ok(r) => r.to_string(),
+            Err(_) => return Ok(None),
+        };
+        Ok(self
+            .list_images()?
+            .into_iter()
+            .find(|r| r.reference == wanted))
     }
 
     /// Deletes layers that no image record references. Returns the digests removed.
@@ -490,6 +576,7 @@ mod tests {
             layers: vec!["sha256:aaa".into()],
             backend: BackendChoice::Overlay,
             created: 1,
+            origin: "pull".into(),
         };
         store.record_image(&rec).unwrap();
         assert_eq!(
@@ -500,9 +587,62 @@ mod tests {
         fs::create_dir_all(store.layer_dir("sha256:aaa")).unwrap();
         fs::create_dir_all(store.layer_dir("sha256:bbb")).unwrap();
         assert_eq!(store.gc_layers().unwrap(), vec!["sha256:bbb".to_string()]);
-        assert!(store.has_layer("sha256:aaa"));
+        assert!(store.layer_dir("sha256:aaa").is_dir());
         store.remove_record("fedora-44").unwrap();
         assert!(store.load_image("fedora-44").unwrap().is_none());
         assert_eq!(store.gc_layers().unwrap(), vec!["sha256:aaa".to_string()]);
+    }
+
+    #[test]
+    fn blob_gc_keeps_layers_and_config_of_recorded_images() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        store.init().unwrap();
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": "sha256:cfg", "size": 2},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+zstd", "digest": "sha256:lay", "size": 3}]
+        });
+        let rec = ImageRecord {
+            name: "img".into(),
+            reference: "hub.example/img:1".into(),
+            manifest_digest: "sha256:m".into(),
+            layers: vec!["sha256:lay".into()],
+            backend: BackendChoice::Flat,
+            created: 1,
+            origin: "build".into(),
+        };
+        store.record_image(&rec).unwrap();
+        store
+            .save_manifest("img", manifest.to_string().as_bytes())
+            .unwrap();
+        for d in ["sha256:cfg", "sha256:lay", "sha256:orphan"] {
+            fs::write(store.blob_path(d), b"x").unwrap();
+        }
+        assert_eq!(store.gc_blobs().unwrap(), vec!["sha256:orphan".to_string()]);
+        assert!(store.has_blob("sha256:cfg") && store.has_blob("sha256:lay"));
+        assert_eq!(
+            store
+                .find_image("img", "hub.example")
+                .unwrap()
+                .unwrap()
+                .origin,
+            "build"
+        );
+        assert_eq!(
+            store
+                .find_image("img:1", "hub.example")
+                .unwrap()
+                .unwrap()
+                .name,
+            "img"
+        );
+        assert!(store
+            .find_image("other:1", "hub.example")
+            .unwrap()
+            .is_none());
+        store.remove_record("img").unwrap();
+        assert!(store.load_manifest("img").is_err());
     }
 }

@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use bytes::Bytes;
 use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
 use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol};
@@ -12,6 +13,7 @@ use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use tokio_util::io::ReaderStream;
 
 use crate::config::Config;
 
@@ -98,8 +100,8 @@ impl Hub {
             .with_context(|| format!("fetching the manifest of {image}"))
     }
 
-    /// Downloads one layer to `dest`, verifying its sha256 digest while streaming.
-    pub async fn download_layer(
+    /// Downloads one blob (layer or config) to `dest`, verifying its sha256 digest while streaming.
+    pub async fn download_blob(
         &self,
         image: &Reference,
         layer: &OciDescriptor,
@@ -151,6 +153,88 @@ impl Hub {
             );
         }
         Ok(())
+    }
+}
+
+impl Hub {
+    /// Exact bytes of a manifest, fetched by digest so that they can be stored and pushed
+    /// again without changing the digest.
+    pub async fn manifest_bytes(&self, image: &Reference, digest: &str) -> Result<Vec<u8>> {
+        let by_digest = Reference::with_digest(
+            image.registry().to_string(),
+            image.repository().to_string(),
+            digest.to_string(),
+        );
+        let accepted = [
+            oci_client::manifest::IMAGE_MANIFEST_MEDIA_TYPE,
+            oci_client::manifest::IMAGE_MANIFEST_LIST_MEDIA_TYPE,
+            oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
+            oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE,
+        ];
+        let (bytes, fetched_digest) = self
+            .client
+            .pull_manifest_raw(&by_digest, &self.auth, &accepted)
+            .await
+            .with_context(|| format!("fetching manifest {digest}"))?;
+        if fetched_digest != digest {
+            bail!("registry returned manifest {fetched_digest} instead of {digest}");
+        }
+        Ok(bytes.to_vec())
+    }
+
+    pub async fn blob_exists(&self, image: &Reference, digest: &str) -> Result<bool> {
+        self.client
+            .blob_exists(image, digest)
+            .await
+            .with_context(|| format!("checking blob {digest} on {}", image.registry()))
+    }
+
+    /// Streams a blob file to the registry.
+    pub async fn upload_blob(&self, image: &Reference, digest: &str, path: &Path) -> Result<()> {
+        let file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("opening {}", path.display()))?;
+        let size = file.metadata().await?.len();
+        let bar = ProgressBar::new(size);
+        bar.set_style(
+            ProgressStyle::with_template(
+                "{msg} {bar:30} {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+            )
+            .expect("valid template"),
+        );
+        bar.set_message(short_digest(digest));
+        let progress = bar.clone();
+        let stream = futures_util::TryStreamExt::map_err(
+            futures_util::StreamExt::inspect(
+                ReaderStream::with_capacity(file, 1 << 20),
+                move |chunk| {
+                    if let Ok(c) = chunk {
+                        progress.inc(c.len() as u64);
+                    }
+                },
+            ),
+            |e| oci_client::errors::OciDistributionError::GenericError(Some(e.to_string())),
+        );
+        self.client
+            .push_blob_stream(image, stream, digest)
+            .await
+            .with_context(|| format!("uploading blob {digest}"))?;
+        bar.finish_and_clear();
+        Ok(())
+    }
+
+    /// Pushes manifest bytes verbatim under the reference's tag. Returns the registry URL.
+    pub async fn push_manifest(
+        &self,
+        image: &Reference,
+        bytes: &[u8],
+        media_type: &str,
+    ) -> Result<String> {
+        let content_type = media_type.parse().context("invalid manifest media type")?;
+        self.client
+            .push_manifest_raw(image, Bytes::copy_from_slice(bytes), content_type)
+            .await
+            .with_context(|| format!("pushing the manifest of {image}"))
     }
 }
 

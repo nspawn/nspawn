@@ -1,12 +1,14 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 
-use crate::backend::{Assembler, Backend, Layer};
-use crate::cli::{BackendChoice, PullArgs};
+use crate::backend::Backend;
+use crate::cli::BackendChoice;
+use crate::cli::PullArgs;
 use crate::commands::require_root;
 use crate::config::Config;
 use crate::hub::{short_digest, Hub};
+use crate::install::{install, replace_existing, Install};
 use crate::reference::{validate_machine_name, ImageRef};
-use crate::store::{now_unix, ImageRecord, Store};
+use crate::store::Store;
 use crate::systemd::Systemd;
 
 pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
@@ -19,30 +21,7 @@ pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
     let sd = Systemd::connect().await?;
     let store = Store::new(&config.machines_dir, &config.state_dir);
     store.init()?;
-    let assembler = Assembler {
-        store: &store,
-        sd: &sd,
-    };
-
-    let existing_record = store.load_image(&name)?;
-    let existing_image = sd.list_images().await?.into_iter().any(|i| i.name == name);
-    if existing_record.is_some() || existing_image {
-        if !args.force {
-            bail!(
-                "image {name} already exists; use --force to replace it or --name for another name"
-            );
-        }
-        if sd.machine_exists(&name).await? {
-            bail!("machine {name} is running; stop it before replacing its image");
-        }
-        match existing_record {
-            Some(rec) => {
-                assembler.remove(&name, rec.backend).await?;
-                store.remove_record(&name)?;
-            }
-            None => sd.remove_image(&name).await?,
-        }
-    }
+    replace_existing(&store, &sd, &name, args.force).await?;
 
     let choice = if args.backend == BackendChoice::Auto {
         config.backend
@@ -52,6 +31,7 @@ pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
     let backend = Backend::choose(choice, &sd).await?;
     let hub = Hub::new(config)?;
     let (manifest, manifest_digest) = hub.resolve(&oci).await?;
+    let manifest_bytes = hub.manifest_bytes(&oci, &manifest_digest).await?;
     println!(
         "{image}: manifest {} with {} layer(s), assembling as {}",
         short_digest(&manifest_digest),
@@ -59,34 +39,34 @@ pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
         backend.name()
     );
 
-    let mut layers = Vec::new();
-    for descriptor in &manifest.layers {
-        let blob = store.blob_path(&descriptor.digest);
-        if backend != Backend::Flat && store.has_layer(&descriptor.digest) {
-            println!(
-                "layer {}: already present",
-                short_digest(&descriptor.digest)
-            );
+    for descriptor in manifest
+        .layers
+        .iter()
+        .chain(std::iter::once(&manifest.config))
+    {
+        if store.has_blob(&descriptor.digest) {
+            println!("blob {}: already present", short_digest(&descriptor.digest));
         } else {
-            println!("layer {}: downloading", short_digest(&descriptor.digest));
-            hub.download_layer(&oci, descriptor, &blob).await?;
+            println!("blob {}: downloading", short_digest(&descriptor.digest));
+            hub.download_blob(&oci, descriptor, &store.blob_path(&descriptor.digest))
+                .await?;
         }
-        layers.push(Layer {
-            digest: descriptor.digest.clone(),
-            media_type: descriptor.media_type.clone(),
-            blob,
-        });
     }
 
-    assembler.assemble(backend, &name, &layers).await?;
-    store.record_image(&ImageRecord {
-        name: name.clone(),
-        reference: image.to_string(),
-        manifest_digest,
-        layers: manifest.layers.iter().map(|l| l.digest.clone()).collect(),
-        backend: backend.as_choice(),
-        created: now_unix(),
-    })?;
+    install(
+        &store,
+        &sd,
+        backend,
+        Install {
+            name: &name,
+            reference: &image.to_string(),
+            manifest_bytes: &manifest_bytes,
+            manifest: &manifest,
+            manifest_digest: &manifest_digest,
+            origin: "pull",
+        },
+    )
+    .await?;
     println!("image {name} is ready: nspawn start {name}");
     Ok(())
 }

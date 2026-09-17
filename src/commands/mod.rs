@@ -1,9 +1,11 @@
 //! Command implementations.
 
+mod build;
 mod hub;
 mod images;
 mod machines;
 mod pull;
+mod push;
 
 use anyhow::{bail, Result};
 
@@ -22,6 +24,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             HubCommand::Tags(a) => hub::tags(a, &config).await,
         },
         Command::Pull(args) => pull::run(args, &config).await,
+        Command::Build(args) => build::run(args, &config).await,
+        Command::Push(args) => push::run(args, &config).await,
         Command::Images(args) => match args.command {
             ImagesCommand::Ls => images::ls(&config).await,
             ImagesCommand::Rm(a) => images::rm(a, &config).await,

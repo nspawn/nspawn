@@ -9,6 +9,8 @@ mod cli;
 mod commands;
 mod config;
 mod hub;
+mod install;
+mod layout;
 mod output;
 mod pty;
 mod reference;
@@ -20,6 +22,14 @@ use clap::Parser;
 
 #[tokio::main]
 async fn main() {
+    // Behave like a normal Unix tool in pipelines: die quietly on a closed pipe instead of
+    // panicking in println!.
+    unsafe {
+        let _ = nix::sys::signal::signal(
+            nix::sys::signal::Signal::SIGPIPE,
+            nix::sys::signal::SigHandler::SigDfl,
+        );
+    }
     let args = cli::Cli::parse();
     if let Err(err) = commands::run(args).await {
         eprintln!("error: {err:#}");

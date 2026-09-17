@@ -28,6 +28,10 @@ pub enum Command {
     Hub(HubArgs),
     /// Download an image from the hub and make it available to machinectl.
     Pull(PullArgs),
+    /// Build an image with mkosi and make it available locally, ready to push.
+    Build(BuildArgs),
+    /// Upload a local image to the hub.
+    Push(PushArgs),
     /// Manage local images.
     Images(ImagesArgs),
     /// Manage running machines.
@@ -85,6 +89,49 @@ pub struct PullArgs {
     /// Replace an existing image with the same name.
     #[arg(long, short = 'f')]
     pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct BuildArgs {
+    /// Directory with the mkosi configuration (mkosi.conf, mkosi.conf.d, ...).
+    #[arg(default_value = ".")]
+    pub directory: PathBuf,
+    /// Reference for the result, for example myapp:1 or hub.example/team/app:2.
+    #[arg(long, short = 't', required = true)]
+    pub tag: String,
+    /// Local image name (default: derived from the tag).
+    #[arg(long, short = 'n')]
+    pub name: Option<String>,
+    /// Distribution to build (mkosi --distribution).
+    #[arg(long, short = 'd')]
+    pub distribution: Option<String>,
+    /// Release to build (mkosi --release).
+    #[arg(long, short = 'r')]
+    pub release: Option<String>,
+    /// mkosi profile to enable (repeatable).
+    #[arg(long)]
+    pub profile: Vec<String>,
+    /// How to assemble the image on this host.
+    #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
+    pub backend: BackendChoice,
+    /// Replace an existing image with the same name.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+    /// Keep the mkosi output directory instead of deleting it after the import.
+    #[arg(long)]
+    pub keep_output: bool,
+    /// Extra arguments passed to mkosi verbatim (after --).
+    #[arg(last = true)]
+    pub mkosi_args: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct PushArgs {
+    /// Local image name, or the reference it was pulled from or built as.
+    pub image: String,
+    /// Push under a different reference than the one recorded for the image.
+    #[arg(long)]
+    pub to: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum, serde::Deserialize, serde::Serialize)]
