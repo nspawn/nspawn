@@ -1,7 +1,7 @@
 //! nspawn: docker-like management of systemd-nspawn machines.
 //!
 //! Images come from an OCI registry (the hub) and are stored as shared layers under
-//! /var/lib/machines/.nspawn. Machines are driven through the D-Bus APIs of
+//! /var/lib/nspawn. Machines are driven through the D-Bus APIs of
 //! systemd-machined and systemd itself, never through machinectl.
 
 mod backend;

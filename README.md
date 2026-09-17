@@ -21,8 +21,9 @@ nspawn images rm fedora-44          # also frees layers nobody references any mo
 
 `pull` fetches the manifest (multi-arch indexes are resolved for the host platform),
 downloads every layer while verifying its sha256 digest, and assembles the image with one
-of three backends. Layers live once under `/var/lib/machines/.nspawn/layers/` and are
-shared between images.
+of three backends. Layers live once under `/var/lib/nspawn/layers/` and are shared
+between images. Nothing of ours is hidden below `/var/lib/machines`, so `machinectl clean`
+stays safe.
 
 | Backend | Requirements | What it creates |
 |---|---|---|
@@ -49,6 +50,7 @@ registry = "hub.nspawn.org"      # default registry for references without a hos
 ca_cert = "/etc/zot/ca.crt"      # extra CA to trust (optional)
 backend = "auto"                 # auto | overlay | flat | mstack
 machines_dir = "/var/lib/machines"
+state_dir = "/var/lib/nspawn"      # layers, records, writable directories of overlay machines
 ```
 
 Image references follow the usual form `[registry/]repository[:tag|@digest]`; `fedora:44`
@@ -58,8 +60,8 @@ becomes the local image `fedora-44`, `debian` (tag `latest`) becomes `debian`.
 
 - A host with systemd-nspawn and systemd-machined (any recent version; 259 and 261 are
   tested), overlayfs for the `overlay` backend and cgroup v2.
-- `pull` and `images rm` need root because they write below `/var/lib/machines` and
-  `/etc/systemd/system`. Everything else goes through D-Bus and polkit.
+- `pull` and `images rm` need root because they write below `/var/lib/machines`,
+  `/var/lib/nspawn` and `/etc/systemd/system`. Everything else goes through D-Bus and polkit.
 - Images must boot systemd (the hub images do): `exec` and `shell` use
   `OpenMachineShell`, which needs D-Bus inside the machine.
 

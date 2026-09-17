@@ -1,5 +1,5 @@
-//! Local storage under <machines_dir>/.nspawn: extracted layers, image records and scratch
-//! space for downloads and per-machine writable directories.
+//! Local state under the state directory (/var/lib/nspawn by default): extracted layers,
+//! image records, downloads in flight and per-machine writable directories.
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
@@ -11,8 +11,6 @@ use nix::sys::stat::{mknod, Mode, SFlag};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::BackendChoice;
-
-pub const PRIVATE_DIR: &str = ".nspawn";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageRecord {
@@ -31,10 +29,10 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new(machines_dir: &Path) -> Self {
+    pub fn new(machines_dir: &Path, state_dir: &Path) -> Self {
         Store {
             machines_dir: machines_dir.to_path_buf(),
-            root: machines_dir.join(PRIVATE_DIR),
+            root: state_dir.to_path_buf(),
         }
     }
 
@@ -483,7 +481,7 @@ mod tests {
     #[test]
     fn records_round_trip_and_gc() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::new(tmp.path());
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
         store.init().unwrap();
         let rec = ImageRecord {
             name: "fedora-44".into(),

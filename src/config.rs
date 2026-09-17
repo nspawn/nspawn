@@ -11,6 +11,10 @@ use crate::cli::BackendChoice;
 pub const DEFAULT_REGISTRY: &str = "hub.nspawn.org";
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/nspawn/nspawn.toml";
 pub const DEFAULT_MACHINES_DIR: &str = "/var/lib/machines";
+/// Layers, records and per-machine writable directories. Kept outside /var/lib/machines on
+/// purpose: machined would list a hidden directory there as an image and `machinectl clean`
+/// would delete it.
+pub const DEFAULT_STATE_DIR: &str = "/var/lib/nspawn";
 
 /// What the configuration file may contain. Every field is optional.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -20,6 +24,7 @@ pub struct FileConfig {
     pub ca_cert: Option<PathBuf>,
     pub backend: Option<BackendChoice>,
     pub machines_dir: Option<PathBuf>,
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Effective configuration after merging file, environment and command line.
@@ -29,6 +34,7 @@ pub struct Config {
     pub ca_cert: Option<PathBuf>,
     pub backend: BackendChoice,
     pub machines_dir: PathBuf,
+    pub state_dir: PathBuf,
 }
 
 impl Config {
@@ -69,6 +75,9 @@ impl Config {
             machines_dir: file
                 .machines_dir
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_MACHINES_DIR)),
+            state_dir: file
+                .state_dir
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
         }
     }
 }
@@ -84,12 +93,13 @@ mod tests {
         assert_eq!(c.backend, BackendChoice::Auto);
         assert_eq!(c.machines_dir, PathBuf::from(DEFAULT_MACHINES_DIR));
         assert!(c.ca_cert.is_none());
+        assert_eq!(c.state_dir, PathBuf::from(DEFAULT_STATE_DIR));
     }
 
     #[test]
     fn command_line_wins_over_file() {
         let file: FileConfig = toml::from_str(
-            "registry = \"file.example\"\nca_cert = \"/a.pem\"\nbackend = \"overlay\"\nmachines_dir = \"/srv/m\"\n",
+            "registry = \"file.example\"\nca_cert = \"/a.pem\"\nbackend = \"overlay\"\nmachines_dir = \"/srv/m\"\nstate_dir = \"/srv/s\"\n",
         )
         .unwrap();
         let c = Config::merge(file, Some("cli.example".into()), None);
@@ -97,6 +107,7 @@ mod tests {
         assert_eq!(c.ca_cert, Some(PathBuf::from("/a.pem")));
         assert_eq!(c.backend, BackendChoice::Overlay);
         assert_eq!(c.machines_dir, PathBuf::from("/srv/m"));
+        assert_eq!(c.state_dir, PathBuf::from("/srv/s"));
     }
 
     #[test]

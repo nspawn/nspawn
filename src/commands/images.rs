@@ -12,7 +12,7 @@ use crate::systemd::Systemd;
 
 pub async fn ls(config: &Config) -> Result<()> {
     let sd = Systemd::connect().await?;
-    let store = Store::new(&config.machines_dir);
+    let store = Store::new(&config.machines_dir, &config.state_dir);
     let records: HashMap<String, _> = store
         .list_images()?
         .into_iter()
@@ -55,7 +55,7 @@ pub async fn ls(config: &Config) -> Result<()> {
 pub async fn rm(args: ImagesRmArgs, config: &Config) -> Result<()> {
     require_root("images rm")?;
     let sd = Systemd::connect().await?;
-    let store = Store::new(&config.machines_dir);
+    let store = Store::new(&config.machines_dir, &config.state_dir);
     let assembler = Assembler {
         store: &store,
         sd: &sd,

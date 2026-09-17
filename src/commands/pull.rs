@@ -17,7 +17,7 @@ pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
     validate_machine_name(&name)?;
 
     let sd = Systemd::connect().await?;
-    let store = Store::new(&config.machines_dir);
+    let store = Store::new(&config.machines_dir, &config.state_dir);
     store.init()?;
     let assembler = Assembler {
         store: &store,

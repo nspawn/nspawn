@@ -52,9 +52,9 @@ step "layer sharing between two images"
 $NSPAWN pull "$IMAGE" --name e2e-a --backend overlay --force >/dev/null || fail "pull e2e-a"
 $NSPAWN pull "$IMAGE" --name e2e-b --backend overlay --force | tee /tmp/e2e-p2.txt || fail "pull e2e-b"
 grep -q "already present" /tmp/e2e-p2.txt || fail "second pull downloaded the layer again"
-layers_before=$(ls /var/lib/machines/.nspawn/layers | wc -l)
+layers_before=$(ls /var/lib/nspawn/layers | wc -l)
 $NSPAWN images rm e2e-a >/dev/null || fail "rm e2e-a"
-[ "$(ls /var/lib/machines/.nspawn/layers | wc -l)" = "$layers_before" ] || fail "layer removed while still referenced"
+[ "$(ls /var/lib/nspawn/layers | wc -l)" = "$layers_before" ] || fail "layer removed while still referenced"
 $NSPAWN images rm e2e-b | tee /tmp/e2e-rm.txt || fail "rm e2e-b"
 grep -q "freed 1 unused layer" /tmp/e2e-rm.txt || fail "unused layer not garbage collected"
 

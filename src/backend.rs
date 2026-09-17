@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::cli::BackendChoice;
-use crate::store::{extract_layer, Store, WhiteoutMode, PRIVATE_DIR};
+use crate::store::{extract_layer, Store, WhiteoutMode};
 use crate::systemd::Systemd;
 use crate::unitname;
 
@@ -246,14 +246,10 @@ pub fn write_mstack(dir: &Path, layer_dirs: &[PathBuf]) -> Result<()> {
     }
     fs::create_dir_all(dir)?;
     for (i, layer) in layer_dirs.iter().enumerate() {
-        let file_name = layer
-            .file_name()
-            .context("layer directory without a name")?;
-        let target = Path::new("..")
-            .join(PRIVATE_DIR)
-            .join("layers")
-            .join(file_name);
-        symlink(&target, dir.join(format!("layer@{i}")))?;
+        if !layer.is_absolute() {
+            bail!("layer directory {} is not absolute", layer.display());
+        }
+        symlink(layer, dir.join(format!("layer@{i}")))?;
     }
     fs::create_dir_all(dir.join("rw"))?;
     Ok(())
@@ -296,23 +292,15 @@ mod tests {
     fn mstack_layout() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("m.mstack");
-        write_mstack(
-            &dir,
-            &[
-                PathBuf::from("/x/.nspawn/layers/sha256-aaa"),
-                PathBuf::from("/x/.nspawn/layers/sha256-bbb"),
-            ],
-        )
-        .unwrap();
-        assert_eq!(
-            fs::read_link(dir.join("layer@0")).unwrap(),
-            PathBuf::from("../.nspawn/layers/sha256-aaa")
-        );
-        assert_eq!(
-            fs::read_link(dir.join("layer@1")).unwrap(),
-            PathBuf::from("../.nspawn/layers/sha256-bbb")
-        );
+        let layers = [
+            PathBuf::from("/var/lib/nspawn/layers/sha256-aaa"),
+            PathBuf::from("/var/lib/nspawn/layers/sha256-bbb"),
+        ];
+        write_mstack(&dir, &layers).unwrap();
+        assert_eq!(fs::read_link(dir.join("layer@0")).unwrap(), layers[0]);
+        assert_eq!(fs::read_link(dir.join("layer@1")).unwrap(), layers[1]);
         assert!(dir.join("rw").is_dir());
+        assert!(write_mstack(&dir, &[PathBuf::from("relative")]).is_err());
     }
 
     #[test]
