@@ -30,6 +30,8 @@ pub enum Command {
     Pull(PullArgs),
     /// Build an image with mkosi and make it available locally, ready to push.
     Build(BuildArgs),
+    /// Make another machine from a local image, like docker create (no registry needed).
+    Create(CreateArgs),
     /// Upload a local image to the hub.
     Push(PushArgs),
     /// Manage local images.
@@ -111,6 +113,26 @@ pub struct PullArgs {
     #[arg(long, value_enum, default_value_t = ModeChoice::Auto)]
     pub mode: ModeChoice,
     /// Replace an existing image with the same name.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct CreateArgs {
+    /// Local image to start from: its name, or the reference it was pulled from.
+    pub source: String,
+    /// Name of the new machine.
+    pub name: String,
+    /// How to assemble it (default: like the source).
+    #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
+    pub backend: BackendChoice,
+    /// Network of the new machine (default: like the source).
+    #[arg(long, value_enum)]
+    pub network: Option<crate::settings::Network>,
+    /// Ports to publish on the host, like start -p.
+    #[arg(long, short = 'p', value_name = "HOST:CONTAINER[/udp]")]
+    pub publish: Vec<String>,
+    /// Replace an existing machine with the same name.
     #[arg(long, short = 'f')]
     pub force: bool,
 }

@@ -1,6 +1,7 @@
 //! Command implementations.
 
 mod build;
+mod create;
 mod hub;
 mod images;
 mod machines;
@@ -26,6 +27,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         },
         Command::Pull(args) => pull::run(args, &config).await,
         Command::Build(args) => build::run(args, &config).await,
+        Command::Create(args) => create::run(args, &config).await,
         Command::Push(args) => push::run(args, &config).await,
         Command::Images(args) => match args.command {
             ImagesCommand::Ls => images::ls(&config).await,

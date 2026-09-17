@@ -88,6 +88,16 @@ $NSPAWN pull "$IMAGE" --name e2e-a --backend overlay --force >/dev/null || fail 
 $NSPAWN pull "$IMAGE" --name e2e-b --backend overlay --force | tee /tmp/e2e-p2.txt || fail "pull e2e-b"
 grep -q "already present" /tmp/e2e-p2.txt || fail "second pull downloaded the layer again"
 
+step "create: another machine from a local image, without the registry"
+env NSPAWN_REGISTRY=127.0.0.1:9 $NSPAWN create e2e-a e2e-c || fail "create from a local image"
+$NSPAWN images ls | grep "^ *e2e-c " | grep -q "create" || fail "created machine not listed with origin create"
+$NSPAWN start e2e-c || fail "start created machine"
+retry 10 $NSPAWN exec e2e-c -- /usr/bin/test -f /etc/os-release </dev/null || fail "exec in created machine"
+$NSPAWN network ls | grep -q "^ *e2e-c " || fail "created machine not on the bridge"
+$NSPAWN stop e2e-c || fail "stop created machine"
+$NSPAWN images rm e2e-c | tee /tmp/e2e-rmc.txt || fail "rm created machine"
+grep -q "freed" /tmp/e2e-rmc.txt && fail "removing the created machine freed a layer still used by e2e-a and e2e-b"
+
 step "two machines on the bridge: names and published ports"
 $NSPAWN start e2e-a || fail "start e2e-a"
 $NSPAWN start e2e-b -p 18080:80 || fail "start e2e-b with a published port"

@@ -10,6 +10,7 @@ nspawn hub ls                       # repositories and tags on the hub
 nspawn pull fedora:44               # download and assemble an image
 nspawn images ls                    # local images (all of them, not only ours)
 nspawn start fedora-44              # boot it as a machine
+nspawn create fedora-44 web2        # another machine from the same local image, docker create style
 nspawn ps                           # running machines: image, mode, command, uptime (-a adds stopped ones)
 nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
 nspawn shell fedora-44
@@ -37,6 +38,12 @@ directory, user and stop signal from the OCI config, and joins the bridge networ
 any other machine (see Networking). `exec` and `shell` then enter the
 machine's namespaces directly, so no D-Bus is needed inside, and `stop` sends the image's
 stop signal to every process before terminating the machine after `--timeout` seconds.
+
+One image, as many machines as you like: `nspawn create SOURCE NAME` makes another
+machine from an image that is already local, without touching the registry. It shares the
+source's layers and gets a writable layer, an address, settings and ports of its own
+(`-p`, `--network`); `images rm` of one never affects the others. `pull` with `--name`
+ends up the same way but resolves the manifest through the registry first.
 
 ## Networking
 
