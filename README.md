@@ -33,8 +33,8 @@ Images that ship an init system (systemd) and whose entrypoint is that init are 
 `--boot`, like `machinectl start` does; `exec` and `shell` go through machined's
 `OpenMachineShell`. Any other image, for example anything from Docker Hub, is an "app":
 its entrypoint runs as PID 2 under nspawn's stub init, with the environment, working
-directory, user and stop signal from the OCI config, and shares the host's network
-(`--network veth` switches to a virtual ethernet pair). `exec` and `shell` then enter the
+directory, user and stop signal from the OCI config, and joins the bridge network like
+any other machine (see Networking). `exec` and `shell` then enter the
 machine's namespaces directly, so no D-Bus is needed inside, and `stop` sends the image's
 stop signal to every process before terminating the machine after `--timeout` seconds.
 
@@ -53,14 +53,23 @@ bridge and `host.nspawn.internal` for the host, and hosts with systemd 258 or ne
 resolve machine names themselves through machined. `nspawn network ls` shows the
 addresses and ports; `nspawn network up` creates the bridge without starting anything.
 
+App images have nothing inside to configure `host0`, so for them nspawn builds the
+network namespace before the process starts (`ip netns`, a veth pair on the bridge, the
+address and the default route) and hands it to systemd-nspawn with `NamespacePath=`,
+together with a generated `/etc/resolv.conf`. The process finds its network ready from
+the first instruction, as in docker, and the namespace goes away with `stop`. One
+consequence: a user namespace cannot join a network namespace that belongs to the host,
+so app machines on the bridge run without one (`PrivateUsers=no`), which is also docker's
+default; capabilities, seccomp and the other namespaces still apply. For the same reason
+app images are assembled with the overlay backend even where mstack is available.
+
 Ports are published like docker: `nspawn start web -p 8080:80 -p 5353:53/udp`. Each one
 is a DNAT entry in the same nftables table, reachable from other hosts, from the host's
 own addresses and from 127.0.0.1, and it goes away when the machine stops. The list is
 remembered for the image; `-p none` forgets it. With firewalld running, the bridge is
 bound to the trusted zone at runtime, which also lets published ports through.
 
-`--network host` shares the host's network instead (the default for app images, which
-have no systemd-networkd to configure `host0`), and `--network veth` keeps the classic
+`--network host` shares the host's network instead, and `--network veth` keeps the classic
 systemd-nspawn setup: a virtual ethernet pair configured by systemd-networkd on the host
 through `80-container-ve.network`. In that mode `start` activates systemd-networkd when
 the host has no `.network` files of its own and refuses with an explanation otherwise,

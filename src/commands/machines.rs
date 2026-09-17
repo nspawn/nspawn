@@ -145,15 +145,18 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
             if !args.command.is_empty() && record.mode == Mode::Boot {
                 bail!("{} boots an init system; a command can only replace the entrypoint of an app image", args.name);
             }
-            if record.network == Network::Bridge && record.mode == Mode::App {
-                bail!(
-                    "{} is an app image, which has no systemd-networkd inside to configure host0; use --network host",
-                    args.name
-                );
-            }
             if !record.ports.is_empty() && record.network != Network::Bridge {
                 bail!(
                     "ports are published through the bridge network; start {} with --network bridge",
+                    args.name
+                );
+            }
+            if record.network == Network::Bridge
+                && record.mode == Mode::App
+                && record.backend == BackendChoice::Mstack
+            {
+                bail!(
+                    "{} is an mstack app: managed user namespaces cannot join the network namespace prepared for the bridge; pull it again with --backend overlay, or start it with --network host",
                     args.name
                 );
             }
@@ -161,7 +164,10 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
             let files = if record.network == Network::Bridge {
                 bridge::up(config, &sd).await?;
                 bridge::check_port_conflicts(&store, &sd, &record).await?;
-                bridge::prepare_machine(&store, config, &mut record)?;
+                let addr = bridge::prepare_machine(&store, config, &mut record)?;
+                if record.mode == Mode::App {
+                    bridge::create_netns(config, &args.name, addr)?;
+                }
                 Some(store.machine_files_dir(&args.name))
             } else {
                 None
@@ -292,6 +298,7 @@ pub async fn stop(args: StopArgs, config: &Config) -> Result<()> {
             .await?;
         hostnet::release(&sd, &admitted).await;
         if record.as_ref().map(|r| r.network) == Some(Network::Bridge) {
+            bridge::delete_netns(&args.name);
             bridge::sync_ports(&store, &sd).await?;
         }
     }

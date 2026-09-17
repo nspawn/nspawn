@@ -74,6 +74,7 @@ pub async fn rm(args: ImagesRmArgs, config: &Config) -> Result<()> {
             Some(rec) => {
                 assembler.remove(name, rec.backend).await?;
                 store.remove_machine_files(name)?;
+                bridge::delete_netns(name);
                 store.remove_record(name)?;
             }
             None => sd.remove_image(name).await?,

@@ -41,21 +41,28 @@ pub async fn install(
             blob: store.blob_path(&d.digest),
         })
         .collect();
-    let assembler = Assembler { store, sd };
-    let trees = assembler.assemble(backend, spec.name, &layers).await?;
-
     let config_path = store.blob_path(&spec.manifest.config.digest);
     let config =
         fs::read(&config_path).with_context(|| format!("reading {}", config_path.display()))?;
     let run = RunSpec::from_config(&config)?;
+    // An mstack image runs with managed user namespaces, which cannot join the network
+    // namespace prepared for app machines on the bridge; apps get overlay instead. Whether
+    // the image is an app is known before extraction when its command says so.
+    let surely_app = spec.mode == Some(Mode::App)
+        || (spec.mode.is_none() && detect_mode(true, &run.command) == Mode::App);
+    let backend = if backend == Backend::Mstack && surely_app {
+        eprintln!("note: {} runs a program rather than an init system; assembling it as overlay, since mstack machines cannot join the bridge network", spec.name);
+        Backend::Overlay
+    } else {
+        backend
+    };
+    let assembler = Assembler { store, sd };
+    let trees = assembler.assemble(backend, spec.name, &layers).await?;
     let mode = spec
         .mode
         .unwrap_or_else(|| detect_mode(has_init(&trees), &run.command));
-    // App images have no network stack of their own worth configuring; share the host's.
-    let network = match mode {
-        Mode::Boot => Network::Bridge,
-        Mode::App => Network::Host,
-    };
+    // Both kinds join the bridge, like docker; --network host is one flag away.
+    let network = Network::Bridge;
     settings::write(&MachineSettings {
         name: spec.name,
         managed_userns: backend == Backend::Mstack,

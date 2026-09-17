@@ -54,6 +54,11 @@ pub fn render(s: &MachineSettings) -> String {
     );
     if s.managed_userns {
         out.push_str("PrivateUsers=managed\n");
+    } else if s.mode == Mode::App && s.network == Network::Bridge && s.bridge.is_some() {
+        // A user namespace cannot join the network namespace prepared on the host
+        // (EPERM: it belongs to the initial user namespace), so app machines on the
+        // bridge run without one, as docker does.
+        out.push_str("PrivateUsers=no\n");
     }
     match s.mode {
         Mode::Boot => out.push_str("Boot=yes\n"),
@@ -85,10 +90,18 @@ pub fn render(s: &MachineSettings) -> String {
         Network::Bridge => {
             if let Some(b) = &s.bridge {
                 let files = b.files.display();
-                out.push_str(&format!(
-                    "\n[Network]\nBridge={}\n\n[Files]\nBindReadOnly={files}/host0.network:/run/systemd/network/10-host0.network\nBindReadOnly={files}/hosts:/etc/hosts\n",
-                    b.bridge
-                ));
+                match s.mode {
+                    // systemd-networkd inside configures host0 from the mounted file.
+                    Mode::Boot => out.push_str(&format!(
+                        "\n[Network]\nBridge={}\n\n[Files]\nBindReadOnly={files}/host0.network:/run/systemd/network/10-host0.network\nBindReadOnly={files}/hosts:/etc/hosts\n",
+                        b.bridge
+                    )),
+                    // Nothing inside to configure anything: the namespace comes ready.
+                    Mode::App => out.push_str(&format!(
+                        "\n[Network]\nNamespacePath={}\n\n[Files]\nBindReadOnly={files}/hosts:/etc/hosts\nBindReadOnly={files}/resolv.conf:/etc/resolv.conf\n",
+                        crate::bridge::netns_path(s.name)
+                    )),
+                }
             }
         }
         Network::Veth => {}
@@ -181,6 +194,23 @@ mod tests {
         assert!(
             bridged.ends_with("BindReadOnly=/var/lib/nspawn/machines/fedora-44/hosts:/etc/hosts\n")
         );
+
+        let app_bridged = render(&MachineSettings {
+            name: "web",
+            managed_userns: false,
+            mode: Mode::App,
+            run: &run,
+            command_override: None,
+            network: Network::Bridge,
+            bridge: Some(BridgeMount {
+                bridge: "nspawn0",
+                files: Path::new("/var/lib/nspawn/machines/web"),
+            }),
+        });
+        assert!(app_bridged.contains("[Exec]\nPrivateUsers=no\nBoot=no\n"));
+        assert!(app_bridged.contains("[Network]\nNamespacePath=/run/netns/nspawn-web\n"));
+        assert!(!app_bridged.contains("Bridge="));
+        assert!(app_bridged.ends_with("BindReadOnly=/var/lib/nspawn/machines/web/hosts:/etc/hosts\nBindReadOnly=/var/lib/nspawn/machines/web/resolv.conf:/etc/resolv.conf\n"));
 
         let run = RunSpec {
             command: vec!["nginx".into(), "-g".into(), "daemon off;".into()],
