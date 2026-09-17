@@ -2,9 +2,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
-use crate::cli::{ExecArgs, ShellArgs, StartArgs, StopArgs};
+use crate::backend::{ensure_mstack_settings, NSRESOURCED_SOCKET_UNIT};
+use crate::cli::{BackendChoice, ExecArgs, ShellArgs, StartArgs, StopArgs};
+use crate::config::Config;
 use crate::output::table;
 use crate::pty;
+use crate::store::Store;
 use crate::systemd::Systemd;
 
 pub async fn ls() -> Result<()> {
@@ -24,10 +27,19 @@ pub async fn ls() -> Result<()> {
     Ok(())
 }
 
-pub async fn start(args: StartArgs) -> Result<()> {
+pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
     let sd = Systemd::connect().await?;
     if sd.machine_exists(&args.name).await? {
         bail!("machine {} is already running", args.name);
+    }
+    let store = Store::new(&config.machines_dir, &config.state_dir);
+    if let Some(record) = store.load_image(&args.name)? {
+        if record.backend == BackendChoice::Mstack {
+            // Managed user namespaces come from nsresourced, which is socket activated but
+            // not necessarily enabled; the settings file is written again if it went missing.
+            ensure_mstack_settings(&args.name)?;
+            sd.start_unit(NSRESOURCED_SOCKET_UNIT).await?;
+        }
     }
     sd.start_machine(&args.name).await?;
     if args.wait {

@@ -101,12 +101,8 @@ impl Systemd {
     }
 
     pub async fn start_machine(&self, name: &str) -> Result<()> {
-        let unit = format!("systemd-nspawn@{name}.service");
-        self.manager
-            .start_unit(unit.clone(), "replace".to_string())
+        self.start_unit(&format!("systemd-nspawn@{name}.service"))
             .await
-            .with_context(|| format!("starting {unit}"))?;
-        Ok(())
     }
 
     /// Asks the machine to power off cleanly (SIGRTMIN+4 to its init, like machinectl poweroff).
@@ -138,6 +134,21 @@ impl Systemd {
             .context("reloading systemd units")
     }
 
+    /// Starts a unit and waits until systemd reports the start job finished.
+    pub async fn start_unit(&self, unit: &str) -> Result<()> {
+        let mut jobs = self
+            .manager
+            .receive_job_removed()
+            .await
+            .context("subscribing to job events")?;
+        let job = self
+            .manager
+            .start_unit(unit.to_string(), "replace".to_string())
+            .await
+            .with_context(|| format!("starting {unit}"))?;
+        wait_for_job(&mut jobs, &job, unit, "starting").await
+    }
+
     /// Stops a unit and waits until systemd reports the stop job finished. Unknown units
     /// (never loaded) are treated as already stopped.
     pub async fn stop_unit(&self, unit: &str) -> Result<()> {
@@ -159,21 +170,7 @@ impl Systemd {
             }
             Err(e) => return Err(e).with_context(|| format!("stopping {unit}")),
         };
-        let wait = async {
-            while let Some(event) = jobs.next().await {
-                if let Ok(args) = event.args() {
-                    if *args.job() == job {
-                        return args.result().to_string();
-                    }
-                }
-            }
-            "lost".to_string()
-        };
-        match tokio::time::timeout(std::time::Duration::from_secs(90), wait).await {
-            Ok(result) if result == "done" || result == "skipped" => Ok(()),
-            Ok(result) => bail!("stopping {unit} ended with result {result}"),
-            Err(_) => bail!("timed out waiting for {unit} to stop"),
-        }
+        wait_for_job(&mut jobs, &job, unit, "stopping").await
     }
 
     /// Opens a PTY inside the machine running `path` with `args` (argv including argv[0]).
@@ -201,5 +198,28 @@ impl Systemd {
             .await
             .with_context(|| format!("opening a shell in {name}"))?;
         Ok((fd.into(), pty))
+    }
+}
+
+async fn wait_for_job(
+    jobs: &mut zbus_systemd::systemd1::JobRemovedStream,
+    job: &zbus::zvariant::OwnedObjectPath,
+    unit: &str,
+    verb: &str,
+) -> Result<()> {
+    let wait = async {
+        while let Some(event) = jobs.next().await {
+            if let Ok(args) = event.args() {
+                if args.job() == job {
+                    return args.result().to_string();
+                }
+            }
+        }
+        "lost".to_string()
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(90), wait).await {
+        Ok(result) if result == "done" || result == "skipped" => Ok(()),
+        Ok(result) => bail!("{verb} {unit} ended with result {result}"),
+        Err(_) => bail!("timed out while {verb} {unit}"),
     }
 }
