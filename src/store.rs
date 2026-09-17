@@ -52,7 +52,9 @@ impl Store {
         ] {
             fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
         }
-        Ok(())
+        fs::create_dir_all(&self.machines_dir)
+            .with_context(|| format!("creating {}", self.machines_dir.display()))?;
+        check_writable(&self.machines_dir)
     }
 
     pub fn layers_dir(&self) -> PathBuf {
@@ -90,7 +92,8 @@ impl Store {
 
     /// The manifest exactly as fetched or built, so its digest stays valid when pushing.
     pub fn save_manifest(&self, name: &str, bytes: &[u8]) -> Result<()> {
-        fs::create_dir_all(self.manifests_dir())?;
+        fs::create_dir_all(self.manifests_dir())
+            .with_context(|| format!("creating {}", self.manifests_dir().display()))?;
         let path = self.manifests_dir().join(format!("{name}.json"));
         fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))
     }
@@ -149,9 +152,9 @@ impl Store {
             .layers_dir()
             .join(format!(".tmp-{}", layer_dir_name(digest)));
         if tmp.exists() {
-            fs::remove_dir_all(&tmp)?;
+            fs::remove_dir_all(&tmp).with_context(|| format!("removing {}", tmp.display()))?;
         }
-        fs::create_dir_all(&tmp)?;
+        fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         extract_layer(blob, media_type, &tmp, WhiteoutMode::OverlayLower)
             .with_context(|| format!("extracting layer {digest}"))?;
         fs::rename(&tmp, &dest)
@@ -264,6 +267,38 @@ impl Store {
     }
 }
 
+/// Fails early, with an explanation, when nothing can be created below `dir`. The classic
+/// case is a btrfs "empty subvolume" placeholder: after booting from a snapshot of the root
+/// subvolume, nested subvolumes such as /var/lib/machines turn into empty, immutable
+/// directories with inode 2.
+pub fn check_writable(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let probe = dir.join(".nspawn-write-test");
+    let _ = fs::remove_dir(&probe);
+    match fs::create_dir(&probe) {
+        Ok(()) => {
+            let _ = fs::remove_dir(&probe);
+            Ok(())
+        }
+        Err(e) => {
+            let inode = fs::metadata(dir).map(|m| m.ino()).unwrap_or(0);
+            Err(anyhow::anyhow!(e)).context(explain_unwritable(dir, inode))
+        }
+    }
+}
+
+pub fn explain_unwritable(dir: &Path, inode: u64) -> String {
+    if inode == 2 {
+        format!(
+            "{d} is an empty btrfs subvolume placeholder (inode 2), typically left behind when the root \
+             subvolume was restored from a snapshot; recreate it with: rmdir {d} && btrfs subvolume create {d}",
+            d = dir.display()
+        )
+    } else {
+        format!("cannot create directories below {}", dir.display())
+    }
+}
+
 pub fn layer_dir_name(digest: &str) -> String {
     digest.replacen(':', "-", 1)
 }
@@ -369,14 +404,15 @@ fn handle_whiteout(target: &Path, whiteout: Whiteout, mode: WhiteoutMode) -> Res
         (WhiteoutMode::Apply, Whiteout::File(path)) => remove_any(&target.join(path))?,
         (WhiteoutMode::OverlayLower, Whiteout::Opaque(dir)) => {
             let dir = target.join(dir);
-            fs::create_dir_all(&dir)?;
+            fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
             xattr::set(&dir, "trusted.overlay.opaque", b"y")
                 .with_context(|| format!("marking {} as opaque", dir.display()))?;
         }
         (WhiteoutMode::OverlayLower, Whiteout::File(path)) => {
             let node = target.join(path);
             if let Some(parent) = node.parent() {
-                fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
             }
             remove_any(&node)?;
             mknod(&node, SFlag::S_IFCHR, Mode::empty(), 0)
@@ -427,6 +463,19 @@ mod tests {
             }
         }
         builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn writable_check_and_btrfs_placeholder_explanation() {
+        let tmp = tempfile::tempdir().unwrap();
+        check_writable(tmp.path()).unwrap();
+        assert!(!tmp.path().join(".nspawn-write-test").exists());
+        let msg = explain_unwritable(Path::new("/var/lib/machines"), 2);
+        assert!(msg.contains("btrfs subvolume placeholder"));
+        assert!(msg.contains("rmdir /var/lib/machines && btrfs subvolume create /var/lib/machines"));
+        assert!(explain_unwritable(Path::new("/x"), 300)
+            .starts_with("cannot create directories below /x"));
+        assert!(check_writable(Path::new("/proc")).is_err());
     }
 
     #[test]

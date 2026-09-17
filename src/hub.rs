@@ -128,7 +128,7 @@ impl Hub {
         bar.set_message(short_digest(&layer.digest));
 
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         let mut file = tokio::fs::File::create(dest)
             .await
@@ -138,7 +138,9 @@ impl Hub {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.with_context(|| format!("downloading layer {}", layer.digest))?;
             hasher.update(&chunk);
-            file.write_all(&chunk).await?;
+            file.write_all(&chunk)
+                .await
+                .with_context(|| format!("writing {}", dest.display()))?;
             bar.inc(chunk.len() as u64);
         }
         file.flush().await?;
