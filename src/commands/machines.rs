@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
-use crate::backend::{ensure_mstack_settings, NSRESOURCED_SOCKET_UNIT};
+use crate::backend::{ensure_mstack_settings, MANAGED_NS_SOCKETS};
 use crate::cli::{BackendChoice, ExecArgs, ShellArgs, StartArgs, StopArgs};
 use crate::config::Config;
 use crate::output::table;
@@ -38,7 +38,9 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
             // Managed user namespaces come from nsresourced, which is socket activated but
             // not necessarily enabled; the settings file is written again if it went missing.
             ensure_mstack_settings(&args.name)?;
-            sd.start_unit(NSRESOURCED_SOCKET_UNIT).await?;
+            for unit in MANAGED_NS_SOCKETS {
+                sd.start_unit(unit).await?;
+            }
         }
     }
     sd.start_machine(&args.name).await?;

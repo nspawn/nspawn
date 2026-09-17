@@ -36,7 +36,7 @@ stays safe.
 
 | Backend | Requirements | What it creates |
 |---|---|---|
-| `mstack` | systemd 261 or newer with systemd-nsresourced installed | `<name>.mstack/` with `layer@N` symlinks and `rw/`, plus `/etc/systemd/nspawn/<name>.nspawn` setting `PrivateUsers=managed` (the stock template's `-U` is rejected by `--mstack=`); `start` activates `systemd-nsresourced.socket` |
+| `mstack` | systemd 261 or newer with systemd-nsresourced installed | `<name>.mstack/` with `layer@N` symlinks and `rw/`, plus `/etc/systemd/nspawn/<name>.nspawn` setting `PrivateUsers=managed` (the stock template's `-U` is rejected by `--mstack=`); `start` activates `systemd-nsresourced.socket` and `systemd-mountfsd.socket` |
 | `overlay` | any systemd with overlayfs | a `.mount` unit that overlays the layers with a writable upper directory, plus a drop-in so `systemd-nspawn@<name>.service` requires it |
 | `flat` | nothing | the layers extracted into `/var/lib/machines/<name>` |
 

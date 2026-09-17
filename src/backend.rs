@@ -14,9 +14,13 @@ use crate::unitname;
 
 pub const UNIT_DIR: &str = "/etc/systemd/system";
 pub const NSPAWN_SETTINGS_DIR: &str = "/etc/systemd/nspawn";
-pub const NSRESOURCED_SOCKET_UNIT: &str = "systemd-nsresourced.socket";
-const NSRESOURCED_SOCKET_PATH: &str = "/run/systemd/io.systemd.NamespaceResource";
-const NSRESOURCED_UNIT_FILE: &str = "/usr/lib/systemd/system/systemd-nsresourced.socket";
+/// Managed user namespaces need systemd-nsresourced (UID range delegation) and
+/// systemd-mountfsd (the actual mounts); both are socket activated and shipped disabled.
+pub const MANAGED_NS_SOCKETS: [&str; 2] = ["systemd-nsresourced.socket", "systemd-mountfsd.socket"];
+const MANAGED_NS_UNIT_FILES: [&str; 2] = [
+    "/usr/lib/systemd/system/systemd-nsresourced.socket",
+    "/usr/lib/systemd/system/systemd-mountfsd.socket",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
@@ -87,8 +91,8 @@ pub fn overlay_supported() -> bool {
         .unwrap_or(false)
 }
 
-/// mstack images boot with managed user namespaces, which systemd-nsresourced provides; the
-/// socket is started on demand, so it only has to be installed.
+/// mstack images boot with managed user namespaces; the sockets are started on demand, so
+/// the units only have to be installed.
 async fn mstack_supported(sd: &Systemd) -> bool {
     let new_enough = sd
         .version()
@@ -96,9 +100,7 @@ async fn mstack_supported(sd: &Systemd) -> bool {
         .ok()
         .and_then(|v| systemd_major(&v))
         .is_some_and(|m| m >= 261);
-    new_enough
-        && (Path::new(NSRESOURCED_SOCKET_PATH).exists()
-            || Path::new(NSRESOURCED_UNIT_FILE).exists())
+    new_enough && MANAGED_NS_UNIT_FILES.iter().all(|f| Path::new(f).exists())
 }
 
 /// The systemd-nspawn@.service template runs with -U (private-users=pick), which
