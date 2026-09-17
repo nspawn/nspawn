@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use anyhow::{bail, Result};
 
 use crate::backend::Assembler;
+use crate::bridge;
 use crate::cli::ImagesRmArgs;
 use crate::commands::require_root;
 use crate::config::Config;
@@ -72,12 +73,14 @@ pub async fn rm(args: ImagesRmArgs, config: &Config) -> Result<()> {
         match store.load_image(name)? {
             Some(rec) => {
                 assembler.remove(name, rec.backend).await?;
+                store.remove_machine_files(name)?;
                 store.remove_record(name)?;
             }
             None => sd.remove_image(name).await?,
         }
         println!("removed {name}");
     }
+    bridge::write_hosts_files(&store, config)?;
     let gone = store.gc_layers()?;
     if !gone.is_empty() {
         println!("freed {} unused layer(s)", gone.len());

@@ -5,6 +5,7 @@
 //! systemd-machined and systemd itself, never through machinectl.
 
 mod backend;
+mod bridge;
 mod cli;
 mod commands;
 mod config;

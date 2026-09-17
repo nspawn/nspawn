@@ -88,17 +88,24 @@ pub async fn machine_interfaces(sd: &Systemd, name: &str) -> Result<Vec<String>>
 pub async fn admit(sd: &Systemd, name: &str) -> Result<Vec<String>> {
     let interfaces = machine_interfaces(sd, name).await?;
     for ifname in &interfaces {
-        match zone_call(sd, "addInterface", ifname).await {
-            Ok(()) => {}
-            Err(zbus::Error::MethodError(_, Some(message), _))
-                if message.contains("ZONE_ALREADY_SET") => {}
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("adding {ifname} to the {ZONE} zone of firewalld"))
-            }
-        }
+        trust_interface(sd, ifname).await?;
     }
     Ok(interfaces)
+}
+
+/// Binds one host interface to the trusted zone of firewalld (runtime configuration).
+pub async fn trust_interface(sd: &Systemd, ifname: &str) -> Result<()> {
+    match zone_call(sd, "addInterface", ifname).await {
+        Ok(()) => Ok(()),
+        Err(zbus::Error::MethodError(_, Some(message), _))
+            if message.contains("ZONE_ALREADY_SET") =>
+        {
+            Ok(())
+        }
+        Err(e) => {
+            Err(e).with_context(|| format!("adding {ifname} to the {ZONE} zone of firewalld"))
+        }
+    }
 }
 
 /// Undoes `admit` once the machine is gone. Best effort: the interface no longer exists.

@@ -1,11 +1,13 @@
 //! Configuration: defaults, /etc/nspawn/nspawn.toml, environment and flags.
 
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::bridge::Subnet;
 use crate::cli::BackendChoice;
 
 pub const DEFAULT_REGISTRY: &str = "hub.nspawn.org";
@@ -15,6 +17,8 @@ pub const DEFAULT_MACHINES_DIR: &str = "/var/lib/machines";
 /// purpose: machined would list a hidden directory there as an image and `machinectl clean`
 /// would delete it.
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/nspawn";
+pub const DEFAULT_BRIDGE: &str = "nspawn0";
+pub const DEFAULT_SUBNET: &str = "10.99.0.0/24";
 
 /// What the configuration file may contain. Every field is optional.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -25,6 +29,12 @@ pub struct FileConfig {
     pub backend: Option<BackendChoice>,
     pub machines_dir: Option<PathBuf>,
     pub state_dir: Option<PathBuf>,
+    /// Name of the bridge the machines join.
+    pub bridge: Option<String>,
+    /// IPv4 subnet of the bridge; the first address is the bridge's own.
+    pub subnet: Option<String>,
+    /// DNS servers handed to the machines (default: the host's upstream servers).
+    pub dns: Option<Vec<IpAddr>>,
 }
 
 /// Effective configuration after merging file, environment and command line.
@@ -35,6 +45,9 @@ pub struct Config {
     pub backend: BackendChoice,
     pub machines_dir: PathBuf,
     pub state_dir: PathBuf,
+    pub bridge: String,
+    pub subnet: Subnet,
+    pub dns: Vec<IpAddr>,
 }
 
 impl Config {
@@ -55,7 +68,7 @@ impl Config {
                 }
             }
         };
-        Ok(Self::merge(file, registry, ca_cert))
+        Self::merge(file, registry, ca_cert)
     }
 
     fn read_file(path: &Path) -> Result<FileConfig> {
@@ -65,8 +78,18 @@ impl Config {
     }
 
     /// Command line values win over the file, the file over the defaults.
-    pub fn merge(file: FileConfig, registry: Option<String>, ca_cert: Option<PathBuf>) -> Self {
-        Config {
+    pub fn merge(
+        file: FileConfig,
+        registry: Option<String>,
+        ca_cert: Option<PathBuf>,
+    ) -> Result<Self> {
+        let subnet = file
+            .subnet
+            .as_deref()
+            .unwrap_or(DEFAULT_SUBNET)
+            .parse()
+            .context("subnet in the configuration")?;
+        Ok(Config {
             registry: registry
                 .or(file.registry)
                 .unwrap_or_else(|| DEFAULT_REGISTRY.to_string()),
@@ -78,7 +101,10 @@ impl Config {
             state_dir: file
                 .state_dir
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
-        }
+            bridge: file.bridge.unwrap_or_else(|| DEFAULT_BRIDGE.to_string()),
+            subnet,
+            dns: file.dns.unwrap_or_default(),
+        })
     }
 }
 
@@ -88,8 +114,11 @@ mod tests {
 
     #[test]
     fn defaults_when_nothing_is_set() {
-        let c = Config::merge(FileConfig::default(), None, None);
+        let c = Config::merge(FileConfig::default(), None, None).unwrap();
         assert_eq!(c.registry, DEFAULT_REGISTRY);
+        assert_eq!(c.bridge, "nspawn0");
+        assert_eq!(c.subnet.to_string(), "10.99.0.0/24");
+        assert!(c.dns.is_empty());
         assert_eq!(c.backend, BackendChoice::Auto);
         assert_eq!(c.machines_dir, PathBuf::from(DEFAULT_MACHINES_DIR));
         assert!(c.ca_cert.is_none());
@@ -99,10 +128,13 @@ mod tests {
     #[test]
     fn command_line_wins_over_file() {
         let file: FileConfig = toml::from_str(
-            "registry = \"file.example\"\nca_cert = \"/a.pem\"\nbackend = \"overlay\"\nmachines_dir = \"/srv/m\"\nstate_dir = \"/srv/s\"\n",
+            "registry = \"file.example\"\nca_cert = \"/a.pem\"\nbackend = \"overlay\"\nmachines_dir = \"/srv/m\"\nstate_dir = \"/srv/s\"\nbridge = \"br-lab\"\nsubnet = \"172.30.5.0/24\"\ndns = [\"10.0.0.53\"]\n",
         )
         .unwrap();
-        let c = Config::merge(file, Some("cli.example".into()), None);
+        let c = Config::merge(file, Some("cli.example".into()), None).unwrap();
+        assert_eq!(c.bridge, "br-lab");
+        assert_eq!(c.subnet.to_string(), "172.30.5.0/24");
+        assert_eq!(c.dns, vec!["10.0.0.53".parse::<IpAddr>().unwrap()]);
         assert_eq!(c.registry, "cli.example");
         assert_eq!(c.ca_cert, Some(PathBuf::from("/a.pem")));
         assert_eq!(c.backend, BackendChoice::Overlay);
@@ -113,5 +145,7 @@ mod tests {
     #[test]
     fn unknown_keys_are_rejected() {
         assert!(toml::from_str::<FileConfig>("registri = \"x\"\n").is_err());
+        let bad: FileConfig = toml::from_str("subnet = \"10.0.0.0/33\"\n").unwrap();
+        assert!(Config::merge(bad, None, None).is_err());
     }
 }

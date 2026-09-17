@@ -1,0 +1,568 @@
+//! The nspawn bridge: a docker0 style network for the machines, run by nspawn itself so
+//! that it behaves the same whatever manages the host's network (systemd-networkd,
+//! NetworkManager or nothing at all).
+//!
+//! The bridge carries the first address of the subnet. Every machine gets a fixed address
+//! from the same subnet, handed to the systemd-networkd inside it through a .network file
+//! mounted at /run/systemd/network/10-host0.network, plus a generated /etc/hosts with the
+//! names of all the machines on the bridge. Outgoing traffic is masqueraded and published
+//! ports are DNAT'ed in the nftables table `ip nspawn`; loopback access to published ports
+//! works through route_localnet, as docker does without its userland proxy.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::fs;
+use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::str::FromStr;
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::config::Config;
+use crate::hostnet;
+use crate::settings::Network;
+use crate::store::{ImageRecord, Store};
+use crate::systemd::Systemd;
+
+pub const TABLE: &str = "nspawn";
+/// Name the machines can use for the host, like host.docker.internal.
+pub const HOST_NAME: &str = "host.nspawn.internal";
+const FALLBACK_DNS: [IpAddr; 2] = [
+    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+    IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+];
+
+/// An IPv4 subnet in CIDR notation, for example 10.99.0.0/24.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subnet {
+    pub network: Ipv4Addr,
+    pub prefix: u8,
+}
+
+impl Subnet {
+    fn mask(&self) -> u32 {
+        u32::MAX << (32 - self.prefix)
+    }
+
+    /// The bridge's own address: the first usable one.
+    pub fn gateway(&self) -> Ipv4Addr {
+        Ipv4Addr::from(u32::from(self.network) + 1)
+    }
+
+    pub fn contains(&self, addr: Ipv4Addr) -> bool {
+        u32::from(addr) & self.mask() == u32::from(self.network)
+    }
+
+    /// The lowest address not in `used`, leaving out the network, the gateway and the
+    /// broadcast address.
+    pub fn allocate(&self, used: &[Ipv4Addr]) -> Result<Ipv4Addr> {
+        let first = u32::from(self.network) + 2;
+        let last = (u32::from(self.network) | !self.mask()) - 1;
+        (first..=last)
+            .map(Ipv4Addr::from)
+            .find(|a| !used.contains(a))
+            .with_context(|| format!("no free address left in {self}"))
+    }
+}
+
+impl FromStr for Subnet {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        let (addr, prefix) = text
+            .split_once('/')
+            .with_context(|| format!("{text}: expected ADDRESS/PREFIX"))?;
+        let addr: Ipv4Addr = addr
+            .parse()
+            .with_context(|| format!("{text}: bad IPv4 address"))?;
+        let prefix: u8 = prefix
+            .parse()
+            .with_context(|| format!("{text}: bad prefix length"))?;
+        if !(8..=30).contains(&prefix) {
+            bail!("{text}: the prefix length must be between 8 and 30");
+        }
+        let mask = u32::MAX << (32 - prefix);
+        Ok(Subnet {
+            network: Ipv4Addr::from(u32::from(addr) & mask),
+            prefix,
+        })
+    }
+}
+
+impl fmt::Display for Subnet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.network, self.prefix)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    Tcp,
+    Udp,
+}
+
+impl Protocol {
+    pub fn name(self) -> &'static str {
+        match self {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+        }
+    }
+}
+
+/// A port published on the host, like docker's -p: HOST:CONTAINER[/udp].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortMap {
+    pub host: u16,
+    pub container: u16,
+    pub protocol: Protocol,
+}
+
+impl FromStr for PortMap {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        let (ports, protocol) = match text.rsplit_once('/') {
+            Some((ports, proto)) => (ports, proto),
+            None => (text, "tcp"),
+        };
+        let protocol = match protocol {
+            "tcp" => Protocol::Tcp,
+            "udp" => Protocol::Udp,
+            other => bail!("{text}: unknown protocol {other} (tcp or udp)"),
+        };
+        let (host, container) = match ports.split_once(':') {
+            Some((host, container)) => (host, container),
+            None => (ports, ports),
+        };
+        if host.contains(':') || container.contains(':') {
+            bail!("{text}: binding to one host address is not supported; ports are published on every address of the host");
+        }
+        let port = |s: &str| {
+            s.parse::<u16>()
+                .ok()
+                .filter(|p| *p > 0)
+                .with_context(|| format!("{text}: bad port {s}"))
+        };
+        Ok(PortMap {
+            host: port(host)?,
+            container: port(container)?,
+            protocol,
+        })
+    }
+}
+
+impl fmt::Display for PortMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}->{}/{}",
+            self.host,
+            self.container,
+            self.protocol.name()
+        )
+    }
+}
+
+/// Parses the -p/--publish values; "none" alone clears the list.
+pub fn parse_publish(values: &[String]) -> Result<Vec<PortMap>> {
+    if values.len() == 1 && values[0] == "none" {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<PortMap> = Vec::new();
+    for value in values {
+        let p: PortMap = value.parse()?;
+        if out
+            .iter()
+            .any(|o| o.host == p.host && o.protocol == p.protocol)
+        {
+            bail!("host port {}/{} given twice", p.host, p.protocol.name());
+        }
+        out.push(p);
+    }
+    Ok(out)
+}
+
+/// Creates the bridge with its address, forwarding, the NAT table and the firewalld
+/// exception. Safe to repeat: everything is idempotent.
+pub async fn up(config: &Config, sd: &Systemd) -> Result<()> {
+    let name = config.bridge.as_str();
+    let subnet = config.subnet;
+    if !Path::new("/sys/class/net").join(name).exists() {
+        run("ip", &["link", "add", name, "type", "bridge"])?;
+    }
+    let address = format!("{}/{}", subnet.gateway(), subnet.prefix);
+    run("ip", &["addr", "replace", &address, "dev", name])?;
+    run("ip", &["link", "set", name, "up"])?;
+    sysctl("net/ipv4/ip_forward", "1")?;
+    sysctl(&format!("net/ipv4/conf/{name}/route_localnet"), "1")?;
+    nft(&base_ruleset(name, subnet))?;
+    if hostnet::firewalld_running(sd).await {
+        hostnet::trust_interface(sd, name).await?;
+    }
+    Ok(())
+}
+
+/// The nftables table: DNAT of published ports (from outside and from the host itself,
+/// loopback included) and masquerading of what leaves the bridge.
+pub fn base_ruleset(bridge: &str, subnet: Subnet) -> String {
+    format!(
+        "table ip {TABLE} {{
+	map ports {{
+		type inet_proto . inet_service : ipv4_addr . inet_service
+	}}
+	chain prerouting {{
+		type nat hook prerouting priority dstnat; policy accept;
+	}}
+	chain output {{
+		type nat hook output priority dstnat; policy accept;
+	}}
+	chain postrouting {{
+		type nat hook postrouting priority srcnat; policy accept;
+	}}
+}}
+flush chain ip {TABLE} prerouting
+flush chain ip {TABLE} output
+flush chain ip {TABLE} postrouting
+add rule ip {TABLE} prerouting fib daddr type local dnat ip to meta l4proto . th dport map @ports
+add rule ip {TABLE} output fib daddr type local dnat ip to meta l4proto . th dport map @ports
+add rule ip {TABLE} postrouting ip saddr {subnet} oifname != \"{bridge}\" masquerade
+add rule ip {TABLE} postrouting ip saddr 127.0.0.0/8 oifname \"{bridge}\" masquerade
+"
+    )
+}
+
+fn run(program: &str, args: &[&str]) -> Result<()> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("running {program} (is it installed?)"))?;
+    if !output.status.success() {
+        bail!(
+            "{program} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn nft(script: &str) -> Result<()> {
+    let mut child = Command::new("nft")
+        .args(["-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("running nft (is nftables installed?)")?;
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(script.as_bytes())
+        .context("feeding nft")?;
+    let output = child.wait_with_output().context("waiting for nft")?;
+    if !output.status.success() {
+        bail!(
+            "nft rejected the rules: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn table_exists() -> bool {
+    Command::new("nft")
+        .args(["list", "table", "ip", TABLE])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn sysctl(key: &str, value: &str) -> Result<()> {
+    let path = format!("/proc/sys/{key}");
+    fs::write(&path, value).with_context(|| format!("writing {path}"))
+}
+
+/// The .network file for host0 inside a machine: fixed address, the bridge as gateway.
+pub fn network_file(addr: Ipv4Addr, subnet: Subnet, dns: &[IpAddr]) -> String {
+    let mut out = format!(
+        "# Generated by nspawn; do not edit.\n[Match]\nName=host0\n\n[Network]\nAddress={addr}/{}\nGateway={}\nLLMNR=yes\n",
+        subnet.prefix,
+        subnet.gateway()
+    );
+    for server in dns {
+        out.push_str(&format!("DNS={server}\n"));
+    }
+    out
+}
+
+/// The /etc/hosts of one machine: itself, the host and every other machine on the bridge.
+pub fn hosts_file(
+    name: &str,
+    addr: Ipv4Addr,
+    gateway: Ipv4Addr,
+    members: &BTreeMap<String, Ipv4Addr>,
+) -> String {
+    let mut out = format!(
+        "# Generated by nspawn; do not edit.\n127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n{addr} {name}\n{gateway} {HOST_NAME}\n"
+    );
+    for (other, other_addr) in members {
+        if other != name {
+            out.push_str(&format!("{other_addr} {other}\n"));
+        }
+    }
+    out
+}
+
+/// DNS servers for the machines: the configured ones, else the host's upstream servers,
+/// else public resolvers (the host's loopback resolver is out of reach from a machine).
+pub fn upstream_dns(configured: &[IpAddr]) -> Vec<IpAddr> {
+    if !configured.is_empty() {
+        return configured.to_vec();
+    }
+    for path in ["/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"] {
+        if let Ok(text) = fs::read_to_string(path) {
+            let servers = nameservers(&text);
+            if !servers.is_empty() {
+                return servers;
+            }
+        }
+    }
+    eprintln!(
+        "warning: no DNS server reachable from the machines found on the host; using {} and {} (set dns in nspawn.toml)",
+        FALLBACK_DNS[0], FALLBACK_DNS[1]
+    );
+    FALLBACK_DNS.to_vec()
+}
+
+fn nameservers(resolv_conf: &str) -> Vec<IpAddr> {
+    resolv_conf
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.next() == Some("nameserver"))
+                .then(|| words.next())
+                .flatten()
+        })
+        .filter_map(|word| word.parse::<IpAddr>().ok())
+        .filter(|addr| !addr.is_loopback())
+        .collect()
+}
+
+/// Gives the machine its address if it has none, writes its .network file and refreshes
+/// the hosts files of every machine on the bridge. The record is saved when it changes.
+pub fn prepare_machine(
+    store: &Store,
+    config: &Config,
+    record: &mut ImageRecord,
+) -> Result<Ipv4Addr> {
+    let addr = match record.address.filter(|a| config.subnet.contains(*a)) {
+        Some(addr) => addr,
+        None => {
+            let used: Vec<Ipv4Addr> = store
+                .list_images()?
+                .iter()
+                .filter(|r| r.name != record.name)
+                .filter_map(|r| r.address)
+                .collect();
+            let addr = config.subnet.allocate(&used)?;
+            record.address = Some(addr);
+            store.record_image(record)?;
+            addr
+        }
+    };
+    let dir = store.machine_files_dir(&record.name);
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let network = dir.join("host0.network");
+    fs::write(
+        &network,
+        network_file(addr, config.subnet, &upstream_dns(&config.dns)),
+    )
+    .with_context(|| format!("writing {}", network.display()))?;
+    write_hosts_files(store, config)?;
+    Ok(addr)
+}
+
+/// Rewrites the hosts file of every machine on the bridge in place, so that running
+/// machines see the change through their bind mount.
+pub fn write_hosts_files(store: &Store, config: &Config) -> Result<()> {
+    let members: BTreeMap<String, Ipv4Addr> = store
+        .list_images()?
+        .into_iter()
+        .filter(|r| r.network == Network::Bridge)
+        .filter_map(|r| r.address.map(|a| (r.name, a)))
+        .collect();
+    for (name, addr) in &members {
+        let dir = store.machine_files_dir(name);
+        if !dir.is_dir() {
+            continue; // never started on the bridge yet; its start creates the files
+        }
+        let path = dir.join("hosts");
+        fs::write(
+            &path,
+            hosts_file(name, *addr, config.subnet.gateway(), &members),
+        )
+        .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Host ports published by the running machines, other than `except`.
+async fn ports_in_use(
+    store: &Store,
+    sd: &Systemd,
+    except: &str,
+) -> Result<BTreeMap<(Protocol, u16), (String, Ipv4Addr, u16)>> {
+    let mut used = BTreeMap::new();
+    for r in store.list_images()? {
+        if r.name == except || r.network != Network::Bridge || r.ports.is_empty() {
+            continue;
+        }
+        let Some(addr) = r.address else { continue };
+        if !sd.machine_exists(&r.name).await? {
+            continue;
+        }
+        for p in &r.ports {
+            used.insert((p.protocol, p.host), (r.name.clone(), addr, p.container));
+        }
+    }
+    Ok(used)
+}
+
+/// Fails when a port the machine wants to publish is taken by another running machine.
+pub async fn check_port_conflicts(store: &Store, sd: &Systemd, record: &ImageRecord) -> Result<()> {
+    let used = ports_in_use(store, sd, &record.name).await?;
+    for p in &record.ports {
+        if let Some((other, _, _)) = used.get(&(p.protocol, p.host)) {
+            bail!(
+                "host port {}/{} is already published by {other}",
+                p.host,
+                p.protocol.name()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Rebuilds the DNAT map from the machines that are running on the bridge.
+pub async fn sync_ports(store: &Store, sd: &Systemd) -> Result<()> {
+    if !table_exists() {
+        return Ok(());
+    }
+    let mut script = format!("flush map ip {TABLE} ports\n");
+    for ((protocol, host), (_, addr, container)) in ports_in_use(store, sd, "").await? {
+        script.push_str(&format!(
+            "add element ip {TABLE} ports {{ {} . {host} : {addr} . {container} }}\n",
+            protocol.name()
+        ));
+    }
+    nft(&script)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subnet_parsing_and_allocation() {
+        let s: Subnet = "10.99.0.7/24".parse().unwrap();
+        assert_eq!(s.to_string(), "10.99.0.0/24");
+        assert_eq!(s.gateway(), Ipv4Addr::new(10, 99, 0, 1));
+        assert!(s.contains(Ipv4Addr::new(10, 99, 0, 200)));
+        assert!(!s.contains(Ipv4Addr::new(10, 99, 1, 1)));
+        assert_eq!(s.allocate(&[]).unwrap(), Ipv4Addr::new(10, 99, 0, 2));
+        let used = [Ipv4Addr::new(10, 99, 0, 2), Ipv4Addr::new(10, 99, 0, 4)];
+        assert_eq!(s.allocate(&used).unwrap(), Ipv4Addr::new(10, 99, 0, 3));
+        let tiny: Subnet = "192.168.7.0/30".parse().unwrap();
+        assert_eq!(tiny.allocate(&[]).unwrap(), Ipv4Addr::new(192, 168, 7, 2));
+        assert!(
+            tiny.allocate(&[Ipv4Addr::new(192, 168, 7, 2)]).is_err(),
+            "a /30 has room for exactly one machine"
+        );
+        assert!("10.0.0.0".parse::<Subnet>().is_err());
+        assert!("10.0.0.0/31".parse::<Subnet>().is_err());
+        assert!("10.0.0.0/7".parse::<Subnet>().is_err());
+        assert!("x/24".parse::<Subnet>().is_err());
+    }
+
+    #[test]
+    fn port_maps() {
+        let p: PortMap = "8080:80".parse().unwrap();
+        assert_eq!((p.host, p.container, p.protocol), (8080, 80, Protocol::Tcp));
+        assert_eq!(p.to_string(), "8080->80/tcp");
+        let p: PortMap = "53:5353/udp".parse().unwrap();
+        assert_eq!((p.host, p.container, p.protocol), (53, 5353, Protocol::Udp));
+        let p: PortMap = "443".parse().unwrap();
+        assert_eq!((p.host, p.container), (443, 443));
+        assert!("0:80".parse::<PortMap>().is_err());
+        assert!("80:x".parse::<PortMap>().is_err());
+        assert!("80:80/sctp".parse::<PortMap>().is_err());
+        assert!("127.0.0.1:80:80".parse::<PortMap>().is_err());
+
+        assert!(parse_publish(&["none".to_string()]).unwrap().is_empty());
+        assert_eq!(
+            parse_publish(&["80:80".into(), "80:81/udp".into()])
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(parse_publish(&["80:80".into(), "80:81".into()]).is_err());
+    }
+
+    #[test]
+    fn generated_files() {
+        let subnet: Subnet = "10.99.0.0/24".parse().unwrap();
+        let dns = vec![
+            "192.168.1.1".parse().unwrap(),
+            "2001:db8::53".parse().unwrap(),
+        ];
+        let text = network_file(Ipv4Addr::new(10, 99, 0, 5), subnet, &dns);
+        assert!(text.contains("[Match]\nName=host0\n"));
+        assert!(text.contains("Address=10.99.0.5/24\nGateway=10.99.0.1\n"));
+        assert!(text.ends_with("DNS=192.168.1.1\nDNS=2001:db8::53\n"));
+
+        let members: BTreeMap<String, Ipv4Addr> = [
+            ("web".to_string(), Ipv4Addr::new(10, 99, 0, 2)),
+            ("db".to_string(), Ipv4Addr::new(10, 99, 0, 3)),
+        ]
+        .into_iter()
+        .collect();
+        let hosts = hosts_file(
+            "web",
+            Ipv4Addr::new(10, 99, 0, 2),
+            subnet.gateway(),
+            &members,
+        );
+        assert!(hosts.contains("127.0.0.1 localhost\n"));
+        assert!(hosts.contains("10.99.0.2 web\n"));
+        assert!(hosts.contains("10.99.0.1 host.nspawn.internal\n"));
+        assert!(hosts.ends_with("10.99.0.3 db\n"));
+        assert_eq!(hosts.matches("web").count(), 1);
+
+        let rules = base_ruleset("nspawn0", subnet);
+        assert!(rules.contains("ip saddr 10.99.0.0/24 oifname != \"nspawn0\" masquerade"));
+        assert!(rules.contains("map @ports"));
+    }
+
+    #[test]
+    fn upstream_servers_skip_loopback() {
+        let text = "# comment\nnameserver 127.0.0.53\nnameserver 192.168.122.1\nsearch lan\nnameserver ::1\nnameserver fe80::1\n";
+        assert_eq!(
+            nameservers(text),
+            vec![
+                "192.168.122.1".parse::<IpAddr>().unwrap(),
+                "fe80::1".parse().unwrap()
+            ]
+        );
+        assert!(nameservers("nameserver 127.0.0.1\n").is_empty());
+        let configured = vec!["10.0.0.53".parse().unwrap()];
+        assert_eq!(upstream_dns(&configured), configured);
+    }
+}

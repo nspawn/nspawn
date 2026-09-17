@@ -53,7 +53,7 @@ pub async fn install(
         .unwrap_or_else(|| detect_mode(has_init(&trees), &run.command));
     // App images have no network stack of their own worth configuring; share the host's.
     let network = match mode {
-        Mode::Boot => Network::Veth,
+        Mode::Boot => Network::Bridge,
         Mode::App => Network::Host,
     };
     settings::write(&MachineSettings {
@@ -63,6 +63,7 @@ pub async fn install(
         run: &run,
         command_override: None,
         network,
+        bridge: None,
     })?;
     store.save_manifest(spec.name, spec.manifest_bytes)?;
     store.record_image(&ImageRecord {
@@ -81,6 +82,8 @@ pub async fn install(
         mode,
         run,
         network,
+        address: None,
+        ports: Vec::new(),
     })?;
     Ok(mode)
 }

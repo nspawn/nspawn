@@ -48,6 +48,23 @@ pub enum Command {
     Shell(ShellArgs),
     /// Show what a machine printed, like docker logs.
     Logs(LogsArgs),
+    /// The bridge network shared by the machines.
+    Network(NetworkArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct NetworkArgs {
+    #[command(subcommand)]
+    pub command: NetworkCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum NetworkCommand {
+    /// Create the bridge with its NAT rules (start does it too; useful at boot).
+    Up,
+    /// List the machines on the bridge with their addresses and published ports.
+    #[command(alias = "list")]
+    Ls,
 }
 
 #[derive(Args, Debug)]
@@ -226,9 +243,14 @@ pub struct StartArgs {
     /// Wait until the machine is registered before returning.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub wait: bool,
-    /// Network setup, remembered for the image: veth (needs systemd-networkd on the host) or host.
+    /// Network of the machine, remembered for the image: bridge (default for booted
+    /// images), veth (systemd-networkd on the host) or host (the host's own network).
     #[arg(long, value_enum)]
     pub network: Option<crate::settings::Network>,
+    /// Publish a port on the host, like docker -p: HOST:CONTAINER[/udp]. Repeatable and
+    /// remembered for the image; "none" forgets them all.
+    #[arg(long, short = 'p', value_name = "HOST:CONTAINER[/udp]")]
+    pub publish: Vec<String>,
     /// For app images: run this command instead of the image's entrypoint (after --).
     #[arg(last = true)]
     pub command: Vec<String>,

@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::backend::MANAGED_NS_SOCKETS;
+use crate::bridge;
 use crate::cli::{BackendChoice, ExecArgs, LogsArgs, PsArgs, ShellArgs, StartArgs, StopArgs};
 use crate::config::Config;
 use crate::hostnet;
@@ -10,7 +11,7 @@ use crate::nsenter;
 use crate::oci::Mode;
 use crate::output::{human_duration, table};
 use crate::pty;
-use crate::settings::{self, MachineSettings, Network};
+use crate::settings::{self, BridgeMount, MachineSettings, Network};
 use crate::store::{now_unix, ImageRecord, Store};
 use crate::systemd::Systemd;
 
@@ -52,6 +53,7 @@ pub async fn ls(args: PsArgs, config: &Config) -> Result<()> {
                 .as_ref()
                 .map(|d| d.leader.to_string())
                 .unwrap_or_else(|| "-".to_string()),
+            network_column(records.get(&m.name)),
             os,
         ]);
     }
@@ -73,6 +75,7 @@ pub async fn ls(args: PsArgs, config: &Config) -> Result<()> {
                 "stopped".into(),
                 "-".into(),
                 "-".into(),
+                network_column(Some(r)),
                 "-".into(),
             ]);
         }
@@ -80,11 +83,28 @@ pub async fn ls(args: PsArgs, config: &Config) -> Result<()> {
     println!(
         "{}",
         table(
-            &["MACHINE", "IMAGE", "MODE", "COMMAND", "STATE", "UP", "PID", "OS"],
+            &["MACHINE", "IMAGE", "MODE", "COMMAND", "STATE", "UP", "PID", "NETWORK", "OS"],
             rows
         )
     );
     Ok(())
+}
+
+/// Address and published ports on the bridge, or the kind of network otherwise.
+fn network_column(record: Option<&ImageRecord>) -> String {
+    match record {
+        Some(r) if r.network == Network::Bridge => {
+            let mut parts = vec![r
+                .address
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "bridge".to_string())];
+            parts.extend(r.ports.iter().map(|p| p.to_string()));
+            parts.join(" ")
+        }
+        Some(r) if r.network == Network::Host => "host".to_string(),
+        Some(_) => "veth".to_string(),
+        None => "-".to_string(),
+    }
 }
 
 /// Image reference, mode and command of a machine, when nspawn installed its image.
@@ -118,11 +138,34 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
         Some(mut record) => {
             if let Some(network) = args.network {
                 record.network = network;
-                store.record_image(&record)?;
+            }
+            if !args.publish.is_empty() {
+                record.ports = bridge::parse_publish(&args.publish)?;
             }
             if !args.command.is_empty() && record.mode == Mode::Boot {
                 bail!("{} boots an init system; a command can only replace the entrypoint of an app image", args.name);
             }
+            if record.network == Network::Bridge && record.mode == Mode::App {
+                bail!(
+                    "{} is an app image, which has no systemd-networkd inside to configure host0; use --network host",
+                    args.name
+                );
+            }
+            if !record.ports.is_empty() && record.network != Network::Bridge {
+                bail!(
+                    "ports are published through the bridge network; start {} with --network bridge",
+                    args.name
+                );
+            }
+            store.record_image(&record)?;
+            let files = if record.network == Network::Bridge {
+                bridge::up(config, &sd).await?;
+                bridge::check_port_conflicts(&store, &sd, &record).await?;
+                bridge::prepare_machine(&store, config, &mut record)?;
+                Some(store.machine_files_dir(&args.name))
+            } else {
+                None
+            };
             // The settings file is regenerated every time: it carries the command override
             // and comes back if it went missing.
             settings::write(&MachineSettings {
@@ -136,6 +179,10 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
                     Some(&args.command)
                 },
                 network: record.network,
+                bridge: files.as_deref().map(|files| BridgeMount {
+                    bridge: &config.bridge,
+                    files,
+                }),
             })?;
             if record.backend == BackendChoice::Mstack {
                 // Managed user namespaces come from socket activated services that
@@ -155,14 +202,14 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
         // Not ours: the stock systemd-nspawn@.service template uses --network-veth.
         None => Network::Veth,
     };
-    let veth = network == Network::Veth;
-    if veth {
+    if network == Network::Veth {
         hostnet::ensure_networkd(&sd).await?;
     }
-    // firewalld only knows the interface once the machine is registered.
-    let firewalld = veth && hostnet::firewalld_running(&sd).await;
+    // firewalld only knows a veth once the machine is registered; published ports need
+    // the machine to count as running.
+    let firewalld = network == Network::Veth && hostnet::firewalld_running(&sd).await;
     sd.start_machine(&args.name).await?;
-    if args.wait || firewalld {
+    if args.wait || firewalld || network == Network::Bridge {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !sd.machine_exists(&args.name).await? {
             if Instant::now() > deadline {
@@ -177,6 +224,9 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
     }
     if firewalld {
         hostnet::admit(&sd, &args.name).await?;
+    }
+    if network == Network::Bridge {
+        bridge::sync_ports(&store, &sd).await?;
     }
     println!("started {}", args.name);
     Ok(())
@@ -241,6 +291,9 @@ pub async fn stop(args: StopArgs, config: &Config) -> Result<()> {
         sd.stop_unit(&format!("systemd-nspawn@{}.service", args.name))
             .await?;
         hostnet::release(&sd, &admitted).await;
+        if record.as_ref().map(|r| r.network) == Some(Network::Bridge) {
+            bridge::sync_ports(&store, &sd).await?;
+        }
     }
     println!("stopped {}", args.name);
     Ok(())

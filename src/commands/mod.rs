@@ -4,12 +4,13 @@ mod build;
 mod hub;
 mod images;
 mod machines;
+mod network;
 mod pull;
 mod push;
 
 use anyhow::{bail, Result};
 
-use crate::cli::{Cli, Command, HubCommand, ImagesCommand, MachinesCommand};
+use crate::cli::{Cli, Command, HubCommand, ImagesCommand, MachinesCommand, NetworkCommand};
 use crate::config::Config;
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -39,6 +40,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Exec(args) => machines::exec(args, &config).await,
         Command::Shell(args) => machines::shell(args, &config).await,
         Command::Logs(args) => machines::logs(args),
+        Command::Network(args) => match args.command {
+            NetworkCommand::Up => network::up(&config).await,
+            NetworkCommand::Ls => network::ls(&config).await,
+        },
     }
 }
 

@@ -40,75 +40,31 @@ stop signal to every process before terminating the machine after `--timeout` se
 
 ## Networking
 
-Booted machines get a virtual ethernet pair (`host0` inside, `ve-<name>` on the host);
-`--network host` shares the host's network instead. systemd-nspawn only creates the pair:
-the host end is brought up, addressed, served by a DHCP server and masqueraded by
-systemd-networkd through the stock `80-container-ve.network`, and inside the machine
-systemd-networkd asks for a lease on `host0` (`80-container-host0.network`). `start`
-therefore activates systemd-networkd on the host when it is not running, but only if
-`/etc/systemd/network` and `/run/systemd/network` hold no `.network` files of the host's
-own: on such hosts (typically NetworkManager users with old networkd configuration) it
-stops with an explanation instead of taking over interfaces. NetworkManager itself ignores
-veth interfaces, so both can coexist. When firewalld is running, the machine's `ve-<name>`
-is bound to the trusted zone at runtime while the machine runs, otherwise firewalld drops
-its DHCP requests; the binding goes away with `stop`.
+Booted machines join the `nspawn0` bridge, a docker0 style network that nspawn manages
+itself, so it behaves the same whether the host runs systemd-networkd, NetworkManager or
+nothing at all. On the first `start` nspawn creates the bridge with the first address of
+the subnet (`10.99.0.0/24` by default; `bridge`, `subnet` and `dns` can be set in
+`nspawn.toml`), enables forwarding and installs the nftables table `ip nspawn` with
+masquerading. Each machine gets a fixed address from the subnet, remembered with the
+image and handed to the systemd-networkd inside it through a `.network` file mounted at
+`/run/systemd/network/10-host0.network`; the DNS servers are the host's upstream ones.
+A generated `/etc/hosts` gives every machine the names of the other machines on the
+bridge and `host.nspawn.internal` for the host, and hosts with systemd 258 or newer
+resolve machine names themselves through machined. `nspawn network ls` shows the
+addresses and ports; `nspawn network up` creates the bridge without starting anything.
 
-```
-nspawn pull docker.io/library/busybox
-nspawn start busybox -- /bin/sleep infinity   # replace the entrypoint for this start
-nspawn exec busybox -- /bin/sh -c 'uname -n'  # exit code is propagated
-nspawn logs busybox                           # everything it ever printed, earlier runs included
-nspawn logs busybox -f                        # last 10 lines (or --lines N) and then whatever comes
-nspawn stop busybox
-```
+Ports are published like docker: `nspawn start web -p 8080:80 -p 5353:53/udp`. Each one
+is a DNAT entry in the same nftables table, reachable from other hosts, from the host's
+own addresses and from 127.0.0.1, and it goes away when the machine stops. The list is
+remembered for the image; `-p none` forgets it. With firewalld running, the bridge is
+bound to the trusted zone at runtime, which also lets published ports through.
 
-Detection can be forced with `--mode boot|app` on `pull` and `build`. Everything nspawn
-decides for a machine ends up in `/etc/systemd/nspawn/<name>.nspawn`, which the stock
-`systemd-nspawn@.service` template honours through `--settings=override`.
-
-## How images are stored
-
-`pull` fetches the manifest (multi-arch indexes are resolved for the host platform),
-downloads every layer while verifying its sha256 digest, and assembles the image with one
-of three backends. Layers live once under `/var/lib/nspawn/layers/` and are shared
-between images. Nothing of ours is hidden below `/var/lib/machines`, so `machinectl clean`
-stays safe.
-
-| Backend | Requirements | What it creates |
-|---|---|---|
-| `mstack` | systemd 261 or newer with systemd-nsresourced and systemd-mountfsd installed | `<name>.mstack/` with `layer@N` symlinks and `rw/`, plus `/etc/systemd/nspawn/<name>.nspawn` setting `PrivateUsers=managed` (the stock template's `-U` is rejected by `--mstack=`); `start` activates `systemd-nsresourced.socket` and `systemd-mountfsd.socket` |
-| `overlay` | any systemd with overlayfs | a `.mount` unit that overlays the layers with a writable upper directory, plus a drop-in so `systemd-nspawn@<name>.service` requires it |
-| `flat` | nothing | the layers extracted into `/var/lib/machines/<name>` |
-
-`--backend auto` (the default) picks the first one the host supports. mstack layers are
-extracted into `/var/lib/nspawn/layers-foreign/` with their UIDs shifted into systemd's
-foreign UID range (2147352576 and up): systemd-mountfsd maps that range into the managed
-user namespace of the machine, while root-owned directories would be mounted without any
-mapping and stay unwritable inside. The other backends keep the image's own IDs under
-`/var/lib/nspawn/layers/`. Whiteouts of
-multi-layer images are honoured (converted to overlayfs whiteouts for `overlay` and
-`mstack`, applied directly for `flat`).
-
-The old `pull-tar` path keeps working for hosts without this tool: every layer blob served
-by the registry is a compressed tar, so `importctl pull-tar https://hub/v2/<repo>/blobs/<digest>`
-imports the same image on any systemd version.
-
-## Configuration
-
-`/etc/nspawn/nspawn.toml`, overridden by the `NSPAWN_REGISTRY`, `NSPAWN_CA_CERT` and
-`NSPAWN_CONFIG` environment variables and by the `--registry`, `--ca-cert` and `--config`
-flags:
-
-```toml
-registry = "hub.nspawn.org"      # default registry for references without a host part
-ca_cert = "/etc/zot/ca.crt"      # extra CA to trust (optional)
-backend = "auto"                 # auto | overlay | flat | mstack
-machines_dir = "/var/lib/machines"
-state_dir = "/var/lib/nspawn"      # layers, records, writable directories of overlay machines
-```
-
-Image references follow the usual form `[registry/]repository[:tag|@digest]`; `fedora:44`
-becomes the local image `fedora-44`, `debian` (tag `latest`) becomes `debian`.
+`--network host` shares the host's network instead (the default for app images, which
+have no systemd-networkd to configure `host0`), and `--network veth` keeps the classic
+systemd-nspawn setup: a virtual ethernet pair configured by systemd-networkd on the host
+through `80-container-ve.network`. In that mode `start` activates systemd-networkd when
+the host has no `.network` files of its own and refuses with an explanation otherwise,
+and binds `ve-<name>` to firewalld's trusted zone while the machine runs.
 
 ## Requirements
 
@@ -118,7 +74,8 @@ becomes the local image `fedora-44`, `debian` (tag `latest`) becomes `debian`.
   `/var/lib/nspawn` and `/etc/systemd/system`. Everything else goes through D-Bus and polkit.
 - Booted machines use `OpenMachineShell` for `exec` and `shell`, which needs D-Bus inside
   the machine (the hub images have it); app images are entered through their namespaces.
-- Virtual ethernet networking needs systemd-networkd on the host (see Networking above).
+- The bridge network needs `ip` and `nft` on the host (iproute2 and nftables), nothing
+  else. `--network veth` needs systemd-networkd on the host.
 
 ## Development
 

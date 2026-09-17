@@ -3,6 +3,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
+use std::net::Ipv4Addr;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,6 +11,7 @@ use anyhow::{bail, Context, Result};
 use nix::sys::stat::{mknod, Mode as FileMode, SFlag};
 use serde::{Deserialize, Serialize};
 
+use crate::bridge::PortMap;
 use crate::cli::BackendChoice;
 use crate::oci::{Mode, RunSpec};
 use crate::settings::Network;
@@ -33,6 +35,12 @@ pub struct ImageRecord {
     pub run: RunSpec,
     #[serde(default = "default_network")]
     pub network: Network,
+    /// Fixed address on the nspawn bridge, once assigned.
+    #[serde(default)]
+    pub address: Option<Ipv4Addr>,
+    /// Ports published on the host, like docker -p (bridge network only).
+    #[serde(default)]
+    pub ports: Vec<PortMap>,
 }
 
 fn default_mode() -> Mode {
@@ -40,7 +48,7 @@ fn default_mode() -> Mode {
 }
 
 fn default_network() -> Network {
-    Network::Veth
+    Network::Bridge
 }
 
 fn default_origin() -> String {
@@ -118,9 +126,21 @@ impl Store {
     pub fn images_dir(&self) -> PathBuf {
         self.root.join("images")
     }
-    /// Writable upper/work directories of overlay machines.
+    /// Writable upper/work directories of overlay machines and generated per-machine files.
     pub fn machines_private_dir(&self) -> PathBuf {
         self.root.join("machines")
+    }
+    /// Files nspawn generates for one machine (network configuration, hosts).
+    pub fn machine_files_dir(&self, name: &str) -> PathBuf {
+        self.machines_private_dir().join(name)
+    }
+    pub fn remove_machine_files(&self, name: &str) -> Result<()> {
+        let dir = self.machine_files_dir(name);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", dir.display())),
+        }
     }
 
     /// Directory of an extracted layer. Colons are avoided on purpose: overlayfs uses them
@@ -756,6 +776,8 @@ mod tests {
             mode: Mode::Boot,
             run: RunSpec::default(),
             network: Network::Veth,
+            address: None,
+            ports: Vec::new(),
         };
         store.record_image(&rec).unwrap();
         assert_eq!(
@@ -794,6 +816,8 @@ mod tests {
             mode: Mode::App,
             run: RunSpec::default(),
             network: Network::Host,
+            address: None,
+            ports: Vec::new(),
         };
         store.record_image(&rec).unwrap();
         store
