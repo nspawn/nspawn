@@ -38,6 +38,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Stop(args) => machines::stop(args, &config).await,
         Command::Exec(args) => machines::exec(args, &config).await,
         Command::Shell(args) => machines::shell(args, &config).await,
+        Command::Logs(args) => machines::logs(args),
     }
 }
 

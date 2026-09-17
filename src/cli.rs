@@ -46,6 +46,8 @@ pub enum Command {
     Exec(ExecArgs),
     /// Open an interactive shell inside a running machine.
     Shell(ShellArgs),
+    /// Show what a machine printed, like docker logs.
+    Logs(LogsArgs),
 }
 
 #[derive(Args, Debug)]
@@ -270,4 +272,28 @@ pub struct ShellArgs {
     /// User inside the machine.
     #[arg(long, short = 'u', default_value = "root")]
     pub user: String,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct LogsArgs {
+    /// Machine name.
+    pub machine: String,
+    /// Keep printing new output (starts from the last 10 lines unless --lines says otherwise).
+    #[arg(long, short = 'f')]
+    pub follow: bool,
+    /// Only the last N lines.
+    #[arg(long, short = 'n', value_name = "N")]
+    pub lines: Option<u32>,
+    /// Only output newer than this (journalctl --since syntax, e.g. "10 min ago").
+    #[arg(long, value_name = "WHEN")]
+    pub since: Option<String>,
+    /// Prefix every line with its timestamp.
+    #[arg(long, short = 't')]
+    pub timestamps: bool,
+    /// Also show what systemd says about the machine's service (start, stop, failures).
+    #[arg(long)]
+    pub all: bool,
+    /// Boot machines only: read the machine's own journal instead of its console output.
+    #[arg(long)]
+    pub inside: bool,
 }

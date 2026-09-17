@@ -101,8 +101,12 @@ cat /tmp/e2e-app.txt
 grep -q "(app image)" /tmp/e2e-app.txt || fail "busybox not detected as an app image"
 grep -q "Boot=no" /etc/systemd/nspawn/$app.nspawn || fail "settings file does not disable --boot"
 grep -q "ProcessTwo=yes" /etc/systemd/nspawn/$app.nspawn || fail "settings file does not use a stub init"
-$NSPAWN start $app -- /bin/sleep 300 || fail "start busybox with a command override"
-grep -q "Parameters=/bin/sleep 300" /etc/systemd/nspawn/$app.nspawn || fail "command override not written"
+$NSPAWN start $app -- /bin/sh -c 'echo hello-from-app; echo to-stderr >&2; exec /bin/sleep 300' || fail "start busybox with a command override"
+grep -q "Parameters=/bin/sh -c" /etc/systemd/nspawn/$app.nspawn || fail "command override not written"
+retry 10 bash -c "$NSPAWN logs $app > /tmp/e2e-logs.txt; grep -q hello-from-app /tmp/e2e-logs.txt" || fail "logs do not show the app's stdout"
+grep -q to-stderr /tmp/e2e-logs.txt || fail "logs do not show the app's stderr"
+grep -q "Started systemd-nspawn" /tmp/e2e-logs.txt && fail "logs include systemd's unit messages without --all"
+$NSPAWN logs $app --all > /tmp/e2e-logs.txt; grep -q "Started systemd-nspawn" /tmp/e2e-logs.txt || fail "logs --all misses the unit messages"
 $NSPAWN machines ls | tee /tmp/e2e-m.txt
 grep -q "^ *$app " /tmp/e2e-m.txt || fail "busybox machine not running"
 out=$($NSPAWN exec $app -- /bin/sh -c 'echo inside:$(uname -n); cat /etc/os-release | head -1' </dev/null | tr -d '\r')

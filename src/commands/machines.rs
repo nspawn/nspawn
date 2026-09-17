@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::backend::MANAGED_NS_SOCKETS;
-use crate::cli::{BackendChoice, ExecArgs, PsArgs, ShellArgs, StartArgs, StopArgs};
+use crate::cli::{BackendChoice, ExecArgs, LogsArgs, PsArgs, ShellArgs, StartArgs, StopArgs};
 use crate::config::Config;
 use crate::nsenter;
 use crate::oci::Mode;
@@ -316,5 +316,117 @@ async fn open_shell_when_ready(
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// docker logs: the machine's console output lives in the journal of its service (nspawn
+/// pipes the payload's stdout and stderr there); boot machines also have a journal of
+/// their own. journalctl is the journal's reader, so it does the work. Everything the unit
+/// ever logged is shown, earlier runs included; --follow starts from the last lines.
+pub fn logs(args: LogsArgs) -> Result<()> {
+    let argv = journalctl_arguments(&args);
+    let status = std::process::Command::new("journalctl")
+        .args(&argv)
+        .status()
+        .context("running journalctl")?;
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+/// Lines shown before following when --lines is not given.
+const FOLLOW_TAIL: u32 = 10;
+
+pub fn journalctl_arguments(args: &LogsArgs) -> Vec<String> {
+    let mut argv = vec!["--no-pager".to_string(), "--quiet".to_string()];
+    let output = if args.timestamps { "short-iso" } else { "cat" };
+    if args.inside {
+        argv.push(format!("--machine={}", args.machine));
+        argv.push(format!("--output={output}"));
+    } else {
+        argv.push(format!("--unit=systemd-nspawn@{}.service", args.machine));
+        argv.push(format!("--output={output}"));
+        if !args.all {
+            // Only what the machine itself wrote, not systemd's messages about the unit.
+            argv.push("_TRANSPORT=stdout".to_string());
+        }
+    }
+    match (args.lines, args.follow) {
+        (Some(n), _) => argv.push(format!("--lines={n}")),
+        (None, true) => argv.push(format!("--lines={FOLLOW_TAIL}")),
+        (None, false) => {}
+    }
+    if let Some(since) = &args.since {
+        argv.push(format!("--since={since}"));
+    }
+    if args.follow {
+        argv.push("--follow".to_string());
+    }
+    argv
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn journalctl_command_lines() {
+        let base = LogsArgs {
+            machine: "web".into(),
+            ..LogsArgs::default()
+        };
+        assert_eq!(
+            journalctl_arguments(&base),
+            vec![
+                "--no-pager",
+                "--quiet",
+                "--unit=systemd-nspawn@web.service",
+                "--output=cat",
+                "_TRANSPORT=stdout"
+            ]
+        );
+        let follow = LogsArgs {
+            machine: "web".into(),
+            follow: true,
+            ..LogsArgs::default()
+        };
+        let argv = journalctl_arguments(&follow);
+        assert!(argv.contains(&"--lines=10".to_string()) && argv.last().unwrap() == "--follow");
+        let full = LogsArgs {
+            machine: "web".into(),
+            follow: true,
+            lines: Some(50),
+            since: Some("10 min ago".into()),
+            timestamps: true,
+            all: true,
+            inside: false,
+        };
+        assert_eq!(
+            journalctl_arguments(&full),
+            vec![
+                "--no-pager",
+                "--quiet",
+                "--unit=systemd-nspawn@web.service",
+                "--output=short-iso",
+                "--lines=50",
+                "--since=10 min ago",
+                "--follow"
+            ]
+        );
+        let inside = LogsArgs {
+            machine: "fedora-44".into(),
+            inside: true,
+            ..LogsArgs::default()
+        };
+        assert_eq!(
+            journalctl_arguments(&inside),
+            vec![
+                "--no-pager",
+                "--quiet",
+                "--machine=fedora-44",
+                "--output=cat"
+            ]
+        );
     }
 }

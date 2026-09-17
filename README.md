@@ -13,6 +13,7 @@ nspawn start fedora-44              # boot it as a machine
 nspawn ps                           # running machines: image, mode, command, uptime (-a adds stopped ones)
 nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
 nspawn shell fedora-44
+nspawn logs fedora-44               # console output; --inside reads the machine's own journal
 nspawn stop fedora-44
 nspawn images rm fedora-44          # also frees layers and blobs nobody references
 
@@ -41,6 +42,8 @@ stop signal to every process before terminating the machine after `--timeout` se
 nspawn pull docker.io/library/busybox
 nspawn start busybox -- /bin/sleep infinity   # replace the entrypoint for this start
 nspawn exec busybox -- /bin/sh -c 'uname -n'  # exit code is propagated
+nspawn logs busybox                           # everything it ever printed, earlier runs included
+nspawn logs busybox -f                        # last 10 lines (or --lines N) and then whatever comes
 nspawn stop busybox
 ```
 
