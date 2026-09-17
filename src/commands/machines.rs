@@ -11,6 +11,7 @@ use crate::nsenter;
 use crate::oci::Mode;
 use crate::output::{human_duration, table};
 use crate::pty;
+use crate::reference::validate_machine_name;
 use crate::settings::{self, BridgeMount, MachineSettings, Network};
 use crate::store::{now_unix, ImageRecord, Store};
 use crate::systemd::Systemd;
@@ -129,6 +130,14 @@ fn describe(record: Option<&ImageRecord>) -> (String, String, String) {
 }
 
 pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
+    if args.name.contains(':') || args.name.contains('/') {
+        bail!(
+            "{} looks like an image reference; machines are started by name. Pull it (nspawn pull {}) or make a machine from a local image (nspawn create IMAGE NAME)",
+            args.name,
+            args.name
+        );
+    }
+    validate_machine_name(&args.name)?;
     let sd = Systemd::connect().await?;
     if sd.machine_exists(&args.name).await? {
         bail!("machine {} is already running", args.name);
