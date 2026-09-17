@@ -10,7 +10,7 @@ nspawn hub ls                       # repositories and tags on the hub
 nspawn pull fedora:44               # download and assemble an image
 nspawn images ls                    # local images (all of them, not only ours)
 nspawn start fedora-44              # boot it as a machine
-nspawn machines ls
+nspawn ps                           # running machines: image, mode, command, uptime (-a adds stopped ones)
 nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
 nspawn shell fedora-44
 nspawn stop fedora-44

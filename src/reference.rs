@@ -69,7 +69,15 @@ impl ImageRef {
     /// The machine image name used locally: `fedora:44` becomes `fedora-44`, `debian:latest`
     /// becomes `debian`, a digest reference keeps twelve hex digits of the digest.
     pub fn local_name(&self) -> String {
-        let mut name = self.repository.replace('/', "-");
+        // Docker Hub's official images live under library/; nobody wants that in a name.
+        let repository = match self.registry.as_str() {
+            "docker.io" | "index.docker.io" | "registry-1.docker.io" => self
+                .repository
+                .strip_prefix("library/")
+                .unwrap_or(&self.repository),
+            _ => self.repository.as_str(),
+        };
+        let mut name = repository.replace('/', "-");
         match (&self.tag, &self.digest) {
             (Some(t), _) if t != "latest" => {
                 name.push('-');
@@ -164,6 +172,12 @@ mod tests {
         assert_eq!(r.registry, "localhost:5000");
         assert_eq!(r.repository, "team/app");
         assert_eq!(r.local_name(), "team-app");
+        let r = ImageRef::parse("docker.io/library/busybox:1.36", HUB).unwrap();
+        assert_eq!(r.local_name(), "busybox-1.36");
+        let r = ImageRef::parse("docker.io/library/archlinux", HUB).unwrap();
+        assert_eq!(r.local_name(), "archlinux");
+        let r = ImageRef::parse("hub.example/library/x", HUB).unwrap();
+        assert_eq!(r.local_name(), "library-x");
     }
 
     #[test]

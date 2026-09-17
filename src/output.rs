@@ -36,9 +36,27 @@ pub fn human_bytes(n: u64) -> String {
     }
 }
 
+/// "12s", "5m", "3h", "2d": how long ago, in the largest sensible unit.
+pub fn human_duration(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m", secs / 60),
+        3600..=86_399 => format!("{}h", secs / 3600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations() {
+        assert_eq!(human_duration(5), "5s");
+        assert_eq!(human_duration(125), "2m");
+        assert_eq!(human_duration(7300), "2h");
+        assert_eq!(human_duration(200_000), "2d");
+    }
 
     #[test]
     fn bytes() {

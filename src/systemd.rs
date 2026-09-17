@@ -25,8 +25,13 @@ pub struct ImageInfo {
 #[derive(Debug, Clone)]
 pub struct MachineInfo {
     pub name: String,
-    pub class: String,
-    pub service: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MachineDetails {
+    pub state: String,
+    pub leader: u32,
+    pub started: u64,
 }
 
 impl Systemd {
@@ -81,11 +86,7 @@ impl Systemd {
             .context("listing machines through systemd-machined")?;
         Ok(raw
             .into_iter()
-            .map(|(name, class, service, _path)| MachineInfo {
-                name,
-                class,
-                service,
-            })
+            .map(|(name, _class, _service, _path)| MachineInfo { name })
             .collect())
     }
 
@@ -110,6 +111,30 @@ impl Systemd {
         self.start_unit(&unit)
             .await
             .with_context(|| format!("machine {name} failed to start; see journalctl -u {unit}"))
+    }
+
+    /// State ("opening", "running", "closing"), leader PID and start time (unix seconds)
+    /// of a machine.
+    pub async fn machine_details(&self, name: &str) -> Result<MachineDetails> {
+        let path = self
+            .machined
+            .get_machine(name.to_string())
+            .await
+            .with_context(|| format!("looking up machine {name}"))?;
+        let machine = machine1::MachineProxy::builder(&self.conn)
+            .path(path)?
+            .build()
+            .await
+            .with_context(|| format!("connecting to machine {name}"))?;
+        Ok(MachineDetails {
+            state: machine.state().await.unwrap_or_else(|_| "-".to_string()),
+            leader: machine.leader().await.unwrap_or(0),
+            started: machine
+                .timestamp()
+                .await
+                .map(|usec| usec / 1_000_000)
+                .unwrap_or(0),
+        })
     }
 
     /// PID of the machine's leader (its PID 1 as seen from the host).

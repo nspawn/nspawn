@@ -3,31 +3,108 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use crate::backend::MANAGED_NS_SOCKETS;
-use crate::cli::{BackendChoice, ExecArgs, ShellArgs, StartArgs, StopArgs};
+use crate::cli::{BackendChoice, ExecArgs, PsArgs, ShellArgs, StartArgs, StopArgs};
 use crate::config::Config;
 use crate::nsenter;
 use crate::oci::Mode;
-use crate::output::table;
+use crate::output::{human_duration, table};
 use crate::pty;
 use crate::settings::{self, MachineSettings};
-use crate::store::{ImageRecord, Store};
+use crate::store::{now_unix, ImageRecord, Store};
 use crate::systemd::Systemd;
 
-pub async fn ls() -> Result<()> {
+pub async fn ls(args: PsArgs, config: &Config) -> Result<()> {
     let sd = Systemd::connect().await?;
+    let store = Store::new(&config.machines_dir, &config.state_dir);
+    let records: std::collections::HashMap<String, ImageRecord> = store
+        .list_images()?
+        .into_iter()
+        .map(|r| (r.name.clone(), r))
+        .collect();
     let mut machines = sd.list_machines().await?;
     machines.retain(|m| !m.name.starts_with('.'));
     machines.sort_by(|a, b| a.name.cmp(&b.name));
+    let now = now_unix();
     let mut rows = Vec::new();
-    for m in machines {
+    for m in &machines {
+        let details = sd.machine_details(&m.name).await.ok();
+        let (image, mode, command) = describe(records.get(&m.name));
         let os = sd
             .machine_os(&m.name)
             .await
             .unwrap_or_else(|| "-".to_string());
-        rows.push(vec![m.name, m.class, m.service, os]);
+        rows.push(vec![
+            m.name.clone(),
+            image,
+            mode,
+            command,
+            details
+                .as_ref()
+                .map(|d| d.state.clone())
+                .unwrap_or_else(|| "-".to_string()),
+            details
+                .as_ref()
+                .filter(|d| d.started > 0 && d.started <= now)
+                .map(|d| human_duration(now - d.started))
+                .unwrap_or_else(|| "-".to_string()),
+            details
+                .as_ref()
+                .map(|d| d.leader.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            os,
+        ]);
     }
-    println!("{}", table(&["MACHINE", "CLASS", "SERVICE", "OS"], rows));
+    if args.all {
+        let running: std::collections::HashSet<&str> =
+            machines.iter().map(|m| m.name.as_str()).collect();
+        let mut stopped: Vec<&ImageRecord> = records
+            .values()
+            .filter(|r| !running.contains(r.name.as_str()))
+            .collect();
+        stopped.sort_by(|a, b| a.name.cmp(&b.name));
+        for r in stopped {
+            let (image, mode, command) = describe(Some(r));
+            rows.push(vec![
+                r.name.clone(),
+                image,
+                mode,
+                command,
+                "stopped".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+            ]);
+        }
+    }
+    println!(
+        "{}",
+        table(
+            &["MACHINE", "IMAGE", "MODE", "COMMAND", "STATE", "UP", "PID", "OS"],
+            rows
+        )
+    );
     Ok(())
+}
+
+/// Image reference, mode and command of a machine, when nspawn installed its image.
+fn describe(record: Option<&ImageRecord>) -> (String, String, String) {
+    match record {
+        Some(r) => {
+            let command = match r.mode {
+                Mode::Boot => "init".to_string(),
+                Mode::App => {
+                    let joined = r.run.command.join(" ");
+                    if joined.chars().count() > 40 {
+                        format!("{}...", joined.chars().take(37).collect::<String>())
+                    } else {
+                        joined
+                    }
+                }
+            };
+            (r.reference.clone(), r.mode.name().to_string(), command)
+        }
+        None => ("-".to_string(), "-".to_string(), "-".to_string()),
+    }
 }
 
 pub async fn start(args: StartArgs, config: &Config) -> Result<()> {

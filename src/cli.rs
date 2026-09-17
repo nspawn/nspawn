@@ -36,6 +36,8 @@ pub enum Command {
     Images(ImagesArgs),
     /// Manage running machines.
     Machines(MachinesArgs),
+    /// List running machines, like docker ps (same as machines ls).
+    Ps(PsArgs),
     /// Boot an image as a machine.
     Start(StartArgs),
     /// Power off a running machine.
@@ -205,7 +207,14 @@ pub struct MachinesArgs {
 pub enum MachinesCommand {
     /// List running machines.
     #[command(alias = "list")]
-    Ls,
+    Ls(PsArgs),
+}
+
+#[derive(Args, Debug, Default)]
+pub struct PsArgs {
+    /// Also list nspawn images that are not running.
+    #[arg(long, short = 'a')]
+    pub all: bool,
 }
 
 #[derive(Args, Debug)]

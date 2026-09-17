@@ -31,8 +31,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             ImagesCommand::Rm(a) => images::rm(a, &config).await,
         },
         Command::Machines(args) => match args.command {
-            MachinesCommand::Ls => machines::ls().await,
+            MachinesCommand::Ls(a) => machines::ls(a, &config).await,
         },
+        Command::Ps(args) => machines::ls(args, &config).await,
         Command::Start(args) => machines::start(args, &config).await,
         Command::Stop(args) => machines::stop(args, &config).await,
         Command::Exec(args) => machines::exec(args, &config).await,
