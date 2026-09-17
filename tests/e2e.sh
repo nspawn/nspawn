@@ -54,6 +54,8 @@ for backend in overlay flat; do
   if firewall-cmd --state >/dev/null 2>&1; then
     firewall-cmd --zone=trusted --list-interfaces | grep -qw "ve-$name" && fail "ve-$name still bound in firewalld after stop"
   fi
+  step "stop right after start"
+  $NSPAWN start "$name" && $NSPAWN stop "$name" || fail "stop right after start ($backend)"
   step "images rm"
   $NSPAWN images rm "$name" || fail "images rm ($backend)"
   $NSPAWN images ls > /tmp/e2e-img.txt; grep -q "^ *$name " /tmp/e2e-img.txt && fail "$name still listed after rm"

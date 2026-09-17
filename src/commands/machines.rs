@@ -216,7 +216,18 @@ pub async fn stop(args: StopArgs, config: &Config) -> Result<()> {
                     sd.terminate_machine(&args.name).await?;
                 }
             }
-            _ => sd.poweroff_machine(&args.name).await?,
+            _ => {
+                if args.wait {
+                    if !poweroff_until_gone(&sd, &args.name, Duration::from_secs(60)).await? {
+                        bail!(
+                            "machine {} is still running after 60 seconds; use --force",
+                            args.name
+                        );
+                    }
+                } else {
+                    sd.poweroff_machine(&args.name).await?;
+                }
+            }
         }
     }
     if args.wait {
@@ -233,6 +244,28 @@ pub async fn stop(args: StopArgs, config: &Config) -> Result<()> {
     }
     println!("stopped {}", args.name);
     Ok(())
+}
+
+/// Asks a booted machine to power off and waits until it is gone, repeating the request
+/// every couple of seconds: right after `start` the machine's init may not have installed
+/// its signal handlers yet, and the kernel silently drops signals that PID 1 of a PID
+/// namespace does not handle.
+async fn poweroff_until_gone(sd: &Systemd, name: &str, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    sd.poweroff_machine(name).await?;
+    let mut requested = Instant::now();
+    while sd.machine_exists(name).await? {
+        if Instant::now() > deadline {
+            return Ok(false);
+        }
+        if requested.elapsed() > Duration::from_secs(2) {
+            // The machine may vanish between the check and the signal; that is success.
+            let _ = sd.poweroff_machine(name).await;
+            requested = Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Ok(true)
 }
 
 async fn wait_gone(sd: &Systemd, name: &str, timeout: Duration) -> Result<bool> {
