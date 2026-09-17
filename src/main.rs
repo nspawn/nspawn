@@ -1,48 +1,28 @@
-pub mod modules;
+//! nspawn: docker-like management of systemd-nspawn machines.
+//!
+//! Images come from an OCI registry (the hub) and are stored as shared layers under
+//! /var/lib/machines/.nspawn. Machines are driven through the D-Bus APIs of
+//! systemd-machined and systemd itself, never through machinectl.
 
-use {
-    clap::{ArgMatches, CommandFactory},
-    clap_complete::{generate, Shell},
-    std::io,
-};
+mod backend;
+mod cli;
+mod commands;
+mod config;
+mod hub;
+mod output;
+mod pty;
+mod reference;
+mod store;
+mod systemd;
+mod unitname;
 
-use {
-    clap::Parser,
-    modules::{args::Arguments, manager::handle_arguments},
-};
+use clap::Parser;
 
-fn generate_completions(matches: &ArgMatches) {
-    if let Some(generator) = matches.get_one::<Shell>("autocomplete").copied() {
-        let cmd = Arguments::command();
-        generate(
-            generator,
-            &mut cmd.clone(),
-            &cmd.get_name().to_string(),
-            &mut io::stdout(),
-        );
-    } else {
-        eprintln!("Invalid generator specified");
-    }
-    std::process::exit(0);
-}
-
-fn try_main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Arguments::parse();
-
-    handle_arguments(args)?;
-
-    Ok(())
-}
-
-fn main() {
-    let matches = Arguments::command().get_matches();
-
-    if matches.contains_id("autocomplete") {
-        generate_completions(&matches);
-    }
-
-    if let Err(e) = try_main() {
-        eprintln!("Error: {e}");
+#[tokio::main]
+async fn main() {
+    let args = cli::Cli::parse();
+    if let Err(err) = commands::run(args).await {
+        eprintln!("error: {err:#}");
         std::process::exit(1);
     }
 }

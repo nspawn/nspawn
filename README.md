@@ -1,0 +1,78 @@
+# nspawn
+
+Docker-like management of [systemd-nspawn](https://www.freedesktop.org/software/systemd/man/latest/systemd-nspawn.html)
+machines. Images come from an OCI registry (the hub), are stored as shared layers and are
+started, inspected and stopped through the D-Bus APIs of systemd-machined and systemd
+itself. `machinectl` and `importctl` are never called.
+
+```
+nspawn hub ls                       # repositories and tags on the hub
+nspawn pull fedora:44               # download and assemble an image
+nspawn images ls                    # local images (all of them, not only ours)
+nspawn start fedora-44              # boot it as a machine
+nspawn machines ls
+nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
+nspawn shell fedora-44
+nspawn stop fedora-44
+nspawn images rm fedora-44          # also frees layers nobody references any more
+```
+
+## How images are stored
+
+`pull` fetches the manifest (multi-arch indexes are resolved for the host platform),
+downloads every layer while verifying its sha256 digest, and assembles the image with one
+of three backends. Layers live once under `/var/lib/machines/.nspawn/layers/` and are
+shared between images.
+
+| Backend | Requirements | What it creates |
+|---|---|---|
+| `mstack` | systemd 261 or newer with systemd-nsresourced | `<name>.mstack/` with `layer@N` symlinks and `rw/` |
+| `overlay` | any systemd with overlayfs | a `.mount` unit that overlays the layers with a writable upper directory, plus a drop-in so `systemd-nspawn@<name>.service` requires it |
+| `flat` | nothing | the layers extracted into `/var/lib/machines/<name>` |
+
+`--backend auto` (the default) picks the first one the host supports. Whiteouts of
+multi-layer images are honoured (converted to overlayfs whiteouts for `overlay` and
+`mstack`, applied directly for `flat`).
+
+The old `pull-tar` path keeps working for hosts without this tool: every layer blob served
+by the registry is a compressed tar, so `importctl pull-tar https://hub/v2/<repo>/blobs/<digest>`
+imports the same image on any systemd version.
+
+## Configuration
+
+`/etc/nspawn/nspawn.toml`, overridden by the `NSPAWN_REGISTRY`, `NSPAWN_CA_CERT` and
+`NSPAWN_CONFIG` environment variables and by the `--registry`, `--ca-cert` and `--config`
+flags:
+
+```toml
+registry = "hub.nspawn.org"      # default registry for references without a host part
+ca_cert = "/etc/zot/ca.crt"      # extra CA to trust (optional)
+backend = "auto"                 # auto | overlay | flat | mstack
+machines_dir = "/var/lib/machines"
+```
+
+Image references follow the usual form `[registry/]repository[:tag|@digest]`; `fedora:44`
+becomes the local image `fedora-44`, `debian` (tag `latest`) becomes `debian`.
+
+## Requirements
+
+- A host with systemd-nspawn and systemd-machined (any recent version; 259 and 261 are
+  tested), overlayfs for the `overlay` backend and cgroup v2.
+- `pull` and `images rm` need root because they write below `/var/lib/machines` and
+  `/etc/systemd/system`. Everything else goes through D-Bus and polkit.
+- Images must boot systemd (the hub images do): `exec` and `shell` use
+  `OpenMachineShell`, which needs D-Bus inside the machine.
+
+## Development
+
+```
+cargo test                                   # unit tests
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+NSPAWN=./target/release/nspawn sudo -E tests/e2e.sh   # end-to-end against a registry and machined
+```
+
+`tests/e2e.sh` pulls an image with both the `overlay` and the `flat` backend, boots it,
+runs commands inside through the PTY, stops it, removes it and checks that layers are shared
+and garbage collected. It expects `NSPAWN_REGISTRY` (and `NSPAWN_CA_CERT` for a private
+CA) to point at a registry that serves the image given in `IMAGE` (default `fedora:44`).

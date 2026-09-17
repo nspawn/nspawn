@@ -1,0 +1,178 @@
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+/// Docker-like management of systemd-nspawn machines.
+#[derive(Parser, Debug)]
+#[command(name = "nspawn", version, about, arg_required_else_help = true)]
+pub struct Cli {
+    /// Registry (hub) to use for image references without a host part.
+    #[arg(long, global = true, env = "NSPAWN_REGISTRY")]
+    pub registry: Option<String>,
+
+    /// Extra CA certificate (PEM) to trust when talking to the registry.
+    #[arg(long, global = true, env = "NSPAWN_CA_CERT", value_name = "FILE")]
+    pub ca_cert: Option<PathBuf>,
+
+    /// Configuration file.
+    #[arg(long, global = true, env = "NSPAWN_CONFIG", value_name = "FILE")]
+    pub config: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Query the hub (OCI registry).
+    Hub(HubArgs),
+    /// Download an image from the hub and make it available to machinectl.
+    Pull(PullArgs),
+    /// Manage local images.
+    Images(ImagesArgs),
+    /// Manage running machines.
+    Machines(MachinesArgs),
+    /// Boot an image as a machine.
+    Start(StartArgs),
+    /// Power off a running machine.
+    Stop(StopArgs),
+    /// Run a command inside a running machine.
+    Exec(ExecArgs),
+    /// Open an interactive shell inside a running machine.
+    Shell(ShellArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct HubArgs {
+    #[command(subcommand)]
+    pub command: HubCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HubCommand {
+    /// List the repositories of the hub, with their tags.
+    #[command(alias = "list")]
+    Ls(HubLsArgs),
+    /// List the tags of one repository.
+    Tags(HubTagsArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct HubLsArgs {
+    /// Only show repositories whose name contains this text.
+    pub filter: Option<String>,
+    /// Do not query the tags of every repository (faster on big hubs).
+    #[arg(long)]
+    pub no_tags: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct HubTagsArgs {
+    /// Repository name, for example "fedora".
+    pub repository: String,
+}
+
+#[derive(Args, Debug)]
+pub struct PullArgs {
+    /// Image reference: [registry/]repository[:tag|@digest], for example fedora:44.
+    pub reference: String,
+    /// Local image name (default: derived from the reference, e.g. fedora-44).
+    #[arg(long, short = 'n')]
+    pub name: Option<String>,
+    /// How to assemble the image on this host.
+    #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
+    pub backend: BackendChoice,
+    /// Replace an existing image with the same name.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendChoice {
+    /// mstack when the host supports it, otherwise an overlay mount, otherwise a flat copy.
+    Auto,
+    /// Shared layers plus an overlayfs mount unit per machine (any systemd with overlayfs).
+    Overlay,
+    /// Extract the layers into a plain directory (no sharing, maximum compatibility).
+    Flat,
+    /// Native systemd.mstack directory (systemd 261 or newer with nsresourced).
+    Mstack,
+}
+
+#[derive(Args, Debug)]
+pub struct ImagesArgs {
+    #[command(subcommand)]
+    pub command: ImagesCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ImagesCommand {
+    /// List local images.
+    #[command(alias = "list")]
+    Ls,
+    /// Remove local images (and the layers nobody uses any more).
+    Rm(ImagesRmArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ImagesRmArgs {
+    /// Image names.
+    #[arg(required = true)]
+    pub names: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct MachinesArgs {
+    #[command(subcommand)]
+    pub command: MachinesCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MachinesCommand {
+    /// List running machines.
+    #[command(alias = "list")]
+    Ls,
+}
+
+#[derive(Args, Debug)]
+pub struct StartArgs {
+    /// Image name.
+    pub name: String,
+    /// Wait until the machine is registered before returning.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub wait: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct StopArgs {
+    /// Machine name.
+    pub name: String,
+    /// Kill the machine immediately instead of asking it to power off.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+    /// Wait until the machine is gone before returning.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub wait: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ExecArgs {
+    /// Machine name.
+    pub machine: String,
+    /// User inside the machine.
+    #[arg(long, short = 'u', default_value = "root")]
+    pub user: String,
+    /// Command and arguments.
+    #[arg(required = true, trailing_var_arg = true)]
+    pub command: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ShellArgs {
+    /// Machine name.
+    pub machine: String,
+    /// User inside the machine.
+    #[arg(long, short = 'u', default_value = "root")]
+    pub user: String,
+}

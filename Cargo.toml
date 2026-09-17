@@ -1,20 +1,35 @@
 [package]
 name = "nspawn"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Docker-like management of systemd-nspawn machines: OCI images from a hub, shared layers, systemd integration"
+rust-version = "1.85"
 
 [dependencies]
-chrono = "0.4.33"
-clap = { version = "4.4.18", features = ["derive"] }
-clap_complete = "4.4.10"
-comfy-table = "7.1.0"
-reqwest = { version = "0.11.24", features = ["blocking", "json"] }
-serde = { version = "1.0.196", features = ["derive"] }
-serde_json = "1.0.113"
-termion = "3.0.0"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+comfy-table = "8"
+flate2 = "1"
+futures-util = "0.3"
+hex = "0.4"
+indicatif = "0.18"
+nix = { version = "0.31", features = ["term", "user", "fs", "ioctl"] }
+oci-client = { version = "0.17", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tar = "0.4"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time"] }
+toml = "1"
+xattr = "1"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+zbus_systemd = { version = "0.26100", features = ["machine1", "systemd1", "zbus-async-tokio"] }
+zstd = "0.14"
 
-[build-dependencies]
-clap = { version = "4.4.18", features = ["derive"] }
-clap_complete = "4.4.10"
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
