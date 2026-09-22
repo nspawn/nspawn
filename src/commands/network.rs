@@ -75,7 +75,7 @@ pub async fn ls(config: &Config) -> Result<()> {
 pub async fn prepare(config: &Config, name: &str) -> Result<()> {
     let sd = Systemd::connect().await?;
     let store = Store::new(&config.machines_dir, &config.state_dir);
-    let _lock = store.lock()?;
+    let _lock = store.lock_for(std::time::Duration::from_secs(60))?;
     let record = store.load_image(name)?;
     machines::prepare(&sd, &store, config, name, record)
         .await
@@ -86,7 +86,7 @@ pub async fn prepare(config: &Config, name: &str) -> Result<()> {
 pub async fn publish(config: &Config, name: &str) -> Result<()> {
     let sd = Systemd::connect().await?;
     let store = Store::new(&config.machines_dir, &config.state_dir);
-    let _lock = store.lock()?;
+    let _lock = store.lock_for(std::time::Duration::from_secs(60))?;
     let Some(record) = store.load_image(name)? else {
         return Ok(());
     };

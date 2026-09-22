@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -141,9 +141,29 @@ fn write_store(path: &Path, file: &AuthFile) -> Result<()> {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let text = serde_json::to_string_pretty(file)?;
-    fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("protecting {}", path.display()))
+    // Created with 0600 from the first byte and renamed into place: at no point is the
+    // file readable by others or half written.
+    let tmp = path.with_file_name(format!(
+        ".{}.{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+    }
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&tmp, path).with_context(|| format!("moving {} into place", path.display()))
 }
 
 /// Remembers credentials for a registry in nspawn's store (mode 0600).

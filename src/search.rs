@@ -63,12 +63,13 @@ struct DockerHubPage {
 #[derive(Deserialize)]
 struct DockerHubResult {
     name: String,
+    /// Docker Hub sends explicit nulls for these at times.
     #[serde(default)]
-    description: String,
+    description: Option<String>,
     #[serde(default)]
-    star_count: u64,
+    star_count: Option<u64>,
     #[serde(default)]
-    is_official: bool,
+    is_official: Option<bool>,
 }
 
 /// What docker search itself queries.
@@ -96,17 +97,20 @@ pub fn parse_docker_hub(json: &[u8]) -> Result<Vec<Hit>> {
     Ok(page
         .results
         .into_iter()
-        .map(|r| Hit {
-            source: DOCKER_HUB.to_string(),
-            // Official images live under library/; the reference makes that explicit.
-            name: if r.is_official && !r.name.contains('/') {
-                format!("docker.io/library/{}", r.name)
-            } else {
-                format!("docker.io/{}", r.name)
-            },
-            description: r.description.trim().to_string(),
-            stars: Some(r.star_count),
-            official: r.is_official,
+        .map(|r| {
+            let official = r.is_official.unwrap_or(false);
+            Hit {
+                source: DOCKER_HUB.to_string(),
+                // Official images live under library/; the reference makes that explicit.
+                name: if official && !r.name.contains('/') {
+                    format!("docker.io/library/{}", r.name)
+                } else {
+                    format!("docker.io/{}", r.name)
+                },
+                description: r.description.unwrap_or_default().trim().to_string(),
+                stars: Some(r.star_count.unwrap_or(0)),
+                official,
+            }
         })
         .collect())
 }
@@ -130,6 +134,17 @@ mod tests {
         assert_eq!(hits[1].name, "docker.io/someone/busybox-extra");
         assert!(!hits[1].official);
         assert!(parse_docker_hub(b"{}").unwrap().is_empty());
+        let nulls = br#"{"results": [{"name": "x", "description": null, "star_count": null, "is_official": null}]}"#;
+        let hit = &parse_docker_hub(nulls).unwrap()[0];
+        assert_eq!(
+            (
+                hit.name.as_str(),
+                hit.description.as_str(),
+                hit.stars,
+                hit.official
+            ),
+            ("docker.io/x", "", Some(0), false)
+        );
         assert!(parse_docker_hub(b"not json").is_err());
     }
 

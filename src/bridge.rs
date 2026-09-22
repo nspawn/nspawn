@@ -578,7 +578,7 @@ pub fn prepare_machine(
 /// machines see the change through their bind mount.
 pub fn write_hosts_files(store: &Store, config: &Config) -> Result<()> {
     let members: BTreeMap<String, Ipv4Addr> = store
-        .list_images()?
+        .list_images_strict()?
         .into_iter()
         .filter(|r| r.network == Network::Bridge)
         .filter_map(|r| r.address.map(|a| (r.name, a)))
@@ -605,7 +605,7 @@ async fn ports_in_use(
     except: &str,
 ) -> Result<BTreeMap<(Protocol, u16), (String, Ipv4Addr, u16)>> {
     let mut used = BTreeMap::new();
-    for r in store.list_images()? {
+    for r in store.list_images_strict()? {
         if r.name == except || r.network != Network::Bridge || r.ports.is_empty() {
             continue;
         }

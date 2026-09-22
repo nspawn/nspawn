@@ -10,7 +10,7 @@ use crate::hub::short_digest;
 use crate::install::{ensure_replaceable, install, remove_existing, Install};
 use crate::oci::Mode;
 use crate::reference::validate_machine_name;
-use crate::store::Store;
+use crate::store::{validate_digest, Store};
 use crate::systemd::Systemd;
 use crate::volume;
 
@@ -54,6 +54,26 @@ pub async fn run(args: CreateArgs, config: &Config) -> Result<()> {
             );
         }
     }
+    // Everything given on the command line is checked before the old machine goes or
+    // the new one is assembled.
+    let ports = bridge::parse_publish(&args.publish)?;
+    let env = volume::parse_env(&args.env)?;
+    let volumes = volume::parse_volumes(&args.volume)?;
+    if source.mode == Mode::Boot
+        && (!args.command.is_empty() || args.entrypoint.is_some() || !args.env.is_empty())
+    {
+        bail!(
+            "{} boots an init system; a command, an entrypoint and variables only apply to the program of an app image",
+            args.name
+        );
+    }
+    for descriptor in manifest
+        .layers
+        .iter()
+        .chain(std::iter::once(&manifest.config))
+    {
+        validate_digest(&descriptor.digest)?;
+    }
     let choice = if args.backend == BackendChoice::Auto {
         source.backend
     } else {
@@ -88,15 +108,7 @@ pub async fn run(args: CreateArgs, config: &Config) -> Result<()> {
         .load_image(&args.name)?
         .context("the record of the new machine is missing")?;
     record.network = args.network.unwrap_or(source.network);
-    record.ports = bridge::parse_publish(&args.publish)?;
-    if mode == Mode::Boot
-        && (!args.command.is_empty() || args.entrypoint.is_some() || !args.env.is_empty())
-    {
-        bail!(
-            "{} boots an init system; a command, an entrypoint and variables only apply to the program of an app image",
-            args.name
-        );
-    }
+    record.ports = ports;
     if let Some(entrypoint) = &args.entrypoint {
         record.entrypoint = Some(if entrypoint.is_empty() {
             Vec::new()
@@ -107,8 +119,8 @@ pub async fn run(args: CreateArgs, config: &Config) -> Result<()> {
     if !args.command.is_empty() {
         record.cmd = Some(args.command.clone());
     }
-    record.env = volume::parse_env(&args.env)?;
-    record.volumes = volume::parse_volumes(&args.volume)?;
+    record.env = env;
+    record.volumes = volumes;
     store.record_image(&record)?;
     println!(
         "machine {} ({} image) is ready: nspawn start {}",

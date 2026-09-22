@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::hub::{short_digest, Hub};
 use crate::install::{ensure_replaceable, install, remove_existing, Install};
 use crate::reference::{validate_machine_name, ImageRef};
-use crate::store::Store;
+use crate::store::{validate_digest, Store};
 use crate::systemd::Systemd;
 
 pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
@@ -21,7 +21,6 @@ pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
     let sd = Systemd::connect().await?;
     let store = Store::new(&config.machines_dir, &config.state_dir);
     store.init()?;
-    let _lock = store.lock()?;
     ensure_replaceable(&store, &sd, &name, args.force).await?;
 
     let choice = if args.backend == BackendChoice::Auto {
@@ -32,6 +31,15 @@ pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
     let backend = Backend::choose(choice, &sd).await?;
     let hub = Hub::new(config)?;
     let (manifest, manifest_digest) = hub.resolve(&oci).await?;
+    // Digests become path components in the store; the registry does not get to choose them.
+    validate_digest(&manifest_digest)?;
+    for descriptor in manifest
+        .layers
+        .iter()
+        .chain(std::iter::once(&manifest.config))
+    {
+        validate_digest(&descriptor.digest)?;
+    }
     let manifest_bytes = hub.manifest_bytes(&oci, &manifest_digest).await?;
     println!(
         "{image}: manifest {} with {} layer(s), assembling as {}",
@@ -54,7 +62,10 @@ pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
         }
     }
 
-    // Only now, with everything downloaded, does the old image go.
+    // The store is locked only now: a long download must not hold up other commands or
+    // the unit hooks. The name is checked again, the old image goes only at this point.
+    let _lock = store.lock()?;
+    ensure_replaceable(&store, &sd, &name, args.force).await?;
     remove_existing(&store, &sd, &name).await?;
     let mode = install(
         &store,

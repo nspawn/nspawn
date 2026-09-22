@@ -86,7 +86,7 @@ impl Hub {
                 .with_context(|| format!("listing the catalog of {registry}"))?;
             let n = page.repositories.len();
             all.extend(page.repositories);
-            if n < 100 {
+            if !more_pages(n, all.last().map(String::as_str), last.as_deref()) {
                 break;
             }
             last = all.last().cloned();
@@ -113,7 +113,7 @@ impl Hub {
                 .with_context(|| format!("listing tags of {}", image.repository()))?;
             let n = page.tags.len();
             all.extend(page.tags);
-            if n < 100 {
+            if !more_pages(n, all.last().map(String::as_str), last.as_deref()) {
                 break;
             }
             last = all.last().cloned();
@@ -203,13 +203,49 @@ impl Hub {
     }
 }
 
-/// Where a blob is written while it is incomplete (".part-<name>", skipped by the store).
+/// Where a blob is written while it is incomplete (".part-<name>.<pid>", skipped by the
+/// store; per process, since downloads run without the store lock).
 pub fn part_path(dest: &Path) -> PathBuf {
     let name = dest
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "blob".to_string());
-    dest.with_file_name(format!(".part-{name}"))
+    dest.with_file_name(format!(".part-{name}.{}", std::process::id()))
+}
+
+/// Whether another page must be asked for: a full page that moved the cursor. A registry
+/// that ignores `n` and `last` would otherwise be asked forever.
+pub fn more_pages(page_len: usize, page_last: Option<&str>, previous: Option<&str>) -> bool {
+    page_len >= 100 && page_last.is_some() && page_last != previous
+}
+
+#[cfg(test)]
+mod pagination_tests {
+    use super::*;
+
+    #[test]
+    fn pagination_stops_on_short_or_repeated_pages() {
+        assert!(more_pages(100, Some("z"), None));
+        assert!(more_pages(100, Some("z"), Some("m")));
+        assert!(!more_pages(99, Some("z"), None));
+        assert!(
+            !more_pages(100, Some("z"), Some("z")),
+            "the cursor did not move"
+        );
+        assert!(!more_pages(100, None, None));
+    }
+
+    #[test]
+    fn part_names_are_per_process() {
+        let part = part_path(Path::new("/var/lib/nspawn/blobs/sha256-abc"));
+        assert_eq!(
+            part,
+            PathBuf::from(format!(
+                "/var/lib/nspawn/blobs/.part-sha256-abc.{}",
+                std::process::id()
+            ))
+        );
+    }
 }
 
 impl Hub {

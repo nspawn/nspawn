@@ -1,6 +1,7 @@
 use std::io::{self, BufRead, Write};
 
 use anyhow::{bail, Context, Result};
+use nix::sys::signal::{self, SigHandler, Signal};
 use nix::sys::termios::{self, LocalFlags, SetArg};
 use nix::unistd::isatty;
 
@@ -71,14 +72,19 @@ fn prompt(label: &str, hidden: bool) -> Result<String> {
         let mut quiet = original.clone();
         quiet.local_flags.remove(LocalFlags::ECHO);
         termios::tcsetattr(&stdin, SetArg::TCSANOW, &quiet)?;
-        Some(original)
+        // Ctrl-C would kill us with the echo still off; ignore it while it is.
+        let previous = unsafe { signal::signal(Signal::SIGINT, SigHandler::SigIgn) }.ok();
+        Some((original, previous))
     } else {
         None
     };
     let mut text = String::new();
     let read = stdin.lock().read_line(&mut text);
-    if let Some(original) = saved {
+    if let Some((original, previous)) = saved {
         let _ = termios::tcsetattr(&stdin, SetArg::TCSANOW, &original);
+        if let Some(previous) = previous {
+            let _ = unsafe { signal::signal(Signal::SIGINT, previous) };
+        }
         println!();
     }
     read.context("reading from the terminal")?;

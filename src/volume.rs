@@ -72,6 +72,10 @@ impl FromStr for Volume {
         {
             bail!("{text}: paths with whitespace are not supported");
         }
+        if target.trim_end_matches('/').is_empty() {
+            bail!("{text}: the machine's root cannot be a volume target");
+        }
+        reject_control_characters(text)?;
         Ok(Volume {
             source: source.to_string(),
             target: target.to_string(),
@@ -106,6 +110,28 @@ pub fn parse_volumes(values: &[String]) -> Result<Vec<Volume>> {
     Ok(out)
 }
 
+/// The settings file is line based: a control character in a value would become another
+/// directive, or nothing systemd can read.
+pub fn reject_control_characters(text: &str) -> Result<()> {
+    if text.chars().any(|c| c.is_control()) {
+        bail!("{text:?}: control characters are not allowed");
+    }
+    Ok(())
+}
+
+/// Environment as a program sees it when `extra` comes after `base`: one entry per
+/// variable, the later value winning (execve keeps duplicates and getenv reads the
+/// first, which is not what a later Environment= line means to systemd).
+pub fn merge_env(base: &[String], extra: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for var in base.iter().chain(extra) {
+        let name = var.split_once('=').map(|(n, _)| n).unwrap_or(var);
+        out.retain(|v| v.split_once('=').map(|(n, _)| n).unwrap_or(v) != name);
+        out.push(var.clone());
+    }
+    out
+}
+
 /// Parses the -e values: VAR=value as given, VAR alone copied from this environment.
 /// "none" alone clears the list; a later value of the same variable wins.
 pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
@@ -114,6 +140,7 @@ pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
     }
     let mut out: Vec<String> = Vec::new();
     for value in values {
+        reject_control_characters(value)?;
         let (name, assignment) = match value.split_once('=') {
             Some((name, _)) => (name, value.clone()),
             None => match std::env::var(value) {
@@ -182,5 +209,31 @@ mod tests {
         assert!(parse_env(&["=x".into()]).is_err());
         assert!(parse_env(&["none".into()]).unwrap().is_empty());
         assert_eq!(parse_env(&["X=a=b".into()]).unwrap(), vec!["X=a=b"]);
+        assert!(
+            parse_env(&["X=line\nbreak".into()]).is_err(),
+            "a newline would be another directive"
+        );
+    }
+
+    #[test]
+    fn later_environment_wins_once_merged() {
+        let base = vec!["PATH=/usr/bin".to_string(), "HOME=/root".to_string()];
+        let extra = vec![
+            "PATH=/opt/app/bin:/usr/bin".to_string(),
+            "MODE=prod".to_string(),
+        ];
+        assert_eq!(
+            merge_env(&base, &extra),
+            vec!["HOME=/root", "PATH=/opt/app/bin:/usr/bin", "MODE=prod"]
+        );
+        assert_eq!(merge_env(&[], &[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn root_and_control_characters_are_refused_as_volumes() {
+        assert!("/srv:/".parse::<Volume>().is_err());
+        assert!("/srv://".parse::<Volume>().is_err());
+        assert!("/srv:/data\n".parse::<Volume>().is_err());
+        assert!("/srv:/data".parse::<Volume>().is_ok());
     }
 }

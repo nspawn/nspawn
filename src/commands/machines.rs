@@ -280,6 +280,13 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
     }
     let store = Store::new(&config.machines_dir, &config.state_dir);
     let lock = store.lock()?;
+    // Registration comes late in a start; the unit's state tells about one in progress.
+    let (_, active) = sd
+        .unit_state(&format!("systemd-nspawn@{}.service", args.name))
+        .await?;
+    if active == "activating" || active == "active" {
+        bail!("machine {} is already starting", args.name);
+    }
     let mut record = store.load_image(&args.name)?;
     match record.as_mut() {
         Some(r) => {
@@ -348,12 +355,25 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
     let firewalld = network == Network::Veth && hostnet::firewalld_running(&sd).await;
     sd.start_machine(&args.name).await?;
     if args.wait || firewalld || network == Network::Bridge {
+        let unit = format!("systemd-nspawn@{}.service", args.name);
         let deadline = Instant::now() + Duration::from_secs(30);
         while !sd.machine_exists(&args.name).await? {
+            // A short program may have run and returned already: not a failure.
+            let (_, active) = sd.unit_state(&unit).await?;
+            match active.as_str() {
+                "active" | "activating" | "reloading" | "deactivating" => {}
+                "failed" => bail!(
+                    "{} ended right after starting with an error; see journalctl -u {unit}",
+                    args.name
+                ),
+                _ => {
+                    println!("{} ran and ended already", args.name);
+                    return Ok(());
+                }
+            }
             if Instant::now() > deadline {
                 bail!(
-                    "machine {} did not register within 30 seconds; see journalctl -u systemd-nspawn@{}",
-                    args.name,
+                    "machine {} did not register within 30 seconds; see journalctl -u {unit}",
                     args.name
                 );
             }
@@ -381,6 +401,13 @@ async fn wait_for_init(sd: &Systemd, name: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let Ok(leader) = sd.machine_leader(name).await else {
+            // Gone while booting: say so instead of "started".
+            let (_, active) = sd
+                .unit_state(&format!("systemd-nspawn@{name}.service"))
+                .await?;
+            if active == "failed" {
+                bail!("{name} died while booting; see journalctl -u systemd-nspawn@{name}.service");
+            }
             return Ok(());
         };
         if std::path::Path::new(&format!("/proc/{leader}/root/run/systemd/private")).exists()
@@ -417,6 +444,8 @@ pub async fn stop(args: StopArgs, config: &Config) -> Result<()> {
             // stop on a stopped container.
             Some(r) => {
                 release_machine(&sd, &store, &args.name, Some(r)).await?;
+                sd.reset_failed(&format!("systemd-nspawn@{}.service", args.name))
+                    .await?;
                 println!("{} was not running", args.name);
                 return Ok(());
             }
@@ -454,10 +483,7 @@ pub async fn stop(args: StopArgs, config: &Config) -> Result<()> {
                 }
                 match payload {
                     Some(payload) => {
-                        if let Err(e) = nix::sys::signal::kill(
-                            nix::unistd::Pid::from_raw(payload),
-                            nix::sys::signal::Signal::try_from(signal_number(&signal)?)?,
-                        ) {
+                        if let Err(e) = send_signal(payload, signal_number(&signal)?) {
                             eprintln!("note: could not send {signal} to PID {payload} of {}: {e}", args.name);
                         }
                     }
@@ -466,7 +492,9 @@ pub async fn stop(args: StopArgs, config: &Config) -> Result<()> {
                         args.name
                     ),
                 }
-                if !wait_gone(&sd, &args.name, Duration::from_secs(args.timeout)).await? {
+                if args.wait
+                    && !wait_gone(&sd, &args.name, Duration::from_secs(args.timeout)).await?
+                {
                     eprintln!(
                         "{} ignored {signal} for {} seconds; killing it",
                         args.name, args.timeout
@@ -581,11 +609,22 @@ fn signal_number(name: &str) -> Result<i32> {
     Ok(signal as i32)
 }
 
-/// The program an app machine runs: the child of its stub init (the leader), found by
-/// its parent PID (the /proc children file is optional in kernels).
+/// The program an app machine runs: the child of its stub init (the leader). The kernel's
+/// children list gives it directly when available; otherwise the oldest child by start
+/// time, since anything re-parented to the stub came later.
 fn payload_pid(leader: u32) -> Option<i32> {
-    let entries = std::fs::read_dir("/proc").ok()?;
-    for entry in entries.flatten() {
+    if let Ok(children) = std::fs::read_to_string(format!("/proc/{leader}/task/{leader}/children"))
+    {
+        if let Some(first) = children
+            .split_whitespace()
+            .next()
+            .and_then(|p| p.parse().ok())
+        {
+            return Some(first);
+        }
+    }
+    let mut oldest: Option<(u64, i32)> = None;
+    for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -596,19 +635,28 @@ fn payload_pid(leader: u32) -> Option<i32> {
         let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
             continue;
         };
-        // "pid (comm) state ppid ...": the comm may contain spaces and parentheses.
-        let Some(rest) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
-            continue;
-        };
-        let ppid = rest
-            .split_whitespace()
-            .nth(1)
-            .and_then(|p| p.parse::<u32>().ok());
-        if ppid == Some(leader) {
-            return Some(pid);
+        if let Some((ppid, started)) = stat_ppid_and_start(&stat) {
+            if ppid == leader && oldest.is_none_or(|(s, _)| started < s) {
+                oldest = Some((started, pid));
+            }
         }
     }
-    None
+    oldest.map(|(_, pid)| pid)
+}
+
+/// Parent PID and start time from a /proc/PID/stat line, whose comm may contain spaces
+/// and parentheses: "pid (comm) state ppid ... starttime" (field 22).
+fn stat_ppid_and_start(stat: &str) -> Option<(u32, u64)> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // rest starts at field 3 (state), so ppid is index 1 and starttime index 19.
+    Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+}
+
+/// kill(2) with a raw number: nix's Signal enum stops at the standard signals and images
+/// may ask for realtime ones (SIGRTMIN+3 is common for systemd-based images).
+fn send_signal(pid: i32, signal: i32) -> nix::Result<()> {
+    nix::errno::Errno::result(unsafe { libc::kill(pid, signal) }).map(drop)
 }
 
 pub async fn exec(args: ExecArgs, config: &Config) -> Result<()> {
@@ -660,9 +708,10 @@ async fn exec_in_namespaces(
     let leader = sd.machine_leader(machine).await?;
     let user = if user == "root" { None } else { Some(user) };
     let working_dir = record.and_then(|r| r.run.working_dir.as_deref());
-    // The image's environment plus what -e added, like the program itself sees.
+    // The image's environment plus what -e added, like the program itself sees: one entry
+    // per variable, the later one winning.
     let env: Vec<String> = record
-        .map(|r| r.run.env.iter().chain(&r.env).cloned().collect())
+        .map(|r| volume::merge_env(&r.run.env, &r.env))
         .unwrap_or_default();
     tokio::task::block_in_place(|| nsenter::exec(leader, command, user, working_dir, &env))
         .with_context(|| format!("running a command inside {machine}"))
@@ -739,6 +788,22 @@ pub fn journalctl_arguments(args: &LogsArgs) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn realtime_signals_reach_kill() {
+        // A PID that cannot exist: the kernel validates the signal number first, so a
+        // realtime number must come back as ESRCH, never EINVAL.
+        let rt = libc::SIGRTMIN() + 3;
+        assert_eq!(send_signal(i32::MAX, rt), Err(nix::errno::Errno::ESRCH));
+        assert_eq!(send_signal(std::process::id() as i32, 0), Ok(()));
+    }
+
+    #[test]
+    fn stat_lines_with_odd_comms() {
+        let line = "4242 (a (weird) name) S 17 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 12345 0 18446744073709551615";
+        assert_eq!(stat_ppid_and_start(line), Some((17, 987654)));
+        assert_eq!(stat_ppid_and_start("garbage"), None);
+    }
 
     #[test]
     fn stop_signal_spellings() {

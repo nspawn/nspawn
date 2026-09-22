@@ -73,10 +73,15 @@ impl ImageRecord {
         argv
     }
 
-    /// Older records stored an empty "command" list meaning "no override".
+    /// Older records stored an empty "command" list meaning "no override", and kept the
+    /// image's entrypoint and cmd joined; both take the current shape here.
     fn normalize(mut self) -> Self {
         if self.cmd.as_ref().is_some_and(|c| c.is_empty()) {
             self.cmd = None;
+        }
+        if self.run.entrypoint.is_empty() && self.run.cmd.is_empty() && !self.run.command.is_empty()
+        {
+            self.run.cmd = std::mem::take(&mut self.run.command);
         }
         self
     }
@@ -164,6 +169,39 @@ impl Store {
         }
     }
 
+    /// Like `lock`, giving up after `wait` with a clear message: for the unit hooks, which
+    /// run inside a start job with a timeout of its own.
+    pub fn lock_for(&self, wait: std::time::Duration) -> Result<StoreLock> {
+        fs::create_dir_all(&self.root)
+            .with_context(|| format!("creating {}", self.root.display()))?;
+        let path = self.root.join(".lock");
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .with_context(|| format!("opening {}", path.display()))?;
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => return Ok(StoreLock(lock)),
+                Err((_, nix::errno::Errno::EWOULDBLOCK))
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err((_, nix::errno::Errno::EWOULDBLOCK)) => {
+                    bail!(
+                        "the store is busy (another nspawn command, a pull perhaps, holds {})",
+                        path.display()
+                    )
+                }
+                Err((_, errno)) => bail!("locking {}: {errno}", path.display()),
+            }
+        }
+    }
+
     pub fn init(&self) -> Result<()> {
         for d in [
             self.layers_dir(Ownership::Root),
@@ -232,8 +270,7 @@ impl Store {
     pub fn save_manifest(&self, name: &str, bytes: &[u8]) -> Result<()> {
         fs::create_dir_all(self.manifests_dir())
             .with_context(|| format!("creating {}", self.manifests_dir().display()))?;
-        let path = self.manifests_dir().join(format!("{name}.json"));
-        fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))
+        write_atomically(&self.manifests_dir().join(format!("{name}.json")), bytes)
     }
 
     pub fn load_manifest(&self, name: &str) -> Result<Vec<u8>> {
@@ -244,7 +281,7 @@ impl Store {
     /// Digests of every blob some image still needs: its layers and its config.
     fn referenced_blobs(&self) -> Result<std::collections::HashSet<String>> {
         let mut set = std::collections::HashSet::new();
-        for record in self.list_images()? {
+        for record in self.list_images_strict()? {
             for layer in &record.layers {
                 set.insert(layer_dir_name(layer));
             }
@@ -270,9 +307,16 @@ impl Store {
             let entry = entry?;
             let file_name = entry.file_name().to_string_lossy().to_string();
             if file_name.starts_with(".part-") {
-                // A download or copy that never finished; the store is locked, so nobody
-                // is writing it now.
-                let _ = fs::remove_file(entry.path());
+                // A download or copy that never finished. Downloads run without the lock,
+                // so only what nobody touched for an hour goes.
+                let stale = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .map(|t| t.elapsed().map(|e| e.as_secs() > 3600).unwrap_or(false))
+                    .unwrap_or(false);
+                if stale {
+                    let _ = fs::remove_file(entry.path());
+                }
                 continue;
             }
             if file_name.starts_with('.') || referenced.contains(&file_name) {
@@ -321,7 +365,7 @@ impl Store {
     pub fn record_image(&self, record: &ImageRecord) -> Result<()> {
         let path = self.images_dir().join(format!("{}.json", record.name));
         let text = serde_json::to_string_pretty(record)?;
-        fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+        write_atomically(&path, text.as_bytes())
     }
 
     pub fn load_image(&self, name: &str) -> Result<Option<ImageRecord>> {
@@ -335,7 +379,19 @@ impl Store {
         Ok(Some(record.normalize()))
     }
 
+    /// Every record, skipping (with a warning) those this version cannot read.
     pub fn list_images(&self) -> Result<Vec<ImageRecord>> {
+        self.read_records(false)
+    }
+
+    /// Every record, or an error when one cannot be read: what garbage collection and
+    /// the generated files must use, since a record they cannot see is an image they
+    /// would treat as gone.
+    pub fn list_images_strict(&self) -> Result<Vec<ImageRecord>> {
+        self.read_records(true)
+    }
+
+    fn read_records(&self, strict: bool) -> Result<Vec<ImageRecord>> {
         let mut out = Vec::new();
         let entries = match fs::read_dir(self.images_dir()) {
             Ok(entries) => entries,
@@ -353,9 +409,18 @@ impl Store {
             if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let text = fs::read_to_string(entry.path())?;
+            let text = fs::read_to_string(entry.path())
+                .with_context(|| format!("reading {}", entry.path().display()))?;
             match serde_json::from_str::<ImageRecord>(&text) {
                 Ok(r) => out.push(r.normalize()),
+                Err(e) if strict => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "record {} cannot be read; fix or remove it first",
+                            entry.path().display()
+                        )
+                    })
+                }
                 Err(e) => eprintln!("warning: ignoring {}: {e}", entry.path().display()),
             }
         }
@@ -402,7 +467,7 @@ impl Store {
     /// and flat machines none at all. Returns the digests removed.
     pub fn gc_layers(&self) -> Result<Vec<String>> {
         let mut referenced: HashMap<Ownership, HashSet<String>> = HashMap::new();
-        for record in self.list_images()? {
+        for record in self.list_images_strict()? {
             let ownership = match record.backend {
                 BackendChoice::Overlay => Ownership::Root,
                 BackendChoice::Mstack => Ownership::Foreign,
@@ -438,6 +503,33 @@ impl Store {
             }
         }
         Ok(removed)
+    }
+}
+
+/// Writes a file through a temporary name in the same directory and a rename, so that
+/// a crash never leaves a half-written record behind.
+pub fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let tmp = path.with_file_name(format!(".tmp-{name}.{}", std::process::id()));
+    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("moving {} into place", path.display()))
+}
+
+/// A digest as the store accepts it for a path component: sha256 and 64 hex digits.
+pub fn validate_digest(digest: &str) -> Result<()> {
+    match digest.strip_prefix("sha256:") {
+        Some(hex)
+            if hex.len() == 64
+                && hex
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()) =>
+        {
+            Ok(())
+        }
+        _ => bail!("{digest:?} is not a sha256 digest"),
     }
 }
 
@@ -680,7 +772,13 @@ fn resolve_inside(target: &Path, relative: &Path, symlink_leaf: bool) -> Result<
                 if symlink_leaf && i + 1 == names.len() {
                     return Ok(Some(path));
                 }
-                return Ok(None);
+                // A symlink that stays inside the tree (lib -> usr/lib) is followed, as
+                // the tar crate does for regular entries; anything else is refused.
+                let root = fs::canonicalize(target)?;
+                match fs::canonicalize(&path) {
+                    Ok(real) if real.starts_with(&root) => path = real,
+                    _ => return Ok(None),
+                }
             }
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -1267,11 +1365,107 @@ mod tests {
         assert!(store
             .layer_dir("sha256:shared", Ownership::Foreign)
             .is_dir());
-        // Abandoned partial blobs go too, finished ones stay.
-        fs::write(store.blobs_dir().join(".part-sha256-x"), b"half").unwrap();
+        // Abandoned partial blobs go once nobody has touched them for an hour (a download
+        // in flight runs without the lock); finished ones stay.
+        let fresh = store.blobs_dir().join(".part-sha256-fresh.1");
+        let old = store.blobs_dir().join(".part-sha256-old.2");
+        fs::write(&fresh, b"half").unwrap();
+        fs::write(&old, b"half").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+            .unwrap();
         fs::write(store.blob_path("sha256:m"), b"manifest?").unwrap();
         store.gc_blobs().unwrap();
-        assert!(!store.blobs_dir().join(".part-sha256-x").exists());
+        assert!(fresh.exists(), "a download in flight is left alone");
+        assert!(!old.exists(), "an abandoned one goes");
+    }
+
+    #[test]
+    fn gc_refuses_to_guess_when_a_record_cannot_be_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        store.init().unwrap();
+        fs::create_dir_all(store.layer_dir("sha256:live", Ownership::Root)).unwrap();
+        fs::write(store.blob_path("sha256:live"), b"blob").unwrap();
+        // A record from a newer version, or a damaged one.
+        fs::write(
+            store.images_dir().join("future.json"),
+            "{\"name\": \"future\", \"network\": \"vpn\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            store.list_images().unwrap().len(),
+            0,
+            "lenient listing skips it"
+        );
+        assert!(store.list_images_strict().is_err());
+        assert!(store.gc_layers().is_err());
+        assert!(store.gc_blobs().is_err());
+        assert!(store.layer_dir("sha256:live", Ownership::Root).is_dir());
+        assert!(store.blob_path("sha256:live").is_file());
+    }
+
+    #[test]
+    fn digests_are_validated_before_becoming_paths() {
+        assert!(validate_digest(&format!("sha256:{}", "a".repeat(64))).is_ok());
+        assert!(validate_digest("sha256:/../../etc").is_err());
+        assert!(validate_digest(&format!("sha256:{}", "A".repeat(64))).is_err());
+        assert!(validate_digest(&format!("sha512:{}", "a".repeat(64))).is_err());
+        assert!(validate_digest(&format!("sha256:{}", "a".repeat(63))).is_err());
+    }
+
+    #[test]
+    fn records_are_written_atomically_and_legacy_commands_become_cmd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        store.init().unwrap();
+        fs::write(
+            store.images_dir().join("old.json"),
+            r#"{"name":"old","reference":"hub/x:1","manifest_digest":"sha256:m","layers":[],"backend":"overlay","created":1,
+                "run":{"command":["/docker-entrypoint.sh","nginx"]},"command":[]}"#,
+        )
+        .unwrap();
+        let old = store.load_image("old").unwrap().unwrap();
+        assert!(old.run.command.is_empty() && old.run.entrypoint().is_empty());
+        assert_eq!(old.run.cmd(), ["/docker-entrypoint.sh", "nginx"]);
+        assert_eq!(old.cmd, None, "an empty legacy override means none");
+        store.record_image(&old).unwrap();
+        assert!(!store.images_dir().join(".tmp-old.json.0").exists());
+        assert!(fs::read_dir(store.images_dir())
+            .unwrap()
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().starts_with(".tmp-")));
+    }
+
+    #[test]
+    fn symlinks_inside_the_tree_are_followed_when_applying_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("root");
+        fs::create_dir_all(target.join("usr/lib")).unwrap();
+        std::os::unix::fs::symlink("usr/lib", target.join("lib")).unwrap();
+        fs::write(target.join("usr/lib/old"), "x").unwrap();
+        let blob = tmp.path().join("layer.tar");
+        fs::write(
+            &blob,
+            tar_with(&[("lib/.wh.old", Some("")), ("lib/new", Some("n"))]),
+        )
+        .unwrap();
+        extract_layer(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar",
+            &target,
+            WhiteoutMode::Apply,
+            Ownership::Root,
+        )
+        .unwrap();
+        assert!(
+            !target.join("usr/lib/old").exists(),
+            "whiteout through an inside symlink applies"
+        );
+        assert_eq!(fs::read_to_string(target.join("usr/lib/new")).unwrap(), "n");
     }
 
     #[test]

@@ -34,8 +34,8 @@ image (blobs, manifest, assembled machine) and can be started right away or push
 ## Machines and apps
 
 Images that ship an init system (systemd) and whose entrypoint is that init are booted with
-`--boot`, like `machinectl start` does; `exec` and `shell` go through machined's
-`OpenMachineShell`. Any other image, for example anything from Docker Hub, is an "app":
+`--boot`, like `machinectl start` does, and `shell` opens machined's login session
+there. Any other image, for example anything from Docker Hub, is an "app":
 its entrypoint runs as PID 2 under nspawn's stub init, with the environment, working
 directory, user and stop signal from the OCI config, and joins the bridge network like
 any other machine (see Networking). The arguments given to `create` or `start` after `--`
@@ -137,10 +137,11 @@ and binds `ve-<name>` to firewalld's trusted zone while the machine runs.
 
 - A host with systemd-nspawn and systemd-machined (any recent version; 259 and 261 are
   tested), overlayfs for the `overlay` backend and cgroup v2.
-- `pull` and `images rm` need root because they write below `/var/lib/machines`,
-  `/var/lib/nspawn` and `/etc/systemd/system`. Everything else goes through D-Bus and polkit.
-- Booted machines use `OpenMachineShell` for `exec` and `shell`, which needs D-Bus inside
-  the machine (the hub images have it); app images are entered through their namespaces.
+- Commands that change the host need root: `pull`, `create`, `build`, `images rm`, `start`,
+  `stop`, `login` and `logout` write below `/var/lib/machines`, `/var/lib/nspawn`,
+  `/etc/systemd` and `/etc/nspawn`. Listing, `search`, `logs` and `hub` do not.
+- `shell` on a booted machine uses machined's login session, which needs D-Bus inside
+  (the hub images have it); `exec` enters the namespaces and needs nothing.
 - The bridge network needs `ip` and `nft` on the host (iproute2 and nftables), nothing
   else. `--network veth` needs systemd-networkd on the host.
 

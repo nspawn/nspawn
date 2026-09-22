@@ -94,17 +94,67 @@ const INIT_PATHS: [&str; 4] = [
 ];
 
 /// Whether the image ships an init program. `trees` are the layers from the base up (or
-/// one flat root); the topmost layer that mentions a path decides, and a whiteout there
-/// (a character device 0:0) means the path was deleted.
+/// one flat root); the topmost layer that says something decides, with overlay's rules:
+/// a whiteout (character device 0:0), a file where a directory is expected or an opaque
+/// directory hides the lower layers, and a symlink on the way counts as "not this layer"
+/// (it may point anywhere, the host included).
 pub fn has_init(trees: &[PathBuf]) -> bool {
     INIT_PATHS.iter().any(|p| {
-        trees
-            .iter()
-            .rev()
-            .find_map(|tree| tree.join(p).symlink_metadata().ok())
-            .map(|meta| !(meta.file_type().is_char_device() && meta.rdev() == 0))
-            .unwrap_or(false)
+        for tree in trees.iter().rev() {
+            match lookup(tree, Path::new(p)) {
+                Lookup::Present => return true,
+                Lookup::Hidden => return false,
+                Lookup::Absent => {}
+            }
+        }
+        false
     })
+}
+
+enum Lookup {
+    Present,
+    Hidden,
+    Absent,
+}
+
+fn lookup(tree: &Path, relative: &Path) -> Lookup {
+    let components: Vec<_> = relative.components().collect();
+    let mut path = tree.to_path_buf();
+    for (i, component) in components.iter().enumerate() {
+        path.push(component);
+        let Ok(meta) = path.symlink_metadata() else {
+            return Lookup::Absent;
+        };
+        let kind = meta.file_type();
+        if kind.is_char_device() && meta.rdev() == 0 {
+            return Lookup::Hidden;
+        }
+        // The init itself may be a symlink (sbin/init -> ../lib/systemd/systemd); a
+        // symlink on the way is another matter.
+        if i + 1 == components.len() {
+            return Lookup::Present;
+        }
+        if kind.is_symlink() {
+            return Lookup::Absent;
+        }
+        if !kind.is_dir() {
+            return Lookup::Hidden;
+        }
+        if xattr::get(&path, "trusted.overlay.opaque")
+            .ok()
+            .flatten()
+            .is_some_and(|v| v == b"y")
+        {
+            // The lower layers' contents of this directory are hidden: only this layer
+            // can still provide the rest of the path.
+            let rest: PathBuf = components[i + 1..].iter().collect();
+            return match lookup(&path, &rest) {
+                Lookup::Present => Lookup::Present,
+                _ => Lookup::Hidden,
+            };
+        }
+    }
+    Lookup::Absent
 }
 
 /// Boot when there is an init and the image does not ask for something else to run.
@@ -185,6 +235,22 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         assert!(!has_init(&[base.clone(), top.clone()]));
         std::os::unix::fs::symlink("systemd", top.join("usr/lib/systemd/systemd")).unwrap();
-        assert!(has_init(&[base, top]));
+        assert!(has_init(&[base.clone(), top.clone()]));
+        // A base layer with init and a top layer that says nothing: still an init.
+        let quiet = tmp.path().join("quiet");
+        std::fs::create_dir_all(&quiet).unwrap();
+        assert!(has_init(&[top.clone(), quiet.clone()]));
+        // A top layer that turns the directory into a file hides the lower init.
+        let flattened = tmp.path().join("flattened");
+        std::fs::create_dir_all(flattened.join("usr/lib")).unwrap();
+        std::fs::write(flattened.join("usr/lib/systemd"), "not a dir").unwrap();
+        assert!(!has_init(&[top.clone(), flattened]));
+        // An absolute symlink must not make the host's own init count.
+        let hostlink = tmp.path().join("hostlink");
+        std::fs::create_dir_all(&hostlink).unwrap();
+        std::os::unix::fs::symlink("/usr/lib", hostlink.join("lib")).unwrap();
+        std::os::unix::fs::symlink("/usr/sbin", hostlink.join("sbin")).unwrap();
+        std::os::unix::fs::symlink("/usr", hostlink.join("usr")).unwrap();
+        assert!(!has_init(&[hostlink]));
     }
 }

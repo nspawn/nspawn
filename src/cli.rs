@@ -328,7 +328,8 @@ pub struct PsArgs {
 pub struct StartArgs {
     /// Image name.
     pub name: String,
-    /// Return as soon as the unit is started, without waiting for the machine to register.
+    /// Do not wait for a booted machine's init to be up before returning (its
+    /// registration is still awaited so that ports and firewall rules can be applied).
     #[arg(long = "no-wait", action = clap::ArgAction::SetFalse)]
     pub wait: bool,
     /// Network of the machine, remembered for the image: bridge (default for booted
@@ -366,7 +367,8 @@ pub struct StopArgs {
     /// Kill the machine immediately instead of asking it to power off.
     #[arg(long, short = 'f')]
     pub force: bool,
-    /// Return right after asking, without waiting for the machine to be gone.
+    /// Return right after the stop request, without waiting for the machine to be gone
+    /// (no SIGKILL after --timeout; the unit hooks release its network when it ends).
     #[arg(long = "no-wait", action = clap::ArgAction::SetFalse)]
     pub wait: bool,
     /// App images: seconds to wait after the stop signal before terminating the machine.

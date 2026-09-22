@@ -20,6 +20,8 @@ cleanup() {
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
   $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || true
+  rm -rf /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol
+  kill "${listener_pid:-}" 2>/dev/null || true
   if [ "$networkd_was" != active ]; then
     systemctl stop systemd-networkd.service systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-resolve-hook.socket >/dev/null 2>&1 || true
   fi
@@ -78,7 +80,7 @@ for backend in overlay flat; do
   echo "is-system-running: $out"
   echo "$out" | grep -qE "running|degraded|starting" || fail "exec did not reach systemd inside $name"
   $NSPAWN exec "$name" -- /usr/bin/cat /etc/os-release </dev/null | tr -d '\r' | grep -q PRETTY_NAME || fail "exec cat os-release"
-  $NSPAWN exec "$name" -- /bin/false </dev/null; [ $? -eq 1 ] || fail "exec did not propagate the exit code of a booted machine"
+  $NSPAWN exec "$name" -- /bin/sh -c 'exit 7' </dev/null; [ $? -eq 7 ] || fail "exec did not propagate the exit code of a booted machine"
   $NSPAWN exec "$name" -- /bin/sh -c 'echo $PATH' </dev/null | tr -d '\r' | grep -q "/usr/bin" || fail "exec has no PATH"
   if [ "$backend" = overlay ]; then
     step "volume in a booted machine (private users, idmapped)"
@@ -118,6 +120,9 @@ for backend in overlay flat; do
       firewall-cmd --zone=trusted --list-interfaces | grep -qw "ve-$name" && fail "ve-$name still bound in firewalld after stop"
     fi
     $NSPAWN start "$name" --network bridge >/dev/null && $NSPAWN stop "$name" >/dev/null || fail "back to the bridge network"
+    if [ "$networkd_was" != active ]; then
+      systemctl stop systemd-networkd.service systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-resolve-hook.socket >/dev/null 2>&1 || true
+    fi
   fi
   step "stop right after start"
   $NSPAWN start "$name" && $NSPAWN stop "$name" || fail "stop right after start ($backend)"
@@ -132,6 +137,12 @@ step "layer sharing between two images"
 $NSPAWN pull "$IMAGE" --name e2e-a --backend overlay --force >/dev/null || fail "pull e2e-a"
 $NSPAWN pull "$IMAGE" --name e2e-b --backend overlay --force | tee /tmp/e2e-p2.txt || fail "pull e2e-b"
 grep -q "already present" /tmp/e2e-p2.txt || fail "second pull downloaded the layer again"
+
+step "create: arguments are checked before anything is made"
+$NSPAWN create e2e-a e2e-bad -e X=1 >/dev/null 2>&1 && fail "create accepted -e for a booted image"
+$NSPAWN images ls | grep -q "^ *e2e-bad " && fail "a refused create left a machine behind"
+$NSPAWN create e2e-a e2e-bad -v "bad volume" >/dev/null 2>&1 && fail "create accepted a bad volume"
+[ -e /etc/systemd/nspawn/e2e-bad.nspawn ] && fail "a refused create left settings behind"
 
 step "create: another machine from a local image, without the registry"
 env NSPAWN_REGISTRY=127.0.0.1:9 $NSPAWN create e2e-a e2e-c || fail "create from a local image"
@@ -224,8 +235,12 @@ echo "$out"
 echo "$out" | grep -q "inside:$app" || fail "exec via namespaces did not run inside the machine"
 [ "$($NSPAWN exec $app -- id -u </dev/null | tr -d '\r')" = "0" ] || fail "exec does not run as the machine's root"
 [ "$($NSPAWN exec $app --user 65534 -- id -u </dev/null | tr -d '\r')" = "65534" ] || fail "exec --user ignored"
-$NSPAWN exec $app -- /bin/false </dev/null; [ $? -eq 1 ] || fail "exec did not propagate the exit code"
+$NSPAWN exec $app -- /bin/sh -c 'exit 7' </dev/null; [ $? -eq 7 ] || fail "exec did not propagate the exit code"
+[ "$(printf 'a\nb' | $NSPAWN exec $app -- cat)" = "$(printf 'a\nb')" ] || fail "piped stdin/stdout through exec is not byte exact"
 step "app on the bridge: address, DNS, internet and published port (no networkd anywhere)"
+if [ "$networkd_was" != active ]; then
+  systemctl is-active systemd-networkd >/dev/null && fail "systemd-networkd is running during the app section"
+fi
 app_addr=$($NSPAWN network ls | awk -v n="$app" '$1 == n {print $2}')
 echo "$app has address $app_addr"
 echo "$app_addr" | grep -q "^10\.99\.0\." || fail "no bridge address for the app"
@@ -256,14 +271,25 @@ $NSPAWN stop $app >/dev/null || fail "stop remembered app"
 machinectl start $app || fail "machinectl start of an app (the hooks must prepare its network)"
 retry 10 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep -q app-web" || fail "no network or ports after machinectl start"
 $NSPAWN stop $app || fail "stop after machinectl start"
+t0=$(date +%s)
+$NSPAWN start $app -- /bin/true || fail "start of a program that returns at once"
+[ $(( $(date +%s) - t0 )) -lt 15 ] || fail "start waited for a program that had already returned"
+$NSPAWN start $app -- /bin/sh -c 'exit 3' >/dev/null 2>&1 || true
+retry 10 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "failed app still listed"
+out=$($NSPAWN stop $app 2>&1); echo "$out" | grep -q "was not running" || fail "stop after a failed program: $out"
+systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit left failed after stop of a program that exited 3"
 $NSPAWN start $app -- /bin/sh -c 'sleep 1' || fail "start short-lived app"
 retry 10 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "short-lived app still listed"
 sleep 1
 [ -e /run/netns/nspawn-$app ] && fail "namespace left behind by an app that exited on its own"
 nft list map ip nspawn ports | grep -q 18081 && fail "ports of an exited app still mapped"
 out=$($NSPAWN stop $app 2>&1); echo "$out" | grep -q "was not running" || fail "stop of a stopped machine is not a no-op: $out"
-out=$($NSPAWN start $app -p 22:80 2>&1); echo "$out" | grep -q "in use by a service on the host" || fail "publishing the host's ssh port was not refused: $out"
-$NSPAWN ps -a | grep "^ *$app " | grep -q "22->80" && fail "a refused port was remembered"
+python3 -c 'import socket,time; s=socket.socket(); s.bind(("0.0.0.0",18099)); s.listen(); time.sleep(120)' &
+listener_pid=$!
+sleep 1
+out=$($NSPAWN start $app -p 18099:80 2>&1); echo "$out" | grep -q "in use by a service on the host" || fail "publishing a port a host service listens on was not refused: $out"
+$NSPAWN ps -a | grep "^ *$app " | grep -q "18099->80" && fail "a refused port was remembered"
+kill "$listener_pid" 2>/dev/null; listener_pid=
 
 step "entrypoint, environment and volumes, docker style"
 rm -rf /tmp/e2e-bind /var/lib/nspawn/volumes/e2evol; mkdir -p /tmp/e2e-bind; echo from-host > /tmp/e2e-bind/hello
@@ -276,6 +302,9 @@ grep -q "^from-host" /tmp/e2e-logs.txt || fail "bind mount not visible inside"
 grep -q "RO-OK" /tmp/e2e-logs.txt || fail "read-only volume was writable"
 [ "$(cat /var/lib/nspawn/volumes/e2evol/written 2>/dev/null)" = from-app ] || fail "named volume not written on the host"
 $NSPAWN ps | grep "^ *$app " | grep -q "/bin/sh -c" || fail "ps does not show the entrypoint plus arguments"
+[ "$($NSPAWN exec $app -- /bin/sh -c 'echo $GREETING' </dev/null | tr -d '\r')" = hola ] || fail "exec does not see -e variables"
+$NSPAWN stop $app >/dev/null; $NSPAWN start $app -e PATH=/opt/none:/usr/bin:/bin -- /bin/sleep 300 >/dev/null || fail "start with a PATH override"
+[ "$($NSPAWN exec $app -- /bin/sh -c 'echo $PATH' </dev/null | tr -d '\r')" = "/opt/none:/usr/bin:/bin" ] || fail "exec does not apply a -e override of an image variable"
 $NSPAWN stop $app || fail "stop app with volumes"
 $NSPAWN start $app --image-command -e none -v none || fail "start with the image's own command"
 $NSPAWN ps | grep "^ *$app " | grep -q " sh " || fail "--image-command did not restore the image's cmd"
@@ -283,7 +312,7 @@ grep -q "Bind=" /etc/systemd/nspawn/$app.nspawn && fail "-v none left volumes in
 $NSPAWN stop $app -t 2 || fail "stop app running its own cmd"
 $NSPAWN images rm $app || fail "rm busybox"
 [ -e /etc/systemd/nspawn/$app.nspawn ] && fail "settings file left behind for $app"
-grep -q "(boot image)" /tmp/e2e-hub.txt 2>/dev/null || true
+ls /etc/systemd/system/ | grep -q "$app" && fail "unit files left behind for $app"
 
 step "pipelines: a reader that closes early must not make nspawn fail"
 $NSPAWN hub ls | head -c 1 >/dev/null; rc=${PIPESTATUS[0]}

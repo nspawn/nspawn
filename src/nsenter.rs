@@ -84,25 +84,39 @@ pub fn exec(
     }
     let c_cwd = CString::new(working_dir.unwrap_or("/"))?;
     let user = user.map(|u| u.to_string());
-    let pty = nix::pty::openpty(None, None).context("allocating a pseudo terminal")?;
+    // A pseudo terminal only when the caller has one, as docker does with -t: piped
+    // input and output pass through byte for byte otherwise, and EOF is a real EOF.
+    let pty = if nix::unistd::isatty(std::io::stdin()).unwrap_or(false) {
+        Some(nix::pty::openpty(None, None).context("allocating a pseudo terminal")?)
+    } else {
+        None
+    };
 
     // SAFETY: the parent is multithreaded (tokio), so the child only performs syscalls and
     // work on data prepared above until it execs or exits.
     match unsafe { fork() }.context("forking the namespace helper")? {
         ForkResult::Parent { child } => {
-            drop(pty.slave);
             drop(ns_fds);
-            let session = pty::run_session(pty.master);
+            let session = match pty {
+                Some(pty) => {
+                    drop(pty.slave);
+                    pty::run_session(pty.master)
+                }
+                None => Ok(()),
+            };
             let status = waitpid(child, None).context("waiting for the namespace helper")?;
             session?;
             Ok(exit_code(status))
         }
         ForkResult::Child => {
-            drop(pty.master);
+            let slave = pty.map(|p| {
+                drop(p.master);
+                p.slave
+            });
             let code = helper(
                 &ns_fds,
                 cgroup.as_deref(),
-                &pty.slave,
+                slave.as_ref(),
                 &c_argv,
                 &env,
                 &c_cwd,
@@ -125,7 +139,7 @@ fn leader_cgroup(leader: u32) -> Option<String> {
 fn helper(
     ns_fds: &[(&str, CloneFlags, OwnedFd)],
     cgroup: Option<&str>,
-    slave: &OwnedFd,
+    slave: Option<&OwnedFd>,
     argv: &[CString],
     env: &[CString],
     cwd: &CString,
@@ -166,25 +180,27 @@ fn helper(
 }
 
 fn grandchild(
-    slave: &OwnedFd,
+    slave: Option<&OwnedFd>,
     argv: &[CString],
     env: &[CString],
     cwd: &CString,
     user: Option<&str>,
 ) -> i32 {
-    if setsid().is_err() {
-        eprintln!("error: setsid failed");
-        return 126;
-    }
-    if unsafe { tiocsctty(slave.as_raw_fd(), 0) }.is_err() {
-        eprintln!("error: cannot take the terminal");
-        return 126;
-    }
-    if dup2_stdin(slave.as_fd()).is_err()
-        || dup2_stdout(slave.as_fd()).is_err()
-        || dup2_stderr(slave.as_fd()).is_err()
-    {
-        return 126;
+    if let Some(slave) = slave {
+        if setsid().is_err() {
+            eprintln!("error: setsid failed");
+            return 126;
+        }
+        if unsafe { tiocsctty(slave.as_raw_fd(), 0) }.is_err() {
+            eprintln!("error: cannot take the terminal");
+            return 126;
+        }
+        if dup2_stdin(slave.as_fd()).is_err()
+            || dup2_stdout(slave.as_fd()).is_err()
+            || dup2_stderr(slave.as_fd()).is_err()
+        {
+            return 126;
+        }
     }
     if let Err(e) = chdir(cwd.as_c_str()) {
         eprintln!("error: cannot change to {}: {e}", cwd.to_string_lossy());

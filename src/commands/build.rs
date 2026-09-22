@@ -12,6 +12,7 @@ use crate::config::Config;
 use crate::hub::short_digest;
 use crate::install::{ensure_replaceable, install, remove_existing, Install};
 use crate::layout::{sha256_digest, sha256_file, Layout};
+use crate::oci::Mode;
 use crate::reference::{validate_machine_name, ImageRef};
 use crate::store::{now_unix, Store};
 use crate::systemd::Systemd;
@@ -63,67 +64,82 @@ pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
         bail!("mkosi failed with {status}");
     }
     let _lock = store.lock()?;
-
-    let layout = Layout::find_below(&output_dir)?;
-    let mut manifest = layout.manifest.clone();
-    let annotations = manifest.annotations.get_or_insert_with(Default::default);
-    if let Some(tag) = &image.tag {
-        annotations.insert("org.opencontainers.image.version".to_string(), tag.clone());
-    }
-    annotations.insert(
-        "org.opencontainers.image.ref.name".to_string(),
-        image.to_string(),
-    );
-    annotations.insert(
-        "org.nspawn.builder".to_string(),
-        format!("nspawn {} / mkosi", env!("CARGO_PKG_VERSION")),
-    );
-    let manifest_bytes = serde_json::to_vec(&manifest)?;
-    let manifest_digest = sha256_digest(&manifest_bytes);
-
-    for descriptor in manifest
-        .layers
-        .iter()
-        .chain(std::iter::once(&manifest.config))
-    {
-        let source = layout.blob_path(&descriptor.digest)?;
-        let actual = sha256_file(&source)?;
-        if actual != descriptor.digest {
-            bail!(
-                "blob {} in the mkosi output has digest {actual}",
-                descriptor.digest
-            );
+    // The name may have been taken while mkosi ran.
+    ensure_replaceable(&store, &sd, &name, args.force).await?;
+    let outcome: Result<Mode> = async {
+        let layout = Layout::find_below(&output_dir)?;
+        let mut manifest = layout.manifest.clone();
+        let annotations = manifest.annotations.get_or_insert_with(Default::default);
+        if let Some(tag) = &image.tag {
+            annotations.insert("org.opencontainers.image.version".to_string(), tag.clone());
         }
-        let dest = store.blob_path(&descriptor.digest);
-        if !dest.exists() {
-            let part = crate::hub::part_path(&dest);
-            fs::copy(&source, &part).with_context(|| format!("copying {}", source.display()))?;
-            fs::rename(&part, &dest)
-                .with_context(|| format!("moving {} into place", dest.display()))?;
+        annotations.insert(
+            "org.opencontainers.image.ref.name".to_string(),
+            image.to_string(),
+        );
+        annotations.insert(
+            "org.nspawn.builder".to_string(),
+            format!("nspawn {} / mkosi", env!("CARGO_PKG_VERSION")),
+        );
+        let manifest_bytes = serde_json::to_vec(&manifest)?;
+        let manifest_digest = sha256_digest(&manifest_bytes);
+
+        for descriptor in manifest
+            .layers
+            .iter()
+            .chain(std::iter::once(&manifest.config))
+        {
+            let source = layout.blob_path(&descriptor.digest)?;
+            let actual = sha256_file(&source)?;
+            if actual != descriptor.digest {
+                bail!(
+                    "blob {} in the mkosi output has digest {actual}",
+                    descriptor.digest
+                );
+            }
+            let dest = store.blob_path(&descriptor.digest);
+            if !dest.exists() {
+                let part = crate::hub::part_path(&dest);
+                fs::copy(&source, &part)
+                    .with_context(|| format!("copying {}", source.display()))?;
+                fs::rename(&part, &dest)
+                    .with_context(|| format!("moving {} into place", dest.display()))?;
+            }
         }
+        println!(
+            "built {image}: manifest {} with {} layer(s), assembling as {}",
+            short_digest(&manifest_digest),
+            manifest.layers.len(),
+            backend.name()
+        );
+        remove_existing(&store, &sd, &name).await?;
+        let mode = install(
+            &store,
+            &sd,
+            backend,
+            Install {
+                name: &name,
+                reference: &image.to_string(),
+                manifest_bytes: &manifest_bytes,
+                manifest: &manifest,
+                manifest_digest: &manifest_digest,
+                origin: "build",
+                mode: args.mode.to_mode(),
+            },
+        )
+        .await?;
+        Ok(mode)
     }
-    println!(
-        "built {image}: manifest {} with {} layer(s), assembling as {}",
-        short_digest(&manifest_digest),
-        manifest.layers.len(),
-        backend.name()
-    );
-    remove_existing(&store, &sd, &name).await?;
-    let mode = install(
-        &store,
-        &sd,
-        backend,
-        Install {
-            name: &name,
-            reference: &image.to_string(),
-            manifest_bytes: &manifest_bytes,
-            manifest: &manifest,
-            manifest_digest: &manifest_digest,
-            origin: "build",
-            mode: args.mode.to_mode(),
-        },
-    )
-    .await?;
+    .await;
+    let mode = match outcome {
+        Ok(mode) => mode,
+        Err(e) => {
+            if !args.keep_output {
+                let _ = fs::remove_dir_all(&output_dir);
+            }
+            return Err(e);
+        }
+    };
     if args.keep_output {
         println!("mkosi output kept at {}", output_dir.display());
     } else {
