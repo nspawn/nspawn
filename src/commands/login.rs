@@ -1,20 +1,17 @@
+//! The terminal side of login: prompts for what the command line did not give.
+
 use std::io::{self, BufRead, Write};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context as _, Result};
 use nix::sys::signal::{self, SigHandler, Signal};
 use nix::sys::termios::{self, LocalFlags, SetArg};
 use nix::unistd::isatty;
 
+use crate::api::{self, Context};
 use crate::auth::{self, Credentials};
 use crate::cli::{LoginArgs, LogoutArgs};
-use crate::commands::require_root;
-use crate::config::Config;
 
-/// docker login: checks the credentials against the registry and keeps them for pull,
-/// push and search.
-pub async fn login(args: LoginArgs, config: &Config) -> Result<()> {
-    require_root("login")?;
-    let registry = args.registry.unwrap_or_else(|| config.registry.clone());
+pub async fn login(args: LoginArgs, ctx: &Context) -> Result<()> {
     let username = match args.username {
         Some(u) => u,
         None => prompt("Username: ", false)?,
@@ -29,35 +26,30 @@ pub async fn login(args: LoginArgs, config: &Config) -> Result<()> {
     } else {
         prompt("Password: ", true)?
     };
-    if username.is_empty() || password.is_empty() {
-        bail!("a username and a password are needed");
-    }
-    let credentials = Credentials { username, password };
-    // The CA certificate applies to the hub only.
-    let ca_cert = (auth::canonical(&registry) == auth::canonical(&config.registry))
-        .then_some(config.ca_cert.as_deref())
-        .flatten();
-    let asked = auth::verify(&registry, &credentials, ca_cert).await?;
-    auth::store(&registry, &credentials)?;
-    if asked {
-        println!("logged in to {registry} as {}", credentials.username);
+    let done = api::login::login(ctx, args.registry, Credentials { username, password }).await?;
+    if done.asked {
+        println!("logged in to {} as {}", done.registry, done.username);
     } else {
         println!(
-            "{registry} did not ask for credentials; kept them for {} anyway in {}",
-            credentials.username,
+            "{} did not ask for credentials; kept them for {} anyway in {}",
+            done.registry,
+            done.username,
             auth::STORE
         );
     }
     Ok(())
 }
 
-pub fn logout(args: LogoutArgs, config: &Config) -> Result<()> {
-    require_root("logout")?;
-    let registry = args.registry.unwrap_or_else(|| config.registry.clone());
-    if auth::forget(&registry)? {
-        println!("removed the credentials for {registry}");
+pub fn logout(args: LogoutArgs, ctx: &Context) -> Result<()> {
+    let done = api::login::logout(ctx, args.registry)?;
+    if done.removed {
+        println!("removed the credentials for {}", done.registry);
     } else {
-        println!("no credentials stored for {registry} in {}", auth::STORE);
+        println!(
+            "no credentials stored for {} in {}",
+            done.registry,
+            auth::STORE
+        );
     }
     Ok(())
 }

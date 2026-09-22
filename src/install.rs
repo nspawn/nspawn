@@ -7,8 +7,8 @@ use std::fs;
 use anyhow::{Context, Result};
 use oci_client::manifest::OciImageManifest;
 
-use crate::backend::{Assembler, Backend, Layer};
-use crate::cli::BackendChoice;
+use crate::api::{note, Report};
+use crate::backend::{Assembler, Backend, BackendChoice, Layer};
 use crate::config::Config;
 use crate::oci::{detect_mode, has_init, Mode, RunSpec};
 use crate::settings::{self, MachineSettings, Network};
@@ -33,6 +33,7 @@ pub async fn install(
     config: &Config,
     backend: Backend,
     spec: Install<'_>,
+    report: Report<'_>,
 ) -> Result<Mode> {
     let layers: Vec<Layer> = spec
         .manifest
@@ -54,7 +55,7 @@ pub async fn install(
     let surely_app = spec.mode == Some(Mode::App)
         || (spec.mode.is_none() && detect_mode(true, &run.argv()) == Mode::App);
     let backend = if backend == Backend::Mstack && surely_app {
-        eprintln!("note: {} runs a program rather than an init system; assembling it as overlay, since mstack machines cannot join the bridge network", spec.name);
+        note(report, format!("note: {} runs a program rather than an init system; assembling it as overlay, since mstack machines cannot join the bridge network", spec.name));
         Backend::Overlay
     } else {
         backend
@@ -67,9 +68,12 @@ pub async fn install(
         .unwrap_or_else(|| detect_mode(has_init(&trees), &run.argv()));
     if mode == Mode::App && backend == Backend::Mstack {
         // Only known now, without a command in the config: no init inside.
-        eprintln!(
-            "note: {} has no init system; reassembling it as overlay, since mstack machines cannot join the bridge network",
-            spec.name
+        note(
+            report,
+            format!(
+                "note: {} has no init system; reassembling it as overlay, since mstack machines cannot join the bridge network",
+                spec.name
+            ),
         );
         assembler.remove(spec.name, BackendChoice::Mstack).await?;
         backend = Backend::Overlay;

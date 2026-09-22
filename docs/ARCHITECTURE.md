@@ -9,7 +9,8 @@ machine units call nspawn back through drop-in hooks.
 
 | Module | Role |
 |---|---|
-| `cli.rs`, `commands/` | clap definitions and one file per command |
+| `api/` | the library: typed operations on images, machines and the network; nothing here prints, progress goes through a `Report` and results come back as values |
+| `cli.rs`, `commands/` | clap definitions and the terminal side: argument conversion, tables, prompts, the commands that own the terminal (exec, shell, logs) |
 | `config.rs` | `/etc/nspawn/nspawn.toml`, environment and flags |
 | `reference.rs` | image references, local names, machine name rules |
 | `hub.rs`, `auth.rs`, `search.rs` | registry client, credentials, search |

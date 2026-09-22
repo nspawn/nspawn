@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::cli::BackendChoice;
 use crate::store::{extract_layer, Ownership, Store, WhiteoutMode, FOREIGN_UID_BASE};
 use crate::systemd::Systemd;
 use crate::unitname;
@@ -20,6 +19,22 @@ const MANAGED_NS_UNIT_FILES: [&str; 2] = [
     "/usr/lib/systemd/system/systemd-nsresourced.socket",
     "/usr/lib/systemd/system/systemd-mountfsd.socket",
 ];
+
+/// What the user may ask for; `Backend::choose` turns it into a `Backend`.
+#[derive(
+    Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendChoice {
+    /// mstack when the host supports it, otherwise an overlay mount, otherwise a flat copy.
+    Auto,
+    /// Shared layers plus an overlayfs mount unit per machine (any systemd with overlayfs).
+    Overlay,
+    /// Extract the layers into a plain directory (no sharing, maximum compatibility).
+    Flat,
+    /// Native systemd.mstack directory (systemd 261 or newer with nsresourced).
+    Mstack,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {

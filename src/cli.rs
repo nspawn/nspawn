@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
+
+pub use crate::backend::BackendChoice;
+pub use crate::oci::ModeChoice;
+pub use crate::search::SearchSource;
 
 /// Docker-like management of systemd-nspawn machines.
 #[derive(Parser, Debug)]
@@ -144,14 +148,6 @@ pub struct SearchArgs {
     pub limit: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum SearchSource {
-    /// The configured hub (its catalog).
-    Hub,
-    /// Docker Hub's search.
-    Dockerhub,
-}
-
 #[derive(Args, Debug)]
 pub struct PullArgs {
     /// Image reference: [registry/]repository[:tag|@digest], for example fedora:44.
@@ -247,39 +243,6 @@ pub struct PushArgs {
     /// Push under a different reference than the one recorded for the image.
     #[arg(long)]
     pub to: Option<String>,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum ModeChoice {
-    /// Boot when the image has an init system and no other entrypoint, app otherwise.
-    Auto,
-    /// Boot the image's init system (systemd machines).
-    Boot,
-    /// Run the image's entrypoint under nspawn's stub init (docker-style images).
-    App,
-}
-
-impl ModeChoice {
-    pub fn to_mode(self) -> Option<crate::oci::Mode> {
-        match self {
-            ModeChoice::Auto => None,
-            ModeChoice::Boot => Some(crate::oci::Mode::Boot),
-            ModeChoice::App => Some(crate::oci::Mode::App),
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BackendChoice {
-    /// mstack when the host supports it, otherwise an overlay mount, otherwise a flat copy.
-    Auto,
-    /// Shared layers plus an overlayfs mount unit per machine (any systemd with overlayfs).
-    Overlay,
-    /// Extract the layers into a plain directory (no sharing, maximum compatibility).
-    Flat,
-    /// Native systemd.mstack directory (systemd 261 or newer with nsresourced).
-    Mstack,
 }
 
 #[derive(Args, Debug)]

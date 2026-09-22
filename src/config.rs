@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::backend::BackendChoice;
 use crate::bridge::Subnet;
-use crate::cli::BackendChoice;
 
 pub const DEFAULT_REGISTRY: &str = "hub.nspawn.org";
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/nspawn/nspawn.toml";

@@ -26,6 +26,27 @@ impl Mode {
     }
 }
 
+/// What the user may ask for; `Auto` leaves the detection to the image's contents.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ModeChoice {
+    /// Boot when the image has an init system and no other entrypoint, app otherwise.
+    Auto,
+    /// Boot the image's init system (systemd machines).
+    Boot,
+    /// Run the image's entrypoint under nspawn's stub init (docker-style images).
+    App,
+}
+
+impl ModeChoice {
+    pub fn to_mode(self) -> Option<Mode> {
+        match self {
+            ModeChoice::Auto => None,
+            ModeChoice::Boot => Some(Mode::Boot),
+            ModeChoice::App => Some(Mode::App),
+        }
+    }
+}
+
 /// The parts of the OCI config that matter at run time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSpec {

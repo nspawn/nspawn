@@ -14,8 +14,8 @@ use nix::fcntl::{Flock, FlockArg};
 use nix::sys::stat::{mknod, Mode as FileMode, SFlag};
 use serde::{Deserialize, Serialize};
 
+use crate::backend::BackendChoice;
 use crate::bridge::PortMap;
-use crate::cli::BackendChoice;
 use crate::oci::{Mode, RunSpec};
 use crate::settings::Network;
 use crate::volume::Volume;

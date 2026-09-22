@@ -1,47 +1,77 @@
+//! docker build, with mkosi: an OCI layout built into a private directory, its blobs
+//! copied into the store, the image assembled and recorded, ready to push.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context as _, Result};
 
-use crate::backend::Backend;
-use crate::cli::BackendChoice;
-use crate::cli::BuildArgs;
-use crate::commands::require_root;
-use crate::config::Config;
+use crate::api::{line, require_root, Context, Report};
+use crate::backend::{Backend, BackendChoice};
 use crate::hub::short_digest;
 use crate::install::{ensure_replaceable, install, remove_existing, Install};
 use crate::layout::{sha256_digest, sha256_file, Layout};
 use crate::oci::Mode;
 use crate::reference::{validate_machine_name, ImageRef};
-use crate::store::{now_unix, Store};
-use crate::systemd::Systemd;
+use crate::store::now_unix;
 
-pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildRequest {
+    /// Directory with the mkosi configuration (mkosi.conf, mkosi.conf.d, ...).
+    pub directory: PathBuf,
+    /// Reference for the result, for example myapp:1 or hub.example/team/app:2.
+    pub tag: String,
+    /// Local name; derived from the tag when missing.
+    pub name: Option<String>,
+    pub distribution: Option<String>,
+    pub release: Option<String>,
+    /// mkosi profiles to enable.
+    pub profile: Vec<String>,
+    pub backend: BackendChoice,
+    pub mode: Option<Mode>,
+    pub force: bool,
+    /// Keep the mkosi output directory instead of deleting it after the import.
+    pub keep_output: bool,
+    /// Extra arguments passed to mkosi verbatim.
+    pub mkosi_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Built {
+    pub name: String,
+    pub reference: String,
+    pub mode: Mode,
+    /// The mkosi output directory, when it was kept.
+    pub output: Option<PathBuf>,
+}
+
+pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) -> Result<Built> {
     require_root("build")?;
-    let image = ImageRef::parse(&args.tag, &config.registry)?;
+    let config = &ctx.config;
+    let image = ImageRef::parse(&request.tag, &config.registry)?;
     if image.digest.is_some() {
         bail!("a build tag cannot carry a digest");
     }
-    let name = args.name.clone().unwrap_or_else(|| image.local_name());
+    let name = request.name.clone().unwrap_or_else(|| image.local_name());
     validate_machine_name(&name)?;
-    let directory = fs::canonicalize(&args.directory)
-        .with_context(|| format!("build directory {}", args.directory.display()))?;
+    let directory = fs::canonicalize(&request.directory)
+        .with_context(|| format!("build directory {}", request.directory.display()))?;
     if !directory.join("mkosi.conf").is_file() && !directory.join("mkosi.conf.d").is_dir() {
         bail!("{} has no mkosi.conf or mkosi.conf.d", directory.display());
     }
     let mkosi = find_in_path("mkosi").context("mkosi is not installed or not in PATH")?;
 
-    let sd = Systemd::connect().await?;
-    let store = Store::new(&config.machines_dir, &config.state_dir);
+    let sd = ctx.sd().await?;
+    let store = &ctx.store;
     store.init()?;
-    ensure_replaceable(&store, &sd, &name, args.force).await?;
-    let choice = if args.backend == BackendChoice::Auto {
+    ensure_replaceable(store, sd, &name, request.force).await?;
+    let choice = if request.backend == BackendChoice::Auto {
         config.backend
     } else {
-        args.backend
+        request.backend
     };
-    let backend = Backend::choose(choice, &sd).await?;
+    let backend = Backend::choose(choice, sd).await?;
 
     let output_dir = config
         .state_dir
@@ -51,21 +81,21 @@ pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
     fs::create_dir_all(&output_dir)?;
     fs::create_dir_all(&cache_dir)?;
 
-    let argv = mkosi_arguments(&args, &image, &directory, &output_dir, &cache_dir);
-    println!("running: mkosi {}", argv.join(" "));
+    let argv = mkosi_arguments(request, &image, &directory, &output_dir, &cache_dir);
+    line(report, format!("running: mkosi {}", argv.join(" ")));
     let status = Command::new(&mkosi)
         .args(&argv)
         .status()
         .with_context(|| format!("running {}", mkosi.display()))?;
     if !status.success() {
-        if !args.keep_output {
+        if !request.keep_output {
             let _ = fs::remove_dir_all(&output_dir);
         }
         bail!("mkosi failed with {status}");
     }
     let _lock = store.lock()?;
     // The name may have been taken while mkosi ran.
-    ensure_replaceable(&store, &sd, &name, args.force).await?;
+    ensure_replaceable(store, sd, &name, request.force).await?;
     let outcome: Result<Mode> = async {
         let layout = Layout::find_below(&output_dir)?;
         let mut manifest = layout.manifest.clone();
@@ -106,16 +136,19 @@ pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
                     .with_context(|| format!("moving {} into place", dest.display()))?;
             }
         }
-        println!(
-            "built {image}: manifest {} with {} layer(s), assembling as {}",
-            short_digest(&manifest_digest),
-            manifest.layers.len(),
-            backend.name()
+        line(
+            report,
+            format!(
+                "built {image}: manifest {} with {} layer(s), assembling as {}",
+                short_digest(&manifest_digest),
+                manifest.layers.len(),
+                backend.name()
+            ),
         );
-        remove_existing(&store, &sd, &name).await?;
-        let mode = install(
-            &store,
-            &sd,
+        remove_existing(store, sd, &name).await?;
+        install(
+            store,
+            sd,
             config,
             backend,
             Install {
@@ -125,37 +158,39 @@ pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
                 manifest: &manifest,
                 manifest_digest: &manifest_digest,
                 origin: "build",
-                mode: args.mode.to_mode(),
+                mode: request.mode,
             },
+            report,
         )
-        .await?;
-        Ok(mode)
+        .await
     }
     .await;
     let mode = match outcome {
         Ok(mode) => mode,
         Err(e) => {
-            if !args.keep_output {
+            if !request.keep_output {
                 let _ = fs::remove_dir_all(&output_dir);
             }
             return Err(e);
         }
     };
-    if args.keep_output {
-        println!("mkosi output kept at {}", output_dir.display());
+    let output = if request.keep_output {
+        Some(output_dir)
     } else {
         let _ = fs::remove_dir_all(&output_dir);
-    }
-    println!(
-        "image {name} ({} image) is ready: nspawn start {name}, nspawn push {name}",
-        mode.name()
-    );
-    Ok(())
+        None
+    };
+    Ok(Built {
+        name,
+        reference: image.to_string(),
+        mode,
+        output,
+    })
 }
 
 /// The mkosi command line: OCI output with zstd layers into a private directory.
 pub fn mkosi_arguments(
-    args: &BuildArgs,
+    request: &BuildRequest,
     image: &ImageRef,
     directory: &Path,
     output_dir: &Path,
@@ -169,16 +204,16 @@ pub fn mkosi_arguments(
         format!("--cache-directory={}", cache_dir.display()),
         format!("--image-id={}", image.repository.replace('/', "-")),
     ];
-    if let Some(d) = &args.distribution {
+    if let Some(d) = &request.distribution {
         argv.push(format!("--distribution={d}"));
     }
-    if let Some(r) = &args.release {
+    if let Some(r) = &request.release {
         argv.push(format!("--release={r}"));
     }
-    for p in &args.profile {
+    for p in &request.profile {
         argv.push(format!("--profile={p}"));
     }
-    argv.extend(args.mkosi_args.iter().cloned());
+    argv.extend(request.mkosi_args.iter().cloned());
     argv.push("--force".to_string());
     argv.push("build".to_string());
     argv
@@ -198,7 +233,7 @@ mod tests {
 
     #[test]
     fn mkosi_command_line() {
-        let args = BuildArgs {
+        let request = BuildRequest {
             directory: PathBuf::from("."),
             tag: "team/app:2".into(),
             name: None,
@@ -206,14 +241,14 @@ mod tests {
             release: Some("44".into()),
             profile: vec!["web".into()],
             backend: BackendChoice::Auto,
-            mode: crate::cli::ModeChoice::Auto,
+            mode: None,
             force: false,
             keep_output: false,
             mkosi_args: vec!["--debug".into()],
         };
         let image = ImageRef::parse("team/app:2", "hub.example").unwrap();
         let argv = mkosi_arguments(
-            &args,
+            &request,
             &image,
             Path::new("/src"),
             Path::new("/out"),

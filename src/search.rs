@@ -11,6 +11,15 @@ use crate::reference::ImageRef;
 pub const DOCKER_HUB: &str = "Docker Hub";
 const DOCKER_HUB_SEARCH: &str = "https://index.docker.io/v1/search";
 
+/// Where `search` looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SearchSource {
+    /// The configured hub (its catalog).
+    Hub,
+    /// Docker Hub's search.
+    Dockerhub,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
     /// Where it comes from: the hub's host, or "Docker Hub".
