@@ -252,18 +252,11 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
     }
     validate_machine_name(&args.name)?;
     let sd = Systemd::connect().await?;
-    if sd.machine_exists(&args.name).await? {
-        bail!("machine {} is already running", args.name);
-    }
+    let unit = format!("systemd-nspawn@{}.service", args.name);
     let store = Store::new(&config.machines_dir, &config.state_dir);
+    let mode = store.load_image(&args.name)?.map(|r| r.mode);
+    wait_for_previous(&sd, &args.name, &unit, mode).await?;
     let lock = store.lock()?;
-    // Registration comes late in a start; the unit's state tells about one in progress.
-    let (_, active) = sd
-        .unit_state(&format!("systemd-nspawn@{}.service", args.name))
-        .await?;
-    if active == "activating" || active == "active" {
-        bail!("machine {} is already starting", args.name);
-    }
     let mut record = store.load_image(&args.name)?;
     match record.as_mut() {
         Some(r) => {
@@ -415,11 +408,13 @@ pub async fn stop(args: StopArgs, config: &Config) -> Result<()> {
     if !sd.machine_exists(&args.name).await? {
         match &record {
             // It ended on its own or elsewhere; leave nothing of it behind, like docker
-            // stop on a stopped container.
+            // stop on a stopped container. The unit may still be running its release
+            // hook: let that finish rather than work beside it.
             Some(r) => {
+                let unit = format!("systemd-nspawn@{}.service", args.name);
+                settled_unit_state(&sd, &unit, Duration::from_secs(30)).await?;
                 release_machine(&args.name, Some(r))?;
-                sd.reset_failed(&format!("systemd-nspawn@{}.service", args.name))
-                    .await?;
+                sd.reset_failed(&unit).await?;
                 println!("{} was not running", args.name);
                 return Ok(());
             }
@@ -514,6 +509,63 @@ pub async fn stop(args: StopArgs, config: &Config) -> Result<()> {
 /// every couple of seconds: right after `start` the machine's init may not have installed
 /// its signal handlers yet, and the kernel silently drops signals that PID 1 of a PID
 /// namespace does not handle.
+/// Waits, within reason, until nothing of a previous instance stands in the way of a new
+/// start: the unit still up with its program gone (nspawn shutting down), the machine
+/// not yet dropped by machined, or the release hook running while the unit deactivates,
+/// which would undo what the start prepares. A machine that is really running, or one
+/// starting elsewhere, is an error.
+async fn wait_for_previous(sd: &Systemd, name: &str, unit: &str, mode: Option<Mode>) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, active) = sd.unit_state(unit).await?;
+        let registered = sd.machine_exists(name).await?;
+        match active.as_str() {
+            "active" | "activating" if registered && machine_alive(sd, name, mode).await => {
+                if active == "activating" {
+                    bail!("machine {name} is already starting");
+                }
+                bail!("machine {name} is already running");
+            }
+            // Up but not registered yet, or registered with nothing running inside, or
+            // on its way down: the next poll tells more.
+            "active" | "activating" | "reloading" | "deactivating" => {}
+            // Down, but machined has yet to drop it.
+            _ if registered => {}
+            _ => return Ok(()),
+        }
+        if Instant::now() > deadline {
+            bail!("machine {name} is still going away; see journalctl -u {unit}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Whether a registered machine still has something running: its leader, and for an app
+/// the program under the stub init (the leader outlives it for a moment).
+async fn machine_alive(sd: &Systemd, name: &str, mode: Option<Mode>) -> bool {
+    let Ok(leader) = sd.machine_leader(name).await else {
+        return false;
+    };
+    if !std::path::Path::new(&format!("/proc/{leader}")).exists() {
+        return false;
+    }
+    mode != Some(Mode::App) || payload_pid(leader).is_some()
+}
+
+/// The active state of a unit once it is no longer on its way down. ExecStopPost=, the
+/// release hook, runs while the unit is "deactivating"; nothing may be prepared for the
+/// next start until it is done. After `timeout` the state is returned as it is.
+async fn settled_unit_state(sd: &Systemd, unit: &str, timeout: Duration) -> Result<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (_, active) = sd.unit_state(unit).await?;
+        if active != "deactivating" || Instant::now() >= deadline {
+            return Ok(active);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn poweroff_until_gone(sd: &Systemd, name: &str, timeout: Duration) -> Result<bool> {
     let deadline = Instant::now() + timeout;
     if sd.poweroff_machine(name).await.is_err() && !sd.machine_exists(name).await? {

@@ -289,6 +289,12 @@ $NSPAWN start $app -- /bin/sh -c 'exit 3' >/dev/null 2>&1 || true
 retry 10 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "failed app still listed"
 out=$($NSPAWN stop $app 2>&1); echo "$out" | grep -q "was not running" || fail "stop after a failed program: $out"
 systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit left failed after stop of a program that exited 3"
+# A program that fails at once leaves the unit on its way down with the release hook
+# running; a start issued right then must not have its namespace pulled away.
+$NSPAWN start $app -- /bin/sh -c 'exit 3' >/dev/null 2>&1 || true
+$NSPAWN start $app -- /bin/sleep 300 || fail "start right after a program that failed at once"
+retry 10 bash -c "$NSPAWN exec $app -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep -q 10.99.0" || fail "no bridge address after a start that followed a failed program"
+$NSPAWN stop $app >/dev/null || fail "stop after the quick restart"
 $NSPAWN start $app -- /bin/sh -c 'sleep 1' || fail "start short-lived app"
 retry 10 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "short-lived app still listed"
 sleep 1
