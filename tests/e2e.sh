@@ -19,6 +19,7 @@ cleanup() {
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
+  $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || true
   if [ "$networkd_was" != active ]; then
     systemctl stop systemd-networkd.service systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-resolve-hook.socket >/dev/null 2>&1 || true
   fi
@@ -34,6 +35,16 @@ $NSPAWN search "${IMAGE%%:*}" > /tmp/e2e-search.txt || fail "search exited non-z
 grep "^ *$NSPAWN_REGISTRY " /tmp/e2e-search.txt | grep -q " ${IMAGE%%:*} " || fail "search does not list ${IMAGE%%:*} from the hub"
 $NSPAWN search busybox --source dockerhub > /tmp/e2e-search.txt || fail "search on Docker Hub exited non-zero"
 grep "^ *Docker Hub " /tmp/e2e-search.txt | grep -q "docker.io/library/busybox" || fail "search does not list busybox from Docker Hub with its source"
+
+step "login and logout"
+echo "s3cret" | $NSPAWN login "$NSPAWN_REGISTRY" -u tester --password-stdin || fail "login on the hub"
+python3 -c "import json; d = json.load(open('/etc/nspawn/auth.json')); assert '$NSPAWN_REGISTRY' in d['auths']" || fail "credentials not stored"
+[ "$(stat -c %a /etc/nspawn/auth.json)" = 600 ] || fail "auth.json is not mode 0600"
+$NSPAWN hub ls >/dev/null || fail "hub ls with stored credentials"
+out=$(echo "wrong-password" | $NSPAWN login docker.io -u nspawn-e2e-nobody --password-stdin 2>&1) && fail "Docker Hub accepted bogus credentials: $out"
+echo "$out" | grep -q "rejected the credentials" || fail "bogus Docker Hub login gave no clear message: $out"
+$NSPAWN logout "$NSPAWN_REGISTRY" | grep -q "removed" || fail "logout"
+$NSPAWN logout "$NSPAWN_REGISTRY" | grep -q "no credentials" || fail "second logout should find nothing"
 
 step "hub tags"
 $NSPAWN hub tags "${IMAGE%%:*}" > /tmp/e2e-tags.txt || fail "hub tags"

@@ -10,16 +10,16 @@ use indicatif::{ProgressBar, ProgressStyle};
 use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol};
 use oci_client::manifest::{OciDescriptor, OciImageManifest};
 use oci_client::secrets::RegistryAuth;
-use oci_client::{Client, Reference};
+use oci_client::{Client, Reference, RegistryOperation};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
+use crate::auth;
 use crate::config::Config;
 
 pub struct Hub {
     client: Client,
-    auth: RegistryAuth,
 }
 
 impl Hub {
@@ -42,8 +42,35 @@ impl Hub {
         };
         Ok(Hub {
             client: Client::new(client_config),
-            auth: RegistryAuth::Anonymous,
         })
+    }
+
+    /// The credentials nspawn login (or docker/podman login) left for a registry, else
+    /// anonymous. Chosen per registry, so that the hub's never travel to Docker Hub.
+    fn auth(&self, registry: &str) -> RegistryAuth {
+        match auth::lookup(registry) {
+            Some(c) => RegistryAuth::Basic(c.username, c.password),
+            None => RegistryAuth::Anonymous,
+        }
+    }
+
+    /// Obtains the tokens a push needs (and the pull ones the blob checks use) up front;
+    /// a registry that wants credentials rejects the push here, with a clear message.
+    pub async fn authenticate_push(&self, image: &Reference) -> Result<()> {
+        let auth = self.auth(image.registry());
+        for operation in [RegistryOperation::Pull, RegistryOperation::Push] {
+            self.client
+                .auth(image, &auth, operation)
+                .await
+                .with_context(|| {
+                    format!(
+                        "authenticating to {} (nspawn login {} if it needs credentials)",
+                        image.registry(),
+                        image.registry()
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     /// All repositories of a registry (follows pagination).
@@ -54,7 +81,7 @@ impl Hub {
         loop {
             let page = self
                 .client
-                .catalog(&probe, &self.auth, Some(100), last.as_deref())
+                .catalog(&probe, &self.auth(registry), Some(100), last.as_deref())
                 .await
                 .with_context(|| format!("listing the catalog of {registry}"))?;
             let n = page.repositories.len();
@@ -76,7 +103,12 @@ impl Hub {
         loop {
             let page = self
                 .client
-                .list_tags(image, &self.auth, Some(100), last.as_deref())
+                .list_tags(
+                    image,
+                    &self.auth(image.registry()),
+                    Some(100),
+                    last.as_deref(),
+                )
                 .await
                 .with_context(|| format!("listing tags of {}", image.repository()))?;
             let n = page.tags.len();
@@ -95,7 +127,7 @@ impl Hub {
     /// and returns it with its digest.
     pub async fn resolve(&self, image: &Reference) -> Result<(OciImageManifest, String)> {
         self.client
-            .pull_image_manifest(image, &self.auth)
+            .pull_image_manifest(image, &self.auth(image.registry()))
             .await
             .with_context(|| format!("fetching the manifest of {image}"))
     }
@@ -197,7 +229,7 @@ impl Hub {
         ];
         let (bytes, fetched_digest) = self
             .client
-            .pull_manifest_raw(&by_digest, &self.auth, &accepted)
+            .pull_manifest_raw(&by_digest, &self.auth(by_digest.registry()), &accepted)
             .await
             .with_context(|| format!("fetching manifest {digest}"))?;
         if fetched_digest != digest {

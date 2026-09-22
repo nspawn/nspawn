@@ -8,6 +8,7 @@ itself. `machinectl` and `importctl` are never called.
 ```
 nspawn hub ls                       # repositories and tags on the hub
 nspawn search fedora                # images on the hub and on Docker Hub, with their source
+nspawn login docker.io -u me        # keep credentials for a registry (the hub by default)
 nspawn pull fedora:44               # download and assemble an image
 nspawn images ls                    # local images (all of them, not only ours)
 nspawn start fedora-44              # boot it as a machine
@@ -74,6 +75,17 @@ machine from an image that is already local, without touching the registry. It s
 source's layers and gets a writable layer, an address, settings and ports of its own
 (`-p`, `--network`); `images rm` of one never affects the others. `pull` with `--name`
 ends up the same way but resolves the manifest through the registry first.
+
+## Registries and credentials
+
+Registries are used anonymously until `nspawn login [REGISTRY] -u USER` (password asked on
+the terminal, or `--password-stdin`) checks the credentials the way docker login does and
+keeps them in `/etc/nspawn/auth.json`, mode 0600, in the auth.json format podman and skopeo
+use. Credentials left by `docker login` or `podman login` on the host (also those of the
+user behind sudo) are picked up as well. Every operation chooses the credentials of the
+registry it talks to, so the hub's never travel to Docker Hub; `nspawn logout [REGISTRY]`
+forgets them. Anonymous pulls from Docker Hub are rate limited per address; logging in
+lifts that.
 
 ## Networking
 

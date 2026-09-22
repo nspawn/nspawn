@@ -4,6 +4,7 @@
 //! /var/lib/nspawn. Machines are driven through the D-Bus APIs of
 //! systemd-machined and systemd itself, never through machinectl.
 
+mod auth;
 mod backend;
 mod bridge;
 mod cli;

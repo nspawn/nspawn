@@ -43,6 +43,7 @@ pub async fn run(args: PushArgs, config: &Config) -> Result<()> {
     }
 
     let hub = Hub::new(config)?;
+    hub.authenticate_push(&dest).await?;
     println!(
         "pushing {} ({}) to {destination}",
         record.name,

@@ -28,6 +28,10 @@ pub enum Command {
     Hub(HubArgs),
     /// Find images on the hub and on Docker Hub, like docker search.
     Search(SearchArgs),
+    /// Keep credentials for a registry (the hub by default), like docker login.
+    Login(LoginArgs),
+    /// Forget the credentials of a registry.
+    Logout(LogoutArgs),
     /// Download an image from the hub and make it available to machinectl.
     Pull(PullArgs),
     /// Build an image with mkosi and make it available locally, ready to push.
@@ -108,6 +112,24 @@ pub struct HubLsArgs {
 pub struct HubTagsArgs {
     /// Repository name, for example "fedora".
     pub repository: String,
+}
+
+#[derive(Args, Debug)]
+pub struct LoginArgs {
+    /// Registry host, for example docker.io or hub.nspawn.org (default: the hub).
+    pub registry: Option<String>,
+    /// User name (asked for when missing).
+    #[arg(long, short = 'u')]
+    pub username: Option<String>,
+    /// Read the password from standard input instead of the terminal.
+    #[arg(long)]
+    pub password_stdin: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct LogoutArgs {
+    /// Registry host (default: the hub).
+    pub registry: Option<String>,
 }
 
 #[derive(Args, Debug)]

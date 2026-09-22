@@ -4,6 +4,7 @@ mod build;
 mod create;
 mod hub;
 mod images;
+mod login;
 mod machines;
 mod network;
 mod pull;
@@ -28,6 +29,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         },
         Command::Pull(args) => pull::run(args, &config).await,
         Command::Search(args) => search::run(args, &config).await,
+        Command::Login(args) => login::login(args, &config).await,
+        Command::Logout(args) => login::logout(args, &config),
         Command::Build(args) => build::run(args, &config).await,
         Command::Create(args) => create::run(args, &config).await,
         Command::Push(args) => push::run(args, &config).await,

@@ -6,6 +6,7 @@ description = "Docker-like management of systemd-nspawn machines: OCI images fro
 rust-version = "1.85"
 
 [dependencies]
+base64 = "0.22"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 comfy-table = "8"
