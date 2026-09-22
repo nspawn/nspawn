@@ -31,7 +31,8 @@ Requirements on the VM: systemd-nspawn and machined 255 or newer (Ubuntu 24.04
 is the oldest host the suite runs on; Debian 12 with systemd 252 does not
 work), overlayfs, `ip`, `nft`, `curl`, `python3`, access to Docker Hub, a
 registry with the test image (`fedora:44` by default), and mkosi for the build
-step. Install the binary
+step. The mstack pass runs only on systemd 261 with systemd-nsresourced and
+systemd-mountfsd installed (Arch); elsewhere it is skipped and says so. Install the binary
 where a system service may execute it, since the unit hooks run it:
 
 ```

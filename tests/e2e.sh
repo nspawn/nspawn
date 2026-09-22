@@ -15,7 +15,7 @@ nonce=$$
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup() {
   local m
-  for m in e2e-overlay e2e-flat e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -52,7 +52,18 @@ step "hub tags"
 $NSPAWN hub tags "${IMAGE%%:*}" > /tmp/e2e-tags.txt || fail "hub tags"
 grep -qx "${IMAGE##*:}" /tmp/e2e-tags.txt || fail "tag ${IMAGE##*:} missing"
 
-for backend in overlay flat; do
+# mstack images need systemd 261 with managed user namespaces (nsresourced, mountfsd).
+mstack_supported=no
+if [ "$(systemctl --version | awk 'NR==1{print $2}' | tr -dc 0-9)" -ge 261 ] 2>/dev/null \
+  && [ -e /usr/lib/systemd/system/systemd-nsresourced.socket ] \
+  && [ -e /usr/lib/systemd/system/systemd-mountfsd.socket ]; then
+  mstack_supported=yes
+fi
+for backend in overlay flat mstack; do
+  if [ "$backend" = mstack ] && [ "$mstack_supported" != yes ]; then
+    echo "mstack: needs systemd 261 with nsresourced and mountfsd; skipped on this host"
+    continue
+  fi
   name=e2e-$backend
   step "pull $IMAGE --backend $backend"
   $NSPAWN pull "$IMAGE" --name "$name" --backend "$backend" --force > /tmp/e2e-pull.txt 2>&1 || { cat /tmp/e2e-pull.txt; fail "pull ($backend)"; continue; }
@@ -64,7 +75,7 @@ for backend in overlay flat; do
   grep "^ *$name " /tmp/e2e-img.txt | grep -q "$backend" || fail "$name backend not shown"
   step "start"
   vol_args=""
-  if [ "$backend" = overlay ]; then
+  if [ "$backend" != flat ]; then
     rm -rf /tmp/e2e-boot-vol; mkdir -p /tmp/e2e-boot-vol
     vol_args="-v /tmp/e2e-boot-vol:/srv/vol"
   fi
@@ -77,6 +88,10 @@ for backend in overlay flat; do
     echo "upper directory of $name after the first start: ${upper_mb} MB"
     [ "$upper_mb" -lt 128 ] || fail "the first start copied the image into the upper directory of $name (${upper_mb} MB)"
   fi
+  if [ "$backend" = mstack ]; then
+    [ -d "/var/lib/machines/$name.mstack" ] || fail "$name has no mstack directory"
+    systemctl is-active systemd-nsresourced.socket >/dev/null || fail "systemd-nsresourced.socket not started for the mstack machine"
+  fi
   step "machines ls"
   $NSPAWN machines ls | tee /tmp/e2e-m.txt
   grep -q "^ *$name " /tmp/e2e-m.txt || fail "$name not running"
@@ -87,8 +102,8 @@ for backend in overlay flat; do
   $NSPAWN exec "$name" -- /usr/bin/cat /etc/os-release </dev/null | tr -d '\r' | grep -q PRETTY_NAME || fail "exec cat os-release"
   $NSPAWN exec "$name" -- /bin/sh -c 'exit 7' </dev/null; [ $? -eq 7 ] || fail "exec did not propagate the exit code of a booted machine"
   $NSPAWN exec "$name" -- /bin/sh -c 'echo $PATH' </dev/null | tr -d '\r' | grep -q "/usr/bin" || fail "exec has no PATH"
-  if [ "$backend" = overlay ]; then
-    step "volume in a booted machine (private users, idmapped)"
+  if [ "$backend" != flat ]; then
+    step "volume in a booted machine ($backend: private users, idmapped)"
     $NSPAWN exec "$name" -- /bin/sh -c 'echo booted > /srv/vol/from-machine' </dev/null || fail "cannot write to the volume inside $name"
     [ "$(cat /tmp/e2e-boot-vol/from-machine 2>/dev/null)" = booted ] || fail "volume write not visible on the host"
     [ "$(stat -c %u /tmp/e2e-boot-vol/from-machine)" = 0 ] || fail "root inside did not write as root on the host (idmap)"
@@ -237,8 +252,10 @@ $NSPAWN start $app -p 18081:80 -- /bin/sh -c "echo hello-from-app-$nonce; echo t
 grep -q "Parameters=/bin/sh -c" /etc/systemd/nspawn/$app.nspawn || fail "command override not written"
 retry 10 bash -c "$NSPAWN logs $app > /tmp/e2e-logs.txt; grep -q hello-from-app-$nonce /tmp/e2e-logs.txt" || fail "logs do not show the app's stdout"
 grep -q to-stderr-$nonce /tmp/e2e-logs.txt || fail "logs do not show the app's stderr"
-grep -q "Started systemd-nspawn" /tmp/e2e-logs.txt && fail "logs include systemd's unit messages without --all"
-$NSPAWN logs $app --all > /tmp/e2e-logs.txt; grep -q "Started systemd-nspawn" /tmp/e2e-logs.txt || fail "logs --all misses the unit messages"
+# systemd 261 words it "Started Container NAME", older ones "Started systemd-nspawn@NAME.service".
+unit_started="Started (systemd-nspawn@$app.service|Container $app)"
+grep -qE "$unit_started" /tmp/e2e-logs.txt && fail "logs include systemd's unit messages without --all"
+$NSPAWN logs $app --all > /tmp/e2e-logs.txt; grep -qE "$unit_started" /tmp/e2e-logs.txt || fail "logs --all misses the unit messages"
 $NSPAWN machines ls | tee /tmp/e2e-m.txt
 grep -q "^ *$app " /tmp/e2e-m.txt || fail "busybox machine not running"
 out=$($NSPAWN exec $app -- /bin/sh -c 'echo inside:$(uname -n); cat /etc/os-release | head -1' </dev/null | tr -d '\r')
@@ -311,12 +328,13 @@ kill "$listener_pid" 2>/dev/null; listener_pid=
 step "entrypoint, environment and volumes, docker style"
 rm -rf /tmp/e2e-bind /var/lib/nspawn/volumes/e2evol; mkdir -p /tmp/e2e-bind; echo from-host > /tmp/e2e-bind/hello
 export E2E_HOST_VAR=fromhost
-$NSPAWN start $app --entrypoint /bin/sh -e GREETING=hola -e E2E_HOST_VAR -v /tmp/e2e-bind:/bind -v e2evol:/vol -v /etc/os-release:/host-os-release:ro -p none -- -c 'echo "greeting=$GREETING hostvar=$E2E_HOST_VAR"; cat /bind/hello; echo from-app > /vol/written; { echo blocked > /host-os-release; } 2>/dev/null && echo RO-FAIL || echo RO-OK; exec /bin/sleep 300' || fail "start with entrypoint, env and volumes"
-retry 10 bash -c "$NSPAWN logs $app | grep -q RO-" || fail "app did not run"
+# The unit's journal keeps the lines of earlier runs, so every line carries the nonce.
+$NSPAWN start $app --entrypoint /bin/sh -e GREETING=hola -e E2E_HOST_VAR -v /tmp/e2e-bind:/bind -v e2evol:/vol -v /etc/os-release:/host-os-release:ro -p none -- -c "echo \"greeting=\$GREETING hostvar=\$E2E_HOST_VAR nonce=$nonce\"; cat /bind/hello; echo from-app > /vol/written; { echo blocked > /host-os-release; } 2>/dev/null && echo RO-FAIL-$nonce || echo RO-OK-$nonce; exec /bin/sleep 300" || fail "start with entrypoint, env and volumes"
+retry 10 bash -c "$NSPAWN logs $app | grep -q RO-[A-Z]*-$nonce" || fail "app did not run"
 $NSPAWN logs $app > /tmp/e2e-logs.txt
-grep -q "greeting=hola hostvar=fromhost" /tmp/e2e-logs.txt || fail "-e variables not seen by the program"
+grep -q "greeting=hola hostvar=fromhost nonce=$nonce" /tmp/e2e-logs.txt || fail "-e variables not seen by the program"
 grep -q "^from-host" /tmp/e2e-logs.txt || fail "bind mount not visible inside"
-grep -q "RO-OK" /tmp/e2e-logs.txt || fail "read-only volume was writable"
+grep -q "RO-OK-$nonce" /tmp/e2e-logs.txt || fail "read-only volume was writable"
 [ "$(cat /var/lib/nspawn/volumes/e2evol/written 2>/dev/null)" = from-app ] || fail "named volume not written on the host"
 $NSPAWN ps | grep "^ *$app " | grep -q "/bin/sh -c" || fail "ps does not show the entrypoint plus arguments"
 [ "$($NSPAWN exec $app -- /bin/sh -c 'echo $GREETING' </dev/null | tr -d '\r')" = hola ] || fail "exec does not see -e variables"
