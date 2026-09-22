@@ -93,7 +93,10 @@ hairpin masquerading and a guard so that `route_localnet` cannot expose the
 host's loopback services. Booted machines get a fixed address through a
 `.network` file mounted at `/run/systemd/network/10-host0.network`; app
 machines get a namespace built beforehand (`ip netns`, veth, address, route)
-referenced by `NamespacePath=`. `/etc/hosts` lists every machine on the bridge
+referenced by `NamespacePath=`. Under managed user namespaces (mstack) nspawn
+has systemd-nsresourced create the veth and does not put its host end on the
+bridge, so the publish hook does (`bridge::adopt_managed_veth`, which finds the
+peer of the machine's host0 through its sysfs). `/etc/hosts` lists every machine on the bridge
 and `host.nspawn.internal`. With firewalld the bridge is bound to the trusted
 zone; with docker or ufw, accept rules go into DOCKER-USER or FORWARD.
 

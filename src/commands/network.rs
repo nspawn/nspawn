@@ -5,6 +5,7 @@ use crate::cli::BackendChoice;
 use crate::commands::machines;
 use crate::config::Config;
 use crate::hostnet;
+use crate::oci::Mode;
 use crate::output::table;
 use crate::settings::Network;
 use crate::store::Store;
@@ -92,11 +93,15 @@ pub async fn publish(config: &Config, name: &str) -> Result<()> {
     let Some(record) = store.load_image(name)? else {
         return Ok(());
     };
-    if record.backend == BackendChoice::Mstack && !record.volumes.is_empty() {
+    if record.backend == BackendChoice::Mstack {
         let leader = sd.machine_leader(name).await?;
         for volume in &record.volumes {
             let source = volume.host_path(&store.volumes_dir());
             volmount::mount_into_machine(leader, &source, &volume.target, volume.read_only)?;
+        }
+        // nspawn does not put the veth of a managed user namespace on the bridge.
+        if record.network == Network::Bridge && record.mode == Mode::Boot {
+            bridge::adopt_managed_veth(config, leader)?;
         }
     }
     let _lock = store.lock_for(std::time::Duration::from_secs(60))?;

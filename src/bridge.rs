@@ -510,6 +510,46 @@ pub fn create_netns(config: &Config, name: &str, addr: Ipv4Addr) -> Result<()> {
     result
 }
 
+/// Under managed user namespaces (mstack) nspawn has systemd-nsresourced create the veth
+/// pair and leaves the host end (ns-*) alone: Bridge= is not applied there and machined
+/// is even told the bridge is the machine's interface. The peer of the machine's host0
+/// is found through the machine's sysfs and put on the bridge. Idempotent.
+pub fn adopt_managed_veth(config: &Config, leader: u32) -> Result<()> {
+    let iflink = fs::read_to_string(format!("/proc/{leader}/root/sys/class/net/host0/iflink"))
+        .context("reading the peer index of host0 inside the machine")?;
+    let index: u32 = iflink
+        .trim()
+        .parse()
+        .context("parsing the peer index of host0")?;
+    let name = interface_by_index(Path::new("/sys/class/net"), index).with_context(|| {
+        format!("no host interface with index {index} is the peer of the machine's host0")
+    })?;
+    if let Ok(master) = fs::read_link(format!("/sys/class/net/{name}/master")) {
+        let master = master.file_name().and_then(|f| f.to_str()).unwrap_or("");
+        if master == config.bridge {
+            return Ok(());
+        }
+        bail!("{name}, the host end of the machine's veth, is already on {master}");
+    }
+    run(
+        "ip",
+        &["link", "set", &name, "master", &config.bridge, "up"],
+    )
+}
+
+/// The name of the interface with `index`, from a sysfs class/net directory.
+pub fn interface_by_index(sys_net: &Path, index: u32) -> Option<String> {
+    for entry in fs::read_dir(sys_net).ok()?.flatten() {
+        let Ok(text) = fs::read_to_string(entry.path().join("ifindex")) else {
+            continue;
+        };
+        if text.trim().parse::<u32>().ok() == Some(index) {
+            return entry.file_name().to_str().map(|s| s.to_string());
+        }
+    }
+    None
+}
+
 /// Removes an app machine's network namespace and with it its veth pair. Best effort.
 pub fn delete_netns(name: &str) {
     if Path::new(&netns_path(name)).exists() {
@@ -802,6 +842,23 @@ mod tests {
             2
         );
         assert!(parse_publish(&["80:80".into(), "80:81".into()]).is_err());
+    }
+
+    #[test]
+    fn interface_lookup_by_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, index) in [("lo", 1), ("eth0", 2), ("ns-8947f178a7c6", 76)] {
+            std::fs::create_dir(tmp.path().join(name)).unwrap();
+            std::fs::write(tmp.path().join(name).join("ifindex"), format!("{index}\n")).unwrap();
+        }
+        std::fs::create_dir(tmp.path().join("bonding_masters")).unwrap();
+        assert_eq!(
+            interface_by_index(tmp.path(), 76).as_deref(),
+            Some("ns-8947f178a7c6")
+        );
+        assert_eq!(interface_by_index(tmp.path(), 2).as_deref(), Some("eth0"));
+        assert_eq!(interface_by_index(tmp.path(), 99), None);
+        assert_eq!(interface_by_index(Path::new("/nonexistent"), 1), None);
     }
 
     #[test]
