@@ -18,6 +18,7 @@ mod oci;
 mod output;
 mod pty;
 mod reference;
+mod search;
 mod settings;
 mod store;
 mod systemd;

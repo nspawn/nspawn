@@ -8,6 +8,7 @@ mod machines;
 mod network;
 mod pull;
 mod push;
+mod search;
 
 use anyhow::{bail, Result};
 
@@ -26,6 +27,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             HubCommand::Tags(a) => hub::tags(a, &config).await,
         },
         Command::Pull(args) => pull::run(args, &config).await,
+        Command::Search(args) => search::run(args, &config).await,
         Command::Build(args) => build::run(args, &config).await,
         Command::Create(args) => create::run(args, &config).await,
         Command::Push(args) => push::run(args, &config).await,

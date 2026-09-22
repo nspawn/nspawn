@@ -1280,6 +1280,7 @@ dependencies = [
  "indicatif",
  "nix",
  "oci-client",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

@@ -29,6 +29,12 @@ trap cleanup EXIT
 step "hub ls"
 $NSPAWN hub ls | tee /tmp/e2e-hub.txt || fail "hub ls exited non-zero"
 grep -q "${IMAGE%%:*}" /tmp/e2e-hub.txt || fail "hub ls does not list ${IMAGE%%:*}"
+step "search: the hub and Docker Hub, each hit with its source"
+$NSPAWN search "${IMAGE%%:*}" > /tmp/e2e-search.txt || fail "search exited non-zero"
+grep "^ *$NSPAWN_REGISTRY " /tmp/e2e-search.txt | grep -q " ${IMAGE%%:*} " || fail "search does not list ${IMAGE%%:*} from the hub"
+$NSPAWN search busybox --source dockerhub > /tmp/e2e-search.txt || fail "search on Docker Hub exited non-zero"
+grep "^ *Docker Hub " /tmp/e2e-search.txt | grep -q "docker.io/library/busybox" || fail "search does not list busybox from Docker Hub with its source"
+
 step "hub tags"
 $NSPAWN hub tags "${IMAGE%%:*}" > /tmp/e2e-tags.txt || fail "hub tags"
 grep -qx "${IMAGE##*:}" /tmp/e2e-tags.txt || fail "tag ${IMAGE##*:} missing"

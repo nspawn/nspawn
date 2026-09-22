@@ -26,6 +26,8 @@ pub struct Cli {
 pub enum Command {
     /// Query the hub (OCI registry).
     Hub(HubArgs),
+    /// Find images on the hub and on Docker Hub, like docker search.
+    Search(SearchArgs),
     /// Download an image from the hub and make it available to machinectl.
     Pull(PullArgs),
     /// Build an image with mkosi and make it available locally, ready to push.
@@ -106,6 +108,26 @@ pub struct HubLsArgs {
 pub struct HubTagsArgs {
     /// Repository name, for example "fedora".
     pub repository: String,
+}
+
+#[derive(Args, Debug)]
+pub struct SearchArgs {
+    /// Text to look for in image names.
+    pub term: String,
+    /// Only one source instead of both.
+    #[arg(long, value_enum)]
+    pub source: Option<SearchSource>,
+    /// Results per source.
+    #[arg(long, short = 'n', default_value_t = 25)]
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SearchSource {
+    /// The configured hub (its catalog).
+    Hub,
+    /// Docker Hub's search.
+    Dockerhub,
 }
 
 #[derive(Args, Debug)]

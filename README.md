@@ -7,6 +7,7 @@ itself. `machinectl` and `importctl` are never called.
 
 ```
 nspawn hub ls                       # repositories and tags on the hub
+nspawn search fedora                # images on the hub and on Docker Hub, with their source
 nspawn pull fedora:44               # download and assemble an image
 nspawn images ls                    # local images (all of them, not only ours)
 nspawn start fedora-44              # boot it as a machine
