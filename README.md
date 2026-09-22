@@ -148,6 +148,9 @@ and binds `ve-<name>` to firewalld's trusted zone while the machine runs.
 
 ## Development
 
+See docs/HACKING.md for building, tests and the e2e suite, docs/ARCHITECTURE.md for
+how it works, and CONTRIBUTING.md before sending changes.
+
 ```
 cargo test                                   # unit tests
 cargo clippy --all-targets -- -D warnings
