@@ -12,6 +12,7 @@ use crate::oci::Mode;
 use crate::reference::validate_machine_name;
 use crate::store::Store;
 use crate::systemd::Systemd;
+use crate::volume;
 
 /// Makes another machine from an image that is already local, like docker create: no
 /// registry involved, layers shared, and a writable layer, address and settings of its own.
@@ -88,15 +89,26 @@ pub async fn run(args: CreateArgs, config: &Config) -> Result<()> {
         .context("the record of the new machine is missing")?;
     record.network = args.network.unwrap_or(source.network);
     record.ports = bridge::parse_publish(&args.publish)?;
-    if !args.command.is_empty() {
-        if mode == Mode::Boot {
-            bail!(
-                "{} boots an init system; a command can only replace the entrypoint of an app image",
-                args.name
-            );
-        }
-        record.command = args.command.clone();
+    if mode == Mode::Boot
+        && (!args.command.is_empty() || args.entrypoint.is_some() || !args.env.is_empty())
+    {
+        bail!(
+            "{} boots an init system; a command, an entrypoint and variables only apply to the program of an app image",
+            args.name
+        );
     }
+    if let Some(entrypoint) = &args.entrypoint {
+        record.entrypoint = Some(if entrypoint.is_empty() {
+            Vec::new()
+        } else {
+            vec![entrypoint.clone()]
+        });
+    }
+    if !args.command.is_empty() {
+        record.cmd = Some(args.command.clone());
+    }
+    record.env = volume::parse_env(&args.env)?;
+    record.volumes = volume::parse_volumes(&args.volume)?;
     store.record_image(&record)?;
     println!(
         "machine {} ({} image) is ready: nspawn start {}",

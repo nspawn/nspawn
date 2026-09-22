@@ -29,8 +29,12 @@ impl Mode {
 /// The parts of the OCI config that matter at run time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSpec {
-    /// Entrypoint followed by Cmd.
     #[serde(default)]
+    pub entrypoint: Vec<String>,
+    #[serde(default)]
+    pub cmd: Vec<String>,
+    /// Older records kept entrypoint and cmd joined here; read as the cmd.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub command: Vec<String>,
     #[serde(default)]
     pub env: Vec<String>,
@@ -49,15 +53,36 @@ impl RunSpec {
         let Some(config) = file.config else {
             return Ok(RunSpec::default());
         };
-        let mut command = config.entrypoint.unwrap_or_default();
-        command.extend(config.cmd.unwrap_or_default());
         Ok(RunSpec {
-            command,
+            entrypoint: config.entrypoint.unwrap_or_default(),
+            cmd: config.cmd.unwrap_or_default(),
+            command: Vec::new(),
             env: config.env.unwrap_or_default(),
             working_dir: config.working_dir.filter(|d| !d.is_empty()),
             user: config.user.filter(|u| !u.is_empty()),
             stop_signal: config.stop_signal.filter(|s| !s.is_empty()),
         })
+    }
+
+    /// The image's own entrypoint.
+    pub fn entrypoint(&self) -> &[String] {
+        &self.entrypoint
+    }
+
+    /// The image's own cmd (older records: the joined command).
+    pub fn cmd(&self) -> &[String] {
+        if self.entrypoint.is_empty() && self.cmd.is_empty() {
+            &self.command
+        } else {
+            &self.cmd
+        }
+    }
+
+    /// Entrypoint followed by cmd: what runs without overrides.
+    pub fn argv(&self) -> Vec<String> {
+        let mut argv = self.entrypoint().to_vec();
+        argv.extend_from_slice(self.cmd());
+        argv
     }
 }
 
@@ -113,10 +138,16 @@ mod tests {
             "config":{"Entrypoint":["/docker-entrypoint.sh"],"Cmd":["nginx","-g","daemon off;"],
             "Env":["PATH=/usr/bin","NGINX_VERSION=1.27"],"WorkingDir":"/srv","User":"nginx","StopSignal":"SIGQUIT"}}"#;
         let spec = RunSpec::from_config(json).unwrap();
+        assert_eq!(spec.entrypoint(), ["/docker-entrypoint.sh"]);
+        assert_eq!(spec.cmd(), ["nginx", "-g", "daemon off;"]);
         assert_eq!(
-            spec.command,
+            spec.argv(),
             vec!["/docker-entrypoint.sh", "nginx", "-g", "daemon off;"]
         );
+        let legacy: RunSpec = serde_json::from_str(r#"{"command":["sh","-c","x"]}"#).unwrap();
+        assert!(legacy.entrypoint().is_empty());
+        assert_eq!(legacy.cmd(), ["sh", "-c", "x"]);
+        assert_eq!(legacy.argv(), ["sh", "-c", "x"]);
         assert_eq!(spec.env, vec!["PATH=/usr/bin", "NGINX_VERSION=1.27"]);
         assert_eq!(spec.working_dir.as_deref(), Some("/srv"));
         assert_eq!(spec.user.as_deref(), Some("nginx"));

@@ -18,6 +18,7 @@ use crate::bridge::PortMap;
 use crate::cli::BackendChoice;
 use crate::oci::{Mode, RunSpec};
 use crate::settings::Network;
+use crate::volume::Volume;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageRecord {
@@ -44,10 +45,41 @@ pub struct ImageRecord {
     /// Ports published on the host, like docker -p (bridge network only).
     #[serde(default)]
     pub ports: Vec<PortMap>,
-    /// For app machines: the command remembered from create or start instead of the
-    /// image's entrypoint (docker fixes it when the container is created).
+    /// Entrypoint override (--entrypoint); None keeps the image's. An empty list runs
+    /// the cmd alone.
     #[serde(default)]
-    pub command: Vec<String>,
+    pub entrypoint: Option<Vec<String>>,
+    /// Cmd override (the arguments after --); None keeps the image's. Older records kept
+    /// a whole command under "command".
+    #[serde(default, alias = "command")]
+    pub cmd: Option<Vec<String>>,
+    /// Environment on top of the image's (-e).
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Bind mounts and named volumes (-v).
+    #[serde(default)]
+    pub volumes: Vec<Volume>,
+}
+
+impl ImageRecord {
+    /// What the machine runs: the overrides where given, the image's otherwise.
+    pub fn effective_command(&self) -> Vec<String> {
+        let mut argv = self
+            .entrypoint
+            .as_deref()
+            .unwrap_or(self.run.entrypoint())
+            .to_vec();
+        argv.extend_from_slice(self.cmd.as_deref().unwrap_or(self.run.cmd()));
+        argv
+    }
+
+    /// Older records stored an empty "command" list meaning "no override".
+    fn normalize(mut self) -> Self {
+        if self.cmd.as_ref().is_some_and(|c| c.is_empty()) {
+            self.cmd = None;
+        }
+        self
+    }
 }
 
 fn default_mode() -> Mode {
@@ -159,6 +191,10 @@ impl Store {
     /// Writable upper/work directories of overlay machines and generated per-machine files.
     pub fn machines_private_dir(&self) -> PathBuf {
         self.root.join("machines")
+    }
+    /// Named volumes (-v name:/path), one directory each.
+    pub fn volumes_dir(&self) -> PathBuf {
+        self.root.join("volumes")
     }
     /// Files nspawn generates for one machine (network configuration, hosts).
     pub fn machine_files_dir(&self, name: &str) -> PathBuf {
@@ -294,9 +330,9 @@ impl Store {
             return Ok(None);
         }
         let text = fs::read_to_string(&path)?;
-        Ok(Some(
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?,
-        ))
+        let record: ImageRecord =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        Ok(Some(record.normalize()))
     }
 
     pub fn list_images(&self) -> Result<Vec<ImageRecord>> {
@@ -319,7 +355,7 @@ impl Store {
             }
             let text = fs::read_to_string(entry.path())?;
             match serde_json::from_str::<ImageRecord>(&text) {
-                Ok(r) => out.push(r),
+                Ok(r) => out.push(r.normalize()),
                 Err(e) => eprintln!("warning: ignoring {}: {e}", entry.path().display()),
             }
         }
@@ -952,7 +988,10 @@ mod tests {
             network: Network::Veth,
             address: None,
             ports: Vec::new(),
-            command: Vec::new(),
+            entrypoint: None,
+            cmd: None,
+            env: Vec::new(),
+            volumes: Vec::new(),
         };
         store.record_image(&rec).unwrap();
         assert_eq!(
@@ -993,7 +1032,10 @@ mod tests {
             network: Network::Host,
             address: None,
             ports: Vec::new(),
-            command: Vec::new(),
+            entrypoint: None,
+            cmd: None,
+            env: Vec::new(),
+            volumes: Vec::new(),
         };
         store.record_image(&rec).unwrap();
         store
@@ -1184,7 +1226,10 @@ mod tests {
             network: Network::Bridge,
             address: None,
             ports: Vec::new(),
-            command: Vec::new(),
+            entrypoint: None,
+            cmd: None,
+            env: Vec::new(),
+            volumes: Vec::new(),
         };
         store
             .record_image(&record("ovl", BackendChoice::Overlay))

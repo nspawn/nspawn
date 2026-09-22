@@ -11,6 +11,7 @@ nspawn pull fedora:44               # download and assemble an image
 nspawn images ls                    # local images (all of them, not only ours)
 nspawn start fedora-44              # boot it as a machine
 nspawn create fedora-44 web2        # another machine from the same local image, docker create style
+nspawn start web -p 8080:80 -e KEY=v -v /srv/data:/data -v pgdata:/var/lib/pg   # docker-style flags
 nspawn ps                           # running machines: image, mode, command, uptime (-a adds stopped ones)
 nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
 nspawn shell fedora-44
@@ -35,9 +36,16 @@ Images that ship an init system (systemd) and whose entrypoint is that init are 
 `OpenMachineShell`. Any other image, for example anything from Docker Hub, is an "app":
 its entrypoint runs as PID 2 under nspawn's stub init, with the environment, working
 directory, user and stop signal from the OCI config, and joins the bridge network like
-any other machine (see Networking). The command given to `create` or `start` after `--`
-is remembered, like the command of a docker container; `start --image-command` goes back
-to the image's own entrypoint.
+any other machine (see Networking). The arguments given to `create` or `start` after `--`
+replace the image's cmd and follow its entrypoint, exactly as with docker (`nspawn start
+web -- nginx -T` still runs `/docker-entrypoint.sh` first); `--entrypoint PROGRAM` replaces
+the entrypoint and `--entrypoint ""` drops it. Both are remembered, like the command of a
+docker container; `start --image-command` goes back to the image's own. `-e VAR=value`
+adds environment on top of the image's (`-e VAR` copies it from your shell), and
+`-v SOURCE:TARGET[:ro]` mounts a host directory, or a named volume that nspawn keeps
+under `/var/lib/nspawn/volumes/NAME`, into any kind of machine; in machines that run
+with private users the mount is idmapped, so root inside owns what it writes on the
+host. `-e none` and `-v none` forget them.
 
 `exec` enters the machine's namespaces for both kinds of machine, like docker exec: the
 exit code comes back, the image's environment applies and nothing is needed inside (no

@@ -13,9 +13,10 @@ use crate::oci::Mode;
 use crate::output::{human_duration, table};
 use crate::pty;
 use crate::reference::validate_machine_name;
-use crate::settings::{self, BridgeMount, MachineSettings, Network};
+use crate::settings::{self, Bind, BridgeMount, MachineSettings, Network};
 use crate::store::{now_unix, ImageRecord, Store};
 use crate::systemd::Systemd;
+use crate::volume;
 
 pub async fn ls(args: PsArgs, config: &Config) -> Result<()> {
     let sd = Systemd::connect().await?;
@@ -116,7 +117,7 @@ fn describe(record: Option<&ImageRecord>) -> (String, String, String) {
             let command = match r.mode {
                 Mode::Boot => "init".to_string(),
                 Mode::App => {
-                    let joined = r.run.command.join(" ");
+                    let joined = r.effective_command().join(" ");
                     if joined.chars().count() > 40 {
                         format!("{}...", joined.chars().take(37).collect::<String>())
                     } else {
@@ -175,6 +176,21 @@ pub async fn prepare(
         store.record_image(&record)?;
         None
     };
+    // Named volumes live under the state directory; a missing host directory is created,
+    // as docker does.
+    let mut binds = Vec::new();
+    for volume in &record.volumes {
+        let source = volume.host_path(&store.volumes_dir());
+        if !source.exists() {
+            std::fs::create_dir_all(&source)
+                .with_context(|| format!("creating volume {}", source.display()))?;
+        }
+        binds.push(Bind {
+            source,
+            target: volume.target.clone(),
+            read_only: volume.read_only,
+        });
+    }
     // The settings file is regenerated every time: it carries the command and comes back
     // if it went missing.
     settings::write(&MachineSettings {
@@ -182,11 +198,9 @@ pub async fn prepare(
         managed_userns: record.backend == BackendChoice::Mstack,
         mode: record.mode,
         run: &record.run,
-        command_override: if record.command.is_empty() {
-            None
-        } else {
-            Some(&record.command)
-        },
+        command: &record.effective_command(),
+        extra_env: &record.env,
+        binds: &binds,
         network: record.network,
         bridge: files.as_deref().map(|files| BridgeMount {
             bridge: &config.bridge,
@@ -261,21 +275,43 @@ pub async fn start(args: StartArgs, config: &Config) -> Result<()> {
                 r.ports = bridge::parse_publish(&args.publish)?;
             }
             if args.image_command {
-                r.command.clear();
+                r.entrypoint = None;
+                r.cmd = None;
+            }
+            if r.mode == Mode::Boot
+                && (!args.command.is_empty() || args.entrypoint.is_some() || !args.env.is_empty())
+            {
+                bail!(
+                    "{} boots an init system; a command, an entrypoint and variables only apply to the program of an app image",
+                    args.name
+                );
+            }
+            if let Some(entrypoint) = &args.entrypoint {
+                r.entrypoint = Some(if entrypoint.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![entrypoint.clone()]
+                });
             }
             if !args.command.is_empty() {
-                if r.mode == Mode::Boot {
-                    bail!(
-                        "{} boots an init system; a command can only replace the entrypoint of an app image",
-                        args.name
-                    );
-                }
-                r.command = args.command.clone();
+                r.cmd = Some(args.command.clone());
+            }
+            if !args.env.is_empty() {
+                r.env = volume::parse_env(&args.env)?;
+            }
+            if !args.volume.is_empty() {
+                r.volumes = volume::parse_volumes(&args.volume)?;
             }
         }
-        None if !args.command.is_empty() || args.network.is_some() || !args.publish.is_empty() => {
+        None if !args.command.is_empty()
+            || args.network.is_some()
+            || !args.publish.is_empty()
+            || args.entrypoint.is_some()
+            || !args.env.is_empty()
+            || !args.volume.is_empty() =>
+        {
             bail!(
-                "{} is not an image managed by nspawn; a command, network or ports need one",
+                "{} is not an image managed by nspawn; a command, network, ports, variables or volumes need one",
                 args.name
             )
         }

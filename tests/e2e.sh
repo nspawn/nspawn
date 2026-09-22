@@ -44,7 +44,12 @@ for backend in overlay flat; do
   grep -q "^ *$name " /tmp/e2e-img.txt || fail "$name not listed"
   grep "^ *$name " /tmp/e2e-img.txt | grep -q "$backend" || fail "$name backend not shown"
   step "start"
-  $NSPAWN start "$name" || fail "start ($backend)"
+  vol_args=""
+  if [ "$backend" = overlay ]; then
+    rm -rf /tmp/e2e-boot-vol; mkdir -p /tmp/e2e-boot-vol
+    vol_args="-v /tmp/e2e-boot-vol:/srv/vol"
+  fi
+  $NSPAWN start "$name" $vol_args || fail "start ($backend)"
   if [ "$backend" = overlay ]; then
     findmnt -n -o FSTYPE "/var/lib/machines/$name" | grep -q overlay || fail "root of $name is not an overlay"
   fi
@@ -58,6 +63,12 @@ for backend in overlay flat; do
   $NSPAWN exec "$name" -- /usr/bin/cat /etc/os-release </dev/null | tr -d '\r' | grep -q PRETTY_NAME || fail "exec cat os-release"
   $NSPAWN exec "$name" -- /bin/false </dev/null; [ $? -eq 1 ] || fail "exec did not propagate the exit code of a booted machine"
   $NSPAWN exec "$name" -- /bin/sh -c 'echo $PATH' </dev/null | tr -d '\r' | grep -q "/usr/bin" || fail "exec has no PATH"
+  if [ "$backend" = overlay ]; then
+    step "volume in a booted machine (private users, idmapped)"
+    $NSPAWN exec "$name" -- /bin/sh -c 'echo booted > /srv/vol/from-machine' </dev/null || fail "cannot write to the volume inside $name"
+    [ "$(cat /tmp/e2e-boot-vol/from-machine 2>/dev/null)" = booted ] || fail "volume write not visible on the host"
+    [ "$(stat -c %u /tmp/e2e-boot-vol/from-machine)" = 0 ] || fail "root inside did not write as root on the host (idmap)"
+  fi
   step "network through the nspawn bridge"
   if [ "$networkd_was" != active ]; then
     systemctl is-active systemd-networkd >/dev/null && fail "systemd-networkd got started on the host; the bridge must not need it"
@@ -235,6 +246,23 @@ nft list map ip nspawn ports | grep -q 18081 && fail "ports of an exited app sti
 out=$($NSPAWN stop $app 2>&1); echo "$out" | grep -q "was not running" || fail "stop of a stopped machine is not a no-op: $out"
 out=$($NSPAWN start $app -p 22:80 2>&1); echo "$out" | grep -q "in use by a service on the host" || fail "publishing the host's ssh port was not refused: $out"
 $NSPAWN ps -a | grep "^ *$app " | grep -q "22->80" && fail "a refused port was remembered"
+
+step "entrypoint, environment and volumes, docker style"
+rm -rf /tmp/e2e-bind /var/lib/nspawn/volumes/e2evol; mkdir -p /tmp/e2e-bind; echo from-host > /tmp/e2e-bind/hello
+export E2E_HOST_VAR=fromhost
+$NSPAWN start $app --entrypoint /bin/sh -e GREETING=hola -e E2E_HOST_VAR -v /tmp/e2e-bind:/bind -v e2evol:/vol -v /etc/os-release:/host-os-release:ro -p none -- -c 'echo "greeting=$GREETING hostvar=$E2E_HOST_VAR"; cat /bind/hello; echo from-app > /vol/written; { echo blocked > /host-os-release; } 2>/dev/null && echo RO-FAIL || echo RO-OK; exec /bin/sleep 300' || fail "start with entrypoint, env and volumes"
+retry 10 bash -c "$NSPAWN logs $app | grep -q RO-" || fail "app did not run"
+$NSPAWN logs $app > /tmp/e2e-logs.txt
+grep -q "greeting=hola hostvar=fromhost" /tmp/e2e-logs.txt || fail "-e variables not seen by the program"
+grep -q "^from-host" /tmp/e2e-logs.txt || fail "bind mount not visible inside"
+grep -q "RO-OK" /tmp/e2e-logs.txt || fail "read-only volume was writable"
+[ "$(cat /var/lib/nspawn/volumes/e2evol/written 2>/dev/null)" = from-app ] || fail "named volume not written on the host"
+$NSPAWN ps | grep "^ *$app " | grep -q "/bin/sh -c" || fail "ps does not show the entrypoint plus arguments"
+$NSPAWN stop $app || fail "stop app with volumes"
+$NSPAWN start $app --image-command -e none -v none || fail "start with the image's own command"
+$NSPAWN ps | grep "^ *$app " | grep -q " sh " || fail "--image-command did not restore the image's cmd"
+grep -q "Bind=" /etc/systemd/nspawn/$app.nspawn && fail "-v none left volumes in the settings"
+$NSPAWN stop $app -t 2 || fail "stop app running its own cmd"
 $NSPAWN images rm $app || fail "rm busybox"
 [ -e /etc/systemd/nspawn/$app.nspawn ] && fail "settings file left behind for $app"
 grep -q "(boot image)" /tmp/e2e-hub.txt 2>/dev/null || true

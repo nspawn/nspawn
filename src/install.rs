@@ -50,7 +50,7 @@ pub async fn install(
     // namespace prepared for app machines on the bridge; apps get overlay instead. Whether
     // the image is an app is known before extraction when its command says so.
     let surely_app = spec.mode == Some(Mode::App)
-        || (spec.mode.is_none() && detect_mode(true, &run.command) == Mode::App);
+        || (spec.mode.is_none() && detect_mode(true, &run.argv()) == Mode::App);
     let backend = if backend == Backend::Mstack && surely_app {
         eprintln!("note: {} runs a program rather than an init system; assembling it as overlay, since mstack machines cannot join the bridge network", spec.name);
         Backend::Overlay
@@ -62,7 +62,7 @@ pub async fn install(
     let trees = assembler.assemble(backend, spec.name, &layers).await?;
     let mode = spec
         .mode
-        .unwrap_or_else(|| detect_mode(has_init(&trees), &run.command));
+        .unwrap_or_else(|| detect_mode(has_init(&trees), &run.argv()));
     if mode == Mode::App && backend == Backend::Mstack {
         // Only known now, without a command in the config: no init inside.
         eprintln!(
@@ -80,7 +80,9 @@ pub async fn install(
         managed_userns: backend == Backend::Mstack,
         mode,
         run: &run,
-        command_override: None,
+        command: &run.argv(),
+        extra_env: &[],
+        binds: &[],
         network,
         bridge: None,
     })?;
@@ -103,7 +105,10 @@ pub async fn install(
         network,
         address: None,
         ports: Vec::new(),
-        command: Vec::new(),
+        entrypoint: None,
+        cmd: None,
+        env: Vec::new(),
+        volumes: Vec::new(),
     })?;
     Ok(mode)
 }

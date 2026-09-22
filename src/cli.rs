@@ -144,7 +144,17 @@ pub struct CreateArgs {
     /// Replace an existing machine with the same name.
     #[arg(long, short = 'f')]
     pub force: bool,
-    /// For app images: the command to run instead of the image's entrypoint (after --).
+    /// Replace the image's entrypoint; an empty string runs the arguments alone.
+    #[arg(long, value_name = "PROGRAM")]
+    pub entrypoint: Option<String>,
+    /// Environment for the program, VAR=value or VAR (copied from here), like docker -e.
+    #[arg(long, short = 'e', value_name = "VAR[=VALUE]")]
+    pub env: Vec<String>,
+    /// Mount a host directory or a named volume, SOURCE:TARGET[:ro], like docker -v.
+    #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]")]
+    pub volume: Vec<String>,
+    /// For app images: the arguments after -- replace the image's cmd and follow its
+    /// entrypoint, as with docker.
     #[arg(last = true)]
     pub command: Vec<String>,
 }
@@ -285,11 +295,22 @@ pub struct StartArgs {
     /// remembered for the image; "none" forgets them all.
     #[arg(long, short = 'p', value_name = "HOST:CONTAINER[/udp]")]
     pub publish: Vec<String>,
-    /// Forget the remembered command and run the image's own entrypoint again.
+    /// Replace the image's entrypoint; an empty string runs the arguments alone.
+    #[arg(long, value_name = "PROGRAM")]
+    pub entrypoint: Option<String>,
+    /// Environment for the program, VAR=value or VAR (copied from here), like docker -e.
+    /// Repeatable and remembered; "none" forgets them.
+    #[arg(long, short = 'e', value_name = "VAR[=VALUE]")]
+    pub env: Vec<String>,
+    /// Mount a host directory or a named volume, SOURCE:TARGET[:ro], like docker -v.
+    /// Repeatable and remembered; "none" forgets them.
+    #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]")]
+    pub volume: Vec<String>,
+    /// Forget the remembered entrypoint and arguments and run the image's own again.
     #[arg(long)]
     pub image_command: bool,
-    /// For app images: run this command instead of the image's entrypoint (after --).
-    /// Remembered for later starts, like docker create.
+    /// For app images: the arguments after -- replace the image's cmd and follow its
+    /// entrypoint, as with docker. Remembered for later starts.
     #[arg(last = true)]
     pub command: Vec<String>,
 }
