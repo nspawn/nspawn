@@ -22,6 +22,7 @@ mod settings;
 mod store;
 mod systemd;
 mod unitname;
+mod volmount;
 mod volume;
 
 use clap::Parser;

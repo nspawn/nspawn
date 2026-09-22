@@ -131,7 +131,10 @@ pub fn render(s: &MachineSettings) -> String {
         }
         Network::Veth => {}
     }
-    for bind in s.binds {
+    // Under managed user namespaces nspawn cannot idmap binds; those volumes are attached
+    // from the host once the machine runs (see volmount).
+    let rendered_binds: &[Bind] = if s.managed_userns { &[] } else { s.binds };
+    for bind in rendered_binds {
         // With private users the host's uid 0 is nobody inside; idmap makes root inside
         // the owner of what it writes, as docker users expect.
         let options = if private_users { ":idmap" } else { "" };

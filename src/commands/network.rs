@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::bridge;
+use crate::cli::BackendChoice;
 use crate::commands::machines;
 use crate::config::Config;
 use crate::hostnet;
@@ -8,6 +9,7 @@ use crate::output::table;
 use crate::settings::Network;
 use crate::store::Store;
 use crate::systemd::Systemd;
+use crate::volmount;
 
 /// Creates the bridge, its NAT and firewall exceptions (start does this on its own; here
 /// for boot-time setup and troubleshooting).
@@ -85,13 +87,25 @@ pub async fn publish(config: &Config, name: &str) -> Result<()> {
     let sd = Systemd::connect().await?;
     let store = Store::new(&config.machines_dir, &config.state_dir);
     let _lock = store.lock()?;
-    match store.load_image(name)?.map(|r| r.network) {
-        Some(Network::Bridge) => bridge::sync_ports(&store, &sd).await,
-        Some(Network::Veth) if hostnet::firewalld_running(&sd).await => {
-            hostnet::admit(&sd, name).await.map(|_| ())
+    let Some(record) = store.load_image(name)? else {
+        return Ok(());
+    };
+    match record.network {
+        Network::Bridge => bridge::sync_ports(&store, &sd).await?,
+        Network::Veth if hostnet::firewalld_running(&sd).await => {
+            hostnet::admit(&sd, name).await?;
         }
-        _ => Ok(()),
+        _ => {}
     }
+    // Volumes of an mstack machine: attached from the host, the settings cannot carry them.
+    if record.backend == BackendChoice::Mstack && !record.volumes.is_empty() {
+        let leader = sd.machine_leader(name).await?;
+        for volume in &record.volumes {
+            let source = volume.host_path(&store.volumes_dir());
+            volmount::mount_into_machine(leader, &source, &volume.target, volume.read_only)?;
+        }
+    }
+    Ok(())
 }
 
 /// ExecStopPost: runs however the machine ended (stop, exit, crash, machinectl). No lock:
