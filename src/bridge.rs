@@ -299,6 +299,9 @@ fn forward_policy_is_drop() -> bool {
         .unwrap_or(false)
 }
 
+/// Priorities are numeric on purpose: the symbolic names (dstnat, srcnat, filter) are not
+/// accepted in every hook by older nft (1.0.6 on Debian 12 rejects dstnat in output).
+///
 /// The nftables table: DNAT of published ports (from outside and from the host itself,
 /// loopback included), masquerading of what leaves the bridge, hairpin masquerading when
 /// a machine reaches a published port through the host's address (otherwise the reply
@@ -311,16 +314,16 @@ pub fn base_ruleset(bridge: &str, subnet: Subnet) -> String {
 		type inet_proto . inet_service : ipv4_addr . inet_service
 	}}
 	chain prerouting {{
-		type nat hook prerouting priority dstnat; policy accept;
+		type nat hook prerouting priority -100; policy accept;
 	}}
 	chain output {{
-		type nat hook output priority dstnat; policy accept;
+		type nat hook output priority -100; policy accept;
 	}}
 	chain postrouting {{
-		type nat hook postrouting priority srcnat; policy accept;
+		type nat hook postrouting priority 100; policy accept;
 	}}
 	chain input {{
-		type filter hook input priority filter; policy accept;
+		type filter hook input priority 0; policy accept;
 	}}
 }}
 flush chain ip {TABLE} prerouting
@@ -834,6 +837,14 @@ mod tests {
         let rules = base_ruleset("nspawn0", subnet);
         assert!(rules.contains("ip saddr 10.99.0.0/24 oifname != \"nspawn0\" masquerade"));
         assert!(rules.contains("map @ports"));
+        for symbolic in ["priority dstnat", "priority srcnat", "priority filter"] {
+            assert!(
+                !rules.contains(symbolic),
+                "{symbolic}: older nft rejects symbolic priorities in some hooks"
+            );
+        }
+        assert!(rules.contains("hook output priority -100;"));
+        assert!(rules.contains("hook postrouting priority 100;"));
     }
 
     #[test]
