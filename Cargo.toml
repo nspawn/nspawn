@@ -2,6 +2,7 @@
 name = "nspawn"
 version = "1.0.0-beta.1"
 edition = "2021"
+license = "GPL-3.0-or-later"
 description = "Docker-like management of systemd-nspawn machines: OCI images from a hub, shared layers, systemd integration"
 rust-version = "1.85"
 
