@@ -201,10 +201,28 @@ pub fn parse_publish(values: &[String]) -> Result<Vec<PortMap>> {
 pub async fn up(config: &Config, sd: &Systemd) -> Result<()> {
     let name = config.bridge.as_str();
     let subnet = config.subnet;
-    if !Path::new("/sys/class/net").join(name).exists() {
-        run("ip", &["link", "add", name, "type", "bridge"])?;
-    }
     let address = format!("{}/{}", subnet.gateway(), subnet.prefix);
+    let sys = Path::new("/sys/class/net").join(name);
+    if !sys.exists() {
+        run("ip", &["link", "add", name, "type", "bridge"])?;
+        run("ip", &["link", "set", "dev", name, "alias", MANAGED_ALIAS])?;
+    } else {
+        // An interface with that name already exists: only a bridge nspawn made (or an
+        // unmarked one carrying nothing but our address) may be taken over. Stripping
+        // docker0 or virbr0 of their addresses is what this guards against.
+        let is_bridge = sys.join("bridge").is_dir();
+        let alias = fs::read_to_string(sys.join("ifalias")).unwrap_or_default();
+        let addresses = ipv4_addresses(name)?;
+        if !adoptable(is_bridge, alias.trim(), &addresses, &address) {
+            bail!(
+                "{name} exists and is not a bridge nspawn created (addresses: {}); pick another name with `bridge` in nspawn.toml",
+                if addresses.is_empty() { "none".to_string() } else { addresses.join(", ") }
+            );
+        }
+        if alias.trim() != MANAGED_ALIAS {
+            run("ip", &["link", "set", "dev", name, "alias", MANAGED_ALIAS])?;
+        }
+    }
     run("ip", &["addr", "replace", &address, "dev", name])?;
     prune_addresses(name, &address)?;
     run("ip", &["link", "set", name, "up"])?;
@@ -320,22 +338,56 @@ add rule ip {TABLE} input iifname \"{bridge}\" ct status & dnat == 0 ip daddr 12
     )
 }
 
-/// Drops IPv4 addresses the bridge carries from an earlier subnet setting.
-fn prune_addresses(bridge: &str, wanted: &str) -> Result<()> {
+/// The mark nspawn leaves on the bridge it creates (its ifalias).
+pub const MANAGED_ALIAS: &str = "nspawn";
+
+/// Whether an existing interface may serve as the bridge: one nspawn marked, or an
+/// unmarked bridge that carries no address but ours.
+pub fn adoptable(is_bridge: bool, alias: &str, addresses: &[String], wanted: &str) -> bool {
+    is_bridge && (alias == MANAGED_ALIAS || addresses.iter().all(|a| a == wanted))
+}
+
+/// IPv4 addresses (with prefix) of an interface.
+fn ipv4_addresses(interface: &str) -> Result<Vec<String>> {
     let output = Command::new("ip")
-        .args(["-4", "-o", "addr", "show", "dev", bridge])
+        .args(["-4", "-o", "addr", "show", "dev", interface])
         .output()
         .context("running ip")?;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut words = line.split_whitespace();
-        if words.nth(2) != Some("inet") {
-            continue;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.nth(2) == Some("inet"))
+                .then(|| words.next().map(str::to_string))
+                .flatten()
+        })
+        .collect())
+}
+
+/// Drops IPv4 addresses the bridge carries from an earlier subnet setting.
+fn prune_addresses(bridge: &str, wanted: &str) -> Result<()> {
+    for addr in ipv4_addresses(bridge)? {
+        if addr != wanted {
+            run("ip", &["addr", "del", &addr, "dev", bridge])?;
         }
-        if let Some(addr) = words.next() {
-            if addr != wanted {
-                run("ip", &["addr", "del", addr, "dev", bridge])?;
-            }
-        }
+    }
+    Ok(())
+}
+
+/// Removes a machine's own published ports from the map, entry by entry, so that it can
+/// run without the store lock next to another machine's publish.
+pub fn withdraw_ports(record: &ImageRecord) -> Result<()> {
+    if !table_exists() {
+        return Ok(());
+    }
+    for p in &record.ports {
+        // A missing element fails the whole transaction, so one script per element and
+        // a failure means it was gone already.
+        let _ = nft(&format!(
+            "delete element ip {TABLE} ports {{ {} . {} }}\n",
+            p.protocol.name(),
+            p.host
+        ));
     }
     Ok(())
 }
@@ -701,6 +753,28 @@ mod tests {
         assert!("10.0.0.0/31".parse::<Subnet>().is_err());
         assert!("10.0.0.0/7".parse::<Subnet>().is_err());
         assert!("x/24".parse::<Subnet>().is_err());
+    }
+
+    #[test]
+    fn foreign_interfaces_are_never_adopted() {
+        let ours = "10.99.0.1/24";
+        assert!(
+            adoptable(true, "nspawn", &["172.17.0.1/16".to_string()], ours),
+            "marked: ours whatever it carries now"
+        );
+        assert!(adoptable(true, "", &[], ours), "an empty unmarked bridge");
+        assert!(
+            adoptable(true, "", &[ours.to_string()], ours),
+            "a bridge from an older nspawn"
+        );
+        assert!(
+            !adoptable(true, "", &["172.17.0.1/16".to_string()], ours),
+            "docker0"
+        );
+        assert!(
+            !adoptable(false, "nspawn", &[], ours),
+            "not a bridge at all"
+        );
     }
 
     #[test]

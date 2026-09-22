@@ -71,7 +71,13 @@ impl Config {
             }
         };
         let mut config = Self::merge(file, registry, ca_cert)?;
-        config.config_path = path.map(Path::to_path_buf);
+        // The unit hooks run from /, so the file must be named by an absolute path.
+        config.config_path = match path {
+            Some(p) => {
+                Some(fs::canonicalize(p).with_context(|| format!("resolving {}", p.display()))?)
+            }
+            None => None,
+        };
         Ok(config)
     }
 
@@ -93,6 +99,26 @@ impl Config {
             .unwrap_or(DEFAULT_SUBNET)
             .parse()
             .context("subnet in the configuration")?;
+        let dns = file.dns.unwrap_or_default();
+        if let Some(bad) = dns.iter().find(|a| !a.is_ipv4() || a.is_loopback()) {
+            anyhow::bail!(
+                "dns server {bad}: only IPv4 servers reachable from the bridge can serve the machines (no loopback, no IPv6)"
+            );
+        }
+        let machines_dir = file
+            .machines_dir
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_MACHINES_DIR));
+        let state_dir = file
+            .state_dir
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR));
+        for (key, dir) in [("machines_dir", &machines_dir), ("state_dir", &state_dir)] {
+            if !dir.is_absolute() {
+                anyhow::bail!(
+                    "{key} must be an absolute path (unit files refer to it): {}",
+                    dir.display()
+                );
+            }
+        }
         let bridge = file.bridge.unwrap_or_else(|| DEFAULT_BRIDGE.to_string());
         if bridge.is_empty()
             || bridge.len() > 15
@@ -108,15 +134,11 @@ impl Config {
                 .unwrap_or_else(|| DEFAULT_REGISTRY.to_string()),
             ca_cert: ca_cert.or(file.ca_cert),
             backend: file.backend.unwrap_or(BackendChoice::Auto),
-            machines_dir: file
-                .machines_dir
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_MACHINES_DIR)),
-            state_dir: file
-                .state_dir
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
+            machines_dir,
+            state_dir,
             bridge,
             subnet,
-            dns: file.dns.unwrap_or_default(),
+            dns,
             config_path: None,
         })
     }
@@ -163,5 +185,28 @@ mod tests {
         assert!(Config::merge(bad, None, None).is_err());
         let long: FileConfig = toml::from_str("bridge = \"nspawn-machines0\"\n").unwrap();
         assert!(Config::merge(long, None, None).is_err());
+        for bad in [
+            "dns = [\"127.0.0.1\"]\n",
+            "dns = [\"2001:db8::53\"]\n",
+            "state_dir = \"relative/dir\"\n",
+        ] {
+            let file: FileConfig = toml::from_str(bad).unwrap();
+            assert!(Config::merge(file, None, None).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn config_path_is_kept_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nspawn.toml");
+        fs::write(&path, "registry = \"x.example\"\n").unwrap();
+        let config = Config::load(Some(&path), None, None).unwrap();
+        assert!(config.config_path.as_ref().unwrap().is_absolute());
+        assert_eq!(config.registry, "x.example");
+        let relative = Path::new("nspawn.toml");
+        assert!(
+            Config::load(Some(relative), None, None).is_err(),
+            "no such file here"
+        );
     }
 }

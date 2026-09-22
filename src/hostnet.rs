@@ -102,6 +102,12 @@ pub async fn trust_interface(sd: &Systemd, ifname: &str) -> Result<()> {
         {
             Ok(())
         }
+        Err(zbus::Error::MethodError(_, Some(message), _)) if message.contains("ZONE_CONFLICT") => {
+            eprintln!(
+                "note: firewalld keeps {ifname} in another zone; nspawn leaves it there (make sure it lets DHCP and forwarding through)"
+            );
+            Ok(())
+        }
         Err(e) => {
             Err(e).with_context(|| format!("adding {ifname} to the {ZONE} zone of firewalld"))
         }

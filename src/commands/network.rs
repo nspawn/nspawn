@@ -16,6 +16,7 @@ use crate::volmount;
 pub async fn up(config: &Config) -> Result<()> {
     let sd = Systemd::connect().await?;
     let store = Store::new(&config.machines_dir, &config.state_dir);
+    let _lock = store.lock_for(std::time::Duration::from_secs(60))?;
     bridge::up(config, &sd).await?;
     bridge::sync_ports(&store, &sd).await?;
     println!(
@@ -82,22 +83,15 @@ pub async fn prepare(config: &Config, name: &str) -> Result<()> {
         .map(|_| ())
 }
 
-/// ExecStartPost: the machine is registered, its ports can be published.
+/// ExecStartPost: the machine is registered, its ports can be published. Volumes of an
+/// mstack machine are attached first and without the store lock: the machine's boot is
+/// waiting for them, and a long pull or create must not hold them up.
 pub async fn publish(config: &Config, name: &str) -> Result<()> {
     let sd = Systemd::connect().await?;
     let store = Store::new(&config.machines_dir, &config.state_dir);
-    let _lock = store.lock_for(std::time::Duration::from_secs(60))?;
     let Some(record) = store.load_image(name)? else {
         return Ok(());
     };
-    match record.network {
-        Network::Bridge => bridge::sync_ports(&store, &sd).await?,
-        Network::Veth if hostnet::firewalld_running(&sd).await => {
-            hostnet::admit(&sd, name).await?;
-        }
-        _ => {}
-    }
-    // Volumes of an mstack machine: attached from the host, the settings cannot carry them.
     if record.backend == BackendChoice::Mstack && !record.volumes.is_empty() {
         let leader = sd.machine_leader(name).await?;
         for volume in &record.volumes {
@@ -105,14 +99,21 @@ pub async fn publish(config: &Config, name: &str) -> Result<()> {
             volmount::mount_into_machine(leader, &source, &volume.target, volume.read_only)?;
         }
     }
+    let _lock = store.lock_for(std::time::Duration::from_secs(60))?;
+    match record.network {
+        Network::Bridge => bridge::sync_ports(&store, &sd).await?,
+        Network::Veth if hostnet::firewalld_running(&sd).await => {
+            hostnet::admit(&sd, name).await?;
+        }
+        _ => {}
+    }
     Ok(())
 }
 
 /// ExecStopPost: runs however the machine ended (stop, exit, crash, machinectl). No lock:
 /// it runs inside the stop job that `images rm` and friends wait for while holding it.
 pub async fn release(config: &Config, name: &str) -> Result<()> {
-    let sd = Systemd::connect().await?;
     let store = Store::new(&config.machines_dir, &config.state_dir);
     let record = store.load_image(name)?;
-    machines::release_machine(&sd, &store, name, record.as_ref()).await
+    machines::release_machine(name, record.as_ref())
 }

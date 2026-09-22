@@ -116,6 +116,7 @@ pub async fn run(args: BuildArgs, config: &Config) -> Result<()> {
         let mode = install(
             &store,
             &sd,
+            config,
             backend,
             Install {
                 name: &name,

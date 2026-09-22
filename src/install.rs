@@ -9,6 +9,7 @@ use oci_client::manifest::OciImageManifest;
 
 use crate::backend::{Assembler, Backend, Layer};
 use crate::cli::BackendChoice;
+use crate::config::Config;
 use crate::oci::{detect_mode, has_init, Mode, RunSpec};
 use crate::settings::{self, MachineSettings, Network};
 use crate::store::{now_unix, ImageRecord, Store};
@@ -29,6 +30,7 @@ pub struct Install<'a> {
 pub async fn install(
     store: &Store,
     sd: &Systemd,
+    config: &Config,
     backend: Backend,
     spec: Install<'_>,
 ) -> Result<Mode> {
@@ -43,9 +45,9 @@ pub async fn install(
         })
         .collect();
     let config_path = store.blob_path(&spec.manifest.config.digest);
-    let config =
+    let config_blob =
         fs::read(&config_path).with_context(|| format!("reading {}", config_path.display()))?;
-    let run = RunSpec::from_config(&config)?;
+    let run = RunSpec::from_config(&config_blob)?;
     // An mstack image runs with managed user namespaces, which cannot join the network
     // namespace prepared for app machines on the bridge; apps get overlay instead. Whether
     // the image is an app is known before extraction when its command says so.
@@ -87,6 +89,11 @@ pub async fn install(
         network,
         bridge: None,
     })?;
+    // The unit hooks exist from now on, so that machinectl start or an enabled unit gets
+    // the same preparation as nspawn start.
+    if settings::write_hooks(spec.name, config)? {
+        sd.reload().await?;
+    }
     store.save_manifest(spec.name, spec.manifest_bytes)?;
     store.record_image(&ImageRecord {
         name: spec.name.to_string(),

@@ -94,7 +94,8 @@ itself, so it behaves the same whether the host runs systemd-networkd, NetworkMa
 nothing at all. On the first `start` nspawn creates the bridge with the first address of
 the subnet (`10.99.0.0/24` by default; `bridge`, `subnet` and `dns` can be set in
 `nspawn.toml`), enables forwarding and installs the nftables table `ip nspawn` with
-masquerading. Each machine gets a fixed address from the subnet, remembered with the
+masquerading. An existing interface with that name is only taken over when it is a bridge
+nspawn made (or an empty one); `bridge = "docker0"` is refused rather than acted on. Each machine gets a fixed address from the subnet, remembered with the
 image and handed to the systemd-networkd inside it through a `.network` file mounted at
 `/run/systemd/network/10-host0.network`; the DNS servers are the host's upstream ones.
 A generated `/etc/hosts` gives every machine the names of the other machines on the

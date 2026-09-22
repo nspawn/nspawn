@@ -17,6 +17,9 @@ use nix::sched::{setns, CloneFlags};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{fork, ForkResult};
 
+/// Follow a symlink as the target (merged-usr images have /lib -> usr/lib and the like).
+const MOVE_MOUNT_T_SYMLINKS: libc::c_uint = 0x10;
+
 /// Mounts `source` at `target` inside the running machine whose leader is `leader`, with
 /// the machine's root owning it.
 pub fn mount_into_machine(leader: u32, source: &Path, target: &str, read_only: bool) -> Result<()> {
@@ -51,7 +54,7 @@ pub fn mount_into_machine(leader: u32, source: &Path, target: &str, read_only: b
         propagation: 0,
         userns_fd: userns.as_raw_fd() as u64,
     };
-    let r = unsafe {
+    let mut r = unsafe {
         libc::syscall(
             libc::SYS_mount_setattr,
             tree.as_raw_fd(),
@@ -61,13 +64,29 @@ pub fn mount_into_machine(leader: u32, source: &Path, target: &str, read_only: b
             std::mem::size_of::<libc::mount_attr>(),
         )
     };
-    if r < 0 {
-        return Err(io::Error::last_os_error()).with_context(|| {
-            format!(
-                "idmapping {} to the machine (the filesystem may not support idmapped mounts)",
-                source.display()
+    if r < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        // A filesystem (or a submount) without idmapped mounts: docker mounts it plainly,
+        // so does nspawn, with a note, since root inside then appears as nobody there.
+        eprintln!(
+            "note: {} cannot be idmapped (unsupported filesystem); attached with the host's ownership",
+            source.display()
+        );
+        attr.attr_set &= !libc::MOUNT_ATTR_IDMAP;
+        attr.userns_fd = 0;
+        r = unsafe {
+            libc::syscall(
+                libc::SYS_mount_setattr,
+                tree.as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH | libc::AT_RECURSIVE,
+                &mut attr as *mut libc::mount_attr,
+                std::mem::size_of::<libc::mount_attr>(),
             )
-        });
+        };
+    }
+    if r < 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("preparing {} for the machine", source.display()));
     }
     let mntns = File::open(format!("/proc/{leader}/ns/mnt"))
         .with_context(|| format!("opening the mount namespace of PID {leader}"))?;
@@ -141,7 +160,7 @@ fn attach(mntns: &File, tree: &OwnedFd, target: &CStr) -> i32 {
             c"".as_ptr(),
             libc::AT_FDCWD,
             target.as_ptr(),
-            libc::MOVE_MOUNT_F_EMPTY_PATH,
+            libc::MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_SYMLINKS,
         )
     };
     if r < 0 {

@@ -221,6 +221,12 @@ $NSPAWN pull docker.io/library/busybox:latest --name $app --backend overlay --fo
 cat /tmp/e2e-app.txt
 grep -q "(app image)" /tmp/e2e-app.txt || fail "busybox not detected as an app image"
 grep -q "Boot=no" /etc/systemd/nspawn/$app.nspawn || fail "settings file does not disable --boot"
+step "machinectl start right after pull: the unit hooks prepare everything"
+[ -e /etc/systemd/system/systemd-nspawn@$app.service.d/nspawn-hooks.conf ] || fail "no hooks drop-in after pull"
+machinectl start $app || fail "machinectl start of a freshly pulled app"
+retry 10 bash -c "$NSPAWN exec $app -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep -q 10.99.0" || fail "no bridge address after machinectl start of a fresh app"
+grep -q "PrivateUsers=no" /etc/systemd/nspawn/$app.nspawn || fail "the prepare hook did not regenerate the settings"
+$NSPAWN stop $app || fail "stop after machinectl start of a fresh app"
 grep -q "ProcessTwo=yes" /etc/systemd/nspawn/$app.nspawn || fail "settings file does not use a stub init"
 $NSPAWN start $app -p 18081:80 -- /bin/sh -c "echo hello-from-app-$nonce; echo to-stderr-$nonce >&2; mkdir -p /www; echo app-web > /www/index.html; exec /bin/httpd -f -p 80 -h /www" || fail "start busybox with a command override and a published port"
 grep -q "Parameters=/bin/sh -c" /etc/systemd/nspawn/$app.nspawn || fail "command override not written"

@@ -70,6 +70,7 @@ pub async fn run(args: PullArgs, config: &Config) -> Result<()> {
     let mode = install(
         &store,
         &sd,
+        config,
         backend,
         Install {
             name: &name,
