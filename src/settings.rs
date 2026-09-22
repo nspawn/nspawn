@@ -37,8 +37,8 @@ pub struct MachineSettings<'a> {
     pub extra_env: &'a [String],
     /// Volumes, resolved to host paths.
     pub binds: &'a [Bind],
-    /// Directory with the units that make a managed-userns machine wait for its volumes
-    /// (see `volume_wait_units`), when it has any.
+    /// Directory with the units that make a booted machine wait for its volumes (see
+    /// `volume_wait_units`), when it has any.
     pub volume_units: Option<&'a Path>,
     pub network: Network,
     /// Bridge networking: the bridge to join and the directory with the machine's
@@ -135,10 +135,12 @@ pub fn render(s: &MachineSettings) -> String {
         Network::Veth => {}
     }
     // Under managed user namespaces nspawn cannot idmap binds; those volumes are attached
-    // from the host once the machine runs (see volmount), and a unit inside holds
-    // local-fs.target until they are there, so that services find them.
+    // from the host once the machine runs (see volmount). Every booted machine with
+    // volumes gets the unit that holds local-fs.target until they are all there: the same
+    // guarantee whatever the backend, and on overlay and flat the binds below make them
+    // present before the init even runs.
     let rendered_binds: &[Bind] = if s.managed_userns { &[] } else { s.binds };
-    if s.managed_userns && !s.binds.is_empty() {
+    if s.mode == Mode::Boot && !s.binds.is_empty() {
         if let Some(units) = s.volume_units {
             let units = units.display();
             files.push(format!(
@@ -174,8 +176,8 @@ pub fn render(s: &MachineSettings) -> String {
     out
 }
 
-/// The units mounted into a managed-userns machine so that its boot waits for the volumes
-/// nspawn attaches from the host: (service, drop-in for local-fs.target).
+/// The units mounted into a booted machine so that its boot waits for its volumes:
+/// (service, drop-in for local-fs.target).
 pub fn volume_wait_units(targets: &[String]) -> (String, String) {
     let list = targets
         .iter()
@@ -348,6 +350,26 @@ mod tests {
         });
         // Managed user namespaces: no Bind= (attached from the host), but the wait units.
         assert!(!mstack_volume.contains("Bind=/srv/pg"));
+        let overlay_volume = render(&MachineSettings {
+            name: "db",
+            managed_userns: false,
+            mode: Mode::Boot,
+            run: &run,
+            command: &run.argv(),
+            extra_env: &[],
+            binds: &[Bind {
+                source: PathBuf::from("/srv/pg"),
+                target: "/var/lib/pgsql".into(),
+                read_only: false,
+            }],
+            volume_units: Some(Path::new("/var/lib/nspawn/machines/db/units")),
+            network: Network::Host,
+            bridge: None,
+        });
+        // Other backends: the bind itself plus the same wait units.
+        assert!(overlay_volume.contains("Bind=/srv/pg:/var/lib/pgsql:idmap\n"));
+        assert!(overlay_volume
+            .contains("nspawn-volumes.service:/run/systemd/system/nspawn-volumes.service\n"));
         assert!(mstack_volume.contains("BindReadOnly=/var/lib/nspawn/machines/db/units/nspawn-volumes.service:/run/systemd/system/nspawn-volumes.service\n"));
         assert!(mstack_volume.contains("local-fs.target.d/nspawn-volumes.conf\n"));
         let (service, dropin) =

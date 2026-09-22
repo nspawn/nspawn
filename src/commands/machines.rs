@@ -191,10 +191,10 @@ pub async fn prepare(
             read_only: volume.read_only,
         });
     }
-    // A managed-userns machine gets its volumes from the host after its init started; the
-    // units mounted here make its boot wait for them.
+    // Every booted machine with volumes waits for them before local-fs.target through the
+    // units mounted here (mstack machines get them from the host after their init started).
     let managed_userns = record.backend == BackendChoice::Mstack;
-    let volume_units = if managed_userns && !binds.is_empty() {
+    let volume_units = if record.mode == Mode::Boot && !binds.is_empty() {
         let dir = store.machine_files_dir(name).join("units");
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let targets: Vec<String> = binds.iter().map(|b| b.target.clone()).collect();

@@ -45,11 +45,13 @@ adds environment on top of the image's (`-e VAR` copies it from your shell), and
 `-v SOURCE:TARGET[:ro]` mounts a host directory, or a named volume that nspawn keeps
 under `/var/lib/nspawn/volumes/NAME`, into any kind of machine; in machines that run
 with private users the mount is idmapped, so root inside owns what it writes on the
-host. mstack machines get their volumes attached from the host right after they start,
-since systemd-nspawn cannot idmap binds under managed user namespaces; a small unit
-mounted into the machine (`nspawn-volumes.service`, before `local-fs.target`) holds the
-boot until they are there, so services find their configuration and data in place.
-`-e none` and `-v none` forget them.
+host. Every booted machine with volumes gets a small unit mounted into it,
+`nspawn-volumes.service`, that holds `local-fs.target` until all of them are mounted and
+fails visibly otherwise, so services find their configuration and data in place whatever
+the backend. On overlay and flat the volumes are there from the first instruction (they
+come from the settings file); mstack machines get them attached from the host right after
+their init starts, since systemd-nspawn cannot idmap binds under managed user namespaces,
+which is what the unit waits for. `-e none` and `-v none` forget them.
 
 `exec` enters the machine's namespaces for both kinds of machine, like docker exec: the
 exit code comes back, the image's environment applies and nothing is needed inside (no
