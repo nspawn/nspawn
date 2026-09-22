@@ -265,6 +265,11 @@ fn remove_dir_if_exists(path: &Path) -> Result<()> {
 }
 
 /// Text of the mount unit. overlayfs lists the topmost layer first in lowerdir=.
+///
+/// `metacopy=on` matters with user namespaces: no released kernel lets an overlayfs
+/// mount be idmapped, so nspawn shifts the tree's ownership with a recursive chown
+/// instead, and without metacopy every chown copies the whole file into the upper
+/// directory. With it only the inode is copied and the layers stay shared.
 pub fn overlay_unit_text(
     name: &str,
     mountpoint: &str,
@@ -286,7 +291,7 @@ pub fn overlay_unit_text(
          What=overlay\n\
          Where={mountpoint}\n\
          Type=overlay\n\
-         Options=lowerdir={},upperdir={},workdir={}\n",
+         Options=lowerdir={},upperdir={},workdir={},metacopy=on\n",
         lower.join(":"),
         upper.display(),
         work.display()
@@ -346,7 +351,9 @@ mod tests {
             Path::new("/w"),
         );
         assert!(text.contains("Where=/var/lib/machines/m\n"));
-        assert!(text.contains("Options=lowerdir=/l/top:/l/base,upperdir=/u,workdir=/w\n"));
+        assert!(
+            text.contains("Options=lowerdir=/l/top:/l/base,upperdir=/u,workdir=/w,metacopy=on\n")
+        );
         assert!(text.contains("Type=overlay\n"));
     }
 

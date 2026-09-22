@@ -74,6 +74,14 @@ directory, user and stop signal. Apps on the bridge run with
 prepared on the host; app images are assembled with overlay even where mstack
 exists.
 
+Overlay machines run under a user namespace like the others, and no released
+kernel lets an overlayfs mount be idmapped, so nspawn shifts the tree with a
+recursive chown at the first start. The mount carries `metacopy=on` so that
+this chown copies inodes rather than file contents into the upper directory
+and the layers stay shared. Attributes in overlayfs's own namespace
+(`trusted.overlay.*`, `user.overlay.*`) are dropped from every layer on
+extraction, so an image cannot redirect a file or its data.
+
 ## Networking
 
 The bridge (`nspawn0`, `10.99.0.0/24`) is created with `ip`; the nftables

@@ -638,7 +638,9 @@ pub fn extract_layer(
     }
     let mut archive = tar::Archive::new(reader);
     archive.set_preserve_permissions(true);
-    archive.set_unpack_xattrs(true);
+    // Extended attributes are applied by hand so that the ones overlayfs interprets never
+    // come from an image; see `entry_xattrs`.
+    archive.set_unpack_xattrs(false);
     archive.set_preserve_ownerships(root);
     archive.set_overwrite(true);
     let mut count = 0u64;
@@ -659,7 +661,11 @@ pub fn extract_layer(
         let gid = header.gid().unwrap_or(0) as u32;
         let file_mode = header.mode().unwrap_or(0o644) & 0o7777;
         let kind = header.entry_type();
-        let capabilities = file_capabilities(&mut entry)?;
+        let xattrs = entry_xattrs(&mut entry)?;
+        let capabilities = xattrs
+            .iter()
+            .find(|(name, _)| name == "security.capability")
+            .map(|(_, value)| value.clone());
         if mode == WhiteoutMode::Apply {
             // A later layer may turn a file into a directory or the other way round; tar
             // only knows how to overwrite like with like.
@@ -686,8 +692,9 @@ pub fn extract_layer(
         {
             continue;
         }
+        let unpacked = target.join(&path);
+        apply_xattrs(&unpacked, &xattrs)?;
         if ownership == Ownership::Foreign {
-            let unpacked = target.join(&path);
             std::os::unix::fs::lchown(&unpacked, Some(foreign_id(uid)), Some(foreign_id(gid)))
                 .with_context(|| format!("shifting ownership of {}", unpacked.display()))?;
             // chown clears setuid/setgid bits and file capabilities, for root too.
@@ -711,17 +718,52 @@ pub fn extract_layer(
     Ok(count)
 }
 
-/// The file capabilities an entry carries in its PAX extended header, if any.
-fn file_capabilities<R: Read>(entry: &mut tar::Entry<'_, R>) -> Result<Option<Vec<u8>>> {
+/// overlayfs reads its own attributes from the layers: a redirect or a metacopy marker
+/// planted by an image would make a file show up under another path or with another
+/// file's data once the layers are stacked. Whiteouts are translated by `handle_whiteout`
+/// instead, so nothing an image says in that namespace is applied.
+fn overlay_xattr(name: &str) -> bool {
+    name.starts_with("trusted.overlay.") || name.starts_with("user.overlay.")
+}
+
+/// The extended attributes an entry carries in its PAX header, overlayfs's left out.
+fn entry_xattrs<R: Read>(entry: &mut tar::Entry<'_, R>) -> Result<Vec<(String, Vec<u8>)>> {
     let Some(extensions) = entry.pax_extensions()? else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
+    let mut xattrs = Vec::new();
     for extension in extensions.flatten() {
-        if extension.key_bytes() == b"SCHILY.xattr.security.capability" {
-            return Ok(Some(extension.value_bytes().to_vec()));
+        let Some(name) = extension.key_bytes().strip_prefix(b"SCHILY.xattr.") else {
+            continue;
+        };
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        if overlay_xattr(name) {
+            continue;
+        }
+        xattrs.push((name.to_string(), extension.value_bytes().to_vec()));
+    }
+    Ok(xattrs)
+}
+
+/// Sets the attributes on an unpacked entry. As with docker, a file system that does not
+/// take one (ENOTSUP, or EPERM for user.* on a symlink) is not an error.
+fn apply_xattrs(path: &Path, xattrs: &[(String, Vec<u8>)]) -> Result<()> {
+    for (name, value) in xattrs {
+        match xattr::set(path, name, value) {
+            Ok(()) => {}
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(nix::libc::ENOTSUP) | Some(nix::libc::EPERM)
+                ) => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("setting {name} on {}", path.display()))
+            }
         }
     }
-    Ok(None)
+    Ok(())
 }
 
 /// Moves whatever is still owned below the foreign range into it.
@@ -890,6 +932,59 @@ mod tests {
             }
         }
         builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn overlay_attributes_of_an_image_are_not_applied() {
+        assert!(overlay_xattr("trusted.overlay.redirect"));
+        assert!(overlay_xattr("trusted.overlay.metacopy"));
+        assert!(overlay_xattr("user.overlay.opaque"));
+        assert!(!overlay_xattr("security.capability"));
+        assert!(!overlay_xattr("user.overlayish"));
+        let tmp = tempfile::tempdir().unwrap();
+        // user.* attributes need a file system that stores them.
+        let probe = tmp.path().join("probe");
+        fs::write(&probe, "").unwrap();
+        if xattr::set(&probe, "user.probe", b"1").is_err() {
+            return;
+        }
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_pax_extensions([
+                (
+                    "SCHILY.xattr.user.overlay.redirect",
+                    b"/etc/shadow".as_slice(),
+                ),
+                ("SCHILY.xattr.user.keep", b"yes".as_slice()),
+            ])
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(2);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "file", Cursor::new(b"hi".as_slice()))
+            .unwrap();
+        let blob = tmp.path().join("layer.tar");
+        fs::write(&blob, builder.into_inner().unwrap()).unwrap();
+        let target = tmp.path().join("root");
+        fs::create_dir(&target).unwrap();
+        extract_layer(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar",
+            &target,
+            WhiteoutMode::Apply,
+            Ownership::Root,
+        )
+        .unwrap();
+        let file = target.join("file");
+        assert_eq!(fs::read(&file).unwrap(), b"hi");
+        assert_eq!(
+            xattr::get(&file, "user.keep").unwrap(),
+            Some(b"yes".to_vec())
+        );
+        assert_eq!(xattr::get(&file, "user.overlay.redirect").unwrap(), None);
     }
 
     #[test]

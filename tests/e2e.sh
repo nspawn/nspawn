@@ -71,6 +71,11 @@ for backend in overlay flat; do
   $NSPAWN start "$name" $vol_args || fail "start ($backend)"
   if [ "$backend" = overlay ]; then
     findmnt -n -o FSTYPE "/var/lib/machines/$name" | grep -q overlay || fail "root of $name is not an overlay"
+    # nspawn shifts the tree with a recursive chown (overlayfs cannot be idmapped); with
+    # metacopy that copies inodes, without it the whole image.
+    upper_mb=$(du -sm "/var/lib/nspawn/machines/$name/upper" | cut -f1)
+    echo "upper directory of $name after the first start: ${upper_mb} MB"
+    [ "$upper_mb" -lt 128 ] || fail "the first start copied the image into the upper directory of $name (${upper_mb} MB)"
   fi
   step "machines ls"
   $NSPAWN machines ls | tee /tmp/e2e-m.txt
