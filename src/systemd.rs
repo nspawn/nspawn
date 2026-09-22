@@ -88,6 +88,38 @@ impl Systemd {
             .context("reading the systemd version")
     }
 
+    /// Major version of the running systemd, when it can be read.
+    pub async fn major(&self) -> Option<u32> {
+        self.version()
+            .await
+            .ok()
+            .and_then(|v| crate::backend::systemd_major(&v))
+    }
+
+    /// argv of the first ExecStart= of a unit as systemd has it loaded: specifiers
+    /// expanded, drop-ins applied.
+    pub async fn exec_start(&self, unit: &str) -> Result<Vec<String>> {
+        let path = self
+            .manager
+            .load_unit(unit.to_string())
+            .await
+            .with_context(|| format!("loading {unit}"))?;
+        let service = systemd1::ServiceProxy::builder(&self.conn)
+            .path(path)?
+            .build()
+            .await
+            .with_context(|| format!("connecting to {unit}"))?;
+        let execs = service
+            .exec_start()
+            .await
+            .with_context(|| format!("reading ExecStart= of {unit}"))?;
+        execs
+            .into_iter()
+            .next()
+            .map(|exec| exec.1)
+            .with_context(|| format!("{unit} has no ExecStart="))
+    }
+
     pub async fn list_images(&self) -> Result<Vec<ImageInfo>> {
         let raw = self
             .machined

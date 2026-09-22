@@ -207,22 +207,26 @@ pub async fn prepare(
     };
     // The settings file is regenerated every time: it carries the command and comes back
     // if it went missing.
-    settings::write(&MachineSettings {
-        name,
-        managed_userns,
-        mode: record.mode,
-        run: &record.run,
-        command: &record.effective_command(),
-        extra_env: &record.env,
-        binds: &binds,
-        volume_units: volume_units.as_deref(),
-        network: record.network,
-        bridge: files.as_deref().map(|files| BridgeMount {
-            bridge: &config.bridge,
-            files,
-        }),
-    })?;
-    if settings::write_hooks(name, config)? {
+    let route = settings::namespace_route(sd, name, record.mode, record.network).await?;
+    settings::write(
+        &MachineSettings {
+            name,
+            managed_userns,
+            mode: record.mode,
+            run: &record.run,
+            command: &record.effective_command(),
+            extra_env: &record.env,
+            binds: &binds,
+            volume_units: volume_units.as_deref(),
+            network: record.network,
+            bridge: files.as_deref().map(|files| BridgeMount {
+                bridge: &config.bridge,
+                files,
+            }),
+        },
+        &route,
+    )?;
+    if settings::write_hooks(name, config, &route)? {
         sd.reload().await?;
     }
     if record.backend == BackendChoice::Mstack {

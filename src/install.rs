@@ -77,21 +77,25 @@ pub async fn install(
     }
     // Both kinds join the bridge, like docker; --network host is one flag away.
     let network = Network::Bridge;
-    settings::write(&MachineSettings {
-        name: spec.name,
-        managed_userns: backend == Backend::Mstack,
-        mode,
-        run: &run,
-        command: &run.argv(),
-        extra_env: &[],
-        binds: &[],
-        volume_units: None,
-        network,
-        bridge: None,
-    })?;
+    let route = settings::namespace_route(sd, spec.name, mode, network).await?;
+    settings::write(
+        &MachineSettings {
+            name: spec.name,
+            managed_userns: backend == Backend::Mstack,
+            mode,
+            run: &run,
+            command: &run.argv(),
+            extra_env: &[],
+            binds: &[],
+            volume_units: None,
+            network,
+            bridge: None,
+        },
+        &route,
+    )?;
     // The unit hooks exist from now on, so that machinectl start or an enabled unit gets
     // the same preparation as nspawn start.
-    if settings::write_hooks(spec.name, config)? {
+    if settings::write_hooks(spec.name, config, &route)? {
         sd.reload().await?;
     }
     store.save_manifest(spec.name, spec.manifest_bytes)?;

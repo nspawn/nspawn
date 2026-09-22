@@ -72,7 +72,10 @@ stub init (`ProcessTwo=yes`), with the OCI config's environment, working
 directory, user and stop signal. Apps on the bridge run with
 `PrivateUsers=no`, since a user namespace cannot join the network namespace
 prepared on the host; app images are assembled with overlay even where mstack
-exists.
+exists. The namespace is named with `NamespacePath=` in the settings file on
+systemd 259 or newer; before that the key does not exist, and the hooks
+drop-in rewrites the unit's `ExecStart=` with `--network-namespace-path=`
+instead (the argv systemd has loaded, minus the options that conflict).
 
 Overlay machines run under a user namespace like the others, and no released
 kernel lets an overlayfs mount be idmapped, so nspawn shifts the tree with a
