@@ -5,17 +5,19 @@
 //! only land in a PID namespace after a fork, so the work happens in a forked helper: the
 //! helper joins the namespaces, forks once more, and the grandchild execs the command.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use nix::libc;
 use nix::sched::{setns, CloneFlags};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{
-    chdir, dup2_stderr, dup2_stdin, dup2_stdout, execvpe, fork, setgid, setgroups, setsid, setuid,
+    chdir, dup2_stderr, dup2_stdin, dup2_stdout, execve, fork, setgid, setgroups, setsid, setuid,
     ForkResult, Gid, Uid,
 };
 
@@ -210,13 +212,46 @@ fn grandchild(
             env.push(CString::new(format!("HOME={home}")).expect("no NUL"));
         }
     }
-    match execvpe(&argv[0], argv, &env) {
+    // execvpe() would search the PATH of the caller's environment, i.e. the host's, which
+    // sudo's secure_path may have trimmed; the command must be found on the machine's.
+    let program = match find_program(&argv[0], &env) {
+        Some(program) => program,
+        None => {
+            eprintln!(
+                "error: cannot execute {}: not found on the machine's PATH",
+                argv[0].to_string_lossy()
+            );
+            return 127;
+        }
+    };
+    match execve(&program, argv, &env) {
         Ok(_) => 0,
         Err(e) => {
-            eprintln!("error: cannot execute {}: {e}", argv[0].to_string_lossy());
-            127
+            eprintln!("error: cannot execute {}: {e}", program.to_string_lossy());
+            126
         }
     }
+}
+
+/// Resolves a program the way a shell would, on the PATH carried by `env` (the machine's).
+fn find_program(name: &CStr, env: &[CString]) -> Option<CString> {
+    let name_str = name.to_str().ok()?;
+    if name_str.contains('/') {
+        return Some(name.to_owned());
+    }
+    let path = env
+        .iter()
+        .find_map(|v| v.to_str().ok()?.strip_prefix("PATH=").map(str::to_owned))
+        .unwrap_or_else(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
+        let candidate = Path::new(dir).join(name_str);
+        if nix::unistd::access(&candidate, nix::unistd::AccessFlags::X_OK).is_ok()
+            && candidate.is_file()
+        {
+            return CString::new(candidate.as_os_str().as_bytes()).ok();
+        }
+    }
+    None
 }
 
 /// Looks a user up in the machine's /etc/passwd (we are inside its mount namespace):
@@ -279,6 +314,22 @@ mod tests {
             Some((Uid::from_raw(65534), Gid::from_raw(65534), "/".to_string()))
         );
         assert_eq!(resolve_user("1000:x"), None);
+    }
+
+    #[test]
+    fn programs_are_found_on_the_given_path() {
+        let env = vec![CString::new("PATH=/nonexistent:/usr/bin:/bin").unwrap()];
+        let found = find_program(&CString::new("sh").unwrap(), &env).unwrap();
+        assert!(found.to_str().unwrap().ends_with("/sh"));
+        assert!(find_program(&CString::new("no-such-program-xyz").unwrap(), &env).is_none());
+        assert_eq!(
+            find_program(&CString::new("/bin/sh").unwrap(), &env).unwrap(),
+            CString::new("/bin/sh").unwrap()
+        );
+        assert!(
+            find_program(&CString::new("sh").unwrap(), &[]).is_some(),
+            "default PATH"
+        );
     }
 
     #[test]

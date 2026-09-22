@@ -645,8 +645,11 @@ async fn exec_in_namespaces(
     let leader = sd.machine_leader(machine).await?;
     let user = if user == "root" { None } else { Some(user) };
     let working_dir = record.and_then(|r| r.run.working_dir.as_deref());
-    let env: &[String] = record.map(|r| r.run.env.as_slice()).unwrap_or(&[]);
-    tokio::task::block_in_place(|| nsenter::exec(leader, command, user, working_dir, env))
+    // The image's environment plus what -e added, like the program itself sees.
+    let env: Vec<String> = record
+        .map(|r| r.run.env.iter().chain(&r.env).cloned().collect())
+        .unwrap_or_default();
+    tokio::task::block_in_place(|| nsenter::exec(leader, command, user, working_dir, &env))
         .with_context(|| format!("running a command inside {machine}"))
 }
 
