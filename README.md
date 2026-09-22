@@ -46,9 +46,10 @@ adds environment on top of the image's (`-e VAR` copies it from your shell), and
 under `/var/lib/nspawn/volumes/NAME`, into any kind of machine; in machines that run
 with private users the mount is idmapped, so root inside owns what it writes on the
 host. mstack machines get their volumes attached from the host right after they start,
-since systemd-nspawn cannot idmap binds under managed user namespaces; a service inside
-that needs the volume in its first second should wait for it. `-e none` and `-v none`
-forget them.
+since systemd-nspawn cannot idmap binds under managed user namespaces; a small unit
+mounted into the machine (`nspawn-volumes.service`, before `local-fs.target`) holds the
+boot until they are there, so services find their configuration and data in place.
+`-e none` and `-v none` forget them.
 
 `exec` enters the machine's namespaces for both kinds of machine, like docker exec: the
 exit code comes back, the image's environment applies and nothing is needed inside (no

@@ -191,16 +191,31 @@ pub async fn prepare(
             read_only: volume.read_only,
         });
     }
+    // A managed-userns machine gets its volumes from the host after its init started; the
+    // units mounted here make its boot wait for them.
+    let managed_userns = record.backend == BackendChoice::Mstack;
+    let volume_units = if managed_userns && !binds.is_empty() {
+        let dir = store.machine_files_dir(name).join("units");
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let targets: Vec<String> = binds.iter().map(|b| b.target.clone()).collect();
+        let (service, dropin) = settings::volume_wait_units(&targets);
+        std::fs::write(dir.join("nspawn-volumes.service"), service)?;
+        std::fs::write(dir.join("nspawn-volumes.conf"), dropin)?;
+        Some(dir)
+    } else {
+        None
+    };
     // The settings file is regenerated every time: it carries the command and comes back
     // if it went missing.
     settings::write(&MachineSettings {
         name,
-        managed_userns: record.backend == BackendChoice::Mstack,
+        managed_userns,
         mode: record.mode,
         run: &record.run,
         command: &record.effective_command(),
         extra_env: &record.env,
         binds: &binds,
+        volume_units: volume_units.as_deref(),
         network: record.network,
         bridge: files.as_deref().map(|files| BridgeMount {
             bridge: &config.bridge,
