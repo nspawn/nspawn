@@ -136,8 +136,9 @@ and binds `ve-<name>` to firewalld's trusted zone while the machine runs.
 
 ## Requirements
 
-- A host with systemd-nspawn and systemd-machined (any recent version; 259 and 261 are
-  tested), overlayfs for the `overlay` backend and cgroup v2.
+- A host with systemd-nspawn and systemd-machined 255 or newer (255, 259 and 261 are
+  tested; 252 cannot mount the generated files under `/run` of a machine), overlayfs for
+  the `overlay` backend and cgroup v2.
 - Commands that change the host need root: `pull`, `create`, `build`, `images rm`, `start`,
   `stop`, `login` and `logout` write below `/var/lib/machines`, `/var/lib/nspawn`,
   `/etc/systemd` and `/etc/nspawn`. Listing, `search`, `logs` and `hub` do not.

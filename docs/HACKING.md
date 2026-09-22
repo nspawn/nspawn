@@ -27,9 +27,11 @@ builds with mkosi, pushes, creates, publishes ports, mounts volumes, runs apps
 from Docker Hub and logs in. It changes host state (bridge, nftables,
 firewall zones, units), so it runs as root on a disposable VM only.
 
-Requirements on the VM: systemd-nspawn and machined, overlayfs, `ip`, `nft`,
-`curl`, `python3`, access to Docker Hub, a registry with the test image
-(`fedora:44` by default), and mkosi for the build step. Install the binary
+Requirements on the VM: systemd-nspawn and machined 255 or newer (Ubuntu 24.04
+is the oldest host the suite runs on; Debian 12 with systemd 252 does not
+work), overlayfs, `ip`, `nft`, `curl`, `python3`, access to Docker Hub, a
+registry with the test image (`fedora:44` by default), and mkosi for the build
+step. Install the binary
 where a system service may execute it, since the unit hooks run it:
 
 ```
