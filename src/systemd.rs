@@ -308,8 +308,10 @@ impl Systemd {
             .map(|(_, class, service, _)| format!("{service} ({class})")))
     }
 
+    /// Whether machined runs a machine of that name. Virtual machines count: their
+    /// names are taken, and their images are in use.
     pub async fn machine_exists(&self, name: &str) -> Result<bool> {
-        Ok(self.list_machines().await?.iter().any(|m| m.name == name))
+        Ok(self.all_machines().await?.iter().any(|m| m.0 == name))
     }
 
     pub async fn machine_os(&self, name: &str) -> Option<String> {
