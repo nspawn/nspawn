@@ -19,6 +19,7 @@ nspawn start web -p 8080:80 -e KEY=v -v /srv/data:/data -v pgdata:/var/lib/pg   
 nspawn start web --label caddy=web.example   # labels for whoever reads them (inspect, ps --json)
 nspawn start web --restart unless-stopped -m 512m --cpus 1   # restart policy and limits, like docker
 nspawn ps                           # running machines: image, mode, command, uptime (-a adds stopped ones)
+                                    # (containers only: the virtual machines machined also lists are left out)
 nspawn inspect web                  # everything nspawn knows about a machine, as JSON
 nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
 nspawn shell fedora-44
@@ -170,7 +171,9 @@ image and handed to the systemd-networkd inside it through a `.network` file mou
 `/run/systemd/network/10-host0.network`; the DNS servers are the host's upstream ones.
 A generated `/etc/hosts` gives every machine the names of the other machines on the
 bridge and `host.nspawn.internal` for the host, and hosts with systemd 258 or newer
-resolve machine names themselves through machined. `nspawn network ls` shows the
+resolve machine names themselves through machined. The bridge carries IPv4 only, so
+neither the machines' `host0` nor the bridge get an IPv6 link-local address: a machine's
+name leads to its bridge address, not to a `fe80::` one. `nspawn network ls` shows the
 addresses and ports; `nspawn network up` creates the bridge without starting anything.
 
 App images have nothing inside to configure `host0`, so for them nspawn builds the

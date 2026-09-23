@@ -11,6 +11,25 @@ networkd_was=$(systemctl is-active systemd-networkd)
 fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
 step() { echo; echo "### $*"; }
 retry() { local n=$1; shift; local i; for i in $(seq 1 "$n"); do "$@" && return 0; sleep 2; done; return 1; }
+# The bridge is IPv4 only: a machine has no IPv6 link-local address for machined to hand
+# out with its name, and where the host resolves machine names (nss-mymachines or
+# resolved) the name leads to the bridge address, which answers a ping.
+ipv4_only() {
+  local name=$1 addr=$2 first
+  $NSPAWN exec "$name" -- cat /proc/net/if_inet6 </dev/null 2>/dev/null | tr -d '\r' | grep_q " host0\$" && fail "host0 of $name has an IPv6 address"
+  if command -v busctl >/dev/null 2>&1; then
+    busctl --system --json=short call org.freedesktop.machine1 /org/freedesktop/machine1 org.freedesktop.machine1.Manager GetMachineAddresses s "$name" \
+      | python3 -c "import json,sys; d = json.load(sys.stdin)['data'][0]; assert d and all(f == 2 for f, _ in d), d" || fail "machined hands out addresses of $name other than IPv4"
+  fi
+  if getent hosts "$name" >/dev/null 2>&1; then
+    first=$(getent ahosts "$name" | awk 'NR == 1 {print $1}')
+    [ "$first" = "$addr" ] || fail "$name resolves to $first first, not to its bridge address $addr"
+    getent ahosts "$name" | grep_q "^fe80" && fail "$name resolves to a link-local IPv6 address"
+    ping -c 1 -W 3 "$name" >/dev/null || fail "ping $name"
+  else
+    echo "this host does not resolve machine names: name and ping checks skipped"
+  fi
+}
 # grep -q in a pipeline stops reading at the first match, and the writer then dies of
 # SIGPIPE, which pipefail counts as a failure: read everything instead.
 grep_q() { grep "$@" >/dev/null; }
@@ -236,8 +255,15 @@ for backend in overlay flat mstack; do
   echo "$name has address $addr"
   echo "$addr" | grep_q "^10\.99\.0\." || fail "no bridge address recorded for $name"
   $NSPAWN network ls --json | python3 -c "import json,sys; d = json.load(sys.stdin); assert d['bridge']['bridge'] == 'nspawn0' and any(m['name'] == '$name' and m['address'] == '$addr' and m['running'] for m in d['machines']), d" || fail "network ls --json"
+  ip -6 addr show dev nspawn0 scope link 2>/dev/null | grep_q inet6 && fail "the bridge has an IPv6 link-local address"
+  # ps lists containers only: machined also registers virtual machines (libvirt).
+  for m in $($NSPAWN ps --json | python3 -c "import json,sys; print(' '.join(m['name'] for m in json.load(sys.stdin)))"); do
+    [ "$(machinectl show "$m" -p Class --value 2>/dev/null)" = container ] || fail "ps lists $m, which is not a container"
+  done
   retry 15 bash -c "$NSPAWN exec $name -- /bin/sh -c 'ip -4 -o addr show host0 | grep -q $addr/24 && curl -sf -m 5 -o /dev/null https://download.opensuse.org/ && echo NET-OK' </dev/null | tr -d '\r' | grep_q NET-OK" \
     || { echo "-- inside $name:"; $NSPAWN exec "$name" -- /bin/sh -c 'ip -4 -o addr; ip route; ping -c 1 -W 2 10.99.0.1; curl -sS -m 5 -o /dev/null https://download.opensuse.org/' </dev/null 2>&1 | tr -d '\r'; bridge link show; fail "no network inside $name through the bridge"; }
+  # Once host0 is configured (above), what the host resolves for the machine's name.
+  ipv4_only "$name" "$addr"
   step "stop"
   $NSPAWN stop "$name" || fail "stop ($backend)"
   retry 15 bash -c "! $NSPAWN machines ls | grep_q '^ *$name '" || fail "$name still running after stop"
@@ -426,6 +452,7 @@ fi
 app_addr=$($NSPAWN network ls | awk -v n="$app" '$1 == n {print $2}')
 echo "$app has address $app_addr"
 echo "$app_addr" | grep_q "^10\.99\.0\." || fail "no bridge address for the app"
+ipv4_only "$app" "$app_addr"
 $NSPAWN exec $app -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep_q "$app_addr/24" || fail "host0 not configured inside the app"
 $NSPAWN exec $app -- cat /etc/hosts </dev/null | tr -d '\r' | grep_q "host.nspawn.internal" || fail "generated /etc/hosts missing in the app"
 $NSPAWN exec $app -- nslookup download.opensuse.org </dev/null >/dev/null 2>&1 || fail "DNS does not work inside the app"
