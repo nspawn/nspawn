@@ -17,7 +17,7 @@ jobs:
         # systemd provides pkgconfig(systemd), which %selinux_requires asks for at
         # build time; a workstation has it already, a container does not.
         run: dnf install -y --setopt=install_weak_deps=False git rpm-build rpmdevtools cargo rust systemd systemd-rpm-macros selinux-policy-devel bzip2 tar xz
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Sources
         run: |
           git config --global --add safe.directory "$PWD"
@@ -35,7 +35,7 @@ jobs:
           mkdir -p dist
           cp ~/rpmbuild/RPMS/*/*.rpm dist/
           ls -l dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: fedora-rpms
           path: dist/*.rpm
@@ -54,7 +54,7 @@ jobs:
           # that distribution's rust (1.75) is older than this crate asks for (1.85).
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Sources
         run: |
           git config --global --add safe.directory "$PWD"
@@ -80,7 +80,7 @@ jobs:
           rm -rf dist/nspawn-${version}
           cp ../*.deb dist/
           ls -l dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ubuntu-debs
           path: dist/*
@@ -93,7 +93,7 @@ jobs:
     steps:
       - name: Tools
         run: pacman -Syu --noconfirm --needed base-devel git cargo sudo
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build
         run: |
           git config --global --add safe.directory "$PWD"
@@ -112,7 +112,7 @@ jobs:
           mkdir -p dist
           cp /tmp/pkg/*.pkg.tar.zst dist/
           ls -l dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: arch-package
           path: dist/*.pkg.tar.zst
@@ -125,7 +125,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Publish
