@@ -14,7 +14,14 @@ retry() { local n=$1; shift; local i; for i in $(seq 1 "$n"); do "$@" && return 
 nonce=$$
 # The command line is a client of the org.nspawn service: it goes on the bus first,
 # with a configuration file that names the registry and its CA for the service's own
-# use (the command line passes them on every call anyway).
+# use (the command line passes them on every call anyway). A binary a package installed
+# keeps the package's own service, bus and polkit files, which is what is under test
+# then; only a drop-in hands it the configuration. Anything else is installed with
+# daemon --install and removed at the end.
+packaged=no
+if rpm -qf "$NSPAWN" >/dev/null 2>&1 || dpkg -S "$(readlink -f "$NSPAWN")" >/dev/null 2>&1 || pacman -Qo "$NSPAWN" >/dev/null 2>&1; then
+  packaged=yes
+fi
 install_service() {
   # With SELinux enforcing the service needs its domain (packaging/selinux) loaded and
   # the binary labelled nspawn_exec_t, or the bus drops it at the first descriptor.
@@ -24,6 +31,15 @@ install_service() {
   fi
   mkdir -p /etc/nspawn
   printf 'registry = "%s"\nca_cert = "%s"\n' "$NSPAWN_REGISTRY" "$NSPAWN_CA_CERT" > /etc/nspawn/e2e.toml
+  # A service left running from before would serve this run with its own configuration.
+  systemctl stop nspawn.service >/dev/null 2>&1 || true
+  if [ "$packaged" = yes ]; then
+    mkdir -p /etc/systemd/system/nspawn.service.d
+    printf '[Service]\nExecStart=\nExecStart=%s --config /etc/nspawn/e2e.toml daemon\n' "$NSPAWN" > /etc/systemd/system/nspawn.service.d/50-e2e.conf
+    systemctl daemon-reload
+    echo "$NSPAWN belongs to a package: testing the packaged service with a configuration drop-in" | tee /tmp/e2e-install.txt
+    return
+  fi
   $NSPAWN --config /etc/nspawn/e2e.toml daemon --install > /tmp/e2e-install.txt 2>&1 || { cat /tmp/e2e-install.txt; echo "cannot install the service"; exit 1; }
   cat /tmp/e2e-install.txt
 }
@@ -43,7 +59,12 @@ cleanup_machines() {
 }
 cleanup_service() {
   systemctl stop nspawn.service >/dev/null 2>&1 || true
-  rm -f /etc/dbus-1/system.d/org.nspawn.conf /usr/share/dbus-1/system-services/org.nspawn.service /etc/systemd/system/nspawn.service /etc/nspawn/e2e.toml
+  if [ "$packaged" = yes ]; then
+    rm -f /etc/systemd/system/nspawn.service.d/50-e2e.conf /etc/nspawn/e2e.toml
+    rmdir /etc/systemd/system/nspawn.service.d 2>/dev/null || true
+  else
+    rm -f /etc/dbus-1/system.d/org.nspawn.conf /usr/share/dbus-1/system-services/org.nspawn.service /etc/systemd/system/nspawn.service /etc/nspawn/e2e.toml
+  fi
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
 cleanup() {
@@ -662,7 +683,9 @@ $NSPAWN hub ls | head -c 1 >/dev/null; rc=${PIPESTATUS[0]}
 
 step "D-Bus: org.nspawn as other clients see it"
 if command -v busctl >/dev/null 2>&1; then
-  grep -q "wrote /etc/systemd/system/nspawn.service" /tmp/e2e-install.txt || fail "install did not write the unit"
+  if [ "$packaged" != yes ]; then
+    grep -q "wrote /etc/systemd/system/nspawn.service" /tmp/e2e-install.txt || fail "install did not write the unit"
+  fi
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"

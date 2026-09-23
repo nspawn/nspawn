@@ -58,6 +58,15 @@ sudo env NSPAWN=/usr/local/bin/nspawn NSPAWN_REGISTRY=hub.example:8443 \
     NSPAWN_CA_CERT=/etc/zot/ca.crt tests/e2e.sh
 ```
 
+With `NSPAWN` pointing at a binary a package installed (`/usr/bin/nspawn` from
+the rpm, deb or Arch package), the suite leaves the package's service, bus and
+polkit files alone and tests them as shipped: a drop-in in
+`/etc/systemd/system/nspawn.service.d/` hands the service the configuration,
+and goes again at the end. That is the run that matters before a release, on
+every distribution of the matrix, and on Fedora `ausearch` has nothing to say
+about `nspawn_t` afterwards (read `/var/log/audit/audit.log` directly where
+`ausearch -ts` trips over the locale's date format).
+
 The suite cleans up before and after itself and ends with `ALL OK` or a
 failure count. Every FAIL line names the check. It runs from wherever it sits,
 as long as `tests/build-context` sits next to it; `NSPAWN_BUILD_CONTEXT` points
