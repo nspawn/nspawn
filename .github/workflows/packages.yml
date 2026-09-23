@@ -30,10 +30,15 @@ jobs:
           tar cJf ~/rpmbuild/SOURCES/nspawn-${version}-vendor.tar.xz vendor
       - name: Build
         run: rpmbuild -ba packaging/fedora/nspawn.spec
+      - name: Collect
+        run: |
+          mkdir -p dist
+          cp ~/rpmbuild/RPMS/*/*.rpm dist/
+          ls -l dist
       - uses: actions/upload-artifact@v4
         with:
           name: fedora-rpms
-          path: ~/rpmbuild/RPMS/*/*.rpm
+          path: dist/*.rpm
 
   deb:
     name: Ubuntu 24.04 deb
@@ -66,19 +71,19 @@ jobs:
         # -d: cargo and rustc come from rustup here, not from the packages the
         # control file names for a distribution whose own rust is new enough.
         run: dpkg-buildpackage -us -uc -b -d
-      - name: The binary on its own
+      - name: Collect, with the binary on its own
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          mkdir -p /tmp/tarball/nspawn-${version}
-          cp target/release/nspawn README.md LICENSE /tmp/tarball/nspawn-${version}/
-          tar -czf /tmp/tarball/nspawn-${version}-x86_64-linux.tar.gz \
-              -C /tmp/tarball nspawn-${version}
+          mkdir -p dist/nspawn-${version}
+          cp target/release/nspawn README.md LICENSE dist/nspawn-${version}/
+          tar -czf dist/nspawn-${version}-x86_64-linux.tar.gz -C dist nspawn-${version}
+          rm -rf dist/nspawn-${version}
+          cp ../*.deb dist/
+          ls -l dist
       - uses: actions/upload-artifact@v4
         with:
           name: ubuntu-debs
-          path: |
-            ../*.deb
-            /tmp/tarball/*.tar.gz
+          path: dist/*
 
   arch:
     name: Arch package
@@ -102,10 +107,15 @@ jobs:
           cp packaging/arch/PKGBUILD /tmp/pkg/ && chown -R builder /tmp/pkg
           sed -i "s/^pkgver=.*/pkgver=${pkgver}/" /tmp/pkg/PKGBUILD
           cd /tmp/pkg && sudo -u builder makepkg --noconfirm --skipchecksums
+      - name: Collect
+        run: |
+          mkdir -p dist
+          cp /tmp/pkg/*.pkg.tar.zst dist/
+          ls -l dist
       - uses: actions/upload-artifact@v4
         with:
           name: arch-package
-          path: /tmp/pkg/*.pkg.tar.zst
+          path: dist/*.pkg.tar.zst
 
   release:
     name: Attach everything to the release
