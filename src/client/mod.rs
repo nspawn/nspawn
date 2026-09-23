@@ -278,17 +278,15 @@ impl Client {
 /// errors, and a word of advice when the service is not there or refuses the caller.
 pub fn error(e: zbus::Error) -> anyhow::Error {
     match &e {
-        zbus::Error::MethodError(name, message, _) => {
-            match name.as_str() {
-                "org.freedesktop.DBus.Error.ServiceUnknown" => {
-                    anyhow!("the nspawn service is not on the system bus; run: sudo nspawn daemon --install")
-                }
-                "org.freedesktop.DBus.Error.AccessDenied" => {
-                    anyhow!("the bus refused the call: nspawn needs root to talk to its service for now")
-                }
-                _ => anyhow!("{}", message.clone().unwrap_or_else(|| name.to_string())),
+        zbus::Error::MethodError(name, message, _) => match name.as_str() {
+            "org.freedesktop.DBus.Error.ServiceUnknown" => {
+                anyhow!("the nspawn service is not on the system bus; run: sudo nspawn daemon --install")
             }
-        }
+            "org.freedesktop.DBus.Error.AccessDenied" => {
+                anyhow!("the bus refused the call; see the policy in /usr/share/dbus-1/system.d/org.nspawn.conf")
+            }
+            _ => anyhow!("{}", message.clone().unwrap_or_else(|| name.to_string())),
+        },
         _ => anyhow!("{e}"),
     }
 }
@@ -376,7 +374,15 @@ mod tests {
             "org.freedesktop.DBus.Error.AccessDenied",
             None,
         ));
-        assert!(denied.to_string().contains("root"));
+        assert!(denied.to_string().contains("org.nspawn.conf"));
+        // What a caller polkit turned down reads like: its own message, nothing added.
+        let refused = error(method_error(
+            "org.nspawn.Error.NotAuthorized",
+            Some("org.nspawn.manage needs an administrator; answer the authentication agent, run the command as root, or let your group through with a polkit rule (see docs/DBUS.md)"),
+        ));
+        assert!(refused
+            .to_string()
+            .starts_with("org.nspawn.manage needs an administrator"));
         let nameless = error(method_error("org.example.Odd", None));
         assert_eq!(nameless.to_string(), "org.example.Odd");
     }

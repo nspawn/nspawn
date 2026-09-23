@@ -81,6 +81,14 @@ ends up the same way but resolves the manifest through the registry first.
 
 ## Registries and credentials
 
+Every command talks to the `org.nspawn` service on the system bus, which decides
+through polkit who may do what: `org.nspawn.inspect` for the commands that only look,
+`org.nspawn.manage` for the rest, both for administrators by default. `sudo nspawn ...`
+therefore works everywhere; to drive nspawn without a password, hand one of those
+actions to a group with a polkit rule, as in `nspawn-wheel.rules` in the documentation
+directory. Doing that makes the group administrators of the host, since a machine's
+commands run as root and any host path can be mounted into one.
+
 Registries are used anonymously until `nspawn login [REGISTRY] -u USER` (password asked on
 the terminal, or `--password-stdin`) checks the credentials the way docker login does and
 keeps them in `/etc/nspawn/auth.json`, mode 0600, in the auth.json format podman and skopeo

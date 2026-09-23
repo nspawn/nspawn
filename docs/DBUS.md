@@ -17,7 +17,8 @@ systemd and the bus:
 
 | File | Role |
 |---|---|
-| `/etc/dbus-1/system.d/org.nspawn.conf` | bus policy: root may own and call `org.nspawn`; everyone may introspect, read properties and receive its signals |
+| `/etc/dbus-1/system.d/org.nspawn.conf` | bus policy: root may own `org.nspawn`, everyone may call it and receive its signals |
+| `/usr/share/polkit-1/actions/org.nspawn.policy` | the two actions polkit authorizes callers for |
 | `/usr/share/dbus-1/system-services/org.nspawn.service` | bus activation: `SystemdService=nspawn.service` |
 | `/etc/systemd/system/nspawn.service` | `Type=dbus` unit running `nspawn daemon` |
 
@@ -31,7 +32,37 @@ one call; the command line passes them when it was given a registry (flag,
 `NSPAWN_REGISTRY` or its own configuration file) and leaves the service's
 alone otherwise.
 
-Methods need root for now (the bus policy says so); polkit comes later.
+Every user may call; who may do what is polkit's answer. The methods that
+only read (`ListImages`, `GetImage`, `ListMachines`, `ListNetwork`) ask for
+`org.nspawn.inspect`, the rest for `org.nspawn.manage`, and both are for
+administrators by default, so `sudo nspawn ...` works as before and a
+desktop or `pkttyagent` session is asked for a password. Root is allowed
+without asking, which is also how the service keeps working where polkit is
+not installed: there, nobody else can call it.
+
+An administrator hands either action to a group with a rule of their own,
+which is how to drive nspawn without a password. The packages ship one as an
+example in their documentation directory
+(`packaging/polkit/nspawn-wheel.rules`):
+
+```
+polkit.addRule(function (action, subject) {
+    if (action.id.startsWith("org.nspawn.") && subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+    }
+});
+```
+
+Copy it to `/etc/polkit-1/rules.d/50-nspawn.rules`. Everyone in that group can
+run commands as root inside a machine and mount any host path into one, so it
+makes them administrators of the host, as the docker group does.
+
+Errors from a refusal come back as `org.nspawn.Error.NotAuthorized`.
+
+A job and a command belong to the user who started them: their objects
+answer that user and root, and anyone else gets `AccessDenied`. The
+`PropertiesChanged` signals of those objects, which carry the state and the
+exit status, reach everyone listening, as bus signals do.
 
 Where SELinux is enforcing (Fedora, RHEL) the service needs a domain of its
 own, `nspawn_t`, like machined and the container runtimes have: the base

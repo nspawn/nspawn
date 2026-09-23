@@ -1,0 +1,10 @@
+/* An example, not installed: copy it to /etc/polkit-1/rules.d/50-nspawn.rules to let a
+   group drive nspawn without a password. Everyone in that group can run commands as
+   root inside a machine and mount any host path into one, which is to say they are
+   administrators of this host. */
+
+polkit.addRule(function (action, subject) {
+    if (action.id.startsWith("org.nspawn.") && subject.isInGroup("wheel")) {
+        return polkit.Result.YES;
+    }
+});

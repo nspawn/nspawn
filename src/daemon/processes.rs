@@ -7,14 +7,18 @@ use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::OwnedObjectPath;
 
+use crate::daemon::polkit;
 use crate::daemon::State;
 use crate::nsenter;
 
 pub struct ProcessState {
     pub path: OwnedObjectPath,
+    /// The user who started it: nobody else reads it or signals it.
+    pub owner: u32,
     pub machine: String,
     pub argv: Vec<String>,
     /// The process's PID as the host sees it.
@@ -45,40 +49,64 @@ impl Processes {
 
 pub struct Process {
     process: Arc<ProcessState>,
+    state: Arc<State>,
+}
+
+impl Process {
+    /// Fails for anyone but the user who started the command, and root.
+    async fn readable(&self, header: Option<&Header<'_>>) -> zbus::fdo::Result<()> {
+        let uid = polkit::header_uid(self.state.connection(), header).await;
+        if polkit::may_read(self.process.owner, uid) {
+            return Ok(());
+        }
+        Err(zbus::fdo::Error::AccessDenied(format!(
+            "this command belongs to another user ({})",
+            self.process.owner
+        )))
+    }
 }
 
 #[zbus::interface(name = "org.nspawn.Process")]
 impl Process {
     #[zbus(property)]
-    fn machine(&self) -> String {
-        self.process.machine.clone()
+    async fn machine(&self, #[zbus(header)] hdr: Option<Header<'_>>) -> zbus::fdo::Result<String> {
+        self.readable(hdr.as_ref()).await?;
+        Ok(self.process.machine.clone())
     }
 
     #[zbus(property)]
-    fn argv(&self) -> Vec<String> {
-        self.process.argv.clone()
+    async fn argv(
+        &self,
+        #[zbus(header)] hdr: Option<Header<'_>>,
+    ) -> zbus::fdo::Result<Vec<String>> {
+        self.readable(hdr.as_ref()).await?;
+        Ok(self.process.argv.clone())
     }
 
     /// The process's PID on the host.
     #[zbus(property)]
-    fn pid(&self) -> u32 {
-        self.process.pid
+    async fn pid(&self, #[zbus(header)] hdr: Option<Header<'_>>) -> zbus::fdo::Result<u32> {
+        self.readable(hdr.as_ref()).await?;
+        Ok(self.process.pid)
     }
 
     /// "running" or "exited".
     #[zbus(property)]
-    fn state(&self) -> String {
-        self.process.state.lock().unwrap().clone()
+    async fn state(&self, #[zbus(header)] hdr: Option<Header<'_>>) -> zbus::fdo::Result<String> {
+        self.readable(hdr.as_ref()).await?;
+        Ok(self.process.state.lock().unwrap().clone())
     }
 
     /// The exit code once exited; 128 plus the signal when it died of one.
     #[zbus(property)]
-    fn exit_status(&self) -> i32 {
-        *self.process.exit_status.lock().unwrap()
+    async fn exit_status(&self, #[zbus(header)] hdr: Option<Header<'_>>) -> zbus::fdo::Result<i32> {
+        self.readable(hdr.as_ref()).await?;
+        Ok(*self.process.exit_status.lock().unwrap())
     }
 
     /// Sends a signal (a number; realtime ones included) to the process while it runs.
-    fn signal(&self, signal: i32) -> zbus::fdo::Result<()> {
+    async fn signal(&self, #[zbus(header)] hdr: Header<'_>, signal: i32) -> zbus::fdo::Result<()> {
+        self.readable(Some(&hdr)).await?;
         if signal < 1 || signal > nix::libc::SIGRTMAX() {
             return Err(zbus::fdo::Error::InvalidArgs(format!(
                 "signal {signal} is out of range"
@@ -108,6 +136,7 @@ impl Process {
 /// service counts as busy until that has been announced.
 pub async fn register(
     state: &Arc<State>,
+    owner: u32,
     machine: &str,
     argv: &[String],
     pid: u32,
@@ -118,6 +147,7 @@ pub async fn register(
     let path = OwnedObjectPath::try_from(format!("/org/nspawn/process/{id}"))?;
     let entry = Arc::new(ProcessState {
         path: path.clone(),
+        owner,
         machine: machine.to_string(),
         argv: argv.to_vec(),
         pid,
@@ -133,6 +163,7 @@ pub async fn register(
             &path,
             Process {
                 process: entry.clone(),
+                state: state.clone(),
             },
         )
         .await?;

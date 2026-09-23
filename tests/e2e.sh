@@ -540,6 +540,43 @@ ls /var/lib/nspawn/blobs/ | grep -q "^\.part-\|^\.hold-" && fail "leftovers in t
 $NSPAWN start e2e-twin-b >/dev/null && $NSPAWN exec e2e-twin-b -- /usr/bin/true </dev/null && $NSPAWN stop e2e-twin-b >/dev/null || fail "a machine pulled alongside another does not run"
 $NSPAWN images rm e2e-twin-a e2e-twin-b >/dev/null || fail "rm the twin images"
 
+step "polkit: a user who is not root, with and without a rule"
+who=${SUDO_USER:-}
+rules=/etc/polkit-1/rules.d/50-nspawn-e2e.rules
+if [ -z "$who" ] || [ "$who" = root ] || ! command -v pkaction >/dev/null 2>&1; then
+  echo "no unprivileged user or no polkit here: skipping"
+elif ! pkaction --action-id org.nspawn.manage >/dev/null 2>&1; then
+  fail "polkit does not know org.nspawn.manage; is the action file installed?"
+elif sudo -u "$who" bash -c 'pkcheck --action-id org.nspawn.inspect --process $$' >/dev/null 2>&1; then
+  # An administrator who already granted this user leaves no refusal to see.
+  echo "this host already lets $who through: skipping"
+else
+  group=$(id -gn "$who")
+  rm -f "$rules"
+  out=$(sudo -u "$who" $NSPAWN ps 2>&1); rc=$?
+  [ $rc -ne 0 ] || fail "$who could list machines with no rule in place"
+  echo "$out" | grep -q "org.nspawn.inspect" || fail "the refusal does not name the action: $out"
+  echo "$out" | grep -q "polkit rule" || fail "the refusal does not say how to allow it: $out"
+  cat > "$rules" <<RULE
+polkit.addRule(function (action, subject) {
+    if (action.id.startsWith("org.nspawn.") && subject.isInGroup("$group")) {
+        return polkit.Result.YES;
+    }
+});
+RULE
+  retry 5 bash -c "sudo -u $who $NSPAWN ps >/dev/null 2>&1" || fail "$who still cannot list machines with the rule in place: $(sudo -u "$who" $NSPAWN ps 2>&1 | tail -2)"
+  sudo -u "$who" $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || fail "$who cannot run a command that changes things with the rule in place"
+  # The rule lets them call; another user's command is still not theirs to read.
+  if [ -n "${proc:-}" ] && command -v busctl >/dev/null 2>&1; then
+    out=$(sudo -u "$who" busctl --system get-property org.nspawn "$proc" org.nspawn.Process Argv 2>&1) && fail "$who could read a command root ran: $out"
+    echo "$out" | grep -qi "denied" || fail "reading another user's command failed for the wrong reason: $out"
+  fi
+  rm -f "$rules"
+  retry 5 bash -c "! sudo -u $who $NSPAWN ps >/dev/null 2>&1" || fail "$who can still list machines after the rule went"
+  # Root never needs any of this.
+  $NSPAWN ps >/dev/null || fail "root cannot list machines"
+fi
+
 step "error handling (these commands must fail with a useful message)"
 out=$($NSPAWN pull "$NSPAWN_REGISTRY/does-not-exist:1" --name e2e-x 2>&1); rc=$?
 echo "$out"

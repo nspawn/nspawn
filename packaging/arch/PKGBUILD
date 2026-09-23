@@ -9,7 +9,8 @@ url='https://github.com/nspawn/nspawn'
 license=('GPL-3.0-or-later')
 depends=('systemd>=255' 'glibc' 'gcc-libs' 'iproute2' 'nftables')
 makedepends=('cargo')
-optdepends=('mkosi: build images with nspawn build'
+optdepends=('polkit: let users other than root drive nspawn'
+            'mkosi: build images with nspawn build'
             'iptables-nft: keep the bridge reachable next to the forwarding rules of docker or ufw')
 # makepkg's -flto=auto turns the C objects of aws-lc-sys into GCC bitcode, which the
 # linker rustc drives cannot read.
@@ -38,7 +39,8 @@ package() {
   install -Dm644 packaging/systemd/nspawn.service "${pkgdir}/usr/lib/systemd/system/nspawn.service"
   install -Dm644 packaging/dbus/org.nspawn.service "${pkgdir}/usr/share/dbus-1/system-services/org.nspawn.service"
   install -Dm644 packaging/dbus/org.nspawn.conf "${pkgdir}/usr/share/dbus-1/system.d/org.nspawn.conf"
-  install -Dm644 README.md docs/ARCHITECTURE.md docs/DBUS.md -t "${pkgdir}/usr/share/doc/${pkgname}"
+  install -Dm644 packaging/polkit/org.nspawn.policy "${pkgdir}/usr/share/polkit-1/actions/org.nspawn.policy"
+  install -Dm644 README.md docs/ARCHITECTURE.md docs/DBUS.md packaging/polkit/nspawn-wheel.rules -t "${pkgdir}/usr/share/doc/${pkgname}"
   install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
   install -dm755 "${pkgdir}/etc/nspawn" "${pkgdir}/var/lib/nspawn"
 }

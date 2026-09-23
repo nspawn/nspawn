@@ -32,6 +32,8 @@ Requires:       systemd-container
 Requires:       iproute
 Requires:       nftables
 Recommends:     (%{name}-selinux if selinux-policy-%{selinuxtype})
+# Without it only root can call the service.
+Recommends:     polkit
 %{?systemd_requires}
 
 %description
@@ -77,6 +79,7 @@ install -D -m 0755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
 install -D -m 0644 packaging/systemd/%{name}.service %{buildroot}%{_unitdir}/%{name}.service
 install -D -m 0644 packaging/dbus/org.nspawn.service %{buildroot}%{_datadir}/dbus-1/system-services/org.nspawn.service
 install -D -m 0644 packaging/dbus/org.nspawn.conf %{buildroot}%{_datadir}/dbus-1/system.d/org.nspawn.conf
+install -D -m 0644 packaging/polkit/org.nspawn.policy %{buildroot}%{_datadir}/polkit-1/actions/org.nspawn.policy
 install -D -m 0644 packaging/selinux/%{name}.pp.bz2 %{buildroot}%{_datadir}/selinux/packages/%{selinuxtype}/%{name}.pp.bz2
 install -D -m 0644 packaging/selinux/%{name}.if %{buildroot}%{_datadir}/selinux/devel/include/contrib/%{name}.if
 install -d -m 0755 %{buildroot}%{_sysconfdir}/%{name}
@@ -118,11 +121,12 @@ fi
 
 %files
 %license LICENSE
-%doc README.md docs/ARCHITECTURE.md docs/DBUS.md
+%doc README.md docs/ARCHITECTURE.md docs/DBUS.md packaging/polkit/nspawn-wheel.rules
 %{_bindir}/%{name}
 %{_unitdir}/%{name}.service
 %{_datadir}/dbus-1/system-services/org.nspawn.service
 %{_datadir}/dbus-1/system.d/org.nspawn.conf
+%{_datadir}/polkit-1/actions/org.nspawn.policy
 %dir %{_sysconfdir}/%{name}
 %dir %{_sharedstatedir}/%{name}
 

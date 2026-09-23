@@ -5,6 +5,7 @@
 pub mod install;
 pub mod jobs;
 pub mod manager;
+pub mod polkit;
 pub mod processes;
 pub mod values;
 

@@ -16,6 +16,7 @@ override_dh_auto_install:
 	install -D -m 0644 packaging/systemd/nspawn.service debian/nspawn/usr/lib/systemd/system/nspawn.service
 	install -D -m 0644 packaging/dbus/org.nspawn.service debian/nspawn/usr/share/dbus-1/system-services/org.nspawn.service
 	install -D -m 0644 packaging/dbus/org.nspawn.conf debian/nspawn/usr/share/dbus-1/system.d/org.nspawn.conf
+	install -D -m 0644 packaging/polkit/org.nspawn.policy debian/nspawn/usr/share/polkit-1/actions/org.nspawn.policy
 	install -d -m 0755 debian/nspawn/etc/nspawn debian/nspawn/var/lib/nspawn
 
 override_dh_auto_clean:

@@ -10,6 +10,8 @@ Rules-Requires-Root: no
 Package: nspawn
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, systemd-container, iproute2, nftables
+Recommends: polkitd | policykit-1
+Suggests: iptables
 Description: Docker-like management of systemd-nspawn machines
  nspawn pulls OCI images from a registry, keeps them as shared layers, and
  runs them as systemd-nspawn machines with a bridge network, published ports

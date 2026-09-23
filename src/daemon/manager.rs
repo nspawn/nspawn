@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
+use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
@@ -13,6 +14,7 @@ use crate::api::{self, Context};
 use crate::auth::Credentials;
 use crate::backend::BackendChoice;
 use crate::daemon::jobs::{self, Dict};
+use crate::daemon::polkit::{self, Action};
 use crate::daemon::processes;
 use crate::daemon::values::{self, Options};
 use crate::daemon::State;
@@ -28,6 +30,8 @@ pub enum Error {
     #[zbus(error)]
     ZBus(zbus::Error),
     Failed(String),
+    /// The caller is not allowed to do this: polkit said so.
+    NotAuthorized(String),
 }
 
 impl From<anyhow::Error> for Error {
@@ -49,6 +53,23 @@ impl Manager {
 
     fn ctx(&self) -> &Context {
         &self.state.ctx
+    }
+
+    /// Whether the caller may do this, which on a host with polkit is polkit's
+    /// answer and on one without is root or nothing.
+    /// Returns the caller's uid, which is what a job or a command started here belongs
+    /// to afterwards.
+    async fn allow(&self, header: &Header<'_>, action: Action) -> Result<u32> {
+        let sender = header
+            .sender()
+            .map(|s| s.to_string())
+            .ok_or_else(|| Error::NotAuthorized("the call carries no sender".to_string()))?;
+        polkit::allows(self.state.connection(), &sender, action)
+            .await
+            .map_err(Error::NotAuthorized)?;
+        Ok(polkit::caller_uid(self.state.connection(), &sender)
+            .await
+            .unwrap_or(0))
     }
 
     /// The context for a call: the service's own, or one with the registry and CA
@@ -165,7 +186,8 @@ impl Manager {
 
     /// Local images, like `images ls`: name, kind, backend, origin, reference, size,
     /// read_only.
-    async fn list_images(&self) -> Result<Vec<Dict>> {
+    async fn list_images(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Vec<Dict>> {
+        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
         let images = api::images::list(self.ctx()).await?;
         Ok(images.iter().map(values::image).collect())
@@ -174,7 +196,8 @@ impl Manager {
     /// Everything nspawn keeps about one image: reference, digest, backend, mode,
     /// network, address, ports, volumes, env, entrypoint, cmd, command, and the OCI
     /// config's image_env, working_dir, user and stop_signal.
-    async fn get_image(&self, name: String) -> Result<Dict> {
+    async fn get_image(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<Dict> {
+        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
         let record = self
             .ctx()
@@ -188,9 +211,11 @@ impl Manager {
     /// ca_cert (s). The job's result carries name, reference and mode.
     async fn pull_image(
         &self,
+        #[zbus(header)] hdr: Header<'_>,
         reference: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<OwnedObjectPath> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
@@ -209,6 +234,7 @@ impl Manager {
         let state = self.state.clone();
         Ok(jobs::spawn(
             &self.state,
+            owner,
             ctx,
             "pull",
             &target,
@@ -231,10 +257,12 @@ impl Manager {
     /// entrypoint (s), env (as), volume (as), command (as), registry (s), ca_cert (s).
     async fn create_machine(
         &self,
+        #[zbus(header)] hdr: Header<'_>,
         source: String,
         name: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<OwnedObjectPath> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
@@ -254,6 +282,7 @@ impl Manager {
         let state = self.state.clone();
         Ok(jobs::spawn(
             &self.state,
+            owner,
             ctx,
             "create",
             &name,
@@ -275,9 +304,11 @@ impl Manager {
     /// carries destination and url.
     async fn push_image(
         &self,
+        #[zbus(header)] hdr: Header<'_>,
         image: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<OwnedObjectPath> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
@@ -288,6 +319,7 @@ impl Manager {
         options.finish()?;
         Ok(jobs::spawn(
             &self.state,
+            owner,
             ctx,
             "push",
             &image,
@@ -308,10 +340,12 @@ impl Manager {
     /// (s), ca_cert (s). mkosi's output comes through the job, line by line.
     async fn build_image(
         &self,
+        #[zbus(header)] hdr: Header<'_>,
         directory: String,
         tag: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<OwnedObjectPath> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
@@ -332,6 +366,7 @@ impl Manager {
         let state = self.state.clone();
         Ok(jobs::spawn(
             &self.state,
+            owner,
             ctx,
             "build",
             &tag,
@@ -362,12 +397,18 @@ impl Manager {
     /// Like `images rm`: a job whose lines say what was removed and freed, with the
     /// removed names as its result. Every name is tried; the job fails at the end when
     /// one could not be removed.
-    async fn remove_images(&self, names: Vec<String>) -> Result<OwnedObjectPath> {
+    async fn remove_images(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        names: Vec<String>,
+    ) -> Result<OwnedObjectPath> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let state = self.state.clone();
         let target = names.join(" ");
         Ok(jobs::spawn(
             &self.state,
+            owner,
             self.state.ctx.clone(),
             "rm",
             &target,
@@ -395,11 +436,13 @@ impl Manager {
     /// registry (s), ca_cert (s).
     async fn search_images(
         &self,
+        #[zbus(header)] hdr: Header<'_>,
         term: String,
         source: String,
         limit: u32,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(Vec<Dict>, Vec<String>)> {
+        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
@@ -424,10 +467,12 @@ impl Manager {
     /// asked. Options: registry (s), ca_cert (s).
     async fn list_repositories(
         &self,
+        #[zbus(header)] hdr: Header<'_>,
         filter: String,
         with_tags: bool,
         options: HashMap<String, OwnedValue>,
     ) -> Result<Vec<Dict>> {
+        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
@@ -455,9 +500,11 @@ impl Manager {
     /// Like `hub tags`. Options: registry (s), ca_cert (s).
     async fn list_tags(
         &self,
+        #[zbus(header)] hdr: Header<'_>,
         repository: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<Vec<String>> {
+        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
@@ -468,7 +515,8 @@ impl Manager {
     /// Like `ps` (and `ps -a` with `all`): every machine with its state, started time,
     /// leader, os and, when nspawn installed its image, the image's record and
     /// machine_path, its object in machined.
-    async fn list_machines(&self, all: bool) -> Result<Vec<Dict>> {
+    async fn list_machines(&self, #[zbus(header)] hdr: Header<'_>, all: bool) -> Result<Vec<Dict>> {
+        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
         let machines = api::machines::list(self.ctx(), all).await?;
         Ok(machines.iter().map(values::machine).collect())
@@ -480,9 +528,11 @@ impl Manager {
     /// and the notes made on the way.
     async fn start_machine(
         &self,
+        #[zbus(header)] hdr: Header<'_>,
         name: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(String, Vec<String>)> {
+        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let request = api::machines::StartRequest {
@@ -511,9 +561,11 @@ impl Manager {
     /// killed, say).
     async fn stop_machine(
         &self,
+        #[zbus(header)] hdr: Header<'_>,
         name: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(String, Vec<String>)> {
+        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let request = api::machines::StopRequest {
@@ -537,10 +589,12 @@ impl Manager {
     /// env (as), the caller's TERM among them (xterm otherwise).
     async fn shell(
         &self,
+        #[zbus(header)] hdr: Header<'_>,
         machine: String,
         user: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(zbus::zvariant::OwnedFd, String)> {
+        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let mut env = options.strings("env")?;
@@ -564,9 +618,11 @@ impl Manager {
     /// output any more, so a --follow ends with its client.
     async fn logs(
         &self,
+        #[zbus(header)] hdr: Header<'_>,
         machine: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let request = api::machines::LogsRequest {
@@ -621,8 +677,16 @@ impl Manager {
         };
         let mut command = vec!["journalctl".to_string()];
         command.extend(argv);
-        let path =
-            processes::register(&self.state, &request.machine, &command, pid, pidfd, wait).await?;
+        let path = processes::register(
+            &self.state,
+            owner,
+            &request.machine,
+            &command,
+            pid,
+            pidfd,
+            wait,
+        )
+        .await?;
         Ok((
             HashMap::from([
                 ("stdout".to_string(), zbus::zvariant::OwnedFd::from(out_r)),
@@ -639,11 +703,13 @@ impl Manager {
     /// otherwise, on a terminal). The process object says how it ends.
     async fn exec(
         &self,
+        #[zbus(header)] hdr: Header<'_>,
         machine: String,
         argv: Vec<String>,
         user: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let tty = options.bool("tty", true)?;
@@ -680,7 +746,9 @@ impl Manager {
                 .unwrap_or(126)
         };
         let path =
-            match processes::register(&self.state, &machine, &argv, pid, Some(pidfd), wait).await {
+            match processes::register(&self.state, owner, &machine, &argv, pid, Some(pidfd), wait)
+                .await
+            {
                 Ok(path) => path,
                 Err(e) => {
                     // Nobody will hold its streams: the command must not linger.
@@ -705,7 +773,8 @@ impl Manager {
 
     /// Like `network ls`: the bridge (bridge, subnet, gateway, host_name) and the
     /// machines on it (name, address, ports, running).
-    async fn list_network(&self) -> Result<(Dict, Vec<Dict>)> {
+    async fn list_network(&self, #[zbus(header)] hdr: Header<'_>) -> Result<(Dict, Vec<Dict>)> {
+        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
         let (info, entries) = api::network::list(self.ctx()).await?;
         Ok((
@@ -715,7 +784,8 @@ impl Manager {
     }
 
     /// Like `network up`: the bridge, plus the notes made on the way under "notes".
-    async fn network_up(&self) -> Result<Dict> {
+    async fn network_up(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Dict> {
+        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let notes = Notes::default();
         let info = api::network::up(self.ctx(), &notes.report()).await?;
@@ -729,11 +799,13 @@ impl Manager {
     /// credentials.
     async fn login(
         &self,
+        #[zbus(header)] hdr: Header<'_>,
         registry: String,
         username: String,
         password: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<Dict> {
+        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
@@ -752,7 +824,8 @@ impl Manager {
     }
 
     /// Like `logout`: true when credentials were stored for the registry.
-    async fn logout(&self, registry: String) -> Result<bool> {
+    async fn logout(&self, #[zbus(header)] hdr: Header<'_>, registry: String) -> Result<bool> {
+        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let registry = if registry.is_empty() {
             None
