@@ -76,10 +76,11 @@ jobs:
           git config --global --add safe.directory "$PWD"
           useradd -m builder && echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          mkdir -p /tmp/pkg && git archive --format=tar.gz --prefix="nspawn-${version}/" -o "/tmp/pkg/nspawn-${version}.tar.gz" HEAD
-          cp packaging/arch/PKGBUILD /tmp/pkg/ && chown -R builder /tmp/pkg
-          # Cargo.toml holds the version; pkgver follows it (1.0.0-beta.1 is 1.0.0beta1).
+          # Cargo.toml holds the version; pkgver follows it (1.0.0-beta.1 is 1.0.0beta1),
+          # and the tarball takes the name the recipe gives what it downloads.
           pkgver=$(echo "${version}" | sed 's/-beta\./beta/')
+          mkdir -p /tmp/pkg && git archive --format=tar.gz --prefix="nspawn-${version}/" -o "/tmp/pkg/nspawn-${pkgver}.tar.gz" HEAD
+          cp packaging/arch/PKGBUILD /tmp/pkg/ && chown -R builder /tmp/pkg
           sed -i "s/^pkgver=.*/pkgver=${pkgver}/" /tmp/pkg/PKGBUILD
           cd /tmp/pkg && sudo -u builder makepkg --noconfirm --skipchecksums
       - uses: actions/upload-artifact@v4
