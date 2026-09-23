@@ -7,7 +7,7 @@ pkgdesc='Docker-like management of systemd-nspawn machines: OCI images from a hu
 arch=('x86_64' 'aarch64')
 url='https://github.com/nspawn/nspawn'
 license=('GPL-3.0-or-later')
-depends=('systemd>=255' 'iproute2' 'nftables')
+depends=('systemd>=255' 'glibc' 'gcc-libs' 'iproute2' 'nftables')
 makedepends=('cargo')
 optdepends=('mkosi: build images with nspawn build'
             'iptables-nft: keep the bridge reachable next to the forwarding rules of docker or ufw')
