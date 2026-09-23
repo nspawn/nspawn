@@ -1,0 +1,8 @@
+[Unit]
+Description=nspawn manager
+Documentation=https://github.com/nspawn/nspawn
+
+[Service]
+Type=dbus
+BusName=org.nspawn
+ExecStart=/usr/bin/nspawn daemon

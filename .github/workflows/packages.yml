@@ -1,0 +1,89 @@
+name: packages
+
+on:
+  push:
+    tags: ["*"]
+  workflow_dispatch:
+
+jobs:
+  rpm:
+    name: Fedora RPM
+    runs-on: ubuntu-latest
+    container:
+      image: registry.fedoraproject.org/fedora:44
+      options: --privileged
+    steps:
+      - name: Tools
+        run: dnf install -y --setopt=install_weak_deps=False git rpm-build rpmdevtools cargo rust systemd-rpm-macros selinux-policy-devel bzip2 tar xz
+      - uses: actions/checkout@v4
+      - name: Sources
+        run: |
+          git config --global --add safe.directory "$PWD"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # Cargo.toml holds the version; the spec follows it.
+          sed -i "s/^%global upstream_version .*/%global upstream_version ${version}/" packaging/fedora/nspawn.spec
+          rpmdev-setuptree
+          git archive --format=tar.gz --prefix="nspawn-${version}/" -o ~/rpmbuild/SOURCES/nspawn-${version}.tar.gz HEAD
+          cargo vendor vendor > /dev/null
+          tar cJf ~/rpmbuild/SOURCES/nspawn-${version}-vendor.tar.xz vendor
+      - name: Build
+        run: rpmbuild -ba packaging/fedora/nspawn.spec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fedora-rpms
+          path: ~/rpmbuild/RPMS/*/*.rpm
+
+  deb:
+    name: Ubuntu 24.04 deb
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git build-essential debhelper cargo rustc ca-certificates
+      - uses: actions/checkout@v4
+      - name: Sources
+        run: |
+          git config --global --add safe.directory "$PWD"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          cargo vendor vendor > /dev/null
+          mkdir -p .cargo
+          printf '[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = "vendor"\n' > .cargo/config.toml
+          cp -r packaging/debian/debian .
+          # Cargo.toml holds the version; the changelog's first entry follows it
+          # (1.0.0-beta.1 sorts as 1.0.0~beta.1 in Debian).
+          sed -i "1s/^nspawn ([^)]*)/nspawn (${version/-/\~}-1)/" debian/changelog
+      - name: Build
+        run: dpkg-buildpackage -us -uc -b
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-debs
+          path: ../*.deb
+
+  arch:
+    name: Arch package
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Tools
+        run: pacman -Syu --noconfirm --needed base-devel git cargo sudo
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          git config --global --add safe.directory "$PWD"
+          useradd -m builder && echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          mkdir -p /tmp/pkg && git archive --format=tar.gz --prefix="nspawn-${version}/" -o "/tmp/pkg/nspawn-${version}.tar.gz" HEAD
+          cp packaging/arch/PKGBUILD /tmp/pkg/ && chown -R builder /tmp/pkg
+          # Cargo.toml holds the version; pkgver follows it (1.0.0-beta.1 is 1.0.0beta1).
+          pkgver=$(echo "${version}" | sed 's/-beta\./beta/')
+          sed -i "s/^pkgver=.*/pkgver=${pkgver}/" /tmp/pkg/PKGBUILD
+          cd /tmp/pkg && sudo -u builder makepkg --noconfirm --skipchecksums
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-package
+          path: /tmp/pkg/*.pkg.tar.zst
+

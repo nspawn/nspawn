@@ -1,0 +1,44 @@
+# Maintainer: Eduard Tolosa <tolosaeduard@gmail.com>
+
+pkgname=nspawn
+pkgver=1.0.0beta1
+pkgrel=1
+pkgdesc='Docker-like management of systemd-nspawn machines: OCI images from a hub, shared layers, a bridge network, driven over D-Bus'
+arch=('x86_64' 'aarch64')
+url='https://github.com/nspawn/nspawn'
+license=('GPL-3.0-or-later')
+depends=('systemd' 'iproute2' 'nftables')
+makedepends=('cargo')
+# The upstream tag: 1.0.0beta1 is 1.0.0-beta.1, a release is its own tag.
+case "${pkgver}" in
+  *beta*) _tag="${pkgver//beta*}-beta.${pkgver##*beta}" ;;
+  *) _tag="${pkgver}" ;;
+esac
+source=("${pkgname}-${_tag}.tar.gz::${url}/archive/refs/tags/${_tag}.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "${pkgname}-${_tag}"
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "${pkgname}-${_tag}"
+  cargo build --release --frozen
+}
+
+check() {
+  cd "${pkgname}-${_tag}"
+  cargo test --release --frozen
+}
+
+package() {
+  cd "${pkgname}-${_tag}"
+  install -Dm755 target/release/nspawn "${pkgdir}/usr/bin/nspawn"
+  install -Dm644 packaging/systemd/nspawn.service "${pkgdir}/usr/lib/systemd/system/nspawn.service"
+  install -Dm644 packaging/dbus/org.nspawn.service "${pkgdir}/usr/share/dbus-1/system-services/org.nspawn.service"
+  install -Dm644 packaging/dbus/org.nspawn.conf "${pkgdir}/usr/share/dbus-1/system.d/org.nspawn.conf"
+  install -Dm644 README.md docs/ARCHITECTURE.md docs/DBUS.md -t "${pkgdir}/usr/share/doc/${pkgname}"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -dm755 "${pkgdir}/etc/nspawn" "${pkgdir}/var/lib/nspawn"
+}

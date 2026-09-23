@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+# The crates are vendored into vendor/ by the package builder (cargo vendor).
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --offline
+
+override_dh_auto_test:
+	cargo test --release --offline
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/nspawn debian/nspawn/usr/bin/nspawn
+	install -D -m 0644 packaging/systemd/nspawn.service debian/nspawn/usr/lib/systemd/system/nspawn.service
+	install -D -m 0644 packaging/dbus/org.nspawn.service debian/nspawn/usr/share/dbus-1/system-services/org.nspawn.service
+	install -D -m 0644 packaging/dbus/org.nspawn.conf debian/nspawn/usr/share/dbus-1/system.d/org.nspawn.conf
+	install -d -m 0755 debian/nspawn/etc/nspawn debian/nspawn/var/lib/nspawn
+
+override_dh_auto_clean:
+	rm -rf target debian/cargo-home

@@ -1,0 +1,8 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: nspawn
+Source: https://github.com/nspawn/nspawn
+
+Files: *
+Copyright: 2026 Eduard Tolosa
+License: GPL-3.0-or-later
+ See /usr/share/common-licenses/GPL-3.

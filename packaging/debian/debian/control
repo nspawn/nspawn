@@ -1,0 +1,18 @@
+Source: nspawn
+Section: admin
+Priority: optional
+Maintainer: Eduard Tolosa <tolosaeduard@gmail.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc
+Standards-Version: 4.6.2
+Homepage: https://github.com/nspawn/nspawn
+Rules-Requires-Root: no
+
+Package: nspawn
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, systemd-container, iproute2, nftables
+Description: Docker-like management of systemd-nspawn machines
+ nspawn pulls OCI images from a registry, keeps them as shared layers, and
+ runs them as systemd-nspawn machines with a bridge network, published ports
+ and volumes, driven over the D-Bus APIs of systemd and machined. The work
+ is done by a service on the system bus, org.nspawn; the command line is its
+ client.

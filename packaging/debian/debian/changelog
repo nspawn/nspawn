@@ -1,0 +1,5 @@
+nspawn (1.0.0~beta.1-1) unstable; urgency=medium
+
+  * First package: the org.nspawn service and its command line.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Tue, 22 Sep 2026 20:00:00 -0500
