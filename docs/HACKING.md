@@ -82,9 +82,17 @@ failure count. Every FAIL line names the check.
 
 `packaging/` holds what the packages ship: the unit and the bus files
 (`systemd/`, `dbus/`, kept identical to what `nspawn daemon --install`
-writes, a unit test checks), the SELinux policy (`selinux/`) and the Fedora
-spec (`fedora/nspawn.spec`), which builds `nspawn` and the noarch
-`nspawn-selinux` from a source tarball plus a `cargo vendor` tarball. The
+writes, a unit test checks), the polkit actions (`polkit/`, with an example
+rule for a group), the SELinux policy (`selinux/`) and the Fedora spec
+(`fedora/nspawn.spec`), which builds `nspawn` and the noarch `nspawn-selinux`
+from a source tarball plus a `cargo vendor` tarball.
+
+`daemon --install` writes some of the same paths, which belong to the
+packages: `/usr/share/dbus-1/system-services/org.nspawn.service` and
+`/usr/share/polkit-1/actions/org.nspawn.policy`. Installing a package over
+them is refused on Arch (pacman does not take files it does not own) and
+silently overwrites them elsewhere, so remove what `--install` listed before
+going from a build to a package. The
 `packages` workflow builds the RPMs in a Fedora container on every tag and on
 demand, and keeps them as artifacts; the suite on the Fedora VM is where they
 get tested, since a container has neither SELinux enforcing nor machined.
