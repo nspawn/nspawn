@@ -731,13 +731,17 @@ pub fn validate_digest(digest: &str) -> Result<()> {
 /// directories with inode 2.
 pub fn check_writable(dir: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    // One probe per call: two pulls at once must not remove each other's.
+    // One probe per call: two pulls at once must not remove each other's. The one name
+    // of versions before 1.1.0 goes if a crash left it.
+    let _ = fs::remove_dir(dir.join(".nspawn-write-test"));
     let probe = dir.join(format!(".nspawn-write-test-{}", unique_suffix()));
     match fs::create_dir(&probe) {
         Ok(()) => {
             let _ = fs::remove_dir(&probe);
             Ok(())
         }
+        // Left by a process of the same PID that crashed: the directory takes new ones.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => {
             let inode = fs::metadata(dir).map(|m| m.ino()).unwrap_or(0);
             Err(anyhow::anyhow!(e)).context(explain_unwritable(dir, inode))
@@ -1824,6 +1828,17 @@ mod tests {
         assert!(
             !tmp.path().join("nowhere").exists(),
             "protect makes nothing"
+        );
+    }
+
+    #[test]
+    fn a_probe_left_behind_does_not_make_a_directory_unwritable() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join(".nspawn-write-test")).unwrap();
+        check_writable(tmp.path()).unwrap();
+        assert!(
+            !tmp.path().join(".nspawn-write-test").exists(),
+            "the probe of earlier versions is cleaned up"
         );
     }
 
