@@ -247,6 +247,9 @@ pub fn write_hooks(
     route: &NamespaceRoute,
 ) -> Result<bool> {
     let exe = std::env::current_exe().context("locating the nspawn binary")?;
+    let exe = replaced_binary(&exe)
+        .filter(|path| path.exists())
+        .unwrap_or(exe);
     let exe = fs::canonicalize(&exe).unwrap_or(exe);
     let mut command = quote(&exe.to_string_lossy());
     if let Some(path) = &config.config_path {
@@ -375,8 +378,26 @@ pub fn quote(arg: &str) -> String {
     }
 }
 
+/// Once the file a process runs has been replaced, as a package upgrade does,
+/// /proc/self/exe (which is what current_exe reads) reports "<path> (deleted)". The
+/// hooks must name the path itself, where the new file sits, or every machine started
+/// afterwards fails to execute them.
+fn replaced_binary(exe: &Path) -> Option<PathBuf> {
+    exe.to_str()?.strip_suffix(" (deleted)").map(PathBuf::from)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_replaced_binary_still_names_its_path() {
+        assert_eq!(
+            replaced_binary(Path::new("/usr/bin/nspawn (deleted)")),
+            Some(PathBuf::from("/usr/bin/nspawn"))
+        );
+        assert_eq!(replaced_binary(Path::new("/usr/bin/nspawn")), None);
+        assert_eq!(replaced_binary(Path::new("/usr/local/bin/nspawn")), None);
+    }
+
     use super::*;
 
     #[test]
