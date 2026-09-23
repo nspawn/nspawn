@@ -131,6 +131,9 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          # Nothing is checked out here, so gh cannot read the repository from a
+          # remote: name it.
+          GH_REPO: ${{ github.repository }}
         run: |
           mkdir -p upload
           find artifacts -type f \( -name '*.rpm' -o -name '*.deb' \
