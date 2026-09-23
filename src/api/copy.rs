@@ -338,13 +338,21 @@ fn pack_entry<W: Write>(
             pack_entry(builder, dir.as_fd(), &name, &path.join(&name), ids, stats)?;
         }
     } else if is(st.st_mode, SFlag::S_IFREG) {
+        // Without blocking, and checked again once open: what the machine swaps in
+        // meanwhile, a fifo say, must not hold the copy forever.
         let file = openat(
             dirfd,
             leaf,
-            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
             Mode::empty(),
         )
         .map_err(|e| nix_error(e, path))?;
+        if !is(
+            fstat(&file).map_err(|e| nix_error(e, path))?.st_mode,
+            SFlag::S_IFREG,
+        ) {
+            bail!("{}: changed while it was being copied", path.display());
+        }
         let size = st.st_size.max(0) as u64;
         header.set_entry_type(tar::EntryType::Regular);
         header.set_size(size);
