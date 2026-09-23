@@ -4,6 +4,7 @@
 //! the D-Bus service are two clients of the same functions.
 
 pub mod build;
+pub mod copy;
 pub mod create;
 pub mod hub;
 pub mod images;

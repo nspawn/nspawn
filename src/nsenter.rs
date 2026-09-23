@@ -170,6 +170,40 @@ pub fn pidfd_signal(pidfd: &OwnedFd, signal: i32) -> nix::Result<()> {
     .map(drop)
 }
 
+/// Raises the file capabilities (chown, DAC override and search, fowner, fsetid) of this
+/// thread again after a setfsuid(2) away from 0 dropped them: a copy into an idmapped
+/// tree writes as the machine's root, and still needs to write where root may.
+pub fn raise_file_capabilities() -> nix::Result<()> {
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const VERSION_3: u32 = 0x2008_0522;
+    // capability.h: CAP_CHOWN 0, CAP_DAC_OVERRIDE 1, CAP_DAC_READ_SEARCH 2,
+    // CAP_FOWNER 3, CAP_FSETID 4.
+    const FILE_CAPABILITIES: u32 = 0b1_1111;
+    let mut header = Header {
+        version: VERSION_3,
+        pid: 0,
+    };
+    let mut data = [Data::default(); 2];
+    // SAFETY: header and data are the layouts capget(2) and capset(2) take for version
+    // 3, two data entries; pid 0 is this thread.
+    Errno::result(unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) })?;
+    data[0].effective |= FILE_CAPABILITIES & data[0].permitted;
+    header.version = VERSION_3;
+    header.pid = 0;
+    Errno::result(unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()) }).map(drop)
+}
+
 /// Starts `argv` inside the machine whose leader is `leader`, with `image_env` plus PATH
 /// when missing (and TERM, on a terminal), its streams set up as `stdio` says.
 pub fn spawn(

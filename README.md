@@ -23,6 +23,7 @@ nspawn inspect web                  # everything nspawn knows about a machine, a
 nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
 nspawn shell fedora-44
 nspawn logs fedora-44               # console output; --inside reads the machine's own journal
+nspawn cp ./nginx.conf web:/etc/nginx/   # copy files in or out, like docker cp
 nspawn stop fedora-44
 nspawn rm -f web2                   # remove a machine, stopping it first (same as images rm)
 nspawn images rm fedora-44          # also frees layers and blobs nobody references
@@ -105,6 +106,18 @@ and `--label KEY=VALUE` on `start` or `create` adds labels of the machine's own 
 remembered like the ports (`--label none` forgets them). nspawn itself does nothing
 with them; `inspect` and `ps --json` show both the merged `labels` and the
 `image_labels`, for tools such as a reverse proxy that configures itself from them.
+
+`cp` copies files and directories between the host and a machine, running or not (a
+stopped mstack machine excepted: its tree only exists while it runs), with docker cp's
+rules: an existing directory receives the source under its own name, anything else is
+the name of the copy, and `DIR/.` copies the contents of DIR. What goes in belongs to
+root inside the machine, whatever user namespace it runs in; what comes out belongs to
+whoever ran `cp`, because the command line writes it. Paths inside the machine are
+resolved inside it, so a link there, absolute or not, never leads to the host; links
+are copied as links, and devices, sockets and fifos are left out. The service and the
+command line exchange a tar stream, as docker's API does. Where SELinux enforces, a host
+directory mounted with `-v` keeps its own label, which the service may not be allowed to
+write (docker needs `:z` for the same); named volumes are nspawn's and always work.
 
 One image, as many machines as you like: `nspawn create SOURCE NAME` makes another
 machine from an image that is already local, without touching the registry. It shares the

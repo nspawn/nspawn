@@ -194,6 +194,14 @@ impl Systemd {
         }
     }
 
+    /// The first host UID of a running machine's user namespace (0 without one).
+    pub async fn machine_uid_shift(&self, name: &str) -> Result<u32> {
+        self.machined
+            .get_machine_uid_shift(name.to_string())
+            .await
+            .with_context(|| format!("reading the UID shift of {name}"))
+    }
+
     /// True when `name` is owned on the system bus, i.e. that service is running.
     pub async fn name_has_owner(&self, name: &str) -> bool {
         let Ok(dbus) = zbus::fdo::DBusProxy::new(&self.conn).await else {

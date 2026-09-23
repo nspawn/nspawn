@@ -2,6 +2,7 @@
 //! org.nspawn service on the system bus; only the service itself, its installation and
 //! the hooks the machine units call run the library in this process.
 
+mod copy;
 mod login;
 mod machines;
 
@@ -486,6 +487,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         Command::Exec(args) => machines::exec(args, client).await,
         Command::Shell(args) => machines::shell(args, client).await,
         Command::Logs(args) => machines::logs(args, client).await,
+        Command::Cp(args) => copy::cp(args, client).await,
         Command::Daemon(_) | Command::Network(_) | Command::Completions(_) | Command::Manpage => {
             unreachable!("handled before")
         }

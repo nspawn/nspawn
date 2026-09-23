@@ -30,12 +30,12 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-dbus e2e-digest e2e-restart; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
   $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || true
-  rm -rf /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol /var/lib/nspawn/volumes/e2evol2 /var/lib/nspawn/volumes/e2evol-free /var/lib/nspawn/volumes/.e2e-hidden
+  rm -rf /tmp/e2e-cp /tmp/e2e-cp-* /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol /var/lib/nspawn/volumes/e2evol2 /var/lib/nspawn/volumes/e2evol-free /var/lib/nspawn/volumes/e2e-bootvol /var/lib/nspawn/volumes/.e2e-hidden
   kill "${listener_pid:-}" 2>/dev/null || true
   if [ "$networkd_was" != active ]; then
     systemctl stop systemd-networkd.service systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-resolve-hook.socket >/dev/null 2>&1 || true
@@ -107,7 +107,7 @@ for backend in overlay flat mstack; do
   vol_args=""
   if [ "$backend" != flat ]; then
     rm -rf /tmp/e2e-boot-vol; mkdir -p /tmp/e2e-boot-vol
-    vol_args="-v /tmp/e2e-boot-vol:/srv/vol"
+    vol_args="-v /tmp/e2e-boot-vol:/srv/vol -v e2e-bootvol:/srv/named"
   fi
   $NSPAWN start "$name" $vol_args || fail "start ($backend)"
   if [ "$backend" = overlay ]; then
@@ -151,12 +151,50 @@ for backend in overlay flat mstack; do
   grep -qi "bogus\|timestamp" /tmp/e2e-logs-err.txt || fail "logs --since bogus said nothing on stderr: $(cat /tmp/e2e-logs-err.txt)"
   timeout 5 $NSPAWN logs "$name" -f -n 2 </dev/null >/dev/null 2>&1; [ $? = 124 ] || fail "logs --follow did not keep following"
   retry 5 bash -c "! pgrep -f '[j]ournalctl.*$name' >/dev/null" || fail "journalctl kept following after its client left"
+  step "cp: files in and out of a running machine ($backend)"
+  cpd=/tmp/e2e-cp; rm -rf $cpd; mkdir -p $cpd/src/sub
+  echo "hello-$nonce" > $cpd/src/a.txt; chmod 640 $cpd/src/a.txt; touch -d @1000000 $cpd/src/a.txt
+  head -c 70000 /dev/urandom > $cpd/src/sub/b.bin; ln -s a.txt $cpd/src/rel
+  $NSPAWN cp $cpd/src/a.txt "$name:/root/" || fail "cp of a file into $name"
+  $NSPAWN cp $cpd/src/a.txt "$name:/tmp/tmpfs.txt" || fail "cp into the /tmp (tmpfs) of $name"
+  [ "$($NSPAWN exec "$name" -- stat -c %u /tmp/tmpfs.txt </dev/null | tr -d '\r')" = 0 ] || fail "a file copied into the /tmp of $name is not root's"
+  $NSPAWN cp "$name:/tmp/tmpfs.txt" $cpd/tmpfs-back.txt && cmp -s $cpd/src/a.txt $cpd/tmpfs-back.txt || fail "cp out of the /tmp (tmpfs) of $name"
+  [ "$($NSPAWN exec "$name" -- stat -c '%u:%g %a %Y' /root/a.txt </dev/null | tr -d '\r')" = "0:0 640 1000000" ] || fail "a file copied into $name is not root's with its mode and time: $($NSPAWN exec "$name" -- stat -c '%u:%g %a %Y' /root/a.txt </dev/null)"
+  $NSPAWN exec "$name" -- cat /root/a.txt </dev/null | tr -d '\r' | grep -q "hello-$nonce" || fail "the copied file has the wrong content"
+  $NSPAWN cp $cpd/src "$name:/opt/copied" || fail "cp of a directory to a new name in $name"
+  [ "$($NSPAWN exec "$name" -- readlink /opt/copied/rel </dev/null | tr -d '\r')" = a.txt ] || fail "a link inside a copied directory did not stay a link"
+  $NSPAWN cp $cpd/src "$name:/opt/" && $NSPAWN exec "$name" -- test -f /opt/src/sub/b.bin </dev/null || fail "cp of a directory into an existing one"
+  $NSPAWN cp $cpd/src/a.txt "$name:/no-such-dir-$nonce/" >/dev/null 2>&1 && fail "cp to a missing directory with a trailing slash succeeded"
+  $NSPAWN cp "$name:/opt/copied" $cpd/out || fail "cp of a directory out of $name"
+  diff -r $cpd/src $cpd/out >/dev/null || fail "the directory copied out differs from what went in"
+  # An absolute link in the middle of the path is followed inside the machine.
+  $NSPAWN exec "$name" -- ln -sfn /root /tmp/rootlink </dev/null
+  $NSPAWN cp "$name:/tmp/rootlink/a.txt" $cpd/through-link || fail "cp through an absolute link inside $name"
+  grep -q "hello-$nonce" $cpd/through-link 2>/dev/null || fail "an absolute link inside $name was not followed inside it"
+  $NSPAWN exec "$name" -- ln -sfn /proc/1/root/etc /root/magic </dev/null
+  $NSPAWN cp "$name:/root/magic/hostname" $cpd/magic >/dev/null 2>&1 && fail "cp went through a magic link of /proc"
+  $NSPAWN cp "$name:/usr/bin/bash" $cpd/bash || fail "cp of a binary out of $name"
+  [ "$(sha256sum < $cpd/bash | cut -d' ' -f1)" = "$($NSPAWN exec "$name" -- sha256sum /usr/bin/bash </dev/null | tr -d '\r' | cut -d' ' -f1)" ] || fail "a binary copied out is not byte exact"
+  timeout 1 $NSPAWN cp "$name:/usr" $cpd/usr-partial >/dev/null 2>&1
+  sleep 1
+  systemctl is-active nspawn.service >/dev/null || fail "a cp client that went away took the service down"
   if [ "$backend" != flat ]; then
     step "volume in a booted machine ($backend: private users, idmapped)"
     $NSPAWN exec "$name" -- /bin/sh -c 'echo booted > /srv/vol/from-machine' </dev/null || fail "cannot write to the volume inside $name"
     [ "$(cat /tmp/e2e-boot-vol/from-machine 2>/dev/null)" = booted ] || fail "volume write not visible on the host"
     [ "$(stat -c %u /tmp/e2e-boot-vol/from-machine)" = 0 ] || fail "root inside did not write as root on the host (idmap)"
     $NSPAWN exec "$name" -- /usr/bin/systemctl is-active nspawn-volumes.service </dev/null | tr -d '\r' | grep -qx active || fail "nspawn-volumes.service not active inside $name"
+    # Volumes are idmapped binds: a copy into one has to be made as the machine's root,
+    # and lands as root on the host. A named volume is nspawn's own directory; a host
+    # directory keeps its SELinux label, which the service may not write to (as with
+    # docker without :z), so that one is only tried where SELinux does not enforce.
+    $NSPAWN cp /tmp/e2e-cp/src/a.txt "$name:/srv/named/" || fail "cp into the named volume of $name"
+    [ "$(stat -c %u /var/lib/nspawn/volumes/e2e-bootvol/a.txt 2>/dev/null)" = 0 ] || fail "a file copied into the named volume of $name is not root's on the host"
+    [ "$($NSPAWN exec "$name" -- stat -c %u /srv/named/a.txt </dev/null | tr -d '\r')" = 0 ] || fail "a file copied into the named volume of $name is not root's inside"
+    if [ "$(getenforce 2>/dev/null)" != Enforcing ]; then
+      $NSPAWN cp /tmp/e2e-cp/src/a.txt "$name:/srv/vol/" || fail "cp into the host-directory volume of $name"
+      [ "$(stat -c %u /tmp/e2e-boot-vol/a.txt 2>/dev/null)" = 0 ] || fail "a file copied into the volume of $name is not root's on the host"
+    fi
   fi
   step "network through the nspawn bridge"
   if [ "$networkd_was" != active ]; then
@@ -197,8 +235,22 @@ for backend in overlay flat mstack; do
     fi
   fi
   $NSPAWN inspect "$name" | python3 -c "import json,sys; d = json.load(sys.stdin); assert d[0]['state'] == 'stopped', d" || fail "inspect of a stopped $name"
+  step "cp into a stopped machine ($backend)"
+  if [ "$backend" = mstack ]; then
+    out=$($NSPAWN cp /tmp/e2e-cp/src/a.txt "$name:/root/stopped.txt" 2>&1) && fail "cp into a stopped mstack machine succeeded"
+    echo "$out" | grep -q "start it first" || fail "cp into a stopped mstack machine was not explained: $out"
+  else
+    if [ "$backend" = overlay ]; then
+      systemctl stop "$(systemd-escape -p --suffix=mount "/var/lib/machines/$name")" || fail "cannot unmount the overlay of $name"
+    fi
+    $NSPAWN cp /tmp/e2e-cp/src/a.txt "$name:/root/stopped.txt" || fail "cp into a stopped $backend machine"
+  fi
   step "stop right after start"
-  $NSPAWN start "$name" && $NSPAWN stop "$name" || fail "stop right after start ($backend)"
+  $NSPAWN start "$name" || fail "start after cp ($backend)"
+  if [ "$backend" != mstack ]; then
+    [ "$($NSPAWN exec "$name" -- stat -c %u /root/stopped.txt </dev/null | tr -d '\r')" = 0 ] || fail "a file copied into the stopped $backend machine is not root's inside"
+  fi
+  $NSPAWN stop "$name" || fail "stop right after start ($backend)"
   step "images rm"
   $NSPAWN images rm "$name" || fail "images rm ($backend)"
   $NSPAWN images ls > /tmp/e2e-img.txt; grep -q "^ *$name " /tmp/e2e-img.txt && fail "$name still listed after rm"
@@ -338,6 +390,10 @@ echo "$out" | grep -q "inside:$app" || fail "exec via namespaces did not run ins
 [ "$($NSPAWN exec $app --user 65534 -- id -u </dev/null | tr -d '\r')" = "65534" ] || fail "exec --user ignored"
 $NSPAWN exec $app -- /bin/sh -c 'exit 7' </dev/null; [ $? -eq 7 ] || fail "exec did not propagate the exit code"
 [ "$(printf 'a\nb' | $NSPAWN exec $app -- cat)" = "$(printf 'a\nb')" ] || fail "piped stdin/stdout through exec is not byte exact"
+echo "app-$nonce" > /tmp/e2e-cp-app
+$NSPAWN cp /tmp/e2e-cp-app "$app:/tmp/" || fail "cp into an app"
+[ "$($NSPAWN exec $app -- stat -c %u /tmp/e2e-cp-app </dev/null | tr -d '\r')" = 0 ] || fail "a file copied into an app is not root's"
+$NSPAWN cp "$app:/etc/passwd" /tmp/e2e-cp-app-passwd && grep -q "^root:" /tmp/e2e-cp-app-passwd || fail "cp out of an app"
 step "app on the bridge: address, DNS, internet and published port (no networkd anywhere)"
 if [ "$networkd_was" != active ]; then
   systemctl is-active systemd-networkd >/dev/null && fail "systemd-networkd is running during the app section"
@@ -610,7 +666,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine StartMachine StopMachine Exec Shell Logs ListNetwork NetworkUp Login Logout RemoveMachines ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine StartMachine StopMachine Exec Shell Logs ListNetwork NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do
@@ -723,7 +779,6 @@ for blob in /var/lib/nspawn/blobs/sha256-*; do
 done
 ls /var/lib/nspawn/blobs/ | grep -q "^\.part-\|^\.hold-" && fail "leftovers in the blob store after two pulls: $(ls -a /var/lib/nspawn/blobs/ | grep '^\.')"
 $NSPAWN start e2e-twin-b >/dev/null && $NSPAWN exec e2e-twin-b -- /usr/bin/true </dev/null && $NSPAWN stop e2e-twin-b >/dev/null || fail "a machine pulled alongside another does not run"
-$NSPAWN images rm e2e-twin-a e2e-twin-b >/dev/null || fail "rm the twin images"
 
 step "polkit: a user who is not root, with and without a rule"
 who=${SUDO_USER:-}
@@ -751,6 +806,10 @@ polkit.addRule(function (action, subject) {
 RULE
   retry 5 bash -c "sudo -u $who $NSPAWN ps >/dev/null 2>&1" || fail "$who still cannot list machines with the rule in place: $(sudo -u "$who" $NSPAWN ps 2>&1 | tail -2)"
   sudo -u "$who" $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || fail "$who cannot run a command that changes things with the rule in place"
+  cpd=$(mktemp -d /tmp/e2e-cp-user.XXXXXX); chown "$who" "$cpd"
+  sudo -u "$who" $NSPAWN cp e2e-twin-b:/etc/passwd "$cpd/" || fail "$who cannot copy out of a machine"
+  [ "$(stat -c %U "$cpd/passwd" 2>/dev/null)" = "$who" ] || fail "a file copied out does not belong to $who"
+  cmp -s "$cpd/passwd" /var/lib/machines/e2e-twin-b/etc/passwd || fail "the file $who copied out differs"
   # The rule lets them call; another user's command is still not theirs to read.
   if [ -n "${proc:-}" ] && command -v busctl >/dev/null 2>&1; then
     out=$(sudo -u "$who" busctl --system get-property org.nspawn "$proc" org.nspawn.Process Argv 2>&1) && fail "$who could read a command root ran: $out"
@@ -762,7 +821,16 @@ RULE
   $NSPAWN ps >/dev/null || fail "root cannot list machines"
 fi
 
+$NSPAWN images rm e2e-twin-a e2e-twin-b >/dev/null || fail "rm the twin images"
+
 step "error handling (these commands must fail with a useful message)"
+out=$($NSPAWN cp /etc/hosts /tmp/e2e-cp-x 2>&1) && fail "cp between two local paths succeeded"
+echo "$out" | grep -q "MACHINE:PATH" || fail "cp of two local paths not explained: $out"
+out=$($NSPAWN cp a:/x b:/y 2>&1) && fail "cp between two machines succeeded"
+echo "$out" | grep -q "between machines" || fail "cp between machines not explained: $out"
+out=$($NSPAWN cp e2e-nonexistent:/etc/hosts /tmp/ 2>&1) && fail "cp out of a missing machine succeeded"
+echo "$out" | grep -q "no machine or image named" || fail "cp out of a missing machine not explained: $out"
+out=$($NSPAWN cp e2e-nonexistent: /tmp/ 2>&1) && fail "cp with no path after the colon succeeded"
 out=$($NSPAWN pull "$NSPAWN_REGISTRY/does-not-exist:1" --name e2e-x 2>&1); rc=$?
 echo "$out"
 [ $rc -ne 0 ] || fail "pull of a missing image succeeded"

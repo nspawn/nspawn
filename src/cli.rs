@@ -64,6 +64,8 @@ pub enum Command {
     Shell(ShellArgs),
     /// Show what a machine printed, like docker logs.
     Logs(LogsArgs),
+    /// Copy files between the host and a machine, like docker cp.
+    Cp(CpArgs),
     /// The bridge network shared by the machines.
     Network(NetworkArgs),
     /// Manage named volumes (-v NAME:/path), like docker volume.
@@ -340,6 +342,18 @@ pub enum ImagesCommand {
     Ls(OutputArgs),
     /// Remove local images (and the layers nobody uses any more).
     Rm(ImagesRmArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CpArgs {
+    /// What to copy: a local path, or MACHINE:PATH (a local path with a colon is
+    /// written ./a:b). DIR/. copies the contents of DIR.
+    #[arg(value_name = "SOURCE")]
+    pub source: String,
+    /// Where to: MACHINE:PATH, or a local path. An existing directory receives the source
+    /// under its own name; otherwise the copy takes this name.
+    #[arg(value_name = "DESTINATION")]
+    pub destination: String,
 }
 
 #[derive(Args, Debug)]

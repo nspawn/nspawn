@@ -46,6 +46,14 @@ pub struct Manager {
     state: Arc<State>,
 }
 
+/// What a copy did, as the job's result.
+fn copy_result(stats: &api::copy::Stats) -> HashMap<String, OwnedValue> {
+    HashMap::from([
+        ("entries".to_string(), values::v(stats.entries)),
+        ("bytes".to_string(), values::v(stats.bytes)),
+    ])
+}
+
 impl Manager {
     pub fn new(state: Arc<State>) -> Self {
         Manager { state }
@@ -477,6 +485,79 @@ impl Manager {
                     "removed".to_string(),
                     values::v(removal.removed),
                 )]))
+            },
+        )
+        .await?)
+    }
+
+    /// Like `cp NAME:PATH ...`: `path` of the machine (running, or a stopped overlay or
+    /// flat one) as a tar stream on the returned pipe, owners as the machine sees them,
+    /// and a job that ends with its result (entries, bytes) or why it could not.
+    async fn copy_from(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        machine: String,
+        path: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<(zbus::zvariant::OwnedFd, OwnedObjectPath)> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        Options::new(&options).finish()?;
+        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .map_err(|e| Error::Failed(format!("creating a pipe: {e}")))?;
+        let target = format!("{machine}:{path}");
+        let job = jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "cp",
+            &target,
+            move |ctx, reporter| async move {
+                let stats =
+                    api::copy::copy_from(&ctx, &machine, &path, write, jobs::report(&reporter))
+                        .await?;
+                Ok(copy_result(&stats))
+            },
+        )
+        .await?;
+        Ok((zbus::zvariant::OwnedFd::from(read), job))
+    }
+
+    /// Like `cp ... NAME:PATH`: the tar stream read from `stream` unpacked at `path` of
+    /// the machine by docker cp's rules, everything owned by root inside. Options:
+    /// contents (b), the source was written DIR/. and its contents go into `path`. A job.
+    async fn copy_to(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        machine: String,
+        path: String,
+        stream: zbus::zvariant::OwnedFd,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<OwnedObjectPath> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        let mut options = Options::new(&options);
+        let contents = options.bool("contents", false)?;
+        options.finish()?;
+        let input = std::os::fd::OwnedFd::from(stream);
+        let target = format!("{machine}:{path}");
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "cp",
+            &target,
+            move |ctx, reporter| async move {
+                let stats = api::copy::copy_to(
+                    &ctx,
+                    &machine,
+                    &path,
+                    contents,
+                    input,
+                    jobs::report(&reporter),
+                )
+                .await?;
+                Ok(copy_result(&stats))
             },
         )
         .await?)

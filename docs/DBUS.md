@@ -69,7 +69,7 @@ Where SELinux is enforcing (Fedora, RHEL) the service needs a domain of its
 own, `nspawn_t`, like machined and the container runtimes have: the base
 policy lets no domain touch the pipes of an unconfined service, so the bus
 drops the service the moment it hands a descriptor over (`Exec`, `Shell`,
-`Logs`). The policy lives in `packaging/selinux` and the `nspawn-selinux`
+`Logs`, `CopyFrom`). The policy lives in `packaging/selinux` and the `nspawn-selinux`
 package loads it; `--install` says so when SELinux is enabled and the module
 is missing, and also when the binary it just wired up is not labelled
 `nspawn_exec_t`, which a build installed by hand is not: the service would
@@ -114,6 +114,8 @@ Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 | `StopMachine(s name, a{sv} options) -> (s, as)` | `stop` | options force, wait (default true), timeout (seconds, default 10, a day at most); "stopped" or "was-not-running", and the notes (a program that had to be killed) |
 | `Exec(s machine, as argv, s user, a{sv} options) -> (a{sh}, o)` | `exec` | user "" for root; options tty (default true), rows, cols, env (the caller's `TERM=` among them; xterm otherwise on a terminal); returns the streams ("tty", or "stdin", "stdout", "stderr") and a process object |
 | `Shell(s machine, s user, a{sv} options) -> (h, s)` | `shell` | the login session machined offers for a booted machine: its pseudo terminal and the terminal's path; options env, as for `Exec`; apps get `Exec` of a shell with a tty instead |
+| `CopyFrom(s machine, s path, a{sv} options) -> (h, o)` | `cp NAME:PATH ...` | a tar stream of `path` on the pipe, owners as the machine sees them, and a job with the outcome (its result: entries, bytes); a running machine, or a stopped overlay or flat one |
+| `CopyTo(s machine, s path, h stream, a{sv} options) -> o` | `cp ... NAME:PATH` | the tar stream read from `stream` unpacked at `path` by docker cp's rules, everything root's inside; option contents (the source was `DIR/.`); a job |
 | `Logs(s machine, a{sv} options) -> (a{sh}, o)` | `logs` | options follow, lines, since, timestamps, all, inside; journalctl's "stdout" and "stderr" and a process object for its exit status; journalctl is stopped once nobody reads its output |
 
 `StartMachine` waits for a booted machine's init and `StopMachine` for the
@@ -164,7 +166,7 @@ property lists them.
 ## org.nspawn.Job at /org/nspawn/job/N
 
 A job is returned by the long operations and keeps what happened: properties
-`Kind` (pull, create, push, build, rm, volume-rm, volume-prune), `Target`, `State` (running, done,
+`Kind` (pull, create, push, build, rm, volume-rm, volume-prune, cp), `Target`, `State` (running, done,
 failed), `Output` (every line so far), `Error` and `Result` (a dictionary,
 for a pull its name, reference and mode, for an rm the names removed). The
 service does not go idle before a job or a process has announced its end.

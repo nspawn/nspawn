@@ -26,6 +26,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `bridge.rs`, `hostnet.rs` | the nspawn0 bridge, ports, firewalls; veth mode |
 | `volume.rs`, `volmount.rs` | `-v` parsing; host-side mounts for mstack machines |
 | `nsenter.rs`, `pty.rs` | exec through namespaces, terminal pumping |
+| `api/copy.rs` | cp: tar streams packed and unpacked relative to directory descriptors, paths resolved with openat2 inside the machine's root |
 | `systemd.rs` | typed D-Bus calls, job waiting |
 
 ## On disk
