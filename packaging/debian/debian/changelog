@@ -1,3 +1,11 @@
+nspawn (1.1.1-1) unstable; urgency=medium
+
+  * Progress of pulls and pushes on the terminal; fixes for hosts without
+    IPv6, the permissions of the state directory, exec and the removal of
+    machines.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Wed, 23 Sep 2026 23:30:00 -0500
+
 nspawn (1.1.0-1) unstable; urgency=medium
 
   * Restart policies, resource limits, inspect and JSON output, labels, cp,
