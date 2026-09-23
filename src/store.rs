@@ -289,6 +289,7 @@ impl Store {
         self.machines_private_dir().join(name)
     }
     pub fn remove_machine_files(&self, name: &str) -> Result<()> {
+        crate::reference::validate_entry_name(name)?;
         let dir = self.machine_files_dir(name);
         match fs::remove_dir_all(&dir) {
             Ok(()) => Ok(()),
@@ -349,6 +350,7 @@ impl Store {
 
     /// Marks `name` as starting until the guard is dropped.
     pub fn mark_starting(&self, name: &str) -> Result<Starting> {
+        crate::reference::validate_entry_name(name)?;
         let path = self.starting_path(name);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -360,6 +362,9 @@ impl Store {
     /// Whether a start of `name` is in progress (a marker left by a start that died with
     /// its process does not count).
     pub fn is_starting(&self, name: &str) -> bool {
+        if crate::reference::validate_entry_name(name).is_err() {
+            return false;
+        }
         let path = self.starting_path(name);
         path.exists() && !is_stale(&path)
     }
@@ -370,12 +375,14 @@ impl Store {
 
     /// The manifest exactly as fetched or built, so its digest stays valid when pushing.
     pub fn save_manifest(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        crate::reference::validate_entry_name(name)?;
         fs::create_dir_all(self.manifests_dir())
             .with_context(|| format!("creating {}", self.manifests_dir().display()))?;
         write_atomically(&self.manifests_dir().join(format!("{name}.json")), bytes)
     }
 
     pub fn load_manifest(&self, name: &str) -> Result<Vec<u8>> {
+        crate::reference::validate_entry_name(name)?;
         let path = self.manifests_dir().join(format!("{name}.json"));
         fs::read(&path).with_context(|| format!("reading {}", path.display()))
     }
@@ -466,12 +473,17 @@ impl Store {
     }
 
     pub fn record_image(&self, record: &ImageRecord) -> Result<()> {
+        crate::reference::validate_entry_name(&record.name)?;
         let path = self.images_dir().join(format!("{}.json", record.name));
         let text = serde_json::to_string_pretty(record)?;
         write_atomically(&path, text.as_bytes())
     }
 
     pub fn load_image(&self, name: &str) -> Result<Option<ImageRecord>> {
+        // A reference ("fedora:44") or a path is no record's name.
+        if crate::reference::validate_entry_name(name).is_err() {
+            return Ok(None);
+        }
         let path = self.images_dir().join(format!("{name}.json"));
         if !path.exists() {
             return Ok(None);
@@ -534,6 +546,7 @@ impl Store {
     }
 
     pub fn remove_record(&self, name: &str) -> Result<()> {
+        crate::reference::validate_entry_name(name)?;
         for path in [
             self.images_dir().join(format!("{name}.json")),
             self.manifests_dir().join(format!("{name}.json")),

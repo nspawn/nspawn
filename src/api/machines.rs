@@ -15,7 +15,7 @@ use crate::hostnet;
 use crate::nsenter;
 use crate::oci::Mode;
 use crate::policy::{Limits, Restart};
-use crate::reference::validate_machine_name;
+use crate::reference::{validate_entry_name, validate_machine_name};
 use crate::settings::{self, Bind, BridgeMount, MachineSettings, Network};
 use crate::store::{now_unix, ImageRecord, Store};
 use crate::systemd::{Systemd, UnitState};
@@ -49,6 +49,7 @@ pub async fn refuse_foreign(sd: &Systemd, name: &str) -> Result<()> {
 /// One machine or image by name, as `list` shows it: machined's view when it runs, the
 /// record as stopped otherwise.
 pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
+    validate_entry_name(name)?;
     let sd = ctx.sd().await?;
     refuse_foreign(sd, name).await?;
     let record = ctx.store.load_image(name)?;
@@ -615,6 +616,7 @@ pub fn latch(restart: Restart, force: bool, mode: Option<Mode>) -> Latch {
 }
 
 pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Result<StopOutcome> {
+    validate_entry_name(&args.name)?;
     let sd = ctx.sd().await?;
     refuse_foreign(sd, &args.name).await?;
     let store = &ctx.store;
@@ -944,6 +946,7 @@ pub async fn spawn_in_namespaces(
     extra_env: &[String],
     stdio: nsenter::Stdio,
 ) -> Result<nsenter::Process> {
+    validate_entry_name(machine)?;
     let sd = ctx.sd().await?;
     refuse_foreign(sd, machine).await?;
     if !sd.machine_exists(machine).await? {
@@ -977,6 +980,7 @@ pub async fn open_shell(
     args: Vec<String>,
     env: Vec<String>,
 ) -> Result<(OwnedFd, String)> {
+    validate_entry_name(machine)?;
     let sd = ctx.sd().await?;
     refuse_foreign(sd, machine).await?;
     if !sd.machine_exists(machine).await? {

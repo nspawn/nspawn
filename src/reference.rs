@@ -129,6 +129,21 @@ pub fn sanitize_machine_name(name: &str) -> String {
     out
 }
 
+/// A name that stays one entry of the directory it is joined to, which every machine or
+/// image name given to nspawn must be before it reaches a path. machined's own image names
+/// follow the same rule (no slash, not hidden), so every image it lists passes, whatever
+/// else is in its name.
+pub fn validate_entry_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.starts_with('.')
+        || name.contains('/')
+        || name.chars().any(char::is_control)
+    {
+        bail!("invalid machine name {name:?}");
+    }
+    Ok(())
+}
+
 pub fn validate_machine_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 || name.starts_with('.') {
         bail!("invalid machine name {name:?}");
@@ -204,6 +219,25 @@ mod tests {
         assert_eq!(o.registry(), HUB);
         assert_eq!(o.repository(), "fedora");
         assert_eq!(o.tag(), Some("44"));
+    }
+
+    #[test]
+    fn names_never_leave_their_directory() {
+        for good in ["fedora-44", "web", "a.b", "odd+name,1", "a..b"] {
+            assert!(validate_entry_name(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../images",
+            "../../../home",
+            "a/b",
+            ".hidden",
+            "a\nb",
+        ] {
+            assert!(validate_entry_name(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

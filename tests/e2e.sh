@@ -911,6 +911,14 @@ echo "$out"
 [ $rc -ne 0 ] || fail "start of an unknown image succeeded"
 echo "$out" | grep_q "no image named" || fail "start of an unknown image gave no hint"
 out=$($NSPAWN stop e2e-nonexistent 2>&1); [ $? -ne 0 ] && echo "$out" | grep_q "not running" || fail "stop of unknown machine"
+# A name is joined to paths: one that climbs out of its directory reaches none of them.
+mkdir -p /tmp/e2e-sentinel/keep
+for cmd in "images rm" "rm" "rm -f" "stop" "inspect"; do
+  out=$($NSPAWN $cmd ../../../tmp/e2e-sentinel 2>&1) && fail "$cmd accepted a name that leaves its directory"
+  echo "$out" | grep_q "invalid machine name" || fail "$cmd of ../../../tmp/e2e-sentinel was not refused by name: $out"
+done
+[ -d /tmp/e2e-sentinel/keep ] || fail "a removal reached a directory outside the store"
+rm -rf /tmp/e2e-sentinel
 out=$($NSPAWN --registry 127.0.0.1:9 search --source hub e2e-$nonce 2>&1 >/dev/null); rc=$?
 [ $rc -eq 0 ] || fail "search with an unreachable hub failed instead of warning: $out"
 echo "$out" | grep_q "warning: 127.0.0.1:9" || fail "search did not warn about the unreachable hub: $out"

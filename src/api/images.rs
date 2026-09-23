@@ -103,8 +103,16 @@ pub async fn remove_machines(
     let mut removal = Removal::default();
     // Stopping takes the store lock itself, so it happens before the removal takes it.
     let mut skip = std::collections::HashSet::new();
+    // A name is joined to paths below: one that is not a plain entry is refused first.
+    for name in names {
+        if let Err(e) = crate::reference::validate_entry_name(name) {
+            removal.failed.push((name.clone(), format!("{e:#}")));
+            skip.insert(name.clone());
+        }
+    }
     if force {
-        for name in names {
+        let valid: Vec<&String> = names.iter().filter(|n| !skip.contains(*n)).collect();
+        for name in valid {
             if store.is_starting(name) {
                 continue;
             }

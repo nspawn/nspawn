@@ -73,6 +73,7 @@ pub async fn list(ctx: &Context) -> Result<(BridgeInfo, Vec<NetworkEntry>)> {
 /// ExecStartPre of systemd-nspawn@NAME.service: the same preparation `start` does, so
 /// that machinectl, a boot-time enablement or a restart get their network too.
 pub async fn prepare(ctx: &Context, name: &str) -> Result<()> {
+    crate::reference::validate_entry_name(name)?;
     let sd = ctx.sd().await?;
     let store = &ctx.store;
     let _lock = store.lock_for(Duration::from_secs(60)).await?;
@@ -123,6 +124,7 @@ pub async fn publish(ctx: &Context, name: &str) -> Result<()> {
 /// ExecStopPost: runs however the machine ended (stop, exit, crash, machinectl). No lock:
 /// it runs inside the stop job that `images rm` and friends wait for while holding it.
 pub fn release(ctx: &Context, name: &str) -> Result<()> {
+    crate::reference::validate_entry_name(name)?;
     let record = ctx.store.load_image(name)?;
     machines::release_machine(name, record.as_ref())
 }
