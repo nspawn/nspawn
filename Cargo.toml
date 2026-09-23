@@ -31,6 +31,8 @@ xattr = "1"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 zbus_systemd = { version = "0.26100", features = ["machine1", "systemd1", "zbus-async-tokio"] }
 zstd = "0.14"
+clap_complete = "4"
+clap_mangen = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

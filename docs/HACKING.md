@@ -87,6 +87,11 @@ rule for a group), the SELinux policy (`selinux/`) and the Fedora spec
 (`fedora/nspawn.spec`), which builds `nspawn` and the noarch `nspawn-selinux`
 from a source tarball plus a `cargo vendor` tarball.
 
+The shell completions and the manual page are generated from the command line
+itself, by `nspawn completions bash|zsh|fish` and `nspawn manpage`; the three
+recipes run them at build time, so a new command or flag reaches them without
+anyone writing it twice.
+
 `daemon --install` writes some of the same paths, which belong to the
 packages: `/usr/share/dbus-1/system-services/org.nspawn.service` and
 `/usr/share/polkit-1/actions/org.nspawn.policy`. Installing a package over

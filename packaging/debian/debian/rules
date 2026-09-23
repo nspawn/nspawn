@@ -13,6 +13,15 @@ override_dh_auto_test:
 
 override_dh_auto_install:
 	install -D -m 0755 target/release/nspawn debian/nspawn/usr/bin/nspawn
+	# Written from the command line's own definition, so they cannot drift from it.
+	target/release/nspawn completions bash > debian/nspawn.bash
+	target/release/nspawn completions zsh > debian/_nspawn
+	target/release/nspawn completions fish > debian/nspawn.fish
+	target/release/nspawn manpage > debian/nspawn.1
+	install -D -m 0644 debian/nspawn.bash debian/nspawn/usr/share/bash-completion/completions/nspawn
+	install -D -m 0644 debian/_nspawn debian/nspawn/usr/share/zsh/vendor-completions/_nspawn
+	install -D -m 0644 debian/nspawn.fish debian/nspawn/usr/share/fish/vendor_completions.d/nspawn.fish
+	install -D -m 0644 debian/nspawn.1 debian/nspawn/usr/share/man/man1/nspawn.1
 	install -D -m 0644 packaging/systemd/nspawn.service debian/nspawn/usr/lib/systemd/system/nspawn.service
 	install -D -m 0644 packaging/dbus/org.nspawn.service debian/nspawn/usr/share/dbus-1/system-services/org.nspawn.service
 	install -D -m 0644 packaging/dbus/org.nspawn.conf debian/nspawn/usr/share/dbus-1/system.d/org.nspawn.conf
@@ -20,7 +29,7 @@ override_dh_auto_install:
 	install -d -m 0755 debian/nspawn/etc/nspawn debian/nspawn/var/lib/nspawn
 
 override_dh_auto_clean:
-	rm -rf target debian/cargo-home
+	rm -rf target debian/cargo-home debian/nspawn.bash debian/_nspawn debian/nspawn.fish debian/nspawn.1
 
 # dh_clean deletes every *.orig in the tree, and cargo keeps a Cargo.toml.orig in
 # each vendored crate whose checksum it verifies: without this the build stops at

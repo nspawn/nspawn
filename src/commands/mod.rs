@@ -5,11 +5,13 @@
 mod login;
 mod machines;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use zbus::zvariant::Value;
 
 use crate::api::{self, Context};
 use crate::backend::BackendChoice;
+use clap::CommandFactory;
+
 use crate::cli::{Cli, Command, HubCommand, ImagesCommand, MachinesCommand, NetworkCommand};
 use crate::client::{self, Client, Options};
 use crate::config::Config;
@@ -24,6 +26,17 @@ pub async fn run(cli: Cli) -> Result<()> {
         cli.ca_cert.clone(),
     )?;
     match cli.command {
+        // What a shell and man(1) need, written from the command line's own definition
+        // so that they cannot drift from it. The packages generate them at build time.
+        Command::Completions(a) => {
+            let mut command = Cli::command();
+            let name = command.get_name().to_string();
+            clap_complete::generate(a.shell, &mut command, name, &mut std::io::stdout());
+            Ok(())
+        }
+        Command::Manpage => clap_mangen::Man::new(Cli::command())
+            .render(&mut std::io::stdout())
+            .context("writing the manual page"),
         Command::Daemon(a) => {
             if a.install {
                 for line in crate::daemon::install::install(config.config_path.as_deref()).await? {
@@ -376,7 +389,9 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         Command::Exec(args) => machines::exec(args, client).await,
         Command::Shell(args) => machines::shell(args, client).await,
         Command::Logs(args) => machines::logs(args, client).await,
-        Command::Daemon(_) | Command::Network(_) => unreachable!("handled before"),
+        Command::Daemon(_) | Command::Network(_) | Command::Completions(_) | Command::Manpage => {
+            unreachable!("handled before")
+        }
     }
 }
 

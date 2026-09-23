@@ -71,6 +71,11 @@ CARGO
 
 %build
 cargo build --release --offline
+# Written from the command line's own definition, so they cannot drift from it.
+for shell in bash zsh fish; do
+    ./target/release/%{name} completions ${shell} > %{name}.${shell}
+done
+./target/release/%{name} manpage > %{name}.1
 make -f %{_datadir}/selinux/devel/Makefile -C packaging/selinux %{name}.pp
 bzip2 -9 packaging/selinux/%{name}.pp
 
@@ -80,6 +85,10 @@ install -D -m 0644 packaging/systemd/%{name}.service %{buildroot}%{_unitdir}/%{n
 install -D -m 0644 packaging/dbus/org.nspawn.service %{buildroot}%{_datadir}/dbus-1/system-services/org.nspawn.service
 install -D -m 0644 packaging/dbus/org.nspawn.conf %{buildroot}%{_datadir}/dbus-1/system.d/org.nspawn.conf
 install -D -m 0644 packaging/polkit/org.nspawn.policy %{buildroot}%{_datadir}/polkit-1/actions/org.nspawn.policy
+install -D -m 0644 %{name}.bash %{buildroot}%{_datadir}/bash-completion/completions/%{name}
+install -D -m 0644 %{name}.zsh %{buildroot}%{_datadir}/zsh/site-functions/_%{name}
+install -D -m 0644 %{name}.fish %{buildroot}%{_datadir}/fish/vendor_completions.d/%{name}.fish
+install -D -m 0644 %{name}.1 %{buildroot}%{_mandir}/man1/%{name}.1
 install -D -m 0644 packaging/selinux/%{name}.pp.bz2 %{buildroot}%{_datadir}/selinux/packages/%{selinuxtype}/%{name}.pp.bz2
 install -D -m 0644 packaging/selinux/%{name}.if %{buildroot}%{_datadir}/selinux/devel/include/contrib/%{name}.if
 install -d -m 0755 %{buildroot}%{_sysconfdir}/%{name}
@@ -127,6 +136,10 @@ fi
 %{_datadir}/dbus-1/system-services/org.nspawn.service
 %{_datadir}/dbus-1/system.d/org.nspawn.conf
 %{_datadir}/polkit-1/actions/org.nspawn.policy
+%{_datadir}/bash-completion/completions/%{name}
+%{_datadir}/zsh/site-functions/_%{name}
+%{_datadir}/fish/vendor_completions.d/%{name}.fish
+%{_mandir}/man1/%{name}.1*
 %dir %{_sysconfdir}/%{name}
 %dir %{_sharedstatedir}/%{name}
 

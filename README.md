@@ -79,6 +79,10 @@ source's layers and gets a writable layer, an address, settings and ports of its
 (`-p`, `--network`); `images rm` of one never affects the others. `pull` with `--name`
 ends up the same way but resolves the manifest through the registry first.
 
+Completions for bash, zsh and fish come with the packages; from a build of your own,
+`nspawn completions bash > ~/.local/share/bash-completion/completions/nspawn` (or the
+equivalent for your shell). `man nspawn` is the same reference the packages install.
+
 ## Registries and credentials
 
 Every command talks to the `org.nspawn` service on the system bus, which decides

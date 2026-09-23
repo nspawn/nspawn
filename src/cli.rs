@@ -64,6 +64,18 @@ pub enum Command {
     Network(NetworkArgs),
     /// Serve org.nspawn on the system bus (started by the bus; see --install).
     Daemon(DaemonArgs),
+    /// Print the completions for a shell, which the packages install for you.
+    Completions(CompletionsArgs),
+    /// Print the manual page in roff, as the packages ship it.
+    #[command(hide = true)]
+    Manpage,
+}
+
+#[derive(Args, Debug)]
+pub struct CompletionsArgs {
+    /// Shell to write the completions for.
+    #[arg(value_enum)]
+    pub shell: clap_complete::Shell,
 }
 
 #[derive(Args, Debug)]
@@ -398,4 +410,47 @@ pub struct LogsArgs {
     /// Boot machines only: read the machine's own journal instead of its console output.
     #[arg(long)]
     pub inside: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_command_line_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    /// The completions and the manual page are written from this very definition, so a
+    /// command or a flag cannot be in one and missing from the other.
+    #[test]
+    fn what_shells_and_man_are_given_comes_from_here() {
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+        ] {
+            let mut out = Vec::new();
+            let mut command = Cli::command();
+            let name = command.get_name().to_string();
+            clap_complete::generate(shell, &mut command, name, &mut out);
+            let text = String::from_utf8(out).expect("the generators write text");
+            for word in ["nspawn", "images", "machines", "network"] {
+                assert!(text.contains(word), "{shell} completions miss {word}");
+            }
+        }
+        let mut man = Vec::new();
+        clap_mangen::Man::new(Cli::command())
+            .render(&mut man)
+            .expect("rendering the manual page");
+        let man = String::from_utf8(man).expect("roff is text");
+        assert!(man.contains(".TH nspawn 1"), "the header names the tool");
+        // roff escapes the hyphens of the description.
+        assert!(
+            man.contains(r"systemd\-nspawn machines"),
+            "and says what it is"
+        );
+        assert!(man.contains(".SH SYNOPSIS"), "with the usual sections");
+    }
 }
