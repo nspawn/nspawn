@@ -11,6 +11,10 @@ networkd_was=$(systemctl is-active systemd-networkd)
 fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
 step() { echo; echo "### $*"; }
 retry() { local n=$1; shift; local i; for i in $(seq 1 "$n"); do "$@" && return 0; sleep 2; done; return 1; }
+# grep -q in a pipeline stops reading at the first match, and the writer then dies of
+# SIGPIPE, which pipefail counts as a failure: read everything instead.
+grep_q() { grep "$@" >/dev/null; }
+export -f grep_q
 nonce=$$
 # The command line is a client of the org.nspawn service: it goes on the bus first,
 # with a configuration file that names the registry and its CA for the service's own
@@ -26,7 +30,7 @@ install_service() {
   # With SELinux enforcing the service needs its domain (packaging/selinux) loaded and
   # the binary labelled nspawn_exec_t, or the bus drops it at the first descriptor.
   if [ "$(getenforce 2>/dev/null)" = Enforcing ]; then
-    semodule -l 2>/dev/null | grep -qx nspawn || { echo "SELinux is enforcing and the nspawn policy module is not loaded; see docs/HACKING.md"; exit 1; }
+    semodule -l 2>/dev/null | grep_q -x nspawn || { echo "SELinux is enforcing and the nspawn policy module is not loaded; see docs/HACKING.md"; exit 1; }
     [ "$(stat -c %C "$NSPAWN" | cut -d: -f3)" = nspawn_exec_t ] || { echo "$NSPAWN is not labelled nspawn_exec_t; see docs/HACKING.md"; exit 1; }
   fi
   mkdir -p /etc/nspawn
@@ -84,9 +88,9 @@ $NSPAWN hub ls | tee /tmp/e2e-hub.txt || fail "hub ls exited non-zero"
 grep -q "${IMAGE%%:*}" /tmp/e2e-hub.txt || fail "hub ls does not list ${IMAGE%%:*}"
 step "search: the hub and Docker Hub, each hit with its source"
 $NSPAWN search "${IMAGE%%:*}" > /tmp/e2e-search.txt || fail "search exited non-zero"
-grep "^ *$NSPAWN_REGISTRY " /tmp/e2e-search.txt | grep -q " ${IMAGE%%:*} " || fail "search does not list ${IMAGE%%:*} from the hub"
+grep "^ *$NSPAWN_REGISTRY " /tmp/e2e-search.txt | grep_q " ${IMAGE%%:*} " || fail "search does not list ${IMAGE%%:*} from the hub"
 $NSPAWN search busybox --source dockerhub > /tmp/e2e-search.txt || fail "search on Docker Hub exited non-zero"
-grep "^ *Docker Hub " /tmp/e2e-search.txt | grep -q "docker.io/library/busybox" || fail "search does not list busybox from Docker Hub with its source"
+grep "^ *Docker Hub " /tmp/e2e-search.txt | grep_q "docker.io/library/busybox" || fail "search does not list busybox from Docker Hub with its source"
 
 step "login and logout"
 echo "s3cret" | $NSPAWN login "$NSPAWN_REGISTRY" -u tester --password-stdin || fail "login on the hub"
@@ -94,9 +98,9 @@ python3 -c "import json; d = json.load(open('/etc/nspawn/auth.json')); assert '$
 [ "$(stat -c %a /etc/nspawn/auth.json)" = 600 ] || fail "auth.json is not mode 0600"
 $NSPAWN hub ls >/dev/null || fail "hub ls with stored credentials"
 out=$(echo "wrong-password" | $NSPAWN login docker.io -u nspawn-e2e-nobody --password-stdin 2>&1) && fail "Docker Hub accepted bogus credentials: $out"
-echo "$out" | grep -q "rejected the credentials" || fail "bogus Docker Hub login gave no clear message: $out"
-$NSPAWN logout "$NSPAWN_REGISTRY" | grep -q "removed" || fail "logout"
-$NSPAWN logout "$NSPAWN_REGISTRY" | grep -q "no credentials" || fail "second logout should find nothing"
+echo "$out" | grep_q "rejected the credentials" || fail "bogus Docker Hub login gave no clear message: $out"
+$NSPAWN logout "$NSPAWN_REGISTRY" | grep_q "removed" || fail "logout"
+$NSPAWN logout "$NSPAWN_REGISTRY" | grep_q "no credentials" || fail "second logout should find nothing"
 
 step "hub tags"
 $NSPAWN hub tags "${IMAGE%%:*}" > /tmp/e2e-tags.txt || fail "hub tags"
@@ -122,7 +126,7 @@ for backend in overlay flat mstack; do
   step "images ls"
   $NSPAWN images ls | tee /tmp/e2e-img.txt
   grep -q "^ *$name " /tmp/e2e-img.txt || fail "$name not listed"
-  grep "^ *$name " /tmp/e2e-img.txt | grep -q "$backend" || fail "$name backend not shown"
+  grep "^ *$name " /tmp/e2e-img.txt | grep_q "$backend" || fail "$name backend not shown"
   $NSPAWN images ls --json | python3 -c "import json,sys; d = [i for i in json.load(sys.stdin) if i['name'] == '$name']; assert d and d[0]['backend'] == '$backend', d" || fail "images ls --json misses $name or its backend"
   step "start"
   vol_args=""
@@ -132,7 +136,7 @@ for backend in overlay flat mstack; do
   fi
   $NSPAWN start "$name" $vol_args || fail "start ($backend)"
   if [ "$backend" = overlay ]; then
-    findmnt -n -o FSTYPE "/var/lib/machines/$name" | grep -q overlay || fail "root of $name is not an overlay"
+    findmnt -n -o FSTYPE "/var/lib/machines/$name" | grep_q overlay || fail "root of $name is not an overlay"
     # nspawn shifts the tree with a recursive chown (overlayfs cannot be idmapped); with
     # metacopy that copies inodes, without it the whole image.
     upper_mb=$(du -sm "/var/lib/nspawn/machines/$name/upper" | cut -f1)
@@ -153,18 +157,18 @@ for backend in overlay flat mstack; do
   step "exec"
   out=$($NSPAWN exec "$name" -- /usr/bin/systemctl is-system-running --wait </dev/null | tr -d '\r' || true)
   echo "is-system-running: $out"
-  echo "$out" | grep -qE "running|degraded|starting" || fail "exec did not reach systemd inside $name"
-  $NSPAWN exec "$name" -- /usr/bin/cat /etc/os-release </dev/null | tr -d '\r' | grep -q PRETTY_NAME || fail "exec cat os-release"
+  echo "$out" | grep_q -E "running|degraded|starting" || fail "exec did not reach systemd inside $name"
+  $NSPAWN exec "$name" -- /usr/bin/cat /etc/os-release </dev/null | tr -d '\r' | grep_q PRETTY_NAME || fail "exec cat os-release"
   $NSPAWN exec "$name" -- /bin/sh -c 'exit 7' </dev/null; [ $? -eq 7 ] || fail "exec did not propagate the exit code of a booted machine"
-  $NSPAWN exec "$name" -- /bin/sh -c 'echo $PATH' </dev/null | tr -d '\r' | grep -q "/usr/bin" || fail "exec has no PATH"
+  $NSPAWN exec "$name" -- /bin/sh -c 'echo $PATH' </dev/null | tr -d '\r' | grep_q "/usr/bin" || fail "exec has no PATH"
   step "terminal: exec with a pty, shell through machined, the machine's own journal"
   out=$(python3 "$(dirname "$0")/terminal.py" $NSPAWN exec "$name" -- /bin/sh -c 'tty; echo term=$TERM; exit 3' </dev/null 2>&1 | tr -d '\r'); rc=${PIPESTATUS[0]}
   [ "$rc" = 3 ] || fail "exec on a pty did not propagate the exit code (got $rc)"
-  echo "$out" | grep -q "^/dev/pts/" || fail "exec from a terminal got no pty of the machine's: $out"
-  echo "$out" | grep -q "term=${TERM:-xterm}" || fail "exec on a pty has no TERM: $out"
+  echo "$out" | grep_q "^/dev/pts/" || fail "exec from a terminal got no pty of the machine's: $out"
+  echo "$out" | grep_q "term=${TERM:-xterm}" || fail "exec on a pty has no TERM: $out"
   out=$(printf 'echo shell-%s term=$TERM; exit\n' "$nonce" | python3 "$(dirname "$0")/terminal.py" $NSPAWN shell "$name" 2>&1 | tr -d '\r')
-  echo "$out" | grep -q "shell-$nonce term=${TERM:-xterm}" || fail "shell on $name did not run a command with a TERM: $(echo "$out" | tail -2)"
-  $NSPAWN logs "$name" --inside -n 3 </dev/null | grep -q . || fail "logs --inside of $name is empty"
+  echo "$out" | grep_q "shell-$nonce term=${TERM:-xterm}" || fail "shell on $name did not run a command with a TERM: $(echo "$out" | tail -2)"
+  $NSPAWN logs "$name" --inside -n 3 </dev/null | grep_q . || fail "logs --inside of $name is empty"
   $NSPAWN logs "$name" --all -n 3 </dev/null >/dev/null || fail "logs --all of $name"
   $NSPAWN logs "$name" --since bogus </dev/null >/tmp/e2e-logs-out.txt 2>/tmp/e2e-logs-err.txt; rc=$?
   [ "$rc" != 0 ] || fail "logs --since bogus exited 0"
@@ -181,7 +185,7 @@ for backend in overlay flat mstack; do
   [ "$($NSPAWN exec "$name" -- stat -c %u /tmp/tmpfs.txt </dev/null | tr -d '\r')" = 0 ] || fail "a file copied into the /tmp of $name is not root's"
   $NSPAWN cp "$name:/tmp/tmpfs.txt" $cpd/tmpfs-back.txt && cmp -s $cpd/src/a.txt $cpd/tmpfs-back.txt || fail "cp out of the /tmp (tmpfs) of $name"
   [ "$($NSPAWN exec "$name" -- stat -c '%u:%g %a %Y' /root/a.txt </dev/null | tr -d '\r')" = "0:0 640 1000000" ] || fail "a file copied into $name is not root's with its mode and time: $($NSPAWN exec "$name" -- stat -c '%u:%g %a %Y' /root/a.txt </dev/null)"
-  $NSPAWN exec "$name" -- cat /root/a.txt </dev/null | tr -d '\r' | grep -q "hello-$nonce" || fail "the copied file has the wrong content"
+  $NSPAWN exec "$name" -- cat /root/a.txt </dev/null | tr -d '\r' | grep_q "hello-$nonce" || fail "the copied file has the wrong content"
   $NSPAWN cp $cpd/src "$name:/opt/copied" || fail "cp of a directory to a new name in $name"
   [ "$($NSPAWN exec "$name" -- readlink /opt/copied/rel </dev/null | tr -d '\r')" = a.txt ] || fail "a link inside a copied directory did not stay a link"
   $NSPAWN cp $cpd/src "$name:/opt/" && $NSPAWN exec "$name" -- test -f /opt/src/sub/b.bin </dev/null || fail "cp of a directory into an existing one"
@@ -204,7 +208,7 @@ for backend in overlay flat mstack; do
     $NSPAWN exec "$name" -- /bin/sh -c 'echo booted > /srv/vol/from-machine' </dev/null || fail "cannot write to the volume inside $name"
     [ "$(cat /tmp/e2e-boot-vol/from-machine 2>/dev/null)" = booted ] || fail "volume write not visible on the host"
     [ "$(stat -c %u /tmp/e2e-boot-vol/from-machine)" = 0 ] || fail "root inside did not write as root on the host (idmap)"
-    $NSPAWN exec "$name" -- /usr/bin/systemctl is-active nspawn-volumes.service </dev/null | tr -d '\r' | grep -qx active || fail "nspawn-volumes.service not active inside $name"
+    $NSPAWN exec "$name" -- /usr/bin/systemctl is-active nspawn-volumes.service </dev/null | tr -d '\r' | grep_q -x active || fail "nspawn-volumes.service not active inside $name"
     # Volumes are idmapped binds: a copy into one has to be made as the machine's root,
     # and lands as root on the host. A named volume is nspawn's own directory; a host
     # directory keeps its SELinux label, which the service may not write to (as with
@@ -221,7 +225,7 @@ for backend in overlay flat mstack; do
   if [ "$networkd_was" != active ]; then
     systemctl is-active systemd-networkd >/dev/null && fail "systemd-networkd got started on the host; the bridge must not need it"
   fi
-  ip -br addr show nspawn0 | grep -q "10.99.0.1/24" || fail "bridge nspawn0 missing or without its address"
+  ip -br addr show nspawn0 | grep_q "10.99.0.1/24" || fail "bridge nspawn0 missing or without its address"
   nft list map ip nspawn ports >/dev/null 2>&1 || fail "nftables table of the bridge missing"
   if firewall-cmd --state >/dev/null 2>&1; then
     # NetworkManager takes a new bridge over for a moment and firewalld follows it before
@@ -230,13 +234,13 @@ for backend in overlay flat mstack; do
   fi
   addr=$($NSPAWN network ls | awk -v n="$name" '$1 == n {print $2}')
   echo "$name has address $addr"
-  echo "$addr" | grep -q "^10\.99\.0\." || fail "no bridge address recorded for $name"
+  echo "$addr" | grep_q "^10\.99\.0\." || fail "no bridge address recorded for $name"
   $NSPAWN network ls --json | python3 -c "import json,sys; d = json.load(sys.stdin); assert d['bridge']['bridge'] == 'nspawn0' and any(m['name'] == '$name' and m['address'] == '$addr' and m['running'] for m in d['machines']), d" || fail "network ls --json"
-  retry 15 bash -c "$NSPAWN exec $name -- /bin/sh -c 'ip -4 -o addr show host0 | grep -q $addr/24 && curl -sf -m 5 -o /dev/null https://download.opensuse.org/ && echo NET-OK' </dev/null | tr -d '\r' | grep -q NET-OK" \
+  retry 15 bash -c "$NSPAWN exec $name -- /bin/sh -c 'ip -4 -o addr show host0 | grep -q $addr/24 && curl -sf -m 5 -o /dev/null https://download.opensuse.org/ && echo NET-OK' </dev/null | tr -d '\r' | grep_q NET-OK" \
     || { echo "-- inside $name:"; $NSPAWN exec "$name" -- /bin/sh -c 'ip -4 -o addr; ip route; ping -c 1 -W 2 10.99.0.1; curl -sS -m 5 -o /dev/null https://download.opensuse.org/' </dev/null 2>&1 | tr -d '\r'; bridge link show; fail "no network inside $name through the bridge"; }
   step "stop"
   $NSPAWN stop "$name" || fail "stop ($backend)"
-  retry 15 bash -c "! $NSPAWN machines ls | grep -q '^ *$name '" || fail "$name still running after stop"
+  retry 15 bash -c "! $NSPAWN machines ls | grep_q '^ *$name '" || fail "$name still running after stop"
   if [ "$backend" = flat ]; then
     step "legacy veth network (systemd-networkd on the host)"
     $NSPAWN start "$name" --network veth || fail "start --network veth"
@@ -244,11 +248,11 @@ for backend in overlay flat mstack; do
     if firewall-cmd --state >/dev/null 2>&1; then
       [ "$(firewall-cmd --get-zone-of-interface="ve-$name")" = trusted ] || fail "ve-$name is not in the trusted zone of firewalld"
     fi
-    retry 15 bash -c "$NSPAWN exec $name -- /bin/sh -c 'curl -sf -m 5 -o /dev/null https://download.opensuse.org/ && echo NET-OK' </dev/null | tr -d '\r' | grep -q NET-OK" \
+    retry 15 bash -c "$NSPAWN exec $name -- /bin/sh -c 'curl -sf -m 5 -o /dev/null https://download.opensuse.org/ && echo NET-OK' </dev/null | tr -d '\r' | grep_q NET-OK" \
       || fail "no network inside $name over the veth"
     $NSPAWN stop "$name" || fail "stop veth machine"
     if firewall-cmd --state >/dev/null 2>&1; then
-      firewall-cmd --zone=trusted --list-interfaces | grep -qw "ve-$name" && fail "ve-$name still bound in firewalld after stop"
+      firewall-cmd --zone=trusted --list-interfaces | grep_q -w "ve-$name" && fail "ve-$name still bound in firewalld after stop"
     fi
     $NSPAWN start "$name" --network bridge >/dev/null && $NSPAWN stop "$name" >/dev/null || fail "back to the bridge network"
     if [ "$networkd_was" != active ]; then
@@ -259,7 +263,7 @@ for backend in overlay flat mstack; do
   step "cp into a stopped machine ($backend)"
   if [ "$backend" = mstack ]; then
     out=$($NSPAWN cp /tmp/e2e-cp/src/a.txt "$name:/root/stopped.txt" 2>&1) && fail "cp into a stopped mstack machine succeeded"
-    echo "$out" | grep -q "start it first" || fail "cp into a stopped mstack machine was not explained: $out"
+    echo "$out" | grep_q "start it first" || fail "cp into a stopped mstack machine was not explained: $out"
   else
     if [ "$backend" = overlay ]; then
       systemctl stop "$(systemd-escape -p --suffix=mount "/var/lib/machines/$name")" || fail "cannot unmount the overlay of $name"
@@ -276,7 +280,7 @@ for backend in overlay flat mstack; do
   $NSPAWN images rm "$name" || fail "images rm ($backend)"
   $NSPAWN images ls > /tmp/e2e-img.txt; grep -q "^ *$name " /tmp/e2e-img.txt && fail "$name still listed after rm"
   [ -e "/var/lib/machines/$name" ] && fail "/var/lib/machines/$name still exists"
-  ls /etc/systemd/system/ | grep -q "e2e" && fail "unit files left behind for $name"
+  ls /etc/systemd/system/ | grep_q "e2e" && fail "unit files left behind for $name"
 done
 
 step "layer sharing between two images"
@@ -286,16 +290,16 @@ grep -q "already present" /tmp/e2e-p2.txt || fail "second pull downloaded the la
 
 step "create: arguments are checked before anything is made"
 $NSPAWN create e2e-a e2e-bad -e X=1 >/dev/null 2>&1 && fail "create accepted -e for a booted image"
-$NSPAWN images ls | grep -q "^ *e2e-bad " && fail "a refused create left a machine behind"
+$NSPAWN images ls | grep_q "^ *e2e-bad " && fail "a refused create left a machine behind"
 $NSPAWN create e2e-a e2e-bad -v "bad volume" >/dev/null 2>&1 && fail "create accepted a bad volume"
 [ -e /etc/systemd/nspawn/e2e-bad.nspawn ] && fail "a refused create left settings behind"
 
 step "create: another machine from a local image, without the registry"
 env NSPAWN_REGISTRY=127.0.0.1:9 $NSPAWN create e2e-a e2e-c || fail "create from a local image"
-$NSPAWN images ls | grep "^ *e2e-c " | grep -q "create" || fail "created machine not listed with origin create"
+$NSPAWN images ls | grep "^ *e2e-c " | grep_q "create" || fail "created machine not listed with origin create"
 $NSPAWN start e2e-c || fail "start created machine"
 retry 10 $NSPAWN exec e2e-c -- /usr/bin/test -f /etc/os-release </dev/null || fail "exec in created machine"
-$NSPAWN network ls | grep -q "^ *e2e-c " || fail "created machine not on the bridge"
+$NSPAWN network ls | grep_q "^ *e2e-c " || fail "created machine not on the bridge"
 $NSPAWN stop e2e-c || fail "stop created machine"
 $NSPAWN images rm e2e-c | tee /tmp/e2e-rmc.txt || fail "rm created machine"
 grep -q "freed" /tmp/e2e-rmc.txt && fail "removing the created machine freed a layer still used by e2e-a and e2e-b"
@@ -305,37 +309,37 @@ $NSPAWN start e2e-a || fail "start e2e-a"
 $NSPAWN start e2e-b -p 18080:80 || fail "start e2e-b with a published port"
 $NSPAWN exec e2e-b -- /usr/bin/systemctl is-system-running --wait </dev/null >/dev/null 2>&1 || true
 # An echo service on port 80 inside e2e-b, from socket activation: no extra packages needed.
-$NSPAWN exec e2e-b -- /bin/sh -c 'printf "[Socket]\nListenStream=80\nAccept=yes\n" > /etc/systemd/system/echo.socket; printf "[Service]\nExecStart=/usr/bin/cat\nStandardInput=socket\n" > /etc/systemd/system/echo@.service; systemctl daemon-reload; systemctl start echo.socket && echo ECHO-UP' </dev/null | tr -d '\r' | grep -q ECHO-UP || fail "echo service inside e2e-b"
+$NSPAWN exec e2e-b -- /bin/sh -c 'printf "[Socket]\nListenStream=80\nAccept=yes\n" > /etc/systemd/system/echo.socket; printf "[Service]\nExecStart=/usr/bin/cat\nStandardInput=socket\n" > /etc/systemd/system/echo@.service; systemctl daemon-reload; systemctl start echo.socket && echo ECHO-UP' </dev/null | tr -d '\r' | grep_q ECHO-UP || fail "echo service inside e2e-b"
 b_addr=$($NSPAWN network ls | awk '$1 == "e2e-b" {print $2}')
 echo "e2e-b has address $b_addr"
-$NSPAWN network ls | grep "e2e-b" | grep -q "18080->80/tcp" || fail "published port not listed by network ls"
-$NSPAWN ps | grep "^ *e2e-b " | grep -q "18080->80/tcp" || fail "published port not shown by ps"
+$NSPAWN network ls | grep "e2e-b" | grep_q "18080->80/tcp" || fail "published port not listed by network ls"
+$NSPAWN ps | grep "^ *e2e-b " | grep_q "18080->80/tcp" || fail "published port not shown by ps"
 echo_test() { timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2 || exit 1; echo $3 >&3; read -t 3 l <&3; [ \"\$l\" = $3 ]" 2>/dev/null; }
 retry 5 echo_test "$b_addr" 80 direct || fail "e2e-b not reachable on its bridge address $b_addr"
 echo_test 127.0.0.1 18080 loopback || fail "published port not reachable on 127.0.0.1"
 host_ip=$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i <= NF; i++) if ($i == "src") print $(i + 1); exit}')
 echo_test "$host_ip" 18080 hostaddr || fail "published port not reachable on the host address $host_ip"
-$NSPAWN exec e2e-a -- /bin/sh -c "getent hosts e2e-b" </dev/null | tr -d '\r' | grep -q "$b_addr" || fail "e2e-a does not resolve e2e-b"
-$NSPAWN exec e2e-a -- /bin/sh -c "getent hosts host.nspawn.internal" </dev/null | tr -d '\r' | grep -q "10.99.0.1" || fail "host.nspawn.internal not resolvable"
-$NSPAWN exec e2e-a -- /bin/bash -c 'exec 3<>/dev/tcp/e2e-b/80 && echo a-to-b >&3 && read -t 3 l <&3 && echo "reply:$l"' </dev/null | tr -d '\r' | grep -q "reply:a-to-b" || fail "e2e-a cannot reach e2e-b by name"
+$NSPAWN exec e2e-a -- /bin/sh -c "getent hosts e2e-b" </dev/null | tr -d '\r' | grep_q "$b_addr" || fail "e2e-a does not resolve e2e-b"
+$NSPAWN exec e2e-a -- /bin/sh -c "getent hosts host.nspawn.internal" </dev/null | tr -d '\r' | grep_q "10.99.0.1" || fail "host.nspawn.internal not resolvable"
+$NSPAWN exec e2e-a -- /bin/bash -c 'exec 3<>/dev/tcp/e2e-b/80 && echo a-to-b >&3 && read -t 3 l <&3 && echo "reply:$l"' </dev/null | tr -d '\r' | grep_q "reply:a-to-b" || fail "e2e-a cannot reach e2e-b by name"
 $NSPAWN stop e2e-b || fail "stop e2e-b"
 $NSPAWN stop e2e-a || fail "stop e2e-a"
-nft list map ip nspawn ports | grep -q 18080 && fail "published port still mapped after stop"
+nft list map ip nspawn ports | grep_q 18080 && fail "published port still mapped after stop"
 
 step "restart policy on a booted machine: its init killed, it boots again"
 $NSPAWN start e2e-a --restart on-failure --memory 256m || fail "start e2e-a with a restart policy"
 [ "$(systemctl show -p MemoryMax --value systemd-nspawn@e2e-a.service)" = 268435456 ] || fail "--memory not applied to the unit of a booted machine"
 kill -KILL "$(machinectl show e2e-a -p Leader --value)" || fail "cannot kill the init of e2e-a"
-retry 20 bash -c "[ \"\$(systemctl show -p NRestarts --value systemd-nspawn@e2e-a.service)\" -ge 1 ] && $NSPAWN exec e2e-a -- /usr/bin/systemctl is-system-running --wait </dev/null | tr -d '\r' | grep -qE 'running|degraded'" || fail "e2e-a did not boot again after its init was killed"
+retry 20 bash -c "[ \"\$(systemctl show -p NRestarts --value systemd-nspawn@e2e-a.service)\" -ge 1 ] && $NSPAWN exec e2e-a -- /usr/bin/systemctl is-system-running --wait </dev/null | tr -d '\r' | grep_q -E 'running|degraded'" || fail "e2e-a did not boot again after its init was killed"
 $NSPAWN stop e2e-a || fail "stop e2e-a with a restart policy"
 sleep 3
-$NSPAWN ps | grep -q "^ *e2e-a " && fail "e2e-a came back after stop"
+$NSPAWN ps | grep_q "^ *e2e-a " && fail "e2e-a came back after stop"
 systemctl is-failed systemd-nspawn@e2e-a.service >/dev/null 2>&1 && fail "the unit of e2e-a was left failed"
 # The hammer on a booted machine that would come back: killed, and it stays down.
 $NSPAWN start e2e-a --restart always >/dev/null || fail "start e2e-a with --restart always"
 $NSPAWN stop e2e-a --force || fail "stop --force of a booted machine with a restart policy"
 sleep 5
-$NSPAWN ps | grep -q "^ *e2e-a " && fail "e2e-a came back after stop --force"
+$NSPAWN ps | grep_q "^ *e2e-a " && fail "e2e-a came back after stop --force"
 systemctl is-failed systemd-nspawn@e2e-a.service >/dev/null 2>&1 && fail "stop --force left the unit of e2e-a failed"
 $NSPAWN start e2e-a --restart no >/dev/null && $NSPAWN stop e2e-a >/dev/null || fail "back to no restart policy for e2e-a"
 
@@ -354,12 +358,12 @@ if command -v mkosi >/dev/null 2>&1; then
   built=e2e-built
   $NSPAWN build -t e2e/built:1 --name $built --force "$ctx" || fail "build"
   $NSPAWN images ls | tee /tmp/e2e-img.txt
-  grep "^ *$built " /tmp/e2e-img.txt | grep -qw "build" || fail "built image not listed with origin build"
+  grep "^ *$built " /tmp/e2e-img.txt | grep_q -w "build" || fail "built image not listed with origin build"
   $NSPAWN inspect $built | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['image_labels'].get('org.nspawn.e2e') == 'built' and d['labels'].get('org.nspawn.e2e') == 'built', d" || fail "the image's own labels (OciLabels=) are not read"
   $NSPAWN start $built || fail "start built image"
   out=$($NSPAWN exec $built -- /usr/bin/systemctl is-system-running --wait </dev/null | tr -d '\r' || true)
   echo "built image is-system-running: $out"
-  echo "$out" | grep -qE "running|degraded|starting" || fail "built image did not boot"
+  echo "$out" | grep_q -E "running|degraded|starting" || fail "built image did not boot"
   $NSPAWN stop $built || fail "stop built image"
   $NSPAWN push $built | tee /tmp/e2e-push.txt || fail "push"
   grep -q "^pushed " /tmp/e2e-push.txt || fail "push did not report success"
@@ -390,7 +394,7 @@ grep -q "Boot=no" /etc/systemd/nspawn/$app.nspawn || fail "settings file does no
 step "machinectl start right after pull: the unit hooks prepare everything"
 [ -e /etc/systemd/system/systemd-nspawn@$app.service.d/nspawn-hooks.conf ] || fail "no hooks drop-in after pull"
 machinectl start $app || fail "machinectl start of a freshly pulled app"
-retry 10 bash -c "$NSPAWN exec $app -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep -q 10.99.0" || fail "no bridge address after machinectl start of a fresh app"
+retry 10 bash -c "$NSPAWN exec $app -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep_q 10.99.0" || fail "no bridge address after machinectl start of a fresh app"
 grep -q "PrivateUsers=no" /etc/systemd/nspawn/$app.nspawn || fail "the prepare hook did not regenerate the settings"
 $NSPAWN stop $app || fail "stop after machinectl start of a fresh app"
 grep -q "ProcessTwo=yes" /etc/systemd/nspawn/$app.nspawn || fail "settings file does not use a stub init"
@@ -406,7 +410,7 @@ $NSPAWN machines ls | tee /tmp/e2e-m.txt
 grep -q "^ *$app " /tmp/e2e-m.txt || fail "busybox machine not running"
 out=$($NSPAWN exec $app -- /bin/sh -c 'echo inside:$(uname -n); cat /etc/os-release | head -1' </dev/null | tr -d '\r')
 echo "$out"
-echo "$out" | grep -q "inside:$app" || fail "exec via namespaces did not run inside the machine"
+echo "$out" | grep_q "inside:$app" || fail "exec via namespaces did not run inside the machine"
 [ "$($NSPAWN exec $app -- id -u </dev/null | tr -d '\r')" = "0" ] || fail "exec does not run as the machine's root"
 [ "$($NSPAWN exec $app --user 65534 -- id -u </dev/null | tr -d '\r')" = "65534" ] || fail "exec --user ignored"
 $NSPAWN exec $app -- /bin/sh -c 'exit 7' </dev/null; [ $? -eq 7 ] || fail "exec did not propagate the exit code"
@@ -421,32 +425,32 @@ if [ "$networkd_was" != active ]; then
 fi
 app_addr=$($NSPAWN network ls | awk -v n="$app" '$1 == n {print $2}')
 echo "$app has address $app_addr"
-echo "$app_addr" | grep -q "^10\.99\.0\." || fail "no bridge address for the app"
-$NSPAWN exec $app -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep -q "$app_addr/24" || fail "host0 not configured inside the app"
-$NSPAWN exec $app -- cat /etc/hosts </dev/null | tr -d '\r' | grep -q "host.nspawn.internal" || fail "generated /etc/hosts missing in the app"
+echo "$app_addr" | grep_q "^10\.99\.0\." || fail "no bridge address for the app"
+$NSPAWN exec $app -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep_q "$app_addr/24" || fail "host0 not configured inside the app"
+$NSPAWN exec $app -- cat /etc/hosts </dev/null | tr -d '\r' | grep_q "host.nspawn.internal" || fail "generated /etc/hosts missing in the app"
 $NSPAWN exec $app -- nslookup download.opensuse.org </dev/null >/dev/null 2>&1 || fail "DNS does not work inside the app"
-$NSPAWN exec $app -- wget -qO- -T 5 http://detectportal.firefox.com/success.txt </dev/null | tr -d '\r' | grep -q success || fail "no internet from the app"
-curl -sf -m 5 http://127.0.0.1:18081/ | grep -q app-web || fail "published app port not reachable on 127.0.0.1"
-$NSPAWN ps | grep "^ *$app " | grep -q "18081->80/tcp" || fail "app port not shown by ps"
+$NSPAWN exec $app -- wget -qO- -T 5 http://detectportal.firefox.com/success.txt </dev/null | tr -d '\r' | grep_q success || fail "no internet from the app"
+curl -sf -m 5 http://127.0.0.1:18081/ | grep_q app-web || fail "published app port not reachable on 127.0.0.1"
+$NSPAWN ps | grep "^ *$app " | grep_q "18081->80/tcp" || fail "app port not shown by ps"
 $NSPAWN stop $app || fail "stop busybox"
-retry 15 bash -c "! $NSPAWN machines ls | grep -q '^ *$app '" || fail "busybox still running after stop"
+retry 15 bash -c "! $NSPAWN machines ls | grep_q '^ *$app '" || fail "busybox still running after stop"
 [ -e /run/netns/nspawn-$app ] && fail "network namespace left behind for $app"
 systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit left in failed state after stop"
 
 step "host network, --no-wait, an app's shell and a missing program"
 $NSPAWN stop $app >/dev/null || fail "stop before the host-network start"
 $NSPAWN start $app --network host -p none -- /bin/sleep 300 || fail "start with --network host"
-$NSPAWN exec $app -- ip -o addr </dev/null | tr -d '\r' | grep -qv "host0" || fail "host network shows host0"
-$NSPAWN exec $app -- ip -o link </dev/null | tr -d '\r' | grep -q "$(ip -o link | awk -F': ' 'NR==2{print $2}' | cut -d@ -f1)" || fail "host network does not see the host's interfaces"
+$NSPAWN exec $app -- ip -o addr </dev/null | tr -d '\r' | grep_q -v "host0" || fail "host network shows host0"
+$NSPAWN exec $app -- ip -o link </dev/null | tr -d '\r' | grep_q "$(ip -o link | awk -F': ' 'NR==2{print $2}' | cut -d@ -f1)" || fail "host network does not see the host's interfaces"
 out=$(printf 'echo appshell-%s; exit\n' "$nonce" | python3 "$(dirname "$0")/terminal.py" $NSPAWN shell $app 2>&1 | tr -d '\r')
-echo "$out" | grep -q "appshell-$nonce" || fail "shell on an app: $(echo "$out" | tail -2)"
+echo "$out" | grep_q "appshell-$nonce" || fail "shell on an app: $(echo "$out" | tail -2)"
 $NSPAWN exec $app -- /bin/sh -c 'exec >/dev/null 2>&1; sleep 12; exit 3' </dev/null; [ $? = 3 ] || fail "exec lost the exit code of a command that closed its streams early"
 $NSPAWN exec $app -- /no/such/program </dev/null >/dev/null 2>&1; [ $? = 127 ] || fail "exec of a missing program is not 127"
 $NSPAWN exec $app -- no-such-command-$nonce </dev/null >/dev/null 2>&1; [ $? = 127 ] || fail "exec of a command missing on PATH is not 127"
 $NSPAWN stop $app --no-wait || fail "stop --no-wait"
-retry 10 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "app still running after stop --no-wait"
+retry 10 bash -c "! $NSPAWN ps | grep_q '^ *$app '" || fail "app still running after stop --no-wait"
 $NSPAWN start $app --network bridge --no-wait -- /bin/sleep 300 || fail "start --no-wait"
-retry 10 bash -c "$NSPAWN ps | grep -q '^ *$app '" || fail "app not running after start --no-wait"
+retry 10 bash -c "$NSPAWN ps | grep_q '^ *$app '" || fail "app not running after start --no-wait"
 $NSPAWN stop $app >/dev/null || fail "stop after --no-wait start"
 
 step "stop: a program that ignores its stop signal is killed after --timeout"
@@ -454,24 +458,24 @@ $NSPAWN start $app -- /bin/sh -c 'trap "" TERM; exec /bin/sleep 300' || fail "st
 t0=$(date +%s)
 out=$($NSPAWN stop $app -t 2 2>&1 >/dev/null) || fail "stop of a stubborn app"
 [ $(( $(date +%s) - t0 )) -lt 20 ] || fail "stop of a stubborn app took too long"
-echo "$out" | grep -q "ignored SIGTERM for 2 seconds; killing it" || fail "stop did not say that it had to kill the program: $out"
-retry 5 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "stubborn app still running"
+echo "$out" | grep_q "ignored SIGTERM for 2 seconds; killing it" || fail "stop did not say that it had to kill the program: $out"
+retry 5 bash -c "! $NSPAWN ps | grep_q '^ *$app '" || fail "stubborn app still running"
 
 step "the remembered command, the unit hooks and an app that exits on its own"
 $NSPAWN start $app -p 18081:80 -- /bin/sh -c 'mkdir -p /www; echo app-web > /www/index.html; exec /bin/httpd -f -p 80 -h /www' || fail "start httpd app"
 $NSPAWN stop $app >/dev/null || fail "stop httpd app"
 $NSPAWN start $app || fail "start without a command"
-retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep -q app-web" || fail "the remembered command did not run"
+retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep_q app-web" || fail "the remembered command did not run"
 $NSPAWN stop $app >/dev/null || fail "stop remembered app"
 machinectl start $app || fail "machinectl start of an app (the hooks must prepare its network)"
-retry 10 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep -q app-web" || fail "no network or ports after machinectl start"
+retry 10 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep_q app-web" || fail "no network or ports after machinectl start"
 $NSPAWN stop $app || fail "stop after machinectl start"
 t0=$(date +%s)
 $NSPAWN start $app -- /bin/true || fail "start of a program that returns at once"
 [ $(( $(date +%s) - t0 )) -lt 15 ] || fail "start waited for a program that had already returned"
 $NSPAWN start $app -- /bin/sh -c 'exit 3' >/dev/null 2>&1 || true
-retry 10 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "failed app still listed"
-out=$($NSPAWN stop $app 2>&1); echo "$out" | grep -q "was not running" || fail "stop after a failed program: $out"
+retry 10 bash -c "! $NSPAWN ps | grep_q '^ *$app '" || fail "failed app still listed"
+out=$($NSPAWN stop $app 2>&1); echo "$out" | grep_q "was not running" || fail "stop after a failed program: $out"
 systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit left failed after stop of a program that exited 3"
 # A program that fails at once leaves the unit on its way down with the release hook
 # running; a start issued right then must not have its namespace pulled away.
@@ -480,22 +484,22 @@ $NSPAWN start $app -- /bin/sh -c 'exit 3' >/dev/null 2>&1 || true
 # service answers within milliseconds); anything else at that moment is a bug.
 for i in 1 2 3 4 5 6 7 8 9 10; do
   out=$($NSPAWN start $app -- /bin/sleep 300 2>&1) && break
-  echo "$out" | grep -q "already running" || { echo "$out"; fail "start right after a program that failed at once"; break; }
+  echo "$out" | grep_q "already running" || { echo "$out"; fail "start right after a program that failed at once"; break; }
   sleep 0.2
 done
-retry 10 bash -c "$NSPAWN exec $app -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep -q 10.99.0" || fail "no bridge address after a start that followed a failed program"
+retry 10 bash -c "$NSPAWN exec $app -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep_q 10.99.0" || fail "no bridge address after a start that followed a failed program"
 $NSPAWN stop $app >/dev/null || fail "stop after the quick restart"
 $NSPAWN start $app -- /bin/sh -c 'sleep 1' || fail "start short-lived app"
-retry 10 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "short-lived app still listed"
+retry 10 bash -c "! $NSPAWN ps | grep_q '^ *$app '" || fail "short-lived app still listed"
 sleep 1
 [ -e /run/netns/nspawn-$app ] && fail "namespace left behind by an app that exited on its own"
-nft list map ip nspawn ports | grep -q 18081 && fail "ports of an exited app still mapped"
-out=$($NSPAWN stop $app 2>&1); echo "$out" | grep -q "was not running" || fail "stop of a stopped machine is not a no-op: $out"
+nft list map ip nspawn ports | grep_q 18081 && fail "ports of an exited app still mapped"
+out=$($NSPAWN stop $app 2>&1); echo "$out" | grep_q "was not running" || fail "stop of a stopped machine is not a no-op: $out"
 python3 -c 'import socket,time; s=socket.socket(); s.bind(("0.0.0.0",18099)); s.listen(); time.sleep(120)' &
 listener_pid=$!
 sleep 1
-out=$($NSPAWN start $app -p 18099:80 2>&1); echo "$out" | grep -q "in use by a service on the host" || fail "publishing a port a host service listens on was not refused: $out"
-$NSPAWN ps -a | grep "^ *$app " | grep -q "18099->80" && fail "a refused port was remembered"
+out=$($NSPAWN start $app -p 18099:80 2>&1); echo "$out" | grep_q "in use by a service on the host" || fail "publishing a port a host service listens on was not refused: $out"
+$NSPAWN ps -a | grep "^ *$app " | grep_q "18099->80" && fail "a refused port was remembered"
 kill "$listener_pid" 2>/dev/null; listener_pid=
 
 step "entrypoint, environment and volumes, docker style"
@@ -503,26 +507,26 @@ rm -rf /tmp/e2e-bind /var/lib/nspawn/volumes/e2evol; mkdir -p /tmp/e2e-bind; ech
 export E2E_HOST_VAR=fromhost
 # The unit's journal keeps the lines of earlier runs, so every line carries the nonce.
 $NSPAWN start $app --label caddy=app.example --label tier=web --entrypoint /bin/sh -e GREETING=hola -e E2E_HOST_VAR -v /tmp/e2e-bind:/bind -v e2evol:/vol -v /etc/os-release:/host-os-release:ro -p none -- -c "echo \"greeting=\$GREETING hostvar=\$E2E_HOST_VAR nonce=$nonce\"; cat /bind/hello; echo from-app > /vol/written; { echo blocked > /host-os-release; } 2>/dev/null && echo RO-FAIL-$nonce || echo RO-OK-$nonce; exec /bin/sleep 300" || fail "start with entrypoint, env and volumes"
-retry 10 bash -c "$NSPAWN logs $app | grep -q RO-[A-Z]*-$nonce" || fail "app did not run"
+retry 10 bash -c "$NSPAWN logs $app | grep_q RO-[A-Z]*-$nonce" || fail "app did not run"
 $NSPAWN logs $app > /tmp/e2e-logs.txt
 grep -q "greeting=hola hostvar=fromhost nonce=$nonce" /tmp/e2e-logs.txt || fail "-e variables not seen by the program"
 grep -q "^from-host" /tmp/e2e-logs.txt || fail "bind mount not visible inside"
 grep -q "RO-OK-$nonce" /tmp/e2e-logs.txt || fail "read-only volume was writable"
 [ "$(cat /var/lib/nspawn/volumes/e2evol/written 2>/dev/null)" = from-app ] || fail "named volume not written on the host"
-$NSPAWN ps | grep "^ *$app " | grep -q "/bin/sh -c" || fail "ps does not show the entrypoint plus arguments"
+$NSPAWN ps | grep "^ *$app " | grep_q "/bin/sh -c" || fail "ps does not show the entrypoint plus arguments"
 [ "$($NSPAWN exec $app -- /bin/sh -c 'echo $GREETING' </dev/null | tr -d '\r')" = hola ] || fail "exec does not see -e variables"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['labels'].get('caddy') == 'app.example' and d['labels'].get('tier') == 'web', d" || fail "--label not recorded"
 $NSPAWN ps --json | python3 -c "import json,sys; d = [m for m in json.load(sys.stdin) if m['name'] == '$app']; assert d and d[0]['labels'].get('caddy') == 'app.example', d" || fail "labels not listed by ps --json"
 # The entrypoint (/bin/sh) is remembered, so the arguments are its.
 $NSPAWN stop $app >/dev/null; $NSPAWN start $app -e PATH=/opt/none:/usr/bin:/bin -- -c 'exec /bin/sleep 300' >/dev/null || fail "start with a PATH override"
-retry 5 bash -c "$NSPAWN ps | grep -q '^ *$app '" || fail "app with a PATH override is not running"
+retry 5 bash -c "$NSPAWN ps | grep_q '^ *$app '" || fail "app with a PATH override is not running"
 [ "$($NSPAWN exec $app -- /bin/sh -c 'echo $PATH' </dev/null | tr -d '\r')" = "/opt/none:/usr/bin:/bin" ] || fail "exec does not apply a -e override of an image variable"
 $NSPAWN stop $app || fail "stop app with volumes"
 out=$($NSPAWN start $app --label novalue 2>&1) && fail "a label without a value was accepted"
-echo "$out" | grep -q "KEY=VALUE" || fail "a bad label was not explained: $out"
+echo "$out" | grep_q "KEY=VALUE" || fail "a bad label was not explained: $out"
 $NSPAWN start $app --image-command -e none -v none --label none || fail "start with the image's own command"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert 'caddy' not in d['labels'], d" || fail "--label none did not forget the labels"
-$NSPAWN ps | grep "^ *$app " | grep -q " sh " || fail "--image-command did not restore the image's cmd"
+$NSPAWN ps | grep "^ *$app " | grep_q " sh " || fail "--image-command did not restore the image's cmd"
 grep -q "Bind=" /etc/systemd/nspawn/$app.nspawn && fail "-v none left volumes in the settings"
 $NSPAWN stop $app -t 2 || fail "stop app running its own cmd"
 
@@ -531,18 +535,18 @@ step "restart policy on-failure: a killed program comes back with its network, s
 $NSPAWN start $app --restart on-failure -p 18081:80 -- /bin/sh -c 'mkdir -p /www; echo app-web > /www/index.html; exec /bin/httpd -f -p 80 -h /www' || fail "start with --restart on-failure"
 grep -qx "Restart=on-failure" $hooks || fail "no Restart= in the drop-in"
 grep -qx "StartLimitIntervalSec=0" $hooks || fail "no StartLimitIntervalSec= in the drop-in"
-retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep -q app-web" || fail "the app does not answer before the kill"
+retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep_q app-web" || fail "the app does not answer before the kill"
 addr_before=$($NSPAWN network ls | awk -v n="$app" '$1 == n {print $2}')
 leader=$(machinectl show $app -p Leader --value)
 kill -KILL $(pgrep -P "$leader") || fail "cannot kill the app's program"
 retry 15 bash -c "[ \"\$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)\" -ge 1 ]" || fail "on-failure did not restart the app"
-retry 15 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep -q app-web" || fail "the restarted app does not answer on its published port"
+retry 15 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep_q app-web" || fail "the restarted app does not answer on its published port"
 [ "$($NSPAWN network ls | awk -v n="$app" '$1 == n {print $2}')" = "$addr_before" ] || fail "the restarted app changed its address"
 [ "$(systemctl is-enabled systemd-nspawn@$app.service 2>/dev/null)" = enabled ] && fail "on-failure enabled the unit at boot"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['restart'] == 'on-failure', d" || fail "inspect does not show the restart policy"
 $NSPAWN stop $app || fail "stop an app with a restart policy"
 sleep 5
-$NSPAWN ps | grep -q "^ *$app " && fail "the app came back after stop"
+$NSPAWN ps | grep_q "^ *$app " && fail "the app came back after stop"
 systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "stop left the unit failed"
 [ -e /run/netns/nspawn-$app ] && fail "stop left the network namespace behind"
 
@@ -551,7 +555,7 @@ step "restart policy: which endings bring a program back"
 $NSPAWN start $app --restart on-failure -p none -- /bin/sh -c 'sleep 1; exit 0' >/dev/null || fail "start a program that ends well under on-failure"
 sleep 6
 [ "$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)" = 0 ] || fail "on-failure restarted a program that exited 0"
-$NSPAWN ps | grep -q "^ *$app " && fail "on-failure kept a program that exited 0 running"
+$NSPAWN ps | grep_q "^ *$app " && fail "on-failure kept a program that exited 0 running"
 $NSPAWN stop $app >/dev/null 2>&1
 $NSPAWN start $app --restart always -- /bin/sh -c 'sleep 1; exit 0' >/dev/null || fail "start a program that ends well under always"
 retry 10 bash -c "[ \"\$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)\" -ge 1 ]" || fail "always did not restart a program that exited 0"
@@ -560,17 +564,17 @@ $NSPAWN stop $app >/dev/null || fail "stop the always program"
 
 step "restart policy: a program that keeps failing is restarting, and stop ends it"
 out=$($NSPAWN start $app --restart always -p none -- /bin/sh -c 'exit 1' 2>&1) || fail "start of a failing program with --restart always: $out"
-retry 10 bash -c "$NSPAWN ps | grep '^ *$app ' | grep -q restarting" || fail "ps does not show the app restarting"
+retry 10 bash -c "$NSPAWN ps | grep '^ *$app ' | grep_q restarting" || fail "ps does not show the app restarting"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['state'] in ('restarting', 'starting', 'running'), d" || fail "inspect of a restarting app"
 out=$($NSPAWN images rm $app 2>&1) && fail "images rm removed a machine that was restarting"
-echo "$out" | grep -q "stop it first" || fail "images rm of a restarting machine was not explained: $out"
-retry 10 bash -c "$NSPAWN ps | grep '^ *$app ' | grep -q restarting" || fail "the app stopped restarting on its own"
+echo "$out" | grep_q "stop it first" || fail "images rm of a restarting machine was not explained: $out"
+retry 10 bash -c "$NSPAWN ps | grep '^ *$app ' | grep_q restarting" || fail "the app stopped restarting on its own"
 out=$($NSPAWN start $app 2>&1) && fail "start of a machine that is restarting succeeded"
-echo "$out" | grep -qE "restarting|already" || fail "start of a restarting machine was not explained: $out"
+echo "$out" | grep_q -E "restarting|already" || fail "start of a restarting machine was not explained: $out"
 $NSPAWN stop $app >/dev/null || fail "stop a restarting app"
 sleep 3
 [ "$(systemctl is-active systemd-nspawn@$app.service)" = inactive ] || fail "the unit kept restarting after stop: $(systemctl is-active systemd-nspawn@$app.service)"
-$NSPAWN ps -a | grep "^ *$app " | grep -q stopped || fail "the app is not stopped after stop"
+$NSPAWN ps -a | grep "^ *$app " | grep_q stopped || fail "the app is not stopped after stop"
 
 step "restart policy always and unless-stopped: started at boot, stop decides"
 $NSPAWN start $app --restart always -- /bin/sleep 300 || fail "start with --restart always"
@@ -578,14 +582,14 @@ $NSPAWN start $app --restart always -- /bin/sleep 300 || fail "start with --rest
 [ -L /etc/systemd/system/machines.target.wants/systemd-nspawn@$app.service ] || fail "always did not hook the unit to machines.target"
 systemctl is-enabled machines.target >/dev/null || fail "machines.target is not enabled"
 # What boot starts: machines.target, which multi-user.target wants, wants the machine.
-systemctl show -p Wants --value machines.target | grep -qw "systemd-nspawn@$app.service" || fail "machines.target does not want the always machine"
-systemctl list-dependencies --plain multi-user.target 2>/dev/null | grep -q "machines.target" || fail "machines.target is not reached at boot"
+systemctl show -p Wants --value machines.target | grep_q -w "systemd-nspawn@$app.service" || fail "machines.target does not want the always machine"
+systemctl list-dependencies --plain multi-user.target 2>/dev/null | grep_q "machines.target" || fail "machines.target is not reached at boot"
 $NSPAWN stop $app || fail "stop an always machine"
 [ "$(systemctl is-enabled systemd-nspawn@$app.service)" = enabled ] || fail "stop disabled an always machine"
 $NSPAWN start $app --restart unless-stopped || fail "start with --restart unless-stopped"
 [ "$(systemctl is-enabled systemd-nspawn@$app.service)" = enabled ] || fail "unless-stopped did not enable the unit"
 $NSPAWN stop $app --no-wait || fail "stop --no-wait of an unless-stopped machine"
-retry 10 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "unless-stopped machine still running after stop --no-wait"
+retry 10 bash -c "! $NSPAWN ps | grep_q '^ *$app '" || fail "unless-stopped machine still running after stop --no-wait"
 [ "$(systemctl is-enabled systemd-nspawn@$app.service)" = disabled ] || fail "stop did not disable an unless-stopped machine"
 $NSPAWN start $app || fail "start an unless-stopped machine again"
 [ "$(systemctl is-enabled systemd-nspawn@$app.service)" = enabled ] || fail "start did not enable an unless-stopped machine again"
@@ -603,7 +607,7 @@ $NSPAWN start e2e-restart >/dev/null || fail "start the created always machine"
 $NSPAWN stop e2e-restart >/dev/null || fail "stop the created always machine"
 # A machine caught in a restart loop is removed with -f: the stop ends the loop first.
 $NSPAWN start e2e-restart -- /bin/sh -c 'exit 1' >/dev/null 2>&1
-retry 10 bash -c "$NSPAWN ps | grep '^ *e2e-restart ' | grep -q restarting" || fail "the created machine is not restarting"
+retry 10 bash -c "$NSPAWN ps | grep '^ *e2e-restart ' | grep_q restarting" || fail "the created machine is not restarting"
 $NSPAWN rm -f e2e-restart >/dev/null || fail "rm -f of an enabled machine that is restarting"
 sleep 3
 systemctl is-active systemd-nspawn@e2e-restart.service >/dev/null && fail "the unit of a removed machine is still restarting"
@@ -623,7 +627,7 @@ cg=/sys/fs/cgroup/machine.slice/systemd-nspawn@$app.service
 [ "$(cat $cg/pids.max)" = 100 ] || fail "pids.max of the machine's cgroup: $(cat $cg/pids.max)"
 # The shell's own status is not the point (pipefail would count it): what it said is.
 out=$($NSPAWN exec $app -- /bin/sh -c 'i=0; while [ $i -lt 150 ]; do sleep 5 & i=$((i+1)); done; wait' </dev/null 2>&1)
-echo "$out" | grep -qi "fork" || fail "the machine could start more processes than --pids-limit"
+echo "$out" | grep_q -i "fork" || fail "the machine could start more processes than --pids-limit"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['memory'] == 67108864 and d['cpus'] == 0.5 and d['pids_limit'] == 100, d" || fail "inspect does not show the limits"
 # The memory limit holds, swap included: a program that wants more than the whole
 # machine may have (64m of memory and as much swap) is killed by the kernel (128 +
@@ -645,13 +649,13 @@ $NSPAWN volume create e2evol-free >/dev/null || fail "volume create of an existi
 $NSPAWN volume create 'bad name' >/dev/null 2>&1 && fail "volume create accepted a bad name"
 mkdir -p /var/lib/nspawn/volumes/.e2e-hidden
 $NSPAWN volume ls | tee /tmp/e2e-vol.txt
-grep "^ *e2evol-free " /tmp/e2e-vol.txt | grep -q " - " || fail "an unused volume is not shown as unused"
+grep "^ *e2evol-free " /tmp/e2e-vol.txt | grep_q " - " || fail "an unused volume is not shown as unused"
 grep -q "e2e-hidden" /tmp/e2e-vol.txt && fail "a dot directory is listed as a volume"
 $NSPAWN start $app -v e2evol2:/v -- /bin/sleep 300 >/dev/null || fail "start with a second named volume"
-$NSPAWN volume ls | grep "^ *e2evol2 " | grep -q "$app" || fail "volume ls does not show who uses e2evol2"
+$NSPAWN volume ls | grep "^ *e2evol2 " | grep_q "$app" || fail "volume ls does not show who uses e2evol2"
 $NSPAWN volume ls --json | python3 -c "import json,sys; d = {v['name']: v for v in json.load(sys.stdin)}; assert d['e2evol2']['used_by'] == ['$app'] and d['e2evol2']['path'] == '/var/lib/nspawn/volumes/e2evol2', d" || fail "volume ls --json"
 out=$($NSPAWN volume rm e2evol2 2>&1) && fail "a volume in use was removed"
-echo "$out" | grep -q "in use by $app" || fail "volume rm did not say who uses it: $out"
+echo "$out" | grep_q "in use by $app" || fail "volume rm did not say who uses it: $out"
 $NSPAWN volume prune -f | tee /tmp/e2e-prune.txt || fail "volume prune"
 grep -q "removed e2evol-free" /tmp/e2e-prune.txt || fail "prune left an unused volume"
 [ -d /var/lib/nspawn/volumes/e2evol2 ] || fail "prune removed a volume in use"
@@ -666,16 +670,16 @@ rmdir /var/lib/nspawn/volumes/.e2e-hidden
 step "rm: a running machine is refused, rm -f stops it first, named volumes stay"
 $NSPAWN start $app -v e2evol:/vol -- /bin/sleep 300 >/dev/null || fail "start the app with e2evol"
 out=$($NSPAWN rm $app 2>&1) && fail "rm removed a running machine"
-echo "$out" | grep -q "rm --force" || fail "rm of a running machine does not mention --force: $out"
+echo "$out" | grep_q "rm --force" || fail "rm of a running machine does not mention --force: $out"
 $NSPAWN rm -f $app > /tmp/e2e-rmf.txt 2>&1 || { cat /tmp/e2e-rmf.txt; fail "rm -f of a running machine"; }
 grep -q "removed $app" /tmp/e2e-rmf.txt || fail "rm -f did not say it removed $app: $(cat /tmp/e2e-rmf.txt)"
 grep -q "volume e2evol kept" /tmp/e2e-rmf.txt || fail "rm did not say the named volume was kept: $(cat /tmp/e2e-rmf.txt)"
 [ -d /var/lib/nspawn/volumes/e2evol ] || fail "rm removed a named volume"
-$NSPAWN ps -a | grep -q "^ *$app " && fail "$app still listed after rm -f"
+$NSPAWN ps -a | grep_q "^ *$app " && fail "$app still listed after rm -f"
 [ -e "/var/lib/machines/$app" ] && fail "/var/lib/machines/$app left after rm -f"
 systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "rm -f left the unit failed"
 [ -e /etc/systemd/nspawn/$app.nspawn ] && fail "settings file left behind for $app"
-ls /etc/systemd/system/ | grep -q "$app" && fail "unit files left behind for $app"
+ls /etc/systemd/system/ | grep_q "$app" && fail "unit files left behind for $app"
 
 step "pipelines: a reader that closes early must not make nspawn fail"
 $NSPAWN hub ls | head -c 1 >/dev/null; rc=${PIPESTATUS[0]}
@@ -699,15 +703,15 @@ if command -v busctl >/dev/null 2>&1; then
   [ "$($B get-property $M Version)" = "s \"$($NSPAWN --version | awk '{print $2}')\"" ] || fail "Version property"
   job=$($B call $M PullImage 'sa{sv}' "$IMAGE" 3 name s e2e-dbus backend s overlay force b true | awk '{print $2}' | tr -d '"')
   echo "pull job: $job"
-  echo "$job" | grep -q "^/org/nspawn/job/" || fail "PullImage did not return a job path"
+  echo "$job" | grep_q "^/org/nspawn/job/" || fail "PullImage did not return a job path"
   retry 90 bash -c "[ \"\$($B get-property org.nspawn $job org.nspawn.Job State)\" != 's \"running\"' ]" || fail "the pull job did not end"
   [ "$($B get-property org.nspawn $job org.nspawn.Job State)" = 's "done"' ] || { $B get-property org.nspawn $job org.nspawn.Job Error; fail "the pull job failed"; }
-  $B get-property org.nspawn $job org.nspawn.Job Output | grep -q "assembling as overlay" || fail "the job kept no output"
-  $B get-property org.nspawn $job org.nspawn.Job Result | grep -q '"name" s "e2e-dbus"' || fail "the job kept no result"
-  $B get-property $M Jobs | grep -q "$job" || fail "Jobs property misses the job"
-  $B call $M ListImages | grep -q '"name" s "e2e-dbus"' || fail "ListImages misses the pulled image"
-  $B call $M GetImage s e2e-dbus | grep -q '"mode" s "boot"' || fail "GetImage"
-  $B call $M GetImage s e2e-dbus | grep -q '"restart" s "no"' || fail "GetImage has no restart policy"
+  $B get-property org.nspawn $job org.nspawn.Job Output | grep_q "assembling as overlay" || fail "the job kept no output"
+  $B get-property org.nspawn $job org.nspawn.Job Result | grep_q '"name" s "e2e-dbus"' || fail "the job kept no result"
+  $B get-property $M Jobs | grep_q "$job" || fail "Jobs property misses the job"
+  $B call $M ListImages | grep_q '"name" s "e2e-dbus"' || fail "ListImages misses the pulled image"
+  $B call $M GetImage s e2e-dbus | grep_q '"mode" s "boot"' || fail "GetImage"
+  $B call $M GetImage s e2e-dbus | grep_q '"restart" s "no"' || fail "GetImage has no restart policy"
   digest=$($B call $M GetImage s e2e-dbus | grep -oE '"digest" s "sha256:[0-9a-f]+"' | grep -oE 'sha256:[0-9a-f]+')
   [ -n "$digest" ] || fail "GetImage has no digest"
   $NSPAWN pull "${IMAGE%%:*}@$digest" --name e2e-digest --backend flat --force >/dev/null || fail "pull by digest"
@@ -716,23 +720,23 @@ if command -v busctl >/dev/null 2>&1; then
   [ "$($B call $M StartMachine 'sa{sv}' e2e-dbus 0)" = 'sas "started" 0' ] || fail "StartMachine"
   out=$($NSPAWN images rm e2e-nothing-$nonce e2e-dbus 2>&1); rc=$?
   [ "$rc" != 0 ] || fail "images rm of a running machine succeeded"
-  echo "$out" | grep -q "removed e2e-nothing-$nonce" || fail "images rm stopped at the first failure: $out"
-  echo "$out" | grep -q "machine e2e-dbus is running" || fail "images rm did not explain the failure: $out"
+  echo "$out" | grep_q "removed e2e-nothing-$nonce" || fail "images rm stopped at the first failure: $out"
+  echo "$out" | grep_q "machine e2e-dbus is running" || fail "images rm did not explain the failure: $out"
   $B call $M ListMachines b false > /tmp/e2e-lm.txt
   grep -q '"name" s "e2e-dbus"' /tmp/e2e-lm.txt || fail "ListMachines misses the machine"
   grep -q '"machine_path" s "/org/freedesktop/machine1/machine/e2e_2ddbus"' /tmp/e2e-lm.txt || fail "ListMachines has no machined path"
   grep -q '"state" s "running"' /tmp/e2e-lm.txt || fail "ListMachines: not running"
-  $B call $M GetMachine s e2e-dbus | grep -q '"state" s "running"' || fail "GetMachine of a running machine"
-  $B call $M ListNetwork | grep -q '"name" s "e2e-dbus"' || fail "ListNetwork misses the machine"
+  $B call $M GetMachine s e2e-dbus | grep_q '"state" s "running"' || fail "GetMachine of a running machine"
+  $B call $M ListNetwork | grep_q '"name" s "e2e-dbus"' || fail "ListNetwork misses the machine"
   # Every exec of this run went through Exec; each left a process object behind.
   out=$($NSPAWN exec e2e-dbus -- /bin/sh -c "echo via-bus-$nonce; exit 7" </dev/null); code=$?
   [ "$code" = 7 ] || fail "exec did not propagate the exit code (got $code)"
-  echo "$out" | grep -q "via-bus-$nonce" || fail "exec lost the output: $out"
+  echo "$out" | grep_q "via-bus-$nonce" || fail "exec lost the output: $out"
   proc=$($B get-property $M Processes | awk '{print $NF}' | tr -d '"')
-  echo "$proc" | grep -q "^/org/nspawn/process/" || fail "no process object after Exec"
+  echo "$proc" | grep_q "^/org/nspawn/process/" || fail "no process object after Exec"
   [ "$($B get-property org.nspawn $proc org.nspawn.Process State)" = 's "exited"' ] || fail "the process object did not see the exit"
   [ "$($B get-property org.nspawn $proc org.nspawn.Process ExitStatus)" = "i 7" ] || fail "the process object kept the wrong exit status"
-  $B get-property org.nspawn $proc org.nspawn.Process Argv | grep -q "via-bus-$nonce" || fail "the process object has the wrong argv"
+  $B get-property org.nspawn $proc org.nspawn.Process Argv | grep_q "via-bus-$nonce" || fail "the process object has the wrong argv"
   # A command nobody pumps: signalled through its object, it ends with 128 plus the signal.
   proc=$($B call $M Exec 'sassa{sv}' e2e-dbus 2 /bin/sleep 300 "" 1 tty b false | grep -oE '"/org/nspawn/process/[0-9]+"' | tr -d '"')
   [ -n "$proc" ] || fail "Exec over the bus returned no process object"
@@ -741,25 +745,25 @@ if command -v busctl >/dev/null 2>&1; then
   retry 10 bash -c "[ \"\$($B get-property org.nspawn $proc org.nspawn.Process State)\" = 's \"exited\"' ]" || fail "the signalled command did not exit"
   [ "$($B get-property org.nspawn $proc org.nspawn.Process ExitStatus)" = "i 143" ] || fail "the signalled command's status is not 143: $($B get-property org.nspawn $proc org.nspawn.Process ExitStatus)"
   out=$($B call org.nspawn $proc org.nspawn.Process Signal i 15 2>&1) && fail "Signal to an exited process succeeded"
-  echo "$out" | grep -q "has exited" || fail "Signal to an exited process not refused with a reason: $out"
+  echo "$out" | grep_q "has exited" || fail "Signal to an exited process not refused with a reason: $out"
   job=$($B call $M RemoveMachines 'asa{sv}' 1 e2e-dbus 1 force b false | awk '{print $2}' | tr -d '"')
   retry 30 bash -c "[ \"\$($B get-property org.nspawn $job org.nspawn.Job State)\" != 's \"running\"' ]" || fail "the refused rm job did not end"
-  $B get-property org.nspawn $job org.nspawn.Job Error | grep -q "rm --force" || fail "RemoveMachines without force did not refuse a running machine"
+  $B get-property org.nspawn $job org.nspawn.Job Error | grep_q "rm --force" || fail "RemoveMachines without force did not refuse a running machine"
   [ "$($B call $M StopMachine 'sa{sv}' e2e-dbus 0)" = 'sas "stopped" 0' ] || fail "StopMachine"
-  $B call $M ListMachines b true | grep -q '"state" s "stopped"' || fail "ListMachines with all misses the stopped machine"
+  $B call $M ListMachines b true | grep_q '"state" s "stopped"' || fail "ListMachines with all misses the stopped machine"
   job=$($B call $M RemoveImages as 1 e2e-dbus | awk '{print $2}' | tr -d '"')
-  echo "$job" | grep -q "^/org/nspawn/job/" || fail "RemoveImages did not return a job path"
+  echo "$job" | grep_q "^/org/nspawn/job/" || fail "RemoveImages did not return a job path"
   retry 30 bash -c "[ \"\$($B get-property org.nspawn $job org.nspawn.Job State)\" != 's \"running\"' ]" || fail "the rm job did not end"
   [ "$($B get-property org.nspawn $job org.nspawn.Job State)" = 's "done"' ] || { $B get-property org.nspawn $job org.nspawn.Job Error; fail "the rm job failed"; }
-  $B get-property org.nspawn $job org.nspawn.Job Output | grep -q "removed e2e-dbus" || fail "the rm job said nothing about e2e-dbus"
-  $B get-property org.nspawn $job org.nspawn.Job Result | grep -q '"removed" as 1 "e2e-dbus"' || fail "the rm job has no result"
+  $B get-property org.nspawn $job org.nspawn.Job Output | grep_q "removed e2e-dbus" || fail "the rm job said nothing about e2e-dbus"
+  $B get-property org.nspawn $job org.nspawn.Job Result | grep_q '"removed" as 1 "e2e-dbus"' || fail "the rm job has no result"
   $B call $M Login 'sssa{sv}' "$NSPAWN_REGISTRY" tester s3cret 0 > /dev/null || fail "Login over the bus"
   python3 -c "import json; d = json.load(open('/etc/nspawn/auth.json')); assert '$NSPAWN_REGISTRY' in d['auths']" || fail "credentials from the bus not stored"
   [ "$($B call $M Logout s "$NSPAWN_REGISTRY")" = "b true" ] || fail "Logout over the bus"
   out=$($B call $M StartMachine 'sa{sv}' e2e-dbus 1 bogus s x 2>&1) && fail "an unknown option was accepted"
-  echo "$out" | grep -q "unknown option" || fail "unknown option not named: $out"
+  echo "$out" | grep_q "unknown option" || fail "unknown option not named: $out"
   out=$($B call $M GetImage s e2e-nonexistent 2>&1) && fail "GetImage of a missing image succeeded"
-  echo "$out" | grep -q "no image named" || fail "missing image not explained: $out"
+  echo "$out" | grep_q "no image named" || fail "missing image not explained: $out"
 else
   echo "busctl not installed: skipping the D-Bus section"
 fi
@@ -777,15 +781,15 @@ else
   [ -n "$hidden_iptables" ] && mv "$hidden_iptables" "${hidden_iptables}.e2e-hidden"
   out=$($NSPAWN network up 2>&1 >/dev/null)
   [ -n "$hidden_iptables" ] && mv "${hidden_iptables}.e2e-hidden" "$hidden_iptables"
-  echo "$out" | grep -q "docker drops forwarded traffic" || fail "no warning when forwarding is dropped and iptables is missing: $out"
-  echo "$out" | grep -q "published ports will answer on this host alone" || fail "the warning does not say what breaks: $out"
+  echo "$out" | grep_q "docker drops forwarded traffic" || fail "no warning when forwarding is dropped and iptables is missing: $out"
+  echo "$out" | grep_q "published ports will answer on this host alone" || fail "the warning does not say what breaks: $out"
   hidden_iptables=
   # With iptables there, nspawn adds the exception instead of warning.
   out=$($NSPAWN network up 2>&1 >/dev/null)
-  echo "$out" | grep -q "drops forwarded traffic" && fail "still warning although iptables is installed: $out"
-  iptables -S DOCKER-USER | grep -q -- "-i nspawn0 -j ACCEPT" || fail "nspawn did not let the bridge through DOCKER-USER: $(iptables -S DOCKER-USER)"
+  echo "$out" | grep_q "drops forwarded traffic" && fail "still warning although iptables is installed: $out"
+  iptables -S DOCKER-USER | grep_q -- "-i nspawn0 -j ACCEPT" || fail "nspawn did not let the bridge through DOCKER-USER: $(iptables -S DOCKER-USER)"
   # iptables prints the conntrack states in its own order, so match the rule, not them.
-  iptables -S DOCKER-USER | grep -q -- "-o nspawn0 -m conntrack" || fail "nspawn did not let the answers back in: $(iptables -S DOCKER-USER)"
+  iptables -S DOCKER-USER | grep_q -- "-o nspawn0 -m conntrack" || fail "nspawn did not let the answers back in: $(iptables -S DOCKER-USER)"
   nft delete table ip filter || fail "cannot remove the test table"
 fi
 
@@ -800,7 +804,7 @@ for blob in /var/lib/nspawn/blobs/sha256-*; do
   [ -e "$blob" ] || continue
   [ "sha256-$(sha256sum "$blob" | awk '{print $1}')" = "$(basename "$blob")" ] || fail "blob $(basename "$blob") does not match its digest after two pulls at once"
 done
-ls /var/lib/nspawn/blobs/ | grep -q "^\.part-\|^\.hold-" && fail "leftovers in the blob store after two pulls: $(ls -a /var/lib/nspawn/blobs/ | grep '^\.')"
+ls /var/lib/nspawn/blobs/ | grep_q "^\.part-\|^\.hold-" && fail "leftovers in the blob store after two pulls: $(ls -a /var/lib/nspawn/blobs/ | grep '^\.')"
 $NSPAWN start e2e-twin-b >/dev/null && $NSPAWN exec e2e-twin-b -- /usr/bin/true </dev/null && $NSPAWN stop e2e-twin-b >/dev/null || fail "a machine pulled alongside another does not run"
 
 step "polkit: a user who is not root, with and without a rule"
@@ -818,8 +822,8 @@ else
   rm -f "$rules"
   out=$(sudo -u "$who" $NSPAWN ps 2>&1); rc=$?
   [ $rc -ne 0 ] || fail "$who could list machines with no rule in place"
-  echo "$out" | grep -q "org.nspawn.inspect" || fail "the refusal does not name the action: $out"
-  echo "$out" | grep -q "polkit rule" || fail "the refusal does not say how to allow it: $out"
+  echo "$out" | grep_q "org.nspawn.inspect" || fail "the refusal does not name the action: $out"
+  echo "$out" | grep_q "polkit rule" || fail "the refusal does not say how to allow it: $out"
   cat > "$rules" <<RULE
 polkit.addRule(function (action, subject) {
     if (action.id.startsWith("org.nspawn.") && subject.isInGroup("$group")) {
@@ -836,7 +840,7 @@ RULE
   # The rule lets them call; another user's command is still not theirs to read.
   if [ -n "${proc:-}" ] && command -v busctl >/dev/null 2>&1; then
     out=$(sudo -u "$who" busctl --system get-property org.nspawn "$proc" org.nspawn.Process Argv 2>&1) && fail "$who could read a command root ran: $out"
-    echo "$out" | grep -qi "denied" || fail "reading another user's command failed for the wrong reason: $out"
+    echo "$out" | grep_q -i "denied" || fail "reading another user's command failed for the wrong reason: $out"
   fi
   rm -f "$rules"
   retry 5 bash -c "! sudo -u $who $NSPAWN ps >/dev/null 2>&1" || fail "$who can still list machines after the rule went"
@@ -848,24 +852,24 @@ $NSPAWN images rm e2e-twin-a e2e-twin-b >/dev/null || fail "rm the twin images"
 
 step "error handling (these commands must fail with a useful message)"
 out=$($NSPAWN cp /etc/hosts /tmp/e2e-cp-x 2>&1) && fail "cp between two local paths succeeded"
-echo "$out" | grep -q "MACHINE:PATH" || fail "cp of two local paths not explained: $out"
+echo "$out" | grep_q "MACHINE:PATH" || fail "cp of two local paths not explained: $out"
 out=$($NSPAWN cp a:/x b:/y 2>&1) && fail "cp between two machines succeeded"
-echo "$out" | grep -q "between machines" || fail "cp between machines not explained: $out"
+echo "$out" | grep_q "between machines" || fail "cp between machines not explained: $out"
 out=$($NSPAWN cp e2e-nonexistent:/etc/hosts /tmp/ 2>&1) && fail "cp out of a missing machine succeeded"
-echo "$out" | grep -q "no machine or image named" || fail "cp out of a missing machine not explained: $out"
+echo "$out" | grep_q "no machine or image named" || fail "cp out of a missing machine not explained: $out"
 out=$($NSPAWN cp e2e-nonexistent: /tmp/ 2>&1) && fail "cp with no path after the colon succeeded"
 out=$($NSPAWN pull "$NSPAWN_REGISTRY/does-not-exist:1" --name e2e-x 2>&1); rc=$?
 echo "$out"
 [ $rc -ne 0 ] || fail "pull of a missing image succeeded"
-echo "$out" | grep -qi "manifest" || fail "missing image error does not mention the manifest"
+echo "$out" | grep_q -i "manifest" || fail "missing image error does not mention the manifest"
 out=$($NSPAWN start e2e-nonexistent 2>&1); rc=$?
 echo "$out"
 [ $rc -ne 0 ] || fail "start of an unknown image succeeded"
-echo "$out" | grep -q "no image named" || fail "start of an unknown image gave no hint"
-out=$($NSPAWN stop e2e-nonexistent 2>&1); [ $? -ne 0 ] && echo "$out" | grep -q "not running" || fail "stop of unknown machine"
+echo "$out" | grep_q "no image named" || fail "start of an unknown image gave no hint"
+out=$($NSPAWN stop e2e-nonexistent 2>&1); [ $? -ne 0 ] && echo "$out" | grep_q "not running" || fail "stop of unknown machine"
 out=$($NSPAWN --registry 127.0.0.1:9 search --source hub e2e-$nonce 2>&1 >/dev/null); rc=$?
 [ $rc -eq 0 ] || fail "search with an unreachable hub failed instead of warning: $out"
-echo "$out" | grep -q "warning: 127.0.0.1:9" || fail "search did not warn about the unreachable hub: $out"
+echo "$out" | grep_q "warning: 127.0.0.1:9" || fail "search did not warn about the unreachable hub: $out"
 
 echo
 if [ "$failures" = 0 ]; then echo "ALL OK"; else echo "$failures FAILURE(S)"; exit 1; fi
