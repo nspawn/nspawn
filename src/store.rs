@@ -627,8 +627,8 @@ pub fn validate_digest(digest: &str) -> Result<()> {
 /// directories with inode 2.
 pub fn check_writable(dir: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let probe = dir.join(".nspawn-write-test");
-    let _ = fs::remove_dir(&probe);
+    // One probe per call: two pulls at once must not remove each other's.
+    let probe = dir.join(format!(".nspawn-write-test-{}", unique_suffix()));
     match fs::create_dir(&probe) {
         Ok(()) => {
             let _ = fs::remove_dir(&probe);
@@ -1663,6 +1663,30 @@ mod tests {
         assert!(validate_digest(&format!("sha256:{}", "A".repeat(64))).is_err());
         assert!(validate_digest(&format!("sha512:{}", "a".repeat(64))).is_err());
         assert!(validate_digest(&format!("sha256:{}", "a".repeat(63))).is_err());
+    }
+
+    #[test]
+    fn writability_checks_at_once_do_not_trip_over_each_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        check_writable(&dir).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            0,
+            "no probe is left behind"
+        );
     }
 
     #[test]
