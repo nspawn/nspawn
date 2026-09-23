@@ -32,6 +32,7 @@ Requires:       systemd-container
 Requires:       iproute
 Requires:       nftables
 Recommends:     (%{name}-selinux if selinux-policy-%{selinuxtype})
+%{?systemd_requires}
 
 %description
 nspawn pulls OCI images from a registry, keeps them as shared layers, and
@@ -84,8 +85,25 @@ install -d -m 0755 %{buildroot}%{_sharedstatedir}/%{name}
 %check
 cargo test --release --offline
 
+%post
+%systemd_post %{name}.service
+
+%preun
+%systemd_preun %{name}.service
+
+%postun
+%systemd_postun_with_restart %{name}.service
+
 %pre selinux
 %selinux_relabel_pre -s %{selinuxtype}
+
+%preun selinux
+if [ $1 -eq 0 ]; then
+    # Before the module goes: a service left running would be in a domain the policy
+    # no longer defines, where every access is denied and not even systemd can
+    # signal it.
+    systemctl stop %{name}.service >/dev/null 2>&1 || :
+fi
 
 %post selinux
 %selinux_modules_install -s %{selinuxtype} %{_datadir}/selinux/packages/%{selinuxtype}/%{name}.pp.bz2
