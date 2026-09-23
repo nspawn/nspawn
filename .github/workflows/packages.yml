@@ -63,10 +63,19 @@ jobs:
         # -d: cargo and rustc come from rustup here, not from the packages the
         # control file names for a distribution whose own rust is new enough.
         run: dpkg-buildpackage -us -uc -b -d
+      - name: The binary on its own
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          mkdir -p /tmp/tarball/nspawn-${version}
+          cp target/release/nspawn README.md LICENSE /tmp/tarball/nspawn-${version}/
+          tar -czf /tmp/tarball/nspawn-${version}-x86_64-linux.tar.gz \
+              -C /tmp/tarball nspawn-${version}
       - uses: actions/upload-artifact@v4
         with:
           name: ubuntu-debs
-          path: ../*.deb
+          path: |
+            ../*.deb
+            /tmp/tarball/*.tar.gz
 
   arch:
     name: Arch package
@@ -94,3 +103,32 @@ jobs:
           name: arch-package
           path: /tmp/pkg/*.pkg.tar.zst
 
+  release:
+    name: Attach everything to the release
+    needs: [rpm, deb, arch]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p upload
+          find artifacts -type f \( -name '*.rpm' -o -name '*.deb' \
+              -o -name '*.pkg.tar.zst' -o -name '*.tar.gz' \) -exec cp {} upload/ \;
+          # What nobody downloads from a release page.
+          rm -f upload/*debuginfo* upload/*debugsource* upload/*-debug-*
+          (cd upload && sha256sum * > SHA256SUMS)
+          ls -l upload
+          tag=${GITHUB_REF_NAME}
+          case "$tag" in *-*) pre=--prerelease ;; *) pre= ;; esac
+          if gh release view "$tag" > /dev/null 2>&1; then
+              gh release upload "$tag" upload/* --clobber
+          else
+              gh release create "$tag" upload/* --title "nspawn $tag" --generate-notes $pre
+          fi

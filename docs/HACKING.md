@@ -98,7 +98,10 @@ packages: `/usr/share/dbus-1/system-services/org.nspawn.service` and
 them is refused on Arch (pacman does not take files it does not own) and
 silently overwrites them elsewhere, so remove what `--install` listed before
 going from a build to a package. The
-`packages` workflow builds the RPMs in a Fedora container on every tag and on
-demand, and keeps them as artifacts; the suite on the Fedora VM is where they
-get tested, since a container has neither SELinux enforcing nor machined.
+`packages` workflow builds all three in their own containers on every tag and
+on demand, keeps them as artifacts, and on a tag attaches them to the GitHub
+release together with the plain binary tarball (built on the oldest supported
+distribution, so that it runs on the later ones) and a `SHA256SUMS` over the
+lot. The suite on the Fedora VM is where the packages get tested, since a
+container has neither SELinux enforcing nor machined.
 
