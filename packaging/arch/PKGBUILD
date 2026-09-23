@@ -7,33 +7,33 @@ pkgdesc='Docker-like management of systemd-nspawn machines: OCI images from a hu
 arch=('x86_64' 'aarch64')
 url='https://github.com/nspawn/nspawn'
 license=('GPL-3.0-or-later')
-depends=('systemd' 'iproute2' 'nftables')
+depends=('systemd>=255' 'iproute2' 'nftables')
 makedepends=('cargo')
-# The upstream tag: 1.0.0beta1 is 1.0.0-beta.1, a release is its own tag.
-case "${pkgver}" in
-  *beta*) _tag="${pkgver//beta*}-beta.${pkgver##*beta}" ;;
-  *) _tag="${pkgver}" ;;
-esac
-source=("${pkgname}-${_tag}.tar.gz::${url}/archive/refs/tags/${_tag}.tar.gz")
+optdepends=('mkosi: build images with nspawn build'
+            'iptables-nft: keep the bridge reachable next to the forwarding rules of docker or ufw')
+# makepkg's -flto=auto turns the C objects of aws-lc-sys into GCC bitcode, which the
+# linker rustc drives cannot read.
+options=('!lto')
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/${pkgver//beta*}-beta.${pkgver##*beta}.tar.gz")
 sha256sums=('SKIP')
 
 prepare() {
-  cd "${pkgname}-${_tag}"
+  cd "${pkgname}-${pkgver//beta*}-beta.${pkgver##*beta}"
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-  cd "${pkgname}-${_tag}"
+  cd "${pkgname}-${pkgver//beta*}-beta.${pkgver##*beta}"
   cargo build --release --frozen
 }
 
 check() {
-  cd "${pkgname}-${_tag}"
+  cd "${pkgname}-${pkgver//beta*}-beta.${pkgver##*beta}"
   cargo test --release --frozen
 }
 
 package() {
-  cd "${pkgname}-${_tag}"
+  cd "${pkgname}-${pkgver//beta*}-beta.${pkgver##*beta}"
   install -Dm755 target/release/nspawn "${pkgdir}/usr/bin/nspawn"
   install -Dm644 packaging/systemd/nspawn.service "${pkgdir}/usr/lib/systemd/system/nspawn.service"
   install -Dm644 packaging/dbus/org.nspawn.service "${pkgdir}/usr/share/dbus-1/system-services/org.nspawn.service"
