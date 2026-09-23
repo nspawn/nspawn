@@ -100,7 +100,13 @@ pub async fn install(
     )?;
     // The unit hooks exist from now on, so that machinectl start or an enabled unit gets
     // the same preparation as nspawn start.
-    if settings::write_hooks(spec.name, config, &route)? {
+    if settings::write_hooks(
+        spec.name,
+        config,
+        &route,
+        crate::policy::Restart::No,
+        &crate::policy::Limits::default(),
+    )? {
         sd.reload().await?;
     }
     store.save_manifest(spec.name, spec.manifest_bytes)?;
@@ -127,6 +133,8 @@ pub async fn install(
         env: Vec::new(),
         volumes: Vec::new(),
         labels: BTreeMap::new(),
+        restart: Default::default(),
+        limits: Default::default(),
     })?;
     Ok(mode)
 }
@@ -155,6 +163,9 @@ pub async fn ensure_replaceable(
     if sd.machine_exists(name).await? {
         anyhow::bail!("machine {name} is running; stop it before replacing its image");
     }
+    if let Some(why) = crate::api::machines::unit_busy(sd, name).await? {
+        anyhow::bail!("{why}");
+    }
     Ok(())
 }
 
@@ -166,6 +177,9 @@ pub async fn remove_existing(store: &Store, sd: &Systemd, name: &str) -> Result<
     }
     if sd.machine_exists(name).await? {
         anyhow::bail!("machine {name} is running; stop it before replacing its image");
+    }
+    if let Some(why) = crate::api::machines::unit_busy(sd, name).await? {
+        anyhow::bail!("{why}");
     }
     let assembler = Assembler { store, sd };
     match store.load_image(name)? {

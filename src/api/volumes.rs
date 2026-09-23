@@ -254,6 +254,8 @@ mod tests {
                     .map(|v| v.parse::<Volume>().unwrap())
                     .collect(),
                 labels: BTreeMap::new(),
+                restart: Default::default(),
+                limits: Default::default(),
             })
             .unwrap();
     }

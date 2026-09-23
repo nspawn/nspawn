@@ -137,6 +137,18 @@ pub async fn start(args: StartArgs, client: &Client) -> Result<()> {
     if !args.label.is_empty() {
         options.insert("label", Value::from(args.label));
     }
+    if let Some(restart) = args.restart {
+        options.insert("restart", Value::from(restart.name()));
+    }
+    if let Some(memory) = args.memory {
+        options.insert("memory", Value::from(memory));
+    }
+    if let Some(cpus) = args.cpus {
+        options.insert("cpus", Value::from(cpus));
+    }
+    if let Some(pids) = args.pids_limit {
+        options.insert("pids_limit", Value::from(pids));
+    }
     if args.image_command {
         options.insert("image_command", Value::from(true));
     }
@@ -153,6 +165,10 @@ pub async fn start(args: StartArgs, client: &Client) -> Result<()> {
     }
     match outcome.as_str() {
         "ended" => println!("{} ran and ended already", args.name),
+        "restarting" => println!(
+            "{0} ended right after starting and is being restarted; see nspawn logs {0}",
+            args.name
+        ),
         _ => println!("started {}", args.name),
     }
     Ok(())

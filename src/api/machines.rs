@@ -14,10 +14,11 @@ use crate::config::Config;
 use crate::hostnet;
 use crate::nsenter;
 use crate::oci::Mode;
+use crate::policy::{Limits, Restart};
 use crate::reference::validate_machine_name;
 use crate::settings::{self, Bind, BridgeMount, MachineSettings, Network};
 use crate::store::{now_unix, ImageRecord, Store};
-use crate::systemd::Systemd;
+use crate::systemd::{Systemd, UnitState};
 use crate::volume;
 
 /// One machine as `ps` shows it: machined's state plus nspawn's record when it installed
@@ -59,11 +60,14 @@ pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
             os: sd.machine_os(name).await,
         });
     }
+    let unit = sd
+        .unit_status(&format!("systemd-nspawn@{name}.service"))
+        .await?;
     match record {
         Some(record) => Ok(MachineSummary {
             name: name.to_string(),
             record: Some(record),
-            state: "stopped".to_string(),
+            state: unit_word(&unit).to_string(),
             started: None,
             leader: None,
             os: None,
@@ -104,19 +108,31 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
             os: sd.machine_os(&m.name).await,
         });
     }
-    if all {
-        let running: std::collections::HashSet<&str> =
-            machines.iter().map(|m| m.name.as_str()).collect();
-        let mut stopped: Vec<&ImageRecord> = records
-            .values()
-            .filter(|r| !running.contains(r.name.as_str()))
-            .collect();
-        stopped.sort_by(|a, b| a.name.cmp(&b.name));
-        for r in stopped {
+    // Records that machined does not list: stopped, or between two runs of a restart
+    // policy, which ps shows without -a since they are not stopped.
+    let running: std::collections::HashSet<&str> =
+        machines.iter().map(|m| m.name.as_str()).collect();
+    let mut others: Vec<&ImageRecord> = records
+        .values()
+        .filter(|r| !running.contains(r.name.as_str()))
+        .collect();
+    others.sort_by(|a, b| a.name.cmp(&b.name));
+    let units: Vec<String> = others
+        .iter()
+        .map(|r| format!("systemd-nspawn@{}.service", r.name))
+        .collect();
+    let states = sd.unit_states(&units).await?;
+    for (r, unit) in others.into_iter().zip(&units) {
+        let state = states
+            .get(unit)
+            .map(unit_word)
+            .unwrap_or("stopped")
+            .to_string();
+        if all || state != "stopped" {
             summaries.push(MachineSummary {
                 name: r.name.clone(),
                 record: Some(r.clone()),
-                state: "stopped".to_string(),
+                state,
                 started: None,
                 leader: None,
                 os: None,
@@ -124,6 +140,35 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
         }
     }
     Ok(summaries)
+}
+
+/// How ps names a machine machined does not list, from its unit's state.
+pub fn unit_word(state: &UnitState) -> &'static str {
+    if state.restarting() {
+        "restarting"
+    } else {
+        match state.active.as_str() {
+            "activating" | "active" | "reloading" => "starting",
+            "deactivating" => "closing",
+            _ => "stopped",
+        }
+    }
+}
+
+/// Why a machine that machined does not list cannot be removed or replaced: its unit is
+/// still up, starting, or waiting to restart it. Removing its record then would leave a
+/// unit restarting forever with nothing to start.
+pub async fn unit_busy(sd: &Systemd, name: &str) -> Result<Option<String>> {
+    let state = sd
+        .unit_status(&format!("systemd-nspawn@{name}.service"))
+        .await?;
+    Ok(if state.restarting() {
+        Some(format!("machine {name} is restarting; stop it first"))
+    } else if state.busy() {
+        Some(format!("machine {name} is starting; stop it first"))
+    } else {
+        None
+    })
 }
 
 /// Everything a machine needs before its unit starts: checks, address and files on the
@@ -234,7 +279,7 @@ pub async fn prepare(
         },
         &route,
     )?;
-    if settings::write_hooks(name, config, &route)? {
+    if settings::write_hooks(name, config, &route, record.restart, &record.limits)? {
         sd.reload().await?;
     }
     if record.backend == BackendChoice::Mstack {
@@ -251,7 +296,7 @@ pub async fn prepare(
 }
 
 /// What `start` may be asked for. Everything but the name is remembered for the image.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StartRequest {
     pub name: String,
     /// Wait for a booted machine's init to be up before returning.
@@ -267,6 +312,14 @@ pub struct StartRequest {
     pub volume: Vec<String>,
     /// KEY=VALUE labels on top of the image's; "none" forgets them.
     pub label: Vec<String>,
+    /// docker's --restart; None keeps the remembered one.
+    pub restart: Option<Restart>,
+    /// Bytes, 0 for none; None keeps the remembered limit.
+    pub memory: Option<u64>,
+    /// CPUs (0.5), 0 for none; None keeps the remembered limit.
+    pub cpus: Option<f64>,
+    /// Processes, 0 for none; None keeps the remembered limit.
+    pub pids_limit: Option<u64>,
     /// Forget the remembered entrypoint and arguments and run the image's own again.
     pub image_command: bool,
     /// App images: replaces the image's cmd and follows its entrypoint.
@@ -279,6 +332,8 @@ pub enum StartOutcome {
     Started,
     /// A short program ran and returned before the machine registered.
     Ended,
+    /// Its program ended right away and its restart policy is bringing it back.
+    Restarting,
 }
 
 pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Result<StartOutcome> {
@@ -308,6 +363,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     }
     let _starting = store.mark_starting(&args.name)?;
     let mut record = store.load_image(&args.name)?;
+    let previous_policy = record.as_ref().map(|r| r.restart).unwrap_or_default();
     match record.as_mut() {
         Some(r) => {
             if let Some(network) = args.network {
@@ -347,6 +403,11 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             if !args.label.is_empty() {
                 r.labels = volume::parse_labels(&args.label)?;
             }
+            if let Some(restart) = args.restart {
+                r.restart = restart;
+            }
+            apply_limits(&mut r.limits, args.memory, args.cpus, args.pids_limit)?;
+            r.limits.check(r.mode)?;
         }
         None if !args.command.is_empty()
             || args.network.is_some()
@@ -354,10 +415,14 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             || args.entrypoint.is_some()
             || !args.env.is_empty()
             || !args.volume.is_empty()
-            || !args.label.is_empty() =>
+            || !args.label.is_empty()
+            || args.restart.is_some()
+            || args.memory.is_some()
+            || args.cpus.is_some()
+            || args.pids_limit.is_some() =>
         {
             bail!(
-                "{} is not an image managed by nspawn; a command, network, ports, variables, volumes or labels need one",
+                "{} is not an image managed by nspawn; a command, network, ports, variables, volumes, labels, a restart policy or limits need one",
                 args.name
             )
         }
@@ -371,20 +436,41 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
         }
     }
     let booted = record.as_ref().is_none_or(|r| r.mode == Mode::Boot);
+    let policy = record.as_ref().map(|r| r.restart);
     let network = prepare(sd, store, config, &args.name, record, report).await?;
     // The unit's own hooks take the lock; it must be free while the unit starts.
     drop(lock);
+    // always and unless-stopped start the machine at boot too, as machinectl enable
+    // would. A unit is only disabled when its policy was changed away from those, so
+    // that one an administrator enabled by hand stays enabled.
+    if let Some(policy) = policy {
+        let changed = if policy.enabled_at_boot() {
+            sd.enable_unit(&unit).await?
+        } else if args.restart.is_some() && previous_policy.enabled_at_boot() {
+            sd.disable_unit(&unit).await?
+        } else {
+            false
+        };
+        if changed {
+            sd.reload().await?;
+        }
+    }
     // firewalld only knows a veth once the machine is registered; published ports need
     // the machine to count as running.
     let firewalld = network == Network::Veth && hostnet::firewalld_running(sd).await;
-    sd.start_machine(&args.name).await?;
+    if sd.start_machine(&args.name).await? {
+        return Ok(StartOutcome::Restarting);
+    }
     if args.wait || firewalld || network == Network::Bridge {
         let unit = format!("systemd-nspawn@{}.service", args.name);
         let deadline = Instant::now() + Duration::from_secs(30);
         while !sd.machine_exists(&args.name).await? {
             // A short program may have run and returned already: not a failure.
-            let (_, active) = sd.unit_state(&unit).await?;
-            match active.as_str() {
+            let state = sd.unit_status(&unit).await?;
+            if state.restarting() {
+                return Ok(StartOutcome::Restarting);
+            }
+            match state.active.as_str() {
                 "active" | "activating" | "reloading" | "deactivating" => {}
                 "failed" => bail!(
                     "{} ended right after starting with an error; see journalctl -u {unit}",
@@ -409,31 +495,53 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
         bridge::sync_ports(store, sd).await?;
     }
     if args.wait && booted {
-        wait_for_init(sd, &args.name).await?;
+        return wait_for_init(sd, &args.name).await;
     }
     Ok(StartOutcome::Started)
+}
+
+/// Sets the limits given on this call (0 removes one), keeping the others.
+fn apply_limits(
+    limits: &mut Limits,
+    memory: Option<u64>,
+    cpus: Option<f64>,
+    pids: Option<u64>,
+) -> Result<()> {
+    if let Some(memory) = memory {
+        limits.memory = memory;
+    }
+    if let Some(cpus) = cpus {
+        limits.milli_cpus = crate::policy::milli_cpus_from(cpus)?;
+    }
+    if let Some(pids) = pids {
+        limits.pids = pids;
+    }
+    Ok(())
 }
 
 /// Registration comes early in a booted machine's life; a command run right after `start`
 /// would find no service manager to talk to. Wait, within reason, until the machine's
 /// systemd listens on its private socket.
-async fn wait_for_init(sd: &Systemd, name: &str) -> Result<()> {
+async fn wait_for_init(sd: &Systemd, name: &str) -> Result<StartOutcome> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let Ok(leader) = sd.machine_leader(name).await else {
             // Gone while booting: say so instead of "started".
-            let (_, active) = sd
-                .unit_state(&format!("systemd-nspawn@{name}.service"))
+            let state = sd
+                .unit_status(&format!("systemd-nspawn@{name}.service"))
                 .await?;
-            if active == "failed" {
+            if state.restarting() {
+                return Ok(StartOutcome::Restarting);
+            }
+            if state.active == "failed" {
                 bail!("{name} died while booting; see journalctl -u systemd-nspawn@{name}.service");
             }
-            return Ok(());
+            return Ok(StartOutcome::Started);
         };
         if std::path::Path::new(&format!("/proc/{leader}/root/run/systemd/private")).exists()
             || Instant::now() > deadline
         {
-            return Ok(());
+            return Ok(StartOutcome::Started);
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -469,21 +577,59 @@ pub enum StopOutcome {
     WasNotRunning,
 }
 
+/// Where `stop` queues the unit's stop job, which is what keeps a restart policy from
+/// bringing the machine back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Latch {
+    /// No policy: nothing restarts it, stop as before.
+    NotNeeded,
+    /// Before the first signal: a booted machine's init shuts down the same way either
+    /// way.
+    BeforeSignal,
+    /// Right after the signal: SIGKILL with `--force` (a stop job first would have
+    /// machined refuse the kill of a machine it already closes), or an app's stop
+    /// signal, after its time to act on it when `wait`, so that the stub init does not
+    /// add SIGTERM and SIGHUP while the program handles its own. Should the machine end
+    /// in between, the stop job also cancels the restart systemd has scheduled.
+    AfterSignal,
+}
+
+pub fn latch(restart: Restart, force: bool, mode: Option<Mode>) -> Latch {
+    if restart == Restart::No {
+        Latch::NotNeeded
+    } else if force || mode == Some(Mode::App) {
+        Latch::AfterSignal
+    } else {
+        Latch::BeforeSignal
+    }
+}
+
 pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Result<StopOutcome> {
     let sd = ctx.sd().await?;
     let store = &ctx.store;
     let record = store.load_image(&args.name)?;
+    let unit = format!("systemd-nspawn@{}.service", args.name);
+    let policy = record.as_ref().map(|r| r.restart).unwrap_or_default();
+    // unless-stopped: stopped by hand means not at boot either, until the next start.
+    if policy == Restart::UnlessStopped && sd.disable_unit(&unit).await? {
+        sd.reload().await?;
+    }
     if !sd.machine_exists(&args.name).await? {
         match &record {
-            // It ended on its own or elsewhere; leave nothing of it behind, like docker
-            // stop on a stopped container. The unit may still be running its release
-            // hook: let that finish rather than work beside it.
+            // It ended on its own or elsewhere, or it is between two runs of its restart
+            // policy; leave nothing of it behind, like docker stop on a stopped container.
+            // The stop job ends a pending restart, and it completes once the release hook
+            // of the last run is done, so nothing is released beside it.
             Some(r) => {
-                let unit = format!("systemd-nspawn@{}.service", args.name);
-                settled_unit_state(sd, &unit, Duration::from_secs(30)).await?;
+                let state = sd.unit_status(&unit).await?;
+                sd.stop_unit_job(&unit).await?.wait().await?;
                 release_machine(&args.name, Some(r))?;
                 sd.reset_failed(&unit).await?;
-                return Ok(StopOutcome::WasNotRunning);
+                return Ok(if state.busy() {
+                    StopOutcome::Stopped
+                } else {
+                    StopOutcome::WasNotRunning
+                });
             }
             None => bail!("machine {} is not running", args.name),
         }
@@ -495,11 +641,30 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
     } else {
         Vec::new()
     };
+    let mode = record.as_ref().map(|r| r.mode);
+    let latch = latch(policy, args.force, mode);
+    let mut job = None;
+    if latch == Latch::BeforeSignal {
+        job = Some(sd.stop_unit_job(&unit).await?);
+    }
     if args.force {
-        // docker kill: no questions asked.
-        sd.kill_machine(&args.name, "all", libc::SIGKILL).await?;
+        // docker kill: no questions asked. systemd 255 answers "Invalid argument" when it
+        // cannot signal some process of the unit although the machine got its SIGKILL,
+        // and machined may keep it listed for a while: the stop job goes in whatever the
+        // answer, so that a restart policy does not bring it back meanwhile, and what
+        // counts is that the machine goes (awaited below when `wait`).
+        let killed = sd.kill_machine(&args.name, "all", libc::SIGKILL).await;
+        if latch == Latch::AfterSignal {
+            job = Some(sd.stop_unit_job(&unit).await?);
+        }
+        if let Err(e) = killed {
+            note(
+                report,
+                format!("note: {e:#}; waiting for {} to go", args.name),
+            );
+        }
     } else {
-        match record.as_ref().map(|r| r.mode) {
+        match mode {
             // Like docker stop: the image's stop signal to every process, then the hammer.
             Some(Mode::App) => {
                 let signal = record
@@ -531,17 +696,24 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
                         ),
                     ),
                 }
-                if args.wait
-                    && !wait_gone(sd, &args.name, Duration::from_secs(args.timeout)).await?
-                {
-                    note(
-                        report,
-                        format!(
-                            "{} ignored {signal} for {} seconds; killing it",
-                            args.name, args.timeout
-                        ),
-                    );
-                    sd.kill_machine(&args.name, "all", libc::SIGKILL).await?;
+                if latch == Latch::AfterSignal && !args.wait {
+                    job = Some(sd.stop_unit_job(&unit).await?);
+                }
+                if args.wait {
+                    let gone = wait_gone(sd, &args.name, Duration::from_secs(args.timeout)).await?;
+                    if latch == Latch::AfterSignal {
+                        job = Some(sd.stop_unit_job(&unit).await?);
+                    }
+                    if !gone {
+                        note(
+                            report,
+                            format!(
+                                "{} ignored {signal} for {} seconds; killing it",
+                                args.name, args.timeout
+                            ),
+                        );
+                        sd.kill_machine(&args.name, "all", libc::SIGKILL).await?;
+                    }
                 }
             }
             _ => {
@@ -552,8 +724,10 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
                             args.name
                         );
                     }
-                } else {
-                    sd.poweroff_machine(&args.name).await?;
+                } else if let Err(e) = sd.poweroff_machine(&args.name).await {
+                    if sd.machine_exists(&args.name).await? {
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -567,8 +741,10 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         }
         // Let the service finish its own teardown so that the image can be removed right
         // away, and clear the failure a signal-killed program leaves on the unit.
-        let unit = format!("systemd-nspawn@{}.service", args.name);
-        sd.stop_unit(&unit).await?;
+        match job {
+            Some(job) => job.wait().await?,
+            None => sd.stop_unit(&unit).await?,
+        }
         sd.reset_failed(&unit).await?;
         hostnet::release(sd, &admitted).await;
         let _lock = store.lock().await?;
@@ -589,7 +765,11 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
 async fn wait_for_previous(sd: &Systemd, name: &str, unit: &str, mode: Option<Mode>) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let (_, active) = sd.unit_state(unit).await?;
+        let state = sd.unit_status(unit).await?;
+        if state.restarting() {
+            bail!("machine {name} is restarting after its program ended; stop it first, or see journalctl -u {unit}");
+        }
+        let active = state.active;
         let registered = sd.machine_exists(name).await?;
         match active.as_str() {
             "active" | "activating" if registered && machine_alive(sd, name, mode).await => {
@@ -622,20 +802,6 @@ async fn machine_alive(sd: &Systemd, name: &str, mode: Option<Mode>) -> bool {
         return false;
     }
     mode != Some(Mode::App) || payload_pid(leader).is_some()
-}
-
-/// The active state of a unit once it is no longer on its way down. ExecStopPost=, the
-/// release hook, runs while the unit is "deactivating"; nothing may be prepared for the
-/// next start until it is done. After `timeout` the state is returned as it is.
-async fn settled_unit_state(sd: &Systemd, unit: &str, timeout: Duration) -> Result<String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let (_, active) = sd.unit_state(unit).await?;
-        if active != "deactivating" || Instant::now() >= deadline {
-            return Ok(active);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 }
 
 async fn poweroff_until_gone(sd: &Systemd, name: &str, timeout: Duration) -> Result<bool> {
@@ -872,6 +1038,66 @@ pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_stop_job_goes_where_nothing_is_lost() {
+        use Latch::*;
+        for mode in [Some(Mode::App), Some(Mode::Boot), None] {
+            for force in [false, true] {
+                assert_eq!(latch(Restart::No, force, mode), NotNeeded);
+            }
+        }
+        for policy in [Restart::OnFailure, Restart::Always, Restart::UnlessStopped] {
+            assert_eq!(latch(policy, false, Some(Mode::App)), AfterSignal);
+            assert_eq!(latch(policy, true, Some(Mode::App)), AfterSignal);
+            assert_eq!(latch(policy, true, Some(Mode::Boot)), AfterSignal);
+            assert_eq!(latch(policy, false, Some(Mode::Boot)), BeforeSignal);
+            assert_eq!(latch(policy, false, None), BeforeSignal);
+        }
+    }
+
+    #[test]
+    fn machines_machined_does_not_list_are_named_by_their_unit() {
+        let state = |active: &str, sub: &str| UnitState {
+            load: "loaded".to_string(),
+            active: active.to_string(),
+            sub: sub.to_string(),
+        };
+        assert_eq!(
+            unit_word(&state("activating", "auto-restart")),
+            "restarting"
+        );
+        assert_eq!(
+            unit_word(&state("activating", "auto-restart-queued")),
+            "restarting"
+        );
+        assert_eq!(unit_word(&state("activating", "start-pre")), "starting");
+        assert_eq!(unit_word(&state("active", "running")), "starting");
+        assert_eq!(unit_word(&state("deactivating", "stop-post")), "closing");
+        assert_eq!(unit_word(&state("inactive", "dead")), "stopped");
+        assert_eq!(unit_word(&state("failed", "failed")), "stopped");
+    }
+
+    #[test]
+    fn limits_given_on_a_start_replace_only_themselves() {
+        let mut limits = Limits {
+            memory: 64 << 20,
+            milli_cpus: 500,
+            pids: 100,
+        };
+        apply_limits(&mut limits, None, Some(2.0), Some(0)).unwrap();
+        assert_eq!(
+            limits,
+            Limits {
+                memory: 64 << 20,
+                milli_cpus: 2000,
+                pids: 0,
+            }
+        );
+        apply_limits(&mut limits, Some(0), None, None).unwrap();
+        assert_eq!(limits.memory, 0);
+        assert!(apply_limits(&mut limits, None, Some(-1.0), None).is_err());
+    }
 
     #[test]
     fn realtime_signals_reach_kill() {

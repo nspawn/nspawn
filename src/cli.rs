@@ -258,6 +258,23 @@ pub struct CreateArgs {
     /// underneath. Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'l', value_name = "KEY=VALUE")]
     pub label: Vec<String>,
+    /// Restart policy, like docker --restart: no, on-failure, always (also starts it at
+    /// boot) or unless-stopped (like always, until nspawn stop). Remembered; applied at
+    /// the next start.
+    #[arg(long, value_enum, value_name = "POLICY")]
+    pub restart: Option<crate::policy::Restart>,
+    /// Memory limit of the whole machine, like docker -m: 512m, 2g, and as much swap
+    /// again; 0 removes it. Remembered; applied at the next start.
+    #[arg(long, short = 'm', value_name = "SIZE", value_parser = crate::policy::parse_memory)]
+    pub memory: Option<u64>,
+    /// CPU limit of the whole machine, like docker --cpus: 0.5, 2; 0 removes it.
+    /// Remembered; applied at the next start.
+    #[arg(long, value_name = "N", value_parser = crate::policy::parse_cpus)]
+    pub cpus: Option<f64>,
+    /// Most processes and threads the machine may have; 0 removes the limit.
+    /// Remembered; applied at the next start.
+    #[arg(long, value_name = "N")]
+    pub pids_limit: Option<u64>,
     /// For app images: the arguments after -- replace the image's cmd and follow its
     /// entrypoint, as with docker.
     #[arg(last = true)]
@@ -410,6 +427,23 @@ pub struct StartArgs {
     /// underneath. Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'l', value_name = "KEY=VALUE")]
     pub label: Vec<String>,
+    /// Restart policy, like docker --restart: no, on-failure, always (also starts it at
+    /// boot) or unless-stopped (like always, until nspawn stop). Remembered; applied at
+    /// the next start.
+    #[arg(long, value_enum, value_name = "POLICY")]
+    pub restart: Option<crate::policy::Restart>,
+    /// Memory limit of the whole machine, like docker -m: 512m, 2g, and as much swap
+    /// again; 0 removes it. Remembered; applied at the next start.
+    #[arg(long, short = 'm', value_name = "SIZE", value_parser = crate::policy::parse_memory)]
+    pub memory: Option<u64>,
+    /// CPU limit of the whole machine, like docker --cpus: 0.5, 2; 0 removes it.
+    /// Remembered; applied at the next start.
+    #[arg(long, value_name = "N", value_parser = crate::policy::parse_cpus)]
+    pub cpus: Option<f64>,
+    /// Most processes and threads the machine may have; 0 removes the limit.
+    /// Remembered; applied at the next start.
+    #[arg(long, value_name = "N")]
+    pub pids_limit: Option<u64>,
     /// Forget the remembered entrypoint and arguments and run the image's own again.
     #[arg(long)]
     pub image_command: bool,
@@ -507,7 +541,9 @@ mod tests {
             let name = command.get_name().to_string();
             clap_complete::generate(shell, &mut command, name, &mut out);
             let text = String::from_utf8(out).expect("the generators write text");
-            for word in ["nspawn", "images", "machines", "network"] {
+            for word in [
+                "nspawn", "images", "machines", "network", "volume", "inspect", "rm", "restart",
+            ] {
                 assert!(text.contains(word), "{shell} completions miss {word}");
             }
         }
@@ -523,5 +559,47 @@ mod tests {
             "and says what it is"
         );
         assert!(man.contains(".SH SYNOPSIS"), "with the usual sections");
+    }
+
+    #[test]
+    fn restart_and_limits_read_like_docker() {
+        let cli = Cli::try_parse_from([
+            "nspawn",
+            "start",
+            "web",
+            "--restart",
+            "unless-stopped",
+            "-m",
+            "64m",
+            "--cpus",
+            "0.5",
+            "--pids-limit",
+            "100",
+            "--label",
+            "a=b",
+        ])
+        .unwrap();
+        let Command::Start(start) = cli.command else {
+            panic!("not start");
+        };
+        assert_eq!(start.restart, Some(crate::policy::Restart::UnlessStopped));
+        assert_eq!(start.memory, Some(64 << 20));
+        assert_eq!(start.cpus, Some(0.5));
+        assert_eq!(start.pids_limit, Some(100));
+        assert_eq!(start.label, ["a=b"]);
+        for bad in [
+            &["nspawn", "start", "web", "--restart", "bogus"][..],
+            &["nspawn", "start", "web", "-m", "12q"][..],
+            &["nspawn", "start", "web", "--cpus", "-1"][..],
+            &["nspawn", "create", "img", "web", "-m", "1k"][..],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
+        let cli = Cli::try_parse_from(["nspawn", "rm", "-f", "a", "b"]).unwrap();
+        let Command::Rm(rm) = cli.command else {
+            panic!("not rm");
+        };
+        assert!(rm.force);
+        assert_eq!(rm.names, ["a", "b"]);
     }
 }

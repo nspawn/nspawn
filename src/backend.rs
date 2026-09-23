@@ -260,6 +260,10 @@ impl Assembler<'_> {
             BackendChoice::Mstack => remove_dir_if_exists(&self.mstack_dir(name))?,
             BackendChoice::Auto => bail!("image record for {name} has no concrete backend"),
         }
+        // A restart policy may have enabled the unit at boot; that goes with the machine.
+        self.sd
+            .disable_unit(&format!("systemd-nspawn@{name}.service"))
+            .await?;
         // Every backend gets the unit hooks, overlay also a mount dependency.
         remove_dropins(name);
         self.sd.reload().await?;

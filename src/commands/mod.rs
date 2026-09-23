@@ -321,6 +321,18 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             put_all(&mut options, "env", crate::volume::expand_env(&a.env)?);
             put_all(&mut options, "volume", a.volume);
             put_all(&mut options, "label", a.label);
+            if let Some(restart) = a.restart {
+                put(&mut options, "restart", restart.name());
+            }
+            if let Some(memory) = a.memory {
+                put(&mut options, "memory", memory);
+            }
+            if let Some(cpus) = a.cpus {
+                put(&mut options, "cpus", cpus);
+            }
+            if let Some(pids) = a.pids_limit {
+                put(&mut options, "pids_limit", pids);
+            }
             put_all(&mut options, "command", a.command);
             let done = client
                 .run_job(|| manager.create_machine(&a.source, &a.name, options))

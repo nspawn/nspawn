@@ -62,6 +62,12 @@ pub struct ImageRecord {
     /// Labels given with --label, on top of the image's own (run.labels).
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// docker's --restart.
+    #[serde(default)]
+    pub restart: crate::policy::Restart,
+    /// --memory, --cpus and --pids-limit.
+    #[serde(default)]
+    pub limits: crate::policy::Limits,
 }
 
 impl ImageRecord {
@@ -1323,6 +1329,8 @@ mod tests {
             env: Vec::new(),
             volumes: Vec::new(),
             labels: BTreeMap::new(),
+            restart: Default::default(),
+            limits: Default::default(),
         };
         store.record_image(&rec).unwrap();
         assert_eq!(
@@ -1368,6 +1376,8 @@ mod tests {
             env: Vec::new(),
             volumes: Vec::new(),
             labels: BTreeMap::new(),
+            restart: Default::default(),
+            limits: Default::default(),
         };
         store.record_image(&rec).unwrap();
         store
@@ -1564,6 +1574,8 @@ mod tests {
             env: Vec::new(),
             volumes: Vec::new(),
             labels: BTreeMap::new(),
+            restart: Default::default(),
+            limits: Default::default(),
         };
         store
             .record_image(&record("ovl", BackendChoice::Overlay))
@@ -1678,9 +1690,23 @@ mod tests {
             ("b".to_string(), "image".to_string()),
         ]);
         labelled.labels = BTreeMap::from([("b".to_string(), "machine".to_string())]);
+        assert_eq!(old.restart, crate::policy::Restart::No);
+        assert_eq!(
+            old.limits,
+            crate::policy::Limits::default(),
+            "a record from before limits has none"
+        );
+        labelled.restart = crate::policy::Restart::OnFailure;
+        labelled.limits = crate::policy::Limits {
+            memory: 64 << 20,
+            milli_cpus: 500,
+            pids: 100,
+        };
         store.record_image(&labelled).unwrap();
         let back = store.load_image("old").unwrap().unwrap();
         assert_eq!(back.labels, labelled.labels);
+        assert_eq!(back.restart, crate::policy::Restart::OnFailure);
+        assert_eq!(back.limits, labelled.limits);
         assert_eq!(
             back.effective_labels(),
             BTreeMap::from([

@@ -30,7 +30,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-dbus e2e-digest; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-dbus e2e-digest e2e-restart; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -249,6 +249,23 @@ $NSPAWN stop e2e-b || fail "stop e2e-b"
 $NSPAWN stop e2e-a || fail "stop e2e-a"
 nft list map ip nspawn ports | grep -q 18080 && fail "published port still mapped after stop"
 
+step "restart policy on a booted machine: its init killed, it boots again"
+$NSPAWN start e2e-a --restart on-failure --memory 256m || fail "start e2e-a with a restart policy"
+[ "$(systemctl show -p MemoryMax --value systemd-nspawn@e2e-a.service)" = 268435456 ] || fail "--memory not applied to the unit of a booted machine"
+kill -KILL "$(machinectl show e2e-a -p Leader --value)" || fail "cannot kill the init of e2e-a"
+retry 20 bash -c "[ \"\$(systemctl show -p NRestarts --value systemd-nspawn@e2e-a.service)\" -ge 1 ] && $NSPAWN exec e2e-a -- /usr/bin/systemctl is-system-running --wait </dev/null | tr -d '\r' | grep -qE 'running|degraded'" || fail "e2e-a did not boot again after its init was killed"
+$NSPAWN stop e2e-a || fail "stop e2e-a with a restart policy"
+sleep 3
+$NSPAWN ps | grep -q "^ *e2e-a " && fail "e2e-a came back after stop"
+systemctl is-failed systemd-nspawn@e2e-a.service >/dev/null 2>&1 && fail "the unit of e2e-a was left failed"
+# The hammer on a booted machine that would come back: killed, and it stays down.
+$NSPAWN start e2e-a --restart always >/dev/null || fail "start e2e-a with --restart always"
+$NSPAWN stop e2e-a --force || fail "stop --force of a booted machine with a restart policy"
+sleep 5
+$NSPAWN ps | grep -q "^ *e2e-a " && fail "e2e-a came back after stop --force"
+systemctl is-failed systemd-nspawn@e2e-a.service >/dev/null 2>&1 && fail "stop --force left the unit of e2e-a failed"
+$NSPAWN start e2e-a --restart no >/dev/null && $NSPAWN stop e2e-a >/dev/null || fail "back to no restart policy for e2e-a"
+
 layers_before=$(ls /var/lib/nspawn/layers | wc -l)
 $NSPAWN images rm e2e-a >/dev/null || fail "rm e2e-a"
 [ "$(ls /var/lib/nspawn/layers | wc -l)" = "$layers_before" ] || fail "layer removed while still referenced"
@@ -432,6 +449,118 @@ $NSPAWN ps | grep "^ *$app " | grep -q " sh " || fail "--image-command did not r
 grep -q "Bind=" /etc/systemd/nspawn/$app.nspawn && fail "-v none left volumes in the settings"
 $NSPAWN stop $app -t 2 || fail "stop app running its own cmd"
 
+hooks=/etc/systemd/system/systemd-nspawn@$app.service.d/nspawn-hooks.conf
+step "restart policy on-failure: a killed program comes back with its network, stop keeps it down"
+$NSPAWN start $app --restart on-failure -p 18081:80 -- /bin/sh -c 'mkdir -p /www; echo app-web > /www/index.html; exec /bin/httpd -f -p 80 -h /www' || fail "start with --restart on-failure"
+grep -qx "Restart=on-failure" $hooks || fail "no Restart= in the drop-in"
+grep -qx "StartLimitIntervalSec=0" $hooks || fail "no StartLimitIntervalSec= in the drop-in"
+retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep -q app-web" || fail "the app does not answer before the kill"
+addr_before=$($NSPAWN network ls | awk -v n="$app" '$1 == n {print $2}')
+leader=$(machinectl show $app -p Leader --value)
+kill -KILL $(pgrep -P "$leader") || fail "cannot kill the app's program"
+retry 15 bash -c "[ \"\$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)\" -ge 1 ]" || fail "on-failure did not restart the app"
+retry 15 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep -q app-web" || fail "the restarted app does not answer on its published port"
+[ "$($NSPAWN network ls | awk -v n="$app" '$1 == n {print $2}')" = "$addr_before" ] || fail "the restarted app changed its address"
+[ "$(systemctl is-enabled systemd-nspawn@$app.service 2>/dev/null)" = enabled ] && fail "on-failure enabled the unit at boot"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['restart'] == 'on-failure', d" || fail "inspect does not show the restart policy"
+$NSPAWN stop $app || fail "stop an app with a restart policy"
+sleep 5
+$NSPAWN ps | grep -q "^ *$app " && fail "the app came back after stop"
+systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "stop left the unit failed"
+[ -e /run/netns/nspawn-$app ] && fail "stop left the network namespace behind"
+
+step "restart policy: which endings bring a program back"
+# on-failure leaves a program that ended well alone; always brings it back anyway.
+$NSPAWN start $app --restart on-failure -p none -- /bin/sh -c 'sleep 1; exit 0' >/dev/null || fail "start a program that ends well under on-failure"
+sleep 6
+[ "$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)" = 0 ] || fail "on-failure restarted a program that exited 0"
+$NSPAWN ps | grep -q "^ *$app " && fail "on-failure kept a program that exited 0 running"
+$NSPAWN stop $app >/dev/null 2>&1
+$NSPAWN start $app --restart always -- /bin/sh -c 'sleep 1; exit 0' >/dev/null || fail "start a program that ends well under always"
+retry 10 bash -c "[ \"\$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)\" -ge 1 ]" || fail "always did not restart a program that exited 0"
+$NSPAWN stop $app >/dev/null || fail "stop the always program"
+[ "$(systemctl is-active systemd-nspawn@$app.service)" = inactive ] || fail "the always program came back after stop"
+
+step "restart policy: a program that keeps failing is restarting, and stop ends it"
+out=$($NSPAWN start $app --restart always -p none -- /bin/sh -c 'exit 1' 2>&1) || fail "start of a failing program with --restart always: $out"
+retry 10 bash -c "$NSPAWN ps | grep '^ *$app ' | grep -q restarting" || fail "ps does not show the app restarting"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['state'] in ('restarting', 'starting', 'running'), d" || fail "inspect of a restarting app"
+out=$($NSPAWN images rm $app 2>&1) && fail "images rm removed a machine that was restarting"
+echo "$out" | grep -q "stop it first" || fail "images rm of a restarting machine was not explained: $out"
+retry 10 bash -c "$NSPAWN ps | grep '^ *$app ' | grep -q restarting" || fail "the app stopped restarting on its own"
+out=$($NSPAWN start $app 2>&1) && fail "start of a machine that is restarting succeeded"
+echo "$out" | grep -qE "restarting|already" || fail "start of a restarting machine was not explained: $out"
+$NSPAWN stop $app >/dev/null || fail "stop a restarting app"
+sleep 3
+[ "$(systemctl is-active systemd-nspawn@$app.service)" = inactive ] || fail "the unit kept restarting after stop: $(systemctl is-active systemd-nspawn@$app.service)"
+$NSPAWN ps -a | grep "^ *$app " | grep -q stopped || fail "the app is not stopped after stop"
+
+step "restart policy always and unless-stopped: started at boot, stop decides"
+$NSPAWN start $app --restart always -- /bin/sleep 300 || fail "start with --restart always"
+[ "$(systemctl is-enabled systemd-nspawn@$app.service)" = enabled ] || fail "always did not enable the unit"
+[ -L /etc/systemd/system/machines.target.wants/systemd-nspawn@$app.service ] || fail "always did not hook the unit to machines.target"
+systemctl is-enabled machines.target >/dev/null || fail "machines.target is not enabled"
+# What boot starts: machines.target, which multi-user.target wants, wants the machine.
+systemctl show -p Wants --value machines.target | grep -qw "systemd-nspawn@$app.service" || fail "machines.target does not want the always machine"
+systemctl list-dependencies --plain multi-user.target 2>/dev/null | grep -q "machines.target" || fail "machines.target is not reached at boot"
+$NSPAWN stop $app || fail "stop an always machine"
+[ "$(systemctl is-enabled systemd-nspawn@$app.service)" = enabled ] || fail "stop disabled an always machine"
+$NSPAWN start $app --restart unless-stopped || fail "start with --restart unless-stopped"
+[ "$(systemctl is-enabled systemd-nspawn@$app.service)" = enabled ] || fail "unless-stopped did not enable the unit"
+$NSPAWN stop $app --no-wait || fail "stop --no-wait of an unless-stopped machine"
+retry 10 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "unless-stopped machine still running after stop --no-wait"
+[ "$(systemctl is-enabled systemd-nspawn@$app.service)" = disabled ] || fail "stop did not disable an unless-stopped machine"
+$NSPAWN start $app || fail "start an unless-stopped machine again"
+[ "$(systemctl is-enabled systemd-nspawn@$app.service)" = enabled ] || fail "start did not enable an unless-stopped machine again"
+$NSPAWN stop $app --force || fail "stop --force of an unless-stopped machine"
+[ "$(systemctl is-enabled systemd-nspawn@$app.service)" = disabled ] || fail "stop --force did not disable an unless-stopped machine"
+systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "stop --force left the unit failed"
+$NSPAWN start $app --restart always >/dev/null && $NSPAWN stop $app >/dev/null || fail "back to always"
+$NSPAWN start $app --restart no >/dev/null || fail "start with --restart no"
+[ "$(systemctl is-enabled systemd-nspawn@$app.service)" = enabled ] && fail "--restart no left the unit enabled"
+grep -q "^Restart=" $hooks && fail "--restart no left Restart= in the drop-in"
+$NSPAWN stop $app >/dev/null || fail "stop after --restart no"
+$NSPAWN create $app e2e-restart --restart always -- /bin/sleep 300 || fail "create with --restart always"
+$NSPAWN start e2e-restart >/dev/null || fail "start the created always machine"
+[ -L /etc/systemd/system/machines.target.wants/systemd-nspawn@e2e-restart.service ] || fail "the created always machine is not enabled"
+$NSPAWN stop e2e-restart >/dev/null || fail "stop the created always machine"
+# A machine caught in a restart loop is removed with -f: the stop ends the loop first.
+$NSPAWN start e2e-restart -- /bin/sh -c 'exit 1' >/dev/null 2>&1
+retry 10 bash -c "$NSPAWN ps | grep '^ *e2e-restart ' | grep -q restarting" || fail "the created machine is not restarting"
+$NSPAWN rm -f e2e-restart >/dev/null || fail "rm -f of an enabled machine that is restarting"
+sleep 3
+systemctl is-active systemd-nspawn@e2e-restart.service >/dev/null && fail "the unit of a removed machine is still restarting"
+[ -e /etc/systemd/system/machines.target.wants/systemd-nspawn@e2e-restart.service ] && fail "rm left the boot link behind"
+[ -e /etc/systemd/system/systemd-nspawn@e2e-restart.service.d ] && fail "rm left the drop-in directory behind"
+
+step "resource limits: memory, cpus and processes of the whole machine"
+$NSPAWN start $app -m 64m --cpus 0.5 --pids-limit 100 -- /bin/sleep 300 || fail "start with limits"
+[ "$(systemctl show -p MemoryMax --value systemd-nspawn@$app.service)" = 67108864 ] || fail "MemoryMax not set"
+[ "$(systemctl show -p MemorySwapMax --value systemd-nspawn@$app.service)" = 67108864 ] || fail "MemorySwapMax not set"
+[ "$(systemctl show -p CPUQuotaPerSecUSec --value systemd-nspawn@$app.service)" = 500ms ] || fail "CPUQuota not set"
+[ "$(systemctl show -p TasksMax --value systemd-nspawn@$app.service)" = 100 ] || fail "TasksMax not set"
+cg=/sys/fs/cgroup/machine.slice/systemd-nspawn@$app.service
+[ "$(cat $cg/memory.max)" = 67108864 ] || fail "memory.max of the machine's cgroup: $(cat $cg/memory.max)"
+[ "$(cat $cg/memory.swap.max)" = 67108864 ] || fail "memory.swap.max of the machine's cgroup: $(cat $cg/memory.swap.max)"
+[ "$(cat $cg/cpu.max)" = "50000 100000" ] || fail "cpu.max of the machine's cgroup: $(cat $cg/cpu.max)"
+[ "$(cat $cg/pids.max)" = 100 ] || fail "pids.max of the machine's cgroup: $(cat $cg/pids.max)"
+# The shell's own status is not the point (pipefail would count it): what it said is.
+out=$($NSPAWN exec $app -- /bin/sh -c 'i=0; while [ $i -lt 150 ]; do sleep 5 & i=$((i+1)); done; wait' </dev/null 2>&1)
+echo "$out" | grep -qi "fork" || fail "the machine could start more processes than --pids-limit"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['memory'] == 67108864 and d['cpus'] == 0.5 and d['pids_limit'] == 100, d" || fail "inspect does not show the limits"
+# The memory limit holds, swap included: a program that wants more than the whole
+# machine may have (64m of memory and as much swap) is killed by the kernel (128 +
+# SIGKILL).
+$NSPAWN exec $app -- /bin/sh -c 'x=$(head -c 268435456 /dev/zero | tr "\\0" a); echo ${#x}' </dev/null >/dev/null 2>&1; rc=$?
+[ "$rc" = 137 ] || fail "a program went past --memory without being killed (exit $rc)"
+$NSPAWN stop $app --force >/dev/null || fail "stop the limited app"
+$NSPAWN start $app -m 0 --cpus 0 --pids-limit 0 -- /bin/sleep 300 >/dev/null || fail "start with the limits removed"
+[ "$(systemctl show -p MemoryMax --value systemd-nspawn@$app.service)" = infinity ] || fail "-m 0 did not remove the memory limit"
+[ "$(systemctl show -p MemorySwapMax --value systemd-nspawn@$app.service)" = infinity ] || fail "-m 0 did not remove the swap limit"
+[ "$(systemctl show -p CPUQuotaPerSecUSec --value systemd-nspawn@$app.service)" = infinity ] || fail "--cpus 0 did not remove the CPU limit"
+[ "$(systemctl show -p TasksMax --value systemd-nspawn@$app.service)" = 100 ] && fail "--pids-limit 0 did not remove the process limit"
+$NSPAWN stop $app >/dev/null || fail "stop after removing the limits"
+
 step "named volumes: listed with their users, made ahead, removed once unused"
 $NSPAWN volume create e2evol-free || fail "volume create"
 [ "$(stat -c '%u %a' /var/lib/nspawn/volumes/e2evol-free)" = "0 755" ] || fail "volume create did not make a root directory with mode 0755"
@@ -499,6 +628,7 @@ if command -v busctl >/dev/null 2>&1; then
   $B get-property $M Jobs | grep -q "$job" || fail "Jobs property misses the job"
   $B call $M ListImages | grep -q '"name" s "e2e-dbus"' || fail "ListImages misses the pulled image"
   $B call $M GetImage s e2e-dbus | grep -q '"mode" s "boot"' || fail "GetImage"
+  $B call $M GetImage s e2e-dbus | grep -q '"restart" s "no"' || fail "GetImage has no restart policy"
   digest=$($B call $M GetImage s e2e-dbus | grep -oE '"digest" s "sha256:[0-9a-f]+"' | grep -oE 'sha256:[0-9a-f]+')
   [ -n "$digest" ] || fail "GetImage has no digest"
   $NSPAWN pull "${IMAGE%%:*}@$digest" --name e2e-digest --backend flat --force >/dev/null || fail "pull by digest"

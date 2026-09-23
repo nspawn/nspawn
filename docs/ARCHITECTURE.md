@@ -50,7 +50,10 @@ files, and the machine units call nspawn back through drop-in hooks.
 /etc/systemd/nspawn/NAME.nspawn          generated settings, regenerated on start
 /etc/systemd/system/systemd-nspawn@NAME.service.d/
   nspawn-overlay.conf   RequiresMountsFor= (overlay)
-  nspawn-hooks.conf     ExecStartPre/Post, ExecStopPost calling nspawn
+  nspawn-hooks.conf     ExecStartPre/Post, ExecStopPost calling nspawn,
+                        Restart= and MemoryMax=/MemorySwapMax=/CPUQuota=/TasksMax= when set
+/etc/systemd/system/machines.target.wants/systemd-nspawn@NAME.service
+                        --restart always or unless-stopped: started at boot
 /etc/nspawn/auth.json  registry credentials, 0600
 ```
 
@@ -69,7 +72,21 @@ enabled units and programs that exit on their own behave the same.
 
 `stop` sends the image's stop signal to the program of an app machine and
 SIGKILLs the cgroup after `--timeout`; a booted machine gets SIGRTMIN+4
-repeatedly until it is gone. `exec` joins the leader's namespaces (user
+repeatedly until it is gone. With a restart policy it also queues a stop job
+for the unit, which is what keeps systemd from restarting it: before the first
+signal for booted machines, right after the SIGKILL of `--force` (machined
+refuses to kill a machine it is already closing), and for an app right after
+its image's stop signal (after its time to act on it too, when `stop` waits),
+so that the stub init does not add its SIGTERM and SIGHUP while the program
+handles its own signal. Should the program end in between, the stop job also cancels
+the restart systemd has scheduled. A machine machined no
+longer lists gets the stop job too, which ends a pending restart and waits for
+the release hook of its last run. The policy and the limits go into the hooks
+drop-in, since the settings file has no keys for them; `always` and
+`unless-stopped` enable the unit the way `machinectl enable` does, `stop`
+disables an `unless-stopped` one and removing a machine disables it. Limits
+could be applied to a running unit with SetUnitProperties; for now they apply
+at the next start, and Restart= could not be anyway. `exec` joins the leader's namespaces (user
 first, mount last), joins its cgroup, becomes the machine's root and then the
 requested user, so capabilities are dropped.
 

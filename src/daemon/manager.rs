@@ -254,8 +254,8 @@ impl Manager {
     }
 
     /// Like `create`. Options: backend (s), network (s), publish (as), force (b),
-    /// entrypoint (s), env (as), volume (as), label (as), command (as), registry (s),
-    /// ca_cert (s).
+    /// entrypoint (s), env (as), volume (as), label (as), restart (s), memory (t, bytes),
+    /// cpus (d), pids_limit (t), command (as), registry (s), ca_cert (s).
     async fn create_machine(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -278,6 +278,13 @@ impl Manager {
             env: options.strings("env")?,
             volume: options.strings("volume")?,
             label: options.strings("label")?,
+            restart: options
+                .string("restart")?
+                .map(|r| crate::policy::Restart::parse(&r))
+                .transpose()?,
+            memory: options.maybe_u64("memory")?,
+            cpus: options.f64("cpus")?,
+            pids_limit: options.maybe_u64("pids_limit")?,
             command: options.strings("command")?,
         };
         options.finish()?;
@@ -644,10 +651,11 @@ impl Manager {
     }
 
     /// Like `start`. Options: wait (b, default true), network (s), publish (as),
-    /// entrypoint (s), env (as), volume (as), label (as), image_command (b), command
-    /// (as). Returns
-    /// "started", or "ended" when the program returned before the machine registered,
-    /// and the notes made on the way.
+    /// entrypoint (s), env (as), volume (as), label (as), restart (s), memory (t,
+    /// bytes), cpus (d), pids_limit (t), image_command (b), command (as). Returns
+    /// "started", "ended" when the program returned before the machine registered, or
+    /// "restarting" when it ended and its restart policy brings it back, and the notes
+    /// made on the way.
     async fn start_machine(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -666,6 +674,13 @@ impl Manager {
             env: options.strings("env")?,
             volume: options.strings("volume")?,
             label: options.strings("label")?,
+            restart: options
+                .string("restart")?
+                .map(|r| crate::policy::Restart::parse(&r))
+                .transpose()?,
+            memory: options.maybe_u64("memory")?,
+            cpus: options.f64("cpus")?,
+            pids_limit: options.maybe_u64("pids_limit")?,
             image_command: options.bool("image_command", false)?,
             command: options.strings("command")?,
         };
@@ -674,6 +689,7 @@ impl Manager {
         let outcome = match api::machines::start(self.ctx(), &request, &notes.report()).await? {
             api::machines::StartOutcome::Started => "started",
             api::machines::StartOutcome::Ended => "ended",
+            api::machines::StartOutcome::Restarting => "restarting",
         };
         Ok((outcome.to_string(), notes.into_lines()))
     }

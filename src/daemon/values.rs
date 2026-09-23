@@ -94,6 +94,10 @@ pub fn record(r: &ImageRecord) -> Dict {
         ("command".to_string(), strings(&r.effective_command())),
         ("image_env".to_string(), strings(&r.run.env)),
         ("labels".to_string(), map(&r.effective_labels())),
+        ("restart".to_string(), v(r.restart.name())),
+        ("memory".to_string(), v(r.limits.memory)),
+        ("cpus".to_string(), v(r.limits.cpus())),
+        ("pids_limit".to_string(), v(r.limits.pids)),
         ("image_labels".to_string(), map(&r.run.labels)),
         (
             "working_dir".to_string(),
@@ -237,8 +241,12 @@ impl<'a> Options<'a> {
 
     /// Any unsigned integer (y, q, u or t) will do.
     pub fn u64(&mut self, key: &'static str, default: u64) -> anyhow::Result<u64> {
-        Ok(self
-            .take(key)
+        Ok(self.maybe_u64(key)?.unwrap_or(default))
+    }
+
+    /// An unsigned integer when one was given: absent and zero are not the same here.
+    pub fn maybe_u64(&mut self, key: &'static str) -> anyhow::Result<Option<u64>> {
+        self.take(key)
             .map(|value| match &**value {
                 Value::U8(n) => Ok(*n as u64),
                 Value::U16(n) => Ok(*n as u64),
@@ -248,8 +256,24 @@ impl<'a> Options<'a> {
                     "option {key} must be an unsigned integer (t, u, q or y)"
                 )),
             })
-            .transpose()?
-            .unwrap_or(default))
+            .transpose()
+    }
+
+    /// A number (d), or an integer of any kind, when one was given.
+    pub fn f64(&mut self, key: &'static str) -> anyhow::Result<Option<f64>> {
+        self.take(key)
+            .map(|value| match &**value {
+                Value::F64(n) => Ok(*n),
+                Value::U8(n) => Ok(*n as f64),
+                Value::U16(n) => Ok(*n as f64),
+                Value::U32(n) => Ok(*n as f64),
+                Value::U64(n) => Ok(*n as f64),
+                Value::I16(n) => Ok(*n as f64),
+                Value::I32(n) => Ok(*n as f64),
+                Value::I64(n) => Ok(*n as f64),
+                _ => Err(anyhow::anyhow!("option {key} must be a number (d)")),
+            })
+            .transpose()
     }
 
     /// Fails on keys nothing asked for.
@@ -317,6 +341,21 @@ mod tests {
             .contains("unsigned integer"));
         assert!(options.string("force").is_err());
         options.finish().unwrap();
+
+        let limits: HashMap<String, OwnedValue> = HashMap::from([
+            ("memory".to_string(), v(0u64)),
+            ("cpus".to_string(), v(0.5f64)),
+            ("pids_limit".to_string(), v(100u32)),
+        ]);
+        let mut given = Options::new(&limits);
+        assert_eq!(given.maybe_u64("memory").unwrap(), Some(0), "zero is given");
+        assert_eq!(given.maybe_u64("absent").unwrap(), None);
+        assert_eq!(given.f64("cpus").unwrap(), Some(0.5));
+        assert_eq!(given.f64("pids_limit").unwrap(), Some(100.0));
+        assert_eq!(given.f64("nothing").unwrap(), None);
+        given.finish().unwrap();
+        let mut wrong = Options::new(&dict);
+        assert!(wrong.f64("name").is_err());
 
         let mut typo = Options::new(&dict);
         typo.string("name").unwrap();

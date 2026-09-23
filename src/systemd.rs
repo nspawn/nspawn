@@ -28,6 +28,55 @@ pub struct MachineInfo {
     pub name: String,
 }
 
+/// Load, active and sub state of a unit, as `systemctl status` shows them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitState {
+    pub load: String,
+    pub active: String,
+    pub sub: String,
+}
+
+impl UnitState {
+    fn unknown() -> Self {
+        UnitState {
+            load: "not-found".to_string(),
+            active: "inactive".to_string(),
+            sub: "dead".to_string(),
+        }
+    }
+
+    /// Between two runs of a unit with Restart=: its program ended and systemd waits
+    /// before starting it again.
+    pub fn restarting(&self) -> bool {
+        self.active == "activating" && self.sub.starts_with("auto-restart")
+    }
+
+    /// Running, or on its way up (a restart included).
+    pub fn busy(&self) -> bool {
+        matches!(self.active.as_str(), "active" | "activating" | "reloading")
+    }
+}
+
+/// A stop job systemd accepted; once it is queued the unit is not restarted any more,
+/// whatever its Restart= says.
+pub struct StopJob {
+    jobs: Option<zbus_systemd::systemd1::JobRemovedStream>,
+    job: Option<zbus::zvariant::OwnedObjectPath>,
+    unit: String,
+}
+
+impl StopJob {
+    /// Waits for the job to finish (at once when the unit was unknown).
+    pub async fn wait(self) -> Result<()> {
+        match (self.jobs, self.job) {
+            (Some(mut jobs), Some(job)) => {
+                wait_for_job(&mut jobs, &job, &self.unit, "stopping").await
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MachineDetails {
     pub state: String,
@@ -69,6 +118,80 @@ impl Systemd {
             .next()
             .map(|u| (u.2, u.3))
             .unwrap_or_else(|| ("not-found".to_string(), "inactive".to_string())))
+    }
+
+    /// Load, active and sub state of several units in one call; unknown units read as
+    /// not-found/inactive/dead.
+    pub async fn unit_states(
+        &self,
+        units: &[String],
+    ) -> Result<std::collections::HashMap<String, UnitState>> {
+        let mut states: std::collections::HashMap<String, UnitState> = units
+            .iter()
+            .map(|u| (u.clone(), UnitState::unknown()))
+            .collect();
+        if units.is_empty() {
+            return Ok(states);
+        }
+        let listed = self
+            .manager
+            .list_units_by_names(units.to_vec())
+            .await
+            .context("querying the state of the machines' units")?;
+        for u in listed {
+            states.insert(
+                u.0,
+                UnitState {
+                    load: u.2,
+                    active: u.3,
+                    sub: u.4,
+                },
+            );
+        }
+        Ok(states)
+    }
+
+    /// The state of one unit, sub state included.
+    pub async fn unit_status(&self, unit: &str) -> Result<UnitState> {
+        Ok(self
+            .unit_states(&[unit.to_string()])
+            .await?
+            .remove(unit)
+            .unwrap_or_else(UnitState::unknown))
+    }
+
+    /// Enables a machine's unit at boot the way `machinectl enable` does: the unit and
+    /// machines.target, which pulls it in. Returns whether anything changed, i.e. whether
+    /// a daemon-reload is due.
+    pub async fn enable_unit(&self, unit: &str) -> Result<bool> {
+        let (_, changes) = self
+            .manager
+            .enable_unit_files(
+                vec![unit.to_string(), "machines.target".to_string()],
+                false,
+                false,
+            )
+            .await
+            .with_context(|| format!("enabling {unit} at boot"))?;
+        Ok(!changes.is_empty())
+    }
+
+    /// Undoes `enable_unit` for the machine's unit (machines.target stays, as machinectl
+    /// leaves it). Unknown units are not an error. Returns whether anything changed.
+    pub async fn disable_unit(&self, unit: &str) -> Result<bool> {
+        match self
+            .manager
+            .disable_unit_files(vec![unit.to_string()], false)
+            .await
+        {
+            Ok(changes) => Ok(!changes.is_empty()),
+            Err(zbus::Error::MethodError(name, _, _))
+                if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(e).with_context(|| format!("disabling {unit} at boot")),
+        }
     }
 
     /// True when `name` is owned on the system bus, i.e. that service is running.
@@ -168,11 +291,49 @@ impl Systemd {
             .map(|(_, v)| v)
     }
 
-    pub async fn start_machine(&self, name: &str) -> Result<()> {
+    /// Starts a machine's unit. Returns true when its program ended during the start
+    /// and the unit is waiting to start it again (Restart=): systemd keeps the start job
+    /// open across restarts, so it is not waited for then.
+    pub async fn start_machine(&self, name: &str) -> Result<bool> {
         let unit = format!("systemd-nspawn@{name}.service");
-        self.start_unit(&unit)
+        self.start_unit_or_restart(&unit)
             .await
             .with_context(|| format!("machine {name} failed to start; see journalctl -u {unit}"))
+    }
+
+    async fn start_unit_or_restart(&self, unit: &str) -> Result<bool> {
+        let mut jobs = self
+            .manager
+            .receive_job_removed()
+            .await
+            .context("subscribing to job events")?;
+        let job = self
+            .manager
+            .start_unit(unit.to_string(), "replace".to_string())
+            .await
+            .with_context(|| format!("starting {unit}"))?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+        let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
+        loop {
+            tokio::select! {
+                event = jobs.next() => {
+                    let Some(event) = event else { bail!("lost the job events while starting {unit}") };
+                    let Ok(args) = event.args() else { continue };
+                    if args.job() != &job { continue }
+                    let result = args.result().to_string();
+                    if result == "done" || result == "skipped" {
+                        return Ok(false);
+                    }
+                    bail!("starting {unit} ended with result {result}");
+                }
+                _ = poll.tick() => {
+                    if self.unit_status(unit).await?.restarting() {
+                        return Ok(true);
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => bail!("timed out while starting {unit}"),
+            }
+        }
     }
 
     /// State ("opening", "running", "closing"), leader PID and start time (unix seconds)
@@ -283,25 +444,38 @@ impl Systemd {
     /// Stops a unit and waits until systemd reports the stop job finished. Unknown units
     /// (never loaded) are treated as already stopped.
     pub async fn stop_unit(&self, unit: &str) -> Result<()> {
-        let mut jobs = self
+        self.stop_unit_job(unit).await?.wait().await
+    }
+
+    /// Queues a stop job for a unit without waiting for it. From the moment systemd
+    /// accepts it the unit is not restarted any more, whatever its Restart= says.
+    pub async fn stop_unit_job(&self, unit: &str) -> Result<StopJob> {
+        let jobs = self
             .manager
             .receive_job_removed()
             .await
             .context("subscribing to job events")?;
-        let job = match self
+        match self
             .manager
             .stop_unit(unit.to_string(), "replace".to_string())
             .await
         {
-            Ok(job) => job,
+            Ok(job) => Ok(StopJob {
+                jobs: Some(jobs),
+                job: Some(job),
+                unit: unit.to_string(),
+            }),
             Err(zbus::Error::MethodError(name, _, _))
                 if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
             {
-                return Ok(())
+                Ok(StopJob {
+                    jobs: None,
+                    job: None,
+                    unit: unit.to_string(),
+                })
             }
-            Err(e) => return Err(e).with_context(|| format!("stopping {unit}")),
-        };
-        wait_for_job(&mut jobs, &job, unit, "stopping").await
+            Err(e) => Err(e).with_context(|| format!("stopping {unit}")),
+        }
     }
 
     /// Opens a PTY inside the machine running `path` with `args` (argv including argv[0])

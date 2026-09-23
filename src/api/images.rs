@@ -105,7 +105,13 @@ pub async fn remove_machines(
     let mut skip = std::collections::HashSet::new();
     if force {
         for name in names {
-            if store.is_starting(name) || !sd.machine_exists(name).await? {
+            if store.is_starting(name) {
+                continue;
+            }
+            // Running, or its unit restarting it: the stop's job ends that too.
+            if !sd.machine_exists(name).await?
+                && crate::api::machines::unit_busy(sd, name).await?.is_none()
+            {
                 continue;
             }
             let stop = crate::api::machines::StopRequest {
@@ -129,6 +135,9 @@ pub async fn remove_machines(
             }
             if sd.machine_exists(name).await? {
                 bail!("machine {name} is running; stop it first{hint}");
+            }
+            if let Some(why) = crate::api::machines::unit_busy(sd, name).await? {
+                bail!("{why}{hint}");
             }
             match store.load_image(name)? {
                 Some(rec) => {

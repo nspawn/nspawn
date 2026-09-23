@@ -20,6 +20,7 @@ mod layout;
 mod nsenter;
 mod oci;
 mod output;
+mod policy;
 mod pty;
 mod reference;
 mod search;

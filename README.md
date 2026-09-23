@@ -17,6 +17,7 @@ nspawn start fedora-44              # boot it as a machine
 nspawn create fedora-44 web2        # another machine from the same local image, docker create style
 nspawn start web -p 8080:80 -e KEY=v -v /srv/data:/data -v pgdata:/var/lib/pg   # docker-style flags
 nspawn start web --label caddy=web.example   # labels for whoever reads them (inspect, ps --json)
+nspawn start web --restart unless-stopped -m 512m --cpus 1   # restart policy and limits, like docker
 nspawn ps                           # running machines: image, mode, command, uptime (-a adds stopped ones)
 nspawn inspect web                  # everything nspawn knows about a machine, as JSON
 nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
@@ -67,6 +68,21 @@ keeps them and says so. `nspawn volume ls` lists them with the machines whose re
 mount them, `volume create NAME` makes one ahead of its first use, and `volume rm` and
 `volume prune` remove the ones no machine uses; a volume still named by a machine is
 refused until that machine is started with other volumes (or `-v none`) or removed.
+
+`--restart` takes docker's policies. `on-failure` restarts the machine when its program
+or its init dies with an error, `always` whenever it ends and also at boot, and
+`unless-stopped` like `always` until `nspawn stop`, which takes the boot start back
+until the next `start`; restarts come after a second, then later and later, up to half a
+minute, for as long as they keep failing, and `ps` shows such a machine as
+`restarting`. `nspawn stop` always stops it for good; `machinectl stop` does too but
+does not take an `unless-stopped` machine off the boot list, and a `poweroff` from
+inside counts as ending under `always`. `-m/--memory`, `--cpus` and `--pids-limit`
+bound the whole machine (its unit's MemoryMax=, CPUQuota= and TasksMax=), which is why
+they cannot be seen from inside; as with docker, `--memory` also lets the machine use as
+much swap again (MemorySwapMax=), and no more. Both are remembered like the ports and apply at the
+next start; `--restart no` and a limit of 0 remove them. With a policy, `stop --no-wait`
+of an app also lets the stub init send the program SIGTERM and SIGHUP, since nobody
+stays to stop the unit later.
 
 `exec` enters the machine's namespaces for both kinds of machine, like docker exec: the
 exit code comes back, the image's environment applies and nothing is needed inside (no

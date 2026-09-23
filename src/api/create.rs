@@ -15,7 +15,7 @@ use crate::settings::Network;
 use crate::store::validate_digest;
 use crate::volume;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CreateRequest {
     /// Local image to start from: its name, or the reference it was pulled from.
     pub source: String,
@@ -36,6 +36,14 @@ pub struct CreateRequest {
     pub volume: Vec<String>,
     /// KEY=VALUE labels on top of the image's, like docker --label.
     pub label: Vec<String>,
+    /// docker's --restart; None is no.
+    pub restart: Option<crate::policy::Restart>,
+    /// Bytes; None or 0 for no limit.
+    pub memory: Option<u64>,
+    /// CPUs (0.5); None or 0 for no limit.
+    pub cpus: Option<f64>,
+    /// Processes; None or 0 for no limit.
+    pub pids_limit: Option<u64>,
     /// App images: replaces the image's cmd and follows its entrypoint.
     pub command: Vec<String>,
 }
@@ -91,6 +99,19 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     let env = volume::parse_env(&request.env)?;
     let volumes = volume::parse_volumes(&request.volume)?;
     let labels = volume::parse_labels(&request.label)?;
+    // Nothing of this comes from the source: a new machine never starts at boot or
+    // inherits limits unless it is told so.
+    let mut limits = crate::policy::Limits::default();
+    if let Some(memory) = request.memory {
+        limits.memory = memory;
+    }
+    if let Some(cpus) = request.cpus {
+        limits.milli_cpus = crate::policy::milli_cpus_from(cpus)?;
+    }
+    if let Some(pids) = request.pids_limit {
+        limits.pids = pids;
+    }
+    limits.check(source.mode)?;
     if source.mode == Mode::Boot
         && (!request.command.is_empty() || request.entrypoint.is_some() || !request.env.is_empty())
     {
@@ -159,6 +180,8 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     record.env = env;
     record.volumes = volumes;
     record.labels = labels;
+    record.restart = request.restart.unwrap_or_default();
+    record.limits = limits;
     store.record_image(&record)?;
     Ok(Created {
         name: request.name.clone(),
