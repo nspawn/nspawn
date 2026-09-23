@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 1.0.0
+%global upstream_version 1.1.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -148,6 +148,10 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Wed Sep 23 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.1.0-1
+- Restart policies, resource limits, inspect and JSON output, labels, cp, rm
+  and named volume management.
+
 * Wed Sep 23 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.0.0-1
 - First stable release.
 
