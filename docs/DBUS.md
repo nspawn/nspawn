@@ -70,8 +70,11 @@ policy lets no domain touch the pipes of an unconfined service, so the bus
 drops the service the moment it hands a descriptor over (`Exec`, `Shell`,
 `Logs`). The policy lives in `packaging/selinux` and the `nspawn-selinux`
 package loads it; `--install` says so when SELinux is enabled and the module
-is missing. Commands run inside a machine take the machine's own context, as
-with docker exec.
+is missing, and also when the binary it just wired up is not labelled
+`nspawn_exec_t`, which a build installed by hand is not: the service would
+then run unconfined and the bus would drop it at the first descriptor, so
+`Exec`, `Shell` and `Logs` fail with the client disconnected. Commands run
+inside a machine take the machine's own context, as with docker exec.
 
 ## org.nspawn.Manager at /org/nspawn
 

@@ -81,18 +81,12 @@ pub async fn install(config_path: Option<&Path>) -> Result<Vec<String>> {
         fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
         done.push(format!("wrote {}", path.display()));
     }
-    if Path::new("/sys/fs/selinux/enforce").exists()
-        && !std::process::Command::new("semodule")
-            .args(["-l"])
-            .output()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .any(|l| l == "nspawn")
-            })
-            .unwrap_or(false)
-    {
-        done.push("note: SELinux is enabled and the nspawn policy module is not loaded; install the nspawn-selinux package, or Exec, Shell and Logs will not work on the bus (see docs/DBUS.md)".to_string());
+    if Path::new("/sys/fs/selinux/enforce").exists() {
+        if !module_loaded() {
+            done.push("note: SELinux is enabled and the nspawn policy module is not loaded; install the nspawn-selinux package, or Exec, Shell and Logs will not work on the bus (see docs/DBUS.md)".to_string());
+        } else if let Some(note) = mislabelled(&binary) {
+            done.push(note);
+        }
     }
     let connection = zbus::Connection::system()
         .await
@@ -110,6 +104,39 @@ pub async fn install(config_path: Option<&Path>) -> Result<Vec<String>> {
         .await
         .context("asking the bus to reload its configuration")?;
     Ok(done)
+}
+
+fn module_loaded() -> bool {
+    std::process::Command::new("semodule")
+        .args(["-l"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l == "nspawn")
+        })
+        .unwrap_or(false)
+}
+
+/// What to say about a binary SELinux does not know as nspawn's: the service would run
+/// unconfined, and the bus drops a service of that kind the moment it hands a
+/// descriptor over, which is `exec`, `shell` and `logs`.
+fn mislabelled(binary: &Path) -> Option<String> {
+    let label = xattr::get(binary, "security.selinux").ok().flatten()?;
+    let label = String::from_utf8_lossy(&label);
+    label_note(binary, label.trim_end_matches('\0'))
+}
+
+/// Split out for the test: None when the type is the one the policy gives nspawn.
+fn label_note(binary: &Path, label: &str) -> Option<String> {
+    let kind = label.split(':').nth(2)?;
+    if kind == "nspawn_exec_t" {
+        return None;
+    }
+    let path = binary.display();
+    Some(format!(
+        "note: SELinux knows {path} as {kind}, not nspawn_exec_t, so the service would run unconfined and the bus would drop it when it hands over a terminal or a pipe (exec, shell, logs). Either install the package, which puts the binary where the policy expects it, or teach SELinux about this one: semanage fcontext -a -t nspawn_exec_t '{path}' && restorecon -v {path}"
+    ))
 }
 
 #[cfg(test)]
@@ -135,6 +162,27 @@ mod tests {
             body(unit_text(Path::new("/usr/bin/nspawn"), None)),
             packaged("systemd/nspawn.service")
         );
+    }
+
+    #[test]
+    fn a_binary_the_policy_does_not_know_is_pointed_out() {
+        let binary = Path::new("/usr/local/bin/nspawn");
+        assert_eq!(
+            label_note(binary, "system_u:object_r:nspawn_exec_t:s0"),
+            None,
+            "the label the policy gives it"
+        );
+        let note = label_note(binary, "system_u:object_r:bin_t:s0").unwrap();
+        assert!(
+            note.contains("knows /usr/local/bin/nspawn as bin_t"),
+            "{note}"
+        );
+        assert!(
+            note.contains("semanage fcontext -a -t nspawn_exec_t"),
+            "{note}"
+        );
+        assert!(note.contains("exec, shell, logs"), "{note}");
+        assert_eq!(label_note(binary, "nonsense"), None, "nothing to say");
     }
 
     #[test]
