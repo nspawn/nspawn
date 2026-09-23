@@ -45,8 +45,8 @@ impl Hub {
         })
     }
 
-    /// The credentials nspawn login (or docker/podman login) left for a registry, else
-    /// anonymous. Chosen per registry, so that the hub's never travel to Docker Hub.
+    /// The credentials nspawn login left for a registry, else anonymous. Chosen per
+    /// registry, so that the hub's never travel to Docker Hub.
     fn auth(&self, registry: &str) -> RegistryAuth {
         match auth::lookup(registry) {
             Some(c) => RegistryAuth::Basic(c.username, c.password),

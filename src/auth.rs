@@ -1,11 +1,12 @@
 //! Registry credentials. `nspawn login` keeps them in /etc/nspawn/auth.json, the auth.json
-//! format podman and skopeo use; what `docker login` or `podman login` left on the host is
-//! picked up as well. Everything is looked up by registry host.
+//! format podman and skopeo use, and that file is the only one consulted: the service
+//! answers many callers and has no home of theirs to look into. Everything is looked up
+//! by registry host.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -80,49 +81,19 @@ fn entry_credentials(entry: &AuthEntry) -> Option<Credentials> {
     }
 }
 
-/// Files consulted, nspawn's own first, then root's podman and docker files (the
-/// service has no environment of the caller's; from a shell, the invoking user's too).
-pub fn sources() -> Vec<PathBuf> {
-    let mut paths = vec![PathBuf::from(STORE)];
-    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
-        paths.push(Path::new(&runtime).join("containers/auth.json"));
-    }
-    paths.push(PathBuf::from("/run/containers/0/auth.json"));
-    let mut homes = vec![PathBuf::from(
-        std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()),
-    )];
-    if let Ok(user) = std::env::var("SUDO_USER") {
-        if let Ok(Some(entry)) = nix::unistd::User::from_name(&user) {
-            homes.push(entry.dir);
-        }
-    }
-    for home in homes {
-        paths.push(home.join(".docker/config.json"));
-        paths.push(home.join(".config/containers/auth.json"));
-    }
-    paths.dedup();
-    paths
+/// Credentials for a registry from nspawn's store; none means anonymous.
+pub fn lookup(registry: &str) -> Option<Credentials> {
+    lookup_in(Path::new(STORE), registry)
 }
 
-/// Credentials for a registry, from the first file that has them.
-pub fn lookup(registry: &str) -> Option<Credentials> {
+pub fn lookup_in(path: &Path, registry: &str) -> Option<Credentials> {
     let key = canonical(registry);
-    for path in sources() {
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(file) = serde_json::from_str::<AuthFile>(&text) else {
-            continue;
-        };
-        for (stored, entry) in &file.auths {
-            if canonical(stored) == key {
-                if let Some(credentials) = entry_credentials(entry) {
-                    return Some(credentials);
-                }
-            }
-        }
-    }
-    None
+    let text = fs::read_to_string(path).ok()?;
+    let file = serde_json::from_str::<AuthFile>(&text).ok()?;
+    file.auths
+        .iter()
+        .find(|(stored, _)| canonical(stored) == key)
+        .and_then(|(_, entry)| entry_credentials(entry))
 }
 
 fn read_store(path: &Path) -> Result<AuthFile> {
@@ -333,6 +304,20 @@ mod tests {
         );
         assert!(forget_in(&path, "docker.io").unwrap());
         assert!(!forget_in(&path, "docker.io").unwrap());
+    }
+
+    #[test]
+    fn lookup_reads_the_store_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("auth.json");
+        assert!(lookup_in(&path, "ghcr.io").is_none(), "no file yet");
+        let creds = Credentials {
+            username: "u".to_string(),
+            password: "p".to_string(),
+        };
+        store_in(&path, "ghcr.io", &creds).unwrap();
+        assert_eq!(lookup_in(&path, "https://ghcr.io/v2/").unwrap(), creds);
+        assert!(lookup_in(&path, "docker.io").is_none());
     }
 
     #[test]

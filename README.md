@@ -84,10 +84,10 @@ ends up the same way but resolves the manifest through the registry first.
 Registries are used anonymously until `nspawn login [REGISTRY] -u USER` (password asked on
 the terminal, or `--password-stdin`) checks the credentials the way docker login does and
 keeps them in `/etc/nspawn/auth.json`, mode 0600, in the auth.json format podman and skopeo
-use. Credentials left by `docker login` or `podman login` on the host (also those of the
-user behind sudo) are picked up as well. Every operation chooses the credentials of the
-registry it talks to, so the hub's never travel to Docker Hub; `nspawn logout [REGISTRY]`
-forgets them. Anonymous pulls from Docker Hub are rate limited per address; logging in
+use. That file is the only one consulted: the service has no home of the caller's to
+look into, so `docker login` or `podman login` do not carry over. Every operation
+chooses the credentials of the registry it talks to, so the hub's never travel to
+Docker Hub; `nspawn logout [REGISTRY]` forgets them. Anonymous pulls from Docker Hub are rate limited per address; logging in
 lifts that.
 
 ## Networking

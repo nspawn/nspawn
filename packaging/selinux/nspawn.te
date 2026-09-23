@@ -93,8 +93,6 @@ files_getattr_all_dirs(nspawn_t)
 userdom_list_user_home_dirs(nspawn_t)
 userdom_read_user_home_content_files(nspawn_t)
 userdom_search_user_tmp_dirs(nspawn_t)
-# Registry credentials of podman and docker are looked up in root's home too.
-userdom_read_admin_home_files(nspawn_t)
 
 # The bus: its own name, and the pipes and pseudo terminals it hands to its
 # clients, which the bus relays.
