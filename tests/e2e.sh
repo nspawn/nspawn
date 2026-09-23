@@ -708,6 +708,17 @@ systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "rm -f l
 [ -e /etc/systemd/nspawn/$app.nspawn ] && fail "settings file left behind for $app"
 ls /etc/systemd/system/ | grep_q "$app" && fail "unit files left behind for $app"
 
+step "progress: a bar follows each download on a terminal, nothing of it in a pipe"
+# rm -f collected the blobs of busybox, so this pull downloads them again.
+bar='[0-9] [KMG]?i?B/[0-9.]+ [KMG]?i?B'
+if grep_q "blob .*: downloading" /tmp/e2e-app.txt; then
+  grep_q -E "$bar" /tmp/e2e-app.txt && fail "progress went into a pipe: $(cat /tmp/e2e-app.txt)"
+fi
+python3 "$(dirname "$0")/terminal.py" $NSPAWN pull docker.io/library/busybox:latest --name $app --backend overlay --force </dev/null > /tmp/e2e-progress.txt 2>&1 || fail "pull busybox on a terminal"
+tr -d '\r' < /tmp/e2e-progress.txt | grep_q "blob .*: downloading" || fail "the pull after rm -f downloaded nothing: $(tr -d '\r' < /tmp/e2e-progress.txt)"
+grep_q -aE "$bar" /tmp/e2e-progress.txt || fail "no progress bar on a terminal: $(tr -d '\r' < /tmp/e2e-progress.txt)"
+$NSPAWN rm $app >/dev/null || fail "rm $app after the pull on a terminal"
+
 step "pipelines: a reader that closes early must not make nspawn fail"
 $NSPAWN hub ls | head -c 1 >/dev/null; rc=${PIPESTATUS[0]}
 [ "$rc" = 0 ] || [ "$rc" = 141 ] || fail "nspawn exited with $rc when the pipe closed"
@@ -723,7 +734,7 @@ if command -v busctl >/dev/null 2>&1; then
   for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine StartMachine StopMachine Exec Shell Logs ListNetwork NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
-  for sig in JobOutput JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do
+  for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do
     grep -q "^\.$sig  *signal" /tmp/e2e-introspect.txt || fail "signal $sig missing from org.nspawn.Manager"
   done
   systemctl is-active nspawn.service >/dev/null || fail "the bus did not start nspawn.service"

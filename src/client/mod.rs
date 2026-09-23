@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Context as _, Result};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
 use crate::config::Config;
@@ -117,6 +117,14 @@ pub trait Manager {
 
     #[zbus(signal)]
     fn job_output(&self, job: OwnedObjectPath, kind: String, line: String) -> zbus::Result<()>;
+    #[zbus(signal)]
+    fn job_progress(
+        &self,
+        job: OwnedObjectPath,
+        item: String,
+        done: u64,
+        total: u64,
+    ) -> zbus::Result<()>;
     #[zbus(signal)]
     fn job_removed(&self, job: OwnedObjectPath, result: String) -> zbus::Result<()>;
 }
@@ -259,6 +267,11 @@ impl Client {
             .receive_job_output()
             .await
             .context("listening for job output")?;
+        let progress = self
+            .manager
+            .receive_job_progress()
+            .await
+            .context("listening for job progress")?;
         let removed = self
             .manager
             .receive_job_removed()
@@ -268,6 +281,7 @@ impl Client {
         Ok(JobWatch {
             connection: self.connection.clone(),
             output,
+            progress,
             removed,
             lost,
         })
@@ -278,14 +292,20 @@ impl Client {
 pub struct JobWatch {
     connection: zbus::Connection,
     output: JobOutputStream,
+    progress: JobProgressStream,
     removed: JobRemovedStream,
     lost: zbus::fdo::NameOwnerChangedStream,
 }
 
 impl JobWatch {
-    /// Follows `job` to its end: its lines go to the terminal as they arrive, and its
-    /// result comes back, or its error.
+    /// Follows `job` to its end: its lines go to the terminal as they arrive, a bar shows
+    /// how far a transfer got when stderr is a terminal, and its result comes back, or
+    /// its error.
     pub async fn finish(mut self, job: OwnedObjectPath) -> Result<Dict> {
+        let mut transfers = Transfers::new(
+            std::io::IsTerminal::is_terminal(&std::io::stderr())
+                .then_some(indicatif::ProgressDrawTarget::stderr),
+        );
         let result = loop {
             // The lines come first: the service sends every JobOutput before JobRemoved,
             // and a random poll order would let the end be seen before the last lines.
@@ -294,10 +314,24 @@ impl JobWatch {
                 Some(signal) = self.output.next() => {
                     let Ok(args) = signal.args() else { continue };
                     if *args.job() != job { continue }
-                    match args.kind().as_str() {
+                    // The progress the service sent before this line is queued already
+                    // (the bus delivers in order, to one stream per signal): it goes first,
+                    // so that a finished transfer does not draw its bar under the next line.
+                    while let Some(Some(signal)) = self.progress.next().now_or_never() {
+                        let Ok(args) = signal.args() else { continue };
+                        if *args.job() == job {
+                            transfers.progress(args.item(), *args.done(), *args.total());
+                        }
+                    }
+                    transfers.print(|| match args.kind().as_str() {
                         "note" => eprintln!("{}", args.line()),
                         _ => println!("{}", args.line()),
-                    }
+                    });
+                }
+                Some(signal) = self.progress.next() => {
+                    let Ok(args) = signal.args() else { continue };
+                    if *args.job() != job { continue }
+                    transfers.progress(args.item(), *args.done(), *args.total());
                 }
                 Some(signal) = self.removed.next() => {
                     let Ok(args) = signal.args() else { continue };
@@ -312,6 +346,7 @@ impl JobWatch {
                 else => anyhow::bail!("the bus connection closed while the job ran"),
             }
         };
+        transfers.clear();
         let proxy = JobProxy::builder(&self.connection)
             .path(job.clone())?
             .cache_properties(zbus::proxy::CacheProperties::No)
@@ -321,6 +356,71 @@ impl JobWatch {
             Ok(proxy.result().await.map_err(error)?)
         } else {
             Err(anyhow!("{}", proxy.error().await.map_err(error)?))
+        }
+    }
+}
+
+/// The bar of the transfer a job is at, drawn where `target` says, or nowhere.
+struct Transfers {
+    target: Option<fn() -> indicatif::ProgressDrawTarget>,
+    bar: Option<(String, indicatif::ProgressBar)>,
+    /// Transfers that ended: a late word about one does not draw it again.
+    finished: std::collections::HashSet<String>,
+}
+
+impl Transfers {
+    fn new(target: Option<fn() -> indicatif::ProgressDrawTarget>) -> Self {
+        Transfers {
+            target,
+            bar: None,
+            finished: Default::default(),
+        }
+    }
+
+    fn progress(&mut self, item: &str, done: u64, total: u64) {
+        let Some(target) = self.target else { return };
+        if self.finished.contains(item) {
+            return;
+        }
+        if self.current() != Some(item) {
+            self.clear();
+            let bar =
+                indicatif::ProgressBar::with_draw_target((total > 0).then_some(total), target());
+            let template = if total > 0 {
+                "{msg} {bar:30} {bytes}/{total_bytes} ({bytes_per_sec}, {eta})"
+            } else {
+                "{msg} {bytes} ({bytes_per_sec})"
+            };
+            bar.set_style(
+                indicatif::ProgressStyle::with_template(template).expect("valid template"),
+            );
+            bar.set_message(item.to_string());
+            self.bar = Some((item.to_string(), bar));
+        }
+        if let Some((_, bar)) = &self.bar {
+            bar.set_position(done);
+        }
+        if total > 0 && done >= total {
+            self.finished.insert(item.to_string());
+            self.clear();
+        }
+    }
+
+    fn current(&self) -> Option<&str> {
+        self.bar.as_ref().map(|(item, _)| item.as_str())
+    }
+
+    /// Prints a line without tearing the bar.
+    fn print(&self, print: impl FnOnce()) {
+        match &self.bar {
+            Some((_, bar)) => bar.suspend(print),
+            None => print(),
+        }
+    }
+
+    fn clear(&mut self) {
+        if let Some((_, bar)) = self.bar.take() {
+            bar.finish_and_clear();
         }
     }
 }
@@ -447,6 +547,34 @@ pub fn dash(text: String) -> String {
 mod tests {
     use super::*;
     use crate::daemon::values::v;
+
+    #[test]
+    fn one_bar_follows_the_transfer_under_way() {
+        let mut shown = Transfers::new(Some(indicatif::ProgressDrawTarget::hidden));
+        shown.progress("aaa", 0, 100);
+        assert_eq!(shown.current(), Some("aaa"));
+        shown.progress("aaa", 50, 100);
+        shown.progress("bbb", 10, 0);
+        assert_eq!(
+            shown.current(),
+            Some("bbb"),
+            "the next transfer takes the bar"
+        );
+        shown.progress("aaa", 100, 100);
+        assert_eq!(shown.current(), None, "a finished transfer leaves no bar");
+        shown.progress("aaa", 80, 100);
+        assert_eq!(shown.current(), None, "nor does a late word about it");
+        shown.progress("ccc", 5, 10);
+        let mut printed = false;
+        shown.print(|| printed = true);
+        assert!(printed);
+        shown.clear();
+        assert_eq!(shown.current(), None);
+
+        let mut hidden = Transfers::new(None);
+        hidden.progress("aaa", 0, 100);
+        assert_eq!(hidden.current(), None, "no bar without a terminal");
+    }
 
     fn method_error(name: &str, message: Option<&str>) -> zbus::Error {
         let call = zbus::message::Message::method_call("/org/nspawn", "Test")

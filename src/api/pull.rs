@@ -96,8 +96,13 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
                 report,
                 format!("blob {}: downloading", short_digest(&descriptor.digest)),
             );
-            hub.download_blob(&oci, descriptor, &store.blob_path(&descriptor.digest))
-                .await?;
+            hub.download_blob(
+                &oci,
+                descriptor,
+                &store.blob_path(&descriptor.digest),
+                report,
+            )
+            .await?;
         }
     }
 

@@ -168,6 +168,20 @@ where
                 let (kind, text) = match event {
                     Event::Line(t) => ("line", t),
                     Event::Note(t) => ("note", t),
+                    // Only for whoever watches now: not kept in the job's output.
+                    Event::Progress { item, done, total } => {
+                        if let Ok(emitter) = state.emitter() {
+                            let _ = Manager::job_progress(
+                                &emitter,
+                                job.path.as_ref(),
+                                &item,
+                                done,
+                                total,
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
                 };
                 job.output.lock().unwrap().push(text.clone());
                 if let Ok(emitter) = state.emitter() {

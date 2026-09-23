@@ -72,6 +72,9 @@ pub enum Event {
     Line(String),
     /// A remark beside the result: "note: ..." or "warning: ...".
     Note(String),
+    /// How far a transfer got: `done` bytes of `total` (0 when unknown) of `item`, the
+    /// short digest of a blob. Frequent, for a progress bar; not a line of output.
+    Progress { item: String, done: u64, total: u64 },
 }
 
 /// Where events go: the terminal, a D-Bus job, a log.

@@ -146,6 +146,7 @@ machine to be gone, which can take longer than a client's default timeout
 | Signal | When |
 |---|---|
 | `JobOutput(o job, s kind, s line)` | a job said a line: kind "line" (progress, a result) or "note" (a remark) |
+| `JobProgress(o job, s item, t done, t total)` | how far a download of `pull` or an upload of `push` got: `done` bytes of `total` (0 when unknown) of blob `item` (its short digest); when the transfer starts, a few times a second, and when it ends. Not kept in `Output` |
 | `JobRemoved(o job, s result)` | a job ended, "done" or "failed" |
 | `ImageAdded(s name)`, `ImageRemoved(s name)` | after a pull, create, build or removal |
 | `MachineStarted(s name)`, `MachineStopped(s name)` | machined's own events, for the machines nspawn installed |

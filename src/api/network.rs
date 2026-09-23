@@ -84,8 +84,9 @@ pub async fn prepare(ctx: &Context, name: &str) -> Result<()> {
 
 /// The hooks run under systemd: what the library remarks goes to the unit's journal.
 fn to_journal(event: Event) {
-    let (Event::Line(text) | Event::Note(text)) = event;
-    eprintln!("{text}");
+    if let Event::Line(text) | Event::Note(text) = event {
+        eprintln!("{text}");
+    }
 }
 
 /// ExecStartPost: the machine is registered, its ports can be published. Volumes of an

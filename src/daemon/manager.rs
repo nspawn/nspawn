@@ -107,10 +107,9 @@ struct Notes(Mutex<Vec<String>>);
 impl Notes {
     fn report(&self) -> impl Fn(api::Event) + '_ {
         move |event| {
-            let text = match event {
-                api::Event::Line(t) | api::Event::Note(t) => t,
-            };
-            self.0.lock().unwrap().push(text);
+            if let api::Event::Line(text) | api::Event::Note(text) = event {
+                self.0.lock().unwrap().push(text);
+            }
         }
     }
 
@@ -1063,6 +1062,17 @@ impl Manager {
         job: ObjectPath<'_>,
         kind: &str,
         line: &str,
+    ) -> zbus::Result<()>;
+
+    /// How far a transfer of a job got: `done` bytes of `total` (0 when unknown) of
+    /// `item`, the short digest of a blob; a few times a second while it runs.
+    #[zbus(signal)]
+    pub async fn job_progress(
+        emitter: &SignalEmitter<'_>,
+        job: ObjectPath<'_>,
+        item: &str,
+        done: u64,
+        total: u64,
     ) -> zbus::Result<()>;
 
     /// A job ended: result "done" or "failed"; the job object keeps the details.

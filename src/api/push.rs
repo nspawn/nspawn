@@ -97,6 +97,7 @@ pub async fn push(ctx: &Context, request: &PushRequest, report: Report<'_>) -> R
                 &dest,
                 &descriptor.digest,
                 &store.blob_path(&descriptor.digest),
+                report,
             )
             .await?;
         }

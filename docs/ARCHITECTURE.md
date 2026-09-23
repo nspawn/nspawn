@@ -124,13 +124,15 @@ name and type (an unknown key is an error), results go back as dictionaries
 with the command line's spellings. Pull, push, build, create, the removals
 (images, machines, volumes) and cp run as jobs:
 the method returns `/org/nspawn/job/N` at once, the job's report events
-become `JobOutput` signals and the object's `Output`, and `JobRemoved` says
-how it ended. machined's `MachineNew` and `MachineRemoved` are relayed as
+become `JobOutput` signals and the object's `Output`, the progress of its
+downloads and uploads `JobProgress` signals, and `JobRemoved` says how it
+ended. machined's `MachineNew` and `MachineRemoved` are relayed as
 `MachineStarted` and `MachineStopped` for the machines nspawn installed.
 
 The command line is a client of that service, so one code path does the
 work: `commands/` converts arguments into calls and prints what comes back,
-follows jobs line by line, attaches the terminal to the descriptors `Exec`,
+follows jobs line by line (with a bar for each transfer when standard error is
+a terminal), attaches the terminal to the descriptors `Exec`,
 `Shell` and `Logs` hand over, and packs or unpacks the tar streams of `CopyTo`
 and `CopyFrom`. The registry and CA certificate the
 command line was given travel as options of each call, so `--registry`,
