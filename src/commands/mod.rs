@@ -394,6 +394,14 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 Ok(())
             }
         },
+        Command::Rm(a) => {
+            let mut options = Options::new();
+            put(&mut options, "force", a.force);
+            client
+                .run_job(|| manager.remove_machines(&a.names, options))
+                .await?;
+            Ok(())
+        }
         Command::Volume(args) => match args.command {
             VolumeCommand::Ls(output) => {
                 let volumes = manager.list_volumes().await.map_err(client::error)?;

@@ -56,6 +56,8 @@ pub enum Command {
     Start(StartArgs),
     /// Power off a running machine.
     Stop(StopArgs),
+    /// Remove machines and what they alone use, like docker rm (same as images rm).
+    Rm(RmArgs),
     /// Run a command inside a running machine.
     Exec(ExecArgs),
     /// Open an interactive shell inside a running machine.
@@ -321,6 +323,16 @@ pub enum ImagesCommand {
     Ls(OutputArgs),
     /// Remove local images (and the layers nobody uses any more).
     Rm(ImagesRmArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct RmArgs {
+    /// Machine names.
+    #[arg(required = true)]
+    pub names: Vec<String>,
+    /// Stop a running machine first (SIGKILL, like docker rm -f) instead of refusing.
+    #[arg(long, short = 'f')]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]

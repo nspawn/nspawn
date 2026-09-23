@@ -41,6 +41,11 @@ pub trait Manager {
         options: Options<'_>,
     ) -> zbus::Result<OwnedObjectPath>;
     fn remove_images(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
+    fn remove_machines(
+        &self,
+        names: &[String],
+        options: Options<'_>,
+    ) -> zbus::Result<OwnedObjectPath>;
     fn search_images(
         &self,
         term: &str,

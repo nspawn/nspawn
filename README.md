@@ -23,6 +23,7 @@ nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
 nspawn shell fedora-44
 nspawn logs fedora-44               # console output; --inside reads the machine's own journal
 nspawn stop fedora-44
+nspawn rm -f web2                   # remove a machine, stopping it first (same as images rm)
 nspawn images rm fedora-44          # also frees layers and blobs nobody references
 nspawn volume ls                    # named volumes and the machines that use them (create, rm, prune)
 
@@ -92,7 +93,10 @@ with them; `inspect` and `ps --json` show both the merged `labels` and the
 One image, as many machines as you like: `nspawn create SOURCE NAME` makes another
 machine from an image that is already local, without touching the registry. It shares the
 source's layers and gets a writable layer, an address, settings and ports of its own
-(`-p`, `--network`); `images rm` of one never affects the others. `pull` with `--name`
+(`-p`, `--network`); removing one never affects the others. A pulled image is a machine
+too, so `nspawn rm NAME` and `nspawn images rm NAME` remove the same thing: the record,
+the tree, the unit files and whatever layers nobody else uses. `rm --force` stops a
+running machine first (SIGKILL, like `docker rm -f`) where both refuse otherwise. `pull` with `--name`
 ends up the same way but resolves the manifest through the registry first.
 
 Completions for bash, zsh and fish come with the packages; from a build of your own,

@@ -456,7 +456,18 @@ grep -q "removed e2evol2" /tmp/e2e-volrm.txt || fail "volume rm stopped at the m
 grep -q "no volume named e2e-no-such-volume" /tmp/e2e-volrm.txt || fail "a missing volume was not explained: $(cat /tmp/e2e-volrm.txt)"
 $NSPAWN volume rm ../images >/dev/null 2>&1 && fail "volume rm reached outside the volumes directory"
 rmdir /var/lib/nspawn/volumes/.e2e-hidden
-$NSPAWN images rm $app || fail "rm busybox"
+
+step "rm: a running machine is refused, rm -f stops it first, named volumes stay"
+$NSPAWN start $app -v e2evol:/vol -- /bin/sleep 300 >/dev/null || fail "start the app with e2evol"
+out=$($NSPAWN rm $app 2>&1) && fail "rm removed a running machine"
+echo "$out" | grep -q "rm --force" || fail "rm of a running machine does not mention --force: $out"
+$NSPAWN rm -f $app > /tmp/e2e-rmf.txt 2>&1 || { cat /tmp/e2e-rmf.txt; fail "rm -f of a running machine"; }
+grep -q "removed $app" /tmp/e2e-rmf.txt || fail "rm -f did not say it removed $app: $(cat /tmp/e2e-rmf.txt)"
+grep -q "volume e2evol kept" /tmp/e2e-rmf.txt || fail "rm did not say the named volume was kept: $(cat /tmp/e2e-rmf.txt)"
+[ -d /var/lib/nspawn/volumes/e2evol ] || fail "rm removed a named volume"
+$NSPAWN ps -a | grep -q "^ *$app " && fail "$app still listed after rm -f"
+[ -e "/var/lib/machines/$app" ] && fail "/var/lib/machines/$app left after rm -f"
+systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "rm -f left the unit failed"
 [ -e /etc/systemd/nspawn/$app.nspawn ] && fail "settings file left behind for $app"
 ls /etc/systemd/system/ | grep -q "$app" && fail "unit files left behind for $app"
 
@@ -470,7 +481,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine StartMachine StopMachine Exec Shell Logs ListNetwork NetworkUp Login Logout ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine StartMachine StopMachine Exec Shell Logs ListNetwork NetworkUp Login Logout RemoveMachines ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do
@@ -492,7 +503,7 @@ if command -v busctl >/dev/null 2>&1; then
   [ -n "$digest" ] || fail "GetImage has no digest"
   $NSPAWN pull "${IMAGE%%:*}@$digest" --name e2e-digest --backend flat --force >/dev/null || fail "pull by digest"
   $NSPAWN start e2e-digest >/dev/null && $NSPAWN exec e2e-digest -- /usr/bin/true </dev/null && $NSPAWN stop e2e-digest >/dev/null || fail "flat machine pulled by digest"
-  $NSPAWN images rm e2e-digest >/dev/null || fail "rm the digest machine"
+  $NSPAWN rm e2e-digest >/dev/null || fail "rm of a stopped machine"
   [ "$($B call $M StartMachine 'sa{sv}' e2e-dbus 0)" = 'sas "started" 0' ] || fail "StartMachine"
   out=$($NSPAWN images rm e2e-nothing-$nonce e2e-dbus 2>&1); rc=$?
   [ "$rc" != 0 ] || fail "images rm of a running machine succeeded"
@@ -522,6 +533,9 @@ if command -v busctl >/dev/null 2>&1; then
   [ "$($B get-property org.nspawn $proc org.nspawn.Process ExitStatus)" = "i 143" ] || fail "the signalled command's status is not 143: $($B get-property org.nspawn $proc org.nspawn.Process ExitStatus)"
   out=$($B call org.nspawn $proc org.nspawn.Process Signal i 15 2>&1) && fail "Signal to an exited process succeeded"
   echo "$out" | grep -q "has exited" || fail "Signal to an exited process not refused with a reason: $out"
+  job=$($B call $M RemoveMachines 'asa{sv}' 1 e2e-dbus 1 force b false | awk '{print $2}' | tr -d '"')
+  retry 30 bash -c "[ \"\$($B get-property org.nspawn $job org.nspawn.Job State)\" != 's \"running\"' ]" || fail "the refused rm job did not end"
+  $B get-property org.nspawn $job org.nspawn.Job Error | grep -q "rm --force" || fail "RemoveMachines without force did not refuse a running machine"
   [ "$($B call $M StopMachine 'sa{sv}' e2e-dbus 0)" = 'sas "stopped" 0' ] || fail "StopMachine"
   $B call $M ListMachines b true | grep -q '"state" s "stopped"' || fail "ListMachines with all misses the stopped machine"
   job=$($B call $M RemoveImages as 1 e2e-dbus | awk '{print $2}' | tr -d '"')

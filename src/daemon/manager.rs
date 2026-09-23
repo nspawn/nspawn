@@ -433,6 +433,48 @@ impl Manager {
         .await?)
     }
 
+    /// Like `rm`: `RemoveImages` with the option force (b), which stops a running machine
+    /// first (SIGKILL) instead of refusing it. A job; its result lists `removed`.
+    async fn remove_machines(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        names: Vec<String>,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<OwnedObjectPath> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        let mut options = Options::new(&options);
+        let force = options.bool("force", false)?;
+        options.finish()?;
+        let state = self.state.clone();
+        let target = names.join(" ");
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "rm",
+            &target,
+            move |ctx, reporter| async move {
+                let removal =
+                    api::images::remove_machines(&ctx, &names, force, jobs::report(&reporter))
+                        .await?;
+                for name in &removal.removed {
+                    if let Ok(emitter) = state.emitter() {
+                        let _ = Manager::image_removed(&emitter, name).await;
+                    }
+                }
+                if let Some(error) = removal.error() {
+                    anyhow::bail!("{error}");
+                }
+                Ok(HashMap::from([(
+                    "removed".to_string(),
+                    values::v(removal.removed),
+                )]))
+            },
+        )
+        .await?)
+    }
+
     /// Like `volume ls`: every named volume with name, path, used_by (the machines whose
     /// records mount it) and created (unix seconds).
     async fn list_volumes(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Vec<Dict>> {

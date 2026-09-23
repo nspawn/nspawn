@@ -85,19 +85,50 @@ impl Removal {
 /// Removes every name it can, like docker rmi: one that cannot be removed does not stop
 /// the others, and is reported in the result.
 pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Result<Removal> {
-    require_root("images rm")?;
+    remove_machines(ctx, names, false, report).await
+}
+
+/// `remove`, and with `force` a running machine is stopped first (SIGKILL, like docker
+/// rm -f) instead of refused.
+pub async fn remove_machines(
+    ctx: &Context,
+    names: &[String],
+    force: bool,
+    report: Report<'_>,
+) -> Result<Removal> {
+    require_root(if force { "rm --force" } else { "rm" })?;
     let sd = ctx.sd().await?;
     let store = &ctx.store;
     let assembler = Assembler { store, sd };
-    let _lock = store.lock().await?;
     let mut removal = Removal::default();
-    for name in names {
+    // Stopping takes the store lock itself, so it happens before the removal takes it.
+    let mut skip = std::collections::HashSet::new();
+    if force {
+        for name in names {
+            if store.is_starting(name) || !sd.machine_exists(name).await? {
+                continue;
+            }
+            let stop = crate::api::machines::StopRequest {
+                name: name.clone(),
+                force: true,
+                wait: true,
+                timeout: 0,
+            };
+            if let Err(e) = crate::api::machines::stop(ctx, &stop, report).await {
+                removal.failed.push((name.clone(), format!("{e:#}")));
+                skip.insert(name.clone());
+            }
+        }
+    }
+    let _lock = store.lock().await?;
+    let hint = if force { "" } else { ", or use rm --force" };
+    for name in names.iter().filter(|n| !skip.contains(*n)) {
         let outcome: Result<()> = async {
             if store.is_starting(name) {
                 bail!("machine {name} is starting; wait for it or stop it first");
             }
             if sd.machine_exists(name).await? {
-                bail!("machine {name} is running; stop it first");
+                bail!("machine {name} is running; stop it first{hint}");
             }
             match store.load_image(name)? {
                 Some(rec) => {
