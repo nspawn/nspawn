@@ -1016,10 +1016,20 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    /// Real layers carry an owner in every header; a header built here would leave the
+    /// field blank, and a reader running as root (the service does, and so does
+    /// dpkg-buildpackage) asks for it while preserving ownership.
+    fn header_owner(header: &mut tar::Header) {
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+    }
+
     fn tar_with(entries: &[(&str, Option<&str>)]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         for (path, content) in entries {
             let mut header = tar::Header::new_gnu();
+            header_owner(&mut header);
             match content {
                 Some(data) => {
                     header.set_size(data.len() as u64);
@@ -1070,6 +1080,7 @@ mod tests {
             ])
             .unwrap();
         let mut header = tar::Header::new_gnu();
+        header_owner(&mut header);
         header.set_size(2);
         header.set_mode(0o644);
         header.set_entry_type(tar::EntryType::Regular);
@@ -1198,6 +1209,7 @@ mod tests {
         // attacker would.
         let mut builder = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
+        header_owner(&mut header);
         let evil = b"../escape";
         header.as_gnu_mut().unwrap().name[..evil.len()].copy_from_slice(evil);
         header.set_size(1);
@@ -1206,6 +1218,7 @@ mod tests {
         header.set_cksum();
         builder.append(&header, Cursor::new(b"x")).unwrap();
         let mut ok = tar::Header::new_gnu();
+        header_owner(&mut ok);
         ok.set_size(1);
         ok.set_mode(0o644);
         ok.set_entry_type(tar::EntryType::Regular);
@@ -1378,6 +1391,7 @@ mod tests {
         let mut builder = tar::Builder::new(Vec::new());
         for (path, target) in entries {
             let mut header = tar::Header::new_gnu();
+            header_owner(&mut header);
             header.set_size(0);
             header.set_mode(0o777);
             header.set_entry_type(tar::EntryType::Symlink);
