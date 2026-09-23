@@ -120,7 +120,8 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
         });
     }
     // Records that machined does not list: stopped, or between two runs of a restart
-    // policy, which ps shows without -a since they are not stopped.
+    // policy, which ps shows without -a like docker ps. A machine only starting or
+    // closing is left to -a: without it ps lists what runs.
     let running: std::collections::HashSet<&str> =
         machines.iter().map(|m| m.name.as_str()).collect();
     let mut others: Vec<&ImageRecord> = records
@@ -139,7 +140,7 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
             .map(unit_word)
             .unwrap_or("stopped")
             .to_string();
-        if all || state != "stopped" {
+        if listed(all, &state) {
             summaries.push(MachineSummary {
                 name: r.name.clone(),
                 record: Some(r.clone()),
@@ -153,14 +154,21 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
     Ok(summaries)
 }
 
-/// How ps names a machine machined does not list, from its unit's state.
+/// Whether ps shows a machine machined does not list, by the word `unit_word` has for it.
+fn listed(all: bool, state: &str) -> bool {
+    all || state == "restarting"
+}
+
+/// How ps names a machine machined does not list, from its unit's state. systemd-nspawn
+/// registers the machine before it tells systemd it is ready, so a unit that is active
+/// without a machine is one whose machine has just ended.
 pub fn unit_word(state: &UnitState) -> &'static str {
     if state.restarting() {
         "restarting"
     } else {
         match state.active.as_str() {
-            "activating" | "active" | "reloading" => "starting",
-            "deactivating" => "closing",
+            "activating" => "starting",
+            "active" | "reloading" | "deactivating" => "closing",
             _ => "stopped",
         }
     }
@@ -173,12 +181,16 @@ pub async fn unit_busy(sd: &Systemd, name: &str) -> Result<Option<String>> {
     let state = sd
         .unit_status(&format!("systemd-nspawn@{name}.service"))
         .await?;
-    Ok(if state.restarting() {
+    Ok(if !state.busy() {
+        None
+    } else if state.restarting() {
         Some(format!("machine {name} is restarting; stop it first"))
-    } else if state.busy() {
+    } else if unit_word(&state) == "starting" {
         Some(format!("machine {name} is starting; stop it first"))
     } else {
-        None
+        Some(format!(
+            "machine {name} is shutting down; wait for it or stop it first"
+        ))
     })
 }
 
@@ -1106,28 +1118,6 @@ mod tests {
     }
 
     #[test]
-    fn machines_machined_does_not_list_are_named_by_their_unit() {
-        let state = |active: &str, sub: &str| UnitState {
-            load: "loaded".to_string(),
-            active: active.to_string(),
-            sub: sub.to_string(),
-        };
-        assert_eq!(
-            unit_word(&state("activating", "auto-restart")),
-            "restarting"
-        );
-        assert_eq!(
-            unit_word(&state("activating", "auto-restart-queued")),
-            "restarting"
-        );
-        assert_eq!(unit_word(&state("activating", "start-pre")), "starting");
-        assert_eq!(unit_word(&state("active", "running")), "starting");
-        assert_eq!(unit_word(&state("deactivating", "stop-post")), "closing");
-        assert_eq!(unit_word(&state("inactive", "dead")), "stopped");
-        assert_eq!(unit_word(&state("failed", "failed")), "stopped");
-    }
-
-    #[test]
     fn a_machine_that_is_gone_is_stopped_when_there_is_something_to_stop() {
         let state = |active: &str, sub: &str| UnitState {
             load: "loaded".to_string(),
@@ -1153,6 +1143,37 @@ mod tests {
         assert!(stop_job_after_kill(Latch::AfterSignal, false));
         assert!(!stop_job_after_kill(Latch::NotNeeded, true));
         assert!(stop_job_after_kill(Latch::NotNeeded, false));
+    }
+
+    #[test]
+    fn machines_machined_does_not_list_are_named_by_their_unit() {
+        let state = |active: &str, sub: &str| UnitState {
+            load: "loaded".to_string(),
+            active: active.to_string(),
+            sub: sub.to_string(),
+        };
+        assert_eq!(
+            unit_word(&state("activating", "auto-restart")),
+            "restarting"
+        );
+        assert_eq!(
+            unit_word(&state("activating", "auto-restart-queued")),
+            "restarting"
+        );
+        assert_eq!(unit_word(&state("activating", "start-pre")), "starting");
+        assert_eq!(unit_word(&state("active", "running")), "closing");
+        assert_eq!(unit_word(&state("deactivating", "stop-post")), "closing");
+        assert_eq!(unit_word(&state("inactive", "dead")), "stopped");
+        assert_eq!(unit_word(&state("failed", "failed")), "stopped");
+    }
+
+    #[test]
+    fn ps_without_all_lists_what_runs_or_restarts() {
+        assert!(listed(false, "restarting"));
+        for state in ["starting", "closing", "stopped"] {
+            assert!(!listed(false, state), "{state}");
+            assert!(listed(true, state), "{state}");
+        }
     }
 
     #[test]
