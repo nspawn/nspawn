@@ -433,6 +433,74 @@ impl Manager {
         .await?)
     }
 
+    /// Like `volume ls`: every named volume with name, path, used_by (the machines whose
+    /// records mount it) and created (unix seconds).
+    async fn list_volumes(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Vec<Dict>> {
+        self.allow(&hdr, Action::Inspect).await?;
+        let _busy = self.state.enter();
+        let volumes = api::volumes::list(&self.ctx().store)?;
+        Ok(volumes.iter().map(values::volume).collect())
+    }
+
+    /// Like `volume create`: makes the volume's directory ahead of its first use and
+    /// returns its path. One that exists already is not an error.
+    async fn create_volume(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<String> {
+        self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        let path = api::volumes::create(self.ctx(), &name).await?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// Like `volume rm`: a job, since a big volume takes a while to delete. Every name is
+    /// tried; the result lists the ones removed, and the job fails at the end when one
+    /// was in use, unknown or not a volume.
+    async fn remove_volumes(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        names: Vec<String>,
+    ) -> Result<OwnedObjectPath> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        let target = names.join(" ");
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "volume-rm",
+            &target,
+            move |ctx, reporter| async move {
+                let removal = api::volumes::remove(&ctx, &names, jobs::report(&reporter)).await?;
+                if let Some(error) = removal.error() {
+                    anyhow::bail!("{error}");
+                }
+                Ok(HashMap::from([(
+                    "removed".to_string(),
+                    values::v(removal.removed),
+                )]))
+            },
+        )
+        .await?)
+    }
+
+    /// Like `volume prune`: a job removing every volume no machine uses; its result lists
+    /// them.
+    async fn prune_volumes(&self, #[zbus(header)] hdr: Header<'_>) -> Result<OwnedObjectPath> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "volume-prune",
+            "",
+            move |ctx, reporter| async move {
+                let removed = api::volumes::prune(&ctx, jobs::report(&reporter)).await?;
+                Ok(HashMap::from([("removed".to_string(), values::v(removed))]))
+            },
+        )
+        .await?)
+    }
+
     /// Like `search`: source "" (both), "hub" or "dockerhub"; limit per source. Returns
     /// the hits and the notes (a source that could not be reached, say). Options:
     /// registry (s), ca_cert (s).

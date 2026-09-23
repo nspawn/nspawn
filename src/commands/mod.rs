@@ -12,11 +12,13 @@ use crate::api::{self, Context};
 use crate::backend::BackendChoice;
 use clap::CommandFactory;
 
-use crate::cli::{Cli, Command, HubCommand, ImagesCommand, MachinesCommand, NetworkCommand};
+use crate::cli::{
+    Cli, Command, HubCommand, ImagesCommand, MachinesCommand, NetworkCommand, VolumeCommand,
+};
 use crate::client::{self, Client, Options};
 use crate::config::Config;
 use crate::oci::ModeChoice;
-use crate::output::{human_bytes, table};
+use crate::output::{human_bytes, human_duration, table};
 use crate::search::SearchSource;
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -389,6 +391,60 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 // A job: what was removed is printed as it happens, and a name that
                 // could not be removed fails it at the end.
                 client.run_job(|| manager.remove_images(&a.names)).await?;
+                Ok(())
+            }
+        },
+        Command::Volume(args) => match args.command {
+            VolumeCommand::Ls(output) => {
+                let volumes = manager.list_volumes().await.map_err(client::error)?;
+                if output.json {
+                    client::print_json(&serde_json::Value::Array(
+                        volumes.iter().map(client::dict_to_json).collect(),
+                    ));
+                    return Ok(());
+                }
+                let now = crate::store::now_unix();
+                let rows = volumes
+                    .iter()
+                    .map(|v| {
+                        let created = client::u64(v, "created");
+                        vec![
+                            client::string(v, "name"),
+                            client::dash(client::strings(v, "used_by").join(" ")),
+                            if created > 0 {
+                                format!("{} ago", human_duration(now.saturating_sub(created)))
+                            } else {
+                                "-".to_string()
+                            },
+                            client::string(v, "path"),
+                        ]
+                    })
+                    .collect();
+                println!("{}", table(&["VOLUME", "USED BY", "CREATED", "PATH"], rows));
+                Ok(())
+            }
+            VolumeCommand::Create { name } => {
+                manager.create_volume(&name).await.map_err(client::error)?;
+                println!("{name}");
+                Ok(())
+            }
+            VolumeCommand::Rm { names } => {
+                client.run_job(|| manager.remove_volumes(&names)).await?;
+                Ok(())
+            }
+            VolumeCommand::Prune { force } => {
+                use std::io::IsTerminal;
+                if !force && std::io::stdin().is_terminal() {
+                    eprint!("Remove every volume no machine uses? [y/N] ");
+                    let mut answer = String::new();
+                    std::io::stdin()
+                        .read_line(&mut answer)
+                        .context("reading the answer")?;
+                    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                        return Ok(());
+                    }
+                }
+                client.run_job(|| manager.prune_volumes()).await?;
                 Ok(())
             }
         },

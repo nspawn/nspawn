@@ -8,6 +8,7 @@ use zbus::zvariant::{OwnedValue, Value};
 use crate::api::images::ImageSummary;
 use crate::api::machines::MachineSummary;
 use crate::api::network::{BridgeInfo, NetworkEntry};
+use crate::api::volumes::VolumeInfo;
 use crate::daemon::jobs::Dict;
 use crate::search::Hit;
 use crate::store::ImageRecord;
@@ -135,6 +136,18 @@ pub fn machined_path(name: &str) -> String {
         }
     }
     path
+}
+
+pub fn volume(vol: &VolumeInfo) -> Dict {
+    HashMap::from([
+        ("name".to_string(), v(vol.name.as_str())),
+        (
+            "path".to_string(),
+            v(vol.path.to_string_lossy().into_owned()),
+        ),
+        ("used_by".to_string(), strings(&vol.used_by)),
+        ("created".to_string(), v(vol.created)),
+    ])
 }
 
 pub fn bridge(b: &BridgeInfo) -> Dict {

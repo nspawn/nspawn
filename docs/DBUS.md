@@ -34,7 +34,7 @@ alone otherwise.
 
 Every user may call; who may do what is polkit's answer. The methods that
 only read (`ListImages`, `GetImage`, `ListMachines`, `GetMachine`,
-`ListNetwork`) ask for
+`ListNetwork`, `ListVolumes`) ask for
 `org.nspawn.inspect`, the rest for `org.nspawn.manage`, and both are for
 administrators by default, so `sudo nspawn ...` works as before and a
 desktop or `pkttyagent` session is asked for a password. Root is allowed
@@ -119,6 +119,15 @@ Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 machine to be gone, which can take longer than a client's default timeout
 (`busctl --timeout=120`).
 
+### Volumes
+
+| Method | Like | Notes |
+|---|---|---|
+| `ListVolumes() -> aa{sv}` | `volume ls` | name, path, used_by (the machines whose records mount it), created (unix seconds) |
+| `CreateVolume(s name) -> s` | `volume create` | the volume's path; one that exists already is not an error |
+| `RemoveVolumes(as names) -> o` | `volume rm` | a job: every name is tried, its result lists `removed`, and it fails at the end when one was in use, unknown or not a volume |
+| `PruneVolumes() -> o` | `volume prune` | a job removing every volume no machine uses; its result lists `removed` |
+
 ### Network and credentials
 
 | Method | Like |
@@ -154,7 +163,7 @@ property lists them.
 ## org.nspawn.Job at /org/nspawn/job/N
 
 A job is returned by the long operations and keeps what happened: properties
-`Kind` (pull, create, push, build, rm), `Target`, `State` (running, done,
+`Kind` (pull, create, push, build, rm, volume-rm, volume-prune), `Target`, `State` (running, done,
 failed), `Output` (every line so far), `Error` and `Result` (a dictionary,
 for a pull its name, reference and mode, for an rm the names removed). The
 service does not go idle before a job or a process has announced its end.

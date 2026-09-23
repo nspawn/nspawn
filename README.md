@@ -24,6 +24,7 @@ nspawn shell fedora-44
 nspawn logs fedora-44               # console output; --inside reads the machine's own journal
 nspawn stop fedora-44
 nspawn images rm fedora-44          # also frees layers and blobs nobody references
+nspawn volume ls                    # named volumes and the machines that use them (create, rm, prune)
 
 nspawn build -t team/app:1 ./app    # mkosi -t oci on ./app, imported as a local image
 nspawn push team/app:1              # upload it to the hub (layers already there are skipped)
@@ -59,6 +60,12 @@ the backend. On overlay and flat the volumes are there from the first instructio
 come from the settings file); mstack machines get them attached from the host right after
 their init starts, since systemd-nspawn cannot idmap binds under managed user namespaces,
 which is what the unit waits for. `-e none` and `-v none` forget them.
+
+Named volumes outlive the machines that use them, as in docker: removing a machine
+keeps them and says so. `nspawn volume ls` lists them with the machines whose records
+mount them, `volume create NAME` makes one ahead of its first use, and `volume rm` and
+`volume prune` remove the ones no machine uses; a volume still named by a machine is
+refused until that machine is started with other volumes (or `-v none`) or removed.
 
 `exec` enters the machine's namespaces for both kinds of machine, like docker exec: the
 exit code comes back, the image's environment applies and nothing is needed inside (no

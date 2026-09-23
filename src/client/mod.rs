@@ -57,6 +57,10 @@ pub trait Manager {
     fn list_tags(&self, repository: &str, options: Options<'_>) -> zbus::Result<Vec<String>>;
     fn list_machines(&self, all: bool) -> zbus::Result<Vec<Dict>>;
     fn get_machine(&self, name: &str) -> zbus::Result<Dict>;
+    fn list_volumes(&self) -> zbus::Result<Vec<Dict>>;
+    fn create_volume(&self, name: &str) -> zbus::Result<String>;
+    fn remove_volumes(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
+    fn prune_volumes(&self) -> zbus::Result<OwnedObjectPath>;
     fn start_machine(
         &self,
         name: &str,

@@ -13,6 +13,7 @@ pub mod network;
 pub mod pull;
 pub mod push;
 pub mod search;
+pub mod volumes;
 
 use anyhow::{bail, Context as _, Result};
 use tokio::sync::OnceCell;

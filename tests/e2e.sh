@@ -35,7 +35,7 @@ cleanup_machines() {
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
   $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || true
-  rm -rf /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol
+  rm -rf /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol /var/lib/nspawn/volumes/e2evol2 /var/lib/nspawn/volumes/e2evol-free /var/lib/nspawn/volumes/.e2e-hidden
   kill "${listener_pid:-}" 2>/dev/null || true
   if [ "$networkd_was" != active ]; then
     systemctl stop systemd-networkd.service systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-resolve-hook.socket >/dev/null 2>&1 || true
@@ -431,6 +431,31 @@ $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0];
 $NSPAWN ps | grep "^ *$app " | grep -q " sh " || fail "--image-command did not restore the image's cmd"
 grep -q "Bind=" /etc/systemd/nspawn/$app.nspawn && fail "-v none left volumes in the settings"
 $NSPAWN stop $app -t 2 || fail "stop app running its own cmd"
+
+step "named volumes: listed with their users, made ahead, removed once unused"
+$NSPAWN volume create e2evol-free || fail "volume create"
+[ "$(stat -c '%u %a' /var/lib/nspawn/volumes/e2evol-free)" = "0 755" ] || fail "volume create did not make a root directory with mode 0755"
+$NSPAWN volume create e2evol-free >/dev/null || fail "volume create of an existing volume is not a no-op"
+$NSPAWN volume create 'bad name' >/dev/null 2>&1 && fail "volume create accepted a bad name"
+mkdir -p /var/lib/nspawn/volumes/.e2e-hidden
+$NSPAWN volume ls | tee /tmp/e2e-vol.txt
+grep "^ *e2evol-free " /tmp/e2e-vol.txt | grep -q " - " || fail "an unused volume is not shown as unused"
+grep -q "e2e-hidden" /tmp/e2e-vol.txt && fail "a dot directory is listed as a volume"
+$NSPAWN start $app -v e2evol2:/v -- /bin/sleep 300 >/dev/null || fail "start with a second named volume"
+$NSPAWN volume ls | grep "^ *e2evol2 " | grep -q "$app" || fail "volume ls does not show who uses e2evol2"
+$NSPAWN volume ls --json | python3 -c "import json,sys; d = {v['name']: v for v in json.load(sys.stdin)}; assert d['e2evol2']['used_by'] == ['$app'] and d['e2evol2']['path'] == '/var/lib/nspawn/volumes/e2evol2', d" || fail "volume ls --json"
+out=$($NSPAWN volume rm e2evol2 2>&1) && fail "a volume in use was removed"
+echo "$out" | grep -q "in use by $app" || fail "volume rm did not say who uses it: $out"
+$NSPAWN volume prune -f | tee /tmp/e2e-prune.txt || fail "volume prune"
+grep -q "removed e2evol-free" /tmp/e2e-prune.txt || fail "prune left an unused volume"
+[ -d /var/lib/nspawn/volumes/e2evol2 ] || fail "prune removed a volume in use"
+$NSPAWN stop $app >/dev/null || fail "stop the app with e2evol2"
+$NSPAWN start $app -v none -- /bin/sleep 300 >/dev/null && $NSPAWN stop $app >/dev/null || fail "start with -v none"
+$NSPAWN volume rm e2evol2 e2e-no-such-volume > /tmp/e2e-volrm.txt 2>&1 && fail "volume rm of a missing volume succeeded"
+grep -q "removed e2evol2" /tmp/e2e-volrm.txt || fail "volume rm stopped at the missing volume: $(cat /tmp/e2e-volrm.txt)"
+grep -q "no volume named e2e-no-such-volume" /tmp/e2e-volrm.txt || fail "a missing volume was not explained: $(cat /tmp/e2e-volrm.txt)"
+$NSPAWN volume rm ../images >/dev/null 2>&1 && fail "volume rm reached outside the volumes directory"
+rmdir /var/lib/nspawn/volumes/.e2e-hidden
 $NSPAWN images rm $app || fail "rm busybox"
 [ -e /etc/systemd/nspawn/$app.nspawn ] && fail "settings file left behind for $app"
 ls /etc/systemd/system/ | grep -q "$app" && fail "unit files left behind for $app"
@@ -445,7 +470,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine StartMachine StopMachine Exec Shell Logs ListNetwork NetworkUp Login Logout; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine StartMachine StopMachine Exec Shell Logs ListNetwork NetworkUp Login Logout ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do

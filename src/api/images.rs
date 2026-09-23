@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use anyhow::{bail, Result};
 
-use crate::api::{line, require_root, Context, Report};
+use crate::api::{line, note, require_root, Context, Report};
 use crate::backend::{Assembler, BackendChoice};
 use crate::bridge;
 
@@ -105,6 +105,16 @@ pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Resu
                     store.remove_machine_files(name)?;
                     bridge::delete_netns(name);
                     store.remove_record(name)?;
+                    // Like docker: named volumes outlive the machine.
+                    for volume in rec.volumes.iter().filter(|v| v.is_named()) {
+                        note(
+                            report,
+                            format!(
+                                "note: volume {0} kept; nspawn volume rm {0} removes it",
+                                volume.source
+                            ),
+                        );
+                    }
                 }
                 None => {
                     // Not recorded: an image machined knows, or leftovers of ours.

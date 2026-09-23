@@ -37,7 +37,7 @@ files, and the machine units call nspawn back through drop-in hooks.
   blobs/             compressed blobs, kept for push; .hold-* lists the blobs
                      of a pull in flight, which the collector leaves alone
   images/NAME.json   the record: reference, backend, mode, network, address,
-                     ports, entrypoint/cmd, env, volumes
+                     ports, entrypoint/cmd, env, volumes, labels
   manifests/NAME.json raw manifest bytes (digest stays valid)
   machines/NAME/     overlay upper/work, host0.network, hosts, resolv.conf,
                      units/ for the volume wait unit
@@ -142,4 +142,7 @@ the machine runs with private users. mstack machines cannot idmap binds, so
 their volumes are attached from the host by the publish hook (`open_tree`,
 `mount_setattr` with the machine's user namespace, `move_mount`). Every
 booted machine with volumes gets `nspawn-volumes.service`, which holds
-`local-fs.target` until they are all mounted.
+`local-fs.target` until they are all mounted. Named volumes are plain directories
+under `volumes/`; `api/volumes.rs` lists them with the records that name
+them and removes only the ones no record names, reading the records
+strictly so that one it cannot read never makes a volume look unused.

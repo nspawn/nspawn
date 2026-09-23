@@ -64,6 +64,8 @@ pub enum Command {
     Logs(LogsArgs),
     /// The bridge network shared by the machines.
     Network(NetworkArgs),
+    /// Manage named volumes (-v NAME:/path), like docker volume.
+    Volume(VolumeArgs),
     /// Serve org.nspawn on the system bus (started by the bus; see --install).
     Daemon(DaemonArgs),
     /// Print the completions for a shell, which the packages install for you.
@@ -113,6 +115,36 @@ pub enum NetworkCommand {
     /// Unit hook (ExecStopPost): drop what a machine's network left behind.
     #[command(hide = true)]
     Release { name: String },
+}
+
+#[derive(Args, Debug)]
+pub struct VolumeArgs {
+    #[command(subcommand)]
+    pub command: VolumeCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VolumeCommand {
+    /// List named volumes with the machines that use them.
+    #[command(alias = "list")]
+    Ls(OutputArgs),
+    /// Make a named volume ahead of its first use (start makes it otherwise).
+    Create {
+        /// Volume name: letters, digits, _ . and -.
+        name: String,
+    },
+    /// Remove named volumes no machine uses.
+    Rm {
+        /// Volume names.
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Remove every named volume no machine uses.
+    Prune {
+        /// Do not ask first.
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
 }
 
 #[derive(Args, Debug)]
