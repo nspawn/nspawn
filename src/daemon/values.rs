@@ -129,11 +129,12 @@ pub fn machine(m: &MachineSummary) -> Dict {
     dict
 }
 
-/// machined's object path for a machine, for whoever wants its own view.
+/// machined's object path for a machine, for whoever wants its own view: systemd's bus
+/// label escaping, which also escapes a leading digit.
 pub fn machined_path(name: &str) -> String {
     let mut path = String::from("/org/freedesktop/machine1/machine/");
-    for byte in name.bytes() {
-        if byte.is_ascii_alphanumeric() {
+    for (i, byte) in name.bytes().enumerate() {
+        if byte.is_ascii_alphabetic() || (i > 0 && byte.is_ascii_digit()) {
             path.push(byte as char);
         } else {
             path.push_str(&format!("_{byte:02x}"));
@@ -309,6 +310,11 @@ mod tests {
         assert_eq!(
             machined_path("e2e-a"),
             "/org/freedesktop/machine1/machine/e2e_2da"
+        );
+        assert_eq!(
+            machined_path("1web"),
+            "/org/freedesktop/machine1/machine/_31web",
+            "a leading digit is escaped"
         );
     }
 
