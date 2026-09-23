@@ -93,6 +93,8 @@ files_getattr_all_dirs(nspawn_t)
 userdom_list_user_home_dirs(nspawn_t)
 userdom_read_user_home_content_files(nspawn_t)
 userdom_search_user_tmp_dirs(nspawn_t)
+# Registry credentials of podman and docker are looked up in root's home too.
+userdom_read_admin_home_files(nspawn_t)
 
 # The bus: its own name, and the pipes and pseudo terminals it hands to its
 # clients, which the bus relays.
@@ -117,10 +119,31 @@ iptables_domtrans(nspawn_t)
 kernel_rw_net_sysctls(nspawn_t)
 sysnet_read_ifconfig_run_files(nspawn_t)
 
-# Logs come from journalctl, into a pipe of the service.
+# Logs come from journalctl, into a pipe of the service, and journalctl is stopped
+# once nobody reads it. For a machine's own journal (logs --inside) journalctl
+# receives the machine's root directory from machined over the bus and reads
+# the journal files inside the tree.
 journalctl_domtrans(nspawn_t)
+allow nspawn_t journalctl_t:process signal_perms;
 allow journalctl_t nspawn_t:fd use;
 allow journalctl_t nspawn_t:fifo_file rw_fifo_file_perms;
+list_dirs_pattern(journalctl_t, nspawn_var_lib_t, nspawn_var_lib_t)
+read_files_pattern(journalctl_t, nspawn_var_lib_t, nspawn_var_lib_t)
+allow journalctl_t nspawn_var_lib_t:file map;
+allow system_dbusd_t nspawn_var_lib_t:dir { getattr read search };
+# journalctl --machine asks machined for the machine's root directory over the
+# bus; from a shell journalctl runs unconfined, from the service it is
+# journalctl_t, which the distribution's policy does not let talk to machined.
+systemd_dbus_chat_machined(journalctl_t)
+allow journalctl_t systemd_machined_t:fd use;
+dontaudit journalctl_t self:capability net_admin;
+# The tree of a machine with private users belongs to its user range.
+allow journalctl_t self:capability { dac_override dac_read_search };
+# The root of a flat machine, and its journal inside, are machined's files.
+list_dirs_pattern(journalctl_t, systemd_machined_var_lib_t, systemd_machined_var_lib_t)
+read_files_pattern(journalctl_t, systemd_machined_var_lib_t, systemd_machined_var_lib_t)
+allow journalctl_t systemd_machined_var_lib_t:file map;
+allow system_dbusd_t systemd_machined_var_lib_t:dir { getattr read search };
 
 # Into the machines: the namespaces and cgroup of their init, its private
 # socket (whether its systemd is up), signals to their programs, and commands
@@ -134,7 +157,7 @@ fs_rw_cgroup_files(nspawn_t)
 kernel_read_system_state(nspawn_t)
 selinux_get_enforce_mode(nspawn_t)
 allow nspawn_t tmpfs_t:sock_file getattr;
-allow nspawn_t unconfined_service_t:process { getattr noatsecure rlimitinh siginh signal sigkill signull transition };
+allow nspawn_t unconfined_service_t:process { getattr noatsecure rlimitinh siginh signal_perms transition };
 allow nspawn_t { nspawn_var_lib_t systemd_machined_var_lib_t }:file execute;
 allow unconfined_service_t { nspawn_var_lib_t systemd_machined_var_lib_t }:file entrypoint;
 
