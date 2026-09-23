@@ -58,21 +58,32 @@ impl UnitState {
 }
 
 /// A stop job systemd accepted; once it is queued the unit is not restarted any more,
-/// whatever its Restart= says.
+/// whatever its Restart= says. Its end is watched by a task of its own from the start:
+/// systemd announces the end of every job on the host, and a signal stream nobody reads
+/// fills up and then holds up every reply on the connection.
 pub struct StopJob {
-    jobs: Option<zbus_systemd::systemd1::JobRemovedStream>,
-    job: Option<zbus::zvariant::OwnedObjectPath>,
+    ended: Option<tokio::task::JoinHandle<String>>,
     unit: String,
 }
 
 impl StopJob {
     /// Waits for the job to finish (at once when the unit was unknown).
-    pub async fn wait(self) -> Result<()> {
-        match (self.jobs, self.job) {
-            (Some(mut jobs), Some(job)) => {
-                wait_for_job(&mut jobs, &job, &self.unit, "stopping").await
-            }
-            _ => Ok(()),
+    pub async fn wait(mut self) -> Result<()> {
+        let Some(ended) = self.ended.as_mut() else {
+            return Ok(());
+        };
+        match tokio::time::timeout(JOB_TIMEOUT, ended).await {
+            Ok(Ok(result)) => job_outcome(&result, &self.unit, "stopping"),
+            Ok(Err(e)) => bail!("watching the stop of {}: {e}", self.unit),
+            Err(_) => bail!("timed out while stopping {}", self.unit),
+        }
+    }
+}
+
+impl Drop for StopJob {
+    fn drop(&mut self) {
+        if let Some(ended) = self.ended.take() {
+            ended.abort();
         }
     }
 }
@@ -334,7 +345,7 @@ impl Systemd {
             .start_unit(unit.to_string(), "replace".to_string())
             .await
             .with_context(|| format!("starting {unit}"))?;
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+        let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
         let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
         loop {
             tokio::select! {
@@ -472,7 +483,7 @@ impl Systemd {
     /// Queues a stop job for a unit without waiting for it. From the moment systemd
     /// accepts it the unit is not restarted any more, whatever its Restart= says.
     pub async fn stop_unit_job(&self, unit: &str) -> Result<StopJob> {
-        let jobs = self
+        let mut jobs = self
             .manager
             .receive_job_removed()
             .await
@@ -483,16 +494,16 @@ impl Systemd {
             .await
         {
             Ok(job) => Ok(StopJob {
-                jobs: Some(jobs),
-                job: Some(job),
+                ended: Some(tokio::spawn(
+                    async move { job_result(&mut jobs, &job).await },
+                )),
                 unit: unit.to_string(),
             }),
             Err(zbus::Error::MethodError(name, _, _))
                 if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
             {
                 Ok(StopJob {
-                    jobs: None,
-                    job: None,
+                    ended: None,
                     unit: unit.to_string(),
                 })
             }
@@ -534,25 +545,39 @@ fn containers(
         .collect()
 }
 
+/// How long a start or stop job of a machine may take.
+const JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The result systemd gives `job` when it ends ("done", "failed", ...).
+async fn job_result(
+    jobs: &mut zbus_systemd::systemd1::JobRemovedStream,
+    job: &zbus::zvariant::OwnedObjectPath,
+) -> String {
+    while let Some(event) = jobs.next().await {
+        if let Ok(args) = event.args() {
+            if args.job() == job {
+                return args.result().to_string();
+            }
+        }
+    }
+    "lost".to_string()
+}
+
+fn job_outcome(result: &str, unit: &str, verb: &str) -> Result<()> {
+    match result {
+        "done" | "skipped" => Ok(()),
+        _ => bail!("{verb} {unit} ended with result {result}"),
+    }
+}
+
 async fn wait_for_job(
     jobs: &mut zbus_systemd::systemd1::JobRemovedStream,
     job: &zbus::zvariant::OwnedObjectPath,
     unit: &str,
     verb: &str,
 ) -> Result<()> {
-    let wait = async {
-        while let Some(event) = jobs.next().await {
-            if let Ok(args) = event.args() {
-                if args.job() == job {
-                    return args.result().to_string();
-                }
-            }
-        }
-        "lost".to_string()
-    };
-    match tokio::time::timeout(std::time::Duration::from_secs(90), wait).await {
-        Ok(result) if result == "done" || result == "skipped" => Ok(()),
-        Ok(result) => bail!("{verb} {unit} ended with result {result}"),
+    match tokio::time::timeout(JOB_TIMEOUT, job_result(jobs, job)).await {
+        Ok(result) => job_outcome(&result, unit, verb),
         Err(_) => bail!("timed out while {verb} {unit}"),
     }
 }
@@ -560,6 +585,19 @@ async fn wait_for_job(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_that_did_not_run_is_fine_one_that_failed_is_not() {
+        assert!(job_outcome("done", "u.service", "stopping").is_ok());
+        assert!(job_outcome("skipped", "u.service", "stopping").is_ok());
+        for bad in ["failed", "canceled", "timeout", "lost"] {
+            let e = job_outcome(bad, "u.service", "stopping").unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!("stopping u.service ended with result {bad}")
+            );
+        }
+    }
 
     #[test]
     fn only_containers_are_machines_here() {

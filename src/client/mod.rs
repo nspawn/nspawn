@@ -347,7 +347,17 @@ impl JobWatch {
             }
         };
         transfers.clear();
-        let proxy = JobProxy::builder(&self.connection)
+        // Streams nobody reads any more would fill up with other jobs' signals and hold
+        // up the replies below.
+        let JobWatch {
+            connection,
+            output,
+            progress,
+            removed,
+            lost,
+        } = self;
+        drop((output, progress, removed, lost));
+        let proxy = JobProxy::builder(&connection)
             .path(job.clone())?
             .cache_properties(zbus::proxy::CacheProperties::No)
             .build()
