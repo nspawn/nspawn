@@ -32,19 +32,23 @@ version, the documentation and the AUR.
 
 ## The tag
 
-4. Bump `version` in Cargo.toml and build so Cargo.lock follows. The packaging
+4. Write `docs/releases/X.Y.Z.md`: what is in, what changed since the last
+   release, the requirements and the gaps. The workflow makes it the body of
+   the release, and falls back to GitHub's summary of the commits when the file
+   is not there.
+5. Bump `version` in Cargo.toml and build so Cargo.lock follows. The packaging
    carries the same version for whoever reads it: `%global upstream_version`
    and a `%changelog` entry in `packaging/fedora/nspawn.spec`, a new entry in
    `packaging/debian/debian/changelog`, and `pkgver` in
    `packaging/arch/PKGBUILD` (a release is its own tag, so the pre-release
    substitution in `source=` and the `cd` lines goes with it).
-5. Commit that as the last commit, subject `Release X.Y.Z`.
-6. Tag it and push the tag. The workflow does the rest; check the release page
+6. Commit that as the last commit, subject `Release X.Y.Z`.
+7. Tag it and push the tag. The workflow does the rest; check the release page
    afterwards, and install from one of the packages on a host that never had a
    build of its own.
 
 ## After the tag
 
-7. The AUR recipes (`nspawn` and `nspawn-git`) take the new `pkgver`,
+8. The AUR recipes (`nspawn` and `nspawn-git`) take the new `pkgver`,
    `updpkgsums` against the published tarball, a regenerated `.SRCINFO`, and a
    push each.

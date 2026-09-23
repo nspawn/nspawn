@@ -125,6 +125,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -144,8 +145,16 @@ jobs:
           ls -l upload
           tag=${GITHUB_REF_NAME}
           case "$tag" in *-*) pre=--prerelease ;; *) pre= ;; esac
+          # The notes written for this version, when there are any; GitHub's summary
+          # of the commits otherwise.
+          notes=docs/releases/${tag}.md
+          if [ -f "$notes" ]; then
+              body="--notes-file $notes"
+          else
+              body=--generate-notes
+          fi
           if gh release view "$tag" > /dev/null 2>&1; then
               gh release upload "$tag" upload/* --clobber
           else
-              gh release create "$tag" upload/* --title "nspawn $tag" --generate-notes $pre
+              gh release create "$tag" upload/* --title "nspawn $tag" $body $pre
           fi
