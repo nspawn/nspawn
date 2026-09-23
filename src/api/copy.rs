@@ -622,6 +622,7 @@ fn write_as(id: u32) -> Result<()> {
 pub async fn open_root(ctx: &Context, name: &str, report: Report<'_>) -> Result<Root> {
     validate_machine_name(name)?;
     let sd = ctx.sd().await?;
+    crate::api::machines::refuse_foreign(sd, name).await?;
     let store = &ctx.store;
     if store.is_starting(name) {
         bail!("machine {name} is starting; wait for it");

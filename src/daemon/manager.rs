@@ -855,6 +855,7 @@ impl Manager {
             inside: options.bool("inside", false)?,
         };
         options.finish()?;
+        api::machines::refuse_foreign(self.ctx().sd().await?, &request.machine).await?;
         let argv = api::machines::journalctl_arguments(&request);
         let pipe = || {
             nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)

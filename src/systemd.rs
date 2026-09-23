@@ -271,16 +271,30 @@ impl Systemd {
             .collect())
     }
 
+    /// The containers machined knows. It also registers the host (".host") and the
+    /// virtual machines of libvirt and others, which nspawn can neither enter nor stop.
     pub async fn list_machines(&self) -> Result<Vec<MachineInfo>> {
-        let raw = self
-            .machined
+        Ok(containers(self.all_machines().await?))
+    }
+
+    async fn all_machines(
+        &self,
+    ) -> Result<Vec<(String, String, String, zbus::zvariant::OwnedObjectPath)>> {
+        self.machined
             .list_machines()
             .await
-            .context("listing machines through systemd-machined")?;
-        Ok(raw
+            .context("listing machines through systemd-machined")
+    }
+
+    /// The service that runs `name` when it is a machine of machined but not a
+    /// container (a virtual machine of libvirt-qemu, say).
+    pub async fn foreign_machine(&self, name: &str) -> Result<Option<String>> {
+        Ok(self
+            .all_machines()
+            .await?
             .into_iter()
-            .map(|(name, _class, _service, _path)| MachineInfo { name })
-            .collect())
+            .find(|(n, class, _, _)| n == name && class != "container")
+            .map(|(_, class, service, _)| format!("{service} ({class})")))
     }
 
     pub async fn machine_exists(&self, name: &str) -> Result<bool> {
@@ -511,6 +525,15 @@ impl Systemd {
     }
 }
 
+fn containers(
+    raw: Vec<(String, String, String, zbus::zvariant::OwnedObjectPath)>,
+) -> Vec<MachineInfo> {
+    raw.into_iter()
+        .filter(|(_, class, _, _)| class == "container")
+        .map(|(name, _, _, _)| MachineInfo { name })
+        .collect()
+}
+
 async fn wait_for_job(
     jobs: &mut zbus_systemd::systemd1::JobRemovedStream,
     job: &zbus::zvariant::OwnedObjectPath,
@@ -531,5 +554,42 @@ async fn wait_for_job(
         Ok(result) if result == "done" || result == "skipped" => Ok(()),
         Ok(result) => bail!("{verb} {unit} ended with result {result}"),
         Err(_) => bail!("timed out while {verb} {unit}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_containers_are_machines_here() {
+        let path = |n: &str| {
+            zbus::zvariant::OwnedObjectPath::try_from(format!(
+                "/org/freedesktop/machine1/machine/{n}"
+            ))
+            .unwrap()
+        };
+        let raw = vec![
+            (
+                ".host".to_string(),
+                "host".to_string(),
+                "".to_string(),
+                path("_2ehost"),
+            ),
+            (
+                "web".to_string(),
+                "container".to_string(),
+                "systemd-nspawn".to_string(),
+                path("web"),
+            ),
+            (
+                "qemu-1-vm".to_string(),
+                "vm".to_string(),
+                "libvirt-qemu".to_string(),
+                path("qemu"),
+            ),
+        ];
+        let names: Vec<String> = containers(raw).into_iter().map(|m| m.name).collect();
+        assert_eq!(names, ["web"]);
     }
 }

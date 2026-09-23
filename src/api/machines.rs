@@ -37,10 +37,20 @@ pub struct MachineSummary {
     pub os: Option<String>,
 }
 
+/// Refuses a name machined lists but that is not a container: libvirt's virtual
+/// machines are registered there too, and nspawn can neither enter nor stop them.
+pub async fn refuse_foreign(sd: &Systemd, name: &str) -> Result<()> {
+    if let Some(runner) = sd.foreign_machine(name).await? {
+        bail!("{name} is a machine of {runner}, not a container; nspawn manages systemd-nspawn machines only");
+    }
+    Ok(())
+}
+
 /// One machine or image by name, as `list` shows it: machined's view when it runs, the
 /// record as stopped otherwise.
 pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
     let sd = ctx.sd().await?;
+    refuse_foreign(sd, name).await?;
     let record = ctx.store.load_image(name)?;
     if sd.machine_exists(name).await? {
         let details = sd.machine_details(name).await.ok();
@@ -606,6 +616,7 @@ pub fn latch(restart: Restart, force: bool, mode: Option<Mode>) -> Latch {
 
 pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Result<StopOutcome> {
     let sd = ctx.sd().await?;
+    refuse_foreign(sd, &args.name).await?;
     let store = &ctx.store;
     let record = store.load_image(&args.name)?;
     let unit = format!("systemd-nspawn@{}.service", args.name);
@@ -934,6 +945,7 @@ pub async fn spawn_in_namespaces(
     stdio: nsenter::Stdio,
 ) -> Result<nsenter::Process> {
     let sd = ctx.sd().await?;
+    refuse_foreign(sd, machine).await?;
     if !sd.machine_exists(machine).await? {
         bail!("machine {machine} is not running");
     }
@@ -966,6 +978,7 @@ pub async fn open_shell(
     env: Vec<String>,
 ) -> Result<(OwnedFd, String)> {
     let sd = ctx.sd().await?;
+    refuse_foreign(sd, machine).await?;
     if !sd.machine_exists(machine).await? {
         bail!("machine {machine} is not running");
     }
