@@ -542,11 +542,12 @@ pub fn create_netns(config: &Config, name: &str, addr: Ipv4Addr) -> Result<()> {
         let address = format!("{addr}/{}", config.subnet.prefix);
         run("ip", &["-n", &ns, "addr", "add", &address, "dev", "host0"])?;
         // IPv4 only, like the bridge: no link-local IPv6 address for machined to hand
-        // out under the machine's name.
-        run(
+        // out under the machine's name. A host booted without IPv6 refuses the setting
+        // and gives host0 no such address anyway.
+        let _ = run(
             "ip",
             &["-n", &ns, "link", "set", "host0", "addrgenmode", "none"],
-        )?;
+        );
         run("ip", &["-n", &ns, "link", "set", "host0", "up"])?;
         let gateway = config.subnet.gateway().to_string();
         run(
