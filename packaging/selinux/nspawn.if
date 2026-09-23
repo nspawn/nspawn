@@ -1,0 +1,61 @@
+## <summary>The nspawn service: OCI images as systemd-nspawn machines.</summary>
+
+########################################
+## <summary>
+##	Execute nspawn in the nspawn domain.
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed to transition.
+##	</summary>
+## </param>
+#
+interface(`nspawn_domtrans',`
+	gen_require(`
+		type nspawn_t, nspawn_exec_t;
+	')
+
+	corecmd_search_bin($1)
+	domtrans_pattern($1, nspawn_exec_t, nspawn_t)
+')
+
+########################################
+## <summary>
+##	Send and receive messages from nspawn over the bus.
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+#
+interface(`nspawn_dbus_chat',`
+	gen_require(`
+		type nspawn_t;
+		class dbus send_msg;
+	')
+
+	allow $1 nspawn_t:dbus send_msg;
+	allow nspawn_t $1:dbus send_msg;
+')
+
+########################################
+## <summary>
+##	Read the images and records nspawn keeps below /var/lib/nspawn.
+## </summary>
+## <param name="domain">
+##	<summary>
+##	Domain allowed access.
+##	</summary>
+## </param>
+#
+interface(`nspawn_read_lib_files',`
+	gen_require(`
+		type nspawn_var_lib_t;
+	')
+
+	files_search_var_lib($1)
+	read_files_pattern($1, nspawn_var_lib_t, nspawn_var_lib_t)
+	read_lnk_files_pattern($1, nspawn_var_lib_t, nspawn_var_lib_t)
+	list_dirs_pattern($1, nspawn_var_lib_t, nspawn_var_lib_t)
+')

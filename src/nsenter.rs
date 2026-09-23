@@ -129,6 +129,7 @@ pub fn spawn(
     }
     let c_cwd = CString::new(working_dir.unwrap_or("/"))?;
     let user = user.map(|u| u.to_string());
+    let exec_context = selinux_context_of(leader);
     // Everything the two sides hold, made before the fork. The command's ends are kept
     // out of what it execs (dup2 onto 0, 1 and 2 clears close-on-exec there).
     let mut parent = Process {
@@ -197,6 +198,7 @@ pub fn spawn(
                 &env,
                 &c_cwd,
                 user.as_deref(),
+                exec_context.as_deref(),
             );
             unsafe { libc::_exit(code) }
         }
@@ -222,6 +224,7 @@ fn helper(
     env: &[CString],
     cwd: &CString,
     user: Option<&str>,
+    exec_context: Option<&str>,
 ) -> i32 {
     if let Some(procs) = cgroup {
         // Best effort: cgroup v1 hosts or delegation quirks must not stop exec.
@@ -257,7 +260,7 @@ fn helper(
         }
         Ok(ForkResult::Child) => {
             drop(pid_w);
-            let code = grandchild(io, argv, env, cwd, user);
+            let code = grandchild(io, argv, env, cwd, user, exec_context);
             unsafe { libc::_exit(code) }
         }
     }
@@ -269,6 +272,7 @@ fn grandchild(
     env: &[CString],
     cwd: &CString,
     user: Option<&str>,
+    exec_context: Option<&str>,
 ) -> i32 {
     match &io {
         ChildIo::Pty(slave) => {
@@ -326,6 +330,19 @@ fn grandchild(
             env.push(CString::new(format!("HOME={home}")).expect("no NUL"));
         }
     }
+    // With SELinux the command belongs to the machine's domain, not to the domain of
+    // whoever runs it here (the confined service, say), as with docker exec.
+    if let Some(context) = exec_context {
+        // Opened for writing only: creating or truncating is not a thing there.
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/proc/self/attr/exec")
+            .and_then(|mut f| std::io::Write::write_all(&mut f, context.as_bytes()));
+        if written.is_err() {
+            eprintln!("error: cannot run the command in the machine's SELinux context {context}");
+            return 126;
+        }
+    }
     // execvpe() would search the PATH of the caller's environment, i.e. the host's, which
     // sudo's secure_path may have trimmed; the command must be found on the machine's.
     let program = match find_program(&argv[0], &env) {
@@ -345,6 +362,17 @@ fn grandchild(
             126
         }
     }
+}
+
+/// The SELinux context of the machine's init, when SELinux is enabled: what a command
+/// run inside the machine gets.
+fn selinux_context_of(leader: u32) -> Option<String> {
+    if !Path::new("/sys/fs/selinux/enforce").exists() {
+        return None;
+    }
+    let context = std::fs::read_to_string(format!("/proc/{leader}/attr/current")).ok()?;
+    let context = context.trim_end_matches('\0').trim().to_string();
+    (!context.is_empty()).then_some(context)
 }
 
 /// Resolves a program the way a shell would, on the PATH carried by `env` (the machine's).

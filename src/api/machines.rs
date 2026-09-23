@@ -135,12 +135,19 @@ pub async fn prepare(
         store.record_image(&record)?;
         None
     };
-    // Named volumes live under the state directory; a missing host directory is created,
-    // as docker does.
+    // Named volumes live under the state directory and are created on first use; a
+    // host path has to exist, as with podman (the service cannot make directories
+    // anywhere on the host, nor should it).
     let mut binds = Vec::new();
     for volume in &record.volumes {
         let source = volume.host_path(&store.volumes_dir());
         if !source.exists() {
+            if volume.source.starts_with('/') {
+                bail!(
+                    "volume {volume}: {} does not exist on the host",
+                    source.display()
+                );
+            }
             std::fs::create_dir_all(&source)
                 .with_context(|| format!("creating volume {}", source.display()))?;
         }

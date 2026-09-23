@@ -1,2 +1,5 @@
 /target
 /.claude-tmp
+/packaging/selinux/tmp/
+/packaging/selinux/*.pp
+/packaging/selinux/*.pp.bz2

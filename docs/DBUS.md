@@ -31,12 +31,14 @@ one call; the command line passes its own on every call.
 
 Methods need root for now (the bus policy says so); polkit comes later.
 
-Where SELinux is enforcing (Fedora, RHEL), `--install` also builds and loads a
-small policy module, `nspawn`: the service runs unconfined and hands pipes and
-pseudo terminals to its clients (`Exec`, `Logs`), and the base policy does not
-let the bus relay descriptors of an unconfined service. It needs `checkmodule`
-and `semodule` (packages checkpolicy and policycoreutils); without them the
-install says so and those two methods do not work there.
+Where SELinux is enforcing (Fedora, RHEL) the service needs a domain of its
+own, `nspawn_t`, like machined and the container runtimes have: the base
+policy lets no domain touch the pipes of an unconfined service, so the bus
+drops the service the moment it hands a descriptor over (`Exec`, `Shell`,
+`Logs`). The policy lives in `packaging/selinux` and the `nspawn-selinux`
+package loads it; `--install` says so when SELinux is enabled and the module
+is missing. Commands run inside a machine take the machine's own context, as
+with docker exec.
 
 ## org.nspawn.Manager at /org/nspawn
 

@@ -26,12 +26,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Daemon(a) => {
             if a.install {
-                for line in crate::daemon::install::install(
-                    config.config_path.as_deref(),
-                    &config.state_dir,
-                )
-                .await?
-                {
+                for line in crate::daemon::install::install(config.config_path.as_deref()).await? {
                     println!("{line}");
                 }
                 println!(

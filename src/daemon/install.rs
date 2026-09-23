@@ -51,113 +51,11 @@ pub fn unit_text(binary: &Path, config: Option<&Path>) -> String {
     )
 }
 
-/// The SELinux policy the service needs where SELinux is enforcing. The service runs
-/// unconfined (unconfined_service_t) and hands pipes and pseudo terminals to its clients
-/// over the bus; the base policy lets no domain touch the pipes of an unconfined
-/// service (a dontaudit rule, so nothing is logged), and dbus-broker drops a peer whose
-/// descriptors it cannot receive. machined has such rules of its own; this is ours.
-pub const SELINUX_MODULE: &str = "nspawn";
-
-pub fn selinux_module_text() -> String {
-    format!(
-        "module {SELINUX_MODULE} 1.0;
-
-require {{
-    type system_dbusd_t;
-    type unconfined_service_t;
-    type devpts_t;
-    type ptmx_t;
-    class fd use;
-    class fifo_file {{ append getattr ioctl lock open read write }};
-    class chr_file {{ append getattr ioctl lock open read write }};
-}}
-
-# The bus relays the pipes and pseudo terminals nspawn's service hands to its clients.
-allow system_dbusd_t unconfined_service_t:fd use;
-allow system_dbusd_t unconfined_service_t:fifo_file {{ append getattr ioctl lock open read write }};
-allow system_dbusd_t devpts_t:chr_file {{ append getattr ioctl lock open read write }};
-allow system_dbusd_t ptmx_t:chr_file {{ append getattr ioctl lock open read write }};
-"
-    )
-}
-
-fn selinux_enabled() -> bool {
-    Path::new("/sys/fs/selinux/enforce").exists()
-}
-
-fn have(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
-}
-
-fn run_tool(program: &str, args: &[&str], dir: &Path) -> Result<()> {
-    let output = std::process::Command::new(program)
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .with_context(|| format!("running {program}"))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "{program} {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-/// Builds and loads the policy module. Returns what happened, one line.
-fn install_selinux_module(state_dir: &Path) -> Result<String> {
-    if !selinux_enabled() {
-        return Ok("SELinux is not enabled here; no policy module needed".to_string());
-    }
-    let missing: Vec<&str> = ["checkmodule", "semodule_package", "semodule"]
-        .into_iter()
-        .filter(|tool| !have(tool))
-        .collect();
-    if !missing.is_empty() {
-        return Ok(format!(
-            "note: SELinux is enabled but {} not found (packages checkpolicy and policycoreutils); without the {SELINUX_MODULE} policy module the bus cannot relay the descriptors of Exec and Logs",
-            missing.join(", ")
-        ));
-    }
-    let dir = state_dir.join("selinux");
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    fs::write(
-        dir.join(format!("{SELINUX_MODULE}.te")),
-        selinux_module_text(),
-    )?;
-    run_tool(
-        "checkmodule",
-        &[
-            "-M",
-            "-m",
-            "-o",
-            &format!("{SELINUX_MODULE}.mod"),
-            &format!("{SELINUX_MODULE}.te"),
-        ],
-        &dir,
-    )?;
-    run_tool(
-        "semodule_package",
-        &[
-            "-o",
-            &format!("{SELINUX_MODULE}.pp"),
-            "-m",
-            &format!("{SELINUX_MODULE}.mod"),
-        ],
-        &dir,
-    )?;
-    run_tool("semodule", &["-i", &format!("{SELINUX_MODULE}.pp")], &dir)?;
-    Ok(format!(
-        "loaded the SELinux policy module {SELINUX_MODULE} (source in {})",
-        dir.display()
-    ))
-}
-
-/// Writes the three files, loads the SELinux policy where needed and tells systemd and
-/// the bus about it all. Returns one line per thing done.
-pub async fn install(config_path: Option<&Path>, state_dir: &Path) -> Result<Vec<String>> {
+/// Writes the three files and tells systemd and the bus about them. Returns one line per
+/// file. On a host with SELinux enforcing the service also needs the policy module the
+/// packages ship (packaging/selinux): the bus drops a service without a domain the
+/// moment it hands a descriptor over.
+pub async fn install(config_path: Option<&Path>) -> Result<Vec<String>> {
     require_root("daemon --install")?;
     let binary = std::env::current_exe().context("locating the nspawn binary")?;
     let binary = fs::canonicalize(&binary).unwrap_or(binary);
@@ -174,7 +72,19 @@ pub async fn install(config_path: Option<&Path>, state_dir: &Path) -> Result<Vec
         fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
         done.push(format!("wrote {}", path.display()));
     }
-    done.push(install_selinux_module(state_dir)?);
+    if Path::new("/sys/fs/selinux/enforce").exists()
+        && !std::process::Command::new("semodule")
+            .args(["-l"])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|l| l == "nspawn")
+            })
+            .unwrap_or(false)
+    {
+        done.push("note: SELinux is enabled and the nspawn policy module is not loaded; install the nspawn-selinux package, or Exec, Shell and Logs will not work on the bus (see docs/DBUS.md)".to_string());
+    }
     let connection = zbus::Connection::system()
         .await
         .context("connecting to the system bus")?;
@@ -197,6 +107,26 @@ pub async fn install(config_path: Option<&Path>, state_dir: &Path) -> Result<Vec
 mod tests {
     use super::*;
 
+    /// What `--install` writes is what the packages ship, minus the generated header.
+    #[test]
+    fn generated_files_match_the_packaged_ones() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging");
+        let body = |text: String| {
+            text.lines()
+                .filter(|l| !l.contains("Generated by nspawn"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        };
+        let packaged = |path: &str| std::fs::read_to_string(root.join(path)).unwrap();
+        assert_eq!(body(policy_text()), packaged("dbus/org.nspawn.conf"));
+        assert_eq!(body(activation_text()), packaged("dbus/org.nspawn.service"));
+        assert_eq!(
+            body(unit_text(Path::new("/usr/bin/nspawn"), None)),
+            packaged("systemd/nspawn.service")
+        );
+    }
+
     #[test]
     fn generated_files() {
         assert!(policy_text().contains("<allow own=\"org.nspawn\"/>"));
@@ -206,9 +136,5 @@ mod tests {
             .contains("Type=dbus\nBusName=org.nspawn\nExecStart=/usr/local/bin/nspawn daemon\n"));
         let with_config = unit_text(Path::new("/usr/bin/nspawn"), Some(Path::new("/etc/x.toml")));
         assert!(with_config.contains("ExecStart=/usr/bin/nspawn daemon --config /etc/x.toml\n"));
-        let module = selinux_module_text();
-        assert!(module.starts_with("module nspawn 1.0;"));
-        assert!(module.contains("allow system_dbusd_t unconfined_service_t:fifo_file"));
-        assert!(module.contains("allow system_dbusd_t devpts_t:chr_file"));
     }
 }

@@ -79,10 +79,21 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
         .join("builds")
         .join(format!("{name}-{}", now_unix()));
     let cache_dir = config.state_dir.join("cache").join("mkosi");
+    // mkosi builds in its workspace and renames the result into place; kept next to
+    // the output so that what lands there carries the store's labels, not /var/tmp's.
+    let workspace_dir = config.state_dir.join("cache").join("mkosi-workspace");
     fs::create_dir_all(&output_dir)?;
     fs::create_dir_all(&cache_dir)?;
+    fs::create_dir_all(&workspace_dir)?;
 
-    let argv = mkosi_arguments(request, &image, &directory, &output_dir, &cache_dir);
+    let argv = mkosi_arguments(
+        request,
+        &image,
+        &directory,
+        &output_dir,
+        &cache_dir,
+        &workspace_dir,
+    );
     line(report, format!("running: mkosi {}", argv.join(" ")));
     let status = run_mkosi(&mkosi, &argv, report).await?;
     if !status.success() {
@@ -217,6 +228,7 @@ pub fn mkosi_arguments(
     directory: &Path,
     output_dir: &Path,
     cache_dir: &Path,
+    workspace_dir: &Path,
 ) -> Vec<String> {
     let mut argv = vec![
         format!("--directory={}", directory.display()),
@@ -224,6 +236,7 @@ pub fn mkosi_arguments(
         "--compress-output=zstd".to_string(),
         format!("--output-directory={}", output_dir.display()),
         format!("--cache-directory={}", cache_dir.display()),
+        format!("--workspace-directory={}", workspace_dir.display()),
         format!("--image-id={}", image.repository.replace('/', "-")),
     ];
     if let Some(d) = &request.distribution {
@@ -275,6 +288,7 @@ mod tests {
             Path::new("/src"),
             Path::new("/out"),
             Path::new("/cache"),
+            Path::new("/work"),
         );
         assert_eq!(
             argv,
@@ -284,6 +298,7 @@ mod tests {
                 "--compress-output=zstd",
                 "--output-directory=/out",
                 "--cache-directory=/cache",
+                "--workspace-directory=/work",
                 "--image-id=team-app",
                 "--distribution=fedora",
                 "--release=44",

@@ -718,12 +718,16 @@ pub fn extract_layer(
     Ok(count)
 }
 
-/// overlayfs reads its own attributes from the layers: a redirect or a metacopy marker
-/// planted by an image would make a file show up under another path or with another
-/// file's data once the layers are stacked. Whiteouts are translated by `handle_whiteout`
-/// instead, so nothing an image says in that namespace is applied.
-fn overlay_xattr(name: &str) -> bool {
-    name.starts_with("trusted.overlay.") || name.starts_with("user.overlay.")
+/// Attributes an image does not get to set. overlayfs reads its own from the layers: a
+/// redirect or a metacopy marker planted by an image would make a file show up under
+/// another path or with another file's data once the layers are stacked (whiteouts are
+/// translated by `handle_whiteout` instead). SELinux labels are the host's business,
+/// as with the container engines: the policy labels what nspawn extracts, and a label
+/// the host does not know would leave the file unlabeled and unusable.
+fn foreign_xattr(name: &str) -> bool {
+    name.starts_with("trusted.overlay.")
+        || name.starts_with("user.overlay.")
+        || name == "security.selinux"
 }
 
 /// The extended attributes an entry carries in its PAX header, overlayfs's left out.
@@ -739,7 +743,7 @@ fn entry_xattrs<R: Read>(entry: &mut tar::Entry<'_, R>) -> Result<Vec<(String, V
         let Ok(name) = std::str::from_utf8(name) else {
             continue;
         };
-        if overlay_xattr(name) {
+        if foreign_xattr(name) {
             continue;
         }
         xattrs.push((name.to_string(), extension.value_bytes().to_vec()));
@@ -936,11 +940,12 @@ mod tests {
 
     #[test]
     fn overlay_attributes_of_an_image_are_not_applied() {
-        assert!(overlay_xattr("trusted.overlay.redirect"));
-        assert!(overlay_xattr("trusted.overlay.metacopy"));
-        assert!(overlay_xattr("user.overlay.opaque"));
-        assert!(!overlay_xattr("security.capability"));
-        assert!(!overlay_xattr("user.overlayish"));
+        assert!(foreign_xattr("trusted.overlay.redirect"));
+        assert!(foreign_xattr("trusted.overlay.metacopy"));
+        assert!(foreign_xattr("user.overlay.opaque"));
+        assert!(foreign_xattr("security.selinux"));
+        assert!(!foreign_xattr("security.capability"));
+        assert!(!foreign_xattr("user.overlayish"));
         let tmp = tempfile::tempdir().unwrap();
         // user.* attributes need a file system that stores them.
         let probe = tmp.path().join("probe");

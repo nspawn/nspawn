@@ -13,6 +13,7 @@ machine units call nspawn back through drop-in hooks.
 | `cli.rs`, `commands/` | clap definitions and the terminal side: argument conversion into calls on the service, tables, prompts, the commands that own the terminal (exec, shell, logs) |
 | `client/` | the proxies for `org.nspawn`, how its errors read, how a job is followed |
 | `daemon/` | the D-Bus service `org.nspawn`: the Manager interface, jobs, processes, dictionaries, the files that make the bus start it |
+| `packaging/` | the unit, bus and SELinux policy files the packages ship, and the Fedora spec |
 | `config.rs` | `/etc/nspawn/nspawn.toml`, environment and flags |
 | `reference.rs` | image references, local names, machine name rules |
 | `hub.rs`, `auth.rs`, `search.rs` | registry client, credentials, search |

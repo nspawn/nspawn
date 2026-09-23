@@ -1,0 +1,143 @@
+policy_module(nspawn, 1.0.0)
+
+########################################
+#
+# Declarations
+#
+
+## <desc>
+## <p>
+## The nspawn service (org.nspawn on the system bus): images from OCI
+## registries, systemd-nspawn machines and the bridge network they share.
+## </p>
+## </desc>
+
+type nspawn_t;
+type nspawn_exec_t;
+init_daemon_domain(nspawn_t, nspawn_exec_t)
+
+# /var/lib/nspawn: layers, blobs, records, volumes, generated machine files.
+type nspawn_var_lib_t;
+files_type(nspawn_var_lib_t)
+
+# /etc/nspawn: configuration and registry credentials.
+type nspawn_etc_t;
+files_config_file(nspawn_etc_t)
+
+########################################
+#
+# The service
+#
+
+gen_require(`
+	type init_t, system_dbusd_t, journalctl_t, unconfined_service_t;
+	type systemd_machined_t, systemd_machined_var_lib_t, systemd_networkd_unit_file_t, tmpfs_t;
+')
+
+allow nspawn_t self:capability { chown dac_override dac_read_search fowner fsetid kill mknod net_admin setfcap setgid setuid sys_admin sys_chroot sys_ptrace sys_resource };
+# The same inside a machine's user namespace, where the exec helper works.
+allow nspawn_t self:cap_userns { chown dac_override dac_read_search fowner fsetid kill setgid setuid sys_admin sys_chroot sys_ptrace };
+allow nspawn_t self:process { fork getcap setcap setexec setrlimit setsched signal_perms };
+allow nspawn_t self:fifo_file rw_fifo_file_perms;
+allow nspawn_t self:unix_stream_socket create_stream_socket_perms;
+allow nspawn_t self:unix_dgram_socket create_socket_perms;
+allow nspawn_t self:tcp_socket create_stream_socket_perms;
+allow nspawn_t self:udp_socket create_socket_perms;
+allow nspawn_t self:netlink_route_socket create_netlink_socket_perms;
+
+# Its own state and configuration. Images carry device nodes, links and
+# attributes of their own, so every kind of file is made and relabelled there.
+manage_dirs_pattern(nspawn_t, nspawn_var_lib_t, nspawn_var_lib_t)
+manage_files_pattern(nspawn_t, nspawn_var_lib_t, nspawn_var_lib_t)
+manage_lnk_files_pattern(nspawn_t, nspawn_var_lib_t, nspawn_var_lib_t)
+manage_fifo_files_pattern(nspawn_t, nspawn_var_lib_t, nspawn_var_lib_t)
+manage_sock_files_pattern(nspawn_t, nspawn_var_lib_t, nspawn_var_lib_t)
+manage_chr_files_pattern(nspawn_t, nspawn_var_lib_t, nspawn_var_lib_t)
+manage_blk_files_pattern(nspawn_t, nspawn_var_lib_t, nspawn_var_lib_t)
+allow nspawn_t nspawn_var_lib_t:{ dir file lnk_file fifo_file sock_file chr_file blk_file } { relabelfrom relabelto };
+files_var_lib_filetrans(nspawn_t, nspawn_var_lib_t, dir, "nspawn")
+manage_dirs_pattern(nspawn_t, nspawn_etc_t, nspawn_etc_t)
+manage_files_pattern(nspawn_t, nspawn_etc_t, nspawn_etc_t)
+files_etc_filetrans(nspawn_t, nspawn_etc_t, dir, "nspawn")
+
+# Machines: their trees below /var/lib/machines (mstack directories hold
+# symlinks to the layers), the .nspawn settings files, the mount units and
+# drop-ins, and machined and systemd over the bus: units are started, stopped,
+# reset and reloaded, networkd's among them for the veth network.
+systemd_machined_manage_lib_files(nspawn_t)
+manage_lnk_files_pattern(nspawn_t, systemd_machined_var_lib_t, systemd_machined_var_lib_t)
+files_manage_etc_dirs(nspawn_t)
+files_manage_etc_files(nspawn_t)
+systemd_manage_unit_dirs(nspawn_t)
+systemd_manage_all_unit_files(nspawn_t)
+init_dbus_chat(nspawn_t)
+init_start(nspawn_t)
+init_stop(nspawn_t)
+allow nspawn_t init_t:system { reload status };
+systemd_config_generic_services(nspawn_t)
+systemd_start_all_unit_files(nspawn_t)
+allow nspawn_t systemd_networkd_unit_file_t:service { start status };
+systemd_dbus_chat_machined(nspawn_t)
+firewalld_dbus_chat(nspawn_t)
+policykit_dbus_chat(nspawn_t)
+# machined lists the images and reads os-release inside the machines' trees.
+list_dirs_pattern(systemd_machined_t, nspawn_var_lib_t, nspawn_var_lib_t)
+read_files_pattern(systemd_machined_t, nspawn_var_lib_t, nspawn_var_lib_t)
+read_lnk_files_pattern(systemd_machined_t, nspawn_var_lib_t, nspawn_var_lib_t)
+
+# Volumes and build directories are wherever the caller says: their existence
+# is checked, mkosi configurations under home directories are read; the mounts
+# themselves are systemd-nspawn's.
+files_search_all(nspawn_t)
+files_getattr_all_dirs(nspawn_t)
+userdom_list_user_home_dirs(nspawn_t)
+userdom_read_user_home_content_files(nspawn_t)
+userdom_search_user_tmp_dirs(nspawn_t)
+
+# The bus: its own name, and the pipes and pseudo terminals it hands to its
+# clients, which the bus relays.
+dbus_system_domain(nspawn_t, nspawn_exec_t)
+allow system_dbusd_t nspawn_t:fd use;
+allow system_dbusd_t nspawn_t:fifo_file rw_fifo_file_perms;
+term_use_ptmx(nspawn_t)
+term_use_generic_ptys(nspawn_t)
+
+# Registries: TLS to any port, the host's resolver and its certificates.
+corenet_tcp_connect_all_ports(nspawn_t)
+corenet_tcp_bind_generic_node(nspawn_t)
+corenet_tcp_bind_all_unreserved_ports(nspawn_t)
+sysnet_dns_name_resolve(nspawn_t)
+sysnet_read_config(nspawn_t)
+miscfiles_read_generic_certs(nspawn_t)
+
+# The bridge: ip, nft and iptables in their own domains, the forwarding
+# sysctls, the network namespaces prepared for apps.
+sysnet_domtrans_ifconfig(nspawn_t)
+iptables_domtrans(nspawn_t)
+kernel_rw_net_sysctls(nspawn_t)
+sysnet_read_ifconfig_run_files(nspawn_t)
+
+# Logs come from journalctl, into a pipe of the service.
+journalctl_domtrans(nspawn_t)
+allow journalctl_t nspawn_t:fd use;
+allow journalctl_t nspawn_t:fifo_file rw_fifo_file_perms;
+
+# Into the machines: the namespaces and cgroup of their init, its private
+# socket (whether its systemd is up), signals to their programs, and commands
+# run inside in the machine's own domain (unconfined_service_t, what
+# systemd-nspawn@.service runs as), entered through the files of the
+# machine's tree.
+domain_read_all_domains_state(nspawn_t)
+domain_getattr_all_domains(nspawn_t)
+fs_read_nsfs_files(nspawn_t)
+fs_rw_cgroup_files(nspawn_t)
+kernel_read_system_state(nspawn_t)
+selinux_get_enforce_mode(nspawn_t)
+allow nspawn_t tmpfs_t:sock_file getattr;
+allow nspawn_t unconfined_service_t:process { getattr noatsecure rlimitinh siginh signal sigkill signull transition };
+allow nspawn_t { nspawn_var_lib_t systemd_machined_var_lib_t }:file execute;
+allow unconfined_service_t { nspawn_var_lib_t systemd_machined_var_lib_t }:file entrypoint;
+
+# mkosi builds images with mounts and chroots of its own; it runs unconfined,
+# as it does from a shell.
+unconfined_server_domtrans(nspawn_t)

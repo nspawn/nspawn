@@ -16,8 +16,15 @@ nonce=$$
 # with a configuration file that names the registry and its CA for the service's own
 # use (the command line passes them on every call anyway).
 install_service() {
-  printf 'registry = "%s"\nca_cert = "%s"\n' "$NSPAWN_REGISTRY" "$NSPAWN_CA_CERT" > /run/nspawn-e2e.toml
-  $NSPAWN --config /run/nspawn-e2e.toml daemon --install > /tmp/e2e-install.txt 2>&1 || { cat /tmp/e2e-install.txt; echo "cannot install the service"; exit 1; }
+  # With SELinux enforcing the service needs its domain (packaging/selinux) loaded and
+  # the binary labelled nspawn_exec_t, or the bus drops it at the first descriptor.
+  if [ "$(getenforce 2>/dev/null)" = Enforcing ]; then
+    semodule -l 2>/dev/null | grep -qx nspawn || { echo "SELinux is enforcing and the nspawn policy module is not loaded; see docs/HACKING.md"; exit 1; }
+    [ "$(stat -c %C "$NSPAWN" | cut -d: -f3)" = nspawn_exec_t ] || { echo "$NSPAWN is not labelled nspawn_exec_t; see docs/HACKING.md"; exit 1; }
+  fi
+  mkdir -p /etc/nspawn
+  printf 'registry = "%s"\nca_cert = "%s"\n' "$NSPAWN_REGISTRY" "$NSPAWN_CA_CERT" > /etc/nspawn/e2e.toml
+  $NSPAWN --config /etc/nspawn/e2e.toml daemon --install > /tmp/e2e-install.txt 2>&1 || { cat /tmp/e2e-install.txt; echo "cannot install the service"; exit 1; }
   cat /tmp/e2e-install.txt
 }
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
@@ -36,8 +43,7 @@ cleanup_machines() {
 }
 cleanup_service() {
   systemctl stop nspawn.service >/dev/null 2>&1 || true
-  rm -f /etc/dbus-1/system.d/org.nspawn.conf /usr/share/dbus-1/system-services/org.nspawn.service /etc/systemd/system/nspawn.service /run/nspawn-e2e.toml
-  semodule -r nspawn >/dev/null 2>&1 || true
+  rm -f /etc/dbus-1/system.d/org.nspawn.conf /usr/share/dbus-1/system-services/org.nspawn.service /etc/systemd/system/nspawn.service /etc/nspawn/e2e.toml
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
 cleanup() {

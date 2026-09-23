@@ -46,8 +46,9 @@ web -- nginx -T` still runs `/docker-entrypoint.sh` first); `--entrypoint PROGRA
 the entrypoint and `--entrypoint ""` drops it. Both are remembered, like the command of a
 docker container; `start --image-command` goes back to the image's own. `-e VAR=value`
 adds environment on top of the image's (`-e VAR` copies it from your shell), and
-`-v SOURCE:TARGET[:ro]` mounts a host directory, or a named volume that nspawn keeps
-under `/var/lib/nspawn/volumes/NAME`, into any kind of machine; in machines that run
+`-v SOURCE:TARGET[:ro]` mounts a host directory (which has to exist), or a named volume
+that nspawn keeps under `/var/lib/nspawn/volumes/NAME` and creates on first use, into
+any kind of machine; in machines that run
 with private users the mount is idmapped, so root inside owns what it writes on the
 host. Every booted machine with volumes gets a small unit mounted into it,
 `nspawn-volumes.service`, that holds `local-fs.target` until all of them are mounted and
@@ -150,10 +151,12 @@ the command's terminal or pipes over the bus. See `docs/DBUS.md`.
 - A host with systemd-nspawn and systemd-machined 255 or newer (255, 259 and 261 are
   tested; 252 cannot mount the generated files under `/run` of a machine), overlayfs for
   the `overlay` backend and cgroup v2.
-- The service, installed once with `sudo nspawn daemon --install`. It runs as root
-  and does everything below `/var/lib/machines`, `/var/lib/nspawn`, `/etc/systemd` and
-  `/etc/nspawn`; the bus policy lets root call it for now, so the command line still
-  runs with `sudo` until polkit rules arrive.
+- The service on the system bus: a package installs it, `sudo nspawn daemon --install`
+  does the same for a binary built by hand. It runs as root and does everything below
+  `/var/lib/machines`, `/var/lib/nspawn`, `/etc/systemd` and `/etc/nspawn`; the bus policy
+  lets root call it for now, so the command line still runs with `sudo` until polkit
+  rules arrive. With SELinux enforcing the `nspawn-selinux` package (the policy in
+  `packaging/selinux`) is needed as well.
 - `shell` on a booted machine uses machined's login session, which needs D-Bus inside
   (the hub images have it); `exec` enters the namespaces and needs nothing inside.
 - The bridge network needs `ip` and `nft` on the host (iproute2 and nftables), nothing

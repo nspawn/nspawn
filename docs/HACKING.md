@@ -34,11 +34,23 @@ registry with the test image (`fedora:44` by default), and mkosi for the build
 step. The mstack pass runs only on systemd 261 with systemd-nsresourced and
 systemd-mountfsd installed (Arch); elsewhere it is skipped and says so. The
 suite installs the bus service first with `nspawn daemon --install` (a
-configuration file under /run carries the registry and CA), since the command
+configuration file, /etc/nspawn/e2e.toml, carries the registry and CA), since the command
 line is its client; a section drives the service with `busctl` as well, and
 the service's files go at the end, another reason the suite belongs on a
-disposable VM. Install the binary where a system service may execute it,
-since the unit hooks and the service run it:
+disposable VM. On a host with SELinux enforcing the policy module must be
+loaded first and the binary labelled, or the bus cuts the service off at the
+first descriptor it passes:
+
+```
+sudo dnf install selinux-policy-devel
+make -f /usr/share/selinux/devel/Makefile -C packaging/selinux nspawn.pp
+sudo semodule -i packaging/selinux/nspawn.pp
+sudo semanage fcontext -a -t nspawn_exec_t /usr/local/bin/nspawn
+sudo restorecon -Rv /usr/local/bin/nspawn /var/lib/nspawn /etc/nspawn
+```
+
+Install the binary where a system service may execute it, since the unit
+hooks and the service run it:
 
 ```
 sudo install -m 755 target/release/nspawn /usr/local/bin/nspawn
@@ -65,3 +77,15 @@ failure count. Every FAIL line names the check.
 2. Run the checks and the e2e suite.
 3. Tag the commit with the version and publish the binary with its
    SHA256SUMS.
+
+## Packages
+
+`packaging/` holds what the packages ship: the unit and the bus files
+(`systemd/`, `dbus/`, kept identical to what `nspawn daemon --install`
+writes, a unit test checks), the SELinux policy (`selinux/`) and the Fedora
+spec (`fedora/nspawn.spec`), which builds `nspawn` and the noarch
+`nspawn-selinux` from a source tarball plus a `cargo vendor` tarball. The
+`packages` workflow builds the RPMs in a Fedora container on every tag and on
+demand, and keeps them as artifacts; the suite on the Fedora VM is where they
+get tested, since a container has neither SELinux enforcing nor machined.
+
