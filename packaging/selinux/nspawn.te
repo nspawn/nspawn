@@ -84,6 +84,10 @@ policykit_dbus_chat(nspawn_t)
 list_dirs_pattern(systemd_machined_t, nspawn_var_lib_t, nspawn_var_lib_t)
 read_files_pattern(systemd_machined_t, nspawn_var_lib_t, nspawn_var_lib_t)
 read_lnk_files_pattern(systemd_machined_t, nspawn_var_lib_t, nspawn_var_lib_t)
+# To tell whether an image is read-only, machined asks whether it could write to
+# its root (access(2) with W_OK), which for the overlay root of a running machine
+# is nspawn's directory; the answer, no, is right, and nothing is written.
+dontaudit systemd_machined_t nspawn_var_lib_t:dir write;
 
 # Volumes and build directories are wherever the caller says: their existence
 # is checked, mkosi configurations under home directories are read; the mounts
