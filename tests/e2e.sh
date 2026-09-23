@@ -49,6 +49,10 @@ cleanup_service() {
 cleanup() {
   cleanup_machines
   cleanup_service
+  # A step that hides iptables must not leave it hidden, however it ended.
+  if [ -n "${hidden_iptables:-}" ] && [ -e "${hidden_iptables}.e2e-hidden" ]; then
+    mv "${hidden_iptables}.e2e-hidden" "$hidden_iptables"
+  fi
 }
 install_service
 cleanup_machines
@@ -494,6 +498,31 @@ if command -v busctl >/dev/null 2>&1; then
   echo "$out" | grep -q "no image named" || fail "missing image not explained: $out"
 else
   echo "busctl not installed: skipping the D-Bus section"
+fi
+
+step "a host that drops forwarded traffic, with and without iptables"
+# Only where nothing else owns that table: deleting it on a host running docker would
+# take docker's own rules with it.
+if nft list table ip filter >/dev/null 2>&1; then
+  echo "an ip filter table is already there (docker? ufw?): skipping"
+else
+  nft add table ip filter || fail "cannot make the test table"
+  nft "add chain ip filter FORWARD { type filter hook forward priority filter; policy drop; }" || fail "cannot make the forward chain"
+  nft add chain ip filter DOCKER-USER || fail "cannot make the DOCKER-USER chain"
+  hidden_iptables=$(command -v iptables)
+  [ -n "$hidden_iptables" ] && mv "$hidden_iptables" "${hidden_iptables}.e2e-hidden"
+  out=$($NSPAWN network up 2>&1 >/dev/null)
+  [ -n "$hidden_iptables" ] && mv "${hidden_iptables}.e2e-hidden" "$hidden_iptables"
+  echo "$out" | grep -q "docker drops forwarded traffic" || fail "no warning when forwarding is dropped and iptables is missing: $out"
+  echo "$out" | grep -q "published ports will answer on this host alone" || fail "the warning does not say what breaks: $out"
+  hidden_iptables=
+  # With iptables there, nspawn adds the exception instead of warning.
+  out=$($NSPAWN network up 2>&1 >/dev/null)
+  echo "$out" | grep -q "drops forwarded traffic" && fail "still warning although iptables is installed: $out"
+  iptables -S DOCKER-USER | grep -q -- "-i nspawn0 -j ACCEPT" || fail "nspawn did not let the bridge through DOCKER-USER: $(iptables -S DOCKER-USER)"
+  # iptables prints the conntrack states in its own order, so match the rule, not them.
+  iptables -S DOCKER-USER | grep -q -- "-o nspawn0 -m conntrack" || fail "nspawn did not let the answers back in: $(iptables -S DOCKER-USER)"
+  nft delete table ip filter || fail "cannot remove the test table"
 fi
 
 step "two pulls at once share their blobs and neither corrupts the other"

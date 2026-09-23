@@ -21,7 +21,7 @@ use std::str::FromStr;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::api::Report;
+use crate::api::{note, Report};
 use crate::config::Config;
 use crate::hostnet;
 use crate::settings::Network;
@@ -230,7 +230,7 @@ pub async fn up(config: &Config, sd: &Systemd, report: Report<'_>) -> Result<()>
     sysctl("net/ipv4/ip_forward", "1")?;
     sysctl(&format!("net/ipv4/conf/{name}/route_localnet"), "1")?;
     nft(&base_ruleset(name, subnet))?;
-    allow_forwarding_past_iptables(name)?;
+    allow_forwarding_past_iptables(name, report)?;
     if hostnet::firewalld_running(sd).await {
         hostnet::trust_interface(sd, name, report).await?;
     }
@@ -241,12 +241,28 @@ pub async fn up(config: &Config, sd: &Systemd, report: Report<'_>) -> Result<()>
 /// would silence every machine on the bridge. Docker reserves the DOCKER-USER chain for
 /// rules like ours and never flushes it; without docker, a DROP policy gets the accept
 /// rules at the top of FORWARD itself. Nothing happens on hosts without iptables.
-fn allow_forwarding_past_iptables(bridge: &str) -> Result<()> {
+fn allow_forwarding_past_iptables(bridge: &str, report: Report<'_>) -> Result<()> {
     let chain = if iptables(&["-S", "DOCKER-USER"]) {
         "DOCKER-USER"
     } else if iptables(&["-S", "FORWARD"]) && forward_policy_is_drop() {
         "FORWARD"
     } else {
+        // The kernel keeps the rules whether or not the command that wrote them is
+        // installed, and a ruleset of its own is invisible to iptables. Either way the
+        // machines would lose the outside world with nothing said, so say it.
+        if let Some(who) = filtered_forwarding() {
+            note(
+                report,
+                format!(
+                    "warning: {who} drops forwarded traffic and nspawn could not add its exception ({}): machines on the bridge will not reach anything beyond it, and published ports will answer on this host alone",
+                    if iptables(&["-V"]) {
+                        "the rules are not in a table iptables can reach"
+                    } else {
+                        "iptables is not installed"
+                    }
+                ),
+            );
+        }
         return Ok(());
     };
     // Out of the bridge: anything. Into the bridge: only what was published (DNAT) or
@@ -272,6 +288,29 @@ fn allow_forwarding_past_iptables(bridge: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// What drops forwarded traffic on this host, as nftables sees it: nft reads the rules
+/// of iptables-nft as well as the rulesets written for it directly. None when forwarding
+/// is not filtered, or when nothing could be read.
+fn filtered_forwarding() -> Option<&'static str> {
+    let ruleset = Command::new("nft")
+        .args(["list", "ruleset"])
+        .output()
+        .ok()?;
+    filtered_forwarding_in(&String::from_utf8_lossy(&ruleset.stdout))
+}
+
+/// Docker keeps a DOCKER-USER chain for exactly these exceptions; anything else that
+/// filters forwarding shows as a chain on the forward hook that drops by default.
+fn filtered_forwarding_in(ruleset: &str) -> Option<&'static str> {
+    let mut lines = ruleset.lines().map(str::trim);
+    if lines.clone().any(|l| l.starts_with("chain DOCKER-USER")) {
+        return Some("docker");
+    }
+    lines
+        .any(|l| l.contains("hook forward") && l.contains("policy drop"))
+        .then_some("a firewall on this host")
 }
 
 /// Runs iptables quietly; false when it is missing or the command fails.
@@ -792,6 +831,20 @@ pub async fn sync_ports_except(store: &Store, sd: &Systemd, except: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_filters_forwarding_is_read_from_the_ruleset() {
+        let docker = "table ip filter {\n\tchain FORWARD {\n\t\ttype filter hook forward priority filter; policy drop;\n\t\tcounter jump DOCKER-USER\n\t}\n\tchain DOCKER-USER {\n\t\tcounter return\n\t}\n}\n";
+        assert_eq!(filtered_forwarding_in(docker), Some("docker"));
+        let ufw = "table ip filter {\n\tchain FORWARD {\n\t\ttype filter hook forward priority filter; policy drop;\n\t}\n}\n";
+        assert_eq!(filtered_forwarding_in(ufw), Some("a firewall on this host"));
+        // What nspawn and machined leave on a host that filters nothing.
+        let ours = format!(
+            "table ip {TABLE} {{\n\tchain prerouting {{\n\t\ttype nat hook prerouting priority -100; policy accept;\n\t}}\n}}\ntable ip io.systemd.nat {{\n\tchain fwd {{\n\t\ttype filter hook forward priority 0; policy accept;\n\t}}\n}}\n"
+        );
+        assert_eq!(filtered_forwarding_in(&ours), None);
+        assert_eq!(filtered_forwarding_in(""), None);
+    }
 
     #[test]
     fn subnet_parsing_and_allocation() {

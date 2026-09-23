@@ -128,8 +128,11 @@ puts it back.
 Hosts running docker (in its default iptables mode) or ufw have a FORWARD policy of
 DROP; `start` then adds two rules to the DOCKER-USER chain, which docker reserves for
 that, or to FORWARD itself: anything out of the bridge, and into the bridge only what was
-published or belongs to a connection a machine opened. A hand-written nftables firewall
-with a drop policy on forward needs the same exception by hand.
+published or belongs to a connection a machine opened. That needs the `iptables` command,
+which those tools bring with them; where the rules are there and the command is not, or
+where a hand-written nftables firewall drops forwarded traffic, `start` says so and the
+exception has to be made by hand. Without it the machines reach nothing beyond the bridge
+and published ports answer on the host alone.
 
 `--network host` shares the host's network instead, and `--network veth` keeps the classic
 systemd-nspawn setup: a virtual ethernet pair configured by systemd-networkd on the host
