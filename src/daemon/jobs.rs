@@ -24,6 +24,8 @@ pub struct JobState {
     pub path: OwnedObjectPath,
     /// The user who asked for it: nobody else reads its output or its result.
     pub owner: u32,
+    /// The bus name of the client that asked for it, which alone gets its signals.
+    pub client: Option<String>,
     pub kind: String,
     pub target: String,
     pub state: Mutex<String>,
@@ -57,7 +59,7 @@ pub struct Job {
 impl Job {
     /// Fails for anyone but the user who started the job, and root.
     async fn readable(&self, header: Option<&Header<'_>>) -> zbus::fdo::Result<()> {
-        let uid = polkit::header_uid(self.state.connection(), header).await;
+        let uid = polkit::reader(self.state.connection(), header).await;
         if polkit::may_read(self.job.owner, uid) {
             return Ok(());
         }
@@ -120,7 +122,7 @@ impl Job {
 /// the library context and a reporter whose events become the job's output.
 pub async fn spawn<F, Fut>(
     state: &Arc<State>,
-    owner: u32,
+    owner: polkit::Caller,
     ctx: Arc<Context>,
     kind: &str,
     target: &str,
@@ -134,7 +136,8 @@ where
     let path = OwnedObjectPath::try_from(format!("/org/nspawn/job/{id}"))?;
     let job = Arc::new(JobState {
         path: path.clone(),
-        owner,
+        owner: owner.uid,
+        client: owner.name,
         kind: kind.to_string(),
         target: target.to_string(),
         state: Mutex::new("running".to_string()),
@@ -170,7 +173,9 @@ where
                     Event::Note(t) => ("note", t),
                     // Only for whoever watches now: not kept in the job's output.
                     Event::Progress { item, done, total } => {
-                        if let Ok(emitter) = state.emitter() {
+                        if let Ok(emitter) =
+                            state.emitter_to(crate::daemon::manager_path(), job.client.as_deref())
+                        {
                             let _ = Manager::job_progress(
                                 &emitter,
                                 job.path.as_ref(),
@@ -184,7 +189,9 @@ where
                     }
                 };
                 job.output.lock().unwrap().push(text.clone());
-                if let Ok(emitter) = state.emitter() {
+                if let Ok(emitter) =
+                    state.emitter_to(crate::daemon::manager_path(), job.client.as_deref())
+                {
                     let _ = Manager::job_output(&emitter, job.path.as_ref(), kind, &text).await;
                 }
             }
@@ -216,10 +223,12 @@ where
             .interface::<_, Job>(&job.path)
             .await
         {
-            let emitter = iface.signal_emitter();
-            let _ = iface.get().await.state_changed(emitter).await;
+            if let Ok(emitter) = state.emitter_to(job.path.as_ref(), job.client.as_deref()) {
+                let _ = iface.get().await.state_changed(&emitter).await;
+            }
         }
-        if let Ok(emitter) = state.emitter() {
+        if let Ok(emitter) = state.emitter_to(crate::daemon::manager_path(), job.client.as_deref())
+        {
             let _ = Manager::job_removed(&emitter, job.path.as_ref(), result).await;
         }
         drop(busy);

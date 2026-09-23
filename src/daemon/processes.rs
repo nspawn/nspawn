@@ -19,6 +19,8 @@ pub struct ProcessState {
     pub path: OwnedObjectPath,
     /// The user who started it: nobody else reads it or signals it.
     pub owner: u32,
+    /// The bus name of the client that started it, which alone gets its signals.
+    pub client: Option<String>,
     pub machine: String,
     pub argv: Vec<String>,
     /// The process's PID as the host sees it.
@@ -55,7 +57,7 @@ pub struct Process {
 impl Process {
     /// Fails for anyone but the user who started the command, and root.
     async fn readable(&self, header: Option<&Header<'_>>) -> zbus::fdo::Result<()> {
-        let uid = polkit::header_uid(self.state.connection(), header).await;
+        let uid = polkit::reader(self.state.connection(), header).await;
         if polkit::may_read(self.process.owner, uid) {
             return Ok(());
         }
@@ -136,7 +138,7 @@ impl Process {
 /// service counts as busy until that has been announced.
 pub async fn register(
     state: &Arc<State>,
-    owner: u32,
+    owner: polkit::Caller,
     machine: &str,
     argv: &[String],
     pid: u32,
@@ -147,7 +149,8 @@ pub async fn register(
     let path = OwnedObjectPath::try_from(format!("/org/nspawn/process/{id}"))?;
     let entry = Arc::new(ProcessState {
         path: path.clone(),
-        owner,
+        owner: owner.uid,
+        client: owner.name,
         machine: machine.to_string(),
         argv: argv.to_vec(),
         pid,
@@ -180,11 +183,12 @@ pub async fn register(
             .interface::<_, Process>(&entry.path)
             .await
         {
-            let emitter = iface.signal_emitter();
-            let _ = iface.get().await.state_changed(emitter).await;
-            let _ = iface.get().await.exit_status_changed(emitter).await;
+            if let Ok(emitter) = state.emitter_to(entry.path.as_ref(), entry.client.as_deref()) {
+                let _ = iface.get().await.state_changed(&emitter).await;
+                let _ = iface.get().await.exit_status_changed(&emitter).await;
+            }
         }
-        if let Ok(emitter) = SignalEmitter::new(state.connection(), entry.path.clone()) {
+        if let Ok(emitter) = state.emitter_to(entry.path.as_ref(), entry.client.as_deref()) {
             let _ = Process::exited(&emitter, status).await;
         }
         // Only now may the service go idle: a client is about to read the outcome.

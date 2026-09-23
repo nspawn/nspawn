@@ -65,9 +65,9 @@ impl Manager {
 
     /// Whether the caller may do this, which on a host with polkit is polkit's
     /// answer and on one without is root or nothing.
-    /// Returns the caller's uid, which is what a job or a command started here belongs
-    /// to afterwards.
-    async fn allow(&self, header: &Header<'_>, action: Action) -> Result<u32> {
+    /// Returns the caller: a job or a command started here belongs to its uid afterwards,
+    /// and their signals go to its bus name.
+    async fn allow(&self, header: &Header<'_>, action: Action) -> Result<polkit::Caller> {
         let sender = header
             .sender()
             .map(|s| s.to_string())
@@ -75,9 +75,13 @@ impl Manager {
         polkit::allows(self.state.connection(), &sender, action)
             .await
             .map_err(Error::NotAuthorized)?;
-        Ok(polkit::caller_uid(self.state.connection(), &sender)
+        let uid = polkit::caller_uid(self.state.connection(), &sender)
             .await
-            .unwrap_or(0))
+            .ok_or_else(|| Error::NotAuthorized("the bus cannot say who called".to_string()))?;
+        Ok(polkit::Caller {
+            uid,
+            name: Some(sender),
+        })
     }
 
     /// The context for a call: the service's own, or one with the registry and CA

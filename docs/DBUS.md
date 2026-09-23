@@ -17,7 +17,7 @@ ran the command, and reloads systemd and the bus:
 
 | File | Role |
 |---|---|
-| `/etc/dbus-1/system.d/org.nspawn.conf` | bus policy: root may own `org.nspawn`, everyone may call it and receive its signals |
+| `/etc/dbus-1/system.d/org.nspawn.conf` | bus policy: root may own `org.nspawn`, everyone may call it and receive its signals (those of a job or a command are sent to the client that started it) |
 | `/usr/share/polkit-1/actions/org.nspawn.policy` | the two actions polkit authorizes callers for |
 | `/usr/share/dbus-1/system-services/org.nspawn.service` | bus activation: `SystemdService=nspawn.service` |
 | `/etc/systemd/system/nspawn.service` | `Type=dbus` unit running `nspawn daemon` |
@@ -61,9 +61,11 @@ makes them administrators of the host, as the docker group does.
 Errors from a refusal come back as `org.nspawn.Error.NotAuthorized`.
 
 A job and a command belong to the user who started them: their objects
-answer that user and root, and anyone else gets `AccessDenied`. The
-`PropertiesChanged` signals of those objects, which carry the state and the
-exit status, reach everyone listening, as bus signals do.
+answer that user and root, and anyone else gets `AccessDenied`. Their
+signals (`JobOutput`, `JobProgress`, `JobRemoved`, `Exited` and the
+`PropertiesChanged` of their objects) go to the client that started them and
+to nobody else; `ImageAdded`, `ImageRemoved`, `MachineStarted` and
+`MachineStopped` reach everyone listening.
 
 Where SELinux is enforcing (Fedora, RHEL) the service needs a domain of its
 own, `nspawn_t`, like machined and the container runtimes have: the base

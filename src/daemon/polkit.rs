@@ -9,6 +9,14 @@ use zbus::message::Header;
 use zbus::zvariant::Value;
 use zbus::Connection;
 
+/// Who called: the uid a job or a command belongs to afterwards, and the bus name its
+/// signals go to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Caller {
+    pub uid: u32,
+    pub name: Option<String>,
+}
+
 /// What a method needs from its caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -89,18 +97,36 @@ pub async fn caller_uid(connection: &Connection, sender: &str) -> Option<u32> {
 }
 
 /// Who may look at a job or a command somebody started: whoever started it, and root.
-/// A read with no message behind it is the service's own, on its way to a signal.
-pub fn may_read(owner: u32, caller: Option<u32>) -> bool {
+pub fn may_read(owner: u32, caller: Reader) -> bool {
     match caller {
-        None => true,
-        Some(uid) => uid == owner || uid == 0,
+        Reader::Service => true,
+        Reader::User(uid) => uid == owner || uid == 0,
+        Reader::Unknown => false,
     }
 }
 
-/// The uid of the caller a message came from, None for the service's own reads.
-pub async fn header_uid(connection: &Connection, header: Option<&Header<'_>>) -> Option<u32> {
-    let sender = header?.sender()?.to_string();
-    caller_uid(connection, &sender).await
+/// Who reads a property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reader {
+    /// The service itself, on its way to a signal: no message behind the read.
+    Service,
+    User(u32),
+    /// A message whose sender the bus cannot name (it has just gone, say).
+    Unknown,
+}
+
+/// Who a message came from.
+pub async fn reader(connection: &Connection, header: Option<&Header<'_>>) -> Reader {
+    let Some(header) = header else {
+        return Reader::Service;
+    };
+    let Some(sender) = header.sender() else {
+        return Reader::Unknown;
+    };
+    match caller_uid(connection, sender.as_str()).await {
+        Some(uid) => Reader::User(uid),
+        None => Reader::Unknown,
+    }
 }
 
 #[cfg(test)]
@@ -109,11 +135,21 @@ mod tests {
 
     #[test]
     fn only_the_owner_and_root_read_what_was_started() {
-        assert!(may_read(1000, Some(1000)), "the one who started it");
-        assert!(may_read(1000, Some(0)), "root");
-        assert!(!may_read(1000, Some(1001)), "another user");
-        assert!(!may_read(0, Some(1000)), "root's work is not for everyone");
-        assert!(may_read(1000, None), "the service reading its own");
+        assert!(may_read(1000, Reader::User(1000)), "the one who started it");
+        assert!(may_read(1000, Reader::User(0)), "root");
+        assert!(!may_read(1000, Reader::User(1001)), "another user");
+        assert!(
+            !may_read(0, Reader::User(1000)),
+            "root's work is not for everyone"
+        );
+        assert!(
+            may_read(1000, Reader::Service),
+            "the service reading its own"
+        );
+        assert!(
+            !may_read(1000, Reader::Unknown),
+            "nor someone the bus cannot name"
+        );
     }
 
     #[test]

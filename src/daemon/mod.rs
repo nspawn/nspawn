@@ -25,6 +25,10 @@ use crate::daemon::manager::Manager;
 pub const BUS_NAME: &str = "org.nspawn";
 pub const MANAGER_PATH: &str = "/org/nspawn";
 
+pub fn manager_path() -> zbus::zvariant::ObjectPath<'static> {
+    zbus::zvariant::ObjectPath::from_static_str_unchecked(MANAGER_PATH)
+}
+
 /// What the interfaces share: the library context, the jobs, and how busy the service is.
 pub struct State {
     pub ctx: Arc<Context>,
@@ -57,6 +61,21 @@ impl State {
     /// A signal emitter for the manager object.
     pub fn emitter(&self) -> zbus::Result<SignalEmitter<'_>> {
         SignalEmitter::new(self.connection(), MANAGER_PATH)
+    }
+
+    /// An emitter for signals about what one client started, sent to that client alone:
+    /// what a job says and how a command ends are its owner's business, as its object's
+    /// properties are.
+    pub fn emitter_to<'a>(
+        &'a self,
+        path: zbus::zvariant::ObjectPath<'a>,
+        client: Option<&'a str>,
+    ) -> zbus::Result<SignalEmitter<'a>> {
+        let emitter = SignalEmitter::new(self.connection(), path)?;
+        Ok(match client {
+            Some(client) => emitter.set_destination(zbus::names::BusName::try_from(client)?),
+            None => emitter,
+        })
     }
 
     /// Marks a call in progress until the guard is dropped.
