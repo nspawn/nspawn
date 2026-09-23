@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 1.0.0-beta.1
+%global upstream_version 1.0.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -148,5 +148,8 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Wed Sep 23 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.0.0-1
+- First stable release.
+
 * Tue Sep 22 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.0.0-0.1.beta1
 - First package: the org.nspawn service, its command line and the SELinux policy.

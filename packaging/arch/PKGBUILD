@@ -1,7 +1,7 @@
 # Maintainer: Eduard Tolosa <tolosaeduard@gmail.com>
 
 pkgname=nspawn
-pkgver=1.0.0beta1
+pkgver=1.0.0
 pkgrel=1
 pkgdesc='Docker-like management of systemd-nspawn machines: OCI images from a hub, shared layers, a bridge network, driven over D-Bus'
 arch=('x86_64' 'aarch64')
@@ -15,26 +15,26 @@ optdepends=('polkit: let users other than root drive nspawn'
 # makepkg's -flto=auto turns the C objects of aws-lc-sys into GCC bitcode, which the
 # linker rustc drives cannot read.
 options=('!lto')
-source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/${pkgver//beta*}-beta.${pkgver##*beta}.tar.gz")
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/${pkgver}.tar.gz")
 sha256sums=('SKIP')
 
 prepare() {
-  cd "${pkgname}-${pkgver//beta*}-beta.${pkgver##*beta}"
+  cd "${pkgname}-${pkgver}"
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-  cd "${pkgname}-${pkgver//beta*}-beta.${pkgver##*beta}"
+  cd "${pkgname}-${pkgver}"
   cargo build --release --frozen
 }
 
 check() {
-  cd "${pkgname}-${pkgver//beta*}-beta.${pkgver##*beta}"
+  cd "${pkgname}-${pkgver}"
   cargo test --release --frozen
 }
 
 package() {
-  cd "${pkgname}-${pkgver//beta*}-beta.${pkgver##*beta}"
+  cd "${pkgname}-${pkgver}"
   install -Dm755 target/release/nspawn "${pkgdir}/usr/bin/nspawn"
   # Written from the command line's own definition, so they cannot drift from it.
   ./target/release/nspawn completions bash | install -Dm644 /dev/stdin "${pkgdir}/usr/share/bash-completion/completions/nspawn"
