@@ -615,6 +615,18 @@ pub fn latch(restart: Restart, force: bool, mode: Option<Mode>) -> Latch {
     }
 }
 
+/// Whether `stop` has something to do for a machine machined does not list: nspawn's
+/// own leaves files and a network behind, anybody's unit may be restarting it.
+fn stoppable_when_gone(recorded: bool, unit: &UnitState) -> bool {
+    recorded || unit.busy()
+}
+
+/// Whether `stop --force` queues the unit's stop job right after its SIGKILL: for the
+/// latch, and whenever the kill failed, since the job is then what makes the machine go.
+fn stop_job_after_kill(latch: Latch, killed: bool) -> bool {
+    latch == Latch::AfterSignal || !killed
+}
+
 pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Result<StopOutcome> {
     validate_entry_name(&args.name)?;
     let sd = ctx.sd().await?;
@@ -628,24 +640,28 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         sd.reload().await?;
     }
     if !sd.machine_exists(&args.name).await? {
-        match &record {
-            // It ended on its own or elsewhere, or it is between two runs of its restart
-            // policy; leave nothing of it behind, like docker stop on a stopped container.
-            // The stop job ends a pending restart, and it completes once the release hook
-            // of the last run is done, so nothing is released beside it.
-            Some(r) => {
-                let state = sd.unit_status(&unit).await?;
-                sd.stop_unit_job(&unit).await?.wait().await?;
-                release_machine(&args.name, Some(r))?;
-                sd.reset_failed(&unit).await?;
-                return Ok(if state.busy() {
-                    StopOutcome::Stopped
-                } else {
-                    StopOutcome::WasNotRunning
-                });
-            }
-            None => bail!("machine {} is not running", args.name),
+        // A start of nspawn's is preparing it: releasing its network now would pull it
+        // from under that start.
+        if store.is_starting(&args.name) {
+            bail!("machine {} is starting; stop it once it runs", args.name);
         }
+        // It ended on its own or elsewhere, or it is between two runs of its restart
+        // policy (nspawn's, or an administrator's Restart= on a machine that is not
+        // nspawn's); leave nothing of it behind, like docker stop on a stopped container.
+        // The stop job ends a pending restart, and it completes once the release hook of
+        // the last run is done, so nothing is released beside it.
+        let state = sd.unit_status(&unit).await?;
+        if !stoppable_when_gone(record.is_some(), &state) {
+            bail!("machine {} is not running", args.name);
+        }
+        sd.stop_unit_job(&unit).await?.wait().await?;
+        release_machine(&args.name, record.as_ref())?;
+        sd.reset_failed(&unit).await?;
+        return Ok(if state.busy() {
+            StopOutcome::Stopped
+        } else {
+            StopOutcome::WasNotRunning
+        });
     }
     let admitted = if hostnet::firewalld_running(sd).await {
         hostnet::machine_interfaces(sd, &args.name)
@@ -665,9 +681,10 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         // cannot signal some process of the unit although the machine got its SIGKILL,
         // and machined may keep it listed for a while: the stop job goes in whatever the
         // answer, so that a restart policy does not bring it back meanwhile, and what
-        // counts is that the machine goes (awaited below when `wait`).
+        // counts is that the machine goes (awaited below when `wait`). When the kill
+        // failed, the stop job is also what makes the machine go, `--no-wait` or not.
         let killed = sd.kill_machine(&args.name, "all", libc::SIGKILL).await;
-        if latch == Latch::AfterSignal {
+        if stop_job_after_kill(latch, killed.is_ok()) {
             job = Some(sd.stop_unit_job(&unit).await?);
         }
         if let Err(e) = killed {
@@ -747,6 +764,12 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
     }
     if args.wait {
         if !wait_gone(sd, &args.name, Duration::from_secs(60)).await? {
+            if args.force {
+                bail!(
+                    "machine {} is still running 60 seconds after SIGKILL; see journalctl -u {unit}",
+                    args.name
+                );
+            }
             bail!(
                 "machine {} is still running after 60 seconds; use --force",
                 args.name
@@ -1102,6 +1125,34 @@ mod tests {
         assert_eq!(unit_word(&state("deactivating", "stop-post")), "closing");
         assert_eq!(unit_word(&state("inactive", "dead")), "stopped");
         assert_eq!(unit_word(&state("failed", "failed")), "stopped");
+    }
+
+    #[test]
+    fn a_machine_that_is_gone_is_stopped_when_there_is_something_to_stop() {
+        let state = |active: &str, sub: &str| UnitState {
+            load: "loaded".to_string(),
+            active: active.to_string(),
+            sub: sub.to_string(),
+        };
+        let restarting = state("activating", "auto-restart");
+        let dead = state("inactive", "dead");
+        assert!(
+            stoppable_when_gone(true, &dead),
+            "nspawn's leaves things behind"
+        );
+        assert!(
+            stoppable_when_gone(false, &restarting),
+            "a restart loop of anybody's"
+        );
+        assert!(!stoppable_when_gone(false, &dead));
+    }
+
+    #[test]
+    fn a_failed_kill_still_stops_the_unit() {
+        assert!(stop_job_after_kill(Latch::AfterSignal, true));
+        assert!(stop_job_after_kill(Latch::AfterSignal, false));
+        assert!(!stop_job_after_kill(Latch::NotNeeded, true));
+        assert!(stop_job_after_kill(Latch::NotNeeded, false));
     }
 
     #[test]
