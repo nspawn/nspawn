@@ -73,10 +73,9 @@ failure count. Every FAIL line names the check.
 
 ## Releasing
 
-1. Bump `version` in Cargo.toml and build so Cargo.lock follows.
-2. Run the checks and the e2e suite.
-3. Tag the commit with the version and publish the binary with its
-   SHA256SUMS.
+See [RELEASING.md](RELEASING.md): the checks and the suite, the documentation
+here and on the website, the version in Cargo.toml and in the packaging, the
+tag, and the AUR.
 
 ## Packages
 

@@ -9,6 +9,7 @@ anything:
 - docs/ARCHITECTURE.md: modules, on-disk layout, networking, unit hooks.
 - docs/DBUS.md: the org.nspawn interface on the system bus.
 - docs/HACKING.md: building, unit tests, clippy, the end-to-end suite, the test VM.
+- docs/RELEASING.md: what a stable release takes, the website among it.
 - CONTRIBUTING.md: commit messages and what every change must come with.
 
 Rules of the road:
@@ -27,4 +28,8 @@ Rules of the road:
 - Commit messages: short imperative subject, a body only for the why. No tool
   names, no signatures, no trailers.
 - Do not push, tag or release unless asked.
+- The website (github.com/nspawn/website, checked out next to this repository)
+  is maintained from here, since this is where the change is made: a stable
+  release updates it in the same pass, and docs/RELEASING.md says which page
+  follows which files. Its examples are checked against a real run.
 - Documentation and messages are plain ASCII English without emojis.

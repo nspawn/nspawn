@@ -2,8 +2,10 @@
 
 nspawn is a single binary that talks to systemd (`org.freedesktop.systemd1`)
 and systemd-machined (`org.freedesktop.machine1`) over D-Bus and to OCI
-registries over HTTPS. There is no daemon: state lives in files, and the
-machine units call nspawn back through drop-in hooks.
+registries over HTTPS. The same binary serves `org.nspawn` on the system bus,
+which the command line is a client of; the bus starts that service on demand
+and it exits again when idle, so nothing runs between commands. State lives in
+files, and the machine units call nspawn back through drop-in hooks.
 
 ## Modules
 

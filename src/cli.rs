@@ -80,8 +80,8 @@ pub struct CompletionsArgs {
 
 #[derive(Args, Debug)]
 pub struct DaemonArgs {
-    /// Write the bus policy, the activation file and the unit that make the bus start
-    /// this binary on demand, then return.
+    /// Write the bus policy, the polkit actions, the activation file and the unit that
+    /// make the bus start this binary on demand, then return.
     #[arg(long)]
     pub install: bool,
     /// Exit after this many seconds without a call or a job; 0 keeps serving.

@@ -12,8 +12,8 @@ machined object path for whoever wants that view.
 sudo nspawn daemon --install
 ```
 
-writes three files with the path of the binary that ran it and reloads
-systemd and the bus:
+writes four files, the unit among them carrying the path of the binary that
+ran the command, and reloads systemd and the bus:
 
 | File | Role |
 |---|---|

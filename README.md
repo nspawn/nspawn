@@ -168,10 +168,14 @@ the command's terminal or pipes over the bus. See `docs/DBUS.md`.
   the `overlay` backend and cgroup v2.
 - The service on the system bus: a package installs it, `sudo nspawn daemon --install`
   does the same for a binary built by hand. It runs as root and does everything below
-  `/var/lib/machines`, `/var/lib/nspawn`, `/etc/systemd` and `/etc/nspawn`; the bus policy
-  lets root call it for now, so the command line still runs with `sudo` until polkit
-  rules arrive. With SELinux enforcing the `nspawn-selinux` package (the policy in
-  `packaging/selinux`) is needed as well.
+  `/var/lib/machines`, `/var/lib/nspawn`, `/etc/systemd` and `/etc/nspawn`; who may call
+  it is polkit's answer, so `sudo` works everywhere and a polkit rule lets a group do
+  without it. polkit itself is needed for anyone but root to call at all.
+- On Fedora or RHEL with SELinux enforcing, the `nspawn-selinux` package (the policy in
+  `packaging/selinux`), which the RPM recommends: without its domain the service runs
+  unconfined and the bus drops it when it passes a descriptor, so `exec`, `shell` and
+  `logs` fail. A binary installed by hand needs the label as well, which
+  `daemon --install` points out.
 - `shell` on a booted machine uses machined's login session, which needs D-Bus inside
   (the hub images have it); `exec` enters the namespaces and needs nothing inside.
 - The bridge network needs `ip` and `nft` on the host (iproute2 and nftables), nothing
