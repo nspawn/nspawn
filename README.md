@@ -17,6 +17,7 @@ nspawn start fedora-44              # boot it as a machine
 nspawn create fedora-44 web2        # another machine from the same local image, docker create style
 nspawn start web -p 8080:80 -e KEY=v -v /srv/data:/data -v pgdata:/var/lib/pg   # docker-style flags
 nspawn ps                           # running machines: image, mode, command, uptime (-a adds stopped ones)
+nspawn inspect web                  # everything nspawn knows about a machine, as JSON
 nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
 nspawn shell fedora-44
 nspawn logs fedora-44               # console output; --inside reads the machine's own journal
@@ -82,6 +83,12 @@ ends up the same way but resolves the manifest through the registry first.
 Completions for bash, zsh and fish come with the packages; from a build of your own,
 `nspawn completions bash > ~/.local/share/bash-completion/completions/nspawn` (or the
 equivalent for your shell). `man nspawn` is the same reference the packages install.
+
+`ps`, `machines ls`, `images ls` and `network ls` take `--json` and print what the
+service answered instead of a table, and `nspawn inspect NAME...` prints the whole
+record of machines or images (running or not) as a JSON array, like docker inspect:
+what a script or an agent reads. The keys are the ones of the D-Bus interface (see
+`docs/DBUS.md`), so the command line and the bus never disagree.
 
 ## Registries and credentials
 

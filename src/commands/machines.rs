@@ -19,11 +19,18 @@ use crate::store::now_unix;
 
 pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
     let now = now_unix();
-    let rows = client
+    let machines = client
         .manager
         .list_machines(args.all)
         .await
-        .map_err(client::error)?
+        .map_err(client::error)?;
+    if args.output.json {
+        client::print_json(&serde_json::Value::Array(
+            machines.iter().map(client::dict_to_json).collect(),
+        ));
+        return Ok(());
+    }
+    let rows = machines
         .iter()
         .map(|m| {
             let (image, mode, command) = describe(m);

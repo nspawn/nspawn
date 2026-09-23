@@ -522,6 +522,15 @@ impl Manager {
         Ok(machines.iter().map(values::machine).collect())
     }
 
+    /// Like `inspect`: one machine as `ListMachines` has it (running or not), or the
+    /// record of an image that is not running, with state "stopped".
+    async fn get_machine(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<Dict> {
+        self.allow(&hdr, Action::Inspect).await?;
+        let _busy = self.state.enter();
+        let machine = api::machines::get(self.ctx(), &name).await?;
+        Ok(values::machine(&machine))
+    }
+
     /// Like `start`. Options: wait (b, default true), network (s), publish (as),
     /// entrypoint (s), env (as), volume (as), image_command (b), command (as). Returns
     /// "started", or "ended" when the program returned before the machine registered,

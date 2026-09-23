@@ -102,6 +102,7 @@ for backend in overlay flat mstack; do
   $NSPAWN images ls | tee /tmp/e2e-img.txt
   grep -q "^ *$name " /tmp/e2e-img.txt || fail "$name not listed"
   grep "^ *$name " /tmp/e2e-img.txt | grep -q "$backend" || fail "$name backend not shown"
+  $NSPAWN images ls --json | python3 -c "import json,sys; d = [i for i in json.load(sys.stdin) if i['name'] == '$name']; assert d and d[0]['backend'] == '$backend', d" || fail "images ls --json misses $name or its backend"
   step "start"
   vol_args=""
   if [ "$backend" != flat ]; then
@@ -124,6 +125,10 @@ for backend in overlay flat mstack; do
   step "machines ls"
   $NSPAWN machines ls | tee /tmp/e2e-m.txt
   grep -q "^ *$name " /tmp/e2e-m.txt || fail "$name not running"
+  step "machine-readable output: ps --json and inspect"
+  $NSPAWN ps --json | python3 -c "import json,sys; d = [m for m in json.load(sys.stdin) if m['name'] == '$name']; assert d and d[0]['state'] == 'running' and d[0]['leader'] > 0, d" || fail "ps --json misses $name running"
+  $NSPAWN inspect "$name" | python3 -c "import json,sys; d = json.load(sys.stdin); assert len(d) == 1 and d[0]['name'] == '$name' and d[0]['mode'] == 'boot' and d[0]['backend'] == '$backend', d" || fail "inspect $name"
+  $NSPAWN inspect "$name" e2e-nonexistent >/dev/null 2>&1 && fail "inspect of a missing machine succeeded"
   step "exec"
   out=$($NSPAWN exec "$name" -- /usr/bin/systemctl is-system-running --wait </dev/null | tr -d '\r' || true)
   echo "is-system-running: $out"
@@ -167,6 +172,7 @@ for backend in overlay flat mstack; do
   addr=$($NSPAWN network ls | awk -v n="$name" '$1 == n {print $2}')
   echo "$name has address $addr"
   echo "$addr" | grep -q "^10\.99\.0\." || fail "no bridge address recorded for $name"
+  $NSPAWN network ls --json | python3 -c "import json,sys; d = json.load(sys.stdin); assert d['bridge']['bridge'] == 'nspawn0' and any(m['name'] == '$name' and m['address'] == '$addr' and m['running'] for m in d['machines']), d" || fail "network ls --json"
   retry 15 bash -c "$NSPAWN exec $name -- /bin/sh -c 'ip -4 -o addr show host0 | grep -q $addr/24 && curl -sf -m 5 -o /dev/null https://download.opensuse.org/ && echo NET-OK' </dev/null | tr -d '\r' | grep -q NET-OK" \
     || { echo "-- inside $name:"; $NSPAWN exec "$name" -- /bin/sh -c 'ip -4 -o addr; ip route; ping -c 1 -W 2 10.99.0.1; curl -sS -m 5 -o /dev/null https://download.opensuse.org/' </dev/null 2>&1 | tr -d '\r'; bridge link show; fail "no network inside $name through the bridge"; }
   step "stop"
@@ -190,6 +196,7 @@ for backend in overlay flat mstack; do
       systemctl stop systemd-networkd.service systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-resolve-hook.socket >/dev/null 2>&1 || true
     fi
   fi
+  $NSPAWN inspect "$name" | python3 -c "import json,sys; d = json.load(sys.stdin); assert d[0]['state'] == 'stopped', d" || fail "inspect of a stopped $name"
   step "stop right after start"
   $NSPAWN start "$name" && $NSPAWN stop "$name" || fail "stop right after start ($backend)"
   step "images rm"
@@ -432,7 +439,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines StartMachine StopMachine Exec Shell Logs ListNetwork NetworkUp Login Logout; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine StartMachine StopMachine Exec Shell Logs ListNetwork NetworkUp Login Logout; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do
@@ -464,6 +471,7 @@ if command -v busctl >/dev/null 2>&1; then
   grep -q '"name" s "e2e-dbus"' /tmp/e2e-lm.txt || fail "ListMachines misses the machine"
   grep -q '"machine_path" s "/org/freedesktop/machine1/machine/e2e_2ddbus"' /tmp/e2e-lm.txt || fail "ListMachines has no machined path"
   grep -q '"state" s "running"' /tmp/e2e-lm.txt || fail "ListMachines: not running"
+  $B call $M GetMachine s e2e-dbus | grep -q '"state" s "running"' || fail "GetMachine of a running machine"
   $B call $M ListNetwork | grep -q '"name" s "e2e-dbus"' || fail "ListNetwork misses the machine"
   # Every exec of this run went through Exec; each left a process object behind.
   out=$($NSPAWN exec e2e-dbus -- /bin/sh -c "echo via-bus-$nonce; exit 7" </dev/null); code=$?

@@ -50,6 +50,8 @@ pub enum Command {
     Machines(MachinesArgs),
     /// List running machines, like docker ps (same as machines ls).
     Ps(PsArgs),
+    /// Everything nspawn knows about machines or images, as JSON, like docker inspect.
+    Inspect(InspectArgs),
     /// Boot an image as a machine.
     Start(StartArgs),
     /// Power off a running machine.
@@ -101,7 +103,7 @@ pub enum NetworkCommand {
     Up,
     /// List the machines on the bridge with their addresses and published ports.
     #[command(alias = "list")]
-    Ls,
+    Ls(OutputArgs),
     /// Unit hook (ExecStartPre): prepare a machine's network before it starts.
     #[command(hide = true)]
     Prepare { name: String },
@@ -280,7 +282,7 @@ pub struct ImagesArgs {
 pub enum ImagesCommand {
     /// List local images.
     #[command(alias = "list")]
-    Ls,
+    Ls(OutputArgs),
     /// Remove local images (and the layers nobody uses any more).
     Rm(ImagesRmArgs),
 }
@@ -310,6 +312,23 @@ pub struct PsArgs {
     /// Also list nspawn images that are not running.
     #[arg(long, short = 'a')]
     pub all: bool,
+    #[command(flatten)]
+    pub output: OutputArgs,
+}
+
+/// How a listing is printed.
+#[derive(Args, Debug, Default, Clone, Copy)]
+pub struct OutputArgs {
+    /// Print the service's answer as JSON instead of a table, for scripts.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct InspectArgs {
+    /// Machine or image names.
+    #[arg(required = true)]
+    pub names: Vec<String>,
 }
 
 #[derive(Args, Debug)]

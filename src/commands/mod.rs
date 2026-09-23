@@ -74,9 +74,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                 );
                 Ok(())
             }
-            NetworkCommand::Ls => {
+            NetworkCommand::Ls(output) => {
                 let client = Client::connect().await?;
                 let (info, entries) = client.manager.list_network().await.map_err(client::error)?;
+                if output.json {
+                    client::print_json(&serde_json::json!({
+                        "bridge": client::dict_to_json(&info),
+                        "machines": entries.iter().map(client::dict_to_json).collect::<Vec<_>>(),
+                    }));
+                    return Ok(());
+                }
                 println!(
                     "{} {} (gateway {}, host name {})",
                     client::string(&info, "bridge"),
@@ -336,11 +343,15 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             Ok(())
         }
         Command::Images(args) => match args.command {
-            ImagesCommand::Ls => {
-                let rows = manager
-                    .list_images()
-                    .await
-                    .map_err(client::error)?
+            ImagesCommand::Ls(output) => {
+                let images = manager.list_images().await.map_err(client::error)?;
+                if output.json {
+                    client::print_json(&serde_json::Value::Array(
+                        images.iter().map(client::dict_to_json).collect(),
+                    ));
+                    return Ok(());
+                }
+                let rows = images
                     .iter()
                     .map(|i| {
                         let size = client::u64(i, "size");
@@ -384,6 +395,15 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             MachinesCommand::Ls(a) => machines::ls(a, client).await,
         },
         Command::Ps(args) => machines::ls(args, client).await,
+        Command::Inspect(args) => {
+            let mut out = Vec::new();
+            for name in &args.names {
+                let machine = manager.get_machine(name).await.map_err(client::error)?;
+                out.push(client::dict_to_json(&machine));
+            }
+            client::print_json(&serde_json::Value::Array(out));
+            Ok(())
+        }
         Command::Start(args) => machines::start(args, client).await,
         Command::Stop(args) => machines::stop(args, client).await,
         Command::Exec(args) => machines::exec(args, client).await,

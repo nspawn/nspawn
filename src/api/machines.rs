@@ -36,6 +36,42 @@ pub struct MachineSummary {
     pub os: Option<String>,
 }
 
+/// One machine or image by name, as `list` shows it: machined's view when it runs, the
+/// record as stopped otherwise.
+pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
+    let sd = ctx.sd().await?;
+    let record = ctx.store.load_image(name)?;
+    if sd.machine_exists(name).await? {
+        let details = sd.machine_details(name).await.ok();
+        let now = now_unix();
+        return Ok(MachineSummary {
+            name: name.to_string(),
+            record,
+            state: details
+                .as_ref()
+                .map(|d| d.state.clone())
+                .unwrap_or_else(|| "-".to_string()),
+            started: details
+                .as_ref()
+                .filter(|d| d.started > 0 && d.started <= now)
+                .map(|d| d.started),
+            leader: details.as_ref().map(|d| d.leader),
+            os: sd.machine_os(name).await,
+        });
+    }
+    match record {
+        Some(record) => Ok(MachineSummary {
+            name: name.to_string(),
+            record: Some(record),
+            state: "stopped".to_string(),
+            started: None,
+            leader: None,
+            os: None,
+        }),
+        None => bail!("no machine or image named {name}"),
+    }
+}
+
 /// The machines machined knows, and with `all` also the images of nspawn that are not
 /// running, as stopped.
 pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {

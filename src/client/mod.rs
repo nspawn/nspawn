@@ -56,6 +56,7 @@ pub trait Manager {
     ) -> zbus::Result<Vec<Dict>>;
     fn list_tags(&self, repository: &str, options: Options<'_>) -> zbus::Result<Vec<String>>;
     fn list_machines(&self, all: bool) -> zbus::Result<Vec<Dict>>;
+    fn get_machine(&self, name: &str) -> zbus::Result<Dict>;
     fn start_machine(
         &self,
         name: &str,
@@ -223,24 +224,52 @@ impl Client {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = zbus::Result<OwnedObjectPath>>,
     {
-        let mut output = self
+        let watch = self.watch_jobs().await?;
+        let job = start().await.map_err(error)?;
+        watch.finish(job).await
+    }
+
+    /// Starts listening to the job signals, for a call that returns a job together with
+    /// something else (a stream) and cannot go through `run_job`.
+    pub async fn watch_jobs(&self) -> Result<JobWatch> {
+        let output = self
             .manager
             .receive_job_output()
             .await
             .context("listening for job output")?;
-        let mut removed = self
+        let removed = self
             .manager
             .receive_job_removed()
             .await
             .context("listening for job results")?;
-        let mut lost = service_lost(&self.connection).await?;
-        let job = start().await.map_err(error)?;
+        let lost = service_lost(&self.connection).await?;
+        Ok(JobWatch {
+            connection: self.connection.clone(),
+            output,
+            removed,
+            lost,
+        })
+    }
+}
+
+/// The job signals, subscribed to before the job exists.
+pub struct JobWatch {
+    connection: zbus::Connection,
+    output: JobOutputStream,
+    removed: JobRemovedStream,
+    lost: zbus::fdo::NameOwnerChangedStream,
+}
+
+impl JobWatch {
+    /// Follows `job` to its end: its lines go to the terminal as they arrive, and its
+    /// result comes back, or its error.
+    pub async fn finish(mut self, job: OwnedObjectPath) -> Result<Dict> {
         let result = loop {
             // The lines come first: the service sends every JobOutput before JobRemoved,
             // and a random poll order would let the end be seen before the last lines.
             tokio::select! {
                 biased;
-                Some(signal) = output.next() => {
+                Some(signal) = self.output.next() => {
                     let Ok(args) = signal.args() else { continue };
                     if *args.job() != job { continue }
                     match args.kind().as_str() {
@@ -248,12 +277,12 @@ impl Client {
                         _ => println!("{}", args.line()),
                     }
                 }
-                Some(signal) = removed.next() => {
+                Some(signal) = self.removed.next() => {
                     let Ok(args) = signal.args() else { continue };
                     if *args.job() != job { continue }
                     break args.result().clone();
                 }
-                Some(signal) = lost.next() => {
+                Some(signal) = self.lost.next() => {
                     if gone(&signal) {
                         anyhow::bail!("the nspawn service went away while the job ran");
                     }
@@ -327,6 +356,60 @@ pub fn bool(dict: &Dict, key: &str) -> bool {
     dict.get(key)
         .and_then(|v| bool::try_from(v.clone()).ok())
         .unwrap_or(false)
+}
+
+/// A value from the bus as JSON: numbers, strings, booleans, arrays and dictionaries
+/// as they are (zvariant's own serialization carries the signature along, which is not
+/// what a script wants to read).
+pub fn to_json(value: &Value<'_>) -> serde_json::Value {
+    use serde_json::Value as J;
+    match value {
+        Value::Bool(b) => J::Bool(*b),
+        Value::U8(n) => J::from(*n),
+        Value::U16(n) => J::from(*n),
+        Value::U32(n) => J::from(*n),
+        Value::U64(n) => J::from(*n),
+        Value::I16(n) => J::from(*n),
+        Value::I32(n) => J::from(*n),
+        Value::I64(n) => J::from(*n),
+        Value::F64(n) => serde_json::Number::from_f64(*n)
+            .map(J::Number)
+            .unwrap_or(J::Null),
+        Value::Str(s) => J::String(s.to_string()),
+        Value::Signature(s) => J::String(s.to_string()),
+        Value::ObjectPath(p) => J::String(p.to_string()),
+        Value::Value(inner) => to_json(inner),
+        Value::Array(items) => J::Array(items.iter().map(to_json).collect()),
+        Value::Structure(s) => J::Array(s.fields().iter().map(to_json).collect()),
+        Value::Dict(d) => {
+            let mut map = serde_json::Map::new();
+            for (k, v) in d.iter() {
+                let key = match to_json(k) {
+                    J::String(s) => s,
+                    other => other.to_string(),
+                };
+                map.insert(key, to_json(v));
+            }
+            J::Object(map)
+        }
+        #[allow(unreachable_patterns)]
+        _ => J::Null,
+    }
+}
+
+/// A dictionary from the service as a JSON object, keys sorted.
+pub fn dict_to_json(dict: &Dict) -> serde_json::Value {
+    let sorted: std::collections::BTreeMap<&String, serde_json::Value> =
+        dict.iter().map(|(k, v)| (k, to_json(v))).collect();
+    serde_json::to_value(sorted).unwrap_or(serde_json::Value::Null)
+}
+
+/// Prints JSON the way `--json` promises: pretty, one document.
+pub fn print_json(value: &serde_json::Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".to_string())
+    );
 }
 
 /// "-" for what is not there, as the tables show it.
@@ -424,6 +507,41 @@ mod tests {
         assert_eq!(strings(&dict, "ports"), ["80->80/tcp"]);
         assert_eq!(dash(String::new()), "-");
         assert_eq!(dash("x".to_string()), "x");
+    }
+
+    #[test]
+    fn dictionaries_become_plain_json() {
+        let labels: HashMap<String, String> = HashMap::from([("a".to_string(), "1".to_string())]);
+        let dict: Dict = HashMap::from([
+            ("name".to_string(), v("web")),
+            ("size".to_string(), v(42u64)),
+            ("leader".to_string(), v(7u32)),
+            ("delta".to_string(), v(-3i64)),
+            ("cpus".to_string(), v(0.5f64)),
+            ("running".to_string(), v(true)),
+            ("ports".to_string(), v(vec!["80->80/tcp".to_string()])),
+            ("labels".to_string(), v(labels)),
+            ("empty".to_string(), v(Vec::<String>::new())),
+        ]);
+        let json = dict_to_json(&dict);
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "name": "web",
+                "size": 42,
+                "leader": 7,
+                "delta": -3,
+                "cpus": 0.5,
+                "running": true,
+                "ports": ["80->80/tcp"],
+                "labels": {"a": "1"},
+                "empty": [],
+            })
+        );
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "keys come out sorted");
     }
 
     #[test]

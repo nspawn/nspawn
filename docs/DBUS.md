@@ -33,7 +33,8 @@ one call; the command line passes them when it was given a registry (flag,
 alone otherwise.
 
 Every user may call; who may do what is polkit's answer. The methods that
-only read (`ListImages`, `GetImage`, `ListMachines`, `ListNetwork`) ask for
+only read (`ListImages`, `GetImage`, `ListMachines`, `GetMachine`,
+`ListNetwork`) ask for
 `org.nspawn.inspect`, the rest for `org.nspawn.manage`, and both are for
 administrators by default, so `sudo nspawn ...` works as before and a
 desktop or `pkttyagent` session is asked for a password. Root is allowed
@@ -107,6 +108,7 @@ Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 | Method | Like | Notes |
 |---|---|---|
 | `ListMachines(b all) -> aa{sv}` | `ps`, `ps -a` | name, state, started (unix seconds), leader, os, machine_path, plus the image's record |
+| `GetMachine(s name) -> a{sv}` | `inspect` | one machine as `ListMachines` has it, whether it runs or not ("stopped" then); fails for a name that is neither running nor an image of nspawn |
 | `StartMachine(s name, a{sv} options) -> (s, as)` | `start` | options wait (default true), network, publish, entrypoint, env, volume, image_command, command; "started" or "ended", and the notes made on the way |
 | `StopMachine(s name, a{sv} options) -> (s, as)` | `stop` | options force, wait (default true), timeout (seconds, default 10, a day at most); "stopped" or "was-not-running", and the notes (a program that had to be killed) |
 | `Exec(s machine, as argv, s user, a{sv} options) -> (a{sh}, o)` | `exec` | user "" for root; options tty (default true), rows, cols, env (the caller's `TERM=` among them; xterm otherwise on a terminal); returns the streams ("tty", or "stdin", "stdout", "stderr") and a process object |
