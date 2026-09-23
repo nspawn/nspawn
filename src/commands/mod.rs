@@ -454,14 +454,19 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 Ok(())
             }
             VolumeCommand::Prune { force } => {
-                use std::io::IsTerminal;
-                if !force && std::io::stdin().is_terminal() {
+                // Like docker: the answer is read from standard input whatever it is, and
+                // anything but a yes keeps the volumes, the end of a script's input too.
+                if !force {
                     eprint!("Remove every volume no machine uses? [y/N] ");
                     let mut answer = String::new();
                     std::io::stdin()
                         .read_line(&mut answer)
                         .context("reading the answer")?;
-                    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                    if !confirmed(&answer) {
+                        use std::io::IsTerminal;
+                        if !std::io::stdin().is_terminal() {
+                            eprintln!("\nnothing removed; volume prune -f removes without asking");
+                        }
                         return Ok(());
                     }
                 }
@@ -499,5 +504,25 @@ fn shorten(text: &str, max: usize) -> String {
         text.to_string()
     } else {
         format!("{}...", text.chars().take(max - 3).collect::<String>())
+    }
+}
+
+/// Whether the answer to a [y/N] question is a yes.
+fn confirmed(answer: &str) -> bool {
+    matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_yes_confirms() {
+        for yes in ["y\n", "Y", "yes\n", " yes "] {
+            assert!(confirmed(yes), "{yes:?}");
+        }
+        for no in ["", "\n", "n\n", "no", "yess", "y y"] {
+            assert!(!confirmed(no), "{no:?}");
+        }
     }
 }

@@ -143,9 +143,9 @@ pub enum VolumeCommand {
         #[arg(required = true)]
         names: Vec<String>,
     },
-    /// Remove every named volume no machine uses.
+    /// Remove every named volume no machine uses, once a yes comes on standard input.
     Prune {
-        /// Do not ask first.
+        /// Do not ask first (without it, nothing is removed when no yes comes).
         #[arg(long, short = 'f')]
         force: bool,
     },
