@@ -59,7 +59,9 @@ sudo env NSPAWN=/usr/local/bin/nspawn NSPAWN_REGISTRY=hub.example:8443 \
 ```
 
 The suite cleans up before and after itself and ends with `ALL OK` or a
-failure count. Every FAIL line names the check.
+failure count. Every FAIL line names the check. It runs from wherever it sits,
+as long as `tests/build-context` sits next to it; `NSPAWN_BUILD_CONTEXT` points
+it at another mkosi definition.
 
 ## Debugging a machine
 

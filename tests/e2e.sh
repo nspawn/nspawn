@@ -250,8 +250,10 @@ grep -q "freed 1 unused layer" /tmp/e2e-rm.txt || fail "unused layer not garbage
 
 step "build, push and pull round trip (docker-like flow)"
 if command -v mkosi >/dev/null 2>&1; then
-  ctx=$(dirname "$0")/build-context
-  [ -f "$ctx/mkosi.conf" ] || ctx=/home/edu4rdshl/nspawn-build/build-context
+  # The fixture next to this script, or one the caller names with a definition of
+  # its own (NSPAWN_BUILD_CONTEXT).
+  ctx=${NSPAWN_BUILD_CONTEXT:-$(dirname "$0")/build-context}
+  [ -f "$ctx/mkosi.conf" ] || fail "no mkosi.conf under $ctx; copy tests/build-context along with this script"
   built=e2e-built
   $NSPAWN build -t e2e/built:1 --name $built --force "$ctx" || fail "build"
   $NSPAWN images ls | tee /tmp/e2e-img.txt
