@@ -51,4 +51,6 @@ version, the documentation and the AUR.
 
 8. The AUR recipes (`nspawn` and `nspawn-git`) take the new `pkgver`,
    `updpkgsums` against the published tarball, a regenerated `.SRCINFO`, and a
-   push each.
+   push each. GitHub builds that tarball from wherever the tag points, so the
+   sums are taken once the tag is final: moving it invalidates them and every
+   `makepkg` then stops at the validity check.
