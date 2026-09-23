@@ -133,7 +133,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         request.backend
     };
     let backend = Backend::choose(choice, sd).await?;
-    remove_existing(store, sd, &request.name).await?;
+    remove_existing(store, sd, &request.name, report).await?;
     line(
         report,
         format!(

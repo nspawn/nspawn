@@ -159,7 +159,7 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
                 backend.name()
             ),
         );
-        remove_existing(store, sd, &name).await?;
+        remove_existing(store, sd, &name, report).await?;
         install(
             store,
             sd,

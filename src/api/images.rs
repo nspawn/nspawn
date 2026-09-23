@@ -153,6 +153,7 @@ pub async fn remove_machines(
                     store.remove_machine_files(name)?;
                     bridge::delete_netns(name);
                     store.remove_record(name)?;
+                    crate::install::take_off_boot(sd, name, report).await;
                     // Like docker: named volumes outlive the machine.
                     for volume in rec.volumes.iter().filter(|v| v.is_named()) {
                         note(
@@ -170,6 +171,7 @@ pub async fn remove_machines(
                     if sd.list_images().await?.iter().any(|i| i.name == *name) {
                         sd.remove_image(name).await?;
                     }
+                    crate::install::take_off_boot(sd, name, report).await;
                 }
             }
             Ok(())

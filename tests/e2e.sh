@@ -314,6 +314,11 @@ $NSPAWN pull "$IMAGE" --name e2e-a --backend overlay --force >/dev/null || fail 
 $NSPAWN pull "$IMAGE" --name e2e-b --backend overlay --force | tee /tmp/e2e-p2.txt || fail "pull e2e-b"
 grep -q "already present" /tmp/e2e-p2.txt || fail "second pull downloaded the layer again"
 
+step "a machine an administrator enabled at boot stays enabled when its image is replaced"
+systemctl enable systemd-nspawn@e2e-b.service >/dev/null 2>&1 || fail "systemctl enable e2e-b"
+$NSPAWN pull "$IMAGE" --name e2e-b --backend overlay --force >/dev/null || fail "pull --force over an enabled machine"
+[ "$(systemctl is-enabled systemd-nspawn@e2e-b.service 2>/dev/null)" = enabled ] || fail "pull --force took e2e-b off the boot list an administrator put it on"
+
 step "create: arguments are checked before anything is made"
 $NSPAWN create e2e-a e2e-bad -e X=1 >/dev/null 2>&1 && fail "create accepted -e for a booted image"
 $NSPAWN images ls | grep_q "^ *e2e-bad " && fail "a refused create left a machine behind"
@@ -374,6 +379,7 @@ $NSPAWN images rm e2e-a >/dev/null || fail "rm e2e-a"
 [ "$(ls /var/lib/nspawn/layers | wc -l)" = "$layers_before" ] || fail "layer removed while still referenced"
 $NSPAWN images rm e2e-b | tee /tmp/e2e-rm.txt || fail "rm e2e-b"
 grep -q "freed 1 unused layer" /tmp/e2e-rm.txt || fail "unused layer not garbage collected"
+[ -e /etc/systemd/system/machines.target.wants/systemd-nspawn@e2e-b.service ] && fail "images rm left e2e-b enabled at boot"
 
 step "build, push and pull round trip (docker-like flow)"
 if command -v mkosi >/dev/null 2>&1; then

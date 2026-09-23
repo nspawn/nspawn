@@ -169,9 +169,37 @@ pub async fn ensure_replaceable(
     Ok(())
 }
 
+/// Takes the unit of a machine that is gone off the boot list: a link left behind would
+/// start a unit with nothing to run at every boot. Best effort, said in a note: the
+/// removal is done by then, and machined allows image names systemd refuses as units.
+pub async fn take_off_boot(sd: &Systemd, name: &str, report: Report<'_>) {
+    match sd
+        .disable_unit(&format!("systemd-nspawn@{name}.service"))
+        .await
+    {
+        Ok(false) => {}
+        Ok(true) => {
+            if let Err(e) = sd.reload().await {
+                note(report, format!("note: {e:#}"));
+            }
+        }
+        Err(e) => note(
+            report,
+            format!("note: {name} is gone, but its unit may still be started at boot: {e:#}"),
+        ),
+    }
+}
+
 /// Removes whatever exists under this name: a recorded image with its backend's files,
-/// or leftovers without a record (a failed install, a hand-deleted record).
-pub async fn remove_existing(store: &Store, sd: &Systemd, name: &str) -> Result<()> {
+/// or leftovers without a record (a failed install, a hand-deleted record). The unit
+/// stays enabled at boot unless nspawn's own restart policy had enabled it: a machine
+/// an administrator enabled comes back at boot with the image that replaces it.
+pub async fn remove_existing(
+    store: &Store,
+    sd: &Systemd,
+    name: &str,
+    report: Report<'_>,
+) -> Result<()> {
     if store.is_starting(name) {
         anyhow::bail!("machine {name} is starting; wait for it or stop it first");
     }
@@ -186,6 +214,9 @@ pub async fn remove_existing(store: &Store, sd: &Systemd, name: &str) -> Result<
         Some(rec) => {
             assembler.remove(name, rec.backend).await?;
             store.remove_record(name)?;
+            if rec.restart.enabled_at_boot() {
+                take_off_boot(sd, name, report).await;
+            }
         }
         None => {
             assembler.remove_leftovers(name).await?;
