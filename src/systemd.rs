@@ -166,7 +166,8 @@ impl Systemd {
     pub async fn unit_status(&self, unit: &str) -> Result<UnitState> {
         Ok(self
             .unit_states(&[unit.to_string()])
-            .await?
+            .await
+            .with_context(|| format!("querying the state of {unit}"))?
             .remove(unit)
             .unwrap_or_else(UnitState::unknown))
     }

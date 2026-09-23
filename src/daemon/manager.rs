@@ -859,7 +859,16 @@ impl Manager {
         };
         options.finish()?;
         crate::reference::validate_entry_name(&request.machine)?;
-        api::machines::refuse_foreign(self.ctx().sd().await?, &request.machine).await?;
+        // Logs are what one reads when machined is in trouble: only its clear answer that
+        // the name is somebody else's machine stands in the way.
+        if let Ok(sd) = self.ctx().sd().await {
+            if let Ok(Some(runner)) = sd.foreign_machine(&request.machine).await {
+                return Err(Error::Failed(format!(
+                    "{} is a machine of {runner}, not a container; nspawn manages systemd-nspawn machines only",
+                    request.machine
+                )));
+            }
+        }
         let argv = api::machines::journalctl_arguments(&request);
         let pipe = || {
             nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)

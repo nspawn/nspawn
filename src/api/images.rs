@@ -85,6 +85,7 @@ impl Removal {
 /// Removes every name it can, like docker rmi: one that cannot be removed does not stop
 /// the others, and is reported in the result.
 pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Result<Removal> {
+    require_root("images rm")?;
     remove_machines(ctx, names, false, report).await
 }
 
@@ -135,7 +136,11 @@ pub async fn remove_machines(
         }
     }
     let _lock = store.lock().await?;
-    let hint = if force { "" } else { ", or use rm --force" };
+    let hint = if force {
+        ""
+    } else {
+        ", or use nspawn rm --force"
+    };
     for name in names.iter().filter(|n| !skip.contains(*n)) {
         let outcome: Result<()> = async {
             if store.is_starting(name) {
