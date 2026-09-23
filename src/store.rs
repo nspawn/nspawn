@@ -333,7 +333,9 @@ impl Store {
             if !name.starts_with(".hold-") {
                 continue;
             }
-            if is_stale(&entry.path()) {
+            // A pull may download for longer than an hour: its hold goes only once the
+            // process that wrote it is gone.
+            if is_stale(&entry.path()) && !writer_alive(&name) {
                 let _ = fs::remove_file(entry.path());
                 continue;
             }
@@ -708,6 +710,15 @@ fn is_stale(path: &Path) -> bool {
         .and_then(|m| m.modified())
         .map(|t| t.elapsed().map(|e| e > STALE_MARKER).unwrap_or(false))
         .unwrap_or(false)
+}
+
+/// Whether the process that named a file with `unique_suffix` ("<prefix><pid>.<n>")
+/// still runs; a name that says no PID reads as gone.
+fn writer_alive(name: &str) -> bool {
+    name.rsplit_once('.')
+        .and_then(|(rest, _)| rest.rsplit(|c: char| !c.is_ascii_digit()).next())
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
 }
 
 /// A digest as the store accepts it for a path component: sha256 and 64 hex digits.
@@ -1976,6 +1987,39 @@ mod tests {
         drop(hold);
         assert_eq!(store.gc_blobs().unwrap(), vec![digest.clone()]);
         assert!(!store.has_blob(&digest));
+    }
+
+    #[test]
+    fn a_long_download_keeps_its_hold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let ours = format!("sha256:{}", "b".repeat(64));
+        let orphan = format!("sha256:{}", "c".repeat(64));
+        fs::create_dir_all(store.blobs_dir()).unwrap();
+        for digest in [&ours, &orphan] {
+            fs::write(store.blob_path(digest), b"x").unwrap();
+        }
+        let hold = store.hold_blobs(std::slice::from_ref(&ours)).unwrap();
+        // A hold whose process is gone: no PID can be this large.
+        let dead = store.blobs_dir().join(".hold-4294967295.0");
+        fs::write(&dead, &orphan).unwrap();
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        for path in [&hold.0, &dead] {
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(two_hours_ago)
+                .unwrap();
+        }
+        assert_eq!(
+            store.gc_blobs().unwrap(),
+            vec![orphan.clone()],
+            "the hold of a live pull stands however old, a dead one's goes"
+        );
+        assert!(store.has_blob(&ours));
+        assert!(!dead.exists());
+        drop(hold);
     }
 
     #[test]
