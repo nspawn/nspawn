@@ -11,6 +11,7 @@ machine units call nspawn back through drop-in hooks.
 |---|---|
 | `api/` | the library: typed operations on images, machines and the network; nothing here prints, progress goes through a `Report` and results come back as values |
 | `cli.rs`, `commands/` | clap definitions and the terminal side: argument conversion, tables, prompts, the commands that own the terminal (exec, shell, logs) |
+| `daemon/` | the D-Bus service `org.nspawn`: the Manager interface, jobs, dictionaries, the files that make the bus start it |
 | `config.rs` | `/etc/nspawn/nspawn.toml`, environment and flags |
 | `reference.rs` | image references, local names, machine name rules |
 | `hub.rs`, `auth.rs`, `search.rs` | registry client, credentials, search |
@@ -85,6 +86,19 @@ this chown copies inodes rather than file contents into the upper directory
 and the layers stay shared. Attributes in overlayfs's own namespace
 (`trusted.overlay.*`, `user.overlay.*`) are dropped from every layer on
 extraction, so an image cannot redirect a file or its data.
+
+## The bus service
+
+`nspawn daemon` serves `org.nspawn` (`docs/DBUS.md`). The bus starts it
+through `nspawn.service` when a client calls, and it exits after a minute
+without a call or a job. Every method is a thin conversion around an `api`
+function: options come as `a{sv}` and are read by name and type (an unknown
+key is an error), results go back as dictionaries with the command line's
+spellings. Pull, push, build and create run as jobs: the method returns
+`/org/nspawn/job/N` at once, the job's report events become `JobOutput`
+signals and the object's `Output`, and `JobRemoved` says how it ended.
+machined's `MachineNew` and `MachineRemoved` are relayed as `MachineStarted`
+and `MachineStopped` for the machines nspawn installed.
 
 ## Networking
 

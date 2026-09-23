@@ -32,7 +32,11 @@ is the oldest host the suite runs on; Debian 12 with systemd 252 does not
 work), overlayfs, `ip`, `nft`, `curl`, `python3`, access to Docker Hub, a
 registry with the test image (`fedora:44` by default), and mkosi for the build
 step. The mstack pass runs only on systemd 261 with systemd-nsresourced and
-systemd-mountfsd installed (Arch); elsewhere it is skipped and says so. Install the binary
+systemd-mountfsd installed (Arch); elsewhere it is skipped and says so. The
+D-Bus section installs the bus service with `nspawn daemon --install` (a
+configuration file under /run carries the registry and CA), drives it with
+`busctl` and `nspawn exec --bus`, and removes the service's files at the end;
+another reason the suite belongs on a disposable VM. Install the binary
 where a system service may execute it, since the unit hooks run it:
 
 ```

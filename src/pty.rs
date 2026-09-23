@@ -125,7 +125,7 @@ fn propagate_window_size(pty: &OwnedFd) {
 }
 
 /// The local terminal's size, when standard output is one.
-fn window_size() -> Option<(u16, u16)> {
+pub fn window_size() -> Option<(u16, u16)> {
     let stdout = io::stdout();
     let mut ws = Winsize {
         ws_row: 0,

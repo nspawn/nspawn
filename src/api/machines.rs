@@ -723,6 +723,37 @@ pub async fn exec_in_namespaces(
         .with_context(|| format!("running a command inside {machine}"))
 }
 
+/// Starts a command inside a machine without waiting for it: what the bus service hands
+/// out with its streams. `extra_env` comes after the image's and the remembered one.
+pub async fn spawn_in_namespaces(
+    ctx: &Context,
+    machine: &str,
+    command: &[String],
+    user: &str,
+    extra_env: &[String],
+    stdio: nsenter::Stdio,
+) -> Result<nsenter::Process> {
+    let sd = ctx.sd().await?;
+    if !sd.machine_exists(machine).await? {
+        bail!("machine {machine} is not running");
+    }
+    let record = ctx.store.load_image(machine)?;
+    let record = record.as_ref();
+    let leader = sd.machine_leader(machine).await?;
+    let user = if user == "root" || user.is_empty() {
+        None
+    } else {
+        Some(user)
+    };
+    let working_dir = record.and_then(|r| r.run.working_dir.as_deref());
+    let env = record
+        .map(|r| volume::merge_env(&r.run.env, &r.env))
+        .unwrap_or_default();
+    let env = volume::merge_env(&env, extra_env);
+    tokio::task::block_in_place(|| nsenter::spawn(leader, command, user, working_dir, &env, stdio))
+        .with_context(|| format!("running a command inside {machine}"))
+}
+
 /// The login session machined offers for a booted machine: a PTY running `path` (the
 /// user's shell when empty) with `args`. A machine that has just been started has no
 /// D-Bus yet for a few seconds; OpenMachineShell is retried for a while.

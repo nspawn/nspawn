@@ -62,6 +62,19 @@ pub enum Command {
     Logs(LogsArgs),
     /// The bridge network shared by the machines.
     Network(NetworkArgs),
+    /// Serve org.nspawn on the system bus (started by the bus; see --install).
+    Daemon(DaemonArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DaemonArgs {
+    /// Write the bus policy, the activation file and the unit that make the bus start
+    /// this binary on demand, then return.
+    #[arg(long)]
+    pub install: bool,
+    /// Exit after this many seconds without a call or a job; 0 keeps serving.
+    #[arg(long, default_value_t = 60, value_name = "SECONDS")]
+    pub idle_exit: u64,
 }
 
 #[derive(Args, Debug)]
@@ -349,6 +362,10 @@ pub struct ExecArgs {
     /// Kept for compatibility: exec always enters the machine's namespaces now.
     #[arg(long, hide = true)]
     pub nsenter: bool,
+    /// Go through the org.nspawn service on the system bus (see docs/DBUS.md) instead of
+    /// entering the machine from here.
+    #[arg(long)]
+    pub bus: bool,
     /// Command and arguments.
     #[arg(required = true, trailing_var_arg = true)]
     pub command: Vec<String>,

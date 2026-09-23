@@ -134,6 +134,14 @@ through `80-container-ve.network`. In that mode `start` activates systemd-networ
 the host has no `.network` files of its own and refuses with an explanation otherwise,
 and binds `ve-<name>` to firewalld's trusted zone while the machine runs.
 
+## D-Bus
+
+Everything above is also available on the system bus as `org.nspawn`, backed
+by the same code: `sudo nspawn daemon --install` makes the bus start the
+service on demand. Images, machines, the network and credentials are methods
+on `org.nspawn.Manager`; pulls, pushes, builds and creates come back as job
+objects with their output and result. See `docs/DBUS.md`.
+
 ## Requirements
 
 - A host with systemd-nspawn and systemd-machined 255 or newer (255, 259 and 261 are

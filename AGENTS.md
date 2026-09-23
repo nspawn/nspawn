@@ -7,6 +7,7 @@ anything:
 
 - README.md: what the tool does and how it is used.
 - docs/ARCHITECTURE.md: modules, on-disk layout, networking, unit hooks.
+- docs/DBUS.md: the org.nspawn interface on the system bus.
 - docs/HACKING.md: building, unit tests, clippy, the end-to-end suite, the test VM.
 - CONTRIBUTING.md: commit messages and what every change must come with.
 

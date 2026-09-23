@@ -11,6 +11,7 @@ mod bridge;
 mod cli;
 mod commands;
 mod config;
+mod daemon;
 mod hostnet;
 mod hub;
 mod install;

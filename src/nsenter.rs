@@ -1,9 +1,11 @@
 //! docker exec for machines that have no D-Bus inside: enter the namespaces of the
-//! machine's leader process and run a command on a pseudo terminal.
+//! machine's leader process and run a command there, on a pseudo terminal, on pipes or
+//! on the caller's own streams.
 //!
 //! setns() into a mount namespace is refused for multithreaded processes, and children
 //! only land in a PID namespace after a fork, so the work happens in a forked helper: the
 //! helper joins the namespaces, forks once more, and the grandchild execs the command.
+//! The helper reports the grandchild's PID and exits with its exit code.
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -13,15 +15,56 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
 use nix::libc;
+use nix::pty::Winsize;
 use nix::sched::{setns, CloneFlags};
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{
-    chdir, dup2_stderr, dup2_stdin, dup2_stdout, execve, fork, setgid, setgroups, setsid, setuid,
-    ForkResult, Gid, Uid,
+    chdir, dup2_stderr, dup2_stdin, dup2_stdout, execve, fork, pipe2, setgid, setgroups, setsid,
+    setuid, ForkResult, Gid, Pid, Uid,
 };
 
 use crate::pty;
+
+/// How the command's standard streams are set up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stdio {
+    /// The caller's own: piped input and output pass through byte for byte.
+    Inherit,
+    /// A pseudo terminal of this size; its master comes back in `Process::master`.
+    Pty { rows: u16, cols: u16 },
+    /// Three pipes; the caller's ends come back in `Process`.
+    Pipes,
+}
+
+/// A command started inside a machine and not waited for yet.
+pub struct Process {
+    /// The helper that forked the command; `wait` reaps it for the command's exit code.
+    pub helper: Pid,
+    /// The command's PID as the host sees it, when the helper got that far.
+    pub pid: Option<u32>,
+    pub master: Option<OwnedFd>,
+    pub stdin: Option<OwnedFd>,
+    pub stdout: Option<OwnedFd>,
+    pub stderr: Option<OwnedFd>,
+}
+
+/// The command's side of the streams.
+enum ChildIo {
+    Inherit,
+    Pty(OwnedFd),
+    Pipes {
+        stdin: OwnedFd,
+        stdout: OwnedFd,
+        stderr: OwnedFd,
+    },
+}
+
+fn cloexec(fd: &OwnedFd) -> Result<()> {
+    fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).context("setting close-on-exec")?;
+    Ok(())
+}
 
 nix::ioctl_write_int_bad!(tiocsctty, libc::TIOCSCTTY);
 
@@ -37,9 +80,9 @@ const NAMESPACES: [(&str, CloneFlags); 7] = [
     ("mnt", CloneFlags::CLONE_NEWNS),
 ];
 
-/// Runs `argv` inside the machine whose leader is `leader`, attached to the local terminal,
-/// with `env` (the image's environment) plus PATH and TERM when missing. Returns the
-/// command's exit code.
+/// Runs `argv` inside the machine whose leader is `leader`, attached to the local terminal
+/// (a pseudo terminal when standard input is one, the streams as they are otherwise),
+/// with `image_env` plus PATH and TERM when missing. Returns the command's exit code.
 pub fn exec(
     leader: u32,
     argv: &[String],
@@ -47,6 +90,41 @@ pub fn exec(
     working_dir: Option<&str>,
     image_env: &[String],
 ) -> Result<i32> {
+    // A pseudo terminal only when the caller has one, as docker does with -t: piped
+    // input and output pass through byte for byte otherwise, and EOF is a real EOF.
+    let stdio = if nix::unistd::isatty(std::io::stdin()).unwrap_or(false) {
+        let (rows, cols) = pty::window_size().unwrap_or((24, 80));
+        Stdio::Pty { rows, cols }
+    } else {
+        Stdio::Inherit
+    };
+    let process = spawn(leader, argv, user, working_dir, image_env, stdio)?;
+    let session = match process.master {
+        Some(master) => pty::run_session(master),
+        None => Ok(()),
+    };
+    let code = wait(process.helper)?;
+    session?;
+    Ok(code)
+}
+
+/// Reaps the helper of a `Process`: the command's exit code, 128 plus the signal when
+/// it died of one.
+pub fn wait(helper: Pid) -> Result<i32> {
+    let status = waitpid(helper, None).context("waiting for the namespace helper")?;
+    Ok(exit_code(status))
+}
+
+/// Starts `argv` inside the machine whose leader is `leader`, with `image_env` plus PATH
+/// and TERM when missing, its streams set up as `stdio` says.
+pub fn spawn(
+    leader: u32,
+    argv: &[String],
+    user: Option<&str>,
+    working_dir: Option<&str>,
+    image_env: &[String],
+    stdio: Stdio,
+) -> Result<Process> {
     if argv.is_empty() {
         bail!("no command given");
     }
@@ -84,39 +162,71 @@ pub fn exec(
     }
     let c_cwd = CString::new(working_dir.unwrap_or("/"))?;
     let user = user.map(|u| u.to_string());
-    // A pseudo terminal only when the caller has one, as docker does with -t: piped
-    // input and output pass through byte for byte otherwise, and EOF is a real EOF.
-    let pty = if nix::unistd::isatty(std::io::stdin()).unwrap_or(false) {
-        Some(nix::pty::openpty(None, None).context("allocating a pseudo terminal")?)
-    } else {
-        None
+    // Everything the two sides hold, made before the fork. The command's ends are kept
+    // out of what it execs (dup2 onto 0, 1 and 2 clears close-on-exec there).
+    let mut parent = Process {
+        helper: Pid::from_raw(0),
+        pid: None,
+        master: None,
+        stdin: None,
+        stdout: None,
+        stderr: None,
     };
+    let child_io = match stdio {
+        Stdio::Inherit => ChildIo::Inherit,
+        Stdio::Pty { rows, cols } => {
+            let size = Winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            let pty =
+                nix::pty::openpty(Some(&size), None).context("allocating a pseudo terminal")?;
+            cloexec(&pty.master)?;
+            cloexec(&pty.slave)?;
+            parent.master = Some(pty.master);
+            ChildIo::Pty(pty.slave)
+        }
+        Stdio::Pipes => {
+            let (stdin_r, stdin_w) = pipe2(OFlag::O_CLOEXEC).context("creating a pipe")?;
+            let (stdout_r, stdout_w) = pipe2(OFlag::O_CLOEXEC).context("creating a pipe")?;
+            let (stderr_r, stderr_w) = pipe2(OFlag::O_CLOEXEC).context("creating a pipe")?;
+            parent.stdin = Some(stdin_w);
+            parent.stdout = Some(stdout_r);
+            parent.stderr = Some(stderr_r);
+            ChildIo::Pipes {
+                stdin: stdin_r,
+                stdout: stdout_w,
+                stderr: stderr_w,
+            }
+        }
+    };
+    // The helper tells the command's PID through here, right after forking it.
+    let (pid_r, pid_w) = pipe2(OFlag::O_CLOEXEC).context("creating a pipe")?;
 
     // SAFETY: the parent is multithreaded (tokio), so the child only performs syscalls and
     // work on data prepared above until it execs or exits.
     match unsafe { fork() }.context("forking the namespace helper")? {
         ForkResult::Parent { child } => {
             drop(ns_fds);
-            let session = match pty {
-                Some(pty) => {
-                    drop(pty.slave);
-                    pty::run_session(pty.master)
-                }
-                None => Ok(()),
-            };
-            let status = waitpid(child, None).context("waiting for the namespace helper")?;
-            session?;
-            Ok(exit_code(status))
+            drop(child_io);
+            drop(pid_w);
+            parent.helper = child;
+            let mut bytes = [0u8; 4];
+            if nix::unistd::read(&pid_r, &mut bytes) == Ok(4) {
+                parent.pid = Some(u32::from_ne_bytes(bytes));
+            }
+            Ok(parent)
         }
         ForkResult::Child => {
-            let slave = pty.map(|p| {
-                drop(p.master);
-                p.slave
-            });
+            drop(parent);
+            drop(pid_r);
             let code = helper(
                 &ns_fds,
                 cgroup.as_deref(),
-                slave.as_ref(),
+                child_io,
+                pid_w,
                 &c_argv,
                 &env,
                 &c_cwd,
@@ -136,10 +246,12 @@ fn leader_cgroup(leader: u32) -> Option<String> {
         .map(|path| format!("/sys/fs/cgroup{path}/cgroup.procs"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn helper(
     ns_fds: &[(&str, CloneFlags, OwnedFd)],
     cgroup: Option<&str>,
-    slave: Option<&OwnedFd>,
+    io: ChildIo,
+    pid_w: OwnedFd,
     argv: &[CString],
     env: &[CString],
     cwd: &CString,
@@ -165,41 +277,62 @@ fn helper(
             eprintln!("error: forking inside the machine: {e}");
             126
         }
-        Ok(ForkResult::Parent { child }) => match waitpid(child, None) {
-            Ok(status) => exit_code(status),
-            Err(e) => {
-                eprintln!("error: waiting for the command: {e}");
-                126
+        Ok(ForkResult::Parent { child }) => {
+            let _ = nix::unistd::write(&pid_w, &(child.as_raw() as u32).to_ne_bytes());
+            drop(pid_w);
+            drop(io);
+            match waitpid(child, None) {
+                Ok(status) => exit_code(status),
+                Err(e) => {
+                    eprintln!("error: waiting for the command: {e}");
+                    126
+                }
             }
-        },
+        }
         Ok(ForkResult::Child) => {
-            let code = grandchild(slave, argv, env, cwd, user);
+            drop(pid_w);
+            let code = grandchild(io, argv, env, cwd, user);
             unsafe { libc::_exit(code) }
         }
     }
 }
 
 fn grandchild(
-    slave: Option<&OwnedFd>,
+    io: ChildIo,
     argv: &[CString],
     env: &[CString],
     cwd: &CString,
     user: Option<&str>,
 ) -> i32 {
-    if let Some(slave) = slave {
-        if setsid().is_err() {
-            eprintln!("error: setsid failed");
-            return 126;
+    match &io {
+        ChildIo::Inherit => {}
+        ChildIo::Pty(slave) => {
+            if setsid().is_err() {
+                eprintln!("error: setsid failed");
+                return 126;
+            }
+            if unsafe { tiocsctty(slave.as_raw_fd(), 0) }.is_err() {
+                eprintln!("error: cannot take the terminal");
+                return 126;
+            }
+            if dup2_stdin(slave.as_fd()).is_err()
+                || dup2_stdout(slave.as_fd()).is_err()
+                || dup2_stderr(slave.as_fd()).is_err()
+            {
+                return 126;
+            }
         }
-        if unsafe { tiocsctty(slave.as_raw_fd(), 0) }.is_err() {
-            eprintln!("error: cannot take the terminal");
-            return 126;
-        }
-        if dup2_stdin(slave.as_fd()).is_err()
-            || dup2_stdout(slave.as_fd()).is_err()
-            || dup2_stderr(slave.as_fd()).is_err()
-        {
-            return 126;
+        ChildIo::Pipes {
+            stdin,
+            stdout,
+            stderr,
+        } => {
+            if dup2_stdin(stdin.as_fd()).is_err()
+                || dup2_stdout(stdout.as_fd()).is_err()
+                || dup2_stderr(stderr.as_fd()).is_err()
+            {
+                return 126;
+            }
         }
     }
     if let Err(e) = chdir(cwd.as_c_str()) {

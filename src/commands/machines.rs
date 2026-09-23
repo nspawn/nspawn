@@ -121,7 +121,11 @@ pub async fn stop(args: StopArgs, ctx: &Context) -> Result<()> {
 }
 
 pub async fn exec(args: ExecArgs, ctx: &Context) -> Result<()> {
-    let code = machines::exec_in_namespaces(ctx, &args.machine, &args.command, &args.user).await?;
+    let code = if args.bus {
+        crate::commands::bus::exec(&args.machine, &args.command, &args.user).await?
+    } else {
+        machines::exec_in_namespaces(ctx, &args.machine, &args.command, &args.user).await?
+    };
     std::process::exit(code);
 }
 

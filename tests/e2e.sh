@@ -15,13 +15,18 @@ nonce=$$
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-dbus; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
   $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || true
   rm -rf /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol
   kill "${listener_pid:-}" 2>/dev/null || true
+  # The bus service installed for the D-Bus section.
+  systemctl stop nspawn.service >/dev/null 2>&1 || true
+  rm -f /etc/dbus-1/system.d/org.nspawn.conf /usr/share/dbus-1/system-services/org.nspawn.service /etc/systemd/system/nspawn.service /run/nspawn-e2e.toml
+  semodule -r nspawn >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
   if [ "$networkd_was" != active ]; then
     systemctl stop systemd-networkd.service systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-resolve-hook.socket >/dev/null 2>&1 || true
   fi
@@ -116,7 +121,9 @@ for backend in overlay flat mstack; do
   ip -br addr show nspawn0 | grep -q "10.99.0.1/24" || fail "bridge nspawn0 missing or without its address"
   nft list map ip nspawn ports >/dev/null 2>&1 || fail "nftables table of the bridge missing"
   if firewall-cmd --state >/dev/null 2>&1; then
-    [ "$(firewall-cmd --get-zone-of-interface=nspawn0)" = trusted ] || fail "nspawn0 is not in the trusted zone of firewalld"
+    # NetworkManager takes a new bridge over for a moment and firewalld follows it before
+    # settling on the binding nspawn made; the binding itself is not in question.
+    retry 5 bash -c "[ \"\$(firewall-cmd --get-zone-of-interface=nspawn0)\" = trusted ]" || fail "nspawn0 is not in the trusted zone of firewalld"
   fi
   addr=$($NSPAWN network ls | awk -v n="$name" '$1 == n {print $2}')
   echo "$name has address $addr"
@@ -354,6 +361,64 @@ ls /etc/systemd/system/ | grep -q "$app" && fail "unit files left behind for $ap
 step "pipelines: a reader that closes early must not make nspawn fail"
 $NSPAWN hub ls | head -c 1 >/dev/null; rc=${PIPESTATUS[0]}
 [ "$rc" = 0 ] || [ "$rc" = 141 ] || fail "nspawn exited with $rc when the pipe closed"
+
+step "D-Bus: org.nspawn does what the command line does"
+if command -v busctl >/dev/null 2>&1; then
+  # The service reads the registry and CA from a configuration file; the unit gets it.
+  printf 'registry = "%s"\nca_cert = "%s"\n' "$NSPAWN_REGISTRY" "$NSPAWN_CA_CERT" > /run/nspawn-e2e.toml
+  $NSPAWN --config /run/nspawn-e2e.toml daemon --install > /tmp/e2e-dbus.txt || fail "daemon --install"
+  grep -q "wrote /etc/systemd/system/nspawn.service" /tmp/e2e-dbus.txt || fail "install did not write the unit"
+  B="busctl --system --timeout=120"
+  M="org.nspawn /org/nspawn org.nspawn.Manager"
+  $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines StartMachine StopMachine Exec Logs ListNetwork NetworkUp Login Logout; do
+    grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
+  done
+  for sig in JobOutput JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do
+    grep -q "^\.$sig  *signal" /tmp/e2e-introspect.txt || fail "signal $sig missing from org.nspawn.Manager"
+  done
+  systemctl is-active nspawn.service >/dev/null || fail "the bus did not start nspawn.service"
+  [ "$($B get-property $M Version)" = "s \"$($NSPAWN --version | awk '{print $2}')\"" ] || fail "Version property"
+  job=$($B call $M PullImage 'sa{sv}' "$IMAGE" 3 name s e2e-dbus backend s overlay force b true | awk '{print $2}' | tr -d '"')
+  echo "pull job: $job"
+  echo "$job" | grep -q "^/org/nspawn/job/" || fail "PullImage did not return a job path"
+  retry 90 bash -c "[ \"\$($B get-property org.nspawn $job org.nspawn.Job State)\" != 's \"running\"' ]" || fail "the pull job did not end"
+  [ "$($B get-property org.nspawn $job org.nspawn.Job State)" = 's "done"' ] || { $B get-property org.nspawn $job org.nspawn.Job Error; fail "the pull job failed"; }
+  $B get-property org.nspawn $job org.nspawn.Job Output | grep -q "assembling as overlay" || fail "the job kept no output"
+  $B get-property org.nspawn $job org.nspawn.Job Result | grep -q '"name" s "e2e-dbus"' || fail "the job kept no result"
+  $B get-property $M Jobs | grep -q "$job" || fail "Jobs property misses the job"
+  $B call $M ListImages | grep -q '"name" s "e2e-dbus"' || fail "ListImages misses the pulled image"
+  $B call $M GetImage s e2e-dbus | grep -q '"mode" s "boot"' || fail "GetImage"
+  [ "$($B call $M StartMachine 'sa{sv}' e2e-dbus 0)" = 's "started"' ] || fail "StartMachine"
+  $B call $M ListMachines b false > /tmp/e2e-lm.txt
+  grep -q '"name" s "e2e-dbus"' /tmp/e2e-lm.txt || fail "ListMachines misses the machine"
+  grep -q '"machine_path" s "/org/freedesktop/machine1/machine/e2e_2ddbus"' /tmp/e2e-lm.txt || fail "ListMachines has no machined path"
+  grep -q '"state" s "running"' /tmp/e2e-lm.txt || fail "ListMachines: not running"
+  $B call $M ListNetwork | grep -q '"name" s "e2e-dbus"' || fail "ListNetwork misses the machine"
+  # Exec hands the command's streams over the bus; the command line can be its client.
+  out=$($NSPAWN exec --bus e2e-dbus -- /bin/sh -c "echo via-bus-$nonce; exit 7" </dev/null); code=$?
+  [ "$code" = 7 ] || fail "exec --bus did not propagate the exit code (got $code)"
+  echo "$out" | grep -q "via-bus-$nonce" || fail "exec --bus lost the output: $out"
+  [ "$(printf 'a\nb' | $NSPAWN exec --bus e2e-dbus -- cat)" = "$(printf 'a\nb')" ] || fail "exec --bus pipes are not byte exact"
+  $NSPAWN exec --bus e2e-dbus -- /bin/sh -c 'echo to-err >&2' </dev/null 2>&1 >/dev/null | grep -q to-err || fail "exec --bus lost stderr"
+  [ "$($NSPAWN exec --bus e2e-dbus --user 65534 -- id -u </dev/null | tr -d '\r')" = "65534" ] || fail "exec --bus ignored --user"
+  proc=$($B get-property $M Processes | awk '{print $3}' | tr -d '"')
+  echo "$proc" | grep -q "^/org/nspawn/process/" || fail "no process object after Exec"
+  [ "$($B get-property org.nspawn $proc org.nspawn.Process State)" = 's "exited"' ] || fail "the process object did not see the exit"
+  [ "$($B get-property org.nspawn $proc org.nspawn.Process ExitStatus)" = "i 7" ] || fail "the process object kept the wrong exit status"
+  [ "$($B call $M StopMachine 'sa{sv}' e2e-dbus 0)" = 's "stopped"' ] || fail "StopMachine"
+  $B call $M ListMachines b true | grep -q '"state" s "stopped"' || fail "ListMachines with all misses the stopped machine"
+  $B call $M RemoveImages as 1 e2e-dbus | grep -q "removed e2e-dbus" || fail "RemoveImages"
+  $B call $M Login sss "$NSPAWN_REGISTRY" tester s3cret > /dev/null || fail "Login over the bus"
+  python3 -c "import json; d = json.load(open('/etc/nspawn/auth.json')); assert '$NSPAWN_REGISTRY' in d['auths']" || fail "credentials from the bus not stored"
+  [ "$($B call $M Logout s "$NSPAWN_REGISTRY")" = "b true" ] || fail "Logout over the bus"
+  out=$($B call $M StartMachine 'sa{sv}' e2e-dbus 1 bogus s x 2>&1) && fail "an unknown option was accepted"
+  echo "$out" | grep -q "unknown option" || fail "unknown option not named: $out"
+  out=$($B call $M GetImage s e2e-nonexistent 2>&1) && fail "GetImage of a missing image succeeded"
+  echo "$out" | grep -q "no image named" || fail "missing image not explained: $out"
+else
+  echo "busctl not installed: skipping the D-Bus section"
+fi
 
 step "error handling (these commands must fail with a useful message)"
 out=$($NSPAWN pull "$NSPAWN_REGISTRY/does-not-exist:1" --name e2e-x 2>&1); rc=$?

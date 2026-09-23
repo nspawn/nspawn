@@ -1,5 +1,6 @@
 //! Command implementations.
 
+mod bus;
 mod login;
 mod machines;
 
@@ -230,6 +231,25 @@ pub async fn run(cli: Cli) -> Result<()> {
             NetworkCommand::Publish { name } => api::network::publish(&ctx, &name).await,
             NetworkCommand::Release { name } => api::network::release(&ctx, &name),
         },
+        Command::Daemon(a) => {
+            if a.install {
+                for line in crate::daemon::install::install(
+                    config.config_path.as_deref(),
+                    &config.state_dir,
+                )
+                .await?
+                {
+                    println!("{line}");
+                }
+                println!(
+                    "{} is available on the system bus; the bus starts it on demand",
+                    crate::daemon::BUS_NAME
+                );
+                return Ok(());
+            }
+            let idle = (a.idle_exit > 0).then(|| std::time::Duration::from_secs(a.idle_exit));
+            crate::daemon::run(config, idle).await
+        }
     }
 }
 
