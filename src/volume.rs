@@ -134,6 +134,24 @@ pub fn merge_env(base: &[String], extra: &[String]) -> Vec<String> {
 
 /// Parses the -e values: VAR=value as given, VAR alone copied from this environment.
 /// "none" alone clears the list; a later value of the same variable wins.
+/// Copies the value of every bare `VAR` from this process's environment, so that a
+/// caller's variables reach a service that has an environment of its own. `VAR=value`
+/// and "none" pass through as they are.
+pub fn expand_env(values: &[String]) -> Result<Vec<String>> {
+    values
+        .iter()
+        .map(|value| {
+            if value.contains('=') || value == "none" {
+                return Ok(value.clone());
+            }
+            match std::env::var(value) {
+                Ok(current) => Ok(format!("{value}={current}")),
+                Err(_) => bail!("{value} is not set in the environment; give it as {value}=VALUE"),
+            }
+        })
+        .collect()
+}
+
 pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
     if values.len() == 1 && values[0] == "none" {
         return Ok(Vec::new());
@@ -163,6 +181,22 @@ pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_variables_are_copied_from_the_environment_before_a_call() {
+        std::env::set_var("NSPAWN_TEST_EXPAND", "yes");
+        let values = [
+            "A=1".to_string(),
+            "NSPAWN_TEST_EXPAND".to_string(),
+            "none".to_string(),
+        ];
+        assert_eq!(
+            expand_env(&values).unwrap(),
+            ["A=1", "NSPAWN_TEST_EXPAND=yes", "none"]
+        );
+        let err = expand_env(&["NSPAWN_TEST_UNSET_XYZ".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("not set in the environment"));
+    }
 
     #[test]
     fn volume_syntax() {

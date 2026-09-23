@@ -97,6 +97,7 @@ impl Job {
 /// the library context and a reporter whose events become the job's output.
 pub async fn spawn<F, Fut>(
     state: &Arc<State>,
+    ctx: Arc<Context>,
     kind: &str,
     target: &str,
     work: F,
@@ -134,18 +135,18 @@ where
         let job = job.clone();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                let text = match event {
-                    Event::Line(t) | Event::Note(t) => t,
+                let (kind, text) = match event {
+                    Event::Line(t) => ("line", t),
+                    Event::Note(t) => ("note", t),
                 };
                 job.output.lock().unwrap().push(text.clone());
                 if let Ok(emitter) = state.emitter() {
-                    let _ = Manager::job_output(&emitter, job.path.as_ref(), &text).await;
+                    let _ = Manager::job_output(&emitter, job.path.as_ref(), kind, &text).await;
                 }
             }
         })
     };
     let state = state.clone();
-    let ctx = state.ctx.clone();
     tokio::spawn(async move {
         let outcome = work(ctx, reporter).await;
         // The reporter is gone with `work`; the forwarder ends once the channel drains.

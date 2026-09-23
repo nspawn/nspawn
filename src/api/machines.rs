@@ -696,33 +696,6 @@ fn send_signal(pid: i32, signal: i32) -> nix::Result<()> {
     nix::errno::Errno::result(unsafe { libc::kill(pid, signal) }).map(drop)
 }
 
-/// docker exec: through the namespaces of the machine's leader, for every kind of
-/// machine, so that the exit code comes back and nothing inside (D-Bus, PAM) is needed.
-/// The command runs with the terminal of this process; see `nsenter::exec`.
-pub async fn exec_in_namespaces(
-    ctx: &Context,
-    machine: &str,
-    command: &[String],
-    user: &str,
-) -> Result<i32> {
-    let sd = ctx.sd().await?;
-    if !sd.machine_exists(machine).await? {
-        bail!("machine {machine} is not running");
-    }
-    let record = ctx.store.load_image(machine)?;
-    let record = record.as_ref();
-    let leader = sd.machine_leader(machine).await?;
-    let user = if user == "root" { None } else { Some(user) };
-    let working_dir = record.and_then(|r| r.run.working_dir.as_deref());
-    // The image's environment plus what -e added, like the program itself sees: one entry
-    // per variable, the later one winning.
-    let env: Vec<String> = record
-        .map(|r| volume::merge_env(&r.run.env, &r.env))
-        .unwrap_or_default();
-    tokio::task::block_in_place(|| nsenter::exec(leader, command, user, working_dir, &env))
-        .with_context(|| format!("running a command inside {machine}"))
-}
-
 /// Starts a command inside a machine without waiting for it: what the bus service hands
 /// out with its streams. `extra_env` comes after the image's and the remembered one.
 pub async fn spawn_in_namespaces(

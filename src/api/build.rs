@@ -3,9 +3,10 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{ExitStatus, Stdio};
 
 use anyhow::{bail, Context as _, Result};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::api::{line, require_root, Context, Report};
 use crate::backend::{Backend, BackendChoice};
@@ -83,10 +84,7 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
 
     let argv = mkosi_arguments(request, &image, &directory, &output_dir, &cache_dir);
     line(report, format!("running: mkosi {}", argv.join(" ")));
-    let status = Command::new(&mkosi)
-        .args(&argv)
-        .status()
-        .with_context(|| format!("running {}", mkosi.display()))?;
+    let status = run_mkosi(&mkosi, &argv, report).await?;
     if !status.success() {
         if !request.keep_output {
             let _ = fs::remove_dir_all(&output_dir);
@@ -186,6 +184,30 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
         mode,
         output,
     })
+}
+
+/// Runs mkosi with both its streams reported line by line as they come, so that a
+/// caller sees the build wherever it sits.
+async fn run_mkosi(mkosi: &Path, argv: &[String], report: Report<'_>) -> Result<ExitStatus> {
+    let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+        .context("creating a pipe for mkosi's output")?;
+    let mut child = {
+        let write2 = write.try_clone()?;
+        let mut command = tokio::process::Command::new(mkosi);
+        command
+            .args(argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(write))
+            .stderr(Stdio::from(write2));
+        command
+            .spawn()
+            .with_context(|| format!("running {}", mkosi.display()))?
+    };
+    let mut lines = BufReader::new(tokio::fs::File::from_std(fs::File::from(read))).lines();
+    while let Ok(Some(text)) = lines.next_line().await {
+        line(report, text);
+    }
+    child.wait().await.context("waiting for mkosi")
 }
 
 /// The mkosi command line: OCI output with zstd layers into a private directory.

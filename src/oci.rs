@@ -37,16 +37,6 @@ pub enum ModeChoice {
     App,
 }
 
-impl ModeChoice {
-    pub fn to_mode(self) -> Option<Mode> {
-        match self {
-            ModeChoice::Auto => None,
-            ModeChoice::Boot => Some(Mode::Boot),
-            ModeChoice::App => Some(Mode::App),
-        }
-    }
-}
-
 /// The parts of the OCI config that matter at run time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSpec {

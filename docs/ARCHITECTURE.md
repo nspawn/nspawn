@@ -10,8 +10,9 @@ machine units call nspawn back through drop-in hooks.
 | Module | Role |
 |---|---|
 | `api/` | the library: typed operations on images, machines and the network; nothing here prints, progress goes through a `Report` and results come back as values |
-| `cli.rs`, `commands/` | clap definitions and the terminal side: argument conversion, tables, prompts, the commands that own the terminal (exec, shell, logs) |
-| `daemon/` | the D-Bus service `org.nspawn`: the Manager interface, jobs, dictionaries, the files that make the bus start it |
+| `cli.rs`, `commands/` | clap definitions and the terminal side: argument conversion into calls on the service, tables, prompts, the commands that own the terminal (exec, shell, logs) |
+| `client/` | the proxies for `org.nspawn`, how its errors read, how a job is followed |
+| `daemon/` | the D-Bus service `org.nspawn`: the Manager interface, jobs, processes, dictionaries, the files that make the bus start it |
 | `config.rs` | `/etc/nspawn/nspawn.toml`, environment and flags |
 | `reference.rs` | image references, local names, machine name rules |
 | `hub.rs`, `auth.rs`, `search.rs` | registry client, credentials, search |
@@ -91,14 +92,24 @@ extraction, so an image cannot redirect a file or its data.
 
 `nspawn daemon` serves `org.nspawn` (`docs/DBUS.md`). The bus starts it
 through `nspawn.service` when a client calls, and it exits after a minute
-without a call or a job. Every method is a thin conversion around an `api`
-function: options come as `a{sv}` and are read by name and type (an unknown
-key is an error), results go back as dictionaries with the command line's
-spellings. Pull, push, build and create run as jobs: the method returns
-`/org/nspawn/job/N` at once, the job's report events become `JobOutput`
-signals and the object's `Output`, and `JobRemoved` says how it ended.
-machined's `MachineNew` and `MachineRemoved` are relayed as `MachineStarted`
-and `MachineStopped` for the machines nspawn installed.
+without a call, a job or a command running. Every method is a thin
+conversion around an `api` function: options come as `a{sv}` and are read by
+name and type (an unknown key is an error), results go back as dictionaries
+with the command line's spellings. Pull, push, build and create run as jobs:
+the method returns `/org/nspawn/job/N` at once, the job's report events
+become `JobOutput` signals and the object's `Output`, and `JobRemoved` says
+how it ended. machined's `MachineNew` and `MachineRemoved` are relayed as
+`MachineStarted` and `MachineStopped` for the machines nspawn installed.
+
+The command line is a client of that service, so one code path does the
+work: `commands/` converts arguments into calls and prints what comes back,
+follows jobs line by line, and attaches the terminal to the descriptors
+`Exec`, `Shell` and `Logs` hand over. The registry and CA certificate the
+command line was given travel as options of each call, so `--registry`,
+`--ca-cert` and the environment keep their meaning. Only the service itself,
+`daemon --install` and the unit hooks (`network prepare`, `publish`,
+`release`, which must not depend on the service while a machine starts) run
+the library in the command line's own process.
 
 ## Networking
 

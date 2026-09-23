@@ -1,8 +1,8 @@
 # The D-Bus interface
 
-nspawn serves `org.nspawn` on the system bus. Everything the command line does
-is a method there, backed by the same library (`src/api`), so a client sees
-exactly what `nspawn` itself would do. machined stays an implementation
+nspawn serves `org.nspawn` on the system bus, and the command line is a
+client of it: everything `nspawn` does is a method here, so another client
+sees exactly what the command line sees. machined stays an implementation
 detail: a client never has to talk to it, though every machine carries its
 machined object path for whoever wants that view.
 
@@ -22,10 +22,12 @@ systemd and the bus:
 | `/etc/systemd/system/nspawn.service` | `Type=dbus` unit running `nspawn daemon` |
 
 Nothing runs until a client calls `org.nspawn`; the bus then starts the unit,
-and the service exits again after a minute without a call or a job
-(`nspawn daemon --idle-exit`). The service reads `/etc/nspawn/nspawn.toml`;
-`nspawn --config FILE daemon --install` puts another file on the unit's
-command line.
+and the service exits again after a minute without a call, a job or a command
+running (`nspawn daemon --idle-exit`). The service reads
+`/etc/nspawn/nspawn.toml`; `nspawn --config FILE daemon --install` puts
+another file on the unit's command line. The methods that reach a registry
+take `registry` and `ca_cert` options that override that configuration for
+one call; the command line passes its own on every call.
 
 Methods need root for now (the bus policy says so); polkit comes later.
 
@@ -52,14 +54,14 @@ Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 |---|---|---|
 | `ListImages() -> aa{sv}` | `images ls` | name, kind, backend, origin, reference, size, read_only |
 | `GetImage(s name) -> a{sv}` | | everything recorded: reference, digest, backend, origin, mode, created, network, address, ports, volumes, env, entrypoint, cmd, command, image_env, working_dir, user, stop_signal |
-| `PullImage(s reference, a{sv} options) -> o` | `pull` | options name, backend, mode, force; a job |
-| `CreateMachine(s source, s name, a{sv} options) -> o` | `create` | options backend, network, publish, force, entrypoint, env, volume, command; a job |
-| `PushImage(s image, a{sv} options) -> o` | `push` | option to; a job |
-| `BuildImage(s directory, s tag, a{sv} options) -> o` | `build` | options name, distribution, release, profile, backend, mode, force, keep_output, mkosi_args; a job (mkosi's own output goes to the service's log) |
+| `PullImage(s reference, a{sv} options) -> o` | `pull` | options name, backend, mode, force, registry, ca_cert; a job |
+| `CreateMachine(s source, s name, a{sv} options) -> o` | `create` | options backend, network, publish, force, entrypoint, env, volume, command, registry, ca_cert; a job |
+| `PushImage(s image, a{sv} options) -> o` | `push` | options to, registry, ca_cert; a job |
+| `BuildImage(s directory, s tag, a{sv} options) -> o` | `build` | options name, distribution, release, profile, backend, mode, force, keep_output, mkosi_args, registry, ca_cert; a job whose output includes mkosi's |
 | `RemoveImages(as names) -> as` | `images rm` | the lines it prints |
-| `SearchImages(s term, s source, u limit) -> aa{sv}` | `search` | source "", "hub" or "dockerhub" |
-| `ListRepositories(s filter, b with_tags) -> aa{sv}` | `hub ls` | |
-| `ListTags(s repository) -> as` | `hub tags` | |
+| `SearchImages(s term, s source, u limit, a{sv} options) -> aa{sv}` | `search` | source "", "hub" or "dockerhub"; options registry, ca_cert |
+| `ListRepositories(s filter, b with_tags, a{sv} options) -> aa{sv}` | `hub ls` | options registry, ca_cert |
+| `ListTags(s repository, a{sv} options) -> as` | `hub tags` | options registry, ca_cert |
 
 ### Machines
 
@@ -69,6 +71,7 @@ Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 | `StartMachine(s name, a{sv} options) -> s` | `start` | options wait (default true), network, publish, entrypoint, env, volume, image_command, command; "started" or "ended" |
 | `StopMachine(s name, a{sv} options) -> s` | `stop` | options force, wait (default true), timeout (seconds, default 10); "stopped" or "was-not-running" |
 | `Exec(s machine, as argv, s user, a{sv} options) -> (a{sh}, o)` | `exec` | user "" for root; options tty (default true), rows, cols, env; returns the streams ("tty", or "stdin", "stdout", "stderr") and a process object |
+| `Shell(s machine, s user) -> (h, s)` | `shell` | the login session machined offers for a booted machine: its pseudo terminal and the terminal's path; apps get `Exec` of a shell with a tty instead |
 | `Logs(s machine, a{sv} options) -> h` | `logs` | options follow, lines, since, timestamps, all, inside; a pipe carrying the lines |
 
 `StartMachine` waits for a booted machine's init and `StopMachine` for the
@@ -81,21 +84,21 @@ machine to be gone, which can take longer than a client's default timeout
 |---|---|
 | `ListNetwork() -> (a{sv}, aa{sv})` | `network ls`: the bridge (bridge, subnet, gateway, host_name) and the machines on it (name, address, ports, running) |
 | `NetworkUp() -> a{sv}` | `network up` |
-| `Login(s registry, s user, s password) -> a{sv}` | `login`; "" for the hub |
+| `Login(s registry, s user, s password, a{sv} options) -> a{sv}` | `login`; "" for the hub; options registry (the hub "" stands for), ca_cert |
 | `Logout(s registry) -> b` | `logout` |
 
 ### Signals
 
 | Signal | When |
 |---|---|
-| `JobOutput(o job, s line)` | a job said a line |
+| `JobOutput(o job, s kind, s line)` | a job said a line: kind "line" (progress, a result) or "note" (a remark) |
 | `JobRemoved(o job, s result)` | a job ended, "done" or "failed" |
 | `ImageAdded(s name)`, `ImageRemoved(s name)` | after a pull, create, build or removal |
 | `MachineStarted(s name)`, `MachineStopped(s name)` | machined's own events, for the machines nspawn installed |
 
-`nspawn exec --bus MACHINE -- COMMAND` is a client of `Exec`: a pseudo
-terminal when run from one, pipes otherwise, and the exit status of the
-command, exactly like `nspawn exec` without the flag.
+`nspawn exec` is a client of `Exec`: it asks for a pseudo terminal when run
+from one and for pipes otherwise, pumps them, and takes the exit status from
+the process object.
 
 ## org.nspawn.Process at /org/nspawn/process/N
 

@@ -3,7 +3,9 @@
 Docker-like management of [systemd-nspawn](https://www.freedesktop.org/software/systemd/man/latest/systemd-nspawn.html)
 machines. Images come from an OCI registry (the hub), are stored as shared layers and are
 started, inspected and stopped through the D-Bus APIs of systemd-machined and systemd
-itself. `machinectl` and `importctl` are never called.
+itself. `machinectl` and `importctl` are never called. The work is done by a service on
+the system bus, `org.nspawn`, and the command line is its client, the way `machinectl`
+and `systemctl` are clients of machined and systemd.
 
 ```
 nspawn hub ls                       # repositories and tags on the hub
@@ -136,22 +138,24 @@ and binds `ve-<name>` to firewalld's trusted zone while the machine runs.
 
 ## D-Bus
 
-Everything above is also available on the system bus as `org.nspawn`, backed
-by the same code: `sudo nspawn daemon --install` makes the bus start the
-service on demand. Images, machines, the network and credentials are methods
-on `org.nspawn.Manager`; pulls, pushes, builds and creates come back as job
-objects with their output and result. See `docs/DBUS.md`.
+Everything above is a method on `org.nspawn.Manager` on the system bus, and
+the command line is one client of it. `sudo nspawn daemon --install` makes the
+bus start the service on demand; without it every command says so. Images,
+machines, the network and credentials are methods; pulls, pushes, builds and
+creates come back as job objects with their output and result; `exec` hands
+the command's terminal or pipes over the bus. See `docs/DBUS.md`.
 
 ## Requirements
 
 - A host with systemd-nspawn and systemd-machined 255 or newer (255, 259 and 261 are
   tested; 252 cannot mount the generated files under `/run` of a machine), overlayfs for
   the `overlay` backend and cgroup v2.
-- Commands that change the host need root: `pull`, `create`, `build`, `images rm`, `start`,
-  `stop`, `login` and `logout` write below `/var/lib/machines`, `/var/lib/nspawn`,
-  `/etc/systemd` and `/etc/nspawn`. Listing, `search`, `logs` and `hub` do not.
+- The service, installed once with `sudo nspawn daemon --install`. It runs as root
+  and does everything below `/var/lib/machines`, `/var/lib/nspawn`, `/etc/systemd` and
+  `/etc/nspawn`; the bus policy lets root call it for now, so the command line still
+  runs with `sudo` until polkit rules arrive.
 - `shell` on a booted machine uses machined's login session, which needs D-Bus inside
-  (the hub images have it); `exec` enters the namespaces and needs nothing.
+  (the hub images have it); `exec` enters the namespaces and needs nothing inside.
 - The bridge network needs `ip` and `nft` on the host (iproute2 and nftables), nothing
   else. `--network veth` needs systemd-networkd on the host.
 

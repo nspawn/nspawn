@@ -25,13 +25,9 @@ use nix::unistd::{
     setuid, ForkResult, Gid, Pid, Uid,
 };
 
-use crate::pty;
-
 /// How the command's standard streams are set up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stdio {
-    /// The caller's own: piped input and output pass through byte for byte.
-    Inherit,
     /// A pseudo terminal of this size; its master comes back in `Process::master`.
     Pty { rows: u16, cols: u16 },
     /// Three pipes; the caller's ends come back in `Process`.
@@ -52,7 +48,6 @@ pub struct Process {
 
 /// The command's side of the streams.
 enum ChildIo {
-    Inherit,
     Pty(OwnedFd),
     Pipes {
         stdin: OwnedFd,
@@ -79,34 +74,6 @@ const NAMESPACES: [(&str, CloneFlags); 7] = [
     ("pid", CloneFlags::CLONE_NEWPID),
     ("mnt", CloneFlags::CLONE_NEWNS),
 ];
-
-/// Runs `argv` inside the machine whose leader is `leader`, attached to the local terminal
-/// (a pseudo terminal when standard input is one, the streams as they are otherwise),
-/// with `image_env` plus PATH and TERM when missing. Returns the command's exit code.
-pub fn exec(
-    leader: u32,
-    argv: &[String],
-    user: Option<&str>,
-    working_dir: Option<&str>,
-    image_env: &[String],
-) -> Result<i32> {
-    // A pseudo terminal only when the caller has one, as docker does with -t: piped
-    // input and output pass through byte for byte otherwise, and EOF is a real EOF.
-    let stdio = if nix::unistd::isatty(std::io::stdin()).unwrap_or(false) {
-        let (rows, cols) = pty::window_size().unwrap_or((24, 80));
-        Stdio::Pty { rows, cols }
-    } else {
-        Stdio::Inherit
-    };
-    let process = spawn(leader, argv, user, working_dir, image_env, stdio)?;
-    let session = match process.master {
-        Some(master) => pty::run_session(master),
-        None => Ok(()),
-    };
-    let code = wait(process.helper)?;
-    session?;
-    Ok(code)
-}
 
 /// Reaps the helper of a `Process`: the command's exit code, 128 plus the signal when
 /// it died of one.
@@ -173,7 +140,6 @@ pub fn spawn(
         stderr: None,
     };
     let child_io = match stdio {
-        Stdio::Inherit => ChildIo::Inherit,
         Stdio::Pty { rows, cols } => {
             let size = Winsize {
                 ws_row: rows,
@@ -305,7 +271,6 @@ fn grandchild(
     user: Option<&str>,
 ) -> i32 {
     match &io {
-        ChildIo::Inherit => {}
         ChildIo::Pty(slave) => {
             if setsid().is_err() {
                 eprintln!("error: setsid failed");

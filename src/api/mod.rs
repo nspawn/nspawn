@@ -39,6 +39,20 @@ impl Context {
         }
     }
 
+    /// The same context with another configuration (a caller's registry and CA
+    /// certificate), sharing the bus connection.
+    pub fn with_config(&self, config: Config) -> Self {
+        let store = Store::new(&config.machines_dir, &config.state_dir);
+        Context {
+            config,
+            store,
+            sd: match self.sd.get() {
+                Some(sd) => OnceCell::from(sd.clone()),
+                None => OnceCell::new(),
+            },
+        }
+    }
+
     /// The bus connection, made on first use: listing a hub or forgetting credentials
     /// must work where there is no bus.
     pub async fn sd(&self) -> Result<&Systemd> {

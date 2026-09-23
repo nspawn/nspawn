@@ -49,6 +49,24 @@ impl Manager {
     fn ctx(&self) -> &Context {
         &self.state.ctx
     }
+
+    /// The context for a call: the service's own, or one with the registry and CA
+    /// certificate the caller named in its options (registry (s), ca_cert (s)).
+    fn context_for(&self, options: &mut Options<'_>) -> anyhow::Result<Arc<Context>> {
+        let registry = options.string("registry")?.filter(|r| !r.is_empty());
+        let ca_cert = options.string("ca_cert")?.filter(|c| !c.is_empty());
+        if registry.is_none() && ca_cert.is_none() {
+            return Ok(self.state.ctx.clone());
+        }
+        let mut config = self.ctx().config.clone();
+        if let Some(registry) = registry {
+            config.registry = registry;
+        }
+        if let Some(ca_cert) = ca_cert {
+            config.ca_cert = Some(PathBuf::from(ca_cert));
+        }
+        Ok(Arc::new(self.ctx().with_config(config)))
+    }
 }
 
 fn backend_choice(text: Option<String>) -> anyhow::Result<BackendChoice> {
@@ -136,8 +154,8 @@ impl Manager {
         Ok(values::record(&record))
     }
 
-    /// Like `pull`. Options: name (s), backend (s), mode (s), force (b). The job's
-    /// result carries name, reference and mode.
+    /// Like `pull`. Options: name (s), backend (s), mode (s), force (b), registry (s),
+    /// ca_cert (s). The job's result carries name, reference and mode.
     async fn pull_image(
         &self,
         reference: String,
@@ -145,6 +163,7 @@ impl Manager {
     ) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
         let request = api::pull::PullRequest {
             reference,
             name: options.string("name")?,
@@ -160,6 +179,7 @@ impl Manager {
         let state = self.state.clone();
         Ok(jobs::spawn(
             &self.state,
+            ctx,
             "pull",
             &target,
             move |ctx, reporter| async move {
@@ -178,7 +198,7 @@ impl Manager {
     }
 
     /// Like `create`. Options: backend (s), network (s), publish (as), force (b),
-    /// entrypoint (s), env (as), volume (as), command (as).
+    /// entrypoint (s), env (as), volume (as), command (as), registry (s), ca_cert (s).
     async fn create_machine(
         &self,
         source: String,
@@ -187,6 +207,7 @@ impl Manager {
     ) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
         let request = api::create::CreateRequest {
             source,
             name: name.clone(),
@@ -203,6 +224,7 @@ impl Manager {
         let state = self.state.clone();
         Ok(jobs::spawn(
             &self.state,
+            ctx,
             "create",
             &name,
             move |ctx, reporter| async move {
@@ -219,7 +241,8 @@ impl Manager {
         .await?)
     }
 
-    /// Like `push`. Options: to (s). The job's result carries destination and url.
+    /// Like `push`. Options: to (s), registry (s), ca_cert (s). The job's result
+    /// carries destination and url.
     async fn push_image(
         &self,
         image: String,
@@ -227,6 +250,7 @@ impl Manager {
     ) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
         let request = api::push::PushRequest {
             image: image.clone(),
             to: options.string("to")?,
@@ -234,6 +258,7 @@ impl Manager {
         options.finish()?;
         Ok(jobs::spawn(
             &self.state,
+            ctx,
             "push",
             &image,
             move |ctx, reporter| async move {
@@ -249,8 +274,8 @@ impl Manager {
     }
 
     /// Like `build`. Options: name (s), distribution (s), release (s), profile (as),
-    /// backend (s), mode (s), force (b), keep_output (b), mkosi_args (as). mkosi's own
-    /// output goes to the service's log, not to the job.
+    /// backend (s), mode (s), force (b), keep_output (b), mkosi_args (as), registry
+    /// (s), ca_cert (s). mkosi's output comes through the job, line by line.
     async fn build_image(
         &self,
         directory: String,
@@ -259,6 +284,7 @@ impl Manager {
     ) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
         let request = api::build::BuildRequest {
             directory: PathBuf::from(directory),
             tag: tag.clone(),
@@ -276,6 +302,7 @@ impl Manager {
         let state = self.state.clone();
         Ok(jobs::spawn(
             &self.state,
+            ctx,
             "build",
             &tag,
             move |ctx, reporter| async move {
@@ -326,8 +353,18 @@ impl Manager {
     }
 
     /// Like `search`: source "" (both), "hub" or "dockerhub"; limit per source.
-    async fn search_images(&self, term: String, source: String, limit: u32) -> Result<Vec<Dict>> {
+    /// Options: registry (s), ca_cert (s).
+    async fn search_images(
+        &self,
+        term: String,
+        source: String,
+        limit: u32,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<Vec<Dict>> {
         let _busy = self.state.enter();
+        let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
+        options.finish()?;
         let source = match source.as_str() {
             "" => None,
             "hub" => Some(SearchSource::Hub),
@@ -340,20 +377,28 @@ impl Manager {
         };
         let quiet = |_: api::Event| {};
         let report: Report<'_> = &quiet;
-        let hits = api::search::search(self.ctx(), &term, source, limit as usize, report).await?;
+        let hits = api::search::search(&ctx, &term, source, limit as usize, report).await?;
         Ok(hits.iter().map(values::hit).collect())
     }
 
     /// Like `hub ls`: repositories containing `filter` ("" for all), with their tags when
-    /// asked.
-    async fn list_repositories(&self, filter: String, with_tags: bool) -> Result<Vec<Dict>> {
+    /// asked. Options: registry (s), ca_cert (s).
+    async fn list_repositories(
+        &self,
+        filter: String,
+        with_tags: bool,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<Vec<Dict>> {
         let _busy = self.state.enter();
+        let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
+        options.finish()?;
         let filter = if filter.is_empty() {
             None
         } else {
             Some(filter.as_str())
         };
-        let repos = api::hub::repositories(self.ctx(), filter, with_tags).await?;
+        let repos = api::hub::repositories(&ctx, filter, with_tags).await?;
         Ok(repos
             .into_iter()
             .map(|r| {
@@ -368,10 +413,17 @@ impl Manager {
             .collect())
     }
 
-    /// Like `hub tags`.
-    async fn list_tags(&self, repository: String) -> Result<Vec<String>> {
+    /// Like `hub tags`. Options: registry (s), ca_cert (s).
+    async fn list_tags(
+        &self,
+        repository: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<Vec<String>> {
         let _busy = self.state.enter();
-        Ok(api::hub::tags(self.ctx(), &repository).await?)
+        let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
+        options.finish()?;
+        Ok(api::hub::tags(&ctx, &repository).await?)
     }
 
     /// Like `ps` (and `ps -a` with `all`): every machine with its state, started time,
@@ -441,6 +493,25 @@ impl Manager {
             }
             .to_string(),
         )
+    }
+
+    /// The login session machined offers for a booted machine, like `shell`: a pseudo
+    /// terminal running the user's shell ("" for root), and the terminal's path. Apps
+    /// have no login inside: Exec with a shell and a tty is the way for them.
+    async fn shell(
+        &self,
+        machine: String,
+        user: String,
+    ) -> Result<(zbus::zvariant::OwnedFd, String)> {
+        let _busy = self.state.enter();
+        let user = if user.is_empty() {
+            "root".to_string()
+        } else {
+            user
+        };
+        let (fd, pty) =
+            api::machines::open_shell(self.ctx(), &machine, &user, "", Vec::new()).await?;
+        Ok((zbus::zvariant::OwnedFd::from(fd), pty))
     }
 
     /// Like `logs`: a pipe from which the lines come, journalctl behind it. Options:
@@ -546,17 +617,26 @@ impl Manager {
         Ok(values::bridge(&info))
     }
 
-    /// Like `login`: registry "" for the hub. Returns registry, username and whether
-    /// the registry asked for credentials.
-    async fn login(&self, registry: String, username: String, password: String) -> Result<Dict> {
+    /// Like `login`: registry "" for the hub. Options: registry (s, the hub "" stands
+    /// for), ca_cert (s). Returns registry, username and whether the registry asked for
+    /// credentials.
+    async fn login(
+        &self,
+        registry: String,
+        username: String,
+        password: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<Dict> {
         let _busy = self.state.enter();
+        let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
+        options.finish()?;
         let registry = if registry.is_empty() {
             None
         } else {
             Some(registry)
         };
-        let done =
-            api::login::login(self.ctx(), registry, Credentials { username, password }).await?;
+        let done = api::login::login(&ctx, registry, Credentials { username, password }).await?;
         Ok(HashMap::from([
             ("registry".to_string(), values::v(done.registry)),
             ("username".to_string(), values::v(done.username)),
@@ -575,11 +655,12 @@ impl Manager {
         Ok(api::login::logout(self.ctx(), registry)?.removed)
     }
 
-    /// A line a job said.
+    /// A line a job said: kind "line" (progress or a result) or "note" (a remark).
     #[zbus(signal)]
     pub async fn job_output(
         emitter: &SignalEmitter<'_>,
         job: ObjectPath<'_>,
+        kind: &str,
         line: &str,
     ) -> zbus::Result<()>;
 

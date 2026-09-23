@@ -12,8 +12,16 @@ fail() { echo "FAIL: $*"; failures=$((failures + 1)); }
 step() { echo; echo "### $*"; }
 retry() { local n=$1; shift; local i; for i in $(seq 1 "$n"); do "$@" && return 0; sleep 2; done; return 1; }
 nonce=$$
+# The command line is a client of the org.nspawn service: it goes on the bus first,
+# with a configuration file that names the registry and its CA for the service's own
+# use (the command line passes them on every call anyway).
+install_service() {
+  printf 'registry = "%s"\nca_cert = "%s"\n' "$NSPAWN_REGISTRY" "$NSPAWN_CA_CERT" > /run/nspawn-e2e.toml
+  $NSPAWN --config /run/nspawn-e2e.toml daemon --install > /tmp/e2e-install.txt 2>&1 || { cat /tmp/e2e-install.txt; echo "cannot install the service"; exit 1; }
+  cat /tmp/e2e-install.txt
+}
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
-cleanup() {
+cleanup_machines() {
   local m
   for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-dbus; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
@@ -22,16 +30,22 @@ cleanup() {
   $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || true
   rm -rf /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol
   kill "${listener_pid:-}" 2>/dev/null || true
-  # The bus service installed for the D-Bus section.
-  systemctl stop nspawn.service >/dev/null 2>&1 || true
-  rm -f /etc/dbus-1/system.d/org.nspawn.conf /usr/share/dbus-1/system-services/org.nspawn.service /etc/systemd/system/nspawn.service /run/nspawn-e2e.toml
-  semodule -r nspawn >/dev/null 2>&1 || true
-  systemctl daemon-reload >/dev/null 2>&1 || true
   if [ "$networkd_was" != active ]; then
     systemctl stop systemd-networkd.service systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-resolve-hook.socket >/dev/null 2>&1 || true
   fi
 }
-cleanup
+cleanup_service() {
+  systemctl stop nspawn.service >/dev/null 2>&1 || true
+  rm -f /etc/dbus-1/system.d/org.nspawn.conf /usr/share/dbus-1/system-services/org.nspawn.service /etc/systemd/system/nspawn.service /run/nspawn-e2e.toml
+  semodule -r nspawn >/dev/null 2>&1 || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+cleanup() {
+  cleanup_machines
+  cleanup_service
+}
+install_service
+cleanup_machines
 trap cleanup EXIT
 
 step "hub ls"
@@ -316,7 +330,13 @@ systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit le
 # A program that fails at once leaves the unit on its way down with the release hook
 # running; a start issued right then must not have its namespace pulled away.
 $NSPAWN start $app -- /bin/sh -c 'exit 3' >/dev/null 2>&1 || true
-$NSPAWN start $app -- /bin/sleep 300 || fail "start right after a program that failed at once"
+# "already running" is the right answer while the failed program is still alive (the
+# service answers within milliseconds); anything else at that moment is a bug.
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  out=$($NSPAWN start $app -- /bin/sleep 300 2>&1) && break
+  echo "$out" | grep -q "already running" || { echo "$out"; fail "start right after a program that failed at once"; break; }
+  sleep 0.2
+done
 retry 10 bash -c "$NSPAWN exec $app -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep -q 10.99.0" || fail "no bridge address after a start that followed a failed program"
 $NSPAWN stop $app >/dev/null || fail "stop after the quick restart"
 $NSPAWN start $app -- /bin/sh -c 'sleep 1' || fail "start short-lived app"
@@ -362,12 +382,9 @@ step "pipelines: a reader that closes early must not make nspawn fail"
 $NSPAWN hub ls | head -c 1 >/dev/null; rc=${PIPESTATUS[0]}
 [ "$rc" = 0 ] || [ "$rc" = 141 ] || fail "nspawn exited with $rc when the pipe closed"
 
-step "D-Bus: org.nspawn does what the command line does"
+step "D-Bus: org.nspawn as other clients see it"
 if command -v busctl >/dev/null 2>&1; then
-  # The service reads the registry and CA from a configuration file; the unit gets it.
-  printf 'registry = "%s"\nca_cert = "%s"\n' "$NSPAWN_REGISTRY" "$NSPAWN_CA_CERT" > /run/nspawn-e2e.toml
-  $NSPAWN --config /run/nspawn-e2e.toml daemon --install > /tmp/e2e-dbus.txt || fail "daemon --install"
-  grep -q "wrote /etc/systemd/system/nspawn.service" /tmp/e2e-dbus.txt || fail "install did not write the unit"
+  grep -q "wrote /etc/systemd/system/nspawn.service" /tmp/e2e-install.txt || fail "install did not write the unit"
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
@@ -395,21 +412,19 @@ if command -v busctl >/dev/null 2>&1; then
   grep -q '"machine_path" s "/org/freedesktop/machine1/machine/e2e_2ddbus"' /tmp/e2e-lm.txt || fail "ListMachines has no machined path"
   grep -q '"state" s "running"' /tmp/e2e-lm.txt || fail "ListMachines: not running"
   $B call $M ListNetwork | grep -q '"name" s "e2e-dbus"' || fail "ListNetwork misses the machine"
-  # Exec hands the command's streams over the bus; the command line can be its client.
-  out=$($NSPAWN exec --bus e2e-dbus -- /bin/sh -c "echo via-bus-$nonce; exit 7" </dev/null); code=$?
-  [ "$code" = 7 ] || fail "exec --bus did not propagate the exit code (got $code)"
-  echo "$out" | grep -q "via-bus-$nonce" || fail "exec --bus lost the output: $out"
-  [ "$(printf 'a\nb' | $NSPAWN exec --bus e2e-dbus -- cat)" = "$(printf 'a\nb')" ] || fail "exec --bus pipes are not byte exact"
-  $NSPAWN exec --bus e2e-dbus -- /bin/sh -c 'echo to-err >&2' </dev/null 2>&1 >/dev/null | grep -q to-err || fail "exec --bus lost stderr"
-  [ "$($NSPAWN exec --bus e2e-dbus --user 65534 -- id -u </dev/null | tr -d '\r')" = "65534" ] || fail "exec --bus ignored --user"
-  proc=$($B get-property $M Processes | awk '{print $3}' | tr -d '"')
+  # Every exec of this run went through Exec; each left a process object behind.
+  out=$($NSPAWN exec e2e-dbus -- /bin/sh -c "echo via-bus-$nonce; exit 7" </dev/null); code=$?
+  [ "$code" = 7 ] || fail "exec did not propagate the exit code (got $code)"
+  echo "$out" | grep -q "via-bus-$nonce" || fail "exec lost the output: $out"
+  proc=$($B get-property $M Processes | awk '{print $NF}' | tr -d '"')
   echo "$proc" | grep -q "^/org/nspawn/process/" || fail "no process object after Exec"
   [ "$($B get-property org.nspawn $proc org.nspawn.Process State)" = 's "exited"' ] || fail "the process object did not see the exit"
   [ "$($B get-property org.nspawn $proc org.nspawn.Process ExitStatus)" = "i 7" ] || fail "the process object kept the wrong exit status"
+  $B get-property org.nspawn $proc org.nspawn.Process Argv | grep -q "via-bus-$nonce" || fail "the process object has the wrong argv"
   [ "$($B call $M StopMachine 'sa{sv}' e2e-dbus 0)" = 's "stopped"' ] || fail "StopMachine"
   $B call $M ListMachines b true | grep -q '"state" s "stopped"' || fail "ListMachines with all misses the stopped machine"
   $B call $M RemoveImages as 1 e2e-dbus | grep -q "removed e2e-dbus" || fail "RemoveImages"
-  $B call $M Login sss "$NSPAWN_REGISTRY" tester s3cret > /dev/null || fail "Login over the bus"
+  $B call $M Login 'sssa{sv}' "$NSPAWN_REGISTRY" tester s3cret 0 > /dev/null || fail "Login over the bus"
   python3 -c "import json; d = json.load(open('/etc/nspawn/auth.json')); assert '$NSPAWN_REGISTRY' in d['auths']" || fail "credentials from the bus not stored"
   [ "$($B call $M Logout s "$NSPAWN_REGISTRY")" = "b true" ] || fail "Logout over the bus"
   out=$($B call $M StartMachine 'sa{sv}' e2e-dbus 1 bogus s x 2>&1) && fail "an unknown option was accepted"

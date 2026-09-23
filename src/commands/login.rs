@@ -7,11 +7,12 @@ use nix::sys::signal::{self, SigHandler, Signal};
 use nix::sys::termios::{self, LocalFlags, SetArg};
 use nix::unistd::isatty;
 
-use crate::api::{self, Context};
-use crate::auth::{self, Credentials};
+use crate::auth;
 use crate::cli::{LoginArgs, LogoutArgs};
+use crate::client::{self, Client};
+use crate::config::Config;
 
-pub async fn login(args: LoginArgs, ctx: &Context) -> Result<()> {
+pub async fn login(args: LoginArgs, client: &Client, config: &Config) -> Result<()> {
     let username = match args.username {
         Some(u) => u,
         None => prompt("Username: ", false)?,
@@ -26,30 +27,40 @@ pub async fn login(args: LoginArgs, ctx: &Context) -> Result<()> {
     } else {
         prompt("Password: ", true)?
     };
-    let done = api::login::login(ctx, args.registry, Credentials { username, password }).await?;
-    if done.asked {
-        println!("logged in to {} as {}", done.registry, done.username);
+    let done = client
+        .manager
+        .login(
+            args.registry.as_deref().unwrap_or(""),
+            &username,
+            &password,
+            client::registry_options(config),
+        )
+        .await
+        .map_err(client::error)?;
+    let registry = client::string(&done, "registry");
+    let username = client::string(&done, "username");
+    if client::bool(&done, "asked") {
+        println!("logged in to {registry} as {username}");
     } else {
         println!(
-            "{} did not ask for credentials; kept them for {} anyway in {}",
-            done.registry,
-            done.username,
+            "{registry} did not ask for credentials; kept them for {username} anyway in {}",
             auth::STORE
         );
     }
     Ok(())
 }
 
-pub fn logout(args: LogoutArgs, ctx: &Context) -> Result<()> {
-    let done = api::login::logout(ctx, args.registry)?;
-    if done.removed {
-        println!("removed the credentials for {}", done.registry);
+pub async fn logout(args: LogoutArgs, client: &Client, config: &Config) -> Result<()> {
+    let registry = args.registry.unwrap_or_else(|| config.registry.clone());
+    let removed = client
+        .manager
+        .logout(&registry)
+        .await
+        .map_err(client::error)?;
+    if removed {
+        println!("removed the credentials for {registry}");
     } else {
-        println!(
-            "no credentials stored for {} in {}",
-            done.registry,
-            auth::STORE
-        );
+        println!("no credentials stored for {registry} in {}", auth::STORE);
     }
     Ok(())
 }

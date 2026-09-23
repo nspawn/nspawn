@@ -101,7 +101,7 @@ pub fn machine(m: &MachineSummary) -> Dict {
     dict.insert("name".to_string(), v(m.name.as_str()));
     dict.insert("state".to_string(), v(m.state.as_str()));
     dict.insert("started".to_string(), v(m.started.unwrap_or(0)));
-    dict.insert("leader".to_string(), v(m.leader.unwrap_or(0)));
+    dict.insert("leader".to_string(), v(u64::from(m.leader.unwrap_or(0))));
     dict.insert("os".to_string(), opt_string(m.os.as_deref()));
     dict.insert(
         "machine_path".to_string(),

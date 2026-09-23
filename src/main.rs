@@ -9,6 +9,7 @@ mod auth;
 mod backend;
 mod bridge;
 mod cli;
+mod client;
 mod commands;
 mod config;
 mod daemon;

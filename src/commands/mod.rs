@@ -1,23 +1,21 @@
-//! Command implementations.
+//! The terminal side: arguments in, tables and lines out. Everything goes through the
+//! org.nspawn service on the system bus; only the service itself, its installation and
+//! the hooks the machine units call run the library in this process.
 
-mod bus;
 mod login;
 mod machines;
 
 use anyhow::Result;
+use zbus::zvariant::Value;
 
-use crate::api::{self, Context, Event};
+use crate::api::{self, Context};
+use crate::backend::BackendChoice;
 use crate::cli::{Cli, Command, HubCommand, ImagesCommand, MachinesCommand, NetworkCommand};
+use crate::client::{self, Client, Options};
 use crate::config::Config;
+use crate::oci::ModeChoice;
 use crate::output::{human_bytes, table};
-
-/// Events on the terminal: lines to stdout, notes to stderr.
-pub fn print(event: Event) {
-    match event {
-        Event::Line(text) => println!("{text}"),
-        Event::Note(text) => eprintln!("{text}"),
-    }
-}
+use crate::search::SearchSource;
 
 pub async fn run(cli: Cli) -> Result<()> {
     let config = Config::load(
@@ -25,212 +23,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         cli.registry.clone(),
         cli.ca_cert.clone(),
     )?;
-    let ctx = Context::new(config.clone());
     match cli.command {
-        Command::Hub(args) => match args.command {
-            HubCommand::Ls(a) => {
-                let repos = api::hub::repositories(&ctx, a.filter.as_deref(), !a.no_tags).await?;
-                if repos.is_empty() {
-                    println!("no repositories on {}", ctx.config.registry);
-                } else {
-                    let rows = repos
-                        .into_iter()
-                        .map(|r| {
-                            vec![
-                                r.name,
-                                r.tags
-                                    .map(|t| t.join(", "))
-                                    .unwrap_or_else(|| "-".to_string()),
-                            ]
-                        })
-                        .collect();
-                    println!("{}", table(&["REPOSITORY", "TAGS"], rows));
-                }
-                Ok(())
-            }
-            HubCommand::Tags(a) => {
-                for tag in api::hub::tags(&ctx, &a.repository).await? {
-                    println!("{tag}");
-                }
-                Ok(())
-            }
-        },
-        Command::Pull(a) => {
-            let pulled = api::pull::pull(
-                &ctx,
-                &api::pull::PullRequest {
-                    reference: a.reference,
-                    name: a.name,
-                    backend: a.backend,
-                    mode: a.mode.to_mode(),
-                    force: a.force,
-                },
-                &print,
-            )
-            .await?;
-            println!(
-                "image {} ({} image) is ready: nspawn start {}",
-                pulled.name,
-                pulled.mode.name(),
-                pulled.name
-            );
-            Ok(())
-        }
-        Command::Search(a) => {
-            let hits = api::search::search(&ctx, &a.term, a.source, a.limit, &print).await?;
-            if hits.is_empty() {
-                println!("nothing found for {:?}", a.term);
-                return Ok(());
-            }
-            let rows: Vec<Vec<String>> = hits
-                .into_iter()
-                .map(|h| {
-                    vec![
-                        h.source,
-                        h.name,
-                        shorten(&h.description, 60),
-                        match h.stars {
-                            Some(n) => n.to_string(),
-                            None => "-".to_string(),
-                        },
-                        if h.official { "yes" } else { "-" }.to_string(),
-                    ]
-                })
-                .collect();
-            println!(
-                "{}",
-                table(
-                    &["SOURCE", "NAME", "DESCRIPTION", "STARS", "OFFICIAL"],
-                    rows
-                )
-            );
-            Ok(())
-        }
-        Command::Login(args) => login::login(args, &ctx).await,
-        Command::Logout(args) => login::logout(args, &ctx),
-        Command::Build(a) => {
-            let built = api::build::build(
-                &ctx,
-                &api::build::BuildRequest {
-                    directory: a.directory,
-                    tag: a.tag,
-                    name: a.name,
-                    distribution: a.distribution,
-                    release: a.release,
-                    profile: a.profile,
-                    backend: a.backend,
-                    mode: a.mode.to_mode(),
-                    force: a.force,
-                    keep_output: a.keep_output,
-                    mkosi_args: a.mkosi_args,
-                },
-                &print,
-            )
-            .await?;
-            if let Some(output) = &built.output {
-                println!("mkosi output kept at {}", output.display());
-            }
-            println!(
-                "image {} ({} image) is ready: nspawn start {}, nspawn push {}",
-                built.name,
-                built.mode.name(),
-                built.name,
-                built.name
-            );
-            Ok(())
-        }
-        Command::Create(a) => {
-            let created = api::create::create(
-                &ctx,
-                &api::create::CreateRequest {
-                    source: a.source,
-                    name: a.name,
-                    backend: a.backend,
-                    network: a.network,
-                    publish: a.publish,
-                    force: a.force,
-                    entrypoint: a.entrypoint,
-                    env: a.env,
-                    volume: a.volume,
-                    command: a.command,
-                },
-                &print,
-            )
-            .await?;
-            println!(
-                "machine {} ({} image) is ready: nspawn start {}",
-                created.name,
-                created.mode.name(),
-                created.name
-            );
-            Ok(())
-        }
-        Command::Push(a) => {
-            let pushed = api::push::push(
-                &ctx,
-                &api::push::PushRequest {
-                    image: a.image,
-                    to: a.to,
-                },
-                &print,
-            )
-            .await?;
-            println!("pushed {}: {}", pushed.destination, pushed.url);
-            Ok(())
-        }
-        Command::Images(args) => match args.command {
-            ImagesCommand::Ls => images_ls(&ctx).await,
-            ImagesCommand::Rm(a) => api::images::remove(&ctx, &a.names, &print).await,
-        },
-        Command::Machines(args) => match args.command {
-            MachinesCommand::Ls(a) => machines::ls(a, &ctx).await,
-        },
-        Command::Ps(args) => machines::ls(args, &ctx).await,
-        Command::Start(args) => machines::start(args, &ctx).await,
-        Command::Stop(args) => machines::stop(args, &ctx).await,
-        Command::Exec(args) => machines::exec(args, &ctx).await,
-        Command::Shell(args) => machines::shell(args, &ctx).await,
-        Command::Logs(args) => machines::logs(args),
-        Command::Network(args) => match args.command {
-            NetworkCommand::Up => {
-                let info = api::network::up(&ctx).await?;
-                println!("{} is up: {} on {}", info.bridge, info.gateway, info.subnet);
-                Ok(())
-            }
-            NetworkCommand::Ls => {
-                let (info, entries) = api::network::list(&ctx).await?;
-                println!(
-                    "{} {} (gateway {}, host name {})",
-                    info.bridge, info.subnet, info.gateway, info.host_name
-                );
-                let rows = entries
-                    .into_iter()
-                    .map(|e| {
-                        vec![
-                            e.name,
-                            e.address
-                                .map(|a| a.to_string())
-                                .unwrap_or_else(|| "-".into()),
-                            if e.ports.is_empty() {
-                                "-".to_string()
-                            } else {
-                                e.ports
-                                    .iter()
-                                    .map(|p| p.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            },
-                            if e.running { "running" } else { "stopped" }.to_string(),
-                        ]
-                    })
-                    .collect();
-                println!("{}", table(&["MACHINE", "ADDRESS", "PORTS", "STATE"], rows));
-                Ok(())
-            }
-            NetworkCommand::Prepare { name } => api::network::prepare(&ctx, &name).await,
-            NetworkCommand::Publish { name } => api::network::publish(&ctx, &name).await,
-            NetworkCommand::Release { name } => api::network::release(&ctx, &name),
-        },
         Command::Daemon(a) => {
             if a.install {
                 for line in crate::daemon::install::install(
@@ -250,6 +43,329 @@ pub async fn run(cli: Cli) -> Result<()> {
             let idle = (a.idle_exit > 0).then(|| std::time::Duration::from_secs(a.idle_exit));
             crate::daemon::run(config, idle).await
         }
+        // The unit hooks must not depend on the service: a machine starts on its own.
+        Command::Network(args) => match args.command {
+            NetworkCommand::Prepare { name } => {
+                api::network::prepare(&Context::new(config), &name).await
+            }
+            NetworkCommand::Publish { name } => {
+                api::network::publish(&Context::new(config), &name).await
+            }
+            NetworkCommand::Release { name } => api::network::release(&Context::new(config), &name),
+            NetworkCommand::Up => {
+                let client = Client::connect().await?;
+                let info = client.manager.network_up().await.map_err(client::error)?;
+                println!(
+                    "{} is up: {} on {}",
+                    client::string(&info, "bridge"),
+                    client::string(&info, "gateway"),
+                    client::string(&info, "subnet")
+                );
+                Ok(())
+            }
+            NetworkCommand::Ls => {
+                let client = Client::connect().await?;
+                let (info, entries) = client.manager.list_network().await.map_err(client::error)?;
+                println!(
+                    "{} {} (gateway {}, host name {})",
+                    client::string(&info, "bridge"),
+                    client::string(&info, "subnet"),
+                    client::string(&info, "gateway"),
+                    client::string(&info, "host_name")
+                );
+                let rows = entries
+                    .iter()
+                    .map(|e| {
+                        vec![
+                            client::string(e, "name"),
+                            client::dash(client::string(e, "address")),
+                            client::dash(client::strings(e, "ports").join(" ")),
+                            if client::bool(e, "running") {
+                                "running"
+                            } else {
+                                "stopped"
+                            }
+                            .to_string(),
+                        ]
+                    })
+                    .collect();
+                println!("{}", table(&["MACHINE", "ADDRESS", "PORTS", "STATE"], rows));
+                Ok(())
+            }
+        },
+        command => {
+            let client = Client::connect().await?;
+            through_the_service(command, &client, &config).await
+        }
+    }
+}
+
+fn lowercase<T: std::fmt::Debug>(value: T) -> String {
+    format!("{value:?}").to_lowercase()
+}
+
+/// Adds the values the command line was given to the options of a call.
+fn put(options: &mut Options<'_>, key: &'static str, value: impl Into<Value<'static>>) {
+    options.insert(key, value.into());
+}
+
+fn put_opt(options: &mut Options<'_>, key: &'static str, value: Option<String>) {
+    if let Some(value) = value {
+        put(options, key, value);
+    }
+}
+
+fn put_all(options: &mut Options<'_>, key: &'static str, values: Vec<String>) {
+    if !values.is_empty() {
+        put(options, key, values);
+    }
+}
+
+fn backend(options: &mut Options<'_>, choice: BackendChoice) {
+    if choice != BackendChoice::Auto {
+        put(options, "backend", lowercase(choice));
+    }
+}
+
+fn mode(options: &mut Options<'_>, choice: ModeChoice) {
+    if choice != ModeChoice::Auto {
+        put(options, "mode", lowercase(choice));
+    }
+}
+
+async fn through_the_service(command: Command, client: &Client, config: &Config) -> Result<()> {
+    let manager = &client.manager;
+    match command {
+        Command::Hub(args) => match args.command {
+            HubCommand::Ls(a) => {
+                let repos = manager
+                    .list_repositories(
+                        a.filter.as_deref().unwrap_or(""),
+                        !a.no_tags,
+                        client::registry_options(config),
+                    )
+                    .await
+                    .map_err(client::error)?;
+                if repos.is_empty() {
+                    println!("no repositories on {}", config.registry);
+                } else {
+                    let rows = repos
+                        .iter()
+                        .map(|r| {
+                            vec![
+                                client::string(r, "name"),
+                                if a.no_tags {
+                                    "-".to_string()
+                                } else {
+                                    client::strings(r, "tags").join(", ")
+                                },
+                            ]
+                        })
+                        .collect();
+                    println!("{}", table(&["REPOSITORY", "TAGS"], rows));
+                }
+                Ok(())
+            }
+            HubCommand::Tags(a) => {
+                for tag in manager
+                    .list_tags(&a.repository, client::registry_options(config))
+                    .await
+                    .map_err(client::error)?
+                {
+                    println!("{tag}");
+                }
+                Ok(())
+            }
+        },
+        Command::Search(a) => {
+            let source = match a.source {
+                None => "",
+                Some(SearchSource::Hub) => "hub",
+                Some(SearchSource::Dockerhub) => "dockerhub",
+            };
+            let hits = manager
+                .search_images(
+                    &a.term,
+                    source,
+                    a.limit as u32,
+                    client::registry_options(config),
+                )
+                .await
+                .map_err(client::error)?;
+            if hits.is_empty() {
+                println!("nothing found for {:?}", a.term);
+                return Ok(());
+            }
+            let rows: Vec<Vec<String>> = hits
+                .iter()
+                .map(|h| {
+                    let stars = client::u64(h, "stars");
+                    vec![
+                        client::string(h, "source"),
+                        client::string(h, "name"),
+                        shorten(&client::string(h, "description"), 60),
+                        if stars == 0 {
+                            "-".to_string()
+                        } else {
+                            stars.to_string()
+                        },
+                        if client::bool(h, "official") {
+                            "yes"
+                        } else {
+                            "-"
+                        }
+                        .to_string(),
+                    ]
+                })
+                .collect();
+            println!(
+                "{}",
+                table(
+                    &["SOURCE", "NAME", "DESCRIPTION", "STARS", "OFFICIAL"],
+                    rows
+                )
+            );
+            Ok(())
+        }
+        Command::Login(args) => login::login(args, client, config).await,
+        Command::Logout(args) => login::logout(args, client, config).await,
+        Command::Pull(a) => {
+            let mut options = client::registry_options(config);
+            put_opt(&mut options, "name", a.name);
+            backend(&mut options, a.backend);
+            mode(&mut options, a.mode);
+            put(&mut options, "force", a.force);
+            let done = client
+                .run_job(|| manager.pull_image(&a.reference, options))
+                .await?;
+            println!(
+                "image {} ({} image) is ready: nspawn start {}",
+                client::string(&done, "name"),
+                client::string(&done, "mode"),
+                client::string(&done, "name")
+            );
+            Ok(())
+        }
+        Command::Build(a) => {
+            let mut options = client::registry_options(config);
+            put_opt(&mut options, "name", a.name);
+            put_opt(&mut options, "distribution", a.distribution);
+            put_opt(&mut options, "release", a.release);
+            put_all(&mut options, "profile", a.profile);
+            backend(&mut options, a.backend);
+            mode(&mut options, a.mode);
+            put(&mut options, "force", a.force);
+            put(&mut options, "keep_output", a.keep_output);
+            put_all(&mut options, "mkosi_args", a.mkosi_args);
+            // The service resolves the directory; give it an absolute one.
+            let directory = std::fs::canonicalize(&a.directory).unwrap_or(a.directory);
+            let directory = directory.to_string_lossy().into_owned();
+            let done = client
+                .run_job(|| manager.build_image(&directory, &a.tag, options))
+                .await?;
+            let output = client::string(&done, "output");
+            if !output.is_empty() {
+                println!("mkosi output kept at {output}");
+            }
+            let name = client::string(&done, "name");
+            println!(
+                "image {name} ({} image) is ready: nspawn start {name}, nspawn push {name}",
+                client::string(&done, "mode")
+            );
+            Ok(())
+        }
+        Command::Create(a) => {
+            let mut options = client::registry_options(config);
+            backend(&mut options, a.backend);
+            if let Some(network) = a.network {
+                put(&mut options, "network", lowercase(network));
+            }
+            put_all(&mut options, "publish", a.publish);
+            put(&mut options, "force", a.force);
+            put_opt(&mut options, "entrypoint", a.entrypoint);
+            put_all(&mut options, "env", crate::volume::expand_env(&a.env)?);
+            put_all(&mut options, "volume", a.volume);
+            put_all(&mut options, "command", a.command);
+            let done = client
+                .run_job(|| manager.create_machine(&a.source, &a.name, options))
+                .await?;
+            let name = client::string(&done, "name");
+            println!(
+                "machine {name} ({} image) is ready: nspawn start {name}",
+                client::string(&done, "mode")
+            );
+            Ok(())
+        }
+        Command::Push(a) => {
+            let mut options = client::registry_options(config);
+            put_opt(&mut options, "to", a.to);
+            let done = client
+                .run_job(|| manager.push_image(&a.image, options))
+                .await?;
+            println!(
+                "pushed {}: {}",
+                client::string(&done, "destination"),
+                client::string(&done, "url")
+            );
+            Ok(())
+        }
+        Command::Images(args) => match args.command {
+            ImagesCommand::Ls => {
+                let rows = manager
+                    .list_images()
+                    .await
+                    .map_err(client::error)?
+                    .iter()
+                    .map(|i| {
+                        let size = client::u64(i, "size");
+                        vec![
+                            client::string(i, "name"),
+                            client::string(i, "kind"),
+                            client::dash(client::string(i, "backend")),
+                            client::dash(client::string(i, "origin")),
+                            client::dash(client::string(i, "reference")),
+                            if size == 0 {
+                                "-".to_string()
+                            } else {
+                                human_bytes(size)
+                            },
+                            if client::bool(i, "read_only") {
+                                "yes"
+                            } else {
+                                "no"
+                            }
+                            .to_string(),
+                        ]
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    table(
+                        &["NAME", "TYPE", "BACKEND", "ORIGIN", "SOURCE", "SIZE", "RO"],
+                        rows
+                    )
+                );
+                Ok(())
+            }
+            ImagesCommand::Rm(a) => {
+                let lines = manager.remove_images(&a.names).await;
+                // What was removed before an error is reported by the error itself.
+                for line in lines.map_err(client::error)? {
+                    println!("{line}");
+                }
+                Ok(())
+            }
+        },
+        Command::Machines(args) => match args.command {
+            MachinesCommand::Ls(a) => machines::ls(a, client).await,
+        },
+        Command::Ps(args) => machines::ls(args, client).await,
+        Command::Start(args) => machines::start(args, client).await,
+        Command::Stop(args) => machines::stop(args, client).await,
+        Command::Exec(args) => machines::exec(args, client).await,
+        Command::Shell(args) => machines::shell(args, client).await,
+        Command::Logs(args) => machines::logs(args, client).await,
+        Command::Daemon(_) | Command::Network(_) => unreachable!("handled before"),
     }
 }
 
@@ -259,32 +375,4 @@ fn shorten(text: &str, max: usize) -> String {
     } else {
         format!("{}...", text.chars().take(max - 3).collect::<String>())
     }
-}
-
-async fn images_ls(ctx: &Context) -> Result<()> {
-    let rows = api::images::list(ctx)
-        .await?
-        .into_iter()
-        .map(|i| {
-            vec![
-                i.name,
-                i.kind,
-                i.backend
-                    .map(|b| format!("{b:?}").to_lowercase())
-                    .unwrap_or_else(|| "-".to_string()),
-                i.origin.unwrap_or_else(|| "-".to_string()),
-                i.reference.unwrap_or_else(|| "-".to_string()),
-                i.size.map(human_bytes).unwrap_or_else(|| "-".to_string()),
-                if i.read_only { "yes" } else { "no" }.to_string(),
-            ]
-        })
-        .collect();
-    println!(
-        "{}",
-        table(
-            &["NAME", "TYPE", "BACKEND", "ORIGIN", "SOURCE", "SIZE", "RO"],
-            rows
-        )
-    );
-    Ok(())
 }

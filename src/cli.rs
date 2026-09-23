@@ -362,10 +362,6 @@ pub struct ExecArgs {
     /// Kept for compatibility: exec always enters the machine's namespaces now.
     #[arg(long, hide = true)]
     pub nsenter: bool,
-    /// Go through the org.nspawn service on the system bus (see docs/DBUS.md) instead of
-    /// entering the machine from here.
-    #[arg(long)]
-    pub bus: bool,
     /// Command and arguments.
     #[arg(required = true, trailing_var_arg = true)]
     pub command: Vec<String>,

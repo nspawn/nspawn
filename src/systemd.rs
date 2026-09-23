@@ -8,6 +8,7 @@ use nix::libc;
 use zbus::Connection;
 use zbus_systemd::{machine1, systemd1};
 
+#[derive(Clone)]
 pub struct Systemd {
     conn: Connection,
     machined: machine1::ManagerProxy<'static>,
