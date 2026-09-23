@@ -20,3 +20,9 @@ override_dh_auto_install:
 
 override_dh_auto_clean:
 	rm -rf target debian/cargo-home
+
+# dh_clean deletes every *.orig in the tree, and cargo keeps a Cargo.toml.orig in
+# each vendored crate whose checksum it verifies: without this the build stops at
+# the first crate with "failed to calculate checksum".
+override_dh_clean:
+	dh_clean -Xvendor
