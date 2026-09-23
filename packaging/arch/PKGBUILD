@@ -46,6 +46,7 @@ package() {
   install -Dm644 packaging/polkit/org.nspawn.policy "${pkgdir}/usr/share/polkit-1/actions/org.nspawn.policy"
   install -Dm644 README.md docs/ARCHITECTURE.md docs/DBUS.md packaging/polkit/nspawn-wheel.rules -t "${pkgdir}/usr/share/doc/${pkgname}"
   install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
-  install -dm755 "${pkgdir}/etc/nspawn" "${pkgdir}/var/lib/nspawn"
+  install -dm755 "${pkgdir}/etc/nspawn"
+  install -dm711 "${pkgdir}/var/lib/nspawn"
 }
 

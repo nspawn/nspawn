@@ -221,6 +221,8 @@ impl Assembler<'_> {
         let work = private.join("work");
         fs::create_dir_all(&upper).with_context(|| format!("creating {}", upper.display()))?;
         fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
+        // What the machine writes, setuid programs among it, is nobody else's to reach.
+        crate::store::restrict(&private, crate::store::PRIVATE)?;
         let mp = mountpoint.to_string_lossy().to_string();
         let unit = unitname::mount_unit_for(&mp);
         let text = overlay_unit_text(name, &mp, layer_dirs, &upper, &work);

@@ -92,7 +92,7 @@ install -D -m 0644 %{name}.1 %{buildroot}%{_mandir}/man1/%{name}.1
 install -D -m 0644 packaging/selinux/%{name}.pp.bz2 %{buildroot}%{_datadir}/selinux/packages/%{selinuxtype}/%{name}.pp.bz2
 install -D -m 0644 packaging/selinux/%{name}.if %{buildroot}%{_datadir}/selinux/devel/include/contrib/%{name}.if
 install -d -m 0755 %{buildroot}%{_sysconfdir}/%{name}
-install -d -m 0755 %{buildroot}%{_sharedstatedir}/%{name}
+install -d -m 0711 %{buildroot}%{_sharedstatedir}/%{name}
 
 %check
 cargo test --release --offline
@@ -141,7 +141,7 @@ fi
 %{_datadir}/fish/vendor_completions.d/%{name}.fish
 %{_mandir}/man1/%{name}.1*
 %dir %{_sysconfdir}/%{name}
-%dir %{_sharedstatedir}/%{name}
+%dir %attr(0711,root,root) %{_sharedstatedir}/%{name}
 
 %files selinux
 %{_datadir}/selinux/packages/%{selinuxtype}/%{name}.pp.bz2

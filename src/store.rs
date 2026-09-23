@@ -215,19 +215,56 @@ impl Store {
     }
 
     pub fn init(&self) -> Result<()> {
-        for d in [
+        create_dir_with_mode(&self.root, PASSAGE)?;
+        for d in self.private_dirs() {
+            create_dir_with_mode(&d, PRIVATE)?;
+        }
+        create_dir_with_mode(&self.machines_private_dir(), PASSAGE)?;
+        self.protect()?;
+        // As systemd's tmpfiles makes it: the trees of machines are nobody else's business.
+        create_dir_with_mode(&self.machines_dir, PRIVATE)?;
+        check_writable(&self.machines_dir)
+    }
+
+    /// What below the state directory is root's alone: the layers hold what the images
+    /// hold, setuid programs and device nodes among them, which would work for any local
+    /// user who reached them; the records hold the machines' environment; volumes and
+    /// builds hold the machines' data and trees.
+    fn private_dirs(&self) -> [PathBuf; 9] {
+        [
             self.layers_dir(Ownership::Root),
             self.layers_dir(Ownership::Foreign),
             self.blobs_dir(),
             self.images_dir(),
-            self.machines_private_dir(),
+            self.manifests_dir(),
             self.volumes_dir(),
-        ] {
-            fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
+            self.root.join("builds"),
+            self.root.join("cache"),
+            self.root.join("starting"),
+        ]
+    }
+
+    /// Closes what earlier versions left open. The state directory and the machines'
+    /// directory stay passable: systemd-nspawn binds a machine's generated files from
+    /// inside the managed user namespace of an mstack machine, where it is nobody. A
+    /// machine's own directory is passable too, unless it holds the writable layer of an
+    /// overlay machine, which is as private as the image's.
+    pub fn protect(&self) -> Result<()> {
+        passable(&self.root)?;
+        for d in self.private_dirs() {
+            restrict(&d, PRIVATE)?;
         }
-        fs::create_dir_all(&self.machines_dir)
-            .with_context(|| format!("creating {}", self.machines_dir.display()))?;
-        check_writable(&self.machines_dir)
+        let machines = self.machines_private_dir();
+        passable(&machines)?;
+        if let Ok(entries) = fs::read_dir(&machines) {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if dir.is_dir() {
+                    restrict(&dir, machine_dir_mode(&dir))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn layers_dir(&self, ownership: Ownership) -> PathBuf {
@@ -571,6 +608,60 @@ impl Store {
             }
         }
         Ok(removed)
+    }
+}
+
+/// Root's alone.
+pub const PRIVATE: u32 = 0o700;
+/// Root's, and passable by anyone who knows a name inside.
+pub const PASSAGE: u32 = 0o711;
+
+/// Creates a directory with `mode`, its missing parents too.
+fn create_dir_with_mode(dir: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(mode)
+        .create(dir)
+        .with_context(|| format!("creating {}", dir.display()))
+}
+
+/// Takes from `path` what `mode` does not allow; one that does not exist is fine.
+pub fn restrict(path: &Path, mode: u32) -> Result<()> {
+    let current = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => meta.mode() & 0o7777,
+        Ok(_) => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    if current & !mode != 0 {
+        fs::set_permissions(path, fs::Permissions::from_mode(current & mode))
+            .with_context(|| format!("restricting {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Gives a directory exactly PASSAGE: less would keep an mstack machine from its files.
+fn passable(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() && meta.mode() & 0o7777 != PASSAGE => {
+            fs::set_permissions(path, fs::Permissions::from_mode(PASSAGE))
+                .with_context(|| format!("setting the mode of {}", path.display()))
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+/// A machine's own directory below the state directory: private once it holds the
+/// writable layer of an overlay machine (what the machine wrote, setuid programs among
+/// it), passable otherwise.
+pub fn machine_dir_mode(dir: &Path) -> u32 {
+    if dir.join("upper").exists() {
+        PRIVATE
+    } else {
+        PASSAGE
     }
 }
 
@@ -1663,6 +1754,64 @@ mod tests {
         assert!(validate_digest(&format!("sha256:{}", "A".repeat(64))).is_err());
         assert!(validate_digest(&format!("sha512:{}", "a".repeat(64))).is_err());
         assert!(validate_digest(&format!("sha256:{}", "a".repeat(63))).is_err());
+    }
+
+    #[test]
+    fn the_state_and_the_machines_are_root_s_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir_all(state.join("layers")).unwrap();
+        fs::create_dir_all(state.join("machines/web/upper")).unwrap();
+        fs::create_dir_all(state.join("machines/db")).unwrap();
+        for dir in ["layers", "machines", "machines/web", "machines/db"] {
+            fs::set_permissions(state.join(dir), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let store = Store::new(&tmp.path().join("new/machines"), &state);
+        store.init().unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().mode() & 0o777;
+        assert_eq!(
+            mode(&state),
+            0o711,
+            "an open state directory is closed but passable"
+        );
+        for private in [
+            "layers",
+            "layers-foreign",
+            "blobs",
+            "images",
+            "manifests",
+            "volumes",
+        ] {
+            assert_eq!(mode(&state.join(private)), 0o700, "{private}");
+        }
+        assert_eq!(mode(&state.join("machines")), 0o711);
+        assert_eq!(
+            mode(&state.join("machines/web")),
+            0o700,
+            "an overlay machine's writable layer is private"
+        );
+        assert_eq!(
+            mode(&state.join("machines/db")),
+            0o711,
+            "the generated files of an mstack machine are reachable from its namespace"
+        );
+        assert_eq!(mode(&tmp.path().join("new/machines")), 0o700);
+        assert_eq!(mode(&tmp.path().join("new")), 0o700, "missing parents too");
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        store.protect().unwrap();
+        assert_eq!(
+            mode(&state),
+            0o711,
+            "a closed one is opened for passing, which mstack machines need"
+        );
+        let missing = Store::new(tmp.path(), &tmp.path().join("nowhere"));
+        missing.protect().unwrap();
+        assert!(
+            !tmp.path().join("nowhere").exists(),
+            "protect makes nothing"
+        );
     }
 
     #[test]

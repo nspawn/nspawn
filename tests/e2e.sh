@@ -537,6 +537,12 @@ $NSPAWN start $app --label caddy=app.example --label tier=web --entrypoint /bin/
 retry 10 bash -c "$NSPAWN logs $app | grep_q RO-[A-Z]*-$nonce" || fail "app did not run"
 $NSPAWN logs $app > /tmp/e2e-logs.txt
 grep -q "greeting=hola hostvar=fromhost nonce=$nonce" /tmp/e2e-logs.txt || fail "-e variables not seen by the program"
+# What -e carries is often a secret, and the state holds the images' setuid programs.
+[ "$(stat -c %a /etc/systemd/nspawn/$app.nspawn)" = 600 ] || fail "the settings file with the -e variables is readable by others"
+[ "$(stat -c %a /var/lib/nspawn)" = 711 ] || fail "the state directory is open to others"
+for dir in layers blobs images volumes machines/$app; do
+  [ "$(stat -c %a /var/lib/nspawn/$dir)" = 700 ] || fail "/var/lib/nspawn/$dir is open to others"
+done
 grep -q "^from-host" /tmp/e2e-logs.txt || fail "bind mount not visible inside"
 grep -q "RO-OK-$nonce" /tmp/e2e-logs.txt || fail "read-only volume was writable"
 [ "$(cat /var/lib/nspawn/volumes/e2evol/written 2>/dev/null)" = from-app ] || fail "named volume not written on the host"

@@ -85,6 +85,10 @@ impl Drop for Busy {
 pub async fn run(config: Config, idle_exit: Option<Duration>) -> Result<()> {
     require_root("daemon")?;
     let state = Arc::new(State::new(Context::new(config)));
+    // Earlier versions left the state directory open to everyone.
+    if let Err(e) = state.ctx.store.protect() {
+        eprintln!("warning: {e:#}");
+    }
     let connection = zbus::connection::Builder::system()?
         .serve_at(MANAGER_PATH, Manager::new(state.clone()))?
         .build()

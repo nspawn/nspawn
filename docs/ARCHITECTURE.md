@@ -33,7 +33,9 @@ files, and the machine units call nspawn back through drop-in hooks.
 ## On disk
 
 ```
-/var/lib/nspawn/
+/var/lib/nspawn/     0711, and 0700 for everything below but machines/: the
+                     layers hold the images' setuid programs and device
+                     nodes, the records the machines' environment
   layers/            root-owned extracted layers (overlay backend)
   layers-foreign/    layers shifted into the foreign UID range (mstack)
   blobs/             compressed blobs, kept for push; .hold-* lists the blobs
@@ -43,14 +45,17 @@ files, and the machine units call nspawn back through drop-in hooks.
                      restart policy, limits
   manifests/NAME.json raw manifest bytes (digest stays valid)
   machines/NAME/     overlay upper/work, host0.network, hosts, resolv.conf,
-                     units/ for the volume wait unit
+                     units/ for the volume wait unit; 0700 with a writable
+                     layer, 0711 otherwise (an mstack machine binds its
+                     files from inside its user namespace)
   volumes/NAME/      named volumes
   starting/NAME      a start in progress, until the machine is registered:
                      nothing removes or replaces the image meanwhile
   .lock              flock serialising commands that change the store
 /var/lib/machines/NAME        the root machined boots (mount point or dir)
 /var/lib/machines/NAME.mstack mstack layout (layer@N links, rw/)
-/etc/systemd/nspawn/NAME.nspawn          generated settings, regenerated on start
+/etc/systemd/nspawn/NAME.nspawn          generated settings, regenerated on start;
+                                         0600, the -e variables are in it
 /etc/systemd/system/systemd-nspawn@NAME.service.d/
   nspawn-overlay.conf   RequiresMountsFor= (overlay)
   nspawn-hooks.conf     ExecStartPre/Post, ExecStopPost calling nspawn,

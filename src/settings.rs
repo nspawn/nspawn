@@ -378,18 +378,40 @@ pub fn unit_quote(arg: &str) -> String {
     quoted
 }
 
-/// Writes the file when it differs from what is there.
+/// Writes the file when it differs from what is there. It is root's alone: the
+/// environment given with -e often carries passwords and tokens.
 pub fn write(s: &MachineSettings, route: &NamespaceRoute) -> Result<()> {
-    let path = path(s.name);
-    let wanted = render_with(s, route);
-    if fs::read_to_string(&path)
+    write_private(&path(s.name), &render_with(s, route))
+}
+
+fn write_private(path: &Path, wanted: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if fs::read_to_string(path)
         .map(|current| current == wanted)
         .unwrap_or(false)
     {
-        return Ok(());
+        // Written by a version that left it readable by everyone.
+        return fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting {} to root", path.display()));
     }
-    fs::create_dir_all(SETTINGS_DIR).with_context(|| format!("creating {SETTINGS_DIR}"))?;
-    fs::write(&path, wanted).with_context(|| format!("writing {}", path.display()))
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    // Through a new file and a rename: a start never reads half of it, and the file
+    // is never readable by others for a moment.
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dir.join(format!(".{name}.{}", crate::store::unique_suffix()));
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .and_then(|mut file| file.write_all(wanted.as_bytes()))
+        .and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("writing {}", path.display()))
 }
 
 pub fn remove(name: &str) {
@@ -447,6 +469,34 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn settings_are_root_s_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nspawn/web.nspawn");
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        write_private(&path, "Environment=PASSWORD=secret\n").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "Environment=PASSWORD=secret\n"
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        write_private(&path, "Environment=PASSWORD=secret\n").unwrap();
+        assert_eq!(
+            mode(&path),
+            0o600,
+            "one an earlier version left open is closed"
+        );
+        write_private(&path, "Environment=PASSWORD=other\n").unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(
+            fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1,
+            "no temporary file left"
+        );
+    }
 
     #[test]
     fn quoting() {
