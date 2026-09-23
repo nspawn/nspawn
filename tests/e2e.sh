@@ -30,7 +30,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-dbus; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-dbus e2e-digest; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -127,6 +127,21 @@ for backend in overlay flat mstack; do
   $NSPAWN exec "$name" -- /usr/bin/cat /etc/os-release </dev/null | tr -d '\r' | grep -q PRETTY_NAME || fail "exec cat os-release"
   $NSPAWN exec "$name" -- /bin/sh -c 'exit 7' </dev/null; [ $? -eq 7 ] || fail "exec did not propagate the exit code of a booted machine"
   $NSPAWN exec "$name" -- /bin/sh -c 'echo $PATH' </dev/null | tr -d '\r' | grep -q "/usr/bin" || fail "exec has no PATH"
+  step "terminal: exec with a pty, shell through machined, the machine's own journal"
+  out=$(python3 "$(dirname "$0")/terminal.py" $NSPAWN exec "$name" -- /bin/sh -c 'tty; echo term=$TERM; exit 3' </dev/null 2>&1 | tr -d '\r'); rc=${PIPESTATUS[0]}
+  [ "$rc" = 3 ] || fail "exec on a pty did not propagate the exit code (got $rc)"
+  echo "$out" | grep -q "^/dev/pts/" || fail "exec from a terminal got no pty of the machine's: $out"
+  echo "$out" | grep -q "term=${TERM:-xterm}" || fail "exec on a pty has no TERM: $out"
+  out=$(printf 'echo shell-%s term=$TERM; exit\n' "$nonce" | python3 "$(dirname "$0")/terminal.py" $NSPAWN shell "$name" 2>&1 | tr -d '\r')
+  echo "$out" | grep -q "shell-$nonce term=${TERM:-xterm}" || fail "shell on $name did not run a command with a TERM: $(echo "$out" | tail -2)"
+  $NSPAWN logs "$name" --inside -n 3 </dev/null | grep -q . || fail "logs --inside of $name is empty"
+  $NSPAWN logs "$name" --all -n 3 </dev/null >/dev/null || fail "logs --all of $name"
+  $NSPAWN logs "$name" --since bogus </dev/null >/tmp/e2e-logs-out.txt 2>/tmp/e2e-logs-err.txt; rc=$?
+  [ "$rc" != 0 ] || fail "logs --since bogus exited 0"
+  [ ! -s /tmp/e2e-logs-out.txt ] || fail "journalctl's complaint went to stdout: $(cat /tmp/e2e-logs-out.txt)"
+  grep -qi "bogus\|timestamp" /tmp/e2e-logs-err.txt || fail "logs --since bogus said nothing on stderr: $(cat /tmp/e2e-logs-err.txt)"
+  timeout 5 $NSPAWN logs "$name" -f -n 2 </dev/null >/dev/null 2>&1; [ $? = 124 ] || fail "logs --follow did not keep following"
+  retry 5 bash -c "! pgrep -f '[j]ournalctl.*$name' >/dev/null" || fail "journalctl kept following after its client left"
   if [ "$backend" != flat ]; then
     step "volume in a booted machine ($backend: private users, idmapped)"
     $NSPAWN exec "$name" -- /bin/sh -c 'echo booted > /srv/vol/from-machine' </dev/null || fail "cannot write to the volume inside $name"
@@ -149,7 +164,7 @@ for backend in overlay flat mstack; do
   echo "$name has address $addr"
   echo "$addr" | grep -q "^10\.99\.0\." || fail "no bridge address recorded for $name"
   retry 15 bash -c "$NSPAWN exec $name -- /bin/sh -c 'ip -4 -o addr show host0 | grep -q $addr/24 && curl -sf -m 5 -o /dev/null https://download.opensuse.org/ && echo NET-OK' </dev/null | tr -d '\r' | grep -q NET-OK" \
-    || fail "no network inside $name through the bridge"
+    || { echo "-- inside $name:"; $NSPAWN exec "$name" -- /bin/sh -c 'ip -4 -o addr; ip route; ping -c 1 -W 2 10.99.0.1; curl -sS -m 5 -o /dev/null https://download.opensuse.org/' </dev/null 2>&1 | tr -d '\r'; bridge link show; fail "no network inside $name through the bridge"; }
   step "stop"
   $NSPAWN stop "$name" || fail "stop ($backend)"
   retry 15 bash -c "! $NSPAWN machines ls | grep -q '^ *$name '" || fail "$name still running after stop"
@@ -310,11 +325,28 @@ retry 15 bash -c "! $NSPAWN machines ls | grep -q '^ *$app '" || fail "busybox s
 [ -e /run/netns/nspawn-$app ] && fail "network namespace left behind for $app"
 systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit left in failed state after stop"
 
+step "host network, --no-wait, an app's shell and a missing program"
+$NSPAWN stop $app >/dev/null || fail "stop before the host-network start"
+$NSPAWN start $app --network host -p none -- /bin/sleep 300 || fail "start with --network host"
+$NSPAWN exec $app -- ip -o addr </dev/null | tr -d '\r' | grep -qv "host0" || fail "host network shows host0"
+$NSPAWN exec $app -- ip -o link </dev/null | tr -d '\r' | grep -q "$(ip -o link | awk -F': ' 'NR==2{print $2}' | cut -d@ -f1)" || fail "host network does not see the host's interfaces"
+out=$(printf 'echo appshell-%s; exit\n' "$nonce" | python3 "$(dirname "$0")/terminal.py" $NSPAWN shell $app 2>&1 | tr -d '\r')
+echo "$out" | grep -q "appshell-$nonce" || fail "shell on an app: $(echo "$out" | tail -2)"
+$NSPAWN exec $app -- /bin/sh -c 'exec >/dev/null 2>&1; sleep 12; exit 3' </dev/null; [ $? = 3 ] || fail "exec lost the exit code of a command that closed its streams early"
+$NSPAWN exec $app -- /no/such/program </dev/null >/dev/null 2>&1; [ $? = 127 ] || fail "exec of a missing program is not 127"
+$NSPAWN exec $app -- no-such-command-$nonce </dev/null >/dev/null 2>&1; [ $? = 127 ] || fail "exec of a command missing on PATH is not 127"
+$NSPAWN stop $app --no-wait || fail "stop --no-wait"
+retry 10 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "app still running after stop --no-wait"
+$NSPAWN start $app --network bridge --no-wait -- /bin/sleep 300 || fail "start --no-wait"
+retry 10 bash -c "$NSPAWN ps | grep -q '^ *$app '" || fail "app not running after start --no-wait"
+$NSPAWN stop $app >/dev/null || fail "stop after --no-wait start"
+
 step "stop: a program that ignores its stop signal is killed after --timeout"
 $NSPAWN start $app -- /bin/sh -c 'trap "" TERM; exec /bin/sleep 300' || fail "start stubborn app"
 t0=$(date +%s)
-$NSPAWN stop $app -t 2 || fail "stop of a stubborn app"
+out=$($NSPAWN stop $app -t 2 2>&1 >/dev/null) || fail "stop of a stubborn app"
 [ $(( $(date +%s) - t0 )) -lt 20 ] || fail "stop of a stubborn app took too long"
+echo "$out" | grep -q "ignored SIGTERM for 2 seconds; killing it" || fail "stop did not say that it had to kill the program: $out"
 retry 5 bash -c "! $NSPAWN ps | grep -q '^ *$app '" || fail "stubborn app still running"
 
 step "the remembered command, the unit hooks and an app that exits on its own"
@@ -394,7 +426,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines StartMachine StopMachine Exec Logs ListNetwork NetworkUp Login Logout; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines StartMachine StopMachine Exec Shell Logs ListNetwork NetworkUp Login Logout; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do
@@ -412,7 +444,16 @@ if command -v busctl >/dev/null 2>&1; then
   $B get-property $M Jobs | grep -q "$job" || fail "Jobs property misses the job"
   $B call $M ListImages | grep -q '"name" s "e2e-dbus"' || fail "ListImages misses the pulled image"
   $B call $M GetImage s e2e-dbus | grep -q '"mode" s "boot"' || fail "GetImage"
-  [ "$($B call $M StartMachine 'sa{sv}' e2e-dbus 0)" = 's "started"' ] || fail "StartMachine"
+  digest=$($B call $M GetImage s e2e-dbus | grep -oE '"digest" s "sha256:[0-9a-f]+"' | grep -oE 'sha256:[0-9a-f]+')
+  [ -n "$digest" ] || fail "GetImage has no digest"
+  $NSPAWN pull "${IMAGE%%:*}@$digest" --name e2e-digest --backend flat --force >/dev/null || fail "pull by digest"
+  $NSPAWN start e2e-digest >/dev/null && $NSPAWN exec e2e-digest -- /usr/bin/true </dev/null && $NSPAWN stop e2e-digest >/dev/null || fail "flat machine pulled by digest"
+  $NSPAWN images rm e2e-digest >/dev/null || fail "rm the digest machine"
+  [ "$($B call $M StartMachine 'sa{sv}' e2e-dbus 0)" = 'sas "started" 0' ] || fail "StartMachine"
+  out=$($NSPAWN images rm e2e-nothing-$nonce e2e-dbus 2>&1); rc=$?
+  [ "$rc" != 0 ] || fail "images rm of a running machine succeeded"
+  echo "$out" | grep -q "removed e2e-nothing-$nonce" || fail "images rm stopped at the first failure: $out"
+  echo "$out" | grep -q "machine e2e-dbus is running" || fail "images rm did not explain the failure: $out"
   $B call $M ListMachines b false > /tmp/e2e-lm.txt
   grep -q '"name" s "e2e-dbus"' /tmp/e2e-lm.txt || fail "ListMachines misses the machine"
   grep -q '"machine_path" s "/org/freedesktop/machine1/machine/e2e_2ddbus"' /tmp/e2e-lm.txt || fail "ListMachines has no machined path"
@@ -427,9 +468,23 @@ if command -v busctl >/dev/null 2>&1; then
   [ "$($B get-property org.nspawn $proc org.nspawn.Process State)" = 's "exited"' ] || fail "the process object did not see the exit"
   [ "$($B get-property org.nspawn $proc org.nspawn.Process ExitStatus)" = "i 7" ] || fail "the process object kept the wrong exit status"
   $B get-property org.nspawn $proc org.nspawn.Process Argv | grep -q "via-bus-$nonce" || fail "the process object has the wrong argv"
-  [ "$($B call $M StopMachine 'sa{sv}' e2e-dbus 0)" = 's "stopped"' ] || fail "StopMachine"
+  # A command nobody pumps: signalled through its object, it ends with 128 plus the signal.
+  proc=$($B call $M Exec 'sassa{sv}' e2e-dbus 2 /bin/sleep 300 "" 1 tty b false | grep -oE '"/org/nspawn/process/[0-9]+"' | tr -d '"')
+  [ -n "$proc" ] || fail "Exec over the bus returned no process object"
+  [ "$($B get-property org.nspawn $proc org.nspawn.Process State)" = 's "running"' ] || fail "the sleeping command is not running"
+  $B call org.nspawn $proc org.nspawn.Process Signal i 15 || fail "Signal over the bus"
+  retry 10 bash -c "[ \"\$($B get-property org.nspawn $proc org.nspawn.Process State)\" = 's \"exited\"' ]" || fail "the signalled command did not exit"
+  [ "$($B get-property org.nspawn $proc org.nspawn.Process ExitStatus)" = "i 143" ] || fail "the signalled command's status is not 143: $($B get-property org.nspawn $proc org.nspawn.Process ExitStatus)"
+  out=$($B call org.nspawn $proc org.nspawn.Process Signal i 15 2>&1) && fail "Signal to an exited process succeeded"
+  echo "$out" | grep -q "has exited" || fail "Signal to an exited process not refused with a reason: $out"
+  [ "$($B call $M StopMachine 'sa{sv}' e2e-dbus 0)" = 'sas "stopped" 0' ] || fail "StopMachine"
   $B call $M ListMachines b true | grep -q '"state" s "stopped"' || fail "ListMachines with all misses the stopped machine"
-  $B call $M RemoveImages as 1 e2e-dbus | grep -q "removed e2e-dbus" || fail "RemoveImages"
+  job=$($B call $M RemoveImages as 1 e2e-dbus | awk '{print $2}' | tr -d '"')
+  echo "$job" | grep -q "^/org/nspawn/job/" || fail "RemoveImages did not return a job path"
+  retry 30 bash -c "[ \"\$($B get-property org.nspawn $job org.nspawn.Job State)\" != 's \"running\"' ]" || fail "the rm job did not end"
+  [ "$($B get-property org.nspawn $job org.nspawn.Job State)" = 's "done"' ] || { $B get-property org.nspawn $job org.nspawn.Job Error; fail "the rm job failed"; }
+  $B get-property org.nspawn $job org.nspawn.Job Output | grep -q "removed e2e-dbus" || fail "the rm job said nothing about e2e-dbus"
+  $B get-property org.nspawn $job org.nspawn.Job Result | grep -q '"removed" as 1 "e2e-dbus"' || fail "the rm job has no result"
   $B call $M Login 'sssa{sv}' "$NSPAWN_REGISTRY" tester s3cret 0 > /dev/null || fail "Login over the bus"
   python3 -c "import json; d = json.load(open('/etc/nspawn/auth.json')); assert '$NSPAWN_REGISTRY' in d['auths']" || fail "credentials from the bus not stored"
   [ "$($B call $M Logout s "$NSPAWN_REGISTRY")" = "b true" ] || fail "Logout over the bus"
@@ -441,6 +496,21 @@ else
   echo "busctl not installed: skipping the D-Bus section"
 fi
 
+step "two pulls at once share their blobs and neither corrupts the other"
+$NSPAWN pull "$IMAGE" --name e2e-twin-a --backend overlay --force > /tmp/e2e-twin-a.txt 2>&1 &
+twin_a=$!
+$NSPAWN pull "$IMAGE" --name e2e-twin-b --backend overlay --force > /tmp/e2e-twin-b.txt 2>&1 &
+twin_b=$!
+wait $twin_a || { cat /tmp/e2e-twin-a.txt; fail "the first of two pulls at once failed"; }
+wait $twin_b || { cat /tmp/e2e-twin-b.txt; fail "the second of two pulls at once failed"; }
+for blob in /var/lib/nspawn/blobs/sha256-*; do
+  [ -e "$blob" ] || continue
+  [ "sha256-$(sha256sum "$blob" | awk '{print $1}')" = "$(basename "$blob")" ] || fail "blob $(basename "$blob") does not match its digest after two pulls at once"
+done
+ls /var/lib/nspawn/blobs/ | grep -q "^\.part-\|^\.hold-" && fail "leftovers in the blob store after two pulls: $(ls -a /var/lib/nspawn/blobs/ | grep '^\.')"
+$NSPAWN start e2e-twin-b >/dev/null && $NSPAWN exec e2e-twin-b -- /usr/bin/true </dev/null && $NSPAWN stop e2e-twin-b >/dev/null || fail "a machine pulled alongside another does not run"
+$NSPAWN images rm e2e-twin-a e2e-twin-b >/dev/null || fail "rm the twin images"
+
 step "error handling (these commands must fail with a useful message)"
 out=$($NSPAWN pull "$NSPAWN_REGISTRY/does-not-exist:1" --name e2e-x 2>&1); rc=$?
 echo "$out"
@@ -451,6 +521,9 @@ echo "$out"
 [ $rc -ne 0 ] || fail "start of an unknown image succeeded"
 echo "$out" | grep -q "no image named" || fail "start of an unknown image gave no hint"
 out=$($NSPAWN stop e2e-nonexistent 2>&1); [ $? -ne 0 ] && echo "$out" | grep -q "not running" || fail "stop of unknown machine"
+out=$($NSPAWN --registry 127.0.0.1:9 search --source hub e2e-$nonce 2>&1 >/dev/null); rc=$?
+[ $rc -eq 0 ] || fail "search with an unreachable hub failed instead of warning: $out"
+echo "$out" | grep -q "warning: 127.0.0.1:9" || fail "search did not warn about the unreachable hub: $out"
 
 echo
 if [ "$failures" = 0 ]; then echo "ALL OK"; else echo "$failures FAILURE(S)"; exit 1; fi

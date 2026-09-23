@@ -6,14 +6,13 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::OwnedFd;
 use std::thread;
-use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow, Signal};
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 use crate::cli::{ExecArgs, LogsArgs, PsArgs, ShellArgs, StartArgs, StopArgs};
-use crate::client::{self, Client, Dict, Options, ProcessProxy};
+use crate::client::{self, Client, Dict, Ended, Options};
 use crate::output::{human_duration, table};
 use crate::pty;
 use crate::store::now_unix;
@@ -134,11 +133,14 @@ pub async fn start(args: StartArgs, client: &Client) -> Result<()> {
     if !args.command.is_empty() {
         options.insert("command", Value::from(args.command));
     }
-    let outcome = client
+    let (outcome, notes) = client
         .manager
         .start_machine(&args.name, options)
         .await
         .map_err(client::error)?;
+    for note in &notes {
+        eprintln!("{note}");
+    }
     match outcome.as_str() {
         "ended" => println!("{} ran and ended already", args.name),
         _ => println!("started {}", args.name),
@@ -151,11 +153,14 @@ pub async fn stop(args: StopArgs, client: &Client) -> Result<()> {
     options.insert("force", Value::from(args.force));
     options.insert("wait", Value::from(args.wait));
     options.insert("timeout", Value::from(args.timeout));
-    let outcome = client
+    let (outcome, notes) = client
         .manager
         .stop_machine(&args.name, options)
         .await
         .map_err(client::error)?;
+    for note in &notes {
+        eprintln!("{note}");
+    }
     match outcome.as_str() {
         "was-not-running" => println!("{} was not running", args.name),
         _ => println!("stopped {}", args.name),
@@ -180,12 +185,24 @@ pub async fn shell(args: ShellArgs, client: &Client) -> Result<()> {
         let code = run_command(client, &args.machine, &shell, &args.user).await?;
         std::process::exit(code);
     }
+    let mut options = Options::new();
+    if let Some(term) = terminal_env() {
+        options.insert("env", Value::from(vec![term]));
+    }
     let (fd, _pty) = client
         .manager
-        .shell(&args.machine, &args.user)
+        .shell(&args.machine, &args.user, options)
         .await
         .map_err(client::error)?;
     tokio::task::block_in_place(|| pty::run_session(OwnedFd::from(fd)))
+}
+
+/// TERM as this terminal has it, for the machine's side of a pseudo terminal.
+fn terminal_env() -> Option<String> {
+    std::env::var("TERM")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("TERM={t}"))
 }
 
 async fn run_command(client: &Client, machine: &str, argv: &[String], user: &str) -> Result<i32> {
@@ -195,11 +212,17 @@ async fn run_command(client: &Client, machine: &str, argv: &[String], user: &str
     options.insert("tty", Value::from(tty));
     options.insert("rows", Value::from(rows as u64));
     options.insert("cols", Value::from(cols as u64));
+    if tty {
+        if let Some(term) = terminal_env() {
+            options.insert("env", Value::from(vec![term]));
+        }
+    }
     let (mut fds, process): (HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath) = client
         .manager
         .exec(machine, argv, user, options)
         .await
         .map_err(client::error)?;
+    let ended = Ended::watch(&client.connection, process).await?;
     let mut take = |name: &str| fds.remove(name).map(OwnedFd::from);
     if let Some(master) = take("tty") {
         tokio::task::block_in_place(|| pty::run_session(master))?;
@@ -211,7 +234,9 @@ async fn run_command(client: &Client, machine: &str, argv: &[String], user: &str
         };
         tokio::task::block_in_place(|| pump_pipes(stdin, stdout, stderr))?;
     }
-    exit_status(client, &process).await
+    // The streams end when the command (and whatever it left behind) closes them; the
+    // exit status may take its time after that, as with docker.
+    ended.status().await
 }
 
 /// Copies this process's streams to and from the command's pipes until its output ends.
@@ -236,14 +261,20 @@ fn pump_pipes(stdin: OwnedFd, stdout: OwnedFd, stderr: OwnedFd) -> Result<()> {
             }
         }
     });
+    let outcome = pump_output(stdout, stderr);
+    // Input still pending is of no use once the command is gone.
+    drop(writer);
+    outcome
+}
+
+/// Copies a process's output pipes to ours until both end.
+fn pump_output(stdout: OwnedFd, stderr: OwnedFd) -> Result<()> {
     let out = thread::spawn(move || copy(File::from(stdout), io::stdout().lock()));
     let err = thread::spawn(move || copy(File::from(stderr), io::stderr().lock()));
     out.join()
         .map_err(|_| anyhow::anyhow!("stdout pump panicked"))??;
     err.join()
         .map_err(|_| anyhow::anyhow!("stderr pump panicked"))??;
-    // Input still pending is of no use once the command is gone.
-    drop(writer);
     Ok(())
 }
 
@@ -262,28 +293,8 @@ fn copy(mut from: File, mut to: impl Write) -> Result<()> {
     }
 }
 
-/// The exit status from the process object once it has exited; the streams end a
-/// moment before the service learns of the exit.
-async fn exit_status(client: &Client, process: &OwnedObjectPath) -> Result<i32> {
-    let proxy = ProcessProxy::builder(&client.connection)
-        .path(process.clone())?
-        .cache_properties(zbus::proxy::CacheProperties::No)
-        .build()
-        .await
-        .context("reaching the process object")?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if proxy.state().await.map_err(client::error)? == "exited" {
-            return proxy.exit_status().await.map_err(client::error);
-        }
-        if Instant::now() > deadline {
-            bail!("the command's streams closed but the service has not seen it exit");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// docker logs: the lines come through a pipe from the service, journalctl behind it.
+/// docker logs: journalctl's output comes through pipes from the service, and its exit
+/// status through the process object.
 pub async fn logs(args: LogsArgs, client: &Client) -> Result<()> {
     let mut options = Options::new();
     options.insert("follow", Value::from(args.follow));
@@ -296,10 +307,19 @@ pub async fn logs(args: LogsArgs, client: &Client) -> Result<()> {
     options.insert("timestamps", Value::from(args.timestamps));
     options.insert("all", Value::from(args.all));
     options.insert("inside", Value::from(args.inside));
-    let fd = client
+    let (mut fds, process) = client
         .manager
         .logs(&args.machine, options)
         .await
         .map_err(client::error)?;
-    tokio::task::block_in_place(|| copy(File::from(OwnedFd::from(fd)), io::stdout().lock()))
+    let ended = Ended::watch(&client.connection, process).await?;
+    let (Some(stdout), Some(stderr)) = (fds.remove("stdout"), fds.remove("stderr")) else {
+        bail!("the service returned no streams for the logs");
+    };
+    tokio::task::block_in_place(|| pump_output(OwnedFd::from(stdout), OwnedFd::from(stderr)))?;
+    let code = ended.status().await?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }

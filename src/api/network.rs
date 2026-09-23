@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::api::{machines, Context};
+use crate::api::{machines, Context, Event, Report};
 use crate::backend::BackendChoice;
 use crate::bridge::{self, PortMap, Subnet};
 use crate::hostnet;
@@ -43,11 +43,11 @@ fn bridge_info(ctx: &Context) -> BridgeInfo {
 
 /// Creates the bridge, its NAT and firewall exceptions (start does this on its own; here
 /// for boot-time setup and troubleshooting).
-pub async fn up(ctx: &Context) -> Result<BridgeInfo> {
+pub async fn up(ctx: &Context, report: Report<'_>) -> Result<BridgeInfo> {
     let sd = ctx.sd().await?;
     let store = &ctx.store;
-    let _lock = store.lock_for(Duration::from_secs(60))?;
-    bridge::up(&ctx.config, sd).await?;
+    let _lock = store.lock_for(Duration::from_secs(60)).await?;
+    bridge::up(&ctx.config, sd, report).await?;
     bridge::sync_ports(store, sd).await?;
     Ok(bridge_info(ctx))
 }
@@ -75,11 +75,17 @@ pub async fn list(ctx: &Context) -> Result<(BridgeInfo, Vec<NetworkEntry>)> {
 pub async fn prepare(ctx: &Context, name: &str) -> Result<()> {
     let sd = ctx.sd().await?;
     let store = &ctx.store;
-    let _lock = store.lock_for(Duration::from_secs(60))?;
+    let _lock = store.lock_for(Duration::from_secs(60)).await?;
     let record = store.load_image(name)?;
-    machines::prepare(sd, store, &ctx.config, name, record)
+    machines::prepare(sd, store, &ctx.config, name, record, &to_journal)
         .await
         .map(|_| ())
+}
+
+/// The hooks run under systemd: what the library remarks goes to the unit's journal.
+fn to_journal(event: Event) {
+    let (Event::Line(text) | Event::Note(text)) = event;
+    eprintln!("{text}");
 }
 
 /// ExecStartPost: the machine is registered, its ports can be published. Volumes of an
@@ -102,11 +108,11 @@ pub async fn publish(ctx: &Context, name: &str) -> Result<()> {
             bridge::adopt_managed_veth(&ctx.config, leader)?;
         }
     }
-    let _lock = store.lock_for(Duration::from_secs(60))?;
+    let _lock = store.lock_for(Duration::from_secs(60)).await?;
     match record.network {
         Network::Bridge => bridge::sync_ports(store, sd).await?,
         Network::Veth if hostnet::firewalld_running(sd).await => {
-            hostnet::admit(sd, name).await?;
+            hostnet::admit(sd, name, &to_journal).await?;
         }
         _ => {}
     }

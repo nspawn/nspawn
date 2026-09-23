@@ -4,18 +4,19 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
-use crate::api::{self, Context, Report};
+use crate::api::{self, Context};
 use crate::auth::Credentials;
 use crate::backend::BackendChoice;
 use crate::daemon::jobs::{self, Dict};
 use crate::daemon::processes;
 use crate::daemon::values::{self, Options};
 use crate::daemon::State;
+use crate::nsenter;
 use crate::oci::Mode;
 use crate::search::SearchSource;
 use crate::settings::Network;
@@ -67,6 +68,35 @@ impl Manager {
         }
         Ok(Arc::new(self.ctx().with_config(config)))
     }
+}
+
+/// The lines and notes a call makes, for the methods that hand them back with their
+/// result instead of streaming them.
+#[derive(Default)]
+struct Notes(Mutex<Vec<String>>);
+
+impl Notes {
+    fn report(&self) -> impl Fn(api::Event) + '_ {
+        move |event| {
+            let text = match event {
+                api::Event::Line(t) | api::Event::Note(t) => t,
+            };
+            self.0.lock().unwrap().push(text);
+        }
+    }
+
+    fn into_lines(self) -> Vec<String> {
+        self.0.into_inner().unwrap()
+    }
+}
+
+/// A child's exit code; 128 plus the signal when it died of one.
+fn status_code(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status
+        .code()
+        .or_else(|| status.signal().map(|s| 128 + s))
+        .unwrap_or(126)
 }
 
 fn backend_choice(text: Option<String>) -> anyhow::Result<BackendChoice> {
@@ -329,38 +359,47 @@ impl Manager {
         .await?)
     }
 
-    /// Like `images rm`: what was removed and freed, line by line.
-    async fn remove_images(&self, names: Vec<String>) -> Result<Vec<String>> {
+    /// Like `images rm`: a job whose lines say what was removed and freed, with the
+    /// removed names as its result. Every name is tried; the job fails at the end when
+    /// one could not be removed.
+    async fn remove_images(&self, names: Vec<String>) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
-        let lines = std::sync::Mutex::new(Vec::new());
-        let report = |event: api::Event| {
-            let text = match event {
-                api::Event::Line(t) | api::Event::Note(t) => t,
-            };
-            lines.lock().unwrap().push(text);
-        };
-        let outcome = api::images::remove(self.ctx(), &names, &report).await;
-        let lines = lines.into_inner().unwrap();
-        for line in &lines {
-            if let Some(name) = line.strip_prefix("removed ") {
-                if let Ok(emitter) = self.state.emitter() {
-                    let _ = Manager::image_removed(&emitter, name).await;
+        let state = self.state.clone();
+        let target = names.join(" ");
+        Ok(jobs::spawn(
+            &self.state,
+            self.state.ctx.clone(),
+            "rm",
+            &target,
+            move |ctx, reporter| async move {
+                let removal = api::images::remove(&ctx, &names, jobs::report(&reporter)).await?;
+                for name in &removal.removed {
+                    if let Ok(emitter) = state.emitter() {
+                        let _ = Manager::image_removed(&emitter, name).await;
+                    }
                 }
-            }
-        }
-        outcome?;
-        Ok(lines)
+                if let Some(error) = removal.error() {
+                    anyhow::bail!("{error}");
+                }
+                Ok(HashMap::from([(
+                    "removed".to_string(),
+                    values::v(removal.removed),
+                )]))
+            },
+        )
+        .await?)
     }
 
-    /// Like `search`: source "" (both), "hub" or "dockerhub"; limit per source.
-    /// Options: registry (s), ca_cert (s).
+    /// Like `search`: source "" (both), "hub" or "dockerhub"; limit per source. Returns
+    /// the hits and the notes (a source that could not be reached, say). Options:
+    /// registry (s), ca_cert (s).
     async fn search_images(
         &self,
         term: String,
         source: String,
         limit: u32,
         options: HashMap<String, OwnedValue>,
-    ) -> Result<Vec<Dict>> {
+    ) -> Result<(Vec<Dict>, Vec<String>)> {
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
@@ -375,10 +414,10 @@ impl Manager {
                 )))
             }
         };
-        let quiet = |_: api::Event| {};
-        let report: Report<'_> = &quiet;
-        let hits = api::search::search(&ctx, &term, source, limit as usize, report).await?;
-        Ok(hits.iter().map(values::hit).collect())
+        let notes = Notes::default();
+        let hits =
+            api::search::search(&ctx, &term, source, limit as usize, &notes.report()).await?;
+        Ok((hits.iter().map(values::hit).collect(), notes.into_lines()))
     }
 
     /// Like `hub ls`: repositories containing `filter` ("" for all), with their tags when
@@ -437,12 +476,13 @@ impl Manager {
 
     /// Like `start`. Options: wait (b, default true), network (s), publish (as),
     /// entrypoint (s), env (as), volume (as), image_command (b), command (as). Returns
-    /// "started", or "ended" when the program returned before the machine registered.
+    /// "started", or "ended" when the program returned before the machine registered,
+    /// and the notes made on the way.
     async fn start_machine(
         &self,
         name: String,
         options: HashMap<String, OwnedValue>,
-    ) -> Result<String> {
+    ) -> Result<(String, Vec<String>)> {
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let request = api::machines::StartRequest {
@@ -457,76 +497,82 @@ impl Manager {
             command: options.strings("command")?,
         };
         options.finish()?;
-        let quiet = |_: api::Event| {};
-        let report: Report<'_> = &quiet;
-        Ok(
-            match api::machines::start(self.ctx(), &request, report).await? {
-                api::machines::StartOutcome::Started => "started",
-                api::machines::StartOutcome::Ended => "ended",
-            }
-            .to_string(),
-        )
+        let notes = Notes::default();
+        let outcome = match api::machines::start(self.ctx(), &request, &notes.report()).await? {
+            api::machines::StartOutcome::Started => "started",
+            api::machines::StartOutcome::Ended => "ended",
+        };
+        Ok((outcome.to_string(), notes.into_lines()))
     }
 
     /// Like `stop`. Options: force (b), wait (b, default true), timeout (t, seconds
-    /// before SIGKILL for an app, default 10). Returns "stopped" or "was-not-running".
+    /// before SIGKILL for an app, default 10, a day at most). Returns "stopped" or
+    /// "was-not-running", and the notes made on the way (a program that had to be
+    /// killed, say).
     async fn stop_machine(
         &self,
         name: String,
         options: HashMap<String, OwnedValue>,
-    ) -> Result<String> {
+    ) -> Result<(String, Vec<String>)> {
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let request = api::machines::StopRequest {
             name,
             force: options.bool("force", false)?,
             wait: options.bool("wait", true)?,
-            timeout: options.u64("timeout", 10)?,
+            timeout: options.u64("timeout", 10)?.min(86_400),
         };
         options.finish()?;
-        let quiet = |_: api::Event| {};
-        let report: Report<'_> = &quiet;
-        Ok(
-            match api::machines::stop(self.ctx(), &request, report).await? {
-                api::machines::StopOutcome::Stopped => "stopped",
-                api::machines::StopOutcome::WasNotRunning => "was-not-running",
-            }
-            .to_string(),
-        )
+        let notes = Notes::default();
+        let outcome = match api::machines::stop(self.ctx(), &request, &notes.report()).await? {
+            api::machines::StopOutcome::Stopped => "stopped",
+            api::machines::StopOutcome::WasNotRunning => "was-not-running",
+        };
+        Ok((outcome.to_string(), notes.into_lines()))
     }
 
     /// The login session machined offers for a booted machine, like `shell`: a pseudo
     /// terminal running the user's shell ("" for root), and the terminal's path. Apps
-    /// have no login inside: Exec with a shell and a tty is the way for them.
+    /// have no login inside: Exec with a shell and a tty is the way for them. Options:
+    /// env (as), the caller's TERM among them (xterm otherwise).
     async fn shell(
         &self,
         machine: String,
         user: String,
+        options: HashMap<String, OwnedValue>,
     ) -> Result<(zbus::zvariant::OwnedFd, String)> {
         let _busy = self.state.enter();
+        let mut options = Options::new(&options);
+        let mut env = options.strings("env")?;
+        options.finish()?;
+        if !env.iter().any(|v| v.starts_with("TERM=")) {
+            env.push("TERM=xterm".to_string());
+        }
         let user = if user.is_empty() {
             "root".to_string()
         } else {
             user
         };
         let (fd, pty) =
-            api::machines::open_shell(self.ctx(), &machine, &user, "", Vec::new()).await?;
+            api::machines::open_shell(self.ctx(), &machine, &user, "", Vec::new(), env).await?;
         Ok((zbus::zvariant::OwnedFd::from(fd), pty))
     }
 
-    /// Like `logs`: a pipe from which the lines come, journalctl behind it. Options:
-    /// follow (b), lines (t), since (s), timestamps (b), all (b), inside (b).
+    /// Like `logs`: journalctl's output under "stdout" and "stderr", and a process
+    /// object for its exit status. Options: follow (b), lines (t), since (s),
+    /// timestamps (b), all (b), inside (b). journalctl is stopped once nobody reads its
+    /// output any more, so a --follow ends with its client.
     async fn logs(
         &self,
         machine: String,
         options: HashMap<String, OwnedValue>,
-    ) -> Result<zbus::zvariant::OwnedFd> {
+    ) -> Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)> {
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
         let request = api::machines::LogsRequest {
             machine,
             follow: options.bool("follow", false)?,
-            lines: options.u64("lines", 0)?.try_into().ok().filter(|n| *n > 0),
+            lines: Some(options.u64("lines", 0)?.min(u32::MAX as u64) as u32).filter(|n| *n > 0),
             since: options.string("since")?,
             timestamps: options.bool("timestamps", false)?,
             all: options.bool("all", false)?,
@@ -534,29 +580,63 @@ impl Manager {
         };
         options.finish()?;
         let argv = api::machines::journalctl_arguments(&request);
-        let (read, write) =
-            nix::unistd::pipe().map_err(|e| Error::Failed(format!("creating a pipe: {e}")))?;
+        let pipe = || {
+            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+                .map_err(|e| Error::Failed(format!("creating a pipe: {e}")))
+        };
+        let (out_r, out_w) = pipe()?;
+        let (err_r, err_w) = pipe()?;
+        // A copy of the output's writing end stays here: it reports an error once nobody
+        // reads, which is how a journalctl --follow learns that its client is gone
+        // instead of waiting for the next line forever.
+        let watch = out_w
+            .try_clone()
+            .map_err(|e| Error::Failed(e.to_string()))?;
         let mut child = tokio::process::Command::new("journalctl")
             .args(&argv)
             .stdin(Stdio::null())
-            .stdout(Stdio::from(
-                write
-                    .try_clone()
-                    .map_err(|e| Error::Failed(e.to_string()))?,
-            ))
-            .stderr(Stdio::from(write))
+            .stdout(Stdio::from(out_w))
+            .stderr(Stdio::from(err_w))
             .spawn()
             .map_err(|e| Error::Failed(format!("running journalctl: {e}")))?;
-        tokio::spawn(async move {
-            let _ = child.wait().await;
-        });
-        Ok(zbus::zvariant::OwnedFd::from(read))
+        let pid = child.id().unwrap_or(0);
+        let pidfd = nsenter::pidfd_open(nix::unistd::Pid::from_raw(pid as i32)).ok();
+        let wait = async move {
+            let reader_gone = async {
+                match tokio::io::unix::AsyncFd::with_interest(watch, tokio::io::Interest::ERROR) {
+                    Ok(watch) => {
+                        let _ = watch.ready(tokio::io::Interest::ERROR).await;
+                    }
+                    Err(_) => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                status = child.wait() => status.map(status_code).unwrap_or(126),
+                _ = reader_gone => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    128 + nix::libc::SIGKILL
+                }
+            }
+        };
+        let mut command = vec!["journalctl".to_string()];
+        command.extend(argv);
+        let path =
+            processes::register(&self.state, &request.machine, &command, pid, pidfd, wait).await?;
+        Ok((
+            HashMap::from([
+                ("stdout".to_string(), zbus::zvariant::OwnedFd::from(out_r)),
+                ("stderr".to_string(), zbus::zvariant::OwnedFd::from(err_r)),
+            ]),
+            path,
+        ))
     }
 
     /// Like `exec`: runs argv inside the machine as `user` ("" for root), and hands out
     /// its streams: with option tty (b, default true) a pseudo terminal of rows x cols
-    /// (u, default 24 x 80) under "tty", otherwise pipes under "stdin", "stdout" and
-    /// "stderr". Option env (as) adds variables. The process object says how it ends.
+    /// (t, default 24 x 80) under "tty", otherwise pipes under "stdin", "stdout" and
+    /// "stderr". Option env (as) adds variables, the caller's TERM among them (xterm
+    /// otherwise, on a terminal). The process object says how it ends.
     async fn exec(
         &self,
         machine: String,
@@ -579,22 +659,46 @@ impl Manager {
         } else {
             crate::nsenter::Stdio::Pipes
         };
-        let mut process =
-            api::machines::spawn_in_namespaces(self.ctx(), &machine, &argv, &user, &env, stdio)
-                .await?;
-        let path = processes::register(&self.state, &machine, &argv, &process).await?;
+        let nsenter::Process {
+            helper,
+            pid,
+            pidfd,
+            master,
+            stdin,
+            stdout,
+            stderr,
+        } = api::machines::spawn_in_namespaces(self.ctx(), &machine, &argv, &user, &env, stdio)
+            .await?;
+        let handle = pidfd
+            .try_clone()
+            .map_err(|e| Error::Failed(format!("duplicating the command's pidfd: {e}")))?;
+        let wait = async move {
+            tokio::task::spawn_blocking(move || nsenter::wait(helper))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or(126)
+        };
+        let path =
+            match processes::register(&self.state, &machine, &argv, pid, Some(pidfd), wait).await {
+                Ok(path) => path,
+                Err(e) => {
+                    // Nobody will hold its streams: the command must not linger.
+                    let _ = nsenter::pidfd_signal(&handle, nix::libc::SIGKILL);
+                    let _ = tokio::task::spawn_blocking(move || nsenter::wait(helper)).await;
+                    return Err(e.into());
+                }
+            };
         let mut fds = HashMap::new();
-        if let Some(master) = process.master.take() {
-            fds.insert("tty".to_string(), zbus::zvariant::OwnedFd::from(master));
-        }
-        if let Some(fd) = process.stdin.take() {
-            fds.insert("stdin".to_string(), zbus::zvariant::OwnedFd::from(fd));
-        }
-        if let Some(fd) = process.stdout.take() {
-            fds.insert("stdout".to_string(), zbus::zvariant::OwnedFd::from(fd));
-        }
-        if let Some(fd) = process.stderr.take() {
-            fds.insert("stderr".to_string(), zbus::zvariant::OwnedFd::from(fd));
+        for (name, fd) in [
+            ("tty", master),
+            ("stdin", stdin),
+            ("stdout", stdout),
+            ("stderr", stderr),
+        ] {
+            if let Some(fd) = fd {
+                fds.insert(name.to_string(), zbus::zvariant::OwnedFd::from(fd));
+            }
         }
         Ok((fds, path))
     }
@@ -610,11 +714,14 @@ impl Manager {
         ))
     }
 
-    /// Like `network up`.
+    /// Like `network up`: the bridge, plus the notes made on the way under "notes".
     async fn network_up(&self) -> Result<Dict> {
         let _busy = self.state.enter();
-        let info = api::network::up(self.ctx()).await?;
-        Ok(values::bridge(&info))
+        let notes = Notes::default();
+        let info = api::network::up(self.ctx(), &notes.report()).await?;
+        let mut dict = values::bridge(&info);
+        dict.insert("notes".to_string(), values::v(notes.into_lines()));
+        Ok(dict)
     }
 
     /// Like `login`: registry "" for the hub. Options: registry (s, the hub "" stands

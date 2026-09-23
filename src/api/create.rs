@@ -51,7 +51,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     let sd = ctx.sd().await?;
     let store = &ctx.store;
     store.init()?;
-    let _lock = store.lock()?;
+    let _lock = store.lock().await?;
     ensure_replaceable(store, sd, &request.name, request.force).await?;
     let source = store
         .find_image(&request.source, &config.registry)?

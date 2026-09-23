@@ -146,7 +146,7 @@ pub fn expand_env(values: &[String]) -> Result<Vec<String>> {
             }
             match std::env::var(value) {
                 Ok(current) => Ok(format!("{value}={current}")),
-                Err(_) => bail!("{value} is not set in the environment; give it as {value}=VALUE"),
+                Err(_) => bail!("{value} has no value here; give it as {value}=VALUE"),
             }
         })
         .collect()
@@ -163,7 +163,7 @@ pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
             Some((name, _)) => (name, value.clone()),
             None => match std::env::var(value) {
                 Ok(current) => (value.as_str(), format!("{value}={current}")),
-                Err(_) => bail!("{value} is not set in the environment; give it as {value}=VALUE"),
+                Err(_) => bail!("{value} has no value here; give it as {value}=VALUE"),
             },
         };
         if name.is_empty()
@@ -195,7 +195,7 @@ mod tests {
             ["A=1", "NSPAWN_TEST_EXPAND=yes", "none"]
         );
         let err = expand_env(&["NSPAWN_TEST_UNSET_XYZ".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("not set in the environment"));
+        assert!(err.to_string().contains("has no value here"));
     }
 
     #[test]

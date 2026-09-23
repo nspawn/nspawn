@@ -50,6 +50,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             NetworkCommand::Up => {
                 let client = Client::connect().await?;
                 let info = client.manager.network_up().await.map_err(client::error)?;
+                for note in client::strings(&info, "notes") {
+                    eprintln!("{note}");
+                }
                 println!(
                     "{} is up: {} on {}",
                     client::string(&info, "bridge"),
@@ -93,6 +96,18 @@ pub async fn run(cli: Cli) -> Result<()> {
             through_the_service(command, &client, &config).await
         }
     }
+}
+
+/// The registry a call went to: ours when we named one, the service's otherwise.
+async fn registry_name(client: &Client, config: &Config) -> String {
+    if config.registry_set {
+        return config.registry.clone();
+    }
+    client
+        .manager
+        .registry()
+        .await
+        .unwrap_or_else(|_| config.registry.clone())
 }
 
 fn lowercase<T: std::fmt::Debug>(value: T) -> String {
@@ -142,7 +157,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                     .await
                     .map_err(client::error)?;
                 if repos.is_empty() {
-                    println!("no repositories on {}", config.registry);
+                    println!("no repositories on {}", registry_name(client, config).await);
                 } else {
                     let rows = repos
                         .iter()
@@ -178,7 +193,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 Some(SearchSource::Hub) => "hub",
                 Some(SearchSource::Dockerhub) => "dockerhub",
             };
-            let hits = manager
+            let (hits, notes) = manager
                 .search_images(
                     &a.term,
                     source,
@@ -187,6 +202,9 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 )
                 .await
                 .map_err(client::error)?;
+            for note in &notes {
+                eprintln!("{note}");
+            }
             if hits.is_empty() {
                 println!("nothing found for {:?}", a.term);
                 return Ok(());
@@ -343,11 +361,9 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 Ok(())
             }
             ImagesCommand::Rm(a) => {
-                let lines = manager.remove_images(&a.names).await;
-                // What was removed before an error is reported by the error itself.
-                for line in lines.map_err(client::error)? {
-                    println!("{line}");
-                }
+                // A job: what was removed is printed as it happens, and a name that
+                // could not be removed fails it at the end.
+                client.run_job(|| manager.remove_images(&a.names)).await?;
                 Ok(())
             }
         },

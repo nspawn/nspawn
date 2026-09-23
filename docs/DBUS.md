@@ -27,7 +27,9 @@ running (`nspawn daemon --idle-exit`). The service reads
 `/etc/nspawn/nspawn.toml`; `nspawn --config FILE daemon --install` puts
 another file on the unit's command line. The methods that reach a registry
 take `registry` and `ca_cert` options that override that configuration for
-one call; the command line passes its own on every call.
+one call; the command line passes them when it was given a registry (flag,
+`NSPAWN_REGISTRY` or its own configuration file) and leaves the service's
+alone otherwise.
 
 Methods need root for now (the bus policy says so); polkit comes later.
 
@@ -44,7 +46,8 @@ with docker exec.
 
 Results are dictionaries (`a{sv}`) whose keys are the command line's
 spellings; options are dictionaries too, and a key nothing expects is an
-error, so a typo never passes as a default. Errors come back as
+error, so a typo never passes as a default. An integer option takes any
+unsigned type (`t`, `u`, `q` or `y`). Errors come back as
 `org.nspawn.Error.Failed` with the same message the command line prints.
 
 Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
@@ -60,8 +63,8 @@ Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 | `CreateMachine(s source, s name, a{sv} options) -> o` | `create` | options backend, network, publish, force, entrypoint, env, volume, command, registry, ca_cert; a job |
 | `PushImage(s image, a{sv} options) -> o` | `push` | options to, registry, ca_cert; a job |
 | `BuildImage(s directory, s tag, a{sv} options) -> o` | `build` | options name, distribution, release, profile, backend, mode, force, keep_output, mkosi_args, registry, ca_cert; a job whose output includes mkosi's |
-| `RemoveImages(as names) -> as` | `images rm` | the lines it prints |
-| `SearchImages(s term, s source, u limit, a{sv} options) -> aa{sv}` | `search` | source "", "hub" or "dockerhub"; options registry, ca_cert |
+| `RemoveImages(as names) -> o` | `images rm` | a job: every name is tried, its result lists `removed`, and it fails at the end when one could not be removed |
+| `SearchImages(s term, s source, u limit, a{sv} options) -> (aa{sv}, as)` | `search` | source "", "hub" or "dockerhub"; the hits and the notes (a source that could not be reached); options registry, ca_cert |
 | `ListRepositories(s filter, b with_tags, a{sv} options) -> aa{sv}` | `hub ls` | options registry, ca_cert |
 | `ListTags(s repository, a{sv} options) -> as` | `hub tags` | options registry, ca_cert |
 
@@ -70,11 +73,11 @@ Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 | Method | Like | Notes |
 |---|---|---|
 | `ListMachines(b all) -> aa{sv}` | `ps`, `ps -a` | name, state, started (unix seconds), leader, os, machine_path, plus the image's record |
-| `StartMachine(s name, a{sv} options) -> s` | `start` | options wait (default true), network, publish, entrypoint, env, volume, image_command, command; "started" or "ended" |
-| `StopMachine(s name, a{sv} options) -> s` | `stop` | options force, wait (default true), timeout (seconds, default 10); "stopped" or "was-not-running" |
-| `Exec(s machine, as argv, s user, a{sv} options) -> (a{sh}, o)` | `exec` | user "" for root; options tty (default true), rows, cols, env; returns the streams ("tty", or "stdin", "stdout", "stderr") and a process object |
-| `Shell(s machine, s user) -> (h, s)` | `shell` | the login session machined offers for a booted machine: its pseudo terminal and the terminal's path; apps get `Exec` of a shell with a tty instead |
-| `Logs(s machine, a{sv} options) -> h` | `logs` | options follow, lines, since, timestamps, all, inside; a pipe carrying the lines |
+| `StartMachine(s name, a{sv} options) -> (s, as)` | `start` | options wait (default true), network, publish, entrypoint, env, volume, image_command, command; "started" or "ended", and the notes made on the way |
+| `StopMachine(s name, a{sv} options) -> (s, as)` | `stop` | options force, wait (default true), timeout (seconds, default 10, a day at most); "stopped" or "was-not-running", and the notes (a program that had to be killed) |
+| `Exec(s machine, as argv, s user, a{sv} options) -> (a{sh}, o)` | `exec` | user "" for root; options tty (default true), rows, cols, env (the caller's `TERM=` among them; xterm otherwise on a terminal); returns the streams ("tty", or "stdin", "stdout", "stderr") and a process object |
+| `Shell(s machine, s user, a{sv} options) -> (h, s)` | `shell` | the login session machined offers for a booted machine: its pseudo terminal and the terminal's path; options env, as for `Exec`; apps get `Exec` of a shell with a tty instead |
+| `Logs(s machine, a{sv} options) -> (a{sh}, o)` | `logs` | options follow, lines, since, timestamps, all, inside; journalctl's "stdout" and "stderr" and a process object for its exit status; journalctl is stopped once nobody reads its output |
 
 `StartMachine` waits for a booted machine's init and `StopMachine` for the
 machine to be gone, which can take longer than a client's default timeout
@@ -85,7 +88,7 @@ machine to be gone, which can take longer than a client's default timeout
 | Method | Like |
 |---|---|
 | `ListNetwork() -> (a{sv}, aa{sv})` | `network ls`: the bridge (bridge, subnet, gateway, host_name) and the machines on it (name, address, ports, running) |
-| `NetworkUp() -> a{sv}` | `network up` |
+| `NetworkUp() -> a{sv}` | `network up`: the bridge as above, plus `notes` |
 | `Login(s registry, s user, s password, a{sv} options) -> a{sv}` | `login`; "" for the hub; options registry (the hub "" stands for), ca_cert |
 | `Logout(s registry) -> b` | `logout` |
 
@@ -100,21 +103,25 @@ machine to be gone, which can take longer than a client's default timeout
 
 `nspawn exec` is a client of `Exec`: it asks for a pseudo terminal when run
 from one and for pipes otherwise, pumps them, and takes the exit status from
-the process object.
+the process object. The terminal is allocated inside the machine, on its own
+devpts, so `tty` and everything that opens its terminal by name work there.
 
 ## org.nspawn.Process at /org/nspawn/process/N
 
-What `Exec` started: properties `Machine`, `Argv`, `Pid` (on the host),
-`State` (running, exited) and `ExitStatus` (128 plus the signal when it died
-of one); the method `Signal(i signal)`; the signal `Exited(i status)`. The
-Manager's `Processes` property lists them.
+What `Exec` or `Logs` started: properties `Machine`, `Argv`, `Pid` (on the
+host), `State` (running, exited) and `ExitStatus` (128 plus the signal when
+it died of one); the method `Signal(i signal)`, which reaches the process
+itself and never a PID handed to someone else since; the signal
+`Exited(i status)`, sent after `State` changed. The Manager's `Processes`
+property lists them.
 
 ## org.nspawn.Job at /org/nspawn/job/N
 
 A job is returned by the long operations and keeps what happened: properties
-`Kind` (pull, create, push, build), `Target`, `State` (running, done,
+`Kind` (pull, create, push, build, rm), `Target`, `State` (running, done,
 failed), `Output` (every line so far), `Error` and `Result` (a dictionary,
-for a pull its name, reference and mode).
+for a pull its name, reference and mode, for an rm the names removed). The
+service does not go idle before a job or a process has announced its end.
 
 ## Example
 

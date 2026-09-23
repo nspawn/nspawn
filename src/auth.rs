@@ -80,18 +80,17 @@ fn entry_credentials(entry: &AuthEntry) -> Option<Credentials> {
     }
 }
 
-/// Files consulted, nspawn's own first, then podman's and docker's (for the invoking user
-/// too when running under sudo).
+/// Files consulted, nspawn's own first, then root's podman and docker files (the
+/// service has no environment of the caller's; from a shell, the invoking user's too).
 pub fn sources() -> Vec<PathBuf> {
     let mut paths = vec![PathBuf::from(STORE)];
     if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
         paths.push(Path::new(&runtime).join("containers/auth.json"));
     }
     paths.push(PathBuf::from("/run/containers/0/auth.json"));
-    let mut homes = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        homes.push(PathBuf::from(home));
-    }
+    let mut homes = vec![PathBuf::from(
+        std::env::var("HOME").unwrap_or_else(|_| "/root".to_string()),
+    )];
     if let Ok(user) = std::env::var("SUDO_USER") {
         if let Ok(Some(entry)) = nix::unistd::User::from_name(&user) {
             homes.push(entry.dir);
@@ -148,7 +147,7 @@ fn write_store(path: &Path, file: &AuthFile) -> Result<()> {
         path.file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        std::process::id()
+        crate::store::unique_suffix()
     ));
     {
         use std::io::Write;
@@ -171,7 +170,12 @@ pub fn store(registry: &str, credentials: &Credentials) -> Result<()> {
     store_in(Path::new(STORE), registry, credentials)
 }
 
+/// One writer at a time: the service takes several logins at once, and each one reads
+/// the file, changes it and writes it back.
+static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn store_in(path: &Path, registry: &str, credentials: &Credentials) -> Result<()> {
+    let _one_at_a_time = WRITES.lock().unwrap_or_else(|e| e.into_inner());
     let mut file = read_store(path)?;
     let encoded = base64::engine::general_purpose::STANDARD
         .encode(format!("{}:{}", credentials.username, credentials.password));
@@ -191,6 +195,7 @@ pub fn forget(registry: &str) -> Result<bool> {
 }
 
 pub fn forget_in(path: &Path, registry: &str) -> Result<bool> {
+    let _one_at_a_time = WRITES.lock().unwrap_or_else(|e| e.into_inner());
     let mut file = read_store(path)?;
     let key = canonical(registry);
     let before = file.auths.len();

@@ -21,6 +21,8 @@ pub type Options<'a> = HashMap<&'a str, Value<'a>>;
 pub trait Manager {
     #[zbus(property)]
     fn version(&self) -> zbus::Result<String>;
+    #[zbus(property)]
+    fn registry(&self) -> zbus::Result<String>;
 
     fn list_images(&self) -> zbus::Result<Vec<Dict>>;
     fn get_image(&self, name: &str) -> zbus::Result<Dict>;
@@ -38,14 +40,14 @@ pub trait Manager {
         tag: &str,
         options: Options<'_>,
     ) -> zbus::Result<OwnedObjectPath>;
-    fn remove_images(&self, names: &[String]) -> zbus::Result<Vec<String>>;
+    fn remove_images(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
     fn search_images(
         &self,
         term: &str,
         source: &str,
         limit: u32,
         options: Options<'_>,
-    ) -> zbus::Result<Vec<Dict>>;
+    ) -> zbus::Result<(Vec<Dict>, Vec<String>)>;
     fn list_repositories(
         &self,
         filter: &str,
@@ -54,8 +56,13 @@ pub trait Manager {
     ) -> zbus::Result<Vec<Dict>>;
     fn list_tags(&self, repository: &str, options: Options<'_>) -> zbus::Result<Vec<String>>;
     fn list_machines(&self, all: bool) -> zbus::Result<Vec<Dict>>;
-    fn start_machine(&self, name: &str, options: Options<'_>) -> zbus::Result<String>;
-    fn stop_machine(&self, name: &str, options: Options<'_>) -> zbus::Result<String>;
+    fn start_machine(
+        &self,
+        name: &str,
+        options: Options<'_>,
+    ) -> zbus::Result<(String, Vec<String>)>;
+    fn stop_machine(&self, name: &str, options: Options<'_>)
+        -> zbus::Result<(String, Vec<String>)>;
     fn exec(
         &self,
         machine: &str,
@@ -67,8 +74,13 @@ pub trait Manager {
         &self,
         machine: &str,
         user: &str,
-    ) -> zbus::Result<(zbus::zvariant::OwnedFd, OwnedObjectPath)>;
-    fn logs(&self, machine: &str, options: Options<'_>) -> zbus::Result<zbus::zvariant::OwnedFd>;
+        options: Options<'_>,
+    ) -> zbus::Result<(zbus::zvariant::OwnedFd, String)>;
+    fn logs(
+        &self,
+        machine: &str,
+        options: Options<'_>,
+    ) -> zbus::Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)>;
     fn list_network(&self) -> zbus::Result<(Dict, Vec<Dict>)>;
     fn network_up(&self) -> zbus::Result<Dict>;
     fn login(
@@ -110,6 +122,78 @@ pub trait Process {
     fn state(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn exit_status(&self) -> zbus::Result<i32>;
+    #[zbus(signal)]
+    fn exited(&self, status: i32) -> zbus::Result<()>;
+}
+
+/// A process the service started for us, watched for its end from before its streams
+/// are pumped, so that a quick exit is never missed.
+pub struct Ended {
+    proxy: ProcessProxy<'static>,
+    exited: ExitedStream,
+    lost: zbus::fdo::NameOwnerChangedStream,
+}
+
+impl Ended {
+    pub async fn watch(connection: &zbus::Connection, process: OwnedObjectPath) -> Result<Self> {
+        let proxy = ProcessProxy::builder(connection)
+            .path(process)?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .context("reaching the process object")?;
+        let exited = proxy
+            .receive_exited()
+            .await
+            .context("listening for the process's end")?;
+        let lost = service_lost(connection).await?;
+        Ok(Ended {
+            proxy,
+            exited,
+            lost,
+        })
+    }
+
+    /// The exit status, once the process has ended.
+    pub async fn status(mut self) -> Result<i32> {
+        // The service sets the state before it sends the signal: "running" here means
+        // the signal is still to come.
+        if self.proxy.state().await.map_err(error)? == "exited" {
+            return self.proxy.exit_status().await.map_err(error);
+        }
+        loop {
+            tokio::select! {
+                Some(signal) = self.exited.next() => {
+                    let args = signal.args().map_err(|e| anyhow!("{e}"))?;
+                    return Ok(*args.status());
+                }
+                Some(signal) = self.lost.next() => {
+                    if gone(&signal) {
+                        anyhow::bail!("the nspawn service went away before the command ended");
+                    }
+                }
+                else => anyhow::bail!("the bus connection closed before the command ended"),
+            }
+        }
+    }
+}
+
+/// NameOwnerChanged for org.nspawn: a signal stream on a well-known name outlives its
+/// owner, so this is how a client learns that the service died on it.
+async fn service_lost(connection: &zbus::Connection) -> Result<zbus::fdo::NameOwnerChangedStream> {
+    zbus::fdo::DBusProxy::new(connection)
+        .await
+        .context("reaching the bus")?
+        .receive_name_owner_changed_with_args(&[(0, "org.nspawn")])
+        .await
+        .context("watching the nspawn service")
+}
+
+fn gone(signal: &zbus::fdo::NameOwnerChanged) -> bool {
+    signal
+        .args()
+        .map(|args| args.new_owner().is_none())
+        .unwrap_or(false)
 }
 
 pub struct Client {
@@ -149,9 +233,13 @@ impl Client {
             .receive_job_removed()
             .await
             .context("listening for job results")?;
+        let mut lost = service_lost(&self.connection).await?;
         let job = start().await.map_err(error)?;
         let result = loop {
+            // The lines come first: the service sends every JobOutput before JobRemoved,
+            // and a random poll order would let the end be seen before the last lines.
             tokio::select! {
+                biased;
                 Some(signal) = output.next() => {
                     let Ok(args) = signal.args() else { continue };
                     if *args.job() != job { continue }
@@ -165,7 +253,12 @@ impl Client {
                     if *args.job() != job { continue }
                     break args.result().clone();
                 }
-                else => anyhow::bail!("the service went away while the job ran"),
+                Some(signal) = lost.next() => {
+                    if gone(&signal) {
+                        anyhow::bail!("the nspawn service went away while the job ran");
+                    }
+                }
+                else => anyhow::bail!("the bus connection closed while the job ran"),
             }
         };
         let proxy = JobProxy::builder(&self.connection)
@@ -200,11 +293,14 @@ pub fn error(e: zbus::Error) -> anyhow::Error {
     }
 }
 
-/// The registry and CA certificate the command line was given, for the service to use
-/// on this call instead of its own configuration.
+/// The registry and CA certificate the command line was given (flag, environment or its
+/// configuration file), for the service to use on this call instead of its own
+/// configuration; the service's stands when nothing was given.
 pub fn registry_options(config: &Config) -> Options<'_> {
     let mut options = Options::new();
-    options.insert("registry", Value::from(config.registry.as_str()));
+    if config.registry_set {
+        options.insert("registry", Value::from(config.registry.as_str()));
+    }
     if let Some(ca) = &config.ca_cert {
         options.insert("ca_cert", Value::from(ca.to_string_lossy().into_owned()));
     }
@@ -283,6 +379,24 @@ mod tests {
         assert!(denied.to_string().contains("root"));
         let nameless = error(method_error("org.example.Odd", None));
         assert_eq!(nameless.to_string(), "org.example.Odd");
+    }
+
+    #[test]
+    fn the_registry_goes_along_only_when_given() {
+        let mut config = Config::merge(crate::config::FileConfig::default(), None, None).unwrap();
+        assert!(
+            registry_options(&config).is_empty(),
+            "nothing given: the service's configuration stands"
+        );
+        config = Config::merge(
+            crate::config::FileConfig::default(),
+            Some("lab:8443".into()),
+            Some("/ca.pem".into()),
+        )
+        .unwrap();
+        let options = registry_options(&config);
+        assert_eq!(options["registry"], Value::from("lab:8443"));
+        assert_eq!(options["ca_cert"], Value::from("/ca.pem"));
     }
 
     #[test]

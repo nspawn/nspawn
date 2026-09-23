@@ -12,6 +12,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
+use crate::api::{note, Report};
 use crate::systemd::Systemd;
 
 const NETWORKD: &str = "systemd-networkd.service";
@@ -24,7 +25,7 @@ const OWN_CONFIG_DIRS: [&str; 2] = ["/etc/systemd/network", "/run/systemd/networ
 /// Makes sure systemd-networkd runs on the host. It is started only when the host has no
 /// .network files of its own, so that nspawn never takes over interfaces another network
 /// manager is handling.
-pub async fn ensure_networkd(sd: &Systemd) -> Result<()> {
+pub async fn ensure_networkd(sd: &Systemd, report: Report<'_>) -> Result<()> {
     let (load, active) = sd.unit_state(NETWORKD).await?;
     if matches!(active.as_str(), "active" | "activating" | "reloading") {
         return Ok(());
@@ -40,7 +41,10 @@ pub async fn ensure_networkd(sd: &Systemd) -> Result<()> {
             ))
         );
     }
-    eprintln!("starting systemd-networkd on the host to configure the machine's virtual ethernet");
+    note(
+        report,
+        "starting systemd-networkd on the host to configure the machine's virtual ethernet",
+    );
     sd.start_unit(NETWORKD)
         .await
         .with_context(|| explanation("it could not be started"))
@@ -85,16 +89,16 @@ pub async fn machine_interfaces(sd: &Systemd, name: &str) -> Result<Vec<String>>
 
 /// Lets the machine's traffic through firewalld by binding its host-side interfaces to
 /// the trusted zone. Returns the names that were bound, for `release`.
-pub async fn admit(sd: &Systemd, name: &str) -> Result<Vec<String>> {
+pub async fn admit(sd: &Systemd, name: &str, report: Report<'_>) -> Result<Vec<String>> {
     let interfaces = machine_interfaces(sd, name).await?;
     for ifname in &interfaces {
-        trust_interface(sd, ifname).await?;
+        trust_interface(sd, ifname, report).await?;
     }
     Ok(interfaces)
 }
 
 /// Binds one host interface to the trusted zone of firewalld (runtime configuration).
-pub async fn trust_interface(sd: &Systemd, ifname: &str) -> Result<()> {
+pub async fn trust_interface(sd: &Systemd, ifname: &str, report: Report<'_>) -> Result<()> {
     match zone_call(sd, "addInterface", ifname).await {
         Ok(()) => Ok(()),
         Err(zbus::Error::MethodError(_, Some(message), _))
@@ -103,8 +107,11 @@ pub async fn trust_interface(sd: &Systemd, ifname: &str) -> Result<()> {
             Ok(())
         }
         Err(zbus::Error::MethodError(_, Some(message), _)) if message.contains("ZONE_CONFLICT") => {
-            eprintln!(
-                "note: firewalld keeps {ifname} in another zone; nspawn leaves it there (make sure it lets DHCP and forwarding through)"
+            note(
+                report,
+                format!(
+                    "note: firewalld keeps {ifname} in another zone; nspawn leaves it there (make sure it lets DHCP and forwarding through)"
+                ),
             );
             Ok(())
         }

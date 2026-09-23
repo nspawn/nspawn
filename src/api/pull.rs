@@ -62,6 +62,15 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
         validate_digest(&descriptor.digest)?;
     }
     let manifest_bytes = hub.manifest_bytes(&oci, &manifest_digest).await?;
+    // Held from here until the record refers to them: an images rm meanwhile must not
+    // collect what this pull is bringing in.
+    let digests: Vec<String> = manifest
+        .layers
+        .iter()
+        .chain(std::iter::once(&manifest.config))
+        .map(|d| d.digest.clone())
+        .collect();
+    let _hold = store.hold_blobs(&digests)?;
     line(
         report,
         format!(
@@ -94,7 +103,7 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
 
     // The store is locked only now: a long download must not hold up other commands or
     // the unit hooks. The name is checked again, the old image goes only at this point.
-    let _lock = store.lock()?;
+    let _lock = store.lock().await?;
     ensure_replaceable(store, sd, &name, request.force).await?;
     remove_existing(store, sd, &name).await?;
     let mode = install(

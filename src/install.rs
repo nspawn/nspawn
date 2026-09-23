@@ -147,6 +147,9 @@ pub async fn ensure_replaceable(
             "image {name} already exists; use --force to replace it or --name for another name"
         );
     }
+    if store.is_starting(name) {
+        anyhow::bail!("machine {name} is starting; wait for it or stop it first");
+    }
     if sd.machine_exists(name).await? {
         anyhow::bail!("machine {name} is running; stop it before replacing its image");
     }
@@ -156,6 +159,9 @@ pub async fn ensure_replaceable(
 /// Removes whatever exists under this name: a recorded image with its backend's files,
 /// or leftovers without a record (a failed install, a hand-deleted record).
 pub async fn remove_existing(store: &Store, sd: &Systemd, name: &str) -> Result<()> {
+    if store.is_starting(name) {
+        anyhow::bail!("machine {name} is starting; wait for it or stop it first");
+    }
     if sd.machine_exists(name).await? {
         anyhow::bail!("machine {name} is running; stop it before replacing its image");
     }

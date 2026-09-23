@@ -54,14 +54,48 @@ pub async fn list(ctx: &Context) -> Result<Vec<ImageSummary>> {
 
 /// Removes images and whatever they alone kept: layers, blobs, network files. A running
 /// machine is refused. What was removed before an error stays removed.
-pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Result<()> {
+/// What `remove` did: the names that are gone, and for the others why not.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Removal {
+    pub removed: Vec<String>,
+    pub failed: Vec<(String, String)>,
+}
+
+impl Removal {
+    /// The failures as one message, when there were any.
+    pub fn error(&self) -> Option<String> {
+        if self.failed.is_empty() {
+            return None;
+        }
+        let reasons: Vec<String> = self
+            .failed
+            .iter()
+            .map(|(name, why)| {
+                if why.contains(name.as_str()) {
+                    why.clone()
+                } else {
+                    format!("{name}: {why}")
+                }
+            })
+            .collect();
+        Some(reasons.join("; "))
+    }
+}
+
+/// Removes every name it can, like docker rmi: one that cannot be removed does not stop
+/// the others, and is reported in the result.
+pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Result<Removal> {
     require_root("images rm")?;
     let sd = ctx.sd().await?;
     let store = &ctx.store;
     let assembler = Assembler { store, sd };
-    let _lock = store.lock()?;
-    let outcome: Result<()> = async {
-        for name in names {
+    let _lock = store.lock().await?;
+    let mut removal = Removal::default();
+    for name in names {
+        let outcome: Result<()> = async {
+            if store.is_starting(name) {
+                bail!("machine {name} is starting; wait for it or stop it first");
+            }
             if sd.machine_exists(name).await? {
                 bail!("machine {name} is running; stop it first");
             }
@@ -80,11 +114,17 @@ pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Resu
                     }
                 }
             }
-            line(report, format!("removed {name}"));
+            Ok(())
         }
-        Ok(())
+        .await;
+        match outcome {
+            Ok(()) => {
+                line(report, format!("removed {name}"));
+                removal.removed.push(name.clone());
+            }
+            Err(e) => removal.failed.push((name.clone(), format!("{e:#}"))),
+        }
     }
-    .await;
     // Whatever happened above, what was removed must not pin anything, and a machine that
     // died on its own must not keep its ports.
     bridge::write_hosts_files(store, &ctx.config)?;
@@ -97,5 +137,27 @@ pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Resu
     if !blobs.is_empty() {
         line(report, format!("freed {} unused blob(s)", blobs.len()));
     }
-    outcome
+    Ok(removal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removal_failures_read_as_one_message() {
+        let mut removal = Removal::default();
+        assert_eq!(removal.error(), None);
+        removal.failed.push((
+            "web".to_string(),
+            "machine web is running; stop it first".to_string(),
+        ));
+        removal
+            .failed
+            .push(("db".to_string(), "Permission denied".to_string()));
+        assert_eq!(
+            removal.error().unwrap(),
+            "machine web is running; stop it first; db: Permission denied"
+        );
+    }
 }

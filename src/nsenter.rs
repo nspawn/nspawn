@@ -1,24 +1,35 @@
 //! docker exec for machines that have no D-Bus inside: enter the namespaces of the
-//! machine's leader process and run a command there, on a pseudo terminal, on pipes or
-//! on the caller's own streams.
+//! machine's leader process and run a command there, on a pseudo terminal or on pipes.
 //!
 //! setns() into a mount namespace is refused for multithreaded processes, and children
 //! only land in a PID namespace after a fork, so the work happens in a forked helper: the
 //! helper joins the namespaces, forks once more, and the grandchild execs the command.
-//! The helper reports the grandchild's PID and exits with its exit code.
+//! The helper reports the command's PID over a socket, with a pidfd and the terminal's
+//! master attached, and exits with the command's exit code.
+//!
+//! The pseudo terminal is allocated inside the machine, as machined and the container
+//! runtimes do: a terminal from the host's devpts has no node under the machine's
+//! /dev/pts, so tty(1) and everything that opens its terminal by name fail there, and
+//! with private users its owner would be nobody.
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::io::{BufRead, BufReader, IoSlice, IoSliceMut};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
+use nix::errno::Errno;
+use nix::fcntl::OFlag;
 use nix::libc;
 use nix::pty::Winsize;
 use nix::sched::{setns, CloneFlags};
+use nix::sys::socket::{
+    recvmsg, sendmsg, socketpair, AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags,
+    SockFlag, SockType,
+};
+use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{
     chdir, dup2_stderr, dup2_stdin, dup2_stdout, execve, fork, pipe2, setgid, setgroups, setsid,
@@ -38,17 +49,23 @@ pub enum Stdio {
 pub struct Process {
     /// The helper that forked the command; `wait` reaps it for the command's exit code.
     pub helper: Pid,
-    /// The command's PID as the host sees it, when the helper got that far.
-    pub pid: Option<u32>,
+    /// The command's PID as the host sees it.
+    pub pid: u32,
+    /// A pidfd of the command: signals go there, never to a PID that may have been
+    /// given to someone else meanwhile.
+    pub pidfd: OwnedFd,
     pub master: Option<OwnedFd>,
     pub stdin: Option<OwnedFd>,
     pub stdout: Option<OwnedFd>,
     pub stderr: Option<OwnedFd>,
 }
 
-/// The command's side of the streams.
+/// What the helper is asked to set up for the command.
 enum ChildIo {
-    Pty(OwnedFd),
+    Pty {
+        rows: u16,
+        cols: u16,
+    },
     Pipes {
         stdin: OwnedFd,
         stdout: OwnedFd,
@@ -56,12 +73,55 @@ enum ChildIo {
     },
 }
 
-fn cloexec(fd: &OwnedFd) -> Result<()> {
-    fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).context("setting close-on-exec")?;
-    Ok(())
+/// The command's side of its streams, once made.
+enum CommandIo {
+    /// The master of a terminal allocated inside the machine; the command opens its
+    /// slave through it.
+    Terminal(OwnedFd),
+    Pipes {
+        stdin: OwnedFd,
+        stdout: OwnedFd,
+        stderr: OwnedFd,
+    },
+}
+
+/// What the helper tells its parent once it knows: the command's PID (its pidfd and,
+/// with a terminal, the master ride along as descriptors), or why there is no command.
+#[derive(Debug, PartialEq, Eq)]
+enum Started {
+    Command(u32),
+    Failed(String),
+}
+
+fn encode(report: &Started) -> Vec<u8> {
+    match report {
+        Started::Command(pid) => {
+            let mut bytes = vec![b'p'];
+            bytes.extend_from_slice(&pid.to_ne_bytes());
+            bytes
+        }
+        Started::Failed(text) => {
+            let mut bytes = vec![b'e'];
+            bytes.extend_from_slice(text.as_bytes());
+            bytes
+        }
+    }
+}
+
+fn decode(bytes: &[u8]) -> Option<Started> {
+    match bytes.split_first()? {
+        (b'p', rest) if rest.len() == 4 => {
+            Some(Started::Command(u32::from_ne_bytes(rest.try_into().ok()?)))
+        }
+        (b'e', rest) => Some(Started::Failed(String::from_utf8_lossy(rest).into_owned())),
+        _ => None,
+    }
 }
 
 nix::ioctl_write_int_bad!(tiocsctty, libc::TIOCSCTTY);
+nix::ioctl_write_ptr_bad!(tiocsptlck, libc::TIOCSPTLCK, libc::c_int);
+nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, Winsize);
+nix::ioctl_write_int_bad!(tiocgptpeer, libc::TIOCGPTPEER);
 
 /// Namespaces to join, in the order the kernel likes: the user namespace first so that we
 /// gain the right capabilities, the mount namespace last.
@@ -82,8 +142,36 @@ pub fn wait(helper: Pid) -> Result<i32> {
     Ok(exit_code(status))
 }
 
+/// pidfd_open(2): a handle on `pid` that follows that process alone.
+pub fn pidfd_open(pid: Pid) -> nix::Result<OwnedFd> {
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_open,
+            pid.as_raw() as libc::c_long,
+            0 as libc::c_long,
+        )
+    };
+    // SAFETY: a successful pidfd_open returns a descriptor nobody else owns.
+    Errno::result(fd).map(|fd| unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+/// pidfd_send_signal(2): `signal` to the process behind `pidfd`, ESRCH once it is gone.
+/// A raw number, so that the realtime signals images ask for work too.
+pub fn pidfd_signal(pidfd: &OwnedFd, signal: i32) -> nix::Result<()> {
+    Errno::result(unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd() as libc::c_long,
+            signal as libc::c_long,
+            std::ptr::null::<libc::siginfo_t>(),
+            0 as libc::c_long,
+        )
+    })
+    .map(drop)
+}
+
 /// Starts `argv` inside the machine whose leader is `leader`, with `image_env` plus PATH
-/// and TERM when missing, its streams set up as `stdio` says.
+/// when missing (and TERM, on a terminal), its streams set up as `stdio` says.
 pub fn spawn(
     leader: u32,
     argv: &[String],
@@ -124,44 +212,24 @@ pub fn spawn(
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         )?);
     }
-    if let Ok(term) = std::env::var("TERM") {
-        env.push(CString::new(format!("TERM={term}"))?);
+    // The caller says what terminal it has (the service's own environment has none);
+    // docker's default stands in otherwise.
+    if matches!(stdio, Stdio::Pty { .. }) && !image_env.iter().any(|v| v.starts_with("TERM=")) {
+        env.push(CString::new("TERM=xterm")?);
     }
     let c_cwd = CString::new(working_dir.unwrap_or("/"))?;
     let user = user.map(|u| u.to_string());
     let exec_context = selinux_context_of(leader);
     // Everything the two sides hold, made before the fork. The command's ends are kept
     // out of what it execs (dup2 onto 0, 1 and 2 clears close-on-exec there).
-    let mut parent = Process {
-        helper: Pid::from_raw(0),
-        pid: None,
-        master: None,
-        stdin: None,
-        stdout: None,
-        stderr: None,
-    };
+    let mut ours = (None, None, None);
     let child_io = match stdio {
-        Stdio::Pty { rows, cols } => {
-            let size = Winsize {
-                ws_row: rows,
-                ws_col: cols,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            };
-            let pty =
-                nix::pty::openpty(Some(&size), None).context("allocating a pseudo terminal")?;
-            cloexec(&pty.master)?;
-            cloexec(&pty.slave)?;
-            parent.master = Some(pty.master);
-            ChildIo::Pty(pty.slave)
-        }
+        Stdio::Pty { rows, cols } => ChildIo::Pty { rows, cols },
         Stdio::Pipes => {
             let (stdin_r, stdin_w) = pipe2(OFlag::O_CLOEXEC).context("creating a pipe")?;
             let (stdout_r, stdout_w) = pipe2(OFlag::O_CLOEXEC).context("creating a pipe")?;
             let (stderr_r, stderr_w) = pipe2(OFlag::O_CLOEXEC).context("creating a pipe")?;
-            parent.stdin = Some(stdin_w);
-            parent.stdout = Some(stdout_r);
-            parent.stderr = Some(stderr_r);
+            ours = (Some(stdin_w), Some(stdout_r), Some(stderr_r));
             ChildIo::Pipes {
                 stdin: stdin_r,
                 stdout: stdout_w,
@@ -169,31 +237,62 @@ pub fn spawn(
             }
         }
     };
-    // The helper tells the command's PID through here, right after forking it.
-    let (pid_r, pid_w) = pipe2(OFlag::O_CLOEXEC).context("creating a pipe")?;
+    // The helper reports through here, once.
+    let (report_r, report_w) = socketpair(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        None,
+        SockFlag::SOCK_CLOEXEC,
+    )
+    .context("creating a socket pair")?;
 
     // SAFETY: the parent is multithreaded (tokio), so the child only performs syscalls and
-    // work on data prepared above until it execs or exits.
+    // work on data prepared above until it execs or exits. It allocates (glibc's fork
+    // handlers keep malloc usable) but never takes a lock of the parent's, which is why
+    // it writes its complaints with write(2) rather than eprintln.
     match unsafe { fork() }.context("forking the namespace helper")? {
         ForkResult::Parent { child } => {
             drop(ns_fds);
             drop(child_io);
-            drop(pid_w);
-            parent.helper = child;
-            let mut bytes = [0u8; 4];
-            if nix::unistd::read(&pid_r, &mut bytes) == Ok(4) {
-                parent.pid = Some(u32::from_ne_bytes(bytes));
+            drop(report_w);
+            let (report, mut fds) = receive(&report_r);
+            match report {
+                Some(Started::Command(pid)) => {
+                    let pidfd = if fds.is_empty() {
+                        let _ = waitpid(child, None);
+                        bail!("the namespace helper reported no pidfd for the command");
+                    } else {
+                        fds.remove(0)
+                    };
+                    let master = fds.pop();
+                    Ok(Process {
+                        helper: child,
+                        pid,
+                        pidfd,
+                        master,
+                        stdin: ours.0,
+                        stdout: ours.1,
+                        stderr: ours.2,
+                    })
+                }
+                Some(Started::Failed(text)) => {
+                    let _ = waitpid(child, None);
+                    bail!("{text}");
+                }
+                None => {
+                    let _ = waitpid(child, None);
+                    bail!("the namespace helper died before running the command");
+                }
             }
-            Ok(parent)
         }
         ForkResult::Child => {
-            drop(parent);
-            drop(pid_r);
+            drop(ours);
+            drop(report_r);
             let code = helper(
                 &ns_fds,
                 cgroup.as_deref(),
                 child_io,
-                pid_w,
+                report_w,
                 &c_argv,
                 &env,
                 &c_cwd,
@@ -205,6 +304,58 @@ pub fn spawn(
     }
 }
 
+/// The helper's one message, with the descriptors it attaches.
+fn receive(socket: &OwnedFd) -> (Option<Started>, Vec<OwnedFd>) {
+    let mut buf = [0u8; 4096];
+    let mut fds = Vec::new();
+    let bytes = {
+        let mut iov = [IoSliceMut::new(&mut buf)];
+        let mut space = nix::cmsg_space!([RawFd; 2]);
+        let message = loop {
+            match recvmsg::<()>(
+                socket.as_raw_fd(),
+                &mut iov,
+                Some(&mut space),
+                MsgFlags::MSG_CMSG_CLOEXEC,
+            ) {
+                Ok(message) => break message,
+                Err(Errno::EINTR) => continue,
+                Err(_) => return (None, fds),
+            }
+        };
+        if let Ok(controls) = message.cmsgs() {
+            for control in controls {
+                if let ControlMessageOwned::ScmRights(received) = control {
+                    // SAFETY: SCM_RIGHTS hands us fresh descriptors of our own.
+                    fds.extend(
+                        received
+                            .into_iter()
+                            .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
+                    );
+                }
+            }
+        }
+        message.bytes
+    };
+    (decode(&buf[..bytes]), fds)
+}
+
+fn tell(socket: &OwnedFd, report: &Started, fds: &[RawFd]) {
+    let bytes = encode(report);
+    let iov = [IoSlice::new(&bytes)];
+    let rights = [ControlMessage::ScmRights(fds)];
+    let controls: &[ControlMessage<'_>] = if fds.is_empty() { &[] } else { &rights };
+    let _ = sendmsg::<()>(socket.as_raw_fd(), &iov, controls, MsgFlags::empty(), None);
+}
+
+/// Writes a line to standard error with write(2): Rust's stderr lock may be held by a
+/// thread of the parent that did not come along with the fork.
+fn complain(text: &str) {
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.push(b'\n');
+    let _ = unsafe { libc::write(2, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+}
+
 /// The cgroup of the machine's leader, so that what we run is accounted to the machine
 /// and dies with it (KillMachine signals the cgroup).
 fn leader_cgroup(leader: u32) -> Option<String> {
@@ -214,12 +365,41 @@ fn leader_cgroup(leader: u32) -> Option<String> {
         .map(|path| format!("/sys/fs/cgroup{path}/cgroup.procs"))
 }
 
+/// A pseudo terminal from the devpts of the mount namespace we are in (the machine's,
+/// by now): its master, unlocked and sized.
+fn open_terminal(rows: u16, cols: u16) -> std::result::Result<OwnedFd, String> {
+    let flags = OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC;
+    let master = nix::fcntl::open("/dev/pts/ptmx", flags, Mode::empty())
+        .or_else(|_| nix::fcntl::open("/dev/ptmx", flags, Mode::empty()))
+        .map_err(|e| format!("opening /dev/pts/ptmx inside the machine: {e}"))?;
+    let unlock: libc::c_int = 0;
+    unsafe { tiocsptlck(master.as_raw_fd(), &unlock) }
+        .map_err(|e| format!("unlocking the pseudo terminal: {e}"))?;
+    let size = Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let _ = unsafe { tiocswinsz(master.as_raw_fd(), &size) };
+    Ok(master)
+}
+
+/// The slave of `master`, by the master alone (TIOCGPTPEER): no path lookup, so no
+/// mistaking it for a terminal of the same number elsewhere.
+fn open_slave(master: &OwnedFd) -> nix::Result<OwnedFd> {
+    let flags = OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC;
+    let fd = unsafe { tiocgptpeer(master.as_raw_fd(), flags.bits()) }?;
+    // SAFETY: the ioctl returned a new descriptor of ours.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn helper(
     ns_fds: &[(&str, CloneFlags, OwnedFd)],
     cgroup: Option<&str>,
     io: ChildIo,
-    pid_w: OwnedFd,
+    socket: OwnedFd,
     argv: &[CString],
     env: &[CString],
     cwd: &CString,
@@ -234,32 +414,77 @@ fn helper(
         if let Err(e) = setns(fd, *flag) {
             // Joining the user namespace we are already in is refused with EINVAL; that is
             // what happens for machines that run without private users.
-            if *flag == CloneFlags::CLONE_NEWUSER && e == nix::errno::Errno::EINVAL {
+            if *flag == CloneFlags::CLONE_NEWUSER && e == Errno::EINVAL {
                 continue;
             }
-            eprintln!("error: joining the {name} namespace: {e}");
+            tell(
+                &socket,
+                &Started::Failed(format!("joining the {name} namespace: {e}")),
+                &[],
+            );
             return 126;
         }
     }
+    let io = match io {
+        ChildIo::Pty { rows, cols } => match open_terminal(rows, cols) {
+            Ok(master) => CommandIo::Terminal(master),
+            Err(text) => {
+                tell(&socket, &Started::Failed(text), &[]);
+                return 126;
+            }
+        },
+        ChildIo::Pipes {
+            stdin,
+            stdout,
+            stderr,
+        } => CommandIo::Pipes {
+            stdin,
+            stdout,
+            stderr,
+        },
+    };
     match unsafe { fork() } {
         Err(e) => {
-            eprintln!("error: forking inside the machine: {e}");
+            tell(
+                &socket,
+                &Started::Failed(format!("forking inside the machine: {e}")),
+                &[],
+            );
             126
         }
         Ok(ForkResult::Parent { child }) => {
-            let _ = nix::unistd::write(&pid_w, &(child.as_raw() as u32).to_ne_bytes());
-            drop(pid_w);
+            // Taken before the child is reaped, so it can never name another process.
+            let pidfd = match pidfd_open(child) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    let _ = nix::sys::signal::kill(child, nix::sys::signal::SIGKILL);
+                    let _ = waitpid(child, None);
+                    tell(
+                        &socket,
+                        &Started::Failed(format!("opening a pidfd for the command: {e}")),
+                        &[],
+                    );
+                    return 126;
+                }
+            };
+            let mut fds = vec![pidfd.as_raw_fd()];
+            if let CommandIo::Terminal(master) = &io {
+                fds.push(master.as_raw_fd());
+            }
+            tell(&socket, &Started::Command(child.as_raw() as u32), &fds);
+            drop(pidfd);
             drop(io);
+            drop(socket);
             match waitpid(child, None) {
                 Ok(status) => exit_code(status),
                 Err(e) => {
-                    eprintln!("error: waiting for the command: {e}");
+                    complain(&format!("error: waiting for the command: {e}"));
                     126
                 }
             }
         }
         Ok(ForkResult::Child) => {
-            drop(pid_w);
+            drop(socket);
             let code = grandchild(io, argv, env, cwd, user, exec_context);
             unsafe { libc::_exit(code) }
         }
@@ -267,31 +492,43 @@ fn helper(
 }
 
 fn grandchild(
-    io: ChildIo,
+    io: CommandIo,
     argv: &[CString],
     env: &[CString],
     cwd: &CString,
     user: Option<&str>,
     exec_context: Option<&str>,
 ) -> i32 {
-    match &io {
-        ChildIo::Pty(slave) => {
-            if setsid().is_err() {
-                eprintln!("error: setsid failed");
-                return 126;
-            }
-            if unsafe { tiocsctty(slave.as_raw_fd(), 0) }.is_err() {
-                eprintln!("error: cannot take the terminal");
-                return 126;
-            }
+    // The streams first: from here on, complaints reach whoever runs the command.
+    match io {
+        CommandIo::Terminal(master) => {
+            let slave = match open_slave(&master) {
+                Ok(slave) => slave,
+                Err(e) => {
+                    complain(&format!(
+                        "error: opening the terminal inside the machine: {e}"
+                    ));
+                    return 126;
+                }
+            };
+            drop(master);
             if dup2_stdin(slave.as_fd()).is_err()
                 || dup2_stdout(slave.as_fd()).is_err()
                 || dup2_stderr(slave.as_fd()).is_err()
             {
                 return 126;
             }
+            drop(slave);
+            if setsid().is_err() {
+                complain("error: setsid failed");
+                return 126;
+            }
+            if unsafe { tiocsctty(0, 0) }.is_err() {
+                complain("error: cannot take the terminal");
+                return 126;
+            }
         }
-        ChildIo::Pipes {
+        CommandIo::Pipes {
             stdin,
             stdout,
             stderr,
@@ -305,14 +542,17 @@ fn grandchild(
         }
     }
     if let Err(e) = chdir(cwd.as_c_str()) {
-        eprintln!("error: cannot change to {}: {e}", cwd.to_string_lossy());
+        complain(&format!(
+            "error: cannot change to {}: {e}",
+            cwd.to_string_lossy()
+        ));
         return 126;
     }
     // After joining the user namespace our host UID is unmapped and we would run as
     // nobody. Become the machine's root first: only a root-to-user change makes the
     // kernel drop capabilities, so a requested user ends up without any.
     if setgid(Gid::from_raw(0)).is_err() || setuid(Uid::from_raw(0)).is_err() {
-        eprintln!("error: cannot become root inside the machine");
+        complain("error: cannot become root inside the machine");
         return 126;
     }
     let mut env: Vec<CString> = env.to_vec();
@@ -320,11 +560,14 @@ fn grandchild(
         None => env.push(CString::new("HOME=/root").expect("no NUL")),
         Some(user) => {
             let Some((uid, gid, home)) = resolve_user(user) else {
-                eprintln!("error: unknown user {user} inside the machine");
+                complain(&format!("error: unknown user {user} inside the machine"));
                 return 126;
             };
             if setgroups(&[]).is_err() || setgid(gid).is_err() || setuid(uid).is_err() {
-                eprintln!("error: cannot switch to uid {} inside the machine", uid);
+                complain(&format!(
+                    "error: cannot switch to uid {} inside the machine",
+                    uid
+                ));
                 return 126;
             }
             env.push(CString::new(format!("HOME={home}")).expect("no NUL"));
@@ -339,7 +582,9 @@ fn grandchild(
             .open("/proc/self/attr/exec")
             .and_then(|mut f| std::io::Write::write_all(&mut f, context.as_bytes()));
         if written.is_err() {
-            eprintln!("error: cannot run the command in the machine's SELinux context {context}");
+            complain(&format!(
+                "error: cannot run the command in the machine's SELinux context {context}"
+            ));
             return 126;
         }
     }
@@ -348,18 +593,27 @@ fn grandchild(
     let program = match find_program(&argv[0], &env) {
         Some(program) => program,
         None => {
-            eprintln!(
+            complain(&format!(
                 "error: cannot execute {}: not found on the machine's PATH",
                 argv[0].to_string_lossy()
-            );
+            ));
             return 127;
         }
     };
     match execve(&program, argv, &env) {
         Ok(_) => 0,
         Err(e) => {
-            eprintln!("error: cannot execute {}: {e}", program.to_string_lossy());
-            126
+            complain(&format!(
+                "error: cannot execute {}: {e}",
+                program.to_string_lossy()
+            ));
+            // As the shells and docker have it: 127 for a program that is not there,
+            // 126 for one that cannot be run.
+            if e == Errno::ENOENT {
+                127
+            } else {
+                126
+            }
         }
     }
 }
@@ -496,5 +750,71 @@ mod tests {
             )),
             137
         );
+    }
+
+    #[test]
+    fn the_helper_report_survives_the_socket() {
+        for report in [
+            Started::Command(4242),
+            Started::Failed("joining the mnt namespace: EPERM".to_string()),
+        ] {
+            assert_eq!(decode(&encode(&report)).unwrap(), report);
+        }
+        assert!(decode(b"").is_none());
+        assert!(decode(b"p12").is_none(), "a truncated PID is no report");
+        assert!(decode(b"x").is_none());
+    }
+
+    #[test]
+    fn the_report_and_its_descriptors_cross_the_socket() {
+        let (ours, theirs) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        let (read, write) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        tell(
+            &theirs,
+            &Started::Command(7),
+            &[read.as_raw_fd(), write.as_raw_fd()],
+        );
+        let (report, fds) = receive(&ours);
+        assert_eq!(report, Some(Started::Command(7)));
+        assert_eq!(fds.len(), 2);
+        nix::unistd::write(&fds[1], b"x").unwrap();
+        let mut buf = [0u8; 1];
+        assert_eq!(nix::unistd::read(&fds[0], &mut buf).unwrap(), 1);
+        tell(&theirs, &Started::Failed("no".to_string()), &[]);
+        let (report, fds) = receive(&ours);
+        assert_eq!(report, Some(Started::Failed("no".to_string())));
+        assert!(fds.is_empty());
+        drop(theirs);
+        assert_eq!(receive(&ours).0, None, "a dead helper reads as no report");
+    }
+
+    #[test]
+    fn a_terminal_is_allocated_unlocked_and_sized() {
+        // /dev/pts/ptmx is open to everyone; this runs where the tests run.
+        let master = open_terminal(31, 111).unwrap();
+        let slave = open_slave(&master).unwrap();
+        assert!(nix::unistd::isatty(&slave).unwrap());
+        let mut size = Winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, Winsize);
+        unsafe { tiocgwinsz(slave.as_raw_fd(), &mut size) }.unwrap();
+        assert_eq!((size.ws_row, size.ws_col), (31, 111));
+    }
+
+    #[test]
+    fn a_pidfd_follows_its_process() {
+        let me = pidfd_open(Pid::this()).unwrap();
+        pidfd_signal(&me, 0).unwrap();
+        assert_eq!(pidfd_signal(&me, 1000), Err(Errno::EINVAL));
     }
 }

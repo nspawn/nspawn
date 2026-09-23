@@ -48,7 +48,8 @@ pub async fn push(ctx: &Context, request: &PushRequest, report: Report<'_>) -> R
             record.name
         )
     })?;
-    let manifest: OciImageManifest = serde_json::from_slice(&manifest_bytes)?;
+    let manifest: OciImageManifest = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("parsing the stored manifest of {}", record.name))?;
     for descriptor in manifest
         .layers
         .iter()

@@ -21,6 +21,7 @@ use std::str::FromStr;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::api::Report;
 use crate::config::Config;
 use crate::hostnet;
 use crate::settings::Network;
@@ -198,7 +199,7 @@ pub fn parse_publish(values: &[String]) -> Result<Vec<PortMap>> {
 
 /// Creates the bridge with its address, forwarding, the NAT table and the firewalld
 /// exception. Safe to repeat: everything is idempotent.
-pub async fn up(config: &Config, sd: &Systemd) -> Result<()> {
+pub async fn up(config: &Config, sd: &Systemd, report: Report<'_>) -> Result<()> {
     let name = config.bridge.as_str();
     let subnet = config.subnet;
     let address = format!("{}/{}", subnet.gateway(), subnet.prefix);
@@ -231,7 +232,7 @@ pub async fn up(config: &Config, sd: &Systemd) -> Result<()> {
     nft(&base_ruleset(name, subnet))?;
     allow_forwarding_past_iptables(name)?;
     if hostnet::firewalld_running(sd).await {
-        hostnet::trust_interface(sd, name).await?;
+        hostnet::trust_interface(sd, name, report).await?;
     }
     Ok(())
 }
@@ -643,8 +644,10 @@ pub fn prepare_machine(
     let addr = match record.address.filter(|a| config.subnet.usable(*a)) {
         Some(addr) => addr,
         None => {
+            // Every record counts, readable or not: an address handed out twice is worse
+            // than a start refused over a record that needs fixing.
             let used: Vec<Ipv4Addr> = store
-                .list_images()?
+                .list_images_strict()?
                 .iter()
                 .filter(|r| r.name != record.name)
                 .filter_map(|r| r.address)
@@ -705,7 +708,7 @@ async fn ports_in_use(
             continue;
         }
         let Some(addr) = r.address else { continue };
-        if !sd.machine_exists(&r.name).await? {
+        if !holds_ports(store, sd, &r.name).await? {
             continue;
         }
         for p in &r.ports {
@@ -713,6 +716,25 @@ async fn ports_in_use(
         }
     }
     Ok(used)
+}
+
+/// Whether a machine holds its published ports: being started (machined does not list
+/// it yet), or registered and not on its way down (machined keeps a closing machine
+/// listed while its unit runs ExecStopPost, which has already withdrawn the ports).
+async fn holds_ports(store: &Store, sd: &Systemd, name: &str) -> Result<bool> {
+    if store.is_starting(name) {
+        return Ok(true);
+    }
+    if !sd.machine_exists(name).await? {
+        return Ok(false);
+    }
+    let (_, active) = sd
+        .unit_state(&format!("systemd-nspawn@{name}.service"))
+        .await?;
+    Ok(matches!(
+        active.as_str(),
+        "active" | "activating" | "reloading"
+    ))
 }
 
 /// Fails when a port the machine wants to publish is taken by another running machine

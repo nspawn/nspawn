@@ -304,19 +304,16 @@ impl Systemd {
         wait_for_job(&mut jobs, &job, unit, "stopping").await
     }
 
-    /// Opens a PTY inside the machine running `path` with `args` (argv including argv[0]).
-    /// An empty path means the user's login shell.
+    /// Opens a PTY inside the machine running `path` with `args` (argv including argv[0])
+    /// and `env`. An empty path means the user's login shell.
     pub async fn open_shell(
         &self,
         name: &str,
         user: &str,
         path: &str,
         args: Vec<String>,
+        env: Vec<String>,
     ) -> Result<(OwnedFd, String)> {
-        let mut env = Vec::new();
-        if let Ok(term) = std::env::var("TERM") {
-            env.push(format!("TERM={term}"));
-        }
         let (fd, pty) = self
             .machined
             .open_machine_shell(

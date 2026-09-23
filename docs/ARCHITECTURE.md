@@ -32,13 +32,16 @@ machine units call nspawn back through drop-in hooks.
 /var/lib/nspawn/
   layers/            root-owned extracted layers (overlay backend)
   layers-foreign/    layers shifted into the foreign UID range (mstack)
-  blobs/             compressed blobs, kept for push
+  blobs/             compressed blobs, kept for push; .hold-* lists the blobs
+                     of a pull in flight, which the collector leaves alone
   images/NAME.json   the record: reference, backend, mode, network, address,
                      ports, entrypoint/cmd, env, volumes
   manifests/NAME.json raw manifest bytes (digest stays valid)
   machines/NAME/     overlay upper/work, host0.network, hosts, resolv.conf,
                      units/ for the volume wait unit
   volumes/NAME/      named volumes
+  starting/NAME      a start in progress, until the machine is registered:
+                     nothing removes or replaces the image meanwhile
   .lock              flock serialising commands that change the store
 /var/lib/machines/NAME        the root machined boots (mount point or dir)
 /var/lib/machines/NAME.mstack mstack layout (layer@N links, rw/)

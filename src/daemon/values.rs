@@ -212,13 +212,18 @@ impl<'a> Options<'a> {
             .unwrap_or(default))
     }
 
+    /// Any unsigned integer (y, q, u or t) will do.
     pub fn u64(&mut self, key: &'static str, default: u64) -> anyhow::Result<u64> {
         Ok(self
             .take(key)
-            .map(|value| {
-                u64::try_from(value.clone()).map_err(|_| {
-                    anyhow::anyhow!("option {key} must be an unsigned 64-bit integer (t)")
-                })
+            .map(|value| match &**value {
+                Value::U8(n) => Ok(*n as u64),
+                Value::U16(n) => Ok(*n as u64),
+                Value::U32(n) => Ok(*n as u64),
+                Value::U64(n) => Ok(*n),
+                _ => Err(anyhow::anyhow!(
+                    "option {key} must be an unsigned integer (t, u, q or y)"
+                )),
             })
             .transpose()?
             .unwrap_or(default))
@@ -274,6 +279,19 @@ mod tests {
         assert_eq!(options.strings("publish").unwrap(), ["80:80"]);
         assert_eq!(options.u64("timeout", 10).unwrap(), 5);
         assert_eq!(options.u64("missing", 10).unwrap(), 10);
+        let narrow: HashMap<String, OwnedValue> = HashMap::from([
+            ("rows".to_string(), v(40u32)),
+            ("cols".to_string(), OwnedValue::from(120u16)),
+            ("lines".to_string(), v("many")),
+        ]);
+        let mut numbers = Options::new(&narrow);
+        assert_eq!(numbers.u64("rows", 24).unwrap(), 40, "u will do for t");
+        assert_eq!(numbers.u64("cols", 80).unwrap(), 120, "so will q");
+        assert!(numbers
+            .u64("lines", 0)
+            .unwrap_err()
+            .to_string()
+            .contains("unsigned integer"));
         assert!(options.string("force").is_err());
         options.finish().unwrap();
 

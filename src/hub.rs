@@ -203,14 +203,15 @@ impl Hub {
     }
 }
 
-/// Where a blob is written while it is incomplete (".part-<name>.<pid>", skipped by the
-/// store; per process, since downloads run without the store lock).
+/// Where a blob is written while it is incomplete (".part-<name>.<pid>.<n>", skipped by
+/// the store): a name of its own per download, since downloads run without the store
+/// lock and the service runs several at once, the same blob among them.
 pub fn part_path(dest: &Path) -> PathBuf {
     let name = dest
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "blob".to_string());
-    dest.with_file_name(format!(".part-{name}.{}", std::process::id()))
+    dest.with_file_name(format!(".part-{name}.{}", crate::store::unique_suffix()))
 }
 
 /// Whether another page must be asked for: a full page that moved the cursor. A registry
@@ -236,15 +237,19 @@ mod pagination_tests {
     }
 
     #[test]
-    fn part_names_are_per_process() {
-        let part = part_path(Path::new("/var/lib/nspawn/blobs/sha256-abc"));
-        assert_eq!(
-            part,
-            PathBuf::from(format!(
-                "/var/lib/nspawn/blobs/.part-sha256-abc.{}",
-                std::process::id()
-            ))
-        );
+    fn part_names_never_repeat() {
+        let dest = Path::new("/var/lib/nspawn/blobs/sha256-abc");
+        let first = part_path(dest);
+        let second = part_path(dest);
+        assert_ne!(first, second, "two downloads of the same blob at once");
+        for part in [&first, &second] {
+            let name = part.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                name.starts_with(&format!(".part-sha256-abc.{}.", std::process::id())),
+                "{name}"
+            );
+            assert_eq!(part.parent(), dest.parent());
+        }
     }
 }
 

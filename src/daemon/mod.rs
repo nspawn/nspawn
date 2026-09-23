@@ -30,7 +30,7 @@ pub struct State {
     pub jobs: jobs::Jobs,
     pub processes: processes::Processes,
     connection: OnceLock<zbus::Connection>,
-    /// Calls in progress; the service does not exit while one runs.
+    /// Calls, jobs and processes in progress; the service does not exit while one runs.
     busy: AtomicUsize,
     last_activity: Mutex<Instant>,
 }
@@ -79,31 +79,32 @@ impl Drop for Busy {
     }
 }
 
-/// Serves org.nspawn until `idle_exit` passes without a call or a job; None serves
-/// forever.
+/// Serves org.nspawn until `idle_exit` passes without a call, a job or a process; None
+/// serves forever.
 pub async fn run(config: Config, idle_exit: Option<Duration>) -> Result<()> {
     require_root("daemon")?;
     let state = Arc::new(State::new(Context::new(config)));
     let connection = zbus::connection::Builder::system()?
-        .name(BUS_NAME)?
         .serve_at(MANAGER_PATH, Manager::new(state.clone()))?
         .build()
         .await
-        .with_context(|| format!("claiming {BUS_NAME} on the system bus"))?;
+        .context("connecting to the system bus")?;
     if state.connection.set(connection.clone()).is_err() {
         unreachable!("the connection is set once");
     }
+    // The name comes last: nobody can call before it exists, and by then the objects
+    // have their connection.
+    connection
+        .request_name(BUS_NAME)
+        .await
+        .with_context(|| format!("claiming {BUS_NAME} on the system bus"))?;
     tokio::spawn(relay_machine_signals(state.clone()));
     loop {
         tokio::time::sleep(Duration::from_secs(5)).await;
         let Some(idle_exit) = idle_exit else {
             continue;
         };
-        if state.busy.load(Ordering::SeqCst) == 0
-            && state.jobs.running() == 0
-            && state.processes.running() == 0
-            && state.idle_for() >= idle_exit
-        {
+        if state.busy.load(Ordering::SeqCst) == 0 && state.idle_for() >= idle_exit {
             break;
         }
     }

@@ -74,17 +74,20 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
     };
     let backend = Backend::choose(choice, sd).await?;
 
-    let output_dir = config
-        .state_dir
-        .join("builds")
-        .join(format!("{name}-{}", now_unix()));
+    let build_id = format!("{name}-{}-{}", now_unix(), crate::store::unique_suffix());
+    let output_dir = config.state_dir.join("builds").join(&build_id);
     let cache_dir = config.state_dir.join("cache").join("mkosi");
     // mkosi builds in its workspace and renames the result into place; kept next to
-    // the output so that what lands there carries the store's labels, not /var/tmp's.
-    let workspace_dir = config.state_dir.join("cache").join("mkosi-workspace");
-    fs::create_dir_all(&output_dir)?;
-    fs::create_dir_all(&cache_dir)?;
-    fs::create_dir_all(&workspace_dir)?;
+    // the output so that what lands there carries the store's labels, not /var/tmp's,
+    // and one per build, since the service may run two at once.
+    let workspace_dir = config
+        .state_dir
+        .join("cache")
+        .join("mkosi-workspace")
+        .join(&build_id);
+    for dir in [&output_dir, &cache_dir, &workspace_dir] {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
 
     let argv = mkosi_arguments(
         request,
@@ -95,14 +98,16 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
         &workspace_dir,
     );
     line(report, format!("running: mkosi {}", argv.join(" ")));
-    let status = run_mkosi(&mkosi, &argv, report).await?;
+    let status = run_mkosi(&mkosi, &argv, report).await;
+    let _ = fs::remove_dir_all(&workspace_dir);
+    let status = status?;
     if !status.success() {
         if !request.keep_output {
             let _ = fs::remove_dir_all(&output_dir);
         }
         bail!("mkosi failed with {status}");
     }
-    let _lock = store.lock()?;
+    let _lock = store.lock().await?;
     // The name may have been taken while mkosi ran.
     ensure_replaceable(store, sd, &name, request.force).await?;
     let outcome: Result<Mode> = async {

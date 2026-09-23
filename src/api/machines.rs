@@ -99,10 +99,11 @@ pub async fn prepare(
     config: &Config,
     name: &str,
     record: Option<ImageRecord>,
+    report: Report<'_>,
 ) -> Result<Network> {
     let Some(mut record) = record else {
         // Not ours: the stock systemd-nspawn@.service template uses --network-veth.
-        hostnet::ensure_networkd(sd).await?;
+        hostnet::ensure_networkd(sd, report).await?;
         return Ok(Network::Veth);
     };
     if record.network == Network::Bridge
@@ -122,7 +123,7 @@ pub async fn prepare(
         );
     }
     let files = if record.network == Network::Bridge {
-        bridge::up(config, sd).await?;
+        bridge::up(config, sd, report).await?;
         bridge::check_port_conflicts(store, sd, &record).await?;
         // Only now, past the checks, does the record keep what it was given.
         store.record_image(&record)?;
@@ -165,8 +166,13 @@ pub async fn prepare(
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let targets: Vec<String> = binds.iter().map(|b| b.target.clone()).collect();
         let (service, dropin) = settings::volume_wait_units(&targets);
-        std::fs::write(dir.join("nspawn-volumes.service"), service)?;
-        std::fs::write(dir.join("nspawn-volumes.conf"), dropin)?;
+        for (file, text) in [
+            ("nspawn-volumes.service", service),
+            ("nspawn-volumes.conf", dropin),
+        ] {
+            let path = dir.join(file);
+            std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        }
         Some(dir)
     } else {
         None
@@ -203,7 +209,7 @@ pub async fn prepare(
         }
     }
     if record.network == Network::Veth {
-        hostnet::ensure_networkd(sd).await?;
+        hostnet::ensure_networkd(sd, report).await?;
     }
     Ok(record.network)
 }
@@ -237,11 +243,7 @@ pub enum StartOutcome {
     Ended,
 }
 
-pub async fn start(
-    ctx: &Context,
-    args: &StartRequest,
-    _report: Report<'_>,
-) -> Result<StartOutcome> {
+pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Result<StartOutcome> {
     let config = &ctx.config;
     if args.name.contains(':') || args.name.contains('/') {
         bail!(
@@ -256,7 +258,17 @@ pub async fn start(
     let store = &ctx.store;
     let mode = store.load_image(&args.name)?.map(|r| r.mode);
     wait_for_previous(sd, &args.name, &unit, mode).await?;
-    let lock = store.lock()?;
+    let lock = store.lock().await?;
+    // Under the lock, what wait_for_previous saw may have changed: another start may be
+    // preparing this machine (its files and network namespace would be redone under it),
+    // or it may be up already.
+    if store.is_starting(&args.name) {
+        bail!("machine {} is starting already", args.name);
+    }
+    if sd.machine_exists(&args.name).await? {
+        bail!("machine {} is already running", args.name);
+    }
+    let _starting = store.mark_starting(&args.name)?;
     let mut record = store.load_image(&args.name)?;
     match record.as_mut() {
         Some(r) => {
@@ -317,7 +329,7 @@ pub async fn start(
         }
     }
     let booted = record.as_ref().is_none_or(|r| r.mode == Mode::Boot);
-    let network = prepare(sd, store, config, &args.name, record).await?;
+    let network = prepare(sd, store, config, &args.name, record, report).await?;
     // The unit's own hooks take the lock; it must be free while the unit starts.
     drop(lock);
     // firewalld only knows a veth once the machine is registered; published ports need
@@ -348,10 +360,10 @@ pub async fn start(
         }
     }
     if firewalld {
-        hostnet::admit(sd, &args.name).await?;
+        hostnet::admit(sd, &args.name, report).await?;
     }
     if network == Network::Bridge {
-        let _lock = store.lock()?;
+        let _lock = store.lock().await?;
         bridge::sync_ports(store, sd).await?;
     }
     if args.wait && booted {
@@ -517,7 +529,7 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         sd.stop_unit(&unit).await?;
         sd.reset_failed(&unit).await?;
         hostnet::release(sd, &admitted).await;
-        let _lock = store.lock()?;
+        let _lock = store.lock().await?;
         release_machine(&args.name, record.as_ref())?;
     }
     Ok(StopOutcome::Stopped)
@@ -735,14 +747,15 @@ pub async fn spawn_in_namespaces(
 }
 
 /// The login session machined offers for a booted machine: a PTY running `path` (the
-/// user's shell when empty) with `args`. A machine that has just been started has no
-/// D-Bus yet for a few seconds; OpenMachineShell is retried for a while.
+/// user's shell when empty) with `args` and `env`. A machine that has just been started
+/// has no D-Bus yet for a few seconds; OpenMachineShell is retried for a while.
 pub async fn open_shell(
     ctx: &Context,
     machine: &str,
     user: &str,
     path: &str,
     args: Vec<String>,
+    env: Vec<String>,
 ) -> Result<(OwnedFd, String)> {
     let sd = ctx.sd().await?;
     if !sd.machine_exists(machine).await? {
@@ -750,7 +763,10 @@ pub async fn open_shell(
     }
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        match sd.open_shell(machine, user, path, args.clone()).await {
+        match sd
+            .open_shell(machine, user, path, args.clone(), env.clone())
+            .await
+        {
             Ok(session) => return Ok(session),
             Err(e) if Instant::now() < deadline && format!("{e:#}").contains("no system bus") => {
                 tokio::time::sleep(Duration::from_millis(500)).await;

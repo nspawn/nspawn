@@ -41,6 +41,8 @@ pub struct FileConfig {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub registry: String,
+    /// Whether the registry was given (flag, environment or file) rather than defaulted.
+    pub registry_set: bool,
     pub ca_cert: Option<PathBuf>,
     pub backend: BackendChoice,
     pub machines_dir: PathBuf,
@@ -128,10 +130,12 @@ impl Config {
         {
             anyhow::bail!("bridge name {bridge:?}: 1 to 15 letters, digits, - or _");
         }
+        let registry_set = registry.is_some() || file.registry.is_some();
         Ok(Config {
             registry: registry
                 .or(file.registry)
                 .unwrap_or_else(|| DEFAULT_REGISTRY.to_string()),
+            registry_set,
             ca_cert: ca_cert.or(file.ca_cert),
             backend: file.backend.unwrap_or(BackendChoice::Auto),
             machines_dir,
@@ -152,6 +156,7 @@ mod tests {
     fn defaults_when_nothing_is_set() {
         let c = Config::merge(FileConfig::default(), None, None).unwrap();
         assert_eq!(c.registry, DEFAULT_REGISTRY);
+        assert!(!c.registry_set);
         assert_eq!(c.bridge, "nspawn0");
         assert_eq!(c.subnet.to_string(), "10.99.0.0/24");
         assert!(c.dns.is_empty());
@@ -172,6 +177,7 @@ mod tests {
         assert_eq!(c.subnet.to_string(), "172.30.5.0/24");
         assert_eq!(c.dns, vec!["10.0.0.53".parse::<IpAddr>().unwrap()]);
         assert_eq!(c.registry, "cli.example");
+        assert!(c.registry_set);
         assert_eq!(c.ca_cert, Some(PathBuf::from("/a.pem")));
         assert_eq!(c.backend, BackendChoice::Overlay);
         assert_eq!(c.machines_dir, PathBuf::from("/srv/m"));
@@ -203,6 +209,7 @@ mod tests {
         let config = Config::load(Some(&path), None, None).unwrap();
         assert!(config.config_path.as_ref().unwrap().is_absolute());
         assert_eq!(config.registry, "x.example");
+        assert!(config.registry_set, "a file's registry counts as given");
         let relative = Path::new("nspawn.toml");
         assert!(
             Config::load(Some(relative), None, None).is_err(),

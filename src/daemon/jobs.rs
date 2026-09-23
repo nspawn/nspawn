@@ -1,10 +1,10 @@
-//! Long operations (pull, push, build, create) run as jobs: the method returns the job's
+//! Long operations (pull, push, build, create, rm) run as jobs: the method returns the job's
 //! object path at once, the job's lines arrive as JobOutput signals and its end as
 //! JobRemoved, and the object keeps the outcome for whoever asks later.
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -31,15 +31,10 @@ pub struct JobState {
 #[derive(Default)]
 pub struct Jobs {
     next: AtomicU64,
-    running: AtomicUsize,
     all: Mutex<Vec<Arc<JobState>>>,
 }
 
 impl Jobs {
-    pub fn running(&self) -> usize {
-        self.running.load(Ordering::SeqCst)
-    }
-
     pub fn paths(&self) -> Vec<OwnedObjectPath> {
         self.all
             .lock()
@@ -56,7 +51,7 @@ pub struct Job {
 
 #[zbus::interface(name = "org.nspawn.Job")]
 impl Job {
-    /// "pull", "push", "build" or "create".
+    /// "pull", "push", "build", "create" or "rm".
     #[zbus(property)]
     fn kind(&self) -> String {
         self.job.kind.clone()
@@ -118,7 +113,6 @@ where
         result: Mutex::new(Dict::new()),
     });
     state.jobs.all.lock().unwrap().push(job.clone());
-    state.jobs.running.fetch_add(1, Ordering::SeqCst);
     state
         .connection()
         .object_server()
@@ -147,6 +141,9 @@ where
         })
     };
     let state = state.clone();
+    // The service is busy until the job's end has been announced: a client is about to
+    // read the outcome, and must not find a fresh service without this object.
+    let busy = state.enter();
     tokio::spawn(async move {
         let outcome = work(ctx, reporter).await;
         // The reporter is gone with `work`; the forwarder ends once the channel drains.
@@ -163,7 +160,6 @@ where
                 "failed"
             }
         };
-        state.jobs.running.fetch_sub(1, Ordering::SeqCst);
         if let Ok(iface) = state
             .connection()
             .object_server()
@@ -176,6 +172,7 @@ where
         if let Ok(emitter) = state.emitter() {
             let _ = Manager::job_removed(&emitter, job.path.as_ref(), result).await;
         }
+        drop(busy);
     });
     Ok(path)
 }

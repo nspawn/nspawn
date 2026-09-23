@@ -135,6 +135,32 @@ pub fn foreign_id(id: u32) -> u32 {
 /// Exclusive hold on the store; see `Store::lock`.
 pub struct StoreLock(#[allow(dead_code)] Flock<File>);
 
+/// Blobs a pull is bringing in, kept from the garbage collector until the image's record
+/// refers to them: a file under the blobs directory listing the digests, gone with the
+/// guard. Downloads run without the store lock, so an `images rm` meanwhile must not
+/// collect them.
+pub struct BlobHold(PathBuf);
+
+impl Drop for BlobHold {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// A machine's start in progress, from the moment its files are prepared until it is
+/// registered or the start failed: what keeps a second start, a removal or a
+/// replacement off it meanwhile, since machined does not list it yet.
+pub struct Starting(PathBuf);
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Holds and start markers older than this belong to a process that died.
+const STALE_MARKER: std::time::Duration = std::time::Duration::from_secs(3600);
+
 #[derive(Debug, Clone)]
 pub struct Store {
     pub machines_dir: PathBuf,
@@ -151,55 +177,23 @@ impl Store {
 
     /// Serialises the commands that change the store (pull, create, build, rm, the
     /// preparation done by start and the unit hooks), so that two of them never hand out
-    /// the same address or extract the same layer at once. Released when dropped.
-    pub fn lock(&self) -> Result<StoreLock> {
-        fs::create_dir_all(&self.root)
-            .with_context(|| format!("creating {}", self.root.display()))?;
-        let path = self.root.join(".lock");
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
-        match Flock::lock(file, FlockArg::LockExclusive) {
-            Ok(lock) => Ok(StoreLock(lock)),
-            Err((_, errno)) => bail!("locking {}: {errno}", path.display()),
-        }
+    /// the same address or extract the same layer at once. Released when dropped. The
+    /// wait happens on a blocking thread: the service must keep answering the bus, and
+    /// reading the replies the lock's holder waits for, while a caller queues.
+    pub async fn lock(&self) -> Result<StoreLock> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || lock_blocking(&root, None))
+            .await
+            .context("waiting for the store lock")?
     }
 
     /// Like `lock`, giving up after `wait` with a clear message: for the unit hooks, which
     /// run inside a start job with a timeout of its own.
-    pub fn lock_for(&self, wait: std::time::Duration) -> Result<StoreLock> {
-        fs::create_dir_all(&self.root)
-            .with_context(|| format!("creating {}", self.root.display()))?;
-        let path = self.root.join(".lock");
-        let deadline = std::time::Instant::now() + wait;
-        loop {
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)
-                .with_context(|| format!("opening {}", path.display()))?;
-            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-                Ok(lock) => return Ok(StoreLock(lock)),
-                Err((_, nix::errno::Errno::EWOULDBLOCK))
-                    if std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-                Err((_, nix::errno::Errno::EWOULDBLOCK)) => {
-                    bail!(
-                        "the store is busy (another nspawn command, a pull perhaps, holds {})",
-                        path.display()
-                    )
-                }
-                Err((_, errno)) => bail!("locking {}: {errno}", path.display()),
-            }
-        }
+    pub async fn lock_for(&self, wait: std::time::Duration) -> Result<StoreLock> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || lock_blocking(&root, Some(wait)))
+            .await
+            .context("waiting for the store lock")?
     }
 
     pub fn init(&self) -> Result<()> {
@@ -262,6 +256,58 @@ impl Store {
         self.blob_path(digest).is_file()
     }
 
+    /// Keeps `digests` from `gc_blobs` while the guard lives.
+    pub fn hold_blobs(&self, digests: &[String]) -> Result<BlobHold> {
+        let dir = self.blobs_dir();
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join(format!(".hold-{}", unique_suffix()));
+        write_atomically(&path, digests.join("\n").as_bytes())?;
+        Ok(BlobHold(path))
+    }
+
+    /// The blob file names held by pulls in flight; stale holds are removed on the way.
+    fn held_blobs(&self) -> HashSet<String> {
+        let mut held = HashSet::new();
+        let Ok(entries) = fs::read_dir(self.blobs_dir()) else {
+            return held;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with(".hold-") {
+                continue;
+            }
+            if is_stale(&entry.path()) {
+                let _ = fs::remove_file(entry.path());
+                continue;
+            }
+            if let Ok(text) = fs::read_to_string(entry.path()) {
+                held.extend(text.lines().map(layer_dir_name));
+            }
+        }
+        held
+    }
+
+    fn starting_path(&self, name: &str) -> PathBuf {
+        self.root.join("starting").join(name)
+    }
+
+    /// Marks `name` as starting until the guard is dropped.
+    pub fn mark_starting(&self, name: &str) -> Result<Starting> {
+        let path = self.starting_path(name);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        fs::write(&path, b"").with_context(|| format!("writing {}", path.display()))?;
+        Ok(Starting(path))
+    }
+
+    /// Whether a start of `name` is in progress (a marker left by a start that died with
+    /// its process does not count).
+    pub fn is_starting(&self, name: &str) -> bool {
+        let path = self.starting_path(name);
+        path.exists() && !is_stale(&path)
+    }
+
     pub fn manifests_dir(&self) -> PathBuf {
         self.root.join("manifests")
     }
@@ -296,30 +342,31 @@ impl Store {
         Ok(set)
     }
 
-    /// Deletes compressed blobs no image references. Returns the digests removed.
+    /// Deletes compressed blobs no image references and no pull in flight holds.
+    /// Returns the digests removed.
     pub fn gc_blobs(&self) -> Result<Vec<String>> {
         let referenced = self.referenced_blobs()?;
         let mut removed = Vec::new();
         if !self.blobs_dir().is_dir() {
             return Ok(removed);
         }
-        for entry in fs::read_dir(self.blobs_dir())? {
-            let entry = entry?;
+        let held = self.held_blobs();
+        let dir = self.blobs_dir();
+        for entry in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+            let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
             let file_name = entry.file_name().to_string_lossy().to_string();
             if file_name.starts_with(".part-") {
                 // A download or copy that never finished. Downloads run without the lock,
                 // so only what nobody touched for an hour goes.
-                let stale = entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .map(|t| t.elapsed().map(|e| e.as_secs() > 3600).unwrap_or(false))
-                    .unwrap_or(false);
-                if stale {
+                if is_stale(&entry.path()) {
                     let _ = fs::remove_file(entry.path());
                 }
                 continue;
             }
-            if file_name.starts_with('.') || referenced.contains(&file_name) {
+            if file_name.starts_with('.')
+                || referenced.contains(&file_name)
+                || held.contains(&file_name)
+            {
                 continue;
             }
             fs::remove_file(entry.path()).with_context(|| format!("removing blob {file_name}"))?;
@@ -373,7 +420,8 @@ impl Store {
         if !path.exists() {
             return Ok(None);
         }
-        let text = fs::read_to_string(&path)?;
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let record: ImageRecord =
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         Ok(Some(record.normalize()))
@@ -405,7 +453,8 @@ impl Store {
             }
         };
         for entry in entries {
-            let entry = entry?;
+            let entry =
+                entry.with_context(|| format!("reading {}", self.images_dir().display()))?;
             if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
@@ -485,8 +534,8 @@ impl Store {
                 continue;
             }
             let used = referenced.remove(&ownership).unwrap_or_default();
-            for entry in fs::read_dir(&dir)? {
-                let entry = entry?;
+            for entry in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+                let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
                 let file_name = entry.file_name().to_string_lossy().to_string();
                 if file_name.starts_with(".tmp-") {
                     // An extraction that never finished; the store is locked, so nobody
@@ -513,9 +562,29 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
-    let tmp = path.with_file_name(format!(".tmp-{name}.{}", std::process::id()));
+    let tmp = path.with_file_name(format!(".tmp-{name}.{}", unique_suffix()));
     fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
     fs::rename(&tmp, path).with_context(|| format!("moving {} into place", path.display()))
+}
+
+/// A suffix for temporary names that repeats neither inside this process (the service
+/// runs several downloads and writes at once) nor across processes.
+pub fn unique_suffix() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    format!(
+        "{}.{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    )
+}
+
+/// Whether nobody touched `path` for an hour: a marker or a part file left by a process
+/// that died.
+fn is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().map(|e| e > STALE_MARKER).unwrap_or(false))
+        .unwrap_or(false)
 }
 
 /// A digest as the store accepts it for a path component: sha256 and 64 hex digits.
@@ -903,6 +972,43 @@ fn remove_any(path: &Path) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// flock() on the store's lock file: forever, or until `wait` has passed.
+fn lock_blocking(root: &Path, wait: Option<std::time::Duration>) -> Result<StoreLock> {
+    fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
+    let path = root.join(".lock");
+    let open = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))
+    };
+    let Some(wait) = wait else {
+        return match Flock::lock(open()?, FlockArg::LockExclusive) {
+            Ok(lock) => Ok(StoreLock(lock)),
+            Err((_, errno)) => bail!("locking {}: {errno}", path.display()),
+        };
+    };
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match Flock::lock(open()?, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => return Ok(StoreLock(lock)),
+            Err((_, nix::errno::Errno::EWOULDBLOCK)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err((_, nix::errno::Errno::EWOULDBLOCK)) => {
+                bail!(
+                    "the store is busy (another nspawn command, a pull perhaps, holds {})",
+                    path.display()
+                )
+            }
+            Err((_, errno)) => bail!("locking {}: {errno}", path.display()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1569,10 +1675,59 @@ mod tests {
     }
 
     #[test]
-    fn store_lock_is_exclusive_between_holders() {
+    fn temporary_names_never_repeat() {
+        let a = unique_suffix();
+        let b = unique_suffix();
+        assert_ne!(a, b);
+        assert!(a.starts_with(&format!("{}.", std::process::id())));
+    }
+
+    #[test]
+    fn held_blobs_survive_the_collector() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
-        let first = store.lock().unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        fs::create_dir_all(store.blobs_dir()).unwrap();
+        fs::write(store.blob_path(&digest), b"x").unwrap();
+        let hold = store.hold_blobs(std::slice::from_ref(&digest)).unwrap();
+        assert!(
+            store.gc_blobs().unwrap().is_empty(),
+            "held by a pull in flight"
+        );
+        assert!(store.has_blob(&digest));
+        drop(hold);
+        assert_eq!(store.gc_blobs().unwrap(), vec![digest.clone()]);
+        assert!(!store.has_blob(&digest));
+    }
+
+    #[test]
+    fn a_start_in_progress_is_marked_until_it_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        assert!(!store.is_starting("web"));
+        let mark = store.mark_starting("web").unwrap();
+        assert!(store.is_starting("web"));
+        drop(mark);
+        assert!(!store.is_starting("web"));
+        let stale = store.mark_starting("old").unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(store.starting_path("old"))
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
+            .unwrap();
+        assert!(
+            !store.is_starting("old"),
+            "a marker left by a start that died with its process"
+        );
+        drop(stale);
+    }
+
+    #[tokio::test]
+    async fn store_lock_is_exclusive_between_holders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let first = store.lock().await.unwrap();
         let path = tmp.path().join("state/.lock");
         let file = fs::OpenOptions::new()
             .read(true)
@@ -1583,12 +1738,23 @@ mod tests {
             Flock::lock(file, FlockArg::LockExclusiveNonblock).is_err(),
             "a second holder must wait"
         );
+        let waited = match store.lock_for(std::time::Duration::from_millis(300)).await {
+            Ok(_) => panic!("a bounded wait must give up on a held lock"),
+            Err(e) => e.to_string(),
+        };
+        assert!(waited.contains("the store is busy"), "{waited}");
         drop(first);
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
-        assert!(Flock::lock(file, FlockArg::LockExclusiveNonblock).is_ok());
+        let taken = Flock::lock(file, FlockArg::LockExclusiveNonblock);
+        assert!(taken.is_ok());
+        drop(taken);
+        store
+            .lock_for(std::time::Duration::from_millis(300))
+            .await
+            .expect("free again");
     }
 }
