@@ -14,7 +14,9 @@ jobs:
       options: --privileged
     steps:
       - name: Tools
-        run: dnf install -y --setopt=install_weak_deps=False git rpm-build rpmdevtools cargo rust systemd-rpm-macros selinux-policy-devel bzip2 tar xz
+        # systemd provides pkgconfig(systemd), which %selinux_requires asks for at
+        # build time; a workstation has it already, a container does not.
+        run: dnf install -y --setopt=install_weak_deps=False git rpm-build rpmdevtools cargo rust systemd systemd-rpm-macros selinux-policy-devel bzip2 tar xz
       - uses: actions/checkout@v4
       - name: Sources
         run: |
@@ -58,7 +60,8 @@ jobs:
           cp -r packaging/debian/debian .
           # Cargo.toml holds the version; the changelog's first entry follows it
           # (a pre-release like 1.0.0-beta.1 sorts as 1.0.0~beta.1 in Debian).
-          sed -i "1s/^nspawn ([^)]*)/nspawn (${version/-/\~}-1)/" debian/changelog
+          deb_version=$(echo "${version}" | sed 's/-/~/')
+          sed -i "1s/^nspawn ([^)]*)/nspawn (${deb_version}-1)/" debian/changelog
       - name: Build
         # -d: cargo and rustc come from rustup here, not from the packages the
         # control file names for a distribution whose own rust is new enough.
