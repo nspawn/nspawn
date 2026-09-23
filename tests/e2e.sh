@@ -548,6 +548,10 @@ grep -q "RO-OK-$nonce" /tmp/e2e-logs.txt || fail "read-only volume was writable"
 [ "$(cat /var/lib/nspawn/volumes/e2evol/written 2>/dev/null)" = from-app ] || fail "named volume not written on the host"
 $NSPAWN ps | grep "^ *$app " | grep_q "/bin/sh -c" || fail "ps does not show the entrypoint plus arguments"
 [ "$($NSPAWN exec $app -- /bin/sh -c 'echo $GREETING' </dev/null | tr -d '\r')" = hola ] || fail "exec does not see -e variables"
+# exec's command gets the machine's capabilities and nothing of the service's descriptors.
+leader_bnd=$(grep CapBnd "/proc/$(machinectl show $app -p Leader --value)/status")
+[ "$($NSPAWN exec $app -- /bin/grep CapBnd /proc/self/status </dev/null | tr -d '\r')" = "$leader_bnd" ] || fail "exec's command has other capabilities than the machine ($leader_bnd)"
+[ "$($NSPAWN exec $app -- /bin/sh -c 'ls /proc/$$/fd; true' </dev/null | tr -d '\r' | tr '\n' ' ')" = "0 1 2 " ] || fail "exec's command has descriptors beyond its streams"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['labels'].get('caddy') == 'app.example' and d['labels'].get('tier') == 'web', d" || fail "--label not recorded"
 $NSPAWN ps --json | python3 -c "import json,sys; d = [m for m in json.load(sys.stdin) if m['name'] == '$app']; assert d and d[0]['labels'].get('caddy') == 'app.example', d" || fail "labels not listed by ps --json"
 # The entrypoint (/bin/sh) is remembered, so the arguments are its.

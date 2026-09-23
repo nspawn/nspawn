@@ -206,8 +206,12 @@ pub fn raise_file_capabilities() -> nix::Result<()> {
 
 /// Starts `argv` inside the machine whose leader is `leader`, with `image_env` plus PATH
 /// when missing (and TERM, on a terminal), its streams set up as `stdio` says.
+/// `leader_fd` is a pidfd of the leader, taken while the machine named it: the
+/// namespaces are only used once it shows that the PID was not given to another
+/// process meanwhile.
 pub fn spawn(
     leader: u32,
+    leader_fd: &OwnedFd,
     argv: &[String],
     user: Option<&str>,
     working_dir: Option<&str>,
@@ -232,6 +236,15 @@ pub fn spawn(
             .into();
         ns_fds.push((name, flag, fd));
     }
+    let exec_context = selinux_context_of(leader);
+    let bounding = std::fs::read_to_string(format!("/proc/{leader}/status"))
+        .ok()
+        .and_then(|status| capability_bounding_set(&status));
+    // Read through /proc/<leader> above: a process that is still alive now is the one
+    // they came from.
+    if pidfd_signal(leader_fd, 0).is_err() {
+        bail!("the machine ended while the command was being started");
+    }
     let c_argv: Vec<CString> = argv
         .iter()
         .map(|a| CString::new(a.as_str()))
@@ -253,7 +266,6 @@ pub fn spawn(
     }
     let c_cwd = CString::new(working_dir.unwrap_or("/"))?;
     let user = user.map(|u| u.to_string());
-    let exec_context = selinux_context_of(leader);
     // Everything the two sides hold, made before the fork. The command's ends are kept
     // out of what it execs (dup2 onto 0, 1 and 2 clears close-on-exec there).
     let mut ours = (None, None, None);
@@ -332,6 +344,7 @@ pub fn spawn(
                 &c_cwd,
                 user.as_deref(),
                 exec_context.as_deref(),
+                bounding,
             );
             unsafe { libc::_exit(code) }
         }
@@ -439,7 +452,20 @@ fn helper(
     cwd: &CString,
     user: Option<&str>,
     exec_context: Option<&str>,
+    bounding: Option<u64>,
 ) -> i32 {
+    // Not dumpable from here on: the command's process is in the machine's PID namespace
+    // before it becomes the machine's root and execs, and until then it holds what the
+    // service holds; the machine's root must neither trace it nor open its descriptors
+    // through /proc. The exec makes the command an ordinary, dumpable program again.
+    if let Err(e) = nix::sys::prctl::set_dumpable(false) {
+        tell(
+            &socket,
+            &Started::Failed(format!("keeping the command's process private: {e}")),
+            &[],
+        );
+        return 126;
+    }
     if let Some(procs) = cgroup {
         // Best effort: cgroup v1 hosts or delegation quirks must not stop exec.
         let _ = std::fs::write(procs, std::process::id().to_string());
@@ -519,7 +545,7 @@ fn helper(
         }
         Ok(ForkResult::Child) => {
             drop(socket);
-            let code = grandchild(io, argv, env, cwd, user, exec_context);
+            let code = grandchild(io, argv, env, cwd, user, exec_context, bounding);
             unsafe { libc::_exit(code) }
         }
     }
@@ -532,6 +558,7 @@ fn grandchild(
     cwd: &CString,
     user: Option<&str>,
     exec_context: Option<&str>,
+    bounding: Option<u64>,
 ) -> i32 {
     // The streams first: from here on, complaints reach whoever runs the command.
     match io {
@@ -589,6 +616,13 @@ fn grandchild(
         complain("error: cannot become root inside the machine");
         return 126;
     }
+    // The capabilities of the machine's own processes and no more, as docker exec gives:
+    // the service's bounding set is the host's whole one, and the command is theirs to
+    // trace once it runs. Best effort: a security module that refuses (an SELinux
+    // policy older than this) must not stop the command, which ran so before.
+    if let Some(bounding) = bounding {
+        let _ = limit_bounding_set(bounding);
+    }
     let mut env: Vec<CString> = env.to_vec();
     match user {
         None => env.push(CString::new("HOME=/root").expect("no NUL")),
@@ -634,6 +668,8 @@ fn grandchild(
             return 127;
         }
     };
+    // Nothing of the service's but the three streams goes along into the machine.
+    close_from(3);
     match execve(&program, argv, &env) {
         Ok(_) => 0,
         Err(e) => {
@@ -648,6 +684,45 @@ fn grandchild(
             } else {
                 126
             }
+        }
+    }
+}
+
+/// The CapBnd of a /proc/PID/status.
+fn capability_bounding_set(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapBnd:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+}
+
+/// Drops from this thread's bounding set every capability `bounding` lacks; the exec
+/// that follows gives root no more than what is left.
+fn limit_bounding_set(bounding: u64) -> nix::Result<()> {
+    for capability in 0..64 {
+        if bounding & (1 << capability) != 0 {
+            continue;
+        }
+        // SAFETY: prctl(2) on this thread's own bounding set.
+        match Errno::result(unsafe {
+            libc::prctl(libc::PR_CAPBSET_DROP, capability as libc::c_ulong, 0, 0, 0)
+        }) {
+            // Past the last capability this kernel knows.
+            Ok(_) | Err(Errno::EINVAL) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Closes every descriptor from `first` on.
+fn close_from(first: libc::c_uint) {
+    // SAFETY: close_range(2) only closes descriptors of this process.
+    let closed = unsafe { libc::syscall(libc::SYS_close_range, first, libc::c_uint::MAX, 0) };
+    if closed != 0 {
+        let max = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }.clamp(1024, 1 << 20);
+        for fd in first as libc::c_long..max {
+            unsafe { libc::close(fd as libc::c_int) };
         }
     }
 }
@@ -843,6 +918,58 @@ mod tests {
         nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, Winsize);
         unsafe { tiocgwinsz(slave.as_raw_fd(), &mut size) }.unwrap();
         assert_eq!((size.ws_row, size.ws_col), (31, 111));
+    }
+
+    #[test]
+    fn the_bounding_set_is_read_from_the_status() {
+        let status = "Name:\tsh\nCapInh:\t0000000000000000\nCapBnd:\t00000000a80425fb\nCapAmb:\t0000000000000000\n";
+        assert_eq!(capability_bounding_set(status), Some(0xa80425fb));
+        assert_eq!(capability_bounding_set("Name:\tsh\n"), None);
+        let ours = std::fs::read_to_string("/proc/self/status").unwrap();
+        assert!(capability_bounding_set(&ours).is_some());
+    }
+
+    #[test]
+    fn a_bounding_set_is_only_ever_narrowed() {
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => {
+                // Keeping every capability is always allowed, whoever runs the test.
+                let code = if limit_bounding_set(u64::MAX).is_ok() {
+                    0
+                } else {
+                    1
+                };
+                unsafe { libc::_exit(code) }
+            }
+            ForkResult::Parent { child } => {
+                assert_eq!(exit_code(waitpid(child, None).unwrap()), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn descriptors_past_the_streams_are_closed() {
+        // In a child, so that the test process keeps its own.
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => {
+                let (read_end, write_end) = pipe2(OFlag::empty()).unwrap();
+                let (read, write) = (read_end.as_raw_fd(), write_end.as_raw_fd());
+                // Closed below by number, not by their owners.
+                std::mem::forget(read_end);
+                std::mem::forget(write_end);
+                close_from(3);
+                let open = |fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
+                let code = if !open(read) && !open(write) && open(0) {
+                    0
+                } else {
+                    1
+                };
+                unsafe { libc::_exit(code) }
+            }
+            ForkResult::Parent { child } => {
+                assert_eq!(exit_code(waitpid(child, None).unwrap()), 0);
+            }
+        }
     }
 
     #[test]

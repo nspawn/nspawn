@@ -1,4 +1,4 @@
-policy_module(nspawn, 1.1.0)
+policy_module(nspawn, 1.1.1)
 
 ########################################
 #
@@ -34,9 +34,10 @@ gen_require(`
 	type systemd_machined_t, systemd_machined_var_lib_t, systemd_networkd_unit_file_t, tmpfs_t;
 ')
 
-allow nspawn_t self:capability { chown dac_override dac_read_search fowner fsetid kill mknod net_admin setfcap setgid setuid sys_admin sys_chroot sys_ptrace sys_resource };
-# The same inside a machine's user namespace, where the exec helper works.
-allow nspawn_t self:cap_userns { chown dac_override dac_read_search fowner fsetid kill setgid setuid sys_admin sys_chroot sys_ptrace };
+allow nspawn_t self:capability { chown dac_override dac_read_search fowner fsetid kill mknod net_admin setfcap setgid setpcap setuid sys_admin sys_chroot sys_ptrace sys_resource };
+# The same inside a machine's user namespace, where the exec helper works. setpcap
+# narrows the command's bounding set to the machine's.
+allow nspawn_t self:cap_userns { chown dac_override dac_read_search fowner fsetid kill setgid setpcap setuid sys_admin sys_chroot sys_ptrace };
 allow nspawn_t self:process { fork getcap setcap setexec setrlimit setsched signal_perms };
 allow nspawn_t self:fifo_file rw_fifo_file_perms;
 allow nspawn_t self:unix_stream_socket create_stream_socket_perms;

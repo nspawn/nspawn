@@ -955,6 +955,13 @@ pub async fn spawn_in_namespaces(
     let record = ctx.store.load_image(machine)?;
     let record = record.as_ref();
     let leader = sd.machine_leader(machine).await?;
+    // Held from before the machine names its leader again: from then on the PID cannot
+    // be another process's without the pidfd saying so.
+    let leader_fd = nsenter::pidfd_open(nix::unistd::Pid::from_raw(leader as i32))
+        .with_context(|| format!("opening the leader of {machine}"))?;
+    if sd.machine_leader(machine).await? != leader {
+        bail!("machine {machine} changed while the command was being started; try again");
+    }
     let user = if user == "root" || user.is_empty() {
         None
     } else {
@@ -965,8 +972,10 @@ pub async fn spawn_in_namespaces(
         .map(|r| volume::merge_env(&r.run.env, &r.env))
         .unwrap_or_default();
     let env = volume::merge_env(&env, extra_env);
-    tokio::task::block_in_place(|| nsenter::spawn(leader, command, user, working_dir, &env, stdio))
-        .with_context(|| format!("running a command inside {machine}"))
+    tokio::task::block_in_place(|| {
+        nsenter::spawn(leader, &leader_fd, command, user, working_dir, &env, stdio)
+    })
+    .with_context(|| format!("running a command inside {machine}"))
 }
 
 /// The login session machined offers for a booted machine: a PTY running `path` (the
