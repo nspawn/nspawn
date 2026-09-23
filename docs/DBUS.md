@@ -74,7 +74,8 @@ package loads it; `--install` says so when SELinux is enabled and the module
 is missing, and also when the binary it just wired up is not labelled
 `nspawn_exec_t`, which a build installed by hand is not: the service would
 then run unconfined and the bus would drop it at the first descriptor, so
-`Exec`, `Shell` and `Logs` fail with the client disconnected. Commands run
+`Exec`, `Shell`, `Logs`, `CopyFrom` and `CopyTo` fail with the client
+disconnected. Commands run
 inside a machine take the machine's own context, as with docker exec.
 
 ## org.nspawn.Manager at /org/nspawn
@@ -93,7 +94,7 @@ Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 | Method | Like | Notes |
 |---|---|---|
 | `ListImages() -> aa{sv}` | `images ls` | name, kind, backend, origin, reference, size, read_only |
-| `GetImage(s name) -> a{sv}` | | everything recorded: reference, digest, backend, origin, mode, created, network, address, ports, volumes, env, entrypoint, cmd, command, image_env, working_dir, user, stop_signal, labels (a{ss}: the image's with the machine's on top), image_labels, restart, memory (bytes), cpus (d), pids_limit |
+| `GetImage(s name) -> a{sv}` | | everything recorded: name, reference, digest, backend, origin, mode, created, network, address, ports, volumes, env, entrypoint, cmd, command, image_env, working_dir, user, stop_signal, labels (a{ss}: the image's with the machine's on top), image_labels, restart, memory (bytes), cpus (d), pids_limit |
 | `PullImage(s reference, a{sv} options) -> o` | `pull` | options name, backend, mode, force, registry, ca_cert; a job |
 | `CreateMachine(s source, s name, a{sv} options) -> o` | `create` | options backend, network, publish, force, entrypoint, env, volume, label, restart, memory (t, bytes), cpus (d), pids_limit (t), command, registry, ca_cert; a job |
 | `PushImage(s image, a{sv} options) -> o` | `push` | options to, registry, ca_cert; a job |
@@ -108,8 +109,8 @@ Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 
 | Method | Like | Notes |
 |---|---|---|
-| `ListMachines(b all) -> aa{sv}` | `ps`, `ps -a` | name, state, started (unix seconds), leader, os, machine_path, plus the image's record; state is machined's (opening, running, closing), or for a machine machined does not list restarting, starting, closing (listed without `all` too) or stopped |
-| `GetMachine(s name) -> a{sv}` | `inspect` | one machine as `ListMachines` has it, whether it runs or not ("stopped" then); fails for a name that is neither running nor an image of nspawn |
+| `ListMachines(b all) -> aa{sv}` | `ps`, `ps -a` | name, state, started (unix seconds), leader, os, machine_path, plus the image's record; state is machined's (opening, running, closing), or for a machine machined does not list restarting, starting, closing (listed without `all` too) or stopped; containers only: the virtual machines machined also registers are left out, and naming one to `GetMachine`, `StopMachine`, `Exec`, `Shell`, `Logs`, `CopyFrom` or `CopyTo` fails with an error that says so |
+| `GetMachine(s name) -> a{sv}` | `inspect` | one machine as `ListMachines` has it, whether it runs or not (its state is then restarting, starting, closing or stopped, as there); fails for a name that is neither running nor an image of nspawn |
 | `StartMachine(s name, a{sv} options) -> (s, as)` | `start` | options wait (default true), network, publish, entrypoint, env, volume, label, restart, memory (t, bytes, 0 removes the limit), cpus (d), pids_limit (t), image_command, command; "started", "ended" (the program returned before the machine registered) or "restarting" (it ended and its restart policy brings it back), and the notes made on the way |
 | `StopMachine(s name, a{sv} options) -> (s, as)` | `stop` | options force, wait (default true), timeout (seconds, default 10, a day at most); "stopped" or "was-not-running", and the notes (a program that had to be killed) |
 | `Exec(s machine, as argv, s user, a{sv} options) -> (a{sh}, o)` | `exec` | user "" for root; options tty (default true), rows, cols, env (the caller's `TERM=` among them; xterm otherwise on a terminal); returns the streams ("tty", or "stdin", "stdout", "stderr") and a process object |
@@ -167,8 +168,11 @@ property lists them.
 
 A job is returned by the long operations and keeps what happened: properties
 `Kind` (pull, create, push, build, rm, volume-rm, volume-prune, cp), `Target`, `State` (running, done,
-failed), `Output` (every line so far), `Error` and `Result` (a dictionary,
-for a pull its name, reference and mode, for an rm the names removed). The
+failed), `Output` (every line so far), `Error` and `Result` (a dictionary:
+for a pull its name, reference and mode; for a build its name, reference,
+mode and output; for a push its name, destination and url; for a create its
+name and mode; for an rm, volume-rm or volume-prune the names removed; for a cp
+the entries and bytes copied). The
 service does not go idle before a job or a process has announced its end.
 
 ## Example

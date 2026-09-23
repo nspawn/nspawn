@@ -418,8 +418,8 @@ pub struct StartArgs {
     /// registration is still awaited so that ports and firewall rules can be applied).
     #[arg(long = "no-wait", action = clap::ArgAction::SetFalse)]
     pub wait: bool,
-    /// Network of the machine, remembered for the image: bridge (default for booted
-    /// images), veth (systemd-networkd on the host) or host (the host's own network).
+    /// Network of the machine, remembered for the image: bridge (the default), veth
+    /// (systemd-networkd on the host, booted images) or host (the host's own network).
     #[arg(long, value_enum)]
     pub network: Option<crate::settings::Network>,
     /// Publish a port on the host, like docker -p: HOST:CONTAINER[/udp]. Repeatable and

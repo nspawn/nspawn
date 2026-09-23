@@ -26,7 +26,7 @@ nspawn shell fedora-44
 nspawn logs fedora-44               # console output; --inside reads the machine's own journal
 nspawn cp ./nginx.conf web:/etc/nginx/   # copy files in or out, like docker cp
 nspawn stop fedora-44
-nspawn rm -f web2                   # remove a machine, stopping it first (same as images rm)
+nspawn rm -f web2                   # remove a machine, stopping it first (rm without -f is images rm)
 nspawn images rm fedora-44          # also frees layers and blobs nobody references
 nspawn volume ls                    # named volumes and the machines that use them (create, rm, prune)
 
@@ -76,9 +76,10 @@ or its init dies with an error, `always` whenever it ends and also at boot, and
 `unless-stopped` like `always` until `nspawn stop`, which takes the boot start back
 until the next `start`; restarts come after a second, then later and later, up to half a
 minute, for as long as they keep failing, and `ps` shows such a machine as
-`restarting`. `nspawn stop` always stops it for good; `machinectl stop` does too but
-does not take an `unless-stopped` machine off the boot list, and a `poweroff` from
-inside counts as ending under `always`. `-m/--memory`, `--cpus` and `--pids-limit`
+`restarting`. `nspawn stop` always stops it, one waiting to be restarted included (an
+`always` machine still starts at the next boot); `machinectl stop` does too but does not
+take an `unless-stopped` machine off the boot list, and a `poweroff` from inside counts as
+ending under `always`. `-m/--memory`, `--cpus` and `--pids-limit`
 bound the whole machine (its unit's MemoryMax=, CPUQuota= and TasksMax=), which is why
 they cannot be seen from inside; as with docker, `--memory` also lets the machine use as
 much swap again (MemorySwapMax=), and no more. Both are remembered like the ports and apply at the
@@ -133,7 +134,7 @@ Completions for bash, zsh and fish come with the packages; from a build of your 
 `nspawn completions bash > ~/.local/share/bash-completion/completions/nspawn` (or the
 equivalent for your shell). `man nspawn` is the same reference the packages install.
 
-`ps`, `machines ls`, `images ls` and `network ls` take `--json` and print what the
+`ps`, `machines ls`, `images ls`, `network ls` and `volume ls` take `--json` and print what the
 service answered instead of a table, and `nspawn inspect NAME...` prints the whole
 record of machines or images (running or not) as a JSON array, like docker inspect:
 what a script or an agent reads. The keys are the ones of the D-Bus interface (see
@@ -215,9 +216,10 @@ and binds `ve-<name>` to firewalld's trusted zone while the machine runs.
 Everything above is a method on `org.nspawn.Manager` on the system bus, and
 the command line is one client of it. `sudo nspawn daemon --install` makes the
 bus start the service on demand; without it every command says so. Images,
-machines, the network and credentials are methods; pulls, pushes, builds and
-creates come back as job objects with their output and result; `exec` hands
-the command's terminal or pipes over the bus. See `docs/DBUS.md`.
+machines, the network and credentials are methods; pulls, pushes, builds, creates,
+removals, copies and volume removals come back as job objects with their output and
+result; `exec` hands the command's terminal or pipes over the bus, and `cp` a tar
+stream. See `docs/DBUS.md`.
 
 ## Requirements
 
@@ -231,8 +233,8 @@ the command's terminal or pipes over the bus. See `docs/DBUS.md`.
   without it. polkit itself is needed for anyone but root to call at all.
 - On Fedora or RHEL with SELinux enforcing, the `nspawn-selinux` package (the policy in
   `packaging/selinux`), which the RPM recommends: without its domain the service runs
-  unconfined and the bus drops it when it passes a descriptor, so `exec`, `shell` and
-  `logs` fail. A binary installed by hand needs the label as well, which
+  unconfined and the bus drops it when it passes a descriptor, so `exec`, `shell`,
+  `logs` and `cp` fail. A binary installed by hand needs the label as well, which
   `daemon --install` points out.
 - `shell` on a booted machine uses machined's login session, which needs D-Bus inside
   (the hub images have it); `exec` enters the namespaces and needs nothing inside.

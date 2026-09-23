@@ -23,8 +23,8 @@ Rules of the road:
   must pass. The e2e suite runs as root on a disposable VM, never on a
   workstation.
 - Anything that changes host state (bridge, nftables, firewalld, iptables,
-  unit drop-ins, files under /etc) must be idempotent and undone by `stop` or
-  `images rm`.
+  unit drop-ins, files under /etc) must be idempotent and undone by `stop`, `rm`
+  or `images rm`.
 - Commit messages: short imperative subject, a body only for the why. No tool
   names, no signatures, no trailers.
 - Do not push, tag or release unless asked.

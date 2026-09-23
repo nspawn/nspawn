@@ -12,7 +12,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | Module | Role |
 |---|---|
 | `api/` | the library: typed operations on images, machines and the network; nothing here prints, progress goes through a `Report` and results come back as values |
-| `cli.rs`, `commands/` | clap definitions and the terminal side: argument conversion into calls on the service, tables, prompts, the commands that own the terminal (exec, shell, logs) |
+| `cli.rs`, `commands/` | clap definitions and the terminal side: argument conversion into calls on the service, tables, prompts, the commands that own the terminal (exec, shell, logs) and the host's end of cp |
 | `client/` | the proxies for `org.nspawn`, how its errors read, how a job is followed |
 | `daemon/` | the D-Bus service `org.nspawn`: the Manager interface, jobs, processes, dictionaries, the files that make the bus start it |
 | `packaging/` | the unit, bus and SELinux policy files the packages ship, and the Fedora spec |
@@ -23,6 +23,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `store.rs` | layers, blobs, records, manifests, gc, the store lock |
 | `install.rs`, `backend.rs` | turning blobs into a machine (overlay, flat, mstack) |
 | `settings.rs` | the `.nspawn` settings file and the unit hook drop-in |
+| `policy.rs` | restart policies and resource limits (`--restart`, `-m`, `--cpus`, `--pids-limit`), written into the hook drop-in |
 | `bridge.rs`, `hostnet.rs` | the nspawn0 bridge, ports, firewalls; veth mode |
 | `volume.rs`, `volmount.rs` | `-v` parsing; host-side mounts for mstack machines |
 | `nsenter.rs`, `pty.rs` | exec through namespaces, terminal pumping |
@@ -38,7 +39,8 @@ files, and the machine units call nspawn back through drop-in hooks.
   blobs/             compressed blobs, kept for push; .hold-* lists the blobs
                      of a pull in flight, which the collector leaves alone
   images/NAME.json   the record: reference, backend, mode, network, address,
-                     ports, entrypoint/cmd, env, volumes, labels
+                     ports, entrypoint/cmd, env, volumes, labels,
+                     restart policy, limits
   manifests/NAME.json raw manifest bytes (digest stays valid)
   machines/NAME/     overlay upper/work, host0.network, hosts, resolv.conf,
                      units/ for the volume wait unit
@@ -119,7 +121,8 @@ through `nspawn.service` when a client calls, and it exits after a minute
 without a call, a job or a command running. Every method is a thin
 conversion around an `api` function: options come as `a{sv}` and are read by
 name and type (an unknown key is an error), results go back as dictionaries
-with the command line's spellings. Pull, push, build and create run as jobs:
+with the command line's spellings. Pull, push, build, create, the removals
+(images, machines, volumes) and cp run as jobs:
 the method returns `/org/nspawn/job/N` at once, the job's report events
 become `JobOutput` signals and the object's `Output`, and `JobRemoved` says
 how it ended. machined's `MachineNew` and `MachineRemoved` are relayed as
@@ -127,8 +130,9 @@ how it ended. machined's `MachineNew` and `MachineRemoved` are relayed as
 
 The command line is a client of that service, so one code path does the
 work: `commands/` converts arguments into calls and prints what comes back,
-follows jobs line by line, and attaches the terminal to the descriptors
-`Exec`, `Shell` and `Logs` hand over. The registry and CA certificate the
+follows jobs line by line, attaches the terminal to the descriptors `Exec`,
+`Shell` and `Logs` hand over, and packs or unpacks the tar streams of `CopyTo`
+and `CopyFrom`. The registry and CA certificate the
 command line was given travel as options of each call, so `--registry`,
 `--ca-cert` and the environment keep their meaning. Only the service itself,
 `daemon --install` and the unit hooks (`network prepare`, `publish`,
@@ -148,7 +152,11 @@ has systemd-nsresourced create the veth and does not put its host end on the
 bridge, so the publish hook does (`bridge::adopt_managed_veth`, which finds the
 peer of the machine's host0 through its sysfs). `/etc/hosts` lists every machine on the bridge
 and `host.nspawn.internal`. With firewalld the bridge is bound to the trusted
-zone; with docker or ufw, accept rules go into DOCKER-USER or FORWARD.
+zone; with docker or ufw, accept rules go into DOCKER-USER or FORWARD. The
+bridge is IPv4 only: it gets `addrgenmode none` (and loses the `fe80::`
+address an earlier version left), host0 gets `LinkLocalAddressing=no` in its
+`.network` file or `addrgenmode none` in an app's namespace, so machined never
+hands out a link-local address under a machine's name.
 
 `--network veth` keeps systemd-nspawn's own veth configured by systemd-networkd
 on the host; `--network host` shares the host's network.
