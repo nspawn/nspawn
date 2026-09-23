@@ -2,6 +2,7 @@
 //! settings file nspawn boots it with, and the record that `images ls`, `images rm`, `start`
 //! and `push` rely on.
 
+use std::collections::BTreeMap;
 use std::fs;
 
 use anyhow::{Context, Result};
@@ -125,6 +126,7 @@ pub async fn install(
         cmd: None,
         env: Vec::new(),
         volumes: Vec::new(),
+        labels: BTreeMap::new(),
     })?;
     Ok(mode)
 }

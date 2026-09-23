@@ -265,6 +265,7 @@ if command -v mkosi >/dev/null 2>&1; then
   $NSPAWN build -t e2e/built:1 --name $built --force "$ctx" || fail "build"
   $NSPAWN images ls | tee /tmp/e2e-img.txt
   grep "^ *$built " /tmp/e2e-img.txt | grep -qw "build" || fail "built image not listed with origin build"
+  $NSPAWN inspect $built | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['image_labels'].get('org.nspawn.e2e') == 'built' and d['labels'].get('org.nspawn.e2e') == 'built', d" || fail "the image's own labels (OciLabels=) are not read"
   $NSPAWN start $built || fail "start built image"
   out=$($NSPAWN exec $built -- /usr/bin/systemctl is-system-running --wait </dev/null | tr -d '\r' || true)
   echo "built image is-system-running: $out"
@@ -407,7 +408,7 @@ step "entrypoint, environment and volumes, docker style"
 rm -rf /tmp/e2e-bind /var/lib/nspawn/volumes/e2evol; mkdir -p /tmp/e2e-bind; echo from-host > /tmp/e2e-bind/hello
 export E2E_HOST_VAR=fromhost
 # The unit's journal keeps the lines of earlier runs, so every line carries the nonce.
-$NSPAWN start $app --entrypoint /bin/sh -e GREETING=hola -e E2E_HOST_VAR -v /tmp/e2e-bind:/bind -v e2evol:/vol -v /etc/os-release:/host-os-release:ro -p none -- -c "echo \"greeting=\$GREETING hostvar=\$E2E_HOST_VAR nonce=$nonce\"; cat /bind/hello; echo from-app > /vol/written; { echo blocked > /host-os-release; } 2>/dev/null && echo RO-FAIL-$nonce || echo RO-OK-$nonce; exec /bin/sleep 300" || fail "start with entrypoint, env and volumes"
+$NSPAWN start $app --label caddy=app.example --label tier=web --entrypoint /bin/sh -e GREETING=hola -e E2E_HOST_VAR -v /tmp/e2e-bind:/bind -v e2evol:/vol -v /etc/os-release:/host-os-release:ro -p none -- -c "echo \"greeting=\$GREETING hostvar=\$E2E_HOST_VAR nonce=$nonce\"; cat /bind/hello; echo from-app > /vol/written; { echo blocked > /host-os-release; } 2>/dev/null && echo RO-FAIL-$nonce || echo RO-OK-$nonce; exec /bin/sleep 300" || fail "start with entrypoint, env and volumes"
 retry 10 bash -c "$NSPAWN logs $app | grep -q RO-[A-Z]*-$nonce" || fail "app did not run"
 $NSPAWN logs $app > /tmp/e2e-logs.txt
 grep -q "greeting=hola hostvar=fromhost nonce=$nonce" /tmp/e2e-logs.txt || fail "-e variables not seen by the program"
@@ -416,12 +417,17 @@ grep -q "RO-OK-$nonce" /tmp/e2e-logs.txt || fail "read-only volume was writable"
 [ "$(cat /var/lib/nspawn/volumes/e2evol/written 2>/dev/null)" = from-app ] || fail "named volume not written on the host"
 $NSPAWN ps | grep "^ *$app " | grep -q "/bin/sh -c" || fail "ps does not show the entrypoint plus arguments"
 [ "$($NSPAWN exec $app -- /bin/sh -c 'echo $GREETING' </dev/null | tr -d '\r')" = hola ] || fail "exec does not see -e variables"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['labels'].get('caddy') == 'app.example' and d['labels'].get('tier') == 'web', d" || fail "--label not recorded"
+$NSPAWN ps --json | python3 -c "import json,sys; d = [m for m in json.load(sys.stdin) if m['name'] == '$app']; assert d and d[0]['labels'].get('caddy') == 'app.example', d" || fail "labels not listed by ps --json"
 # The entrypoint (/bin/sh) is remembered, so the arguments are its.
 $NSPAWN stop $app >/dev/null; $NSPAWN start $app -e PATH=/opt/none:/usr/bin:/bin -- -c 'exec /bin/sleep 300' >/dev/null || fail "start with a PATH override"
 retry 5 bash -c "$NSPAWN ps | grep -q '^ *$app '" || fail "app with a PATH override is not running"
 [ "$($NSPAWN exec $app -- /bin/sh -c 'echo $PATH' </dev/null | tr -d '\r')" = "/opt/none:/usr/bin:/bin" ] || fail "exec does not apply a -e override of an image variable"
 $NSPAWN stop $app || fail "stop app with volumes"
-$NSPAWN start $app --image-command -e none -v none || fail "start with the image's own command"
+out=$($NSPAWN start $app --label novalue 2>&1) && fail "a label without a value was accepted"
+echo "$out" | grep -q "KEY=VALUE" || fail "a bad label was not explained: $out"
+$NSPAWN start $app --image-command -e none -v none --label none || fail "start with the image's own command"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert 'caddy' not in d['labels'], d" || fail "--label none did not forget the labels"
 $NSPAWN ps | grep "^ *$app " | grep -q " sh " || fail "--image-command did not restore the image's cmd"
 grep -q "Bind=" /etc/systemd/nspawn/$app.nspawn && fail "-v none left volumes in the settings"
 $NSPAWN stop $app -t 2 || fail "stop app running its own cmd"

@@ -34,6 +34,8 @@ pub struct CreateRequest {
     pub env: Vec<String>,
     /// SOURCE:TARGET[:ro], like docker -v.
     pub volume: Vec<String>,
+    /// KEY=VALUE labels on top of the image's, like docker --label.
+    pub label: Vec<String>,
     /// App images: replaces the image's cmd and follows its entrypoint.
     pub command: Vec<String>,
 }
@@ -88,6 +90,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     let ports = bridge::parse_publish(&request.publish)?;
     let env = volume::parse_env(&request.env)?;
     let volumes = volume::parse_volumes(&request.volume)?;
+    let labels = volume::parse_labels(&request.label)?;
     if source.mode == Mode::Boot
         && (!request.command.is_empty() || request.entrypoint.is_some() || !request.env.is_empty())
     {
@@ -155,6 +158,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     }
     record.env = env;
     record.volumes = volumes;
+    record.labels = labels;
     store.record_image(&record)?;
     Ok(Created {
         name: request.name.clone(),

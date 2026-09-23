@@ -1,6 +1,7 @@
 //! What an OCI image config says about running the image, and whether the image boots an
 //! init system (a "machine") or runs a single program (an "app", the docker case).
 
+use std::collections::BTreeMap;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
@@ -55,6 +56,9 @@ pub struct RunSpec {
     pub user: Option<String>,
     #[serde(default)]
     pub stop_signal: Option<String>,
+    /// The image's own labels (LABEL in a Containerfile, OciLabels= in mkosi).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 impl RunSpec {
@@ -72,6 +76,7 @@ impl RunSpec {
             working_dir: config.working_dir.filter(|d| !d.is_empty()),
             user: config.user.filter(|u| !u.is_empty()),
             stop_signal: config.stop_signal.filter(|s| !s.is_empty()),
+            labels: config.labels.unwrap_or_default().into_iter().collect(),
         })
     }
 
@@ -197,7 +202,8 @@ mod tests {
     fn parses_run_spec_from_config() {
         let json = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},
             "config":{"Entrypoint":["/docker-entrypoint.sh"],"Cmd":["nginx","-g","daemon off;"],
-            "Env":["PATH=/usr/bin","NGINX_VERSION=1.27"],"WorkingDir":"/srv","User":"nginx","StopSignal":"SIGQUIT"}}"#;
+            "Env":["PATH=/usr/bin","NGINX_VERSION=1.27"],"WorkingDir":"/srv","User":"nginx","StopSignal":"SIGQUIT",
+            "Labels":{"org.opencontainers.image.title":"nginx","maintainer":"someone"}}}"#;
         let spec = RunSpec::from_config(json).unwrap();
         assert_eq!(spec.entrypoint(), ["/docker-entrypoint.sh"]);
         assert_eq!(spec.cmd(), ["nginx", "-g", "daemon off;"]);
@@ -213,6 +219,18 @@ mod tests {
         assert_eq!(spec.working_dir.as_deref(), Some("/srv"));
         assert_eq!(spec.user.as_deref(), Some("nginx"));
         assert_eq!(spec.stop_signal.as_deref(), Some("SIGQUIT"));
+        assert_eq!(
+            spec.labels,
+            BTreeMap::from([
+                ("maintainer".to_string(), "someone".to_string()),
+                (
+                    "org.opencontainers.image.title".to_string(),
+                    "nginx".to_string()
+                ),
+            ])
+        );
+        let round: RunSpec = serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
+        assert_eq!(round, spec, "labels survive the record");
 
         let minimal =
             br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#;

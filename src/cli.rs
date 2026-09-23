@@ -220,6 +220,10 @@ pub struct CreateArgs {
     /// Mount a host directory or a named volume, SOURCE:TARGET[:ro], like docker -v.
     #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]")]
     pub volume: Vec<String>,
+    /// Label the machine, KEY=VALUE, like docker --label; the image's own labels stay
+    /// underneath. Repeatable and remembered; "none" forgets them.
+    #[arg(long, short = 'l', value_name = "KEY=VALUE")]
+    pub label: Vec<String>,
     /// For app images: the arguments after -- replace the image's cmd and follow its
     /// entrypoint, as with docker.
     #[arg(last = true)]
@@ -358,6 +362,10 @@ pub struct StartArgs {
     /// Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]")]
     pub volume: Vec<String>,
+    /// Label the machine, KEY=VALUE, like docker --label; the image's own labels stay
+    /// underneath. Repeatable and remembered; "none" forgets them.
+    #[arg(long, short = 'l', value_name = "KEY=VALUE")]
+    pub label: Vec<String>,
     /// Forget the remembered entrypoint and arguments and run the image's own again.
     #[arg(long)]
     pub image_command: bool,

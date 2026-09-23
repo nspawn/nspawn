@@ -21,6 +21,14 @@ pub fn strings(items: &[String]) -> OwnedValue {
     v(items.to_vec())
 }
 
+/// A string map as a{ss}.
+pub fn map(items: &std::collections::BTreeMap<String, String>) -> OwnedValue {
+    v(items
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<HashMap<String, String>>())
+}
+
 fn opt_string(item: Option<&str>) -> OwnedValue {
     v(item.unwrap_or(""))
 }
@@ -84,6 +92,8 @@ pub fn record(r: &ImageRecord) -> Dict {
         ),
         ("command".to_string(), strings(&r.effective_command())),
         ("image_env".to_string(), strings(&r.run.env)),
+        ("labels".to_string(), map(&r.effective_labels())),
+        ("image_labels".to_string(), map(&r.run.labels)),
         (
             "working_dir".to_string(),
             opt_string(r.run.working_dir.as_deref()),

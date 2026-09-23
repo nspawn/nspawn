@@ -134,6 +134,9 @@ pub async fn start(args: StartArgs, client: &Client) -> Result<()> {
     if !args.volume.is_empty() {
         options.insert("volume", Value::from(args.volume));
     }
+    if !args.label.is_empty() {
+        options.insert("label", Value::from(args.label));
+    }
     if args.image_command {
         options.insert("image_command", Value::from(true));
     }

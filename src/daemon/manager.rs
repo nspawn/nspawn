@@ -254,7 +254,8 @@ impl Manager {
     }
 
     /// Like `create`. Options: backend (s), network (s), publish (as), force (b),
-    /// entrypoint (s), env (as), volume (as), command (as), registry (s), ca_cert (s).
+    /// entrypoint (s), env (as), volume (as), label (as), command (as), registry (s),
+    /// ca_cert (s).
     async fn create_machine(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -276,6 +277,7 @@ impl Manager {
             entrypoint: options.string("entrypoint")?,
             env: options.strings("env")?,
             volume: options.strings("volume")?,
+            label: options.strings("label")?,
             command: options.strings("command")?,
         };
         options.finish()?;
@@ -532,7 +534,8 @@ impl Manager {
     }
 
     /// Like `start`. Options: wait (b, default true), network (s), publish (as),
-    /// entrypoint (s), env (as), volume (as), image_command (b), command (as). Returns
+    /// entrypoint (s), env (as), volume (as), label (as), image_command (b), command
+    /// (as). Returns
     /// "started", or "ended" when the program returned before the machine registered,
     /// and the notes made on the way.
     async fn start_machine(
@@ -552,6 +555,7 @@ impl Manager {
             entrypoint: options.string("entrypoint")?,
             env: options.strings("env")?,
             volume: options.strings("volume")?,
+            label: options.strings("label")?,
             image_command: options.bool("image_command", false)?,
             command: options.strings("command")?,
         };

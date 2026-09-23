@@ -59,11 +59,7 @@ impl FromStr for Volume {
             if source.contains("/../") || source.ends_with("/..") {
                 bail!("{text}: the source must be a plain absolute path");
             }
-        } else if !source
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-            || source.starts_with('.')
-        {
+        } else if validate_volume_name(source).is_err() {
             bail!("{text}: a volume name may only have letters, digits, _ . and -");
         }
         if [source, target]
@@ -92,6 +88,40 @@ impl fmt::Display for Volume {
         }
         Ok(())
     }
+}
+
+/// The names a managed volume may have: what `-v NAME:/path` accepts, which is also a
+/// safe single directory name under the volumes directory.
+pub fn validate_volume_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.starts_with('.')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    {
+        bail!("{name:?} is not a volume name: letters, digits, _ . and -, not starting with a dot");
+    }
+    Ok(())
+}
+
+/// Parses the --label values, KEY=VALUE each; "none" alone clears them, a later value of
+/// the same key wins.
+pub fn parse_labels(values: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut out = std::collections::BTreeMap::new();
+    if values.len() == 1 && values[0] == "none" {
+        return Ok(out);
+    }
+    for value in values {
+        reject_control_characters(value)?;
+        let Some((key, val)) = value.split_once('=') else {
+            bail!("{value}: expected KEY=VALUE");
+        };
+        if key.is_empty() || key.chars().any(char::is_whitespace) {
+            bail!("{value}: a label needs a key without whitespace");
+        }
+        out.insert(key.to_string(), val.to_string());
+    }
+    Ok(out)
 }
 
 /// Parses the -v values; "none" alone clears the list.
@@ -181,6 +211,45 @@ pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labels_are_key_value_pairs() {
+        let labels = parse_labels(&[
+            "caddy=example.com".to_string(),
+            "caddy.reverse_proxy={{upstreams 80}}".to_string(),
+            "empty=".to_string(),
+            "caddy=example.org".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(labels.len(), 3);
+        assert_eq!(labels["caddy"], "example.org", "the later value wins");
+        assert_eq!(labels["caddy.reverse_proxy"], "{{upstreams 80}}");
+        assert_eq!(labels["empty"], "");
+        assert!(parse_labels(&["none".to_string()]).unwrap().is_empty());
+        for bad in ["novalue", "=x", "a b=c", "a=\nb"] {
+            assert!(parse_labels(&[bad.to_string()]).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn volume_names_are_single_plain_directory_names() {
+        for good in ["data", "pg-data_1", "a.b", "X"] {
+            assert!(validate_volume_name(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "a/b",
+            "a b",
+            "../x",
+            "a:b",
+            "caf\u{e9}",
+        ] {
+            assert!(validate_volume_name(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn bare_variables_are_copied_from_the_environment_before_a_call() {

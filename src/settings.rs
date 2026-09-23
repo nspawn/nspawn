@@ -616,6 +616,7 @@ mod tests {
             working_dir: Some("/srv".into()),
             user: Some("nginx".into()),
             stop_signal: Some("SIGQUIT".into()),
+            labels: Default::default(),
         };
         let app = render(&MachineSettings {
             name: "web",

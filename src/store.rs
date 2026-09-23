@@ -1,7 +1,7 @@
 //! Local state under the state directory (/var/lib/nspawn by default): extracted layers,
 //! image records, downloads in flight and per-machine writable directories.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::net::Ipv4Addr;
@@ -59,6 +59,18 @@ pub struct ImageRecord {
     /// Bind mounts and named volumes (-v).
     #[serde(default)]
     pub volumes: Vec<Volume>,
+    /// Labels given with --label, on top of the image's own (run.labels).
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+}
+
+impl ImageRecord {
+    /// The image's labels with the ones given to this machine on top.
+    pub fn effective_labels(&self) -> BTreeMap<String, String> {
+        let mut labels = self.run.labels.clone();
+        labels.extend(self.labels.clone());
+        labels
+    }
 }
 
 impl ImageRecord {
@@ -203,6 +215,7 @@ impl Store {
             self.blobs_dir(),
             self.images_dir(),
             self.machines_private_dir(),
+            self.volumes_dir(),
         ] {
             fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
         }
@@ -1309,6 +1322,7 @@ mod tests {
             cmd: None,
             env: Vec::new(),
             volumes: Vec::new(),
+            labels: BTreeMap::new(),
         };
         store.record_image(&rec).unwrap();
         assert_eq!(
@@ -1353,6 +1367,7 @@ mod tests {
             cmd: None,
             env: Vec::new(),
             volumes: Vec::new(),
+            labels: BTreeMap::new(),
         };
         store.record_image(&rec).unwrap();
         store
@@ -1548,6 +1563,7 @@ mod tests {
             cmd: None,
             env: Vec::new(),
             volumes: Vec::new(),
+            labels: BTreeMap::new(),
         };
         store
             .record_image(&record("ovl", BackendChoice::Overlay))
@@ -1652,6 +1668,27 @@ mod tests {
         assert!(old.run.command.is_empty() && old.run.entrypoint().is_empty());
         assert_eq!(old.run.cmd(), ["/docker-entrypoint.sh", "nginx"]);
         assert_eq!(old.cmd, None, "an empty legacy override means none");
+        assert!(
+            old.labels.is_empty(),
+            "a record from before labels has none"
+        );
+        let mut labelled = old.clone();
+        labelled.run.labels = BTreeMap::from([
+            ("a".to_string(), "image".to_string()),
+            ("b".to_string(), "image".to_string()),
+        ]);
+        labelled.labels = BTreeMap::from([("b".to_string(), "machine".to_string())]);
+        store.record_image(&labelled).unwrap();
+        let back = store.load_image("old").unwrap().unwrap();
+        assert_eq!(back.labels, labelled.labels);
+        assert_eq!(
+            back.effective_labels(),
+            BTreeMap::from([
+                ("a".to_string(), "image".to_string()),
+                ("b".to_string(), "machine".to_string()),
+            ]),
+            "the machine's labels win over the image's"
+        );
         store.record_image(&old).unwrap();
         assert!(!store.images_dir().join(".tmp-old.json.0").exists());
         assert!(fs::read_dir(store.images_dir())

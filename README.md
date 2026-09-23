@@ -16,6 +16,7 @@ nspawn images ls                    # local images (all of them, not only ours)
 nspawn start fedora-44              # boot it as a machine
 nspawn create fedora-44 web2        # another machine from the same local image, docker create style
 nspawn start web -p 8080:80 -e KEY=v -v /srv/data:/data -v pgdata:/var/lib/pg   # docker-style flags
+nspawn start web --label caddy=web.example   # labels for whoever reads them (inspect, ps --json)
 nspawn ps                           # running machines: image, mode, command, uptime (-a adds stopped ones)
 nspawn inspect web                  # everything nspawn knows about a machine, as JSON
 nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
@@ -73,6 +74,13 @@ that exits on its own or a crash all prepare and release the network the same wa
 `nspawn start` and `nspawn stop`. The drop-in names the nspawn binary that wrote it, so
 install nspawn where a system service may run it (`/usr/bin` or `/usr/local/bin`; on
 SELinux hosts a binary below a home directory is refused with "Permission denied").
+
+Labels work as in docker. An image's own labels (`LABEL` in a Containerfile,
+`OciLabels=` in a mkosi.conf) are read from its OCI config when it is pulled or built,
+and `--label KEY=VALUE` on `start` or `create` adds labels of the machine's own on top,
+remembered like the ports (`--label none` forgets them). nspawn itself does nothing
+with them; `inspect` and `ps --json` show both the merged `labels` and the
+`image_labels`, for tools such as a reverse proxy that configures itself from them.
 
 One image, as many machines as you like: `nspawn create SOURCE NAME` makes another
 machine from an image that is already local, without touching the registry. It shares the

@@ -265,6 +265,8 @@ pub struct StartRequest {
     pub env: Vec<String>,
     /// SOURCE:TARGET[:ro]; "none" forgets them.
     pub volume: Vec<String>,
+    /// KEY=VALUE labels on top of the image's; "none" forgets them.
+    pub label: Vec<String>,
     /// Forget the remembered entrypoint and arguments and run the image's own again.
     pub image_command: bool,
     /// App images: replaces the image's cmd and follows its entrypoint.
@@ -342,16 +344,20 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             if !args.volume.is_empty() {
                 r.volumes = volume::parse_volumes(&args.volume)?;
             }
+            if !args.label.is_empty() {
+                r.labels = volume::parse_labels(&args.label)?;
+            }
         }
         None if !args.command.is_empty()
             || args.network.is_some()
             || !args.publish.is_empty()
             || args.entrypoint.is_some()
             || !args.env.is_empty()
-            || !args.volume.is_empty() =>
+            || !args.volume.is_empty()
+            || !args.label.is_empty() =>
         {
             bail!(
-                "{} is not an image managed by nspawn; a command, network, ports, variables or volumes need one",
+                "{} is not an image managed by nspawn; a command, network, ports, variables, volumes or labels need one",
                 args.name
             )
         }

@@ -318,6 +318,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             put_opt(&mut options, "entrypoint", a.entrypoint);
             put_all(&mut options, "env", crate::volume::expand_env(&a.env)?);
             put_all(&mut options, "volume", a.volume);
+            put_all(&mut options, "label", a.label);
             put_all(&mut options, "command", a.command);
             let done = client
                 .run_job(|| manager.create_machine(&a.source, &a.name, options))
