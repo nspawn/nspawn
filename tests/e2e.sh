@@ -34,6 +34,8 @@ ipv4_only() {
 # SIGPIPE, which pipefail counts as a failure: read everything instead.
 grep_q() { grep "$@" >/dev/null; }
 export -f grep_q
+# Runs a command on a pseudo terminal of its own (script(1) is not on every host).
+pyrun() { python3 -c 'import os, pty, sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"; }
 # A machine's address on its network, as inspect has it.
 addr_of() { $NSPAWN inspect "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)[0].get('address') or '')"; }
 nonce=$$
@@ -71,7 +73,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-run-boot; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -361,6 +363,23 @@ $NSPAWN stop e2e-b || fail "stop e2e-b"
 $NSPAWN stop e2e-a || fail "stop e2e-a"
 nft list map ip nspawn ports | grep_q 18080 && fail "published port still mapped after stop"
 
+step "run of a booted image: its console until it powers off, a shell with -it"
+$NSPAWN run --rm "$IMAGE" --name e2e-run-boot > /tmp/e2e-run-boot.txt 2>/tmp/e2e-run-boot.err &
+run_pid=$!
+retry 30 $NSPAWN exec e2e-run-boot -- /usr/bin/systemctl is-system-running --wait </dev/null >/dev/null 2>&1 || true
+$NSPAWN exec e2e-run-boot -- /usr/bin/systemctl poweroff </dev/null >/dev/null 2>&1
+wait $run_pid; rc=$?
+[ "$rc" = 0 ] || fail "run of a booted image did not end with 0 after a poweroff: $rc $(tail -3 /tmp/e2e-run-boot.err)"
+grep_q -i "reached target" /tmp/e2e-run-boot.txt || fail "run of a booted image did not show its console"
+$NSPAWN images ls | grep_q "^ *e2e-run-boot " && fail "run --rm left the booted machine behind"
+# The line waits in the terminal until the shell reads it, once the machine is up.
+echo 'exit 7' | pyrun $NSPAWN run -it --rm "$IMAGE" --name e2e-run-boot >/dev/null 2>&1; rc=$?
+[ "$rc" = 7 ] || fail "run -it of a booted image did not give the shell's exit code: $rc"
+$NSPAWN images ls | grep_q "^ *e2e-run-boot " && fail "run -it --rm left the booted machine behind"
+out=$($NSPAWN run -t --rm "$IMAGE" --name e2e-run-boot 2>&1) && fail "run -t alone of a booted image succeeded"
+echo "$out" | grep_q "shell" || fail "run -t alone of a booted image was not explained: $out"
+$NSPAWN images ls | grep_q "^ *e2e-run-boot " && fail "a refused run --rm left its machine behind"
+
 step "restart policy on a booted machine: its init killed, it boots again"
 $NSPAWN start e2e-a --restart on-failure --memory 256m || fail "start e2e-a with a restart policy"
 [ "$(systemctl show -p MemoryMax --value systemd-nspawn@e2e-a.service)" = 268435456 ] || fail "--memory not applied to the unit of a booted machine"
@@ -548,9 +567,9 @@ if firewall-cmd --state >/dev/null 2>&1; then
 fi
 $NSPAWN network ls | grep_q "^ *bridge " || fail "the default network is not listed"
 
-step "run: a machine from an image and started in one step, like docker run -d"
+step "run -d: a machine from an image and started in one step, like docker run -d"
 # busybox is here as $app: run makes another machine of it without the registry.
-$NSPAWN run docker.io/library/busybox:latest --name e2e-run -p 18082:80 -- /bin/sh -c "mkdir -p /www; echo run-$nonce > /www/index.html; exec /bin/httpd -f -p 80 -h /www" > /tmp/e2e-run.txt 2>&1 || { cat /tmp/e2e-run.txt; fail "run from a local image"; }
+$NSPAWN run -d docker.io/library/busybox:latest --name e2e-run -p 18082:80 -- /bin/sh -c "mkdir -p /www; echo run-$nonce > /www/index.html; exec /bin/httpd -f -p 80 -h /www" > /tmp/e2e-run.txt 2>&1 || { cat /tmp/e2e-run.txt; fail "run from a local image"; }
 cat /tmp/e2e-run.txt
 grep_q "started e2e-run" /tmp/e2e-run.txt || fail "run did not say it started e2e-run"
 grep_q "downloading" /tmp/e2e-run.txt && fail "run downloaded an image that is here already"
@@ -563,6 +582,47 @@ echo "$out" | grep_q "no local image" || fail "run --pull never without a local 
 $NSPAWN images ls | grep_q "nothing-$nonce" && fail "run --pull never left an image behind"
 $NSPAWN rm -f e2e-run >/dev/null || fail "rm -f e2e-run"
 systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit left in failed state after stop"
+
+step "run attached, like docker run: output, input, terminal, signals, exit code, --rm"
+bb=docker.io/library/busybox:latest
+out=$($NSPAWN run --rm $bb --name e2e-run -- /bin/sh -c 'echo out-$0; echo err-$0 >&2; exit 3' $nonce 2>/tmp/e2e-run.err); rc=$?
+[ "$rc" = 3 ] || fail "run did not exit with the program's code: $rc"
+# stdout and stderr come merged, from the journal; nothing of nspawn's own is among them.
+[ "$out" = "$(printf 'out-%s\nerr-%s' $nonce $nonce)" ] || fail "run did not show the program's output, and that alone, on stdout: $out"
+$NSPAWN images ls | grep_q "^ *e2e-run " && fail "run --rm left the machine behind"
+[ "$(echo abc | $NSPAWN run -i --rm $bb --name e2e-run -- wc -c 2>/dev/null)" = 4 ] || fail "run -i did not give the program its input"
+out=$(pyrun $NSPAWN run -it --rm $bb --name e2e-run -- /bin/sh -c 'stty size; tty; exit 5' </dev/null 2>/dev/null | tr -d '\0\r'); rc=${PIPESTATUS[0]}
+[ "$rc" = 5 ] || fail "run -it did not exit with the program's code: $rc"
+echo "$out" | grep_q "^[0-9]* [0-9]*$" || fail "run -it gave the program no terminal size: $out"
+echo "$out" | grep_q "not a tty" && fail "run -it gave the program no terminal: $out"
+$NSPAWN run --rm $bb --name e2e-run -- /bin/sleep 300 >/dev/null 2>&1 &
+run_pid=$!
+retry 10 bash -c "$NSPAWN ps | grep_q '^ *e2e-run '" || fail "the attached run did not start"
+sleep 1; kill -INT $run_pid; wait $run_pid; rc=$?
+[ "$rc" = 130 ] || fail "Ctrl-C did not reach the program as SIGINT: $rc"
+$NSPAWN run --rm $bb --name e2e-run -- /bin/sleep 300 >/dev/null 2>&1 &
+run_pid=$!
+retry 10 bash -c "$NSPAWN ps | grep_q '^ *e2e-run '" || fail "the attached run did not start"
+$NSPAWN kill e2e-run >/dev/null || fail "kill of an attached run"
+wait $run_pid; rc=$?
+[ "$rc" = 137 ] || fail "run killed with SIGKILL did not exit with 137: $rc"
+retry 15 bash -c "! $NSPAWN images ls | grep_q '^ *e2e-run '" || fail "run --rm left a killed machine behind"
+$NSPAWN run --name e2e-run $bb -- /bin/sh -c 'echo logged-$0' $nonce >/dev/null 2>&1 || fail "run without --rm"
+$NSPAWN logs e2e-run | grep_q "logged-$nonce" || fail "logs does not show what an attached run showed"
+$NSPAWN rm e2e-run >/dev/null || fail "rm the machine of an attached run"
+$NSPAWN run -d --rm $bb --name e2e-run -- /bin/sh -c 'sleep 2' >/dev/null || fail "run -d --rm"
+retry 20 bash -c "! $NSPAWN images ls | grep_q '^ *e2e-run '" || fail "run -d --rm left the machine behind once it ended"
+$NSPAWN run -d --rm $bb --name e2e-run -- /bin/sleep 300 >/dev/null || fail "run -d --rm of a long program"
+$NSPAWN stop e2e-run >/dev/null || fail "stop a machine of run -d --rm"
+retry 20 bash -c "! $NSPAWN images ls | grep_q '^ *e2e-run '" || fail "run -d --rm left the machine behind after stop"
+systemctl list-units --all 'nspawn-rm-*' --no-legend | grep_q . && fail "a removal unit was left behind"
+ls /run/nspawn/attach/ 2>/dev/null | grep_q . && fail "a run left its socket behind"
+out=$($NSPAWN run --rm --restart always $bb --name e2e-run -- /bin/true 2>&1) && fail "run --rm --restart always succeeded"
+echo "$out" | grep_q "restart" || fail "run --rm with a restart policy was not explained: $out"
+$NSPAWN run -d -t $bb --name e2e-run -- /bin/true 2>/dev/null && fail "run -d -t succeeded"
+$NSPAWN run --no-wait $bb --name e2e-run -- /bin/true 2>/dev/null && fail "run --no-wait without -d succeeded"
+$NSPAWN images ls | grep_q "^ *e2e-run " && fail "a refused run --rm left its machine behind"
+$NSPAWN rm -f e2e-run >/dev/null 2>&1 || true
 
 step "host network, --no-wait, an app's shell and a missing program"
 $NSPAWN stop $app >/dev/null || fail "stop before the host-network start"
@@ -943,7 +1003,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine StopMachine KillMachine UpdateMachine Exec Events Shell Logs ListNetwork ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine UpdateMachine Exec Events Shell Logs ListNetwork ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do

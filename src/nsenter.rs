@@ -395,6 +395,24 @@ fn tell(socket: &OwnedFd, report: &Started, fds: &[RawFd]) {
     let _ = sendmsg::<()>(socket.as_raw_fd(), &iov, controls, MsgFlags::empty(), None);
 }
 
+/// Sends `bytes` with `fds` attached (SCM_RIGHTS) over a connected Unix socket, in one
+/// message.
+pub fn send_fds(socket: &impl AsFd, bytes: &[u8], fds: &[&OwnedFd]) -> Result<()> {
+    let raw: Vec<RawFd> = fds.iter().map(|fd| fd.as_raw_fd()).collect();
+    let iov = [IoSlice::new(bytes)];
+    let rights = [ControlMessage::ScmRights(&raw)];
+    let controls: &[ControlMessage<'_>] = if raw.is_empty() { &[] } else { &rights };
+    sendmsg::<()>(
+        socket.as_fd().as_raw_fd(),
+        &iov,
+        controls,
+        MsgFlags::MSG_NOSIGNAL,
+        None,
+    )
+    .context("sending descriptors")?;
+    Ok(())
+}
+
 /// Receives one message of at most 256 bytes and the descriptors attached to it.
 pub fn receive_fds(socket: &impl AsFd) -> Result<(Vec<u8>, Vec<OwnedFd>)> {
     let mut buf = [0u8; 256];
@@ -426,6 +444,13 @@ pub fn receive_fds(socket: &impl AsFd) -> Result<(Vec<u8>, Vec<OwnedFd>)> {
 /// none: the kernel then sends it SIGWINCH when the terminal is resized.
 pub fn take_controlling_terminal(tty: &impl AsFd) -> nix::Result<()> {
     unsafe { tiocsctty(tty.as_fd().as_raw_fd(), 0) }.map(drop)
+}
+
+/// A pseudo terminal of the host, master and slave, sized.
+pub fn host_pty(rows: u16, cols: u16) -> Result<(OwnedFd, OwnedFd)> {
+    let master = open_terminal(rows, cols).map_err(|e| anyhow::anyhow!(e))?;
+    let slave = open_slave(&master).context("opening the pseudo terminal's slave")?;
+    Ok((master, slave))
 }
 
 /// Writes a line to standard error with write(2): Rust's stderr lock may be held by a

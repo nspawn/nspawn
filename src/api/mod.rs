@@ -14,6 +14,7 @@ pub mod machines;
 pub mod network;
 pub mod pull;
 pub mod push;
+pub mod run;
 pub mod search;
 pub mod stats;
 pub mod volumes;

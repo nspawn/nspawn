@@ -59,6 +59,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             let idle = (a.idle_exit > 0).then(|| std::time::Duration::from_secs(a.idle_exit));
             crate::daemon::run(config, idle).await
         }
+        Command::RemoveAfterExit { name, invocation } => {
+            api::network::remove_after_exit(&Context::new(config), &name, &invocation).await
+        }
         // The unit hooks must not depend on the service: a machine starts on its own.
         Command::Network(args) => match args.command {
             NetworkCommand::Prepare { name } => {
@@ -558,6 +561,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         | Command::Network(_)
         | Command::Completions(_)
         | Command::Manpage
+        | Command::RemoveAfterExit { .. }
         | Command::AttachExec { .. } => {
             unreachable!("handled before")
         }

@@ -108,6 +108,7 @@ pub async fn install(
         app_argv.as_deref(),
         crate::policy::Restart::No,
         &crate::policy::Limits::default(),
+        false,
     )? {
         sd.reload().await?;
     }
@@ -138,6 +139,7 @@ pub async fn install(
         labels: BTreeMap::new(),
         restart: Default::default(),
         limits: Default::default(),
+        remove_on_exit: false,
     })?;
     Ok(mode)
 }

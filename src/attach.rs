@@ -37,6 +37,13 @@ pub enum Mode {
 }
 
 impl Mode {
+    fn encode(&self) -> Vec<u8> {
+        match self {
+            Mode::Tty { term } => format!("tty\n{term}\n").into_bytes(),
+            Mode::Stdin => b"stdin\n".to_vec(),
+        }
+    }
+
     fn decode(bytes: &[u8]) -> Option<Mode> {
         let text = std::str::from_utf8(bytes).ok()?;
         let mut lines = text.lines();
@@ -109,20 +116,123 @@ fn receive(name: &str) -> Result<Option<(Mode, OwnedFd, UnixStream)>> {
     Ok(Some((mode, fd, stream)))
 }
 
+/// The service's end: a socket for one run of one machine, removed when dropped.
+pub struct Listener {
+    name: String,
+    path: PathBuf,
+    listener: tokio::net::UnixListener,
+}
+
+impl Listener {
+    pub fn bind(name: &str) -> Result<Self> {
+        let dir = PathBuf::from(DIR);
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting {}", dir.display()))?;
+        let path = socket_path(name);
+        let _ = std::fs::remove_file(&path);
+        let listener = tokio::net::UnixListener::bind(&path)
+            .with_context(|| format!("listening on {}", path.display()))?;
+        Ok(Listener {
+            name: name.to_string(),
+            path,
+            listener,
+        })
+    }
+
+    /// Hands `fd` to the machine's systemd-nspawn when it asks, within `timeout`, and
+    /// waits for it to take it. Only a root process in the machine's own unit is
+    /// answered.
+    pub async fn hand_over(&self, mode: &Mode, fd: &OwnedFd, timeout: Duration) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let (mut stream, _) = tokio::time::timeout_at(deadline, self.listener.accept())
+                .await
+                .with_context(|| format!("{} did not ask for its terminal or input", self.name))?
+                .context("accepting on the run's socket")?;
+            let Ok(credentials) = stream.peer_cred() else {
+                continue;
+            };
+            let in_unit = credentials
+                .pid()
+                .and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok())
+                .is_some_and(|cgroup| in_machine_unit(&cgroup, &self.name));
+            if credentials.uid() != 0 || !in_unit {
+                continue;
+            }
+            nsenter::send_fds(&stream, &mode.encode(), &[fd])?;
+            let mut answer = [0u8; 2];
+            use tokio::io::AsyncReadExt;
+            tokio::time::timeout_at(deadline, stream.read_exact(&mut answer))
+                .await
+                .with_context(|| format!("{} did not take its terminal or input", self.name))?
+                .context("reading the machine's answer")?;
+            if &answer != b"ok" {
+                bail!("{} refused its terminal or input", self.name);
+            }
+            return Ok(());
+        }
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Whether a /proc/PID/cgroup names the unit of machine `name` (or a group below it).
+fn in_machine_unit(cgroup: &str, name: &str) -> bool {
+    let unit = format!("/systemd-nspawn@{name}.service");
+    cgroup.lines().any(|line| {
+        line.strip_prefix("0::").is_some_and(|path| {
+            path.split_once(&unit)
+                .is_some_and(|(_, rest)| rest.is_empty() || rest.starts_with('/'))
+        })
+    })
+}
+
+/// Sockets left by a service that went away: no run waits on them any more.
+pub fn sweep() {
+    if let Ok(entries) = std::fs::read_dir(DIR) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn modes_as_the_run_sends_them() {
-        assert_eq!(
-            Mode::decode(b"tty\nxterm-256color\n"),
-            Some(Mode::Tty {
-                term: "xterm-256color".into()
-            })
-        );
-        assert_eq!(Mode::decode(b"stdin\n"), Some(Mode::Stdin));
+    fn modes_survive_the_socket() {
+        for mode in [
+            Mode::Tty {
+                term: "xterm-256color".into(),
+            },
+            Mode::Stdin,
+        ] {
+            assert_eq!(Mode::decode(&mode.encode()), Some(mode));
+        }
         assert_eq!(Mode::decode(b"tty\n\n"), None, "a terminal needs its TERM");
         assert_eq!(Mode::decode(b"shell\n"), None);
+    }
+
+    #[test]
+    fn only_the_machine_s_own_unit_is_answered() {
+        let own = "0::/machine.slice/systemd-nspawn@web.service/supervisor\n";
+        assert!(in_machine_unit(own, "web"));
+        assert!(in_machine_unit(
+            "0::/machine.slice/systemd-nspawn@web.service\n",
+            "web"
+        ));
+        assert!(!in_machine_unit(own, "we"));
+        assert!(!in_machine_unit(
+            "0::/machine.slice/systemd-nspawn@web.service2/x\n",
+            "web"
+        ));
+        assert!(!in_machine_unit("0::/user.slice/user-1000.slice\n", "web"));
     }
 }

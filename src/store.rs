@@ -73,6 +73,10 @@ pub struct ImageRecord {
     /// --memory, --cpus and --pids-limit.
     #[serde(default)]
     pub limits: crate::policy::Limits,
+    /// run --rm: the machine is removed once its current run ends. Set by the start
+    /// that began that run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub remove_on_exit: bool,
 }
 
 impl ImageRecord {
@@ -381,6 +385,43 @@ impl Store {
         match fs::remove_file(&path) {
             Ok(()) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+
+    fn signal_path(&self, name: &str) -> PathBuf {
+        self.machine_files_dir(name).join("last-signal")
+    }
+
+    /// Remembers the signal nspawn sent the machine's current run (kill, stop), which the
+    /// exit code of an attached run is made of: systemd-nspawn only says 255 when its
+    /// program died of one, 1 when the whole machine got SIGKILL.
+    pub fn mark_signal(&self, name: &str, signal: i32) -> Result<()> {
+        crate::reference::validate_entry_name(name)?;
+        let path = self.signal_path(name);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        fs::write(&path, signal.to_string()).with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// The signal of `mark_signal`, if any.
+    pub fn last_signal(&self, name: &str) -> Option<i32> {
+        crate::reference::validate_entry_name(name).ok()?;
+        fs::read_to_string(self.signal_path(name))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Forgets the signal of the last run, as a new run begins.
+    pub fn forget_signal(&self, name: &str) -> Result<()> {
+        crate::reference::validate_entry_name(name)?;
+        let path = self.signal_path(name);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
         }
     }
@@ -1548,6 +1589,7 @@ mod tests {
             labels: BTreeMap::new(),
             restart: Default::default(),
             limits: Default::default(),
+            remove_on_exit: false,
         };
         store.record_image(&rec).unwrap();
         assert_eq!(
@@ -1596,6 +1638,7 @@ mod tests {
             labels: BTreeMap::new(),
             restart: Default::default(),
             limits: Default::default(),
+            remove_on_exit: false,
         };
         store.record_image(&rec).unwrap();
         store
@@ -1795,6 +1838,7 @@ mod tests {
             labels: BTreeMap::new(),
             restart: Default::default(),
             limits: Default::default(),
+            remove_on_exit: false,
         };
         store
             .record_image(&record("ovl", BackendChoice::Overlay))
@@ -2143,6 +2187,20 @@ mod tests {
             "a marker left by a start that died with its process"
         );
         drop(stale);
+    }
+
+    #[test]
+    fn the_last_signal_is_remembered_until_forgotten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        assert_eq!(store.last_signal("web"), None);
+        store.mark_signal("web", 9).unwrap();
+        assert_eq!(store.last_signal("web"), Some(9));
+        store.mark_signal("web", 15).unwrap();
+        assert_eq!(store.last_signal("web"), Some(15));
+        store.forget_signal("web").unwrap();
+        store.forget_signal("web").unwrap();
+        assert_eq!(store.last_signal("web"), None);
     }
 
     #[test]

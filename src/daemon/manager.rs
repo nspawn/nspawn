@@ -149,6 +149,64 @@ fn mode_choice(text: Option<String>) -> anyhow::Result<Option<Mode>> {
     })
 }
 
+/// Ends when the client with this unique bus name leaves the bus; never without one.
+async fn caller_gone(connection: zbus::Connection, name: Option<String>) {
+    use futures_util::StreamExt;
+    let Some(name) = name else {
+        return std::future::pending().await;
+    };
+    let Ok(dbus) = zbus::fdo::DBusProxy::new(&connection).await else {
+        return std::future::pending().await;
+    };
+    let Ok(mut changes) = dbus
+        .receive_name_owner_changed_with_args(&[(0, name.as_str())])
+        .await
+    else {
+        return std::future::pending().await;
+    };
+    // Gone before the watch began.
+    if let Ok(bus_name) = zbus::names::BusName::try_from(name.as_str()) {
+        if !dbus.name_has_owner(bus_name).await.unwrap_or(true) {
+            return;
+        }
+    }
+    while let Some(change) = changes.next().await {
+        if change.args().is_ok_and(|args| args.new_owner().is_none()) {
+            return;
+        }
+    }
+}
+
+/// What StartMachine and RunMachine are asked: wait (b, default `wait`), network (s),
+/// publish (as), entrypoint (s), env (as), volume (as), label (as), restart (s), memory
+/// (t), cpus (d), pids_limit (t), image_command (b), command (as), remove (b).
+fn start_request(
+    name: String,
+    options: &mut Options<'_>,
+    wait: bool,
+) -> anyhow::Result<api::machines::StartRequest> {
+    Ok(api::machines::StartRequest {
+        name,
+        wait: options.bool("wait", wait)?,
+        network: network_choice(options.string("network")?)?,
+        publish: options.strings("publish")?,
+        entrypoint: options.string("entrypoint")?,
+        env: options.strings("env")?,
+        volume: options.strings("volume")?,
+        label: options.strings("label")?,
+        restart: options
+            .string("restart")?
+            .map(|r| crate::policy::Restart::parse(&r))
+            .transpose()?,
+        memory: options.maybe_u64("memory")?,
+        cpus: options.f64("cpus")?,
+        pids_limit: options.maybe_u64("pids_limit")?,
+        image_command: options.bool("image_command", false)?,
+        command: options.strings("command")?,
+        remove: options.bool("remove", false)?,
+    })
+}
+
 /// The network option: bridge, veth, host or a network's name, checked before anything
 /// is done.
 fn network_choice(text: Option<String>) -> anyhow::Result<Option<String>> {
@@ -870,25 +928,7 @@ impl Manager {
         self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
-        let request = api::machines::StartRequest {
-            name,
-            wait: options.bool("wait", true)?,
-            network: network_choice(options.string("network")?)?,
-            publish: options.strings("publish")?,
-            entrypoint: options.string("entrypoint")?,
-            env: options.strings("env")?,
-            volume: options.strings("volume")?,
-            label: options.strings("label")?,
-            restart: options
-                .string("restart")?
-                .map(|r| crate::policy::Restart::parse(&r))
-                .transpose()?,
-            memory: options.maybe_u64("memory")?,
-            cpus: options.f64("cpus")?,
-            pids_limit: options.maybe_u64("pids_limit")?,
-            image_command: options.bool("image_command", false)?,
-            command: options.strings("command")?,
-        };
+        let request = start_request(name, &mut options, true)?;
         options.finish()?;
         let notes = Notes::default();
         let outcome = match api::machines::start(self.ctx(), &request, &notes.report()).await? {
@@ -897,6 +937,76 @@ impl Manager {
             api::machines::StartOutcome::Restarting => "restarting",
         };
         Ok((outcome.to_string(), notes.into_lines()))
+    }
+
+    /// Like `run` without -d: starts a machine PullImage or CreateMachine made, attached.
+    /// Options: those of StartMachine (wait defaults to false), tty (b), rows and cols
+    /// (t, 24 x 80), term (s, xterm); descriptors: stdin (the program's input without
+    /// tty). An app's program gets a pseudo terminal with tty, whose master comes back
+    /// under "tty"; otherwise what the machine writes comes back under "stdout", a line
+    /// at a time. The process object's Signal reaches the program (a booted machine is
+    /// powered off), and its exit status is docker run's: the program's, 128 plus a
+    /// signal it died of. Returns the descriptors, the process object and the notes
+    /// made by the start.
+    async fn run_machine(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        name: String,
+        options: HashMap<String, OwnedValue>,
+        mut fds: HashMap<String, zbus::zvariant::OwnedFd>,
+    ) -> Result<(
+        HashMap<String, zbus::zvariant::OwnedFd>,
+        OwnedObjectPath,
+        Vec<String>,
+    )> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        let mut options = Options::new(&options);
+        let tty = options.bool("tty", false)?;
+        let rows = options.u64("rows", 24)?.clamp(1, u16::MAX as u64) as u16;
+        let cols = options.u64("cols", 80)?.clamp(1, u16::MAX as u64) as u16;
+        let term = options
+            .string("term")?
+            .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_graphic()))
+            .unwrap_or_else(|| "xterm".to_string());
+        let request = start_request(name, &mut options, false)?;
+        options.finish()?;
+        let stdin = fds.remove("stdin").map(std::os::fd::OwnedFd::from);
+        if let Some(other) = fds.keys().next() {
+            return Err(Error::Failed(format!("unknown descriptor {other}")));
+        }
+        if let Err(e) = api::network::remove_ended(self.ctx()).await {
+            eprintln!("warning: removing the machines of run --rm that ended: {e:#}");
+        }
+        let notes = Notes::default();
+        let run = api::run::RunRequest {
+            start: request,
+            terminal: tty.then_some(api::run::Terminal { rows, cols, term }),
+            stdin: if tty { None } else { stdin },
+        };
+        let mut attached = api::run::attach(self.ctx(), run, &notes.report()).await?;
+        let mut handed = HashMap::new();
+        if let Some(master) = attached.terminal.take() {
+            handed.insert("tty".to_string(), zbus::zvariant::OwnedFd::from(master));
+        }
+        if let Some(output) = attached.output.take() {
+            handed.insert("stdout".to_string(), zbus::zvariant::OwnedFd::from(output));
+        }
+        let signals = processes::Signals {
+            poweroff: (!attached.app).then(|| attached.name.clone()),
+            program: attached.app.then(|| attached.name.clone()),
+            sent: Default::default(),
+        };
+        let sent = signals.sent.clone();
+        let pid = attached.main_pid;
+        let name = attached.name.clone();
+        let caller_gone = caller_gone(self.state.connection().clone(), owner.name.clone());
+        let wait = attached.finish(self.state.ctx.clone(), caller_gone, sent);
+        let argv = vec!["run".to_string(), name.clone()];
+        let path =
+            processes::register_with(&self.state, owner, &name, &argv, pid, None, signals, wait)
+                .await?;
+        Ok((handed, path, notes.into_lines()))
     }
 
     /// Like `stop`. Options: force (b), wait (b, default true), timeout (t, seconds

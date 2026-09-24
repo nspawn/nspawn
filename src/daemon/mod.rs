@@ -108,6 +108,12 @@ pub async fn run(config: Config, idle_exit: Option<Duration>) -> Result<()> {
     if let Err(e) = state.ctx.store.protect() {
         eprintln!("warning: {e:#}");
     }
+    // Nothing waits on a socket of an earlier service, and a machine of run --rm that
+    // ended while nothing could remove it goes now.
+    crate::attach::sweep();
+    if let Err(e) = crate::api::network::remove_ended(&state.ctx).await {
+        eprintln!("warning: removing the machines of run --rm that ended: {e:#}");
+    }
     let connection = zbus::connection::Builder::system()?
         .serve_at(MANAGER_PATH, Manager::new(state.clone()))?
         .build()

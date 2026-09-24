@@ -212,6 +212,7 @@ pub async fn prepare(
     };
     // A new run: what `kill` asked of the last one is over.
     store.take_exit_on_next(name)?;
+    store.forget_signal(name)?;
     if record.network == Network::Bridge
         && record.mode == Mode::App
         && record.backend == BackendChoice::Mstack
@@ -321,6 +322,7 @@ pub async fn prepare(
         app_argv.as_deref(),
         record.restart,
         &record.limits,
+        record.remove_on_exit,
     )? {
         sd.reload().await?;
     }
@@ -367,6 +369,8 @@ pub struct StartRequest {
     pub image_command: bool,
     /// App images: replaces the image's cmd and follows its entrypoint.
     pub command: Vec<String>,
+    /// run --rm: remove the machine once this run ends.
+    pub remove: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,6 +457,11 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             }
             apply_limits(&mut r.limits, args.memory, args.cpus, args.pids_limit)?;
             r.limits.check(r.mode)?;
+            // Each start says it anew, so that a machine kept once is not removed later.
+            if args.remove && r.restart != Restart::No {
+                bail!("--rm and a restart policy exclude each other: a machine removed when it ends cannot be restarted (--restart no)");
+            }
+            r.remove_on_exit = args.remove;
         }
         None if !args.command.is_empty()
             || args.network.is_some()
@@ -464,7 +473,8 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             || args.restart.is_some()
             || args.memory.is_some()
             || args.cpus.is_some()
-            || args.pids_limit.is_some() =>
+            || args.pids_limit.is_some()
+            || args.remove =>
         {
             bail!(
                 "{} is not an image managed by nspawn; a command, network, ports, variables, volumes, labels, a restart policy or limits need one",
@@ -717,6 +727,9 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         // answer, so that a restart policy does not bring it back meanwhile, and what
         // counts is that the machine goes (awaited below when `wait`). When the kill
         // failed, the stop job is also what makes the machine go, `--no-wait` or not.
+        if record.is_some() {
+            store.mark_signal(&args.name, libc::SIGKILL)?;
+        }
         let killed = sd.kill_machine(&args.name, "all", libc::SIGKILL).await;
         if stop_job_after_kill(latch, killed.is_ok()) {
             job = Some(sd.stop_unit_job(&unit).await?);
@@ -736,6 +749,7 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
                     .and_then(|r| r.run.stop_signal.clone())
                     .unwrap_or_else(|| "SIGTERM".to_string());
                 let (leader, payload) = wait_for_payload(sd, &args.name).await?;
+                store.mark_signal(&args.name, signal_number(&signal)?)?;
                 match payload {
                     Some(payload) => {
                         if let Err(e) = send_signal(payload, signal_number(&signal)?) {
@@ -766,6 +780,7 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
                                 args.name, args.timeout
                             ),
                         );
+                        store.mark_signal(&args.name, libc::SIGKILL)?;
                         sd.kill_machine(&args.name, "all", libc::SIGKILL).await?;
                     }
                 }
@@ -869,6 +884,7 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
     if policy != Restart::No && stop_signals(record.as_ref())?.contains(&signal) {
         ctx.store.mark_exit_on_next(&args.name)?;
     }
+    ctx.store.mark_signal(&args.name, signal)?;
     if mode == Some(Mode::App) {
         let (leader, payload) = wait_for_payload(sd, &args.name).await?;
         let payload = payload.with_context(|| {
@@ -958,6 +974,7 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
         app_argv.as_deref(),
         record.restart,
         &record.limits,
+        record.remove_on_exit,
     )?;
     let running = state.active == "active";
     // always and unless-stopped start the machine at boot, as with `start`.
@@ -1104,6 +1121,17 @@ fn signal_number(name: &str) -> Result<i32> {
         .parse()
         .map_err(|_| anyhow::anyhow!("unknown signal {name}"))?;
     Ok(signal as i32)
+}
+
+/// Sends `signal` to the program of an app machine, waiting a moment for the stub init
+/// to have started it.
+pub async fn signal_program(sd: &Systemd, name: &str, signal: i32) -> Result<()> {
+    let (leader, payload) = wait_for_payload(sd, name).await?;
+    let payload = payload.with_context(|| {
+        format!("{name} has no program running under its init (leader PID {leader})")
+    })?;
+    send_signal(payload, signal)
+        .with_context(|| format!("sending signal {signal} to PID {payload} of {name}"))
 }
 
 /// The program an app machine runs: the child of its stub init (the leader). The kernel's

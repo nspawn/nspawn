@@ -84,6 +84,9 @@ pub enum Command {
     Volume(VolumeArgs),
     /// Serve org.nspawn on the system bus (started by the bus; see --install).
     Daemon(DaemonArgs),
+    /// run --rm: removes a machine once its unit is down after that run.
+    #[command(hide = true)]
+    RemoveAfterExit { name: String, invocation: String },
     /// ExecStart of an app machine: runs systemd-nspawn with the terminal or input an
     /// attached run hands over, or as it is.
     #[command(hide = true)]
@@ -574,6 +577,20 @@ pub struct RunArgs {
     /// Make the machine anew when one of that name exists (it must be stopped).
     #[arg(long, short = 'f')]
     pub force: bool,
+    /// Start it in the background and return, like docker run -d; without it the
+    /// output follows until the machine ends and run exits with its exit code.
+    #[arg(long, short = 'd')]
+    pub detach: bool,
+    /// Remove the machine when it ends (named volumes stay), like docker run --rm.
+    #[arg(long)]
+    pub rm: bool,
+    /// Give the program of an app this standard input, like docker run -i.
+    #[arg(long, short = 'i')]
+    pub interactive: bool,
+    /// Give the program of an app a terminal, like docker run -t; -it on a booted
+    /// image opens a shell once it is up, and leaving it powers the machine off.
+    #[arg(long, short = 't')]
+    pub tty: bool,
     #[command(flatten)]
     pub options: StartOptions,
 }

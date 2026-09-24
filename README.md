@@ -15,7 +15,8 @@ nspawn pull fedora:44               # download and assemble an image
 nspawn images ls                    # local images (all of them, not only ours)
 nspawn start fedora-44              # boot it as a machine
 nspawn create fedora-44 web2        # another machine from the same local image, docker create style
-nspawn run nginx:1.27 --name web -p 8080:80   # make a machine and start it, like docker run -d
+nspawn run -d nginx:1.27 --name web -p 8080:80   # make a machine and start it in the background
+nspawn run -it --rm alpine:3 sh     # like docker run: attached, a terminal, removed once it ends
 nspawn start web -p 8080:80 -e KEY=v -v /srv/data:/data -v pgdata:/var/lib/pg   # docker-style flags
 nspawn start web --label caddy=web.example   # labels for whoever reads them (inspect, ps --json)
 nspawn start web --restart unless-stopped -m 512m --cpus 1   # restart policy and limits, like docker
@@ -43,9 +44,19 @@ nspawn push app-1 --to team/app:2   # push a local image under another tag
 
 `run` is `pull` (or `create` from a local image with the same reference, as docker's
 `--pull missing` has it) followed by `start`, with the flags of both; `--pull always` asks
-the registry every time and `--pull never` never. Like `docker run -d` it returns once the
-machine runs: `nspawn logs -f NAME` follows its output. A name that is taken is refused
-unless `--force`, which makes the machine anew.
+the registry every time and `--pull never` never. A name that is taken is refused unless
+`--force`, which makes the machine anew. Like `docker run` it stays attached: the
+machine's output follows until it ends (stdout and stderr together, a line at a time,
+from the journal, so that `logs` shows it later too), and `run` exits with the program's
+exit code, or 128 plus the signal it died of. Ctrl-C, SIGTERM, SIGHUP and SIGQUIT go to
+the program; a third Ctrl-C within a second leaves it running and returns. `-i` gives the
+program this standard input, `-t` a terminal (`-it` for a shell), `--rm` removes the
+machine once it ends (named volumes stay), and `-d` starts it in the background and
+returns, as `run` did before 1.2.0. A booted image shows its console until it powers off
+(Ctrl-C powers it off); `run -it` on one waits for its boot, opens a root shell and powers
+the machine off when the shell ends, with the shell's exit code. Closing the terminal of
+`run -t` stops the machine, since nothing would read its terminal any more; `-d` and
+`exec` are for machines that stay.
 
 `build` runs `mkosi` in the given directory with `--format=oci`, so the same
 `mkosi.conf` tree that works on its own works here; `--distribution`, `--release`,

@@ -113,7 +113,8 @@ Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 |---|---|---|
 | `ListMachines(b all) -> aa{sv}` | `ps`, `ps -a` | name, state, started (unix seconds), leader, os, machine_path, plus the image's record; state is machined's (opening, running, closing), or for a machine machined does not list restarting (listed without `all` too), starting, closing or stopped; containers only: the virtual machines machined also registers are left out, and naming one to `GetMachine`, `StopMachine`, `Exec`, `Shell`, `Logs`, `CopyFrom` or `CopyTo` fails with an error that says so |
 | `GetMachine(s name) -> a{sv}` | `inspect` | one machine as `ListMachines` has it, whether it runs or not (its state is then restarting, starting, closing or stopped, as there); fails for a name that is neither running nor an image of nspawn |
-| `StartMachine(s name, a{sv} options) -> (s, as)` | `start` | options wait (default true), network (bridge, veth, host or a network made with CreateNetwork), publish, entrypoint, env, volume, label, restart, memory (t, bytes, 0 removes the limit), cpus (d), pids_limit (t), image_command, command; "started", "ended" (the program returned before the machine registered) or "restarting" (it ended and its restart policy brings it back), and the notes made on the way |
+| `StartMachine(s name, a{sv} options) -> (s, as)` | `start` | options wait (default true), network (bridge, veth, host or a network made with CreateNetwork), publish, entrypoint, env, volume, label, restart, memory (t, bytes, 0 removes the limit), cpus (d), pids_limit (t), image_command, command, remove (b, `run -d --rm`: removed once it ends); "started", "ended" (the program returned before the machine registered) or "restarting" (it ended and its restart policy brings it back), and the notes made on the way |
+| `RunMachine(s name, a{sv} options, a{sh} fds) -> (a{sh}, o, as)` | `run` without `-d` | starts a machine PullImage or CreateMachine made, attached; options those of StartMachine (wait defaults to false, remove (b) is `--rm`), tty (b), rows and cols (t), term (s); descriptor stdin for the program's input without tty. An app gets a pseudo terminal with tty, its master under "tty"; otherwise the machine's output, a line at a time, under "stdout". The process object's exit status is docker run's: the program's, 128 plus the signal it died of, 137 after SIGKILL; `--rm` machines are removed by a unit of their own once theirs is down |
 | `StopMachine(s name, a{sv} options) -> (s, as)` | `stop` | options force, wait (default true), timeout (seconds, default 10, a day at most); "stopped" or "was-not-running", and the notes (a program that had to be killed) |
 | `MachineStats(as names) -> aa{sv}` | `stats` | one sample of each named machine that runs (every running container when none is named; names that do not run are left out): name, time_usec (CLOCK_MONOTONIC), cpu_usec, memory (memory.current without inactive_file, as docker), memory_limit (the host's memory without a limit), pids, io_read, io_write, net_rx, net_tx; a counter that cannot be read is left out, the network ones on the host's network; rates come from two samples |
 | `UpdateMachine(s name, a{sv} options) -> b` | `update` | options restart, memory, cpus, pids_limit as for StartMachine (0 removes a limit, absent keeps it); a running machine gets the limits at once; true when it was running |
@@ -169,12 +170,13 @@ devpts, so `tty` and everything that opens its terminal by name work there.
 
 ## org.nspawn.Process at /org/nspawn/process/N
 
-What `Exec` or `Logs` started: properties `Machine`, `Argv`, `Pid` (on the
-host), `State` (running, exited) and `ExitStatus` (128 plus the signal when
-it died of one); the method `Signal(i signal)`, which reaches the process
-itself and never a PID handed to someone else since; the signal
-`Exited(i status)`, sent after `State` changed. The Manager's `Processes`
-property lists them.
+What `Exec`, `Logs`, `Events` or `RunMachine` started: properties `Machine`,
+`Argv`, `Pid` (on the host), `State` (running, exited) and `ExitStatus` (128
+plus the signal when it died of one); the method `Signal(i signal)`, which
+reaches the process itself and never a PID handed to someone else since (for a
+run, the program of an app machine, whichever process it is by then, or a
+poweroff request for a booted one); the signal `Exited(i status)`, sent after
+`State` changed. The Manager's `Processes` property lists them.
 
 ## org.nspawn.Job at /org/nspawn/job/N
 

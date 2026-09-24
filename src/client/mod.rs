@@ -85,6 +85,16 @@ pub trait Manager {
         name: &str,
         options: Options<'_>,
     ) -> zbus::Result<(String, Vec<String>)>;
+    fn run_machine(
+        &self,
+        name: &str,
+        options: Options<'_>,
+        fds: HashMap<&str, zbus::zvariant::Fd<'_>>,
+    ) -> zbus::Result<(
+        HashMap<String, zbus::zvariant::OwnedFd>,
+        OwnedObjectPath,
+        Vec<String>,
+    )>;
     fn stop_machine(&self, name: &str, options: Options<'_>)
         -> zbus::Result<(String, Vec<String>)>;
     fn kill_machine(&self, name: &str, options: Options<'_>) -> zbus::Result<Vec<String>>;
@@ -165,6 +175,7 @@ pub trait Process {
     fn state(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn exit_status(&self) -> zbus::Result<i32>;
+    fn signal(&self, signal: i32) -> zbus::Result<()>;
     #[zbus(signal)]
     fn exited(&self, status: i32) -> zbus::Result<()>;
 }
@@ -195,6 +206,11 @@ impl Ended {
             exited,
             lost,
         })
+    }
+
+    /// Sends the process a signal (a run: its program, or a booted machine's poweroff).
+    pub async fn signal(&self, signal: i32) -> Result<()> {
+        self.proxy.signal(signal).await.map_err(error)
     }
 
     /// The exit status, once the process has ended.
@@ -271,6 +287,18 @@ impl Client {
         watch.finish(job).await
     }
 
+    /// `run_job` with every line on standard error.
+    pub async fn run_job_to_stderr<F, Fut>(&self, start: F) -> Result<Dict>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = zbus::Result<OwnedObjectPath>>,
+    {
+        let mut watch = self.watch_jobs().await?;
+        watch.lines_to_stderr = true;
+        let job = start().await.map_err(error)?;
+        watch.finish(job).await
+    }
+
     /// Starts listening to the job signals, for a call that returns a job together with
     /// something else (a stream) and cannot go through `run_job`.
     pub async fn watch_jobs(&self) -> Result<JobWatch> {
@@ -292,6 +320,7 @@ impl Client {
         let lost = service_lost(&self.connection).await?;
         Ok(JobWatch {
             connection: self.connection.clone(),
+            lines_to_stderr: false,
             output,
             progress,
             removed,
@@ -303,6 +332,9 @@ impl Client {
 /// The job signals, subscribed to before the job exists.
 pub struct JobWatch {
     connection: zbus::Connection,
+    /// Every line to standard error, which then carries nothing but what a command's
+    /// own program writes (run).
+    lines_to_stderr: bool,
     output: JobOutputStream,
     progress: JobProgressStream,
     removed: JobRemovedStream,
@@ -335,7 +367,9 @@ impl JobWatch {
                             transfers.progress(args.item(), *args.done(), *args.total());
                         }
                     }
+                    let to_stderr = self.lines_to_stderr;
                     transfers.print(|| match args.kind().as_str() {
+                        _ if to_stderr => eprintln!("{}", args.line()),
                         "note" => eprintln!("{}", args.line()),
                         _ => println!("{}", args.line()),
                     });
@@ -367,6 +401,7 @@ impl JobWatch {
             progress,
             removed,
             lost,
+            ..
         } = self;
         drop((output, progress, removed, lost));
         let proxy = JobProxy::builder(&connection)

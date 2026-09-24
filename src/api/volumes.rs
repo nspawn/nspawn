@@ -264,6 +264,7 @@ mod tests {
                 labels: BTreeMap::new(),
                 restart: Default::default(),
                 limits: Default::default(),
+                remove_on_exit: false,
             })
             .unwrap();
     }

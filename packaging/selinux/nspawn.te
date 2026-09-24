@@ -24,6 +24,10 @@ files_type(nspawn_var_lib_t)
 type nspawn_etc_t;
 files_config_file(nspawn_etc_t)
 
+# /run/nspawn: the sockets an attached run waits on for its machine.
+type nspawn_var_run_t;
+files_pid_file(nspawn_var_run_t)
+
 ########################################
 #
 # The service
@@ -60,6 +64,13 @@ files_var_lib_filetrans(nspawn_t, nspawn_var_lib_t, dir, "nspawn")
 manage_dirs_pattern(nspawn_t, nspawn_etc_t, nspawn_etc_t)
 manage_files_pattern(nspawn_t, nspawn_etc_t, nspawn_etc_t)
 files_etc_filetrans(nspawn_t, nspawn_etc_t, dir, "nspawn")
+# An attached run listens under /run/nspawn/attach, and the machine's ExecStart
+# (nspawn attach-exec, nspawn_t too) connects there for its terminal or input
+# before it execs systemd-nspawn.
+manage_dirs_pattern(nspawn_t, nspawn_var_run_t, nspawn_var_run_t)
+manage_sock_files_pattern(nspawn_t, nspawn_var_run_t, nspawn_var_run_t)
+files_pid_filetrans(nspawn_t, nspawn_var_run_t, dir, "nspawn")
+stream_connect_pattern(nspawn_t, nspawn_var_run_t, nspawn_var_run_t, nspawn_t)
 
 # Machines: their trees below /var/lib/machines (mstack directories hold
 # symlinks to the layers), the .nspawn settings files, the mount units and

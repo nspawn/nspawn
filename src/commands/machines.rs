@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::thread;
 
 use anyhow::{bail, Context as _, Result};
@@ -227,6 +227,12 @@ fn run_source(
 /// docker run -d: the machine from a local image with the reference or from the registry,
 /// then started with the options given, which it keeps like after start.
 pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> {
+    if !args.detach && !args.options.wait {
+        bail!("--no-wait goes with -d: an attached run follows the machine anyway");
+    }
+    if args.detach && (args.tty || args.interactive) {
+        bail!("-d runs the machine in the background; -i and -t are for a run that stays attached");
+    }
     let registry = super::registry_name(client, config).await;
     let image = ImageRef::parse(&args.reference, &registry)?;
     let name = args.name.clone().unwrap_or_else(|| image.local_name());
@@ -258,7 +264,7 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
     match source {
         Source::Local(source) => {
             client
-                .run_job(|| manager.create_machine(&source, &name, options))
+                .run_job_to_stderr(|| manager.create_machine(&source, &name, options))
                 .await?;
         }
         Source::Registry => {
@@ -270,11 +276,212 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
                 );
             }
             client
-                .run_job(|| manager.pull_image(&args.reference, options))
+                .run_job_to_stderr(|| manager.pull_image(&args.reference, options))
                 .await?;
         }
     }
-    start_machine(client, &name, start_options(args.options)?).await
+    let mut options = start_options(args.options)?;
+    if args.rm {
+        options.insert("remove", Value::from(true));
+    }
+    let started = if args.detach {
+        start_machine(client, &name, options).await.map(|()| None)
+    } else {
+        run_attached(client, &name, options, args.tty, args.interactive)
+            .await
+            .map(Some)
+    };
+    let code = match started {
+        Ok(code) => code,
+        Err(e) => {
+            // docker run --rm leaves nothing behind when the start fails.
+            if args.rm {
+                let mut options = Options::new();
+                options.insert("force", Value::from(true));
+                let names = [name.clone()];
+                let _ = client
+                    .run_job_to_stderr(|| client.manager.remove_machines(&names, options))
+                    .await;
+            }
+            return Err(e);
+        }
+    };
+    let Some(code) = code else { return Ok(()) };
+    if args.rm {
+        removed(client, &name).await;
+    }
+    std::process::exit(code);
+}
+
+/// An attached run of a machine made already: its console or its program's output, a
+/// shell for -it on a booted one.
+async fn run_attached(
+    client: &Client,
+    name: &str,
+    options: Options<'_>,
+    tty: bool,
+    interactive: bool,
+) -> Result<i32> {
+    let booted = client
+        .manager
+        .get_image(name)
+        .await
+        .map_err(client::error)
+        .map(|image| client::string(&image, "mode") == "boot")?;
+    match (booted, tty, interactive) {
+        (true, true, true) => booted_shell(client, name, options).await,
+        (true, false, false) | (false, _, _) => {
+            attached(client, name, options, tty, interactive).await
+        }
+        (true, _, _) => bail!(
+            "{name} boots an init system: without -i and -t run shows its console, with -it it opens a shell"
+        ),
+    }
+}
+
+/// docker run without -d: the machine's output (or its terminal) until it ends, and its
+/// exit code. Ctrl-C and the like go to its program; a third Ctrl-C within a second
+/// leaves it running and returns.
+async fn attached(
+    client: &Client,
+    name: &str,
+    mut options: Options<'_>,
+    tty: bool,
+    interactive: bool,
+) -> Result<i32> {
+    let (rows, cols) = pty::window_size().unwrap_or((24, 80));
+    options.insert("tty", Value::from(tty));
+    options.insert("rows", Value::from(rows as u64));
+    options.insert("cols", Value::from(cols as u64));
+    if let Ok(term) = std::env::var("TERM") {
+        options.insert("term", Value::from(term));
+    }
+    let stdin = io::stdin();
+    let mut fds = HashMap::new();
+    if interactive && !tty {
+        fds.insert("stdin", zbus::zvariant::Fd::from(stdin.as_fd()));
+    }
+    let (mut handed, process, notes) = client
+        .manager
+        .run_machine(name, options, fds)
+        .await
+        .map_err(client::error)?;
+    for note in &notes {
+        eprintln!("{note}");
+    }
+    let ended = Ended::watch(&client.connection, process).await?;
+    if let Some(master) = handed.remove("tty") {
+        tokio::task::block_in_place(|| pty::run_session(OwnedFd::from(master)))?;
+        return ended.status().await;
+    }
+    let Some(output) = handed.remove("stdout") else {
+        bail!("the service returned neither a terminal nor the output");
+    };
+    let output = OwnedFd::from(output);
+    let mut copy = tokio::task::spawn_blocking(move || copy(File::from(output), io::stdout()));
+    let mut forwarded = Forwarded::new()?;
+    loop {
+        tokio::select! {
+            done = &mut copy => {
+                done.map_err(|_| anyhow::anyhow!("the output pump panicked"))??;
+                break;
+            }
+            signal = forwarded.next() => {
+                let Some(signal) = signal else { continue };
+                if forwarded.detaching() {
+                    eprintln!("\n{name} keeps running; nspawn stop {name} stops it");
+                    std::process::exit(0);
+                }
+                if let Err(e) = ended.signal(signal).await {
+                    eprintln!("note: {e:#}");
+                }
+            }
+        }
+    }
+    ended.status().await
+}
+
+/// The signals `run` passes on to the program, and the Ctrl-C count that detaches.
+struct Forwarded {
+    streams: Vec<(i32, tokio::signal::unix::Signal)>,
+    interrupts: Vec<std::time::Instant>,
+}
+
+impl Forwarded {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut streams = Vec::new();
+        for (number, kind) in [
+            (nix::libc::SIGINT, SignalKind::interrupt()),
+            (nix::libc::SIGTERM, SignalKind::terminate()),
+            (nix::libc::SIGHUP, SignalKind::hangup()),
+            (nix::libc::SIGQUIT, SignalKind::quit()),
+        ] {
+            streams.push((number, signal(kind).context("catching signals")?));
+        }
+        Ok(Forwarded {
+            streams,
+            interrupts: Vec::new(),
+        })
+    }
+
+    async fn next(&mut self) -> Option<i32> {
+        let futures = self.streams.iter_mut().map(|(number, stream)| {
+            let number = *number;
+            Box::pin(async move { stream.recv().await.map(|_| number) })
+        });
+        let (signal, _, _) = futures_util::future::select_all(futures).await;
+        if signal == Some(nix::libc::SIGINT) {
+            let now = std::time::Instant::now();
+            self.interrupts
+                .retain(|t| now.duration_since(*t) < std::time::Duration::from_secs(1));
+            self.interrupts.push(now);
+        }
+        signal
+    }
+
+    /// Three Ctrl-C within a second.
+    fn detaching(&self) -> bool {
+        self.interrupts.len() >= 3
+    }
+}
+
+/// docker run -it of a booted image: a shell once the machine is up, and the machine
+/// powered off when the shell ends, whose exit code is the run's.
+async fn booted_shell(client: &Client, name: &str, options: Options<'_>) -> Result<i32> {
+    let (_, notes) = client
+        .manager
+        .start_machine(name, options)
+        .await
+        .map_err(client::error)?;
+    for note in &notes {
+        eprintln!("{note}");
+    }
+    let shell = [
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "if [ -x /bin/bash ]; then exec /bin/bash -l; else exec /bin/sh -l; fi".to_string(),
+    ];
+    let code = run_command(client, name, &shell, "").await;
+    let mut stop = Options::new();
+    stop.insert("wait", Value::from(true));
+    let stopped = client.manager.stop_machine(name, stop).await;
+    let code = code?;
+    stopped.map_err(client::error)?;
+    Ok(code)
+}
+
+/// run --rm: the machine goes once its unit is down, in a unit of its own; returns once
+/// it is gone (or after a while).
+async fn removed(client: &Client, name: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while client.manager.get_image(name).await.is_ok() {
+        if std::time::Instant::now() > deadline {
+            eprintln!("note: {name} is still there; nspawn rm {name} removes it");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 pub async fn stop(args: StopArgs, client: &Client) -> Result<()> {

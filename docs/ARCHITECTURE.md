@@ -48,7 +48,8 @@ files, and the machine units call nspawn back through drop-in hooks.
   manifests/NAME.json raw manifest bytes (digest stays valid)
   machines/NAME/     overlay upper/work, host0.network, hosts, resolv.conf,
                      units/ for the volume wait unit, exit-on-next when
-                     `kill` sent the stop signal; 0700 with a writable
+                     `kill` sent the stop signal, last-signal (what `kill`
+                     or `stop` sent the current run); 0700 with a writable
                      layer, 0711 otherwise (an mstack machine binds its
                      files from inside its user namespace)
   volumes/NAME/      named volumes
@@ -69,6 +70,8 @@ files, and the machine units call nspawn back through drop-in hooks.
 /etc/systemd/system/machines.target.wants/systemd-nspawn@NAME.service
                         --restart always or unless-stopped: started at boot
 /etc/nspawn/auth.json  registry credentials, 0600
+/run/nspawn/attach/NAME.sock  where an attached run waits for its machine's
+                        systemd-nspawn (0700 directory)
 ```
 
 Records are written through a temporary file and a rename. Garbage
@@ -178,7 +181,27 @@ follows jobs line by line (with a bar for each transfer when standard error is
 a terminal), attaches the terminal to the descriptors `Exec`,
 `Shell` and `Logs` hand over, and packs or unpacks the tar streams of `CopyTo`
 and `CopyFrom`. `run` is the one command made of several calls, as docker's
-is: `PullImage` or `CreateMachine`, then `StartMachine`. The registry and CA certificate the
+is: `PullImage` or `CreateMachine`, then `StartMachine` for `-d`, and
+`RunMachine` otherwise. `RunMachine` subscribes to systemd's unit signals and
+watches the unit's `PropertiesChanged` from before the start: the main
+process's `ExecMainCode` and `ExecMainStatus` as the signal carries them are
+the end (a later read could miss them once a restart began; a reboot from
+inside, 133, is not an end). The output is the journal's, from a cursor taken
+before the start (`_SYSTEMD_UNIT`, `_TRANSPORT=stdout`, leaving out what the
+hooks write, whose `_COMM` is `nspawn`), copied line by line into the client's
+pipe until it has been quiet for a moment after the end. The exit code is the
+program's; systemd-nspawn exits 255 whatever signal killed an app's program and
+1 after a SIGKILL of the whole machine on systemd 259 and newer, so the signal
+nspawn itself sent (Ctrl-C through the process object, `kill` and `stop`
+through `machines/NAME/last-signal`) makes it 128 plus that signal. With `-t`
+the service keeps a copy of the terminal's master: should the client go away,
+it drains the terminal and stops the machine the normal way. `--rm` sets
+`remove_on_exit` in the record, and the hooks drop-in then resets
+`RestartForceExitStatus=`; the release hook starts a transient unit
+`nspawn-rm-NAME-<invocation>` that runs `nspawn remove-after-exit`, which waits
+for the machine's unit to be down after that invocation and removes the
+machine. Where that unit cannot start (at shutdown) the service removes such
+machines when it starts, and before every `RunMachine`. The registry and CA certificate the
 command line was given travel as options of each call, so `--registry`,
 `--ca-cert` and the environment keep their meaning. Only the service itself,
 `daemon --install` and the unit hooks (`network prepare`, `publish`,

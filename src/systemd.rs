@@ -544,6 +544,74 @@ impl Systemd {
         }
     }
 
+    /// Asks systemd for its unit signals (PropertiesChanged of every unit), which it only
+    /// sends while a client subscribed; the subscription ends with the connection.
+    pub async fn subscribe(&self) -> Result<()> {
+        match self.manager.subscribe().await {
+            Ok(()) => Ok(()),
+            Err(zbus::Error::MethodError(name, _, _))
+                if name.as_str() == "org.freedesktop.systemd1.AlreadySubscribed" =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).context("subscribing to the signals of systemd"),
+        }
+    }
+
+    /// The object path of a unit, loading it if needed.
+    pub async fn unit_path(&self, unit: &str) -> Result<zbus::zvariant::OwnedObjectPath> {
+        self.manager
+            .load_unit(unit.to_string())
+            .await
+            .with_context(|| format!("loading {unit}"))
+    }
+
+    async fn service(&self, unit: &str) -> Result<systemd1::ServiceProxy<'static>> {
+        systemd1::ServiceProxy::builder(&self.conn)
+            .path(self.unit_path(unit).await?)?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .with_context(|| format!("connecting to {unit}"))
+    }
+
+    /// The PID of the main process of the unit's current or last run (0 before any).
+    pub async fn exec_main_pid(&self, unit: &str) -> Result<u32> {
+        self.service(unit)
+            .await?
+            .exec_main_pid()
+            .await
+            .with_context(|| format!("reading the main process of {unit}"))
+    }
+
+    /// The invocation ID of the unit's current or last run, in hex.
+    pub async fn invocation_id(&self, unit: &str) -> Result<String> {
+        let proxy = systemd1::UnitProxy::builder(&self.conn)
+            .path(self.unit_path(unit).await?)?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .with_context(|| format!("connecting to {unit}"))?;
+        let id = proxy
+            .invocation_id()
+            .await
+            .with_context(|| format!("reading the invocation of {unit}"))?;
+        Ok(hex::encode(id))
+    }
+
+    /// Starts a transient unit with these properties and returns without waiting.
+    pub async fn start_transient(
+        &self,
+        unit: &str,
+        properties: Vec<(String, zbus::zvariant::OwnedValue)>,
+    ) -> Result<()> {
+        self.manager
+            .start_transient_unit(unit.to_string(), "fail".to_string(), properties, Vec::new())
+            .await
+            .with_context(|| format!("starting {unit}"))?;
+        Ok(())
+    }
+
     /// Queues a stop job for a unit and returns at once, without watching the job.
     pub async fn queue_stop(&self, unit: &str) -> Result<()> {
         self.manager

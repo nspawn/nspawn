@@ -385,6 +385,103 @@ pub async fn release(ctx: &Context, name: &str) -> Result<()> {
             }
         }
     }
+    // run --rm: the removal cannot happen here, inside the unit's own stop, so a unit of
+    // its own does it once this one is down. At shutdown that start is refused, and the
+    // service removes the machine when it next starts.
+    if record.as_ref().is_some_and(|r| r.remove_on_exit) {
+        if let Err(e) = remove_later(ctx, name).await {
+            eprintln!("warning: {e:#}; nspawn removes {name} when its service next starts");
+        }
+    }
+    Ok(())
+}
+
+async fn remove_later(ctx: &Context, name: &str) -> Result<()> {
+    let sd = ctx.sd().await?;
+    let invocation = std::env::var("INVOCATION_ID").unwrap_or_default();
+    let mut argv = crate::settings::hook_argv(&ctx.config)?;
+    argv.extend([
+        "remove-after-exit".to_string(),
+        name.to_string(),
+        invocation.clone(),
+    ]);
+    let unit = format!(
+        "nspawn-rm-{name}-{}.service",
+        invocation.get(..8).unwrap_or("0")
+    );
+    sd.start_transient(
+        &unit,
+        crate::api::run::transient_service(
+            &format!("Remove machine {name} once it stopped"),
+            &argv,
+        ),
+    )
+    .await
+}
+
+/// run --rm, from the unit `release` starts: waits for the machine's unit to be down
+/// after the run `invocation`, then removes the machine, unless it was started again
+/// meanwhile or kept (started since without --rm).
+pub async fn remove_after_exit(ctx: &Context, name: &str, invocation: &str) -> Result<()> {
+    crate::reference::validate_entry_name(name)?;
+    let sd = ctx.sd().await?;
+    let unit = format!("systemd-nspawn@{name}.service");
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let state = sd.unit_status(&unit).await?;
+        if !state.busy() {
+            break;
+        }
+        if !invocation.is_empty() && sd.invocation_id(&unit).await? != invocation {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            bail!("{unit} did not stop within two minutes; {name} is left");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    if !ctx
+        .store
+        .load_image(name)?
+        .is_some_and(|r| r.remove_on_exit)
+    {
+        return Ok(());
+    }
+    sd.reset_failed(&unit).await?;
+    let removal =
+        crate::api::images::remove_machines(ctx, &[name.to_string()], false, &to_journal).await?;
+    if let Some(error) = removal.error() {
+        bail!("{error}");
+    }
+    Ok(())
+}
+
+/// run --rm machines whose run ended while nothing could remove them (the host shut
+/// down, the removal unit was refused): removed now. One being started is left alone.
+pub async fn remove_ended(ctx: &Context) -> Result<()> {
+    let sd = ctx.sd().await?;
+    let ended: Vec<String> = {
+        let mut ended = Vec::new();
+        for r in ctx.store.list_images()? {
+            if !r.remove_on_exit || ctx.store.is_starting(&r.name) {
+                continue;
+            }
+            let unit = format!("systemd-nspawn@{}.service", r.name);
+            if !sd.unit_status(&unit).await?.busy() && !sd.machine_exists(&r.name).await? {
+                ended.push(r.name);
+            }
+        }
+        ended
+    };
+    if ended.is_empty() {
+        return Ok(());
+    }
+    for name in &ended {
+        let _ = sd
+            .reset_failed(&format!("systemd-nspawn@{name}.service"))
+            .await;
+    }
+    crate::api::images::remove_machines(ctx, &ended, false, &|_| {}).await?;
     Ok(())
 }
 

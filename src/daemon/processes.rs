@@ -30,6 +30,19 @@ pub struct ProcessState {
     pub pidfd: Option<OwnedFd>,
     pub state: Mutex<String>,
     pub exit_status: Mutex<i32>,
+    pub signals: Signals,
+}
+
+/// Where the Signal method of an attached run goes, and what it remembers.
+#[derive(Default)]
+pub struct Signals {
+    /// A booted machine: any signal asks it to power off, as Ctrl-C of docker run
+    /// stops a container.
+    pub poweroff: Option<String>,
+    /// An app machine: signals go to its program, whichever process it is by then.
+    pub program: Option<String>,
+    /// The last signal sent, which the run's exit code may be made of.
+    pub sent: Arc<Mutex<Option<i32>>>,
 }
 
 #[derive(Default)]
@@ -119,6 +132,32 @@ impl Process {
                 "the process has exited".to_string(),
             ));
         }
+        if let Some(machine) = &self.process.signals.poweroff {
+            let sd = self
+                .state
+                .ctx
+                .sd()
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+            sd.poweroff_machine(machine)
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+            *self.process.signals.sent.lock().unwrap() = Some(signal);
+            return Ok(());
+        }
+        if let Some(machine) = &self.process.signals.program {
+            let sd = self
+                .state
+                .ctx
+                .sd()
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+            crate::api::machines::signal_program(sd, machine, signal)
+                .await
+                .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
+            *self.process.signals.sent.lock().unwrap() = Some(signal);
+            return Ok(());
+        }
         let Some(pidfd) = &self.process.pidfd else {
             return Err(zbus::fdo::Error::Failed(
                 "the process cannot be signalled".to_string(),
@@ -126,7 +165,9 @@ impl Process {
         };
         nsenter::pidfd_signal(pidfd, signal).map_err(|e| {
             zbus::fdo::Error::Failed(format!("signalling PID {}: {e}", self.process.pid))
-        })
+        })?;
+        *self.process.signals.sent.lock().unwrap() = Some(signal);
+        Ok(())
     }
 
     /// The process ended with this status.
@@ -145,6 +186,31 @@ pub async fn register(
     pidfd: Option<OwnedFd>,
     wait: impl Future<Output = i32> + Send + 'static,
 ) -> zbus::Result<OwnedObjectPath> {
+    register_with(
+        state,
+        owner,
+        machine,
+        argv,
+        pid,
+        pidfd,
+        Signals::default(),
+        wait,
+    )
+    .await
+}
+
+/// `register`, with the Signal method of an attached run.
+#[allow(clippy::too_many_arguments)]
+pub async fn register_with(
+    state: &Arc<State>,
+    owner: polkit::Caller,
+    machine: &str,
+    argv: &[String],
+    pid: u32,
+    pidfd: Option<OwnedFd>,
+    signals: Signals,
+    wait: impl Future<Output = i32> + Send + 'static,
+) -> zbus::Result<OwnedObjectPath> {
     let id = state.processes.next.fetch_add(1, Ordering::SeqCst) + 1;
     let path = OwnedObjectPath::try_from(format!("/org/nspawn/process/{id}"))?;
     let entry = Arc::new(ProcessState {
@@ -157,6 +223,7 @@ pub async fn register(
         pidfd,
         state: Mutex::new("running".to_string()),
         exit_status: Mutex::new(0),
+        signals,
     });
     state.processes.all.lock().unwrap().push(entry.clone());
     state
