@@ -15,7 +15,7 @@ flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
 indicatif = "0.18"
-nix = { version = "0.31", features = ["term", "user", "fs", "dir", "ioctl", "signal", "sched", "process", "poll", "socket", "uio"] }
+nix = { version = "0.31", features = ["term", "user", "fs", "dir", "ioctl", "signal", "sched", "process", "poll", "socket", "uio", "time"] }
 oci-client = { version = "0.17", default-features = false, features = ["rustls-tls"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 serde = { version = "1", features = ["derive"] }

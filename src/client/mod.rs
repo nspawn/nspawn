@@ -62,6 +62,7 @@ pub trait Manager {
     fn list_tags(&self, repository: &str, options: Options<'_>) -> zbus::Result<Vec<String>>;
     fn list_machines(&self, all: bool) -> zbus::Result<Vec<Dict>>;
     fn get_machine(&self, name: &str) -> zbus::Result<Dict>;
+    fn machine_stats(&self, names: &[String]) -> zbus::Result<Vec<Dict>>;
     fn copy_from(
         &self,
         machine: &str,
@@ -484,6 +485,11 @@ pub fn u64(dict: &Dict, key: &str) -> u64 {
     dict.get(key)
         .and_then(|v| u64::try_from(v.clone()).ok())
         .unwrap_or(0)
+}
+
+/// A number that may be absent, which is not the same as 0.
+pub fn maybe_u64(dict: &Dict, key: &str) -> Option<u64> {
+    dict.get(key).and_then(|v| u64::try_from(v.clone()).ok())
 }
 
 pub fn bool(dict: &Dict, key: &str) -> bool {

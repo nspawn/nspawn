@@ -154,6 +154,8 @@ allow system_dbusd_t systemd_machined_var_lib_t:dir { getattr read search };
 # systemd-nspawn@.service runs as), entered through the files of the
 # machine's tree.
 domain_read_all_domains_state(nspawn_t)
+# stats reads a machine's interfaces through /proc/LEADER/net/dev.
+kernel_read_network_state(nspawn_t)
 domain_getattr_all_domains(nspawn_t)
 fs_read_nsfs_files(nspawn_t)
 fs_rw_cgroup_files(nspawn_t)

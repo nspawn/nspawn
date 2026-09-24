@@ -64,6 +64,8 @@ pub enum Command {
     /// Change the restart policy and limits of machines, like docker update; a running
     /// machine gets the limits at once.
     Update(UpdateArgs),
+    /// What running machines use: CPU, memory, network, disk, processes, like docker stats.
+    Stats(StatsArgs),
     /// Remove machines and what they alone use, like docker rm (same as images rm).
     Rm(RmArgs),
     /// Run a command inside a running machine.
@@ -404,6 +406,18 @@ pub struct UpdateArgs {
     /// Most processes and threads the machine may have; 0 removes the limit.
     #[arg(long, value_name = "N")]
     pub pids_limit: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct StatsArgs {
+    /// Machine names (every running machine when none is given).
+    pub names: Vec<String>,
+    /// Print one table and return instead of drawing a new one every second.
+    #[arg(long)]
+    pub no_stream: bool,
+    /// One JSON object per machine and sample.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]

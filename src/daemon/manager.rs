@@ -725,6 +725,22 @@ impl Manager {
         Ok(machines.iter().map(values::machine).collect())
     }
 
+    /// Like `stats`: one sample of the counters of each named machine that runs (every
+    /// running container when none is named): name, time_usec (CLOCK_MONOTONIC),
+    /// cpu_usec, memory, memory_limit, pids, io_read, io_write, net_rx, net_tx, each
+    /// left out when it cannot be read (net_* on the host's network). Rates come from
+    /// two samples.
+    async fn machine_stats(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        names: Vec<String>,
+    ) -> Result<Vec<Dict>> {
+        self.allow(&hdr, Action::Inspect).await?;
+        let _busy = self.state.enter();
+        let samples = api::stats::sample(self.ctx(), &names).await?;
+        Ok(samples.iter().map(values::sample).collect())
+    }
+
     /// Like `inspect`: one machine as `ListMachines` has it (running or not), or the
     /// record of an image that is not running, with state "stopped".
     async fn get_machine(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<Dict> {

@@ -14,6 +14,7 @@ pub mod network;
 pub mod pull;
 pub mod push;
 pub mod search;
+pub mod stats;
 pub mod volumes;
 
 use anyhow::{bail, Context as _, Result};

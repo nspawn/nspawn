@@ -767,6 +767,17 @@ $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0];
 $NSPAWN update $app 2>/dev/null && fail "update with nothing to change succeeded"
 $NSPAWN update e2e-nope -m 64m 2>/dev/null && fail "update of an unknown machine succeeded"
 
+step "stats: what running machines use, rates from two samples"
+$NSPAWN start $app -m 64m --pids-limit 0 -- /bin/sh -c 'while :; do :; done' >/dev/null || fail "start a busy app"
+out=$($NSPAWN stats --no-stream --json $app) || fail "stats --no-stream --json"
+echo "$out" | python3 -c "import json,sys; d = json.loads(sys.stdin.read().strip().splitlines()[0]); assert d['name'] == '$app' and d['cpu_percent'] > 10 and d['memory_limit'] == 67108864 and d['memory'] > 0 and d['pids'] >= 1 and d['net_rx'] is not None and d['io_read'] is not None, d" || fail "stats of a busy app: $out"
+$NSPAWN stats --no-stream | grep_q "^ *$app " || fail "stats without names does not list the app"
+out=$(timeout 3 $NSPAWN stats $app)
+echo "$out" | grep_q "^ *$app " || fail "stats did not draw a table within 3 seconds: $out"
+out=$($NSPAWN stats --no-stream e2e-nope 2>&1) && fail "stats of a machine that does not run succeeded"
+echo "$out" | grep_q "not running" || fail "stats of a machine that does not run was not explained: $out"
+$NSPAWN stop $app --force >/dev/null || fail "stop the busy app"
+
 step "named volumes: listed with their users, made ahead, removed once unused"
 $NSPAWN volume create e2evol-free || fail "volume create"
 [ "$(stat -c '%u %a' /var/lib/nspawn/volumes/e2evol-free)" = "0 755" ] || fail "volume create did not make a root directory with mode 0755"
@@ -832,7 +843,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine StartMachine StopMachine KillMachine UpdateMachine Exec Shell Logs ListNetwork NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine StopMachine KillMachine UpdateMachine Exec Shell Logs ListNetwork NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do

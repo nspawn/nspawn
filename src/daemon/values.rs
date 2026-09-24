@@ -8,6 +8,7 @@ use zbus::zvariant::{OwnedValue, Value};
 use crate::api::images::ImageSummary;
 use crate::api::machines::MachineSummary;
 use crate::api::network::{BridgeInfo, NetworkEntry};
+use crate::api::stats::Sample;
 use crate::api::volumes::VolumeInfo;
 use crate::daemon::jobs::Dict;
 use crate::search::Hit;
@@ -141,6 +142,29 @@ pub fn machined_path(name: &str) -> String {
         }
     }
     path
+}
+
+/// A sample of `MachineStats`: what could not be read is left out.
+pub fn sample(s: &Sample) -> Dict {
+    let mut dict = HashMap::from([
+        ("name".to_string(), v(s.name.as_str())),
+        ("time_usec".to_string(), v(s.time_usec)),
+    ]);
+    for (key, value) in [
+        ("cpu_usec", s.cpu_usec),
+        ("memory", s.memory),
+        ("memory_limit", s.memory_limit),
+        ("pids", s.pids),
+        ("io_read", s.io_read),
+        ("io_write", s.io_write),
+        ("net_rx", s.net_rx),
+        ("net_tx", s.net_tx),
+    ] {
+        if let Some(value) = value {
+            dict.insert(key.to_string(), v(value));
+        }
+    }
+    dict
 }
 
 pub fn volume(vol: &VolumeInfo) -> Dict {

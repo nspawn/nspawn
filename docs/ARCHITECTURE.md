@@ -106,7 +106,11 @@ with SetUnitProperties at once; systemd then keeps copies under
 boot, so `update` removes them right away and `prepare` removes any a
 `systemctl set-property --runtime` left: the record decides at every start.
 Restart= cannot be set that way, but systemd reads it again at the reload that
-follows. `exec` joins the leader's namespaces (user
+follows. `stats` reads the same cgroup (the unit's `ControlGroup`, which holds
+systemd-nspawn and the whole machine: `cpu.stat`, `memory.current` and
+`memory.stat`, `memory.max`, `pids.current`, `io.stat`) and the machine's
+interfaces through `/proc/LEADER/net/dev`; the service returns counters with a
+monotonic time and the client makes rates of two samples. `exec` joins the leader's namespaces (user
 first, mount last), joins its cgroup, becomes the machine's root and then the
 requested user, so capabilities are dropped.
 

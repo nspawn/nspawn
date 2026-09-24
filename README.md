@@ -23,6 +23,7 @@ nspawn update web -m 1g --restart always   # change them later, a running machin
 nspawn ps                           # running machines: image, mode, command, uptime (-a adds stopped ones)
                                     # (containers only: the virtual machines machined also lists are left out)
 nspawn inspect web                  # everything nspawn knows about a machine, as JSON
+nspawn stats                        # CPU, memory, network and disk of running machines, like docker stats
 nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
 nspawn shell fedora-44
 nspawn logs fedora-44               # console output; --inside reads the machine's own journal
@@ -96,7 +97,9 @@ bound the whole machine (its unit's MemoryMax=, CPUQuota= and TasksMax=), which 
 they cannot be seen from inside; as with docker, `--memory` also lets the machine use as
 much swap again (MemorySwapMax=), and no more. Both are remembered like the ports and apply at the
 next start; `--restart no` and a limit of 0 remove them. `update` changes them without a
-start, like docker update: a running machine gets the new limits in its cgroup at once. With a policy, `stop --no-wait`
+start, like docker update: a running machine gets the new limits in its cgroup at once.
+`stats` shows what each running machine uses against them, its unit's cgroup read every
+second (`--no-stream` for one reading, `--json` for scripts). With a policy, `stop --no-wait`
 of an app also lets the stub init send the program SIGTERM and SIGHUP, since nobody
 stays to stop the unit later.
 

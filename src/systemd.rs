@@ -409,6 +409,36 @@ impl Systemd {
             .with_context(|| format!("reading the leader of {name}"))
     }
 
+    /// The unit machined has the machine in (systemd-nspawn@NAME.service for nspawn's).
+    pub async fn machine_unit(&self, name: &str) -> Result<String> {
+        self.machine(name)
+            .await?
+            .unit()
+            .await
+            .with_context(|| format!("reading the unit of {name}"))
+    }
+
+    /// The cgroup of a service or scope unit, as a path below /sys/fs/cgroup.
+    pub async fn control_group(&self, unit: &str) -> Result<String> {
+        let path = self
+            .manager
+            .get_unit(unit.to_string())
+            .await
+            .with_context(|| format!("looking up {unit}"))?;
+        let interface = if unit.ends_with(".scope") {
+            "org.freedesktop.systemd1.Scope"
+        } else {
+            "org.freedesktop.systemd1.Service"
+        };
+        let proxy = zbus::Proxy::new(&self.conn, "org.freedesktop.systemd1", path, interface)
+            .await
+            .with_context(|| format!("connecting to {unit}"))?;
+        proxy
+            .get_property::<String>("ControlGroup")
+            .await
+            .with_context(|| format!("reading the cgroup of {unit}"))
+    }
+
     /// Interface indices of the machine's host-side network interfaces.
     pub async fn machine_interfaces(&self, name: &str) -> Result<Vec<i32>> {
         self.machine(name)
