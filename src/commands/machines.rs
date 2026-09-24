@@ -224,7 +224,18 @@ fn run_source(
     })
 }
 
-/// docker run -d: the machine from a local image with the reference or from the registry,
+/// The name of a machine of run --rm without --name: the image's local name and a random
+/// part, as docker names its containers when not told.
+fn run_name(base: &str) -> Result<String> {
+    let mut bytes = [0u8; 4];
+    File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .context("reading /dev/urandom")?;
+    let base: String = base.chars().take(54).collect();
+    Ok(format!("{base}-{}", hex::encode(bytes)))
+}
+
+/// docker run: the machine from a local image with the reference or from the registry,
 /// then started with the options given, which it keeps like after start.
 pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> {
     if !args.detach && !args.options.wait {
@@ -235,7 +246,13 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
     }
     let registry = super::registry_name(client, config).await;
     let image = ImageRef::parse(&args.reference, &registry)?;
-    let name = args.name.clone().unwrap_or_else(|| image.local_name());
+    let name = match &args.name {
+        Some(name) => name.clone(),
+        // run --rm keeps the image, as docker does (see below): the machine it removes
+        // gets a name of its own.
+        None if args.rm => run_name(&image.local_name())?,
+        None => image.local_name(),
+    };
     let images: Vec<(String, String)> = client
         .manager
         .list_images()
@@ -261,10 +278,46 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
         );
     }
     let manager = &client.manager;
+    // In nspawn a pulled image is a machine; with --rm the one pulled for this run would
+    // go with it, and the next run would download it again. So it is pulled under its
+    // own name and kept, and the machine is made from it, unless that name is taken by
+    // another image.
+    let base = image.local_name();
+    let keep_image = args.rm
+        && matches!(source, Source::Registry)
+        && base != name
+        && images
+            .iter()
+            .all(|(n, r)| n != &base || r == &image.to_string());
     match source {
         Source::Local(source) => {
             client
                 .run_job_to_stderr(|| manager.create_machine(&source, &name, options))
+                .await?;
+        }
+        Source::Registry if keep_image => {
+            let mut create = client::registry_options(config);
+            create.insert("force", Value::from(args.force));
+            if args.backend != crate::cli::BackendChoice::Auto {
+                create.insert(
+                    "backend",
+                    Value::from(format!("{:?}", args.backend).to_lowercase()),
+                );
+            }
+            options.insert("name", Value::from(base.clone()));
+            // An older copy under that name is replaced (--pull always).
+            options.insert("force", Value::from(true));
+            if args.mode != ModeChoice::Auto {
+                options.insert(
+                    "mode",
+                    Value::from(format!("{:?}", args.mode).to_lowercase()),
+                );
+            }
+            client
+                .run_job_to_stderr(|| manager.pull_image(&args.reference, options))
+                .await?;
+            client
+                .run_job_to_stderr(|| manager.create_machine(&base, &name, create))
                 .await?;
         }
         Source::Registry => {
@@ -799,6 +852,20 @@ pub async fn logs(args: LogsArgs, client: &Client) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machines_of_run_rm_get_names_of_their_own() {
+        let a = run_name("alpine-3").unwrap();
+        let b = run_name("alpine-3").unwrap();
+        assert!(
+            a.starts_with("alpine-3-") && a.len() == "alpine-3-".len() + 8,
+            "{a}"
+        );
+        assert_ne!(a, b);
+        let long = run_name(&"x".repeat(80)).unwrap();
+        assert!(long.len() <= 64);
+        crate::reference::validate_machine_name(&long).unwrap();
+    }
 
     #[test]
     fn events_read_like_docker_events() {

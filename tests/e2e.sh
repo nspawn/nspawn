@@ -73,11 +73,16 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-run-boot; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-run-boot busybox-1.37; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
   $NSPAWN network rm e2e-na e2e-nb e2e-nc e2e-nd e2e-ne >/dev/null 2>&1 || true
+  # Machines of run --rm have names of their own.
+  for m in $($NSPAWN images ls 2>/dev/null | awk '$1 ~ /^busybox-1\.37-/ {print $1}'); do
+    $NSPAWN rm -f "$m" >/dev/null 2>&1 || true
+  done
+  $NSPAWN images rm busybox-1.37 >/dev/null 2>&1 || true
   $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || true
   rm -rf /tmp/e2e-cp /tmp/e2e-cp-* /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol /var/lib/nspawn/volumes/e2evol2 /var/lib/nspawn/volumes/e2evol-free /var/lib/nspawn/volumes/e2evol-events /var/lib/nspawn/volumes/e2e-bootvol /var/lib/nspawn/volumes/.e2e-hidden
   kill "${listener_pid:-}" 2>/dev/null || true
@@ -614,6 +619,13 @@ $NSPAWN kill e2e-run >/dev/null || fail "kill of an attached run"
 wait $run_pid; rc=$?
 [ "$rc" = 137 ] || fail "run killed with SIGKILL did not exit with 137: $rc"
 retry 15 bash -c "! $NSPAWN images ls | grep_q '^ *e2e-run '" || fail "run --rm left a killed machine behind"
+# docker keeps the image of a --rm run: what run pulled stays, the machine goes.
+# (A tag of its own, so that no image of the host is replaced.)
+out=$($NSPAWN run --rm docker.io/library/busybox:1.37 /bin/echo kept-$nonce 2>/dev/null) || fail "run --rm of an image not here yet"
+[ "$out" = "kept-$nonce" ] || fail "run --rm of an image not here yet did not show the output: $out"
+$NSPAWN images ls | grep_q "^ *busybox-1.37 " || fail "run --rm did not keep the image it pulled"
+$NSPAWN images ls | grep_q "^ *busybox-1.37-" && fail "run --rm left its machine behind"
+$NSPAWN images rm busybox-1.37 >/dev/null || fail "images rm of the image run kept"
 # A reboot asked from inside ends a --rm run (the machine is not restarted then).
 timeout 60 $NSPAWN run --rm $bb --name e2e-run -- /bin/reboot -f >/dev/null 2>&1; rc=$?
 [ "$rc" = 133 ] || fail "run --rm of a program that reboots did not end with 133: $rc"

@@ -53,7 +53,9 @@ from the journal, so that `logs` shows it later too), and `run` exits with the p
 exit code, or 128 plus the signal it died of. Ctrl-C, SIGTERM, SIGHUP and SIGQUIT go to
 the program; a third Ctrl-C within a second leaves it running and returns. `-i` gives the
 program this standard input, `-t` a terminal (`-it` for a shell), `--rm` removes the
-machine once it ends (named volumes stay), and `-d` starts it in the background and
+machine once it ends (named volumes stay; an image it had to pull is kept under its own
+name, as docker keeps images, and the machine gets a name of its own unless `--name`
+says one), and `-d` starts it in the background and
 returns, as `run` did before 1.2.0. A booted image shows its console until it powers off
 (Ctrl-C powers it off); `run -it` on one waits for its boot, opens a root shell and powers
 the machine off when the shell ends, with the shell's exit code. Closing the terminal of
