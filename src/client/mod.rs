@@ -112,6 +112,11 @@ pub trait Manager {
         options: Options<'_>,
     ) -> zbus::Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)>;
     fn list_network(&self) -> zbus::Result<(Dict, Vec<Dict>)>;
+    fn list_networks(&self) -> zbus::Result<Vec<Dict>>;
+    fn get_network(&self, name: &str) -> zbus::Result<(Dict, Vec<Dict>)>;
+    fn create_network(&self, name: &str, options: Options<'_>) -> zbus::Result<Dict>;
+    fn remove_networks(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
+    fn prune_networks(&self) -> zbus::Result<OwnedObjectPath>;
     fn network_up(&self) -> zbus::Result<Dict>;
     fn login(
         &self,

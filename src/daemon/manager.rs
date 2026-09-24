@@ -21,7 +21,6 @@ use crate::daemon::State;
 use crate::nsenter;
 use crate::oci::Mode;
 use crate::search::SearchSource;
-use crate::settings::Network;
 
 /// Errors leave as org.nspawn.Error.Failed with the library's message.
 #[derive(Debug, zbus::DBusError)]
@@ -150,14 +149,17 @@ fn mode_choice(text: Option<String>) -> anyhow::Result<Option<Mode>> {
     })
 }
 
-fn network_choice(text: Option<String>) -> anyhow::Result<Option<Network>> {
-    Ok(match text.as_deref() {
-        None | Some("") => None,
-        Some("bridge") => Some(Network::Bridge),
-        Some("veth") => Some(Network::Veth),
-        Some("host") => Some(Network::Host),
-        Some(other) => anyhow::bail!("network {other}: expected bridge, veth or host"),
-    })
+/// The network option: bridge, veth, host or a network's name, checked before anything
+/// is done.
+fn network_choice(text: Option<String>) -> anyhow::Result<Option<String>> {
+    match text {
+        None => Ok(None),
+        Some(text) if text.is_empty() => Ok(None),
+        Some(text) => {
+            api::network::choice(&text)?;
+            Ok(Some(text))
+        }
+    }
 }
 
 #[zbus::interface(name = "org.nspawn.Manager")]
@@ -628,6 +630,109 @@ impl Manager {
             "",
             move |ctx, reporter| async move {
                 let removed = api::volumes::prune(&ctx, jobs::report(&reporter)).await?;
+                Ok(HashMap::from([("removed".to_string(), values::v(removed))]))
+            },
+        )
+        .await?)
+    }
+
+    /// Like `network ls`: every network (the default one first) with name, interface,
+    /// subnet, gateway, internal, created and machines (the ones whose records name it).
+    async fn list_networks(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Vec<Dict>> {
+        self.allow(&hdr, Action::Inspect).await?;
+        let _busy = self.state.enter();
+        let networks = api::network::list_networks(self.ctx())?;
+        Ok(networks.iter().map(values::network_summary).collect())
+    }
+
+    /// Like `network inspect`: one network ("bridge" for the default one) and its
+    /// machines, with address, ports and whether they run.
+    async fn get_network(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        name: String,
+    ) -> Result<(Dict, Vec<Dict>)> {
+        self.allow(&hdr, Action::Inspect).await?;
+        let _busy = self.state.enter();
+        let (spec, entries) = api::network::inspect(self.ctx(), &name).await?;
+        Ok((
+            values::network(&spec),
+            entries.iter().map(values::network_entry).collect(),
+        ))
+    }
+
+    /// Like `network create`: options subnet (s, CIDR; the next free /24 of
+    /// network_pool otherwise), internal (b). The bridge comes up at once. Returns the
+    /// network as ListNetworks has it, and the notes made on the way under "notes".
+    async fn create_network(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        name: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<Dict> {
+        self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        let mut options = Options::new(&options);
+        let subnet = options.string("subnet")?;
+        let internal = options.bool("internal", false)?;
+        options.finish()?;
+        let notes = Notes::default();
+        let spec = api::network::create(
+            self.ctx(),
+            &name,
+            subnet.as_deref(),
+            internal,
+            &notes.report(),
+        )
+        .await?;
+        let mut dict = values::network(&spec);
+        dict.insert("notes".to_string(), values::v(notes.into_lines()));
+        Ok(dict)
+    }
+
+    /// Like `network rm`: a job; every name is tried, the result lists the ones removed,
+    /// and the job fails at the end when one was in use, unknown or the default network.
+    async fn remove_networks(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        names: Vec<String>,
+    ) -> Result<OwnedObjectPath> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        let target = names.join(" ");
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "network-rm",
+            &target,
+            move |ctx, reporter| async move {
+                let removal = api::network::remove(&ctx, &names, jobs::report(&reporter)).await?;
+                if let Some(error) = removal.error() {
+                    anyhow::bail!("{error}");
+                }
+                Ok(HashMap::from([(
+                    "removed".to_string(),
+                    values::v(removal.removed),
+                )]))
+            },
+        )
+        .await?)
+    }
+
+    /// Like `network prune`: a job removing every user-defined network no machine names;
+    /// its result lists them.
+    async fn prune_networks(&self, #[zbus(header)] hdr: Header<'_>) -> Result<OwnedObjectPath> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "network-prune",
+            "",
+            move |ctx, reporter| async move {
+                let removed = api::network::prune(&ctx, jobs::report(&reporter)).await?;
                 Ok(HashMap::from([("removed".to_string(), values::v(removed))]))
             },
         )
@@ -1196,8 +1301,9 @@ impl Manager {
         self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let notes = Notes::default();
-        let info = api::network::up(self.ctx(), &notes.report()).await?;
+        let (info, networks) = api::network::up(self.ctx(), &notes.report()).await?;
         let mut dict = values::bridge(&info);
+        dict.insert("networks".to_string(), values::strings(&networks));
         dict.insert("notes".to_string(), values::v(notes.into_lines()));
         Ok(dict)
     }

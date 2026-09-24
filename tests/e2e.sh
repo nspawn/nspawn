@@ -34,6 +34,8 @@ ipv4_only() {
 # SIGPIPE, which pipefail counts as a failure: read everything instead.
 grep_q() { grep "$@" >/dev/null; }
 export -f grep_q
+# A machine's address on its network, as inspect has it.
+addr_of() { $NSPAWN inspect "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)[0].get('address') or '')"; }
 nonce=$$
 # The command line is a client of the org.nspawn service: it goes on the bus first,
 # with a configuration file that names the registry and its CA for the service's own
@@ -69,12 +71,13 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
+  $NSPAWN network rm e2e-na e2e-nb e2e-nc e2e-nd e2e-ne >/dev/null 2>&1 || true
   $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || true
-  rm -rf /tmp/e2e-cp /tmp/e2e-cp-* /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol /var/lib/nspawn/volumes/e2evol2 /var/lib/nspawn/volumes/e2evol-free /var/lib/nspawn/volumes/e2e-bootvol /var/lib/nspawn/volumes/.e2e-hidden
+  rm -rf /tmp/e2e-cp /tmp/e2e-cp-* /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol /var/lib/nspawn/volumes/e2evol2 /var/lib/nspawn/volumes/e2evol-free /var/lib/nspawn/volumes/e2evol-events /var/lib/nspawn/volumes/e2e-bootvol /var/lib/nspawn/volumes/.e2e-hidden
   kill "${listener_pid:-}" 2>/dev/null || true
   if [ "$networkd_was" != active ]; then
     systemctl stop systemd-networkd.service systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-resolve-hook.socket >/dev/null 2>&1 || true
@@ -251,10 +254,11 @@ for backend in overlay flat mstack; do
     # settling on the binding nspawn made; the binding itself is not in question.
     retry 5 bash -c "[ \"\$(firewall-cmd --get-zone-of-interface=nspawn0)\" = trusted ]" || fail "nspawn0 is not in the trusted zone of firewalld"
   fi
-  addr=$($NSPAWN network ls | awk -v n="$name" '$1 == n {print $2}')
+  addr=$(addr_of "$name")
   echo "$name has address $addr"
   echo "$addr" | grep_q "^10\.99\.0\." || fail "no bridge address recorded for $name"
-  $NSPAWN network ls --json | python3 -c "import json,sys; d = json.load(sys.stdin); assert d['bridge']['bridge'] == 'nspawn0' and any(m['name'] == '$name' and m['address'] == '$addr' and m['running'] for m in d['machines']), d" || fail "network ls --json"
+  $NSPAWN network inspect bridge | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['interface'] == 'nspawn0' and any(m['name'] == '$name' and m['address'] == '$addr' and m['running'] for m in d['machines']), d" || fail "network inspect bridge"
+  $NSPAWN network ls --json | python3 -c "import json,sys; d = json.load(sys.stdin); assert d[0]['name'] == 'bridge' and '$name' in d[0]['machines'], d" || fail "network ls --json"
   ip -6 addr show dev nspawn0 scope link 2>/dev/null | grep_q inet6 && fail "the bridge has an IPv6 link-local address"
   # ps lists containers only: machined also registers virtual machines (libvirt).
   for m in $($NSPAWN ps --json | python3 -c "import json,sys; print(' '.join(m['name'] for m in json.load(sys.stdin)))"); do
@@ -330,7 +334,7 @@ env NSPAWN_REGISTRY=127.0.0.1:9 $NSPAWN create e2e-a e2e-c || fail "create from 
 $NSPAWN images ls | grep "^ *e2e-c " | grep_q "create" || fail "created machine not listed with origin create"
 $NSPAWN start e2e-c || fail "start created machine"
 retry 10 $NSPAWN exec e2e-c -- /usr/bin/test -f /etc/os-release </dev/null || fail "exec in created machine"
-$NSPAWN network ls | grep_q "^ *e2e-c " || fail "created machine not on the bridge"
+$NSPAWN network inspect bridge | grep_q '"name": "e2e-c"' || fail "created machine not on the bridge"
 $NSPAWN stop e2e-c || fail "stop created machine"
 $NSPAWN images rm e2e-c | tee /tmp/e2e-rmc.txt || fail "rm created machine"
 grep -q "freed" /tmp/e2e-rmc.txt && fail "removing the created machine freed a layer still used by e2e-a and e2e-b"
@@ -341,9 +345,9 @@ $NSPAWN start e2e-b -p 18080:80 || fail "start e2e-b with a published port"
 $NSPAWN exec e2e-b -- /usr/bin/systemctl is-system-running --wait </dev/null >/dev/null 2>&1 || true
 # An echo service on port 80 inside e2e-b, from socket activation: no extra packages needed.
 $NSPAWN exec e2e-b -- /bin/sh -c 'printf "[Socket]\nListenStream=80\nAccept=yes\n" > /etc/systemd/system/echo.socket; printf "[Service]\nExecStart=/usr/bin/cat\nStandardInput=socket\n" > /etc/systemd/system/echo@.service; systemctl daemon-reload; systemctl start echo.socket && echo ECHO-UP' </dev/null | tr -d '\r' | grep_q ECHO-UP || fail "echo service inside e2e-b"
-b_addr=$($NSPAWN network ls | awk '$1 == "e2e-b" {print $2}')
+b_addr=$(addr_of e2e-b)
 echo "e2e-b has address $b_addr"
-$NSPAWN network ls | grep "e2e-b" | grep_q "18080->80/tcp" || fail "published port not listed by network ls"
+$NSPAWN network inspect bridge | grep_q "18080->80/tcp" || fail "published port not listed by network inspect"
 $NSPAWN ps | grep "^ *e2e-b " | grep_q "18080->80/tcp" || fail "published port not shown by ps"
 echo_test() { timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2 || exit 1; echo $3 >&3; read -t 3 l <&3; [ \"\$l\" = $3 ]" 2>/dev/null; }
 retry 5 echo_test "$b_addr" 80 direct || fail "e2e-b not reachable on its bridge address $b_addr"
@@ -466,7 +470,7 @@ step "app on the bridge: address, DNS, internet and published port (no networkd 
 if [ "$networkd_was" != active ]; then
   systemctl is-active systemd-networkd >/dev/null && fail "systemd-networkd is running during the app section"
 fi
-app_addr=$($NSPAWN network ls | awk -v n="$app" '$1 == n {print $2}')
+app_addr=$(addr_of $app)
 echo "$app has address $app_addr"
 echo "$app_addr" | grep_q "^10\.99\.0\." || fail "no bridge address for the app"
 ipv4_only "$app" "$app_addr"
@@ -479,6 +483,70 @@ $NSPAWN ps | grep "^ *$app " | grep_q "18081->80/tcp" || fail "app port not show
 $NSPAWN stop $app || fail "stop busybox"
 retry 15 bash -c "! $NSPAWN machines ls | grep_q '^ *$app '" || fail "busybox still running after stop"
 [ -e /run/netns/nspawn-$app ] && fail "network namespace left behind for $app"
+
+step "user-defined networks: machines of one network reach each other, the rest does not reach them"
+$NSPAWN network create e2e-na >/dev/null || fail "network create"
+$NSPAWN network create e2e-nb --subnet 10.98.7.0/24 >/dev/null || fail "network create --subnet"
+$NSPAWN network create e2e-nc --internal >/dev/null || fail "network create --internal"
+ip link show nsbr-e2e-na >/dev/null 2>&1 || fail "network create did not bring the bridge up"
+na_subnet=$($NSPAWN network inspect e2e-na | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['subnet'])")
+case "$na_subnet" in 10.99.0.0/24|"") fail "e2e-na got no subnet of its own: $na_subnet" ;; esac
+$NSPAWN network ls | grep "^ *e2e-nb " | grep_q "10.98.7.0/24" || fail "network ls does not list e2e-nb with its subnet"
+$NSPAWN network ls | grep "^ *e2e-nc " | grep_q " yes " || fail "network ls does not show e2e-nc internal"
+$NSPAWN network create e2e-nd --subnet 10.98.7.128/25 2>/dev/null && fail "a subnet overlapping another network was accepted"
+$NSPAWN network create host 2>/dev/null && fail "a network took a reserved name"
+$NSPAWN network create e2e-na 2>/dev/null && fail "a network was made twice"
+web='mkdir -p /www; echo "$0" > /www/index.html; exec /bin/httpd -f -p 80 -h /www'
+$NSPAWN create $app e2e-na-web --network e2e-na -- /bin/sh -c "$web" na-web >/dev/null || fail "create on e2e-na"
+$NSPAWN create $app e2e-na-cli --network e2e-na -- /bin/sleep 600 >/dev/null || fail "create a client on e2e-na"
+$NSPAWN create $app e2e-nb-web --network e2e-nb -p 18090:80 -- /bin/sh -c "$web" nb-web >/dev/null || fail "create on e2e-nb"
+$NSPAWN create $app e2e-nc-web --network e2e-nc -- /bin/sh -c "$web" nc-web >/dev/null || fail "create on e2e-nc"
+$NSPAWN create $app e2e-def-cli --network bridge -p none -- /bin/sleep 600 >/dev/null || fail "create on the default network"
+for m in e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-def-cli; do
+  $NSPAWN start $m >/dev/null || fail "start $m"
+done
+$NSPAWN inspect e2e-na-web | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['network'] == 'e2e-na', d" || fail "inspect does not name the network"
+na_web=$(addr_of e2e-na-web); nb_web=$(addr_of e2e-nb-web); nc_web=$(addr_of e2e-nc-web)
+echo "e2e-na-web $na_web, e2e-nb-web $nb_web, e2e-nc-web $nc_web"
+[ "$nb_web" != "${nb_web#10.98.7.}" ] || fail "e2e-nb-web is not on 10.98.7.0/24: $nb_web"
+get() { $NSPAWN exec "$1" -- wget -qO- -T 3 "$2" </dev/null 2>/dev/null | tr -d '\r'; }
+retry 5 bash -c "$NSPAWN exec e2e-na-cli -- wget -qO- -T 3 http://e2e-na-web/ </dev/null 2>/dev/null | grep_q na-web" || fail "a machine does not reach another of its network by name"
+$NSPAWN exec e2e-na-cli -- cat /etc/hosts </dev/null | grep_q e2e-nb-web && fail "the hosts file lists a machine of another network"
+get e2e-na-cli "http://$nb_web/" | grep_q nb-web && fail "a machine reached one of another network"
+get e2e-def-cli "http://$na_web/" | grep_q na-web && fail "a machine of the default network reached one of e2e-na"
+get e2e-na-cli "http://host.nspawn.internal:18090/" | grep_q nb-web || fail "a port published on e2e-nb is not reachable from e2e-na through the host"
+curl -sf -m 5 http://127.0.0.1:18090/ | grep_q nb-web || fail "the published port of e2e-nb is not reachable from the host"
+get e2e-na-cli "http://detectportal.firefox.com/success.txt" | grep_q success || fail "no internet from e2e-na"
+get e2e-nc-web "http://detectportal.firefox.com/success.txt" | grep_q success && fail "a machine of an internal network got out"
+get e2e-na-cli "http://$nc_web/" | grep_q nc-web && fail "a machine reached one of an internal network"
+$NSPAWN create $app e2e-nc-pub --network e2e-nc -p 18091:80 -- /bin/sleep 1 >/dev/null || fail "create with a port on an internal network"
+out=$($NSPAWN start e2e-nc-pub 2>&1) && fail "a port was published from an internal network"
+echo "$out" | grep_q internal || fail "publishing from an internal network was not explained: $out"
+$NSPAWN images rm e2e-nc-pub >/dev/null || fail "rm e2e-nc-pub"
+out=$($NSPAWN network rm e2e-na 2>&1) && fail "network rm removed a network in use"
+echo "$out" | grep_q "in use by e2e-na-cli, e2e-na-web" || fail "network rm of a network in use was not explained: $out"
+$NSPAWN network rm bridge 2>/dev/null && fail "network rm removed the default network"
+nft list table ip nspawn | grep_q nsbr-e2e-na || fail "no rules for e2e-na in the nspawn table"
+# A bridge deleted by hand comes back with the next start of one of its machines.
+$NSPAWN stop e2e-na-web >/dev/null && $NSPAWN stop e2e-na-cli >/dev/null || fail "stop the e2e-na machines"
+ip link del nsbr-e2e-na || fail "delete the bridge by hand"
+$NSPAWN start e2e-na-web >/dev/null && $NSPAWN start e2e-na-cli >/dev/null || fail "start after the bridge went"
+retry 5 bash -c "$NSPAWN exec e2e-na-cli -- wget -qO- -T 3 http://e2e-na-web/ </dev/null 2>/dev/null | grep_q na-web" || fail "the network did not come back with its machines"
+for m in e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-def-cli; do
+  $NSPAWN rm -f $m >/dev/null || fail "rm -f $m"
+done
+$NSPAWN network create e2e-ne >/dev/null || fail "network create e2e-ne"
+$NSPAWN network prune -f >/dev/null || fail "network prune"
+$NSPAWN network ls | grep_q "^ *e2e-n[a-e] " && fail "network prune left an unused network: $($NSPAWN network ls)"
+ip -o link show | grep_q nsbr-e2e && fail "a removed network left its bridge"
+nft list table ip nspawn | grep_q nsbr-e2e && fail "a removed network left rules in the nspawn table"
+if command -v iptables >/dev/null 2>&1; then
+  iptables -w -S 2>/dev/null | grep_q nsbr-e2e && fail "a removed network left iptables rules"
+fi
+if firewall-cmd --state >/dev/null 2>&1; then
+  firewall-cmd --zone=trusted --list-interfaces | grep_q nsbr-e2e && fail "a removed network is still in the trusted zone"
+fi
+$NSPAWN network ls | grep_q "^ *bridge " || fail "the default network is not listed"
 
 step "run: a machine from an image and started in one step, like docker run -d"
 # busybox is here as $app: run makes another machine of it without the registry.
@@ -605,12 +673,12 @@ $NSPAWN start $app --restart on-failure -p 18081:80 -- /bin/sh -c 'mkdir -p /www
 grep -qx "Restart=on-failure" $hooks || fail "no Restart= in the drop-in"
 grep -qx "StartLimitIntervalSec=0" $hooks || fail "no StartLimitIntervalSec= in the drop-in"
 retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep_q app-web" || fail "the app does not answer before the kill"
-addr_before=$($NSPAWN network ls | awk -v n="$app" '$1 == n {print $2}')
+addr_before=$(addr_of $app)
 leader=$(machinectl show $app -p Leader --value)
 kill -KILL $(pgrep -P "$leader") || fail "cannot kill the app's program"
 retry 15 bash -c "[ \"\$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)\" -ge 1 ]" || fail "on-failure did not restart the app"
 retry 15 bash -c "curl -sf -m 2 http://127.0.0.1:18081/ | grep_q app-web" || fail "the restarted app does not answer on its published port"
-[ "$($NSPAWN network ls | awk -v n="$app" '$1 == n {print $2}')" = "$addr_before" ] || fail "the restarted app changed its address"
+[ "$(addr_of $app)" = "$addr_before" ] || fail "the restarted app changed its address"
 [ "$(systemctl is-enabled systemd-nspawn@$app.service 2>/dev/null)" = enabled ] && fail "on-failure enabled the unit at boot"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['restart'] == 'on-failure', d" || fail "inspect does not show the restart policy"
 $NSPAWN stop $app || fail "stop an app with a restart policy"
@@ -875,7 +943,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine StopMachine KillMachine UpdateMachine Exec Events Shell Logs ListNetwork NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine StopMachine KillMachine UpdateMachine Exec Events Shell Logs ListNetwork ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do

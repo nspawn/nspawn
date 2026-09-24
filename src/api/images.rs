@@ -193,7 +193,7 @@ pub async fn remove_machines(
     }
     // Whatever happened above, what was removed must not pin anything, and a machine that
     // died on its own must not keep its ports.
-    bridge::write_hosts_files(store, &ctx.config)?;
+    bridge::write_hosts_files(store, &crate::api::network::all(store, &ctx.config)?)?;
     bridge::sync_ports(store, sd).await?;
     let gone = store.gc_layers()?;
     if !gone.is_empty() {

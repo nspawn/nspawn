@@ -19,6 +19,7 @@ pub const DEFAULT_MACHINES_DIR: &str = "/var/lib/machines";
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/nspawn";
 pub const DEFAULT_BRIDGE: &str = "nspawn0";
 pub const DEFAULT_SUBNET: &str = "10.99.0.0/24";
+pub const DEFAULT_NETWORK_POOL: &str = "10.99.0.0/16";
 
 /// What the configuration file may contain. Every field is optional.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -33,6 +34,8 @@ pub struct FileConfig {
     pub bridge: Option<String>,
     /// IPv4 subnet of the bridge; the first address is the bridge's own.
     pub subnet: Option<String>,
+    /// Where `network create` takes the /24 of a network given no --subnet.
+    pub network_pool: Option<String>,
     /// DNS servers handed to the machines (default: the host's upstream servers).
     pub dns: Option<Vec<IpAddr>>,
 }
@@ -49,6 +52,7 @@ pub struct Config {
     pub state_dir: PathBuf,
     pub bridge: String,
     pub subnet: Subnet,
+    pub network_pool: Subnet,
     pub dns: Vec<IpAddr>,
     /// The file given with --config, so that unit hooks can use the same one.
     pub config_path: Option<PathBuf>,
@@ -101,6 +105,12 @@ impl Config {
             .unwrap_or(DEFAULT_SUBNET)
             .parse()
             .context("subnet in the configuration")?;
+        let network_pool = file
+            .network_pool
+            .as_deref()
+            .unwrap_or(DEFAULT_NETWORK_POOL)
+            .parse()
+            .context("network_pool in the configuration")?;
         let dns = file.dns.unwrap_or_default();
         if let Some(bad) = dns.iter().find(|a| !a.is_ipv4() || a.is_loopback()) {
             anyhow::bail!(
@@ -142,9 +152,21 @@ impl Config {
             state_dir,
             bridge,
             subnet,
+            network_pool,
             dns,
             config_path: None,
         })
+    }
+
+    /// The default network, the one of `bridge` and `subnet`.
+    pub fn default_network(&self) -> crate::bridge::NetSpec {
+        crate::bridge::NetSpec {
+            name: crate::bridge::DEFAULT_NETWORK.to_string(),
+            interface: self.bridge.clone(),
+            subnet: self.subnet,
+            internal: false,
+            created: 0,
+        }
     }
 }
 

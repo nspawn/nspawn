@@ -110,6 +110,20 @@ pub struct DaemonArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct NetworkCreateArgs {
+    /// Network name: letters, digits, '_' and '-'.
+    pub name: String,
+    /// IPv4 subnet in CIDR notation (default: the next free /24 of network_pool in
+    /// nspawn.toml, 10.99.0.0/16 unless set).
+    #[arg(long, value_name = "CIDR")]
+    pub subnet: Option<String>,
+    /// Keep the machines from anything beyond the network: no way out, no published
+    /// ports; they reach each other and the host.
+    #[arg(long)]
+    pub internal: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct NetworkArgs {
     #[command(subcommand)]
     pub command: NetworkCommand,
@@ -117,11 +131,34 @@ pub struct NetworkArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum NetworkCommand {
-    /// Create the bridge with its NAT rules (start does it too; useful at boot).
+    /// Bring up every network's bridge with its NAT rules (start does it for its
+    /// machine's network too; useful at boot).
     Up,
-    /// List the machines on the bridge with their addresses and published ports.
+    /// List the networks: the default one (bridge) and those made with network create.
     #[command(alias = "list")]
     Ls(OutputArgs),
+    /// Make a network of its own for some machines, like docker network create: they
+    /// reach each other by name, and machines on other networks do not reach them.
+    Create(NetworkCreateArgs),
+    /// The networks with their machines, addresses and published ports, as JSON.
+    Inspect {
+        /// Network names ("bridge" for the default one).
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Remove networks no machine uses, with their bridges and rules.
+    #[command(alias = "remove")]
+    Rm {
+        /// Network names.
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Remove every network no machine uses.
+    Prune {
+        /// Do not ask.
+        #[arg(long, short = 'f')]
+        force: bool,
+    },
     /// Unit hook (ExecStartPre): prepare a machine's network before it starts.
     #[command(hide = true)]
     Prepare { name: String },
@@ -250,9 +287,10 @@ pub struct CreateArgs {
     /// How to assemble it (default: like the source).
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     pub backend: BackendChoice,
-    /// Network of the new machine (default: like the source).
-    #[arg(long, value_enum)]
-    pub network: Option<crate::settings::Network>,
+    /// Network of the new machine: bridge, veth, host or a network made with network
+    /// create (default: like the source).
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<String>,
     /// Ports to publish on the host, like start -p.
     #[arg(long, short = 'p', value_name = "HOST:CONTAINER[/udp]")]
     pub publish: Vec<String>,
@@ -539,10 +577,11 @@ pub struct StartOptions {
     /// registration is still awaited so that ports and firewall rules can be applied).
     #[arg(long = "no-wait", action = clap::ArgAction::SetFalse)]
     pub wait: bool,
-    /// Network of the machine, remembered for the image: bridge (the default), veth
-    /// (systemd-networkd on the host, booted images) or host (the host's own network).
-    #[arg(long, value_enum)]
-    pub network: Option<crate::settings::Network>,
+    /// Network of the machine, remembered for the image: bridge (the default network),
+    /// veth (systemd-networkd on the host, booted images), host (the host's own
+    /// network) or the name of a network made with network create.
+    #[arg(long, value_name = "NETWORK")]
+    pub network: Option<String>,
     /// Publish a port on the host, like docker -p: HOST:CONTAINER[/udp]. Repeatable and
     /// remembered for the image; "none" forgets them all.
     #[arg(long, short = 'p', value_name = "HOST:CONTAINER[/udp]")]

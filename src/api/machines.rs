@@ -229,15 +229,23 @@ pub async fn prepare(
         );
     }
     let files = if record.network == Network::Bridge {
-        bridge::up(config, sd, report).await?;
+        let all = crate::api::network::all(store, config)?;
+        let net = crate::api::network::of(store, config, &record)?;
+        if net.internal && !record.ports.is_empty() {
+            bail!(
+                "network {} is internal: nothing is published from it; start {name} with -p none or on another network",
+                net.name
+            );
+        }
+        bridge::up(&net, &all, sd, report).await?;
         bridge::check_port_conflicts(store, sd, &record).await?;
         // Only now, past the checks, does the record keep what it was given.
         store.record_image(&record)?;
-        let addr = bridge::prepare_machine(store, config, &mut record)?;
+        let addr = bridge::prepare_machine(store, config, &net, &all, &mut record)?;
         if record.mode == Mode::App {
-            bridge::create_netns(config, name, addr)?;
+            bridge::create_netns(&net, name, addr)?;
         }
-        Some(store.machine_files_dir(name))
+        Some((store.machine_files_dir(name), net.interface))
     } else {
         store.record_image(&record)?;
         None
@@ -298,9 +306,9 @@ pub async fn prepare(
             binds: &binds,
             volume_units: volume_units.as_deref(),
             network: record.network,
-            bridge: files.as_deref().map(|files| BridgeMount {
-                bridge: &config.bridge,
-                files,
+            bridge: files.as_ref().map(|(files, bridge)| BridgeMount {
+                bridge: bridge.as_str(),
+                files: files.as_path(),
             }),
         },
         &route,
@@ -330,7 +338,8 @@ pub struct StartRequest {
     pub name: String,
     /// Wait for a booted machine's init to be up before returning.
     pub wait: bool,
-    pub network: Option<Network>,
+    /// bridge, veth, host or the name of a network made with `network create`.
+    pub network: Option<String>,
     /// HOST:CONTAINER[/udp]; "none" forgets them all.
     pub publish: Vec<String>,
     /// Replaces the image's entrypoint; an empty string runs the arguments alone.
@@ -395,8 +404,10 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     let previous_policy = record.as_ref().map(|r| r.restart).unwrap_or_default();
     match record.as_mut() {
         Some(r) => {
-            if let Some(network) = args.network {
-                r.network = network;
+            if let Some(network) = &args.network {
+                let (kind, name) = crate::api::network::choice(network)?;
+                r.network = kind;
+                r.network_name = name;
             }
             if !args.publish.is_empty() {
                 r.ports = bridge::parse_publish(&args.publish)?;

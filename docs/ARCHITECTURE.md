@@ -41,7 +41,8 @@ files, and the machine units call nspawn back through drop-in hooks.
   layers-foreign/    layers shifted into the foreign UID range (mstack)
   blobs/             compressed blobs, kept for push; .hold-* lists the blobs
                      of a pull in flight, which the collector leaves alone
-  images/NAME.json   the record: reference, backend, mode, network, address,
+  images/NAME.json   the record: reference, backend, mode, network (and
+                     network_name for a user-defined one), address,
                      ports, entrypoint/cmd, env, volumes, labels,
                      restart policy, limits
   manifests/NAME.json raw manifest bytes (digest stays valid)
@@ -51,6 +52,7 @@ files, and the machine units call nspawn back through drop-in hooks.
                      layer, 0711 otherwise (an mstack machine binds its
                      files from inside its user namespace)
   volumes/NAME/      named volumes
+  networks/NAME.json user-defined networks: interface, subnet, internal
   starting/NAME      a start in progress, until the machine is registered:
                      nothing removes or replaces the image meanwhile
   .lock              flock serialising commands that change the store
@@ -177,18 +179,27 @@ the library in the command line's own process.
 
 ## Networking
 
-The bridge (`nspawn0`, `10.99.0.0/24`) is created with `ip`; the nftables
-table `ip nspawn` holds the DNAT map for published ports, masquerading,
-hairpin masquerading and a guard so that `route_localnet` cannot expose the
-host's loopback services. Booted machines get a fixed address through a
+The default bridge (`nspawn0`, `10.99.0.0/24`) and those of user-defined
+networks (`nsbr-NAME`, a /24 of `network_pool` each) are created with `ip`;
+the nftables table `ip nspawn` holds the DNAT map for published ports, and for
+every network masquerading (not for internal ones), hairpin masquerading and a
+guard so that `route_localnet` cannot expose the host's loopback services. Its
+forward chain keeps the networks apart: an internal network forwards nothing,
+connections to published ports cross (DNAT), anything else from one bridge to
+another is dropped, which holds whatever firewalld or iptables accept. The
+table is always written for all networks at once, so bringing one bridge up
+never drops another's rules. A machine's record says its network kind
+(`network`) and, for a user-defined network, its name in `network_name`: an
+older nspawn reads such a record as a machine of the default network. Booted machines get a fixed address through a
 `.network` file mounted at `/run/systemd/network/10-host0.network`; app
 machines get a namespace built beforehand (`ip netns`, veth, address, route)
 referenced by `NamespacePath=`. Under managed user namespaces (mstack) nspawn
 has systemd-nsresourced create the veth and does not put its host end on the
 bridge, so the publish hook does (`bridge::adopt_managed_veth`, which finds the
-peer of the machine's host0 through its sysfs). `/etc/hosts` lists every machine on the bridge
-and `host.nspawn.internal`. With firewalld the bridge is bound to the trusted
-zone; with docker or ufw, accept rules go into DOCKER-USER or FORWARD. The
+peer of the machine's host0 through its sysfs). `/etc/hosts` lists every machine of the
+same network and `host.nspawn.internal`, that network's gateway. With firewalld the
+bridges are bound to the trusted zone; with docker or ufw, accept rules go into
+DOCKER-USER or FORWARD. `network rm` undoes all of it for its bridge. The
 bridge is IPv4 only: it gets `addrgenmode none` (and loses the `fe80::`
 address an earlier version left), host0 gets `LinkLocalAddressing=no` in its
 `.network` file or `addrgenmode none` in an app's namespace, so machined never

@@ -130,10 +130,7 @@ fn start_options(args: StartOptions) -> Result<Options<'static>> {
     let mut options = Options::new();
     options.insert("wait", Value::from(args.wait));
     if let Some(network) = args.network {
-        options.insert(
-            "network",
-            Value::from(format!("{network:?}").to_lowercase()),
-        );
+        options.insert("network", Value::from(network));
     }
     if !args.publish.is_empty() {
         options.insert("publish", Value::from(args.publish));

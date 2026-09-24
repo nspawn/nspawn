@@ -251,6 +251,7 @@ mod tests {
                 mode: Mode::App,
                 run: RunSpec::default(),
                 network: Network::Host,
+                network_name: None,
                 address: None,
                 ports: Vec::new(),
                 entrypoint: None,

@@ -34,6 +34,7 @@ nspawn kill -s HUP web              # a signal for the program, like docker kill
 nspawn rm -f web2                   # remove a machine, stopping it first (rm without -f is images rm)
 nspawn images rm fedora-44          # also frees layers and blobs nobody references
 nspawn volume ls                    # named volumes and the machines that use them (create, rm, prune)
+nspawn network create backend       # a network of its own; --network backend on start, run, create
 
 nspawn build -t team/app:1 ./app    # mkosi -t oci on ./app, imported as a local image
 nspawn push team/app:1              # upload it to the hub (layers already there are skipped)
@@ -198,8 +199,20 @@ A generated `/etc/hosts` gives every machine the names of the other machines on 
 bridge and `host.nspawn.internal` for the host, and hosts with systemd 258 or newer
 resolve machine names themselves through machined. The bridge carries IPv4 only, so
 neither the machines' `host0` nor the bridge get an IPv6 link-local address: a machine's
-name leads to its bridge address, not to a `fe80::` one. `nspawn network ls` shows the
-addresses and ports; `nspawn network up` creates the bridge without starting anything.
+name leads to its bridge address, not to a `fe80::` one. `nspawn network inspect bridge`
+shows the addresses and ports; `nspawn network up` creates the bridges without starting
+anything.
+
+More networks are made like docker's user-defined ones: `nspawn network create backend`
+gives a bridge of its own (`nsbr-backend`) with the next free /24 of `network_pool`
+(`10.99.0.0/16` unless set in `nspawn.toml`, never one the host already routes) or the
+one given with `--subnet`, and `--network backend` on `start`, `run` or `create` puts a
+machine on it. Machines of one network reach each other by name, and nothing of another
+network, the default one included, reaches them; a port they publish is reachable from
+every network through the host, as from the LAN. `--internal` makes a network with no
+way out: its machines reach each other and the host, publish nothing and are reached by
+nothing else. A machine joins one network. `network ls` lists them, `network rm` and
+`network prune` remove the ones no machine names, bridge and rules included.
 
 App images have nothing inside to configure `host0`, so for them nspawn builds the
 network namespace before the process starts (`ip netns`, a veth pair on the bridge, the

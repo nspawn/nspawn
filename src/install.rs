@@ -126,6 +126,7 @@ pub async fn install(
         mode,
         run,
         network,
+        network_name: None,
         address: None,
         ports: Vec::new(),
         entrypoint: None,

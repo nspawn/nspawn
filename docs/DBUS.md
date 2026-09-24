@@ -96,7 +96,7 @@ Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 | Method | Like | Notes |
 |---|---|---|
 | `ListImages() -> aa{sv}` | `images ls` | name, kind, backend, origin, reference, size, read_only |
-| `GetImage(s name) -> a{sv}` | | everything recorded: name, reference, digest, backend, origin, mode, created, network, address, ports, volumes, env, entrypoint, cmd, command, image_env, working_dir, user, stop_signal, labels (a{ss}: the image's with the machine's on top), image_labels, restart, memory (bytes), cpus (d), pids_limit |
+| `GetImage(s name) -> a{sv}` | | everything recorded: name, reference, digest, backend, origin, mode, created, network (bridge, veth, host or a user-defined network's name), address, ports, volumes, env, entrypoint, cmd, command, image_env, working_dir, user, stop_signal, labels (a{ss}: the image's with the machine's on top), image_labels, restart, memory (bytes), cpus (d), pids_limit |
 | `PullImage(s reference, a{sv} options) -> o` | `pull` | options name, backend, mode, force, registry, ca_cert; a job |
 | `CreateMachine(s source, s name, a{sv} options) -> o` | `create` | options backend, network, publish, force, entrypoint, env, volume, label, restart, memory (t, bytes), cpus (d), pids_limit (t), command, registry, ca_cert; a job |
 | `PushImage(s image, a{sv} options) -> o` | `push` | options to, registry, ca_cert; a job |
@@ -113,7 +113,7 @@ Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 |---|---|---|
 | `ListMachines(b all) -> aa{sv}` | `ps`, `ps -a` | name, state, started (unix seconds), leader, os, machine_path, plus the image's record; state is machined's (opening, running, closing), or for a machine machined does not list restarting (listed without `all` too), starting, closing or stopped; containers only: the virtual machines machined also registers are left out, and naming one to `GetMachine`, `StopMachine`, `Exec`, `Shell`, `Logs`, `CopyFrom` or `CopyTo` fails with an error that says so |
 | `GetMachine(s name) -> a{sv}` | `inspect` | one machine as `ListMachines` has it, whether it runs or not (its state is then restarting, starting, closing or stopped, as there); fails for a name that is neither running nor an image of nspawn |
-| `StartMachine(s name, a{sv} options) -> (s, as)` | `start` | options wait (default true), network, publish, entrypoint, env, volume, label, restart, memory (t, bytes, 0 removes the limit), cpus (d), pids_limit (t), image_command, command; "started", "ended" (the program returned before the machine registered) or "restarting" (it ended and its restart policy brings it back), and the notes made on the way |
+| `StartMachine(s name, a{sv} options) -> (s, as)` | `start` | options wait (default true), network (bridge, veth, host or a network made with CreateNetwork), publish, entrypoint, env, volume, label, restart, memory (t, bytes, 0 removes the limit), cpus (d), pids_limit (t), image_command, command; "started", "ended" (the program returned before the machine registered) or "restarting" (it ended and its restart policy brings it back), and the notes made on the way |
 | `StopMachine(s name, a{sv} options) -> (s, as)` | `stop` | options force, wait (default true), timeout (seconds, default 10, a day at most); "stopped" or "was-not-running", and the notes (a program that had to be killed) |
 | `MachineStats(as names) -> aa{sv}` | `stats` | one sample of each named machine that runs (every running container when none is named; names that do not run are left out): name, time_usec (CLOCK_MONOTONIC), cpu_usec, memory (memory.current without inactive_file, as docker), memory_limit (the host's memory without a limit), pids, io_read, io_write, net_rx, net_tx; a counter that cannot be read is left out, the network ones on the host's network; rates come from two samples |
 | `UpdateMachine(s name, a{sv} options) -> b` | `update` | options restart, memory, cpus, pids_limit as for StartMachine (0 removes a limit, absent keeps it); a running machine gets the limits at once; true when it was running |
@@ -142,8 +142,13 @@ machine to be gone, which can take longer than a client's default timeout
 
 | Method | Like |
 |---|---|
-| `ListNetwork() -> (a{sv}, aa{sv})` | `network ls`: the bridge (bridge, subnet, gateway, host_name) and the machines on it (name, address, ports, running) |
-| `NetworkUp() -> a{sv}` | `network up`: the bridge as above, plus `notes` |
+| `ListNetworks() -> aa{sv}` | `network ls`: every network, the default one ("bridge") first: name, interface, subnet, gateway, internal, created, machines (as) |
+| `GetNetwork(s name) -> (a{sv}, aa{sv})` | `network inspect`: the network as above without machines, and its machines (name, address, ports, running) |
+| `CreateNetwork(s name, a{sv} options) -> a{sv}` | `network create`: options subnet (CIDR; the next free /24 of network_pool otherwise), internal (b); the network as ListNetworks has it, plus `notes` |
+| `RemoveNetworks(as names) -> o` | `network rm`: a job (kind network-rm); a network in use, unknown or the default one is refused without stopping the others; result `removed` (as) |
+| `PruneNetworks() -> o` | `network prune`: a job (kind network-prune) removing every user-defined network no machine names; result `removed` (as) |
+| `ListNetwork() -> (a{sv}, aa{sv})` | 1.1's `network ls`, kept for its clients: the default bridge (bridge, subnet, gateway, host_name) and the machines on it (name, address, ports, running) |
+| `NetworkUp() -> a{sv}` | `network up`: every network's bridge comes up; the default one as ListNetwork has it, `networks` (as, every network) and `notes` |
 | `Login(s registry, s user, s password, a{sv} options) -> a{sv}` | `login`; "" for the hub; options registry (the hub "" stands for), ca_cert |
 | `Logout(s registry) -> b` | `logout` |
 

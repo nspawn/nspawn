@@ -78,42 +78,106 @@ pub async fn run(cli: Cli) -> Result<()> {
                     client::string(&info, "gateway"),
                     client::string(&info, "subnet")
                 );
+                let others: Vec<String> = client::strings(&info, "networks")
+                    .into_iter()
+                    .filter(|n| n != crate::bridge::DEFAULT_NETWORK)
+                    .collect();
+                if !others.is_empty() {
+                    println!("and {} are up", others.join(", "));
+                }
                 Ok(())
             }
             NetworkCommand::Ls(output) => {
                 let client = Client::connect().await?;
-                let (info, entries) = client.manager.list_network().await.map_err(client::error)?;
+                let networks = client
+                    .manager
+                    .list_networks()
+                    .await
+                    .map_err(client::error)?;
                 if output.json {
-                    client::print_json(&serde_json::json!({
-                        "bridge": client::dict_to_json(&info),
-                        "machines": entries.iter().map(client::dict_to_json).collect::<Vec<_>>(),
-                    }));
+                    client::print_json(&serde_json::Value::Array(
+                        networks.iter().map(client::dict_to_json).collect(),
+                    ));
                     return Ok(());
                 }
-                println!(
-                    "{} {} (gateway {}, host name {})",
-                    client::string(&info, "bridge"),
-                    client::string(&info, "subnet"),
-                    client::string(&info, "gateway"),
-                    client::string(&info, "host_name")
-                );
-                let rows = entries
+                let rows = networks
                     .iter()
-                    .map(|e| {
+                    .map(|n| {
                         vec![
-                            client::string(e, "name"),
-                            client::dash(client::string(e, "address")),
-                            client::dash(client::strings(e, "ports").join(" ")),
-                            if client::bool(e, "running") {
-                                "running"
+                            client::string(n, "name"),
+                            client::string(n, "interface"),
+                            client::string(n, "subnet"),
+                            if client::bool(n, "internal") {
+                                "yes"
                             } else {
-                                "stopped"
+                                "no"
                             }
                             .to_string(),
+                            client::dash(client::strings(n, "machines").join(" ")),
                         ]
                     })
                     .collect();
-                println!("{}", table(&["MACHINE", "ADDRESS", "PORTS", "STATE"], rows));
+                println!(
+                    "{}",
+                    table(
+                        &["NETWORK", "INTERFACE", "SUBNET", "INTERNAL", "MACHINES"],
+                        rows
+                    )
+                );
+                Ok(())
+            }
+            NetworkCommand::Inspect { names } => {
+                let client = Client::connect().await?;
+                let mut out = Vec::new();
+                for name in &names {
+                    let (info, entries) = client
+                        .manager
+                        .get_network(name)
+                        .await
+                        .map_err(client::error)?;
+                    let mut network = client::dict_to_json(&info);
+                    network["machines"] = serde_json::Value::Array(
+                        entries.iter().map(client::dict_to_json).collect(),
+                    );
+                    out.push(network);
+                }
+                client::print_json(&serde_json::Value::Array(out));
+                Ok(())
+            }
+            NetworkCommand::Create(a) => {
+                let client = Client::connect().await?;
+                let mut options = Options::new();
+                put_opt(&mut options, "subnet", a.subnet);
+                put(&mut options, "internal", a.internal);
+                let info = client
+                    .manager
+                    .create_network(&a.name, options)
+                    .await
+                    .map_err(client::error)?;
+                for note in client::strings(&info, "notes") {
+                    eprintln!("{note}");
+                }
+                println!(
+                    "{} is up: {} on {}",
+                    client::string(&info, "name"),
+                    client::string(&info, "interface"),
+                    client::string(&info, "subnet")
+                );
+                Ok(())
+            }
+            NetworkCommand::Rm { names } => {
+                let client = Client::connect().await?;
+                client
+                    .run_job(|| client.manager.remove_networks(&names))
+                    .await?;
+                Ok(())
+            }
+            NetworkCommand::Prune { force } => {
+                if !force && !ask("Remove every network no machine uses?", "network prune -f")? {
+                    return Ok(());
+                }
+                let client = Client::connect().await?;
+                client.run_job(|| client.manager.prune_networks()).await?;
                 Ok(())
             }
         },
@@ -316,9 +380,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         Command::Create(a) => {
             let mut options = client::registry_options(config);
             backend(&mut options, a.backend);
-            if let Some(network) = a.network {
-                put(&mut options, "network", lowercase(network));
-            }
+            put_opt(&mut options, "network", a.network);
             put_all(&mut options, "publish", a.publish);
             put(&mut options, "force", a.force);
             put_opt(&mut options, "entrypoint", a.entrypoint);
@@ -457,21 +519,8 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 Ok(())
             }
             VolumeCommand::Prune { force } => {
-                // Like docker: the answer is read from standard input whatever it is, and
-                // anything but a yes keeps the volumes, the end of a script's input too.
-                if !force {
-                    eprint!("Remove every volume no machine uses? [y/N] ");
-                    let mut answer = String::new();
-                    std::io::stdin()
-                        .read_line(&mut answer)
-                        .context("reading the answer")?;
-                    if !confirmed(&answer) {
-                        use std::io::IsTerminal;
-                        if !std::io::stdin().is_terminal() {
-                            eprintln!("\nnothing removed; volume prune -f removes without asking");
-                        }
-                        return Ok(());
-                    }
+                if !force && !ask("Remove every volume no machine uses?", "volume prune -f")? {
+                    return Ok(());
                 }
                 client.run_job(|| manager.prune_volumes()).await?;
                 Ok(())
@@ -516,6 +565,24 @@ fn shorten(text: &str, max: usize) -> String {
 }
 
 /// Whether the answer to a [y/N] question is a yes.
+/// Like docker: the answer is read from standard input whatever it is, and anything but
+/// a yes is a no, the end of a script's input too.
+fn ask(question: &str, without_asking: &str) -> Result<bool> {
+    eprint!("{question} [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("reading the answer")?;
+    if confirmed(&answer) {
+        return Ok(true);
+    }
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        eprintln!("\nnothing removed; {without_asking} removes without asking");
+    }
+    Ok(false)
+}
+
 fn confirmed(answer: &str) -> bool {
     matches!(answer.trim(), "y" | "Y" | "yes" | "Yes" | "YES")
 }

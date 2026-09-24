@@ -11,7 +11,6 @@ use crate::hub::short_digest;
 use crate::install::{ensure_replaceable, install, remove_existing, Install};
 use crate::oci::Mode;
 use crate::reference::validate_machine_name;
-use crate::settings::Network;
 use crate::store::validate_digest;
 use crate::volume;
 
@@ -24,7 +23,8 @@ pub struct CreateRequest {
     /// Auto: like the source.
     pub backend: BackendChoice,
     /// None: like the source.
-    pub network: Option<Network>,
+    /// bridge, veth, host or the name of a network made with `network create`.
+    pub network: Option<String>,
     /// HOST:CONTAINER[/udp], like start -p.
     pub publish: Vec<String>,
     pub force: bool,
@@ -161,11 +161,19 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         report,
     )
     .await?;
-    // The network kind is inherited; ports are not, two machines cannot publish the same.
+    // The network is inherited; ports are not, two machines cannot publish the same.
     let mut record = store
         .load_image(&request.name)?
         .context("the record of the new machine is missing")?;
-    record.network = request.network.unwrap_or(source.network);
+    match &request.network {
+        Some(network) => {
+            (record.network, record.network_name) = crate::api::network::choice(network)?;
+        }
+        None => {
+            record.network = source.network;
+            record.network_name = source.network_name.clone();
+        }
+    }
     record.ports = ports;
     if let Some(entrypoint) = &request.entrypoint {
         record.entrypoint = Some(if entrypoint.is_empty() {

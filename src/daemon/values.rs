@@ -7,9 +7,10 @@ use zbus::zvariant::{OwnedValue, Value};
 
 use crate::api::images::ImageSummary;
 use crate::api::machines::MachineSummary;
-use crate::api::network::{BridgeInfo, NetworkEntry};
+use crate::api::network::{BridgeInfo, NetworkEntry, NetworkSummary};
 use crate::api::stats::Sample;
 use crate::api::volumes::VolumeInfo;
+use crate::bridge::NetSpec;
 use crate::daemon::jobs::Dict;
 use crate::search::Hit;
 use crate::store::ImageRecord;
@@ -67,9 +68,12 @@ pub fn record(r: &ImageRecord) -> Dict {
         ("origin".to_string(), v(r.origin.as_str())),
         ("mode".to_string(), v(r.mode.name())),
         ("created".to_string(), v(r.created)),
+        // As --network spells it: bridge, veth, host or the network's name.
         (
             "network".to_string(),
-            v(format!("{:?}", r.network).to_lowercase()),
+            v(r.network_name
+                .clone()
+                .unwrap_or_else(|| format!("{:?}", r.network).to_lowercase())),
         ),
         (
             "address".to_string(),
@@ -186,6 +190,26 @@ pub fn bridge(b: &BridgeInfo) -> Dict {
         ("gateway".to_string(), v(b.gateway.to_string())),
         ("host_name".to_string(), v(b.host_name.as_str())),
     ])
+}
+
+/// A network: name, interface, subnet, gateway, internal, created (unix seconds, 0 for
+/// the default one).
+pub fn network(n: &NetSpec) -> Dict {
+    HashMap::from([
+        ("name".to_string(), v(n.name.as_str())),
+        ("interface".to_string(), v(n.interface.as_str())),
+        ("subnet".to_string(), v(n.subnet.to_string())),
+        ("gateway".to_string(), v(n.subnet.gateway().to_string())),
+        ("internal".to_string(), v(n.internal)),
+        ("created".to_string(), v(n.created)),
+    ])
+}
+
+/// A network with the machines it has, as `network ls` lists it.
+pub fn network_summary(s: &NetworkSummary) -> Dict {
+    let mut dict = network(&s.spec);
+    dict.insert("machines".to_string(), strings(&s.machines));
+    dict
 }
 
 pub fn network_entry(e: &NetworkEntry) -> Dict {

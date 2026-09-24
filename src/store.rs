@@ -15,7 +15,7 @@ use nix::sys::stat::{mknod, Mode as FileMode, SFlag};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::BackendChoice;
-use crate::bridge::PortMap;
+use crate::bridge::{NetSpec, PortMap};
 use crate::oci::{Mode, RunSpec};
 use crate::settings::Network;
 use crate::volume::Volume;
@@ -39,6 +39,11 @@ pub struct ImageRecord {
     pub run: RunSpec,
     #[serde(default = "default_network")]
     pub network: Network,
+    /// With the bridge kind: a network made with `network create` rather than the
+    /// default one. Kept apart from `network` so that an older nspawn still reads the
+    /// record (as a machine of the default network).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_name: Option<String>,
     /// Fixed address on the nspawn bridge, once assigned.
     #[serde(default)]
     pub address: Option<Ipv4Addr>,
@@ -230,7 +235,7 @@ impl Store {
     /// hold, setuid programs and device nodes among them, which would work for any local
     /// user who reached them; the records hold the machines' environment; volumes and
     /// builds hold the machines' data and trees.
-    fn private_dirs(&self) -> [PathBuf; 9] {
+    fn private_dirs(&self) -> [PathBuf; 10] {
         [
             self.layers_dir(Ownership::Root),
             self.layers_dir(Ownership::Foreign),
@@ -241,6 +246,7 @@ impl Store {
             self.root.join("builds"),
             self.root.join("cache"),
             self.root.join("starting"),
+            self.networks_dir(),
         ]
     }
 
@@ -283,6 +289,71 @@ impl Store {
     /// Named volumes (-v name:/path), one directory each.
     pub fn volumes_dir(&self) -> PathBuf {
         self.root.join("volumes")
+    }
+    /// User-defined networks, one NAME.json each.
+    pub fn networks_dir(&self) -> PathBuf {
+        self.root.join("networks")
+    }
+
+    pub fn record_network(&self, net: &NetSpec) -> Result<()> {
+        crate::reference::validate_entry_name(&net.name)?;
+        let dir = self.networks_dir();
+        create_dir_with_mode(&dir, PRIVATE)?;
+        let text = serde_json::to_string_pretty(net)?;
+        write_atomically(&dir.join(format!("{}.json", net.name)), text.as_bytes())
+    }
+
+    pub fn load_network(&self, name: &str) -> Result<Option<NetSpec>> {
+        if crate::reference::validate_entry_name(name).is_err() {
+            return Ok(None);
+        }
+        let path = self.networks_dir().join(format!("{name}.json"));
+        match fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(
+                serde_json::from_str(&text)
+                    .with_context(|| format!("parsing {}", path.display()))?,
+            )),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// Every user-defined network, sorted by name; one that cannot be read is an error,
+    /// since its subnet and its rules would be missed.
+    pub fn list_networks(&self) -> Result<Vec<NetSpec>> {
+        let dir = self.networks_dir();
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let path = entry
+                .with_context(|| format!("reading {}", dir.display()))?
+                .path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let text =
+                fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            out.push(
+                serde_json::from_str::<NetSpec>(&text)
+                    .with_context(|| format!("parsing {}", path.display()))?,
+            );
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    pub fn remove_network(&self, name: &str) -> Result<()> {
+        crate::reference::validate_entry_name(name)?;
+        let path = self.networks_dir().join(format!("{name}.json"));
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        }
     }
     /// Files nspawn generates for one machine (network configuration, hosts).
     pub fn machine_files_dir(&self, name: &str) -> PathBuf {
@@ -1467,6 +1538,7 @@ mod tests {
             mode: Mode::Boot,
             run: RunSpec::default(),
             network: Network::Veth,
+            network_name: None,
             address: None,
             ports: Vec::new(),
             entrypoint: None,
@@ -1514,6 +1586,7 @@ mod tests {
             mode: Mode::App,
             run: RunSpec::default(),
             network: Network::Host,
+            network_name: None,
             address: None,
             ports: Vec::new(),
             entrypoint: None,
@@ -1712,6 +1785,7 @@ mod tests {
             mode: Mode::Boot,
             run: RunSpec::default(),
             network: Network::Bridge,
+            network_name: None,
             address: None,
             ports: Vec::new(),
             entrypoint: None,

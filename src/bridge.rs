@@ -1,13 +1,15 @@
-//! The nspawn bridge: a docker0 style network for the machines, run by nspawn itself so
-//! that it behaves the same whatever manages the host's network (systemd-networkd,
-//! NetworkManager or nothing at all).
+//! The nspawn bridges: docker0 style networks for the machines, run by nspawn itself so
+//! that they behave the same whatever manages the host's network (systemd-networkd,
+//! NetworkManager or nothing at all). The default one comes from nspawn.toml; more are
+//! made with `network create`, like docker's user-defined networks.
 //!
-//! The bridge carries the first address of the subnet. Every machine gets a fixed address
-//! from the same subnet, handed to the systemd-networkd inside it through a .network file
-//! mounted at /run/systemd/network/10-host0.network, plus a generated /etc/hosts with the
-//! names of all the machines on the bridge. Outgoing traffic is masqueraded and published
-//! ports are DNAT'ed in the nftables table `ip nspawn`; loopback access to published ports
-//! works through route_localnet, as docker does without its userland proxy.
+//! A bridge carries the first address of its subnet. Every machine gets a fixed address
+//! from its network's subnet, handed to the systemd-networkd inside it through a .network
+//! file mounted at /run/systemd/network/10-host0.network, plus a generated /etc/hosts with
+//! the names of the other machines on the same network. Outgoing traffic is masqueraded
+//! and published ports are DNAT'ed in the nftables table `ip nspawn`, which also keeps
+//! the networks apart; loopback access to published ports works through route_localnet,
+//! as docker does without its userland proxy.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -78,6 +80,26 @@ impl Subnet {
     }
 }
 
+impl Subnet {
+    /// Whether the two share any address.
+    pub fn overlaps(&self, other: &Subnet) -> bool {
+        self.contains(other.network) || other.contains(self.network)
+    }
+}
+
+impl Serialize for Subnet {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Subnet {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 impl FromStr for Subnet {
     type Err = anyhow::Error;
 
@@ -106,6 +128,132 @@ impl fmt::Display for Subnet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.network, self.prefix)
     }
+}
+
+/// The default network's name, as `--network` and `network ls` spell it.
+pub const DEFAULT_NETWORK: &str = "bridge";
+
+/// Names `--network` gives a meaning of its own, which no network may take.
+pub const RESERVED_NETWORKS: [&str; 5] = [DEFAULT_NETWORK, "veth", "host", "none", "default"];
+
+/// A bridge network: the default one of nspawn.toml or one made with `network create`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetSpec {
+    pub name: String,
+    /// The bridge interface.
+    pub interface: String,
+    pub subnet: Subnet,
+    /// Its machines reach each other and the host, nothing beyond it, and nothing
+    /// reaches them through it but the host.
+    #[serde(default)]
+    pub internal: bool,
+    /// Unix seconds; 0 for the default network.
+    #[serde(default)]
+    pub created: u64,
+}
+
+/// The interface of a user-defined network: nsbr-NAME, hashed when the name is too long
+/// for an interface name (15 characters).
+pub fn network_interface(name: &str) -> String {
+    let plain = format!("nsbr-{name}");
+    if plain.len() <= 15 {
+        plain
+    } else {
+        format!("nsbr-{}", short_hash(name))
+    }
+}
+
+/// FNV-1a of a name, as eight hex digits.
+fn short_hash(name: &str) -> String {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in name.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{hash:08x}")
+}
+
+/// The first /24 of `pool` that overlaps nothing in `taken` (other networks, the host's
+/// own addresses and routes).
+pub fn free_subnet(pool: Subnet, taken: &[Subnet]) -> Result<Subnet> {
+    let prefix = pool.prefix.max(24);
+    let size = 1u64 << (32 - prefix);
+    let first = u64::from(u32::from(pool.network));
+    let end = first + (1u64 << (32 - pool.prefix));
+    let mut at = first;
+    while at < end {
+        let candidate = Subnet {
+            network: Ipv4Addr::from(at as u32),
+            prefix,
+        };
+        if !taken.iter().any(|t| t.overlaps(&candidate)) {
+            return Ok(candidate);
+        }
+        at += size;
+    }
+    bail!("no free /{prefix} left in {pool}; give one with --subnet or widen network_pool in nspawn.toml")
+}
+
+/// The IPv4 networks the host already has: its addresses and its main routing table,
+/// but those of nspawn's own bridges and the default route.
+pub fn host_subnets(own: &[String]) -> Vec<Subnet> {
+    let mut out = Vec::new();
+    for args in [
+        &["-4", "-o", "addr", "show"][..],
+        &["-4", "route", "show"][..],
+    ] {
+        if let Ok(output) = Command::new("ip").args(args).output() {
+            out.extend(subnets_in(&String::from_utf8_lossy(&output.stdout), own));
+        }
+    }
+    out
+}
+
+/// The networks in `ip -4 -o addr show` or `ip -4 route show` output, leaving out lines
+/// about the interfaces in `own`.
+fn subnets_in(text: &str, own: &[String]) -> Vec<Subnet> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let device = words
+            .iter()
+            .position(|w| *w == "dev")
+            .and_then(|i| words.get(i + 1).copied())
+            // addr show: "2: eth0    inet 192.168.1.5/24 ..."
+            .or_else(|| words.get(1).map(|w| w.trim_end_matches(':')));
+        if device.is_some_and(|d| own.iter().any(|o| o == d)) {
+            continue;
+        }
+        let candidate = match words.iter().position(|w| *w == "inet") {
+            Some(i) => words.get(i + 1).copied(),
+            None => words.first().copied(),
+        };
+        let Some(candidate) = candidate.filter(|c| *c != "default") else {
+            continue;
+        };
+        let text = if candidate.contains('/') {
+            candidate.to_string()
+        } else {
+            format!("{candidate}/32")
+        };
+        // Prefixes the bridge refuses (below 8 or above 30) still take their room.
+        if let Some((addr, prefix)) = text.split_once('/') {
+            if let (Ok(addr), Ok(prefix)) = (addr.parse::<Ipv4Addr>(), prefix.parse::<u8>()) {
+                if (1..=32).contains(&prefix) {
+                    let mask = if prefix == 32 {
+                        u32::MAX
+                    } else {
+                        u32::MAX << (32 - prefix)
+                    };
+                    out.push(Subnet {
+                        network: Ipv4Addr::from(u32::from(addr) & mask),
+                        prefix,
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -197,11 +345,12 @@ pub fn parse_publish(values: &[String]) -> Result<Vec<PortMap>> {
     Ok(out)
 }
 
-/// Creates the bridge with its address, forwarding, the NAT table and the firewalld
+/// Creates a network's bridge with its address, forwarding, the NAT table (written for
+/// `all` the networks, so that no other network loses its rules) and the firewalld
 /// exception. Safe to repeat: everything is idempotent.
-pub async fn up(config: &Config, sd: &Systemd, report: Report<'_>) -> Result<()> {
-    let name = config.bridge.as_str();
-    let subnet = config.subnet;
+pub async fn up(net: &NetSpec, all: &[NetSpec], sd: &Systemd, report: Report<'_>) -> Result<()> {
+    let name = net.interface.as_str();
+    let subnet = net.subnet;
     let address = format!("{}/{}", subnet.gateway(), subnet.prefix);
     let sys = Path::new("/sys/class/net").join(name);
     if !sys.exists() {
@@ -216,8 +365,17 @@ pub async fn up(config: &Config, sd: &Systemd, report: Report<'_>) -> Result<()>
         let addresses = ipv4_addresses(name)?;
         if !adoptable(is_bridge, alias.trim(), &addresses, &address) {
             bail!(
-                "{name} exists and is not a bridge nspawn created (addresses: {}); pick another name with `bridge` in nspawn.toml",
-                if addresses.is_empty() { "none".to_string() } else { addresses.join(", ") }
+                "{name} exists and is not a bridge nspawn created (addresses: {}); {}",
+                if addresses.is_empty() {
+                    "none".to_string()
+                } else {
+                    addresses.join(", ")
+                },
+                if net.name == DEFAULT_NETWORK {
+                    "pick another name with `bridge` in nspawn.toml"
+                } else {
+                    "remove it or name the network otherwise"
+                }
             );
         }
         if alias.trim() != MANAGED_ALIAS {
@@ -233,10 +391,42 @@ pub async fn up(config: &Config, sd: &Systemd, report: Report<'_>) -> Result<()>
     run("ip", &["link", "set", name, "up"])?;
     sysctl("net/ipv4/ip_forward", "1")?;
     sysctl(&format!("net/ipv4/conf/{name}/route_localnet"), "1")?;
-    nft(&base_ruleset(name, subnet))?;
-    allow_forwarding_past_iptables(name, report)?;
+    nft(&base_ruleset(all))?;
+    // An internal network forwards nothing, so nothing needs to get past a firewall.
+    if !net.internal {
+        allow_forwarding_past_iptables(name, report)?;
+    }
     if hostnet::firewalld_running(sd).await {
         hostnet::trust_interface(sd, name, report).await?;
+    }
+    Ok(())
+}
+
+/// Undoes `up` for a network being removed: its bridge, its rules in the table (written
+/// again for the `remaining` networks), its iptables exceptions and firewalld binding.
+pub async fn down(net: &NetSpec, remaining: &[NetSpec], sd: &Systemd) -> Result<()> {
+    let name = net.interface.as_str();
+    let sys = Path::new("/sys/class/net").join(name);
+    if sys.exists() {
+        let alias = fs::read_to_string(sys.join("ifalias")).unwrap_or_default();
+        if alias.trim() == MANAGED_ALIAS {
+            run("ip", &["link", "del", name])?;
+        }
+    }
+    if table_exists() {
+        nft(&base_ruleset(remaining))?;
+    }
+    for chain in ["DOCKER-USER", "FORWARD"] {
+        for rule in forwarding_rules(name) {
+            let check = [&["-C", chain][..], &rule[..]].concat();
+            while iptables(&check) {
+                run("iptables", &[&["-w", "-D", chain][..], &rule[..]].concat())
+                    .with_context(|| format!("removing the exception for {name} from {chain}"))?;
+            }
+        }
+    }
+    if hostnet::firewalld_running(sd).await {
+        hostnet::release(sd, &[name.to_string()]).await;
     }
     Ok(())
 }
@@ -269,9 +459,20 @@ fn allow_forwarding_past_iptables(bridge: &str, report: Report<'_>) -> Result<()
         }
         return Ok(());
     };
-    // Out of the bridge: anything. Into the bridge: only what was published (DNAT) or
-    // belongs to a connection a machine opened, like docker does.
-    let rules: [Vec<&str>; 2] = [
+    for rule in &forwarding_rules(bridge) {
+        if !iptables(&[&["-C", chain][..], &rule[..]].concat()) {
+            run("iptables", &[&["-w", "-I", chain][..], &rule[..]].concat()).with_context(
+                || format!("letting the bridge's traffic through the {chain} chain"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Out of the bridge: anything. Into the bridge: only what was published (DNAT) or
+/// belongs to a connection a machine opened, like docker does.
+fn forwarding_rules(bridge: &str) -> [Vec<&str>; 2] {
+    [
         vec!["-i", bridge, "-j", "ACCEPT"],
         vec![
             "-o",
@@ -283,15 +484,7 @@ fn allow_forwarding_past_iptables(bridge: &str, report: Report<'_>) -> Result<()
             "-j",
             "ACCEPT",
         ],
-    ];
-    for rule in &rules {
-        if !iptables(&[&["-C", chain][..], &rule[..]].concat()) {
-            run("iptables", &[&["-w", "-I", chain][..], &rule[..]].concat()).with_context(
-                || format!("letting the bridge's traffic through the {chain} chain"),
-            )?;
-        }
-    }
-    Ok(())
+    ]
 }
 
 /// What drops forwarded traffic on this host, as nftables sees it: nft reads the rules
@@ -346,13 +539,17 @@ fn forward_policy_is_drop() -> bool {
 /// Priorities are numeric on purpose: the symbolic names (dstnat, srcnat, filter) are not
 /// accepted in every hook by older nft (1.0.6 on Debian 12 rejects dstnat in output).
 ///
-/// The nftables table: DNAT of published ports (from outside and from the host itself,
-/// loopback included), masquerading of what leaves the bridge, hairpin masquerading when
-/// a machine reaches a published port through the host's address (otherwise the reply
-/// would bypass the NAT), and a guard so that route_localnet does not let a machine at
-/// the host's loopback-only services.
-pub fn base_ruleset(bridge: &str, subnet: Subnet) -> String {
-    format!(
+/// The nftables table, for every network at once: DNAT of published ports (from outside
+/// and from the host itself, loopback included), masquerading of what leaves a bridge
+/// (not for an internal network), hairpin masquerading when a machine reaches a
+/// published port through the host's address (otherwise the reply would bypass the
+/// NAT), a guard so that route_localnet does not let a machine at the host's
+/// loopback-only services, and the forward chain that keeps the networks apart: nothing
+/// crosses from one bridge to another but connections to published ports, which every
+/// network reaches as the LAN does, and an internal network forwards nothing at all. A
+/// drop here is final whatever other tables accept.
+pub fn base_ruleset(all: &[NetSpec]) -> String {
+    let mut text = format!(
         "table ip {TABLE} {{
 	map ports {{
 		type inet_proto . inet_service : ipv4_addr . inet_service
@@ -369,20 +566,60 @@ pub fn base_ruleset(bridge: &str, subnet: Subnet) -> String {
 	chain input {{
 		type filter hook input priority 0; policy accept;
 	}}
+	chain forward {{
+		type filter hook forward priority 0; policy accept;
+	}}
 }}
 flush chain ip {TABLE} prerouting
 flush chain ip {TABLE} output
 flush chain ip {TABLE} postrouting
 flush chain ip {TABLE} input
+flush chain ip {TABLE} forward
 add rule ip {TABLE} prerouting fib daddr type local dnat ip to meta l4proto . th dport map @ports
 add rule ip {TABLE} output fib daddr type local dnat ip to meta l4proto . th dport map @ports
-add rule ip {TABLE} postrouting ip saddr {subnet} oifname != \"{bridge}\" masquerade
-add rule ip {TABLE} postrouting ip saddr {subnet} oifname \"{bridge}\" ct status dnat masquerade
+"
+    );
+    for net in all {
+        let (bridge, subnet) = (&net.interface, net.subnet);
+        if !net.internal {
+            text.push_str(&format!(
+                "add rule ip {TABLE} postrouting ip saddr {subnet} oifname != \"{bridge}\" masquerade\n"
+            ));
+        }
+        text.push_str(&format!(
+            "add rule ip {TABLE} postrouting ip saddr {subnet} oifname \"{bridge}\" ct status dnat masquerade
 add rule ip {TABLE} postrouting ip saddr 127.0.0.0/8 oifname \"{bridge}\" masquerade
 add rule ip {TABLE} input iifname \"{bridge}\" ct status & dnat == 0 ip saddr 127.0.0.0/8 drop
 add rule ip {TABLE} input iifname \"{bridge}\" ct status & dnat == 0 ip daddr 127.0.0.0/8 drop
 "
-    )
+        ));
+    }
+    for net in all.iter().filter(|n| n.internal) {
+        let bridge = &net.interface;
+        text.push_str(&format!(
+            "add rule ip {TABLE} forward iifname \"{bridge}\" oifname != \"{bridge}\" drop
+add rule ip {TABLE} forward oifname \"{bridge}\" iifname != \"{bridge}\" drop
+"
+        ));
+    }
+    text.push_str(&format!(
+        "add rule ip {TABLE} forward ct status dnat accept\n"
+    ));
+    for net in all {
+        let others: Vec<String> = all
+            .iter()
+            .filter(|o| o.interface != net.interface)
+            .map(|o| format!("\"{}\"", o.interface))
+            .collect();
+        if !others.is_empty() {
+            text.push_str(&format!(
+                "add rule ip {TABLE} forward iifname \"{}\" oifname {{ {} }} drop\n",
+                net.interface,
+                others.join(", ")
+            ));
+        }
+    }
+    text
 }
 
 /// The mark nspawn leaves on the bridge it creates (its ifalias).
@@ -509,19 +746,14 @@ pub fn host_end_name(name: &str) -> String {
     if plain.len() <= 15 {
         return plain;
     }
-    let mut hash: u32 = 0x811c_9dc5;
-    for byte in name.bytes() {
-        hash ^= u32::from(byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    format!("vb-{hash:08x}")
+    format!("vb-{}", short_hash(name))
 }
 
 /// Builds the network namespace of an app machine before it starts, so that its process
 /// finds host0 configured from its first instruction: a veth pair with the host end on
-/// the bridge, the machine's address, the bridge as default route. The pair disappears
-/// with the namespace.
-pub fn create_netns(config: &Config, name: &str, addr: Ipv4Addr) -> Result<()> {
+/// its network's bridge, the machine's address, the bridge as default route. The pair
+/// disappears with the namespace.
+pub fn create_netns(net: &NetSpec, name: &str, addr: Ipv4Addr) -> Result<()> {
     let ns = netns_name(name);
     delete_netns(name);
     let host_end = host_end_name(name);
@@ -536,10 +768,10 @@ pub fn create_netns(config: &Config, name: &str, addr: Ipv4Addr) -> Result<()> {
         )?;
         run(
             "ip",
-            &["link", "set", &host_end, "master", &config.bridge, "up"],
+            &["link", "set", &host_end, "master", &net.interface, "up"],
         )?;
         run("ip", &["-n", &ns, "link", "set", "lo", "up"])?;
-        let address = format!("{addr}/{}", config.subnet.prefix);
+        let address = format!("{addr}/{}", net.subnet.prefix);
         run("ip", &["-n", &ns, "addr", "add", &address, "dev", "host0"])?;
         // IPv4 only, like the bridge: no link-local IPv6 address for machined to hand
         // out under the machine's name. A host booted without IPv6 refuses the setting
@@ -549,7 +781,7 @@ pub fn create_netns(config: &Config, name: &str, addr: Ipv4Addr) -> Result<()> {
             &["-n", &ns, "link", "set", "host0", "addrgenmode", "none"],
         );
         run("ip", &["-n", &ns, "link", "set", "host0", "up"])?;
-        let gateway = config.subnet.gateway().to_string();
+        let gateway = net.subnet.gateway().to_string();
         run(
             "ip",
             &["-n", &ns, "route", "add", "default", "via", &gateway],
@@ -565,7 +797,7 @@ pub fn create_netns(config: &Config, name: &str, addr: Ipv4Addr) -> Result<()> {
 /// pair and leaves the host end (ns-*) alone: Bridge= is not applied there and machined
 /// is even told the bridge is the machine's interface. The peer of the machine's host0
 /// is found through the machine's sysfs and put on the bridge. Idempotent.
-pub fn adopt_managed_veth(config: &Config, leader: u32) -> Result<()> {
+pub fn adopt_managed_veth(bridge: &str, leader: u32) -> Result<()> {
     let iflink = fs::read_to_string(format!("/proc/{leader}/root/sys/class/net/host0/iflink"))
         .context("reading the peer index of host0 inside the machine")?;
     let index: u32 = iflink
@@ -577,15 +809,12 @@ pub fn adopt_managed_veth(config: &Config, leader: u32) -> Result<()> {
     })?;
     if let Ok(master) = fs::read_link(format!("/sys/class/net/{name}/master")) {
         let master = master.file_name().and_then(|f| f.to_str()).unwrap_or("");
-        if master == config.bridge {
+        if master == bridge {
             return Ok(());
         }
         bail!("{name}, the host end of the machine's veth, is already on {master}");
     }
-    run(
-        "ip",
-        &["link", "set", &name, "master", &config.bridge, "up"],
-    )
+    run("ip", &["link", "set", &name, "master", bridge, "up"])
 }
 
 /// The name of the interface with `index`, from a sysfs class/net directory.
@@ -686,25 +915,29 @@ fn nameservers(resolv_conf: &str) -> Vec<IpAddr> {
         .collect()
 }
 
-/// Gives the machine its address if it has none, writes its .network file and refreshes
-/// the hosts files of every machine on the bridge. The record is saved when it changes.
+/// Gives the machine an address on its network if it has none there, writes its .network
+/// file and refreshes the hosts files of every machine on a bridge. The record is saved
+/// when it changes.
 pub fn prepare_machine(
     store: &Store,
     config: &Config,
+    net: &NetSpec,
+    all: &[NetSpec],
     record: &mut ImageRecord,
 ) -> Result<Ipv4Addr> {
-    let addr = match record.address.filter(|a| config.subnet.usable(*a)) {
+    let addr = match record.address.filter(|a| net.subnet.usable(*a)) {
         Some(addr) => addr,
         None => {
             // Every record counts, readable or not: an address handed out twice is worse
-            // than a start refused over a record that needs fixing.
+            // than a start refused over a record that needs fixing. The subnets do not
+            // overlap, so the addresses of other networks never stand in the way.
             let used: Vec<Ipv4Addr> = store
                 .list_images_strict()?
                 .iter()
                 .filter(|r| r.name != record.name)
                 .filter_map(|r| r.address)
                 .collect();
-            let addr = config.subnet.allocate(&used)?;
+            let addr = net.subnet.allocate(&used)?;
             record.address = Some(addr);
             store.record_image(record)?;
             addr
@@ -714,36 +947,54 @@ pub fn prepare_machine(
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let dns = upstream_dns(&config.dns);
     for (file, text) in [
-        ("host0.network", network_file(addr, config.subnet, &dns)),
+        ("host0.network", network_file(addr, net.subnet, &dns)),
         ("resolv.conf", resolv_conf(&dns)),
     ] {
         let path = dir.join(file);
         fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
     }
-    write_hosts_files(store, config)?;
+    write_hosts_files(store, all)?;
     Ok(addr)
 }
 
-/// Rewrites the hosts file of every machine on the bridge in place, so that running
-/// machines see the change through their bind mount.
-pub fn write_hosts_files(store: &Store, config: &Config) -> Result<()> {
-    let members: BTreeMap<String, Ipv4Addr> = store
-        .list_images_strict()?
-        .into_iter()
-        .filter(|r| r.network == Network::Bridge)
-        .filter_map(|r| r.address.map(|a| (r.name, a)))
-        .collect();
-    for (name, addr) in &members {
-        let dir = store.machine_files_dir(name);
-        if !dir.is_dir() {
-            continue; // never started on the bridge yet; its start creates the files
+/// The network a machine on a bridge is on: its record's, or the default one.
+pub fn network_of(record: &ImageRecord) -> &str {
+    record.network_name.as_deref().unwrap_or(DEFAULT_NETWORK)
+}
+
+/// Rewrites the hosts file of every machine on a bridge in place, so that running
+/// machines see the change through their bind mount. Each one lists the machines of its
+/// own network, whose gateway is the host.
+pub fn write_hosts_files(store: &Store, all: &[NetSpec]) -> Result<()> {
+    let mut networks: BTreeMap<String, BTreeMap<String, Ipv4Addr>> = BTreeMap::new();
+    for r in store.list_images_strict()? {
+        if r.network != Network::Bridge {
+            continue;
         }
-        let path = dir.join("hosts");
-        fs::write(
-            &path,
-            hosts_file(name, *addr, config.subnet.gateway(), &members),
-        )
-        .with_context(|| format!("writing {}", path.display()))?;
+        if let Some(addr) = r.address {
+            networks
+                .entry(network_of(&r).to_string())
+                .or_default()
+                .insert(r.name, addr);
+        }
+    }
+    for (network, members) in &networks {
+        // A network removed from under a stopped machine: its start will say so.
+        let Some(net) = all.iter().find(|n| &n.name == network) else {
+            continue;
+        };
+        for (name, addr) in members {
+            let dir = store.machine_files_dir(name);
+            if !dir.is_dir() {
+                continue; // never started on the bridge yet; its start creates the files
+            }
+            let path = dir.join("hosts");
+            fs::write(
+                &path,
+                hosts_file(name, *addr, net.subnet.gateway(), members),
+            )
+            .with_context(|| format!("writing {}", path.display()))?;
+        }
     }
     Ok(())
 }
@@ -980,7 +1231,7 @@ mod tests {
         assert!(hosts.ends_with("10.99.0.3 db\n"));
         assert_eq!(hosts.matches("web").count(), 1);
 
-        let rules = base_ruleset("nspawn0", subnet);
+        let rules = base_ruleset(&[net("bridge", "nspawn0", "10.99.0.0/24", false)]);
         assert!(rules.contains("ip saddr 10.99.0.0/24 oifname != \"nspawn0\" masquerade"));
         assert!(rules.contains("map @ports"));
         for symbolic in ["priority dstnat", "priority srcnat", "priority filter"] {
@@ -991,6 +1242,133 @@ mod tests {
         }
         assert!(rules.contains("hook output priority -100;"));
         assert!(rules.contains("hook postrouting priority 100;"));
+    }
+
+    fn net(name: &str, interface: &str, subnet: &str, internal: bool) -> NetSpec {
+        NetSpec {
+            name: name.into(),
+            interface: interface.into(),
+            subnet: subnet.parse().unwrap(),
+            internal,
+            created: 0,
+        }
+    }
+
+    #[test]
+    fn networks_are_kept_apart_in_one_table() {
+        let default = net("bridge", "nspawn0", "10.99.0.0/24", false);
+        let web = net("web", "nsbr-web", "10.99.1.0/24", false);
+        let db = net("db", "nsbr-db", "10.99.2.0/24", true);
+        let one = base_ruleset(std::slice::from_ref(&default));
+        assert!(one
+            .contains("chain forward {\n\t\ttype filter hook forward priority 0; policy accept;"));
+        assert!(one.contains("flush chain ip nspawn forward\n"));
+        assert!(
+            !one.contains("oifname {"),
+            "one network has nothing to be kept from"
+        );
+        let all = base_ruleset(&[default, web, db]);
+        for masquerade in [
+            "10.99.0.0/24 oifname != \"nspawn0\"",
+            "10.99.1.0/24 oifname != \"nsbr-web\"",
+        ] {
+            assert!(
+                all.contains(&format!("ip saddr {masquerade} masquerade")),
+                "{masquerade}"
+            );
+        }
+        assert!(
+            !all.contains("10.99.2.0/24 oifname != \"nsbr-db\" masquerade"),
+            "an internal network has no way out"
+        );
+        assert!(all.contains("iifname \"nsbr-db\" ct status & dnat == 0 ip daddr 127.0.0.0/8 drop"));
+        let internal = all
+            .find("forward iifname \"nsbr-db\" oifname != \"nsbr-db\" drop")
+            .unwrap();
+        assert!(all.contains("forward oifname \"nsbr-db\" iifname != \"nsbr-db\" drop"));
+        let published = all.find("forward ct status dnat accept").unwrap();
+        let apart = all
+            .find("forward iifname \"nsbr-web\" oifname { \"nspawn0\", \"nsbr-db\" } drop")
+            .unwrap();
+        assert!(
+            internal < published && published < apart,
+            "internal networks first, then published ports, then the others apart"
+        );
+        assert!(
+            all.contains("forward iifname \"nspawn0\" oifname { \"nsbr-web\", \"nsbr-db\" } drop")
+        );
+    }
+
+    #[test]
+    fn network_interfaces_fit_an_interface_name() {
+        assert_eq!(network_interface("web"), "nsbr-web");
+        assert_eq!(network_interface("0123456789"), "nsbr-0123456789");
+        let long = network_interface("a-rather-long-network");
+        assert_eq!(long.len(), 13);
+        assert!(long.starts_with("nsbr-"));
+        assert_ne!(long, network_interface("a-rather-long-networl"));
+    }
+
+    #[test]
+    fn subnets_for_new_networks() {
+        let pool: Subnet = "10.99.0.0/16".parse().unwrap();
+        let taken: Vec<Subnet> = ["10.99.0.0/24", "10.99.1.0/24", "10.99.3.0/25"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(
+            free_subnet(pool, &taken).unwrap().to_string(),
+            "10.99.2.0/24"
+        );
+        let lan: Subnet = "10.99.0.0/22".parse().unwrap();
+        assert_eq!(
+            free_subnet(pool, &[lan]).unwrap().to_string(),
+            "10.99.4.0/24"
+        );
+        let small: Subnet = "192.168.50.0/24".parse().unwrap();
+        assert_eq!(
+            free_subnet(small, &[]).unwrap().to_string(),
+            "192.168.50.0/24"
+        );
+        assert!(free_subnet(small, &[small]).is_err());
+        let a: Subnet = "10.0.0.0/8".parse().unwrap();
+        let b: Subnet = "10.99.5.0/24".parse().unwrap();
+        assert!(a.overlaps(&b) && b.overlaps(&a));
+        assert!(!b.overlaps(&"10.99.6.0/24".parse().unwrap()));
+        assert_eq!(serde_json::to_string(&b).unwrap(), "\"10.99.5.0/24\"");
+        assert_eq!(
+            serde_json::from_str::<Subnet>("\"10.99.5.0/24\"").unwrap(),
+            b
+        );
+        assert!(serde_json::from_str::<Subnet>("\"10.99.5.0\"").is_err());
+    }
+
+    #[test]
+    fn what_the_host_uses_is_read_from_ip() {
+        let addr = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever
+2: enp1s0    inet 192.168.122.33/24 brd 192.168.122.255 scope global dynamic noprefixroute enp1s0\\       valid_lft 3000sec
+5: nspawn0    inet 10.99.0.1/24 brd 10.99.0.255 scope global nspawn0\\       valid_lft forever
+";
+        let route = "default via 192.168.122.1 dev enp1s0 proto dhcp src 192.168.122.33 metric 100
+10.99.0.0/24 dev nspawn0 proto kernel scope link src 10.99.0.1
+172.16.0.0/12 via 192.168.122.5 dev enp1s0
+192.168.122.0/24 dev enp1s0 proto kernel scope link src 192.168.122.33 metric 100
+";
+        let own = vec!["nspawn0".to_string()];
+        let found: Vec<String> = subnets_in(addr, &own)
+            .into_iter()
+            .chain(subnets_in(route, &own))
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            found,
+            [
+                "127.0.0.0/8",
+                "192.168.122.0/24",
+                "172.16.0.0/12",
+                "192.168.122.0/24"
+            ]
+        );
     }
 
     #[test]
