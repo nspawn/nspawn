@@ -204,11 +204,22 @@ fn from_machine(entry: &Value) -> bool {
     entry.get("_COMM").and_then(Value::as_str) != Some("nspawn")
 }
 
-/// Copies what the machine writes into `out`, a line at a time. `finish` ends it once
-/// the output has been quiet for a moment, so that the last lines are not cut.
+/// Copies what the machine writes into `out`, a line at a time. It is started before
+/// the machine, so that journalctl, which takes its time to start on a big journal,
+/// reads along as the program writes; `finish` ends it once the output has been quiet
+/// for a moment after the end, so that the last lines are not cut.
 pub struct Follower {
     stop: tokio::sync::watch::Sender<bool>,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Follower {
+    fn drop(&mut self) {
+        // journalctl goes with the task (kill_on_drop).
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl Follower {
@@ -227,12 +238,15 @@ impl Follower {
         let (stop, mut stopping) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(entries).lines();
+            // After the end: at least half a second, for what journald still has to
+            // take from the stream, then until nothing came for 300 ms; three at most.
             let quiet = Duration::from_millis(300);
             let mut last_line = tokio::time::Instant::now();
+            let mut floor = tokio::time::Instant::now();
             let mut deadline: Option<tokio::time::Instant> = None;
             loop {
                 let wait = match deadline {
-                    Some(deadline) => (last_line + quiet).min(deadline),
+                    Some(deadline) => (last_line + quiet).max(floor).min(deadline),
                     None => tokio::time::Instant::now() + Duration::from_secs(3600),
                 };
                 tokio::select! {
@@ -251,8 +265,10 @@ impl Follower {
                     }
                     changed = stopping.changed(), if deadline.is_none() => {
                         if changed.is_err() || *stopping.borrow() {
-                            deadline = Some(tokio::time::Instant::now() + Duration::from_secs(2));
-                            last_line = tokio::time::Instant::now();
+                            let now = tokio::time::Instant::now();
+                            deadline = Some(now + Duration::from_secs(3));
+                            floor = now + Duration::from_millis(500);
+                            last_line = now;
                         }
                     }
                     _ = tokio::time::sleep_until(wait), if deadline.is_some() => break,
@@ -260,14 +276,19 @@ impl Follower {
             }
             let _ = child.kill().await;
         });
-        Ok(Follower { stop, task })
+        Ok(Follower {
+            stop,
+            task: Some(task),
+        })
     }
 
-    /// Ends the copy once the output has been quiet for a moment (two seconds at most),
-    /// and closes the pipe.
-    pub async fn finish(self) {
+    /// Ends the copy once the output has been quiet for a moment (three seconds at
+    /// most), and closes the pipe.
+    pub async fn finish(mut self) {
         let _ = self.stop.send(true);
-        let _ = self.task.await;
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
     }
 }
 
@@ -356,10 +377,14 @@ pub async fn attach(
         }
         _ => None,
     };
-    let cursor = if terminal.is_none() {
-        journal_cursor().await
+    let (output, follower) = if terminal.is_none() {
+        let cursor = journal_cursor().await;
+        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .context("creating the output's pipe")?;
+        let follower = Follower::start(&unit, cursor.as_deref(), write)?;
+        (Some(read), Some(follower))
     } else {
-        None
+        (None, None)
     };
     let mut watch = UnitWatch::new(sd, &unit).await?;
     if let Err(e) = crate::api::machines::start(ctx, &request.start, report).await {
@@ -387,14 +412,6 @@ pub async fn attach(
     }
     let main_pid = sd.exec_main_pid(&unit).await.unwrap_or(0);
     watch.saw(main_pid);
-    let (output, follower) = if terminal.is_none() {
-        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
-            .context("creating the output's pipe")?;
-        let follower = Follower::start(&unit, cursor.as_deref(), write)?;
-        (Some(read), Some(follower))
-    } else {
-        (None, None)
-    };
     Ok(Attached {
         name,
         app,
