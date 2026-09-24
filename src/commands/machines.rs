@@ -118,7 +118,7 @@ fn describe(machine: &Dict) -> (String, String, String) {
 }
 
 pub async fn start(args: StartArgs, client: &Client) -> Result<()> {
-    let mut options = start_options(args.options)?;
+    let mut options = start_options(args.options, args.command)?;
     if args.image_command {
         options.insert("image_command", Value::from(true));
     }
@@ -126,7 +126,7 @@ pub async fn start(args: StartArgs, client: &Client) -> Result<()> {
 }
 
 /// The options of a StartMachine call from what start or run was given.
-fn start_options(args: StartOptions) -> Result<Options<'static>> {
+fn start_options(args: StartOptions, command: Vec<String>) -> Result<Options<'static>> {
     let mut options = Options::new();
     options.insert("wait", Value::from(args.wait));
     if let Some(network) = args.network {
@@ -160,8 +160,8 @@ fn start_options(args: StartOptions) -> Result<Options<'static>> {
     if let Some(pids) = args.pids_limit {
         options.insert("pids_limit", Value::from(pids));
     }
-    if !args.command.is_empty() {
-        options.insert("command", Value::from(args.command));
+    if !command.is_empty() {
+        options.insert("command", Value::from(command));
     }
     Ok(options)
 }
@@ -280,7 +280,7 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
                 .await?;
         }
     }
-    let mut options = start_options(args.options)?;
+    let mut options = start_options(args.options, args.command)?;
     if args.rm {
         options.insert("remove", Value::from(true));
     }

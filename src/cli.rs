@@ -543,6 +543,10 @@ pub struct StartArgs {
     /// Forget the remembered entrypoint and arguments and run the image's own again.
     #[arg(long)]
     pub image_command: bool,
+    /// For app images: the arguments after -- replace the image's cmd and follow its
+    /// entrypoint, as with docker. Remembered for later starts.
+    #[arg(last = true)]
+    pub command: Vec<String>,
 }
 
 /// When `run` asks the registry.
@@ -593,6 +597,15 @@ pub struct RunArgs {
     pub tty: bool,
     #[command(flatten)]
     pub options: StartOptions,
+    /// For app images, as with docker run: what follows the image replaces its cmd
+    /// and follows its entrypoint (run -it alpine sh); after -- as well. Remembered for
+    /// later starts.
+    #[arg(
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "COMMAND"
+    )]
+    pub command: Vec<String>,
 }
 
 /// What `start` and `run` give a machine; remembered for its next starts.
@@ -643,10 +656,6 @@ pub struct StartOptions {
     /// Remembered; applied at the next start.
     #[arg(long, value_name = "N")]
     pub pids_limit: Option<u64>,
-    /// For app images: the arguments after -- replace the image's cmd and follow its
-    /// entrypoint, as with docker. Remembered for later starts.
-    #[arg(last = true)]
-    pub command: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -819,9 +828,39 @@ mod tests {
         assert_eq!(run.pull, PullPolicy::Never);
         assert_eq!(run.options.publish, ["8080:80"]);
         assert_eq!(run.options.restart, Some(crate::policy::Restart::Always));
-        assert_eq!(run.options.command, ["nginx", "-g", "daemon off;"]);
+        assert_eq!(run.command, ["nginx", "-g", "daemon off;"]);
         assert!(run.options.wait, "run waits like start unless --no-wait");
         assert!(Cli::try_parse_from(["nspawn", "run", "x", "--pull", "sometimes"]).is_err());
+        // docker's order: options, the image, then its command and arguments as they are.
+        let cli = Cli::try_parse_from([
+            "nspawn",
+            "run",
+            "-it",
+            "--rm",
+            "-n",
+            "a",
+            "alpine:3",
+            "sh",
+            "-c",
+            "echo -n hi",
+        ])
+        .unwrap();
+        let Command::Run(run) = cli.command else {
+            panic!("not run");
+        };
+        assert!(run.tty && run.interactive && run.rm);
+        assert_eq!(run.name.as_deref(), Some("a"));
+        assert_eq!(run.command, ["sh", "-c", "echo -n hi"]);
+        let cli = Cli::try_parse_from(["nspawn", "run", "alpine:3", "-p", "80:80", "-d"]).unwrap();
+        let Command::Run(run) = cli.command else {
+            panic!("not run");
+        };
+        assert!(
+            run.command.is_empty(),
+            "options after the image are still options"
+        );
+        assert!(run.detach);
+        assert_eq!(run.options.publish, ["80:80"]);
         let cli = Cli::try_parse_from(["nspawn", "rm", "-f", "a", "b"]).unwrap();
         let Command::Rm(rm) = cli.command else {
             panic!("not rm");

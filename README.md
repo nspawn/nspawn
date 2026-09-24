@@ -16,7 +16,7 @@ nspawn images ls                    # local images (all of them, not only ours)
 nspawn start fedora-44              # boot it as a machine
 nspawn create fedora-44 web2        # another machine from the same local image, docker create style
 nspawn run -d nginx:1.27 --name web -p 8080:80   # make a machine and start it in the background
-nspawn run -it --rm alpine:3 sh     # like docker run: attached, a terminal, removed once it ends
+nspawn run -it --rm docker.io/library/alpine:3 sh   # like docker run: a terminal, removed at the end
 nspawn start web -p 8080:80 -e KEY=v -v /srv/data:/data -v pgdata:/var/lib/pg   # docker-style flags
 nspawn start web --label caddy=web.example   # labels for whoever reads them (inspect, ps --json)
 nspawn start web --restart unless-stopped -m 512m --cpus 1   # restart policy and limits, like docker
@@ -45,7 +45,9 @@ nspawn push app-1 --to team/app:2   # push a local image under another tag
 `run` is `pull` (or `create` from a local image with the same reference, as docker's
 `--pull missing` has it) followed by `start`, with the flags of both; `--pull always` asks
 the registry every time and `--pull never` never. A name that is taken is refused unless
-`--force`, which makes the machine anew. Like `docker run` it stays attached: the
+`--force`, which makes the machine anew. What follows the image replaces an app's
+command, as with docker (`nspawn run -it alpine sh`; after `--` as well). Like `docker
+run` it stays attached: the
 machine's output follows until it ends (stdout and stderr together, a line at a time,
 from the journal, so that `logs` shows it later too), and `run` exits with the program's
 exit code, or 128 plus the signal it died of. Ctrl-C, SIGTERM, SIGHUP and SIGQUIT go to
