@@ -299,7 +299,8 @@ pub struct CreateArgs {
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     pub backend: BackendChoice,
     /// Network of the new machine: bridge, veth, host or a network made with network
-    /// create (default: like the source).
+    /// create (default: the source's kind; a network made with network create is not
+    /// inherited).
     #[arg(long, value_name = "NETWORK")]
     pub network: Option<String>,
     /// Ports to publish on the host, like start -p.

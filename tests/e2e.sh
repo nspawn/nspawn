@@ -525,6 +525,10 @@ for m in e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-def-cli; do
   $NSPAWN start $m >/dev/null || fail "start $m"
 done
 $NSPAWN inspect e2e-na-web | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['network'] == 'e2e-na', d" || fail "inspect does not name the network"
+# A machine made from one on a network of its own is not put there unasked.
+$NSPAWN create e2e-na-web e2e-nc-pub >/dev/null || fail "create from a machine on e2e-na"
+$NSPAWN inspect e2e-nc-pub | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['network'] == 'bridge', d" || fail "create put the new machine on its source's network"
+$NSPAWN images rm e2e-nc-pub >/dev/null || fail "rm the machine made from e2e-na-web"
 na_web=$(addr_of e2e-na-web); nb_web=$(addr_of e2e-nb-web); nc_web=$(addr_of e2e-nc-web)
 echo "e2e-na-web $na_web, e2e-nb-web $nb_web, e2e-nc-web $nc_web"
 [ "$nb_web" != "${nb_web#10.98.7.}" ] || fail "e2e-nb-web is not on 10.98.7.0/24: $nb_web"

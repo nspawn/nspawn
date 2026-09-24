@@ -161,7 +161,10 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         report,
     )
     .await?;
-    // The network is inherited; ports are not, two machines cannot publish the same.
+    // The network kind is inherited; ports are not, two machines cannot publish the
+    // same, and neither is a network made with `network create`, which a machine joins
+    // when told to, as with docker (run makes its machine from any local image with the
+    // reference, whatever network that one was put on).
     let mut record = store
         .load_image(&request.name)?
         .context("the record of the new machine is missing")?;
@@ -171,7 +174,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         }
         None => {
             record.network = source.network;
-            record.network_name = source.network_name.clone();
+            record.network_name = None;
         }
     }
     record.ports = ports;
