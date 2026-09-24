@@ -806,6 +806,31 @@ impl Manager {
         Ok((outcome.to_string(), notes.into_lines()))
     }
 
+    /// docker kill: option signal (s, a name like KILL or SIGHUP, or a number; SIGKILL
+    /// when absent). SIGKILL stops the machine for good, like StopMachine with force;
+    /// other signals go to an app's program or a booted machine's init. Returns the
+    /// notes made on the way.
+    async fn kill_machine(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        name: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<Vec<String>> {
+        self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        let mut options = Options::new(&options);
+        let request = api::machines::KillRequest {
+            name,
+            signal: options
+                .string("signal")?
+                .unwrap_or_else(|| "SIGKILL".to_string()),
+        };
+        options.finish()?;
+        let notes = Notes::default();
+        api::machines::kill(self.ctx(), &request, &notes.report()).await?;
+        Ok(notes.into_lines())
+    }
+
     /// The login session machined offers for a booted machine, like `shell`: a pseudo
     /// terminal running the user's shell ("" for root), and the terminal's path. Apps
     /// have no login inside: Exec with a shell and a tty is the way for them. Options:

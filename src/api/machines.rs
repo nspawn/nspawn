@@ -210,6 +210,8 @@ pub async fn prepare(
         hostnet::ensure_networkd(sd, report).await?;
         return Ok(Network::Veth);
     };
+    // A new run: what `kill` asked of the last one is over.
+    store.take_exit_on_next(name)?;
     if record.network == Network::Bridge
         && record.mode == Mode::App
         && record.backend == BackendChoice::Mstack
@@ -713,17 +715,7 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
                     .as_ref()
                     .and_then(|r| r.run.stop_signal.clone())
                     .unwrap_or_else(|| "SIGTERM".to_string());
-                // To the program itself (PID 2, the stub init's child), never to the
-                // whole cgroup: systemd-nspawn and its stub react to signals in their own
-                // ways (the stub reboots the machine on SIGINT, nspawn dies of SIGQUIT).
-                let leader = sd.machine_leader(&args.name).await?;
-                // Right after start the stub init may not have forked the program yet.
-                let mut payload = payload_pid(leader);
-                let deadline = Instant::now() + Duration::from_secs(2);
-                while payload.is_none() && Instant::now() < deadline {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    payload = payload_pid(leader);
-                }
+                let (leader, payload) = wait_for_payload(sd, &args.name).await?;
                 match payload {
                     Some(payload) => {
                         if let Err(e) = send_signal(payload, signal_number(&signal)?) {
@@ -801,10 +793,89 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
     Ok(StopOutcome::Stopped)
 }
 
-/// Asks a booted machine to power off and waits until it is gone, repeating the request
-/// every couple of seconds: right after `start` the machine's init may not have installed
-/// its signal handlers yet, and the kernel silently drops signals that PID 1 of a PID
-/// namespace does not handle.
+/// The program an app machine runs, to be signalled itself (PID 2, the stub init's
+/// child), never the whole cgroup: systemd-nspawn and its stub react to signals in their
+/// own ways (the stub reboots the machine on SIGINT, nspawn dies of SIGQUIT). Right after
+/// start the stub init may not have forked it yet. Returns the leader too.
+async fn wait_for_payload(sd: &Systemd, name: &str) -> Result<(u32, Option<i32>)> {
+    let leader = sd.machine_leader(name).await?;
+    let mut payload = payload_pid(leader);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while payload.is_none() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        payload = payload_pid(leader);
+    }
+    Ok((leader, payload))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KillRequest {
+    pub name: String,
+    /// A name or number as `signal_number` reads it.
+    pub signal: String,
+}
+
+/// docker kill. SIGKILL is `stop --force`: the machine goes and stays gone. Any other
+/// signal goes to what the machine runs, an app's program or a booted machine's init,
+/// and the machine lives on unless the signal ends it, in which case its restart policy
+/// applies, as with docker. Docker's exception holds too: the machine's own stop signal
+/// ends it for good, through the mark the release hook reads.
+pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Result<()> {
+    validate_entry_name(&args.name)?;
+    let signal = signal_number(&args.signal)?;
+    let sd = ctx.sd().await?;
+    refuse_foreign(sd, &args.name).await?;
+    let unit = format!("systemd-nspawn@{}.service", args.name);
+    let registered = sd.machine_exists(&args.name).await?;
+    // Between two runs of its restart policy there is nothing to signal, but SIGKILL still
+    // ends it, as docker kill ends a restarting container.
+    if !registered && !(signal == libc::SIGKILL && sd.unit_status(&unit).await?.restarting()) {
+        bail!("machine {} is not running", args.name);
+    }
+    if signal == libc::SIGKILL {
+        let request = StopRequest {
+            name: args.name.clone(),
+            force: true,
+            wait: true,
+            timeout: 0,
+        };
+        stop(ctx, &request, report).await?;
+        return Ok(());
+    }
+    let record = ctx.store.load_image(&args.name)?;
+    let mode = record.as_ref().map(|r| r.mode);
+    let policy = record.as_ref().map(|r| r.restart).unwrap_or_default();
+    if policy != Restart::No && stop_signals(record.as_ref())?.contains(&signal) {
+        ctx.store.mark_exit_on_next(&args.name)?;
+    }
+    if mode == Some(Mode::App) {
+        let (leader, payload) = wait_for_payload(sd, &args.name).await?;
+        let payload = payload.with_context(|| {
+            format!(
+                "{} has no program running under its init (leader PID {leader})",
+                args.name
+            )
+        })?;
+        send_signal(payload, signal).with_context(|| {
+            format!("sending {} to PID {payload} of {}", args.signal, args.name)
+        })?;
+    } else {
+        sd.kill_machine(&args.name, "leader", signal).await?;
+    }
+    Ok(())
+}
+
+/// The signals that ask a machine to end: an app's stop signal (SIGTERM unless its image
+/// names another), a booted machine's halt and poweroff requests to its init.
+fn stop_signals(record: Option<&ImageRecord>) -> Result<Vec<i32>> {
+    match record {
+        Some(r) if r.mode == Mode::App => Ok(vec![signal_number(
+            r.run.stop_signal.as_deref().unwrap_or("SIGTERM"),
+        )?]),
+        _ => Ok(vec![libc::SIGRTMIN() + 3, libc::SIGRTMIN() + 4]),
+    }
+}
+
 /// Waits, within reason, until nothing of a previous instance stands in the way of a new
 /// start: the unit still up with its program gone (nspawn shutting down), the machine
 /// not yet dropped by machined, or the release hook running while the unit deactivates,
@@ -852,6 +923,10 @@ async fn machine_alive(sd: &Systemd, name: &str, mode: Option<Mode>) -> bool {
     mode != Some(Mode::App) || payload_pid(leader).is_some()
 }
 
+/// Asks a booted machine to power off and waits until it is gone, repeating the request
+/// every couple of seconds: right after `start` the machine's init may not have installed
+/// its signal handlers yet, and the kernel silently drops signals that PID 1 of a PID
+/// namespace does not handle.
 async fn poweroff_until_gone(sd: &Systemd, name: &str, timeout: Duration) -> Result<bool> {
     let deadline = Instant::now() + timeout;
     if sd.poweroff_machine(name).await.is_err() && !sd.machine_exists(name).await? {
@@ -1224,6 +1299,22 @@ mod tests {
         assert!(signal_number("SIGRTMIN+200").is_err());
         assert!(signal_number("0").is_err());
         assert!(signal_number("SIGBOGUS").is_err());
+    }
+
+    #[test]
+    fn what_asks_a_machine_to_end() {
+        let record = |json: &str| serde_json::from_str::<ImageRecord>(json).unwrap();
+        let base = r#""name": "web", "reference": "r", "manifest_digest": "d", "layers": [], "backend": "overlay", "created": 0"#;
+        let app = record(&format!(r#"{{{base}, "mode": "app"}}"#));
+        assert_eq!(stop_signals(Some(&app)).unwrap(), [libc::SIGTERM]);
+        let quits = record(&format!(
+            r#"{{{base}, "mode": "app", "run": {{"stop_signal": "SIGQUIT"}}}}"#
+        ));
+        assert_eq!(stop_signals(Some(&quits)).unwrap(), [libc::SIGQUIT]);
+        let booted = record(&format!(r#"{{{base}, "mode": "boot"}}"#));
+        let init = [libc::SIGRTMIN() + 3, libc::SIGRTMIN() + 4];
+        assert_eq!(stop_signals(Some(&booted)).unwrap(), init);
+        assert_eq!(stop_signals(None).unwrap(), init);
     }
 
     #[test]

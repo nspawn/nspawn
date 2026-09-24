@@ -45,7 +45,8 @@ files, and the machine units call nspawn back through drop-in hooks.
                      restart policy, limits
   manifests/NAME.json raw manifest bytes (digest stays valid)
   machines/NAME/     overlay upper/work, host0.network, hosts, resolv.conf,
-                     units/ for the volume wait unit; 0700 with a writable
+                     units/ for the volume wait unit, exit-on-next when
+                     `kill` sent the stop signal; 0700 with a writable
                      layer, 0711 otherwise (an mstack machine binds its
                      files from inside its user namespace)
   volumes/NAME/      named volumes
@@ -89,7 +90,13 @@ so that the stub init does not add its SIGTERM and SIGHUP while the program
 handles its own signal. Should the program end in between, the stop job also cancels
 the restart systemd has scheduled. A machine machined no
 longer lists gets the stop job too, which ends a pending restart and waits for
-the release hook of its last run. The policy and the limits go into the hooks
+the release hook of its last run. `kill` with SIGKILL is `stop --force`; any
+other signal goes to the program of an app or the init of a booted machine and
+leaves the policy to decide should the machine end, except the machine's own
+stop signal, which docker counts as a stop: `kill` then leaves `exit-on-next`
+in the machine's directory, and the release hook, finding it, queues the stop
+job while the unit is still winding down. `prepare` removes a mark an earlier
+run left. The policy and the limits go into the hooks
 drop-in, since the settings file has no keys for them; `always` and
 `unless-stopped` enable the unit the way `machinectl enable` does, `stop`
 disables an `unless-stopped` one and removing a machine disables it. Limits

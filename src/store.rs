@@ -288,6 +288,32 @@ impl Store {
     pub fn machine_files_dir(&self, name: &str) -> PathBuf {
         self.machines_private_dir().join(name)
     }
+    fn exit_on_next_path(&self, name: &str) -> PathBuf {
+        self.machine_files_dir(name).join("exit-on-next")
+    }
+
+    /// Remembers that the machine's current run was sent its stop signal: when it ends,
+    /// it is not restarted (docker's rule for `docker kill` with the stop signal).
+    pub fn mark_exit_on_next(&self, name: &str) -> Result<()> {
+        crate::reference::validate_entry_name(name)?;
+        let path = self.exit_on_next_path(name);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        fs::write(&path, b"").with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// Forgets the mark of `mark_exit_on_next`; true when there was one.
+    pub fn take_exit_on_next(&self, name: &str) -> Result<bool> {
+        crate::reference::validate_entry_name(name)?;
+        let path = self.exit_on_next_path(name);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+
     pub fn remove_machine_files(&self, name: &str) -> Result<()> {
         crate::reference::validate_entry_name(name)?;
         let dir = self.machine_files_dir(name);
@@ -2043,6 +2069,17 @@ mod tests {
             "a marker left by a start that died with its process"
         );
         drop(stale);
+    }
+
+    #[test]
+    fn the_exit_on_next_mark_is_taken_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        assert!(!store.take_exit_on_next("web").unwrap());
+        store.mark_exit_on_next("web").unwrap();
+        assert!(store.take_exit_on_next("web").unwrap());
+        assert!(!store.take_exit_on_next("web").unwrap());
+        assert!(store.mark_exit_on_next("../x").is_err());
     }
 
     #[tokio::test]

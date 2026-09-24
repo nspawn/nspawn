@@ -514,6 +514,15 @@ impl Systemd {
         }
     }
 
+    /// Queues a stop job for a unit and returns at once, without watching the job.
+    pub async fn queue_stop(&self, unit: &str) -> Result<()> {
+        self.manager
+            .stop_unit(unit.to_string(), "replace".to_string())
+            .await
+            .with_context(|| format!("stopping {unit}"))?;
+        Ok(())
+    }
+
     /// Opens a PTY inside the machine running `path` with `args` (argv including argv[0])
     /// and `env`. An empty path means the user's login shell.
     pub async fn open_shell(

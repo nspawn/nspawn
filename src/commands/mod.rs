@@ -62,7 +62,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             NetworkCommand::Publish { name } => {
                 api::network::publish(&Context::new(config), &name).await
             }
-            NetworkCommand::Release { name } => api::network::release(&Context::new(config), &name),
+            NetworkCommand::Release { name } => {
+                api::network::release(&Context::new(config), &name).await
+            }
             NetworkCommand::Up => {
                 let client = Client::connect().await?;
                 let info = client.manager.network_up().await.map_err(client::error)?;
@@ -490,6 +492,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         Command::Start(args) => machines::start(args, client).await,
         Command::Run(args) => machines::run(args, client, config).await,
         Command::Stop(args) => machines::stop(args, client).await,
+        Command::Kill(args) => machines::kill(args, client).await,
         Command::Exec(args) => machines::exec(args, client).await,
         Command::Shell(args) => machines::shell(args, client).await,
         Command::Logs(args) => machines::logs(args, client).await,

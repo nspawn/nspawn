@@ -59,6 +59,8 @@ pub enum Command {
     Start(StartArgs),
     /// Power off a running machine.
     Stop(StopArgs),
+    /// Send a signal to running machines, like docker kill (SIGKILL stops them for good).
+    Kill(KillArgs),
     /// Remove machines and what they alone use, like docker rm (same as images rm).
     Rm(RmArgs),
     /// Run a command inside a running machine.
@@ -367,6 +369,19 @@ pub struct RmArgs {
     /// Stop a running machine first (SIGKILL, like docker rm -f) instead of refusing.
     #[arg(long, short = 'f')]
     pub force: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct KillArgs {
+    /// Machine names.
+    #[arg(required = true)]
+    pub names: Vec<String>,
+    /// Signal to send: a name (KILL, SIGHUP, RTMIN+3) or a number. SIGKILL stops the
+    /// machine like stop --force; other signals go to an app's program or a booted
+    /// machine's init, and a machine they end is restarted by its policy, unless the
+    /// signal was its stop signal.
+    #[arg(long, short = 's', default_value = "KILL")]
+    pub signal: String,
 }
 
 #[derive(Args, Debug)]

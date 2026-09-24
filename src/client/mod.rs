@@ -86,6 +86,7 @@ pub trait Manager {
     ) -> zbus::Result<(String, Vec<String>)>;
     fn stop_machine(&self, name: &str, options: Options<'_>)
         -> zbus::Result<(String, Vec<String>)>;
+    fn kill_machine(&self, name: &str, options: Options<'_>) -> zbus::Result<Vec<String>>;
     fn exec(
         &self,
         machine: &str,

@@ -27,6 +27,7 @@ nspawn shell fedora-44
 nspawn logs fedora-44               # console output; --inside reads the machine's own journal
 nspawn cp ./nginx.conf web:/etc/nginx/   # copy files in or out, like docker cp
 nspawn stop fedora-44
+nspawn kill -s HUP web              # a signal for the program, like docker kill (SIGKILL by default)
 nspawn rm -f web2                   # remove a machine, stopping it first (rm without -f is images rm)
 nspawn images rm fedora-44          # also frees layers and blobs nobody references
 nspawn volume ls                    # named volumes and the machines that use them (create, rm, prune)
@@ -86,7 +87,10 @@ minute, for as long as they keep failing, and `ps` shows such a machine as
 `restarting`. `nspawn stop` always stops it, one waiting to be restarted included (an
 `always` machine still starts at the next boot); `machinectl stop` does too but does not
 take an `unless-stopped` machine off the boot list, and a `poweroff` from inside counts as
-ending under `always`. `-m/--memory`, `--cpus` and `--pids-limit`
+ending under `always`. `kill` works as docker's: SIGKILL, its default, stops the machine
+for good; any other signal goes to the program (or the init of a booted machine), and
+should it end the machine the policy decides, unless it was the machine's stop signal,
+which counts as a stop. `-m/--memory`, `--cpus` and `--pids-limit`
 bound the whole machine (its unit's MemoryMax=, CPUQuota= and TasksMax=), which is why
 they cannot be seen from inside; as with docker, `--memory` also lets the machine use as
 much swap again (MemorySwapMax=), and no more. Both are remembered like the ports and apply at the

@@ -123,8 +123,20 @@ pub async fn publish(ctx: &Context, name: &str) -> Result<()> {
 
 /// ExecStopPost: runs however the machine ended (stop, exit, crash, machinectl). No lock:
 /// it runs inside the stop job that `images rm` and friends wait for while holding it.
-pub fn release(ctx: &Context, name: &str) -> Result<()> {
+pub async fn release(ctx: &Context, name: &str) -> Result<()> {
     crate::reference::validate_entry_name(name)?;
     let record = ctx.store.load_image(name)?;
-    machines::release_machine(name, record.as_ref())
+    machines::release_machine(name, record.as_ref())?;
+    // `kill` sent the machine its stop signal: a stop job queued while the unit is still
+    // winding down is what keeps systemd from restarting it (it is not waited for, it
+    // ends after this hook). Best effort: at shutdown nothing restarts anyway.
+    if ctx.store.take_exit_on_next(name)? {
+        if let Ok(sd) = ctx.sd().await {
+            let unit = format!("systemd-nspawn@{name}.service");
+            if let Err(e) = sd.queue_stop(&unit).await {
+                eprintln!("warning: {e:#}; {name} may be restarted");
+            }
+        }
+    }
+    Ok(())
 }

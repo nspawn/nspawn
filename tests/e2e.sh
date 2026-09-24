@@ -683,6 +683,35 @@ systemctl is-active systemd-nspawn@e2e-restart.service >/dev/null && fail "the u
 [ -e /etc/systemd/system/machines.target.wants/systemd-nspawn@e2e-restart.service ] && fail "rm left the boot link behind"
 [ -e /etc/systemd/system/systemd-nspawn@e2e-restart.service.d ] && fail "rm left the drop-in directory behind"
 
+step "kill: a signal for the program, and what ends a machine for good"
+$NSPAWN start $app --restart always -p none -- /bin/sh -c 'trap "echo e2e-got-hup" HUP; while :; do sleep 1; done' >/dev/null || fail "start an app that traps SIGHUP"
+[ "$($NSPAWN kill -s HUP $app)" = "$app" ] || fail "kill -s HUP does not print the machine's name"
+retry 5 bash -c "$NSPAWN logs $app | grep_q e2e-got-hup" || fail "the program did not get SIGHUP"
+$NSPAWN ps | grep_q "^ *$app " || fail "SIGHUP, which the program handles, ended the machine"
+restarts=$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)
+$NSPAWN kill -s USR1 $app >/dev/null || fail "kill -s USR1"
+retry 15 bash -c "[ \"\$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)\" -gt $restarts ]" || fail "a program ended by kill -s USR1 was not restarted by its policy"
+retry 15 bash -c "$NSPAWN ps | grep_q '^ *$app '" || fail "the app did not come back after SIGUSR1"
+# docker's rule: the stop signal sent by kill ends the machine for good.
+$NSPAWN kill -s TERM $app >/dev/null || fail "kill with the stop signal"
+sleep 5
+# The program died of the signal, so the unit may end failed; it must not come back.
+case "$(systemctl is-active systemd-nspawn@$app.service)" in
+  active|activating) fail "the stop signal sent by kill did not end the machine for good" ;;
+esac
+[ -e /var/lib/nspawn/machines/$app/exit-on-next ] && fail "the release hook left the exit-on-next mark behind"
+$NSPAWN start $app >/dev/null || fail "start after kill -s TERM"
+$NSPAWN kill $app >/dev/null || fail "kill (SIGKILL)"
+sleep 3
+[ "$(systemctl is-active systemd-nspawn@$app.service)" = inactive ] || fail "kill did not end a machine with --restart always"
+systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "kill left the unit failed"
+out=$($NSPAWN kill $app 2>&1) && fail "kill of a stopped machine succeeded"
+echo "$out" | grep_q "not running" || fail "kill of a stopped machine was not explained: $out"
+$NSPAWN start $app --restart no >/dev/null || fail "start after kill"
+$NSPAWN kill -s BOGUS $app 2>/dev/null && fail "kill -s BOGUS succeeded"
+$NSPAWN ps | grep_q "^ *$app " || fail "a refused kill ended the machine"
+$NSPAWN stop $app >/dev/null || fail "stop after the kill checks"
+
 step "resource limits: memory, cpus and processes of the whole machine"
 $NSPAWN start $app -m 64m --cpus 0.5 --pids-limit 100 -- /bin/sleep 300 || fail "start with limits"
 [ "$(systemctl show -p MemoryMax --value systemd-nspawn@$app.service)" = 67108864 ] || fail "MemoryMax not set"
@@ -776,7 +805,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine StartMachine StopMachine Exec Shell Logs ListNetwork NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine StartMachine StopMachine KillMachine Exec Shell Logs ListNetwork NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do

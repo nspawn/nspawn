@@ -12,7 +12,7 @@ use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow, Signal};
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 use crate::cli::{
-    ExecArgs, LogsArgs, ModeChoice, PsArgs, PullPolicy, RunArgs, ShellArgs, StartArgs,
+    ExecArgs, KillArgs, LogsArgs, ModeChoice, PsArgs, PullPolicy, RunArgs, ShellArgs, StartArgs,
     StartOptions, StopArgs,
 };
 use crate::client::{self, Client, Dict, Ended, Options};
@@ -296,6 +296,35 @@ pub async fn stop(args: StopArgs, client: &Client) -> Result<()> {
     match outcome.as_str() {
         "was-not-running" => println!("{} was not running", args.name),
         _ => println!("stopped {}", args.name),
+    }
+    Ok(())
+}
+
+/// docker kill: every name gets the signal, each one printed once it did; a name that
+/// could not be signalled is reported and makes the command fail at the end.
+pub async fn kill(args: KillArgs, client: &Client) -> Result<()> {
+    let mut failed = 0;
+    for name in &args.names {
+        let mut options = Options::new();
+        options.insert("signal", Value::from(args.signal.clone()));
+        match client.manager.kill_machine(name, options).await {
+            Ok(notes) => {
+                for note in &notes {
+                    eprintln!("{note}");
+                }
+                println!("{name}");
+            }
+            Err(e) => {
+                eprintln!("error: {:#}", client::error(e));
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        bail!(
+            "{failed} of {} machines could not be signalled",
+            args.names.len()
+        );
     }
     Ok(())
 }
