@@ -19,6 +19,7 @@ nspawn run nginx:1.27 --name web -p 8080:80   # make a machine and start it, lik
 nspawn start web -p 8080:80 -e KEY=v -v /srv/data:/data -v pgdata:/var/lib/pg   # docker-style flags
 nspawn start web --label caddy=web.example   # labels for whoever reads them (inspect, ps --json)
 nspawn start web --restart unless-stopped -m 512m --cpus 1   # restart policy and limits, like docker
+nspawn update web -m 1g --restart always   # change them later, a running machine at once
 nspawn ps                           # running machines: image, mode, command, uptime (-a adds stopped ones)
                                     # (containers only: the virtual machines machined also lists are left out)
 nspawn inspect web                  # everything nspawn knows about a machine, as JSON
@@ -94,7 +95,8 @@ which counts as a stop. `-m/--memory`, `--cpus` and `--pids-limit`
 bound the whole machine (its unit's MemoryMax=, CPUQuota= and TasksMax=), which is why
 they cannot be seen from inside; as with docker, `--memory` also lets the machine use as
 much swap again (MemorySwapMax=), and no more. Both are remembered like the ports and apply at the
-next start; `--restart no` and a limit of 0 remove them. With a policy, `stop --no-wait`
+next start; `--restart no` and a limit of 0 remove them. `update` changes them without a
+start, like docker update: a running machine gets the new limits in its cgroup at once. With a policy, `stop --no-wait`
 of an app also lets the stub init send the program SIGTERM and SIGHUP, since nobody
 stays to stop the unit later.
 

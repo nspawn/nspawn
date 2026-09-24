@@ -238,6 +238,38 @@ pub fn volume_wait_units(targets: &[String]) -> (String, String) {
     (service, dropin)
 }
 
+/// Where systemd keeps what SetUnitProperties changed on a running unit with `runtime`,
+/// and the files it writes there for the limits: they win over the unit's own drop-ins
+/// until the next boot.
+const RUNTIME_CONTROL_DIR: &str = "/run/systemd/system.control";
+const RUNTIME_LIMIT_FILES: [&str; 4] = [
+    "50-MemoryMax.conf",
+    "50-MemorySwapMax.conf",
+    "50-CPUQuota.conf",
+    "50-TasksMax.conf",
+];
+
+/// Removes the limits a runtime change left for the machine's unit, so that the hooks
+/// drop-in, which follows the record, decides again. Returns whether anything went (a
+/// daemon-reload is then due).
+pub fn clear_runtime_limits(name: &str) -> Result<bool> {
+    clear_runtime_limits_in(Path::new(RUNTIME_CONTROL_DIR), name)
+}
+
+fn clear_runtime_limits_in(control: &Path, name: &str) -> Result<bool> {
+    let dir = control.join(format!("systemd-nspawn@{name}.service.d"));
+    let mut removed = false;
+    for file in RUNTIME_LIMIT_FILES {
+        let path = dir.join(file);
+        match fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+    Ok(removed)
+}
+
 /// The drop-in that makes the machine's unit call nspawn around its life: the network is
 /// prepared before it starts, ports are published once it runs and everything is released
 /// however it ends, whether it was started by nspawn, machinectl or at boot. It also
@@ -469,6 +501,25 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn runtime_limits_are_cleared_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("systemd-nspawn@web.service.d");
+        fs::create_dir_all(&dir).unwrap();
+        for file in ["50-MemoryMax.conf", "50-TasksMax.conf", "50-CPUWeight.conf"] {
+            fs::write(dir.join(file), "[Service]\n").unwrap();
+        }
+        assert!(clear_runtime_limits_in(tmp.path(), "web").unwrap());
+        assert!(!dir.join("50-MemoryMax.conf").exists());
+        assert!(!dir.join("50-TasksMax.conf").exists());
+        assert!(
+            dir.join("50-CPUWeight.conf").exists(),
+            "not nspawn's setting"
+        );
+        assert!(!clear_runtime_limits_in(tmp.path(), "web").unwrap());
+        assert!(!clear_runtime_limits_in(tmp.path(), "other").unwrap());
+    }
 
     #[test]
     fn settings_are_root_s_alone() {

@@ -806,6 +806,33 @@ impl Manager {
         Ok((outcome.to_string(), notes.into_lines()))
     }
 
+    /// docker update: options restart (s), memory (t, bytes), cpus (d), pids_limit (t),
+    /// 0 removing a limit, absent keeping it. A running machine gets the limits at once
+    /// (the restart policy applies to its next ending anyway). Returns whether it was
+    /// running.
+    async fn update_machine(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        name: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<bool> {
+        self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        let mut options = Options::new(&options);
+        let request = api::machines::UpdateRequest {
+            name,
+            restart: options
+                .string("restart")?
+                .map(|r| crate::policy::Restart::parse(&r))
+                .transpose()?,
+            memory: options.maybe_u64("memory")?,
+            cpus: options.f64("cpus")?,
+            pids_limit: options.maybe_u64("pids_limit")?,
+        };
+        options.finish()?;
+        Ok(api::machines::update(self.ctx(), &request).await?)
+    }
+
     /// docker kill: option signal (s, a name like KILL or SIGHUP, or a number; SIGKILL
     /// when absent). SIGKILL stops the machine for good, like StopMachine with force;
     /// other signals go to an app's program or a booted machine's init. Returns the

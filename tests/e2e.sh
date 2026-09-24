@@ -740,6 +740,33 @@ $NSPAWN start $app -m 0 --cpus 0 --pids-limit 0 -- /bin/sleep 300 >/dev/null || 
 [ "$(systemctl show -p TasksMax --value systemd-nspawn@$app.service)" = 100 ] && fail "--pids-limit 0 did not remove the process limit"
 $NSPAWN stop $app >/dev/null || fail "stop after removing the limits"
 
+step "update: the limits of a running machine change at once, the policy with them"
+$NSPAWN start $app -m 64m -- /bin/sleep 300 >/dev/null || fail "start before update"
+[ "$($NSPAWN update $app -m 128m --cpus 0.5 --pids-limit 50)" = "$app" ] || fail "update of a running machine"
+[ "$(cat $cg/memory.max)" = 134217728 ] || fail "update did not change memory.max at once: $(cat $cg/memory.max)"
+[ "$(cat $cg/memory.swap.max)" = 134217728 ] || fail "update did not change memory.swap.max at once: $(cat $cg/memory.swap.max)"
+[ "$(cat $cg/cpu.max)" = "50000 100000" ] || fail "update did not change cpu.max at once: $(cat $cg/cpu.max)"
+[ "$(cat $cg/pids.max)" = 50 ] || fail "update did not change pids.max at once: $(cat $cg/pids.max)"
+[ "$(systemctl show -p MemoryMax --value systemd-nspawn@$app.service)" = 134217728 ] || fail "the unit does not show the updated MemoryMax"
+left=$(ls /run/systemd/system.control/systemd-nspawn@$app.service.d/ 2>/dev/null)
+[ -z "$left" ] || fail "update left runtime settings behind: $left"
+grep -qx "MemoryMax=134217728" $hooks || fail "update did not write the new limit into the drop-in"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['memory'] == 134217728 and d['cpus'] == 0.5 and d['pids_limit'] == 50, d" || fail "inspect does not show the updated limits"
+$NSPAWN update $app --restart always >/dev/null || fail "update --restart always"
+[ "$(systemctl is-enabled systemd-nspawn@$app.service)" = enabled ] || fail "update --restart always did not enable the unit"
+grep -qx "Restart=always" $hooks || fail "update --restart always did not write Restart="
+$NSPAWN update $app -m 0 --restart no >/dev/null || fail "update -m 0 --restart no"
+[ "$(cat $cg/memory.max)" = max ] || fail "update -m 0 did not remove the memory limit: $(cat $cg/memory.max)"
+[ "$(systemctl is-enabled systemd-nspawn@$app.service)" = enabled ] && fail "update --restart no left the unit enabled"
+$NSPAWN stop $app >/dev/null || fail "stop after update"
+$NSPAWN start $app >/dev/null || fail "start after update"
+[ "$(cat $cg/pids.max)" = 50 ] || fail "the updated limits did not outlive a restart: $(cat $cg/pids.max)"
+$NSPAWN stop $app >/dev/null || fail "stop the updated machine"
+$NSPAWN update $app --pids-limit 0 >/dev/null || fail "update of a stopped machine"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['pids_limit'] == 0, d" || fail "update of a stopped machine was not remembered"
+$NSPAWN update $app 2>/dev/null && fail "update with nothing to change succeeded"
+$NSPAWN update e2e-nope -m 64m 2>/dev/null && fail "update of an unknown machine succeeded"
+
 step "named volumes: listed with their users, made ahead, removed once unused"
 $NSPAWN volume create e2evol-free || fail "volume create"
 [ "$(stat -c '%u %a' /var/lib/nspawn/volumes/e2evol-free)" = "0 755" ] || fail "volume create did not make a root directory with mode 0755"
@@ -805,7 +832,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine StartMachine StopMachine KillMachine Exec Shell Logs ListNetwork NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine StartMachine StopMachine KillMachine UpdateMachine Exec Shell Logs ListNetwork NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do

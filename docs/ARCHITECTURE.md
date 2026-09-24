@@ -99,9 +99,14 @@ job while the unit is still winding down. `prepare` removes a mark an earlier
 run left. The policy and the limits go into the hooks
 drop-in, since the settings file has no keys for them; `always` and
 `unless-stopped` enable the unit the way `machinectl enable` does, `stop`
-disables an `unless-stopped` one and removing a machine disables it. Limits
-could be applied to a running unit with SetUnitProperties; for now they apply
-at the next start, and Restart= could not be anyway. `exec` joins the leader's namespaces (user
+disables an `unless-stopped` one and removing a machine disables it. `update`
+rewrites the record and the drop-in and, for a running unit, sets the limits
+with SetUnitProperties at once; systemd then keeps copies under
+`/run/systemd/system.control`, which would win over the drop-in until the next
+boot, so `update` removes them right away and `prepare` removes any a
+`systemctl set-property --runtime` left: the record decides at every start.
+Restart= cannot be set that way, but systemd reads it again at the reload that
+follows. `exec` joins the leader's namespaces (user
 first, mount last), joins its cgroup, becomes the machine's root and then the
 requested user, so capabilities are dropped.
 

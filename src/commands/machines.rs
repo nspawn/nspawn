@@ -13,7 +13,7 @@ use zbus::zvariant::{OwnedObjectPath, Value};
 
 use crate::cli::{
     ExecArgs, KillArgs, LogsArgs, ModeChoice, PsArgs, PullPolicy, RunArgs, ShellArgs, StartArgs,
-    StartOptions, StopArgs,
+    StartOptions, StopArgs, UpdateArgs,
 };
 use crate::client::{self, Client, Dict, Ended, Options};
 use crate::config::Config;
@@ -323,6 +323,40 @@ pub async fn kill(args: KillArgs, client: &Client) -> Result<()> {
     if failed > 0 {
         bail!(
             "{failed} of {} machines could not be signalled",
+            args.names.len()
+        );
+    }
+    Ok(())
+}
+
+/// docker update: every name gets the same changes, each one printed once it has them.
+pub async fn update(args: UpdateArgs, client: &Client) -> Result<()> {
+    let mut failed = 0;
+    for name in &args.names {
+        let mut options = Options::new();
+        if let Some(restart) = args.restart {
+            options.insert("restart", Value::from(restart.name()));
+        }
+        if let Some(memory) = args.memory {
+            options.insert("memory", Value::from(memory));
+        }
+        if let Some(cpus) = args.cpus {
+            options.insert("cpus", Value::from(cpus));
+        }
+        if let Some(pids) = args.pids_limit {
+            options.insert("pids_limit", Value::from(pids));
+        }
+        match client.manager.update_machine(name, options).await {
+            Ok(_) => println!("{name}"),
+            Err(e) => {
+                eprintln!("error: {:#}", client::error(e));
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        bail!(
+            "{failed} of {} machines could not be updated",
             args.names.len()
         );
     }

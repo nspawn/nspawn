@@ -304,7 +304,10 @@ pub async fn prepare(
         },
         &route,
     )?;
-    if settings::write_hooks(name, config, &route, record.restart, &record.limits)? {
+    // Limits changed by hand on the running unit (systemctl set-property --runtime) end
+    // with its run: the record decides again.
+    let cleared = settings::clear_runtime_limits(name)?;
+    if settings::write_hooks(name, config, &route, record.restart, &record.limits)? || cleared {
         sd.reload().await?;
     }
     if record.backend == BackendChoice::Mstack {
@@ -863,6 +866,96 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
         sd.kill_machine(&args.name, "leader", signal).await?;
     }
     Ok(())
+}
+
+/// What `update` may change, docker update's subset that nspawn has: None keeps the
+/// remembered value.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UpdateRequest {
+    pub name: String,
+    pub restart: Option<Restart>,
+    /// Bytes, 0 for none.
+    pub memory: Option<u64>,
+    /// CPUs (0.5), 0 for none.
+    pub cpus: Option<f64>,
+    /// Processes, 0 for none.
+    pub pids_limit: Option<u64>,
+}
+
+/// docker update: the record and the hooks drop-in get the new policy and limits, and a
+/// running machine gets the limits in its cgroup at once. Returns whether it was running.
+pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
+    validate_entry_name(&args.name)?;
+    if args.restart.is_none()
+        && args.memory.is_none()
+        && args.cpus.is_none()
+        && args.pids_limit.is_none()
+    {
+        bail!("nothing to update; give --memory, --cpus, --pids-limit or --restart");
+    }
+    let sd = ctx.sd().await?;
+    refuse_foreign(sd, &args.name).await?;
+    let store = &ctx.store;
+    let _lock = store.lock().await?;
+    let mut record = store.load_image(&args.name)?.with_context(|| {
+        format!(
+            "{} is not an image managed by nspawn; a restart policy or limits need one",
+            args.name
+        )
+    })?;
+    let unit = format!("systemd-nspawn@{}.service", args.name);
+    let state = sd.unit_status(&unit).await?;
+    // Between states the unit's settings are about to be read again: nothing to change
+    // under a start or a restart.
+    if state.restarting() {
+        bail!(
+            "machine {} is restarting; update it once it runs, or stop it first",
+            args.name
+        );
+    }
+    if state.active == "activating" || store.is_starting(&args.name) {
+        bail!("machine {} is starting; update it once it runs", args.name);
+    }
+    let previous_policy = record.restart;
+    if let Some(restart) = args.restart {
+        record.restart = restart;
+    }
+    apply_limits(&mut record.limits, args.memory, args.cpus, args.pids_limit)?;
+    record.limits.check(record.mode)?;
+    store.record_image(&record)?;
+    let route = settings::namespace_route(sd, &args.name, record.mode, record.network).await?;
+    let mut reload = settings::write_hooks(
+        &args.name,
+        &ctx.config,
+        &route,
+        record.restart,
+        &record.limits,
+    )?;
+    let running = state.active == "active";
+    if running {
+        let properties = record
+            .limits
+            .unit_properties()
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), zbus::zvariant::OwnedValue::from(value)))
+            .collect();
+        sd.set_unit_properties(&unit, true, properties).await?;
+        // The drop-in says the same now: the runtime copies would only outlive it, and
+        // win over a later start with other limits.
+        reload |= settings::clear_runtime_limits(&args.name)?;
+    }
+    // always and unless-stopped start the machine at boot, as with `start`.
+    let changed = if record.restart.enabled_at_boot() {
+        sd.enable_unit(&unit).await?
+    } else if args.restart.is_some() && previous_policy.enabled_at_boot() {
+        sd.disable_unit(&unit).await?
+    } else {
+        false
+    };
+    if reload || changed {
+        sd.reload().await?;
+    }
+    Ok(running)
 }
 
 /// The signals that ask a machine to end: an app's stop signal (SIGTERM unless its image

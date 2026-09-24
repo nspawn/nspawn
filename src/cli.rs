@@ -61,6 +61,9 @@ pub enum Command {
     Stop(StopArgs),
     /// Send a signal to running machines, like docker kill (SIGKILL stops them for good).
     Kill(KillArgs),
+    /// Change the restart policy and limits of machines, like docker update; a running
+    /// machine gets the limits at once.
+    Update(UpdateArgs),
     /// Remove machines and what they alone use, like docker rm (same as images rm).
     Rm(RmArgs),
     /// Run a command inside a running machine.
@@ -382,6 +385,25 @@ pub struct KillArgs {
     /// signal was its stop signal.
     #[arg(long, short = 's', default_value = "KILL")]
     pub signal: String,
+}
+
+#[derive(Args, Debug)]
+pub struct UpdateArgs {
+    /// Machine names.
+    #[arg(required = true)]
+    pub names: Vec<String>,
+    /// Restart policy: no, on-failure, always (also starts it at boot) or unless-stopped.
+    #[arg(long, value_enum, value_name = "POLICY")]
+    pub restart: Option<crate::policy::Restart>,
+    /// Memory limit of the whole machine: 512m, 2g, and as much swap again; 0 removes it.
+    #[arg(long, short = 'm', value_name = "SIZE", value_parser = crate::policy::parse_memory)]
+    pub memory: Option<u64>,
+    /// CPU limit of the whole machine: 0.5, 2; 0 removes it.
+    #[arg(long, value_name = "N", value_parser = crate::policy::parse_cpus)]
+    pub cpus: Option<f64>,
+    /// Most processes and threads the machine may have; 0 removes the limit.
+    #[arg(long, value_name = "N")]
+    pub pids_limit: Option<u64>,
 }
 
 #[derive(Args, Debug)]
