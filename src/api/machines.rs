@@ -1282,7 +1282,13 @@ const FOLLOW_TAIL: u32 = 10;
 /// their own. journalctl is the journal's reader, so it does the work: these are its
 /// arguments. Everything the unit ever logged is shown, earlier runs included.
 pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
-    let mut argv = vec!["--no-pager".to_string(), "--quiet".to_string()];
+    // --all: a line with colours or a carriage return, which is most of what a console
+    // shows, would read "[N B blob data]" otherwise.
+    let mut argv = vec![
+        "--no-pager".to_string(),
+        "--quiet".to_string(),
+        "--all".to_string(),
+    ];
     let output = if args.timestamps { "short-iso" } else { "cat" };
     if args.inside {
         argv.push(format!("--machine={}", args.machine));
@@ -1466,6 +1472,7 @@ mod tests {
             vec![
                 "--no-pager",
                 "--quiet",
+                "--all",
                 "--unit=systemd-nspawn@web.service",
                 "--output=cat",
                 "_TRANSPORT=stdout"
@@ -1492,6 +1499,7 @@ mod tests {
             vec![
                 "--no-pager",
                 "--quiet",
+                "--all",
                 "--unit=systemd-nspawn@web.service",
                 "--output=short-iso",
                 "--lines=50",
@@ -1509,6 +1517,7 @@ mod tests {
             vec![
                 "--no-pager",
                 "--quiet",
+                "--all",
                 "--machine=fedora-44",
                 "--output=cat"
             ]
