@@ -103,13 +103,11 @@ run left. The policy and the limits go into the hooks
 drop-in, since the settings file has no keys for them; `always` and
 `unless-stopped` enable the unit the way `machinectl enable` does, `stop`
 disables an `unless-stopped` one and removing a machine disables it. `update`
-rewrites the record and the drop-in and, for a running unit, sets the limits
-with SetUnitProperties at once; systemd then keeps copies under
-`/run/systemd/system.control`, which would win over the drop-in until the next
-boot, so `update` removes them right away and `prepare` removes any a
-`systemctl set-property --runtime` left: the record decides at every start.
-Restart= cannot be set that way, but systemd reads it again at the reload that
-follows. `stats` reads the same cgroup (the unit's `ControlGroup`, which holds
+rewrites the record and the drop-in and reloads: systemd applies a running
+unit's changed limits to its cgroup at a daemon-reload (255 to 261 alike), and
+reads Restart= again for its next ending. SetUnitProperties is not used: with
+`runtime` it leaves copies under `/run/systemd/system.control` that would win
+over the drop-in until the next boot. `stats` reads the same cgroup (the unit's `ControlGroup`, which holds
 systemd-nspawn and the whole machine: `cpu.stat`, `memory.current` and
 `memory.stat`, `memory.max`, `pids.current`, `io.stat`) and the machine's
 interfaces through `/proc/LEADER/net/dev`; the service returns counters with a

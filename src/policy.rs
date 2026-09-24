@@ -112,23 +112,6 @@ impl Limits {
     pub fn cpus(&self) -> f64 {
         self.milli_cpus as f64 / 1000.0
     }
-
-    /// The limits as the unit properties systemd changes on a running unit, no limit
-    /// being infinity (u64::MAX); the drop-in's MemoryMax=, MemorySwapMax=, CPUQuota=
-    /// and TasksMax=.
-    pub fn unit_properties(&self) -> [(&'static str, u64); 4] {
-        let or_infinity = |value: u64| if value == 0 { u64::MAX } else { value };
-        [
-            ("MemoryMax", or_infinity(self.memory)),
-            ("MemorySwapMax", or_infinity(self.memory)),
-            // Thousandths of a CPU are milliseconds of CPU time per second.
-            (
-                "CPUQuotaPerSecUSec",
-                or_infinity(self.milli_cpus.saturating_mul(1000)),
-            ),
-            ("TasksMax", or_infinity(self.pids)),
-        ]
-    }
 }
 
 /// docker's --memory: a number of bytes, or one with b, k, m, g or t (1024-based,
@@ -192,27 +175,6 @@ pub fn parse_cpus(text: &str) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn limits_as_properties_of_a_running_unit() {
-        let set = Limits {
-            memory: 64 * 1024 * 1024,
-            milli_cpus: 500,
-            pids: 100,
-        };
-        assert_eq!(
-            set.unit_properties(),
-            [
-                ("MemoryMax", 67108864),
-                ("MemorySwapMax", 67108864),
-                ("CPUQuotaPerSecUSec", 500_000),
-                ("TasksMax", 100),
-            ]
-        );
-        for (_, value) in Limits::default().unit_properties() {
-            assert_eq!(value, u64::MAX, "no limit is infinity");
-        }
-    }
 
     #[test]
     fn restart_policies_are_spelled_like_docker_everywhere() {

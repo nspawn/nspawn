@@ -313,10 +313,7 @@ pub async fn prepare(
         },
         &route,
     )?;
-    // Limits changed by hand on the running unit (systemctl set-property --runtime) end
-    // with its run: the record decides again.
-    let cleared = settings::clear_runtime_limits(name)?;
-    if settings::write_hooks(name, config, &route, record.restart, &record.limits)? || cleared {
+    if settings::write_hooks(name, config, &route, record.restart, &record.limits)? {
         sd.reload().await?;
     }
     if record.backend == BackendChoice::Mstack {
@@ -901,8 +898,10 @@ pub struct UpdateRequest {
     pub pids_limit: Option<u64>,
 }
 
-/// docker update: the record and the hooks drop-in get the new policy and limits, and a
-/// running machine gets the limits in its cgroup at once. Returns whether it was running.
+/// docker update: the record and the hooks drop-in get the new policy and limits. The
+/// reload that follows is what a running machine needs too: systemd applies a unit's
+/// changed limits to its cgroup at a daemon-reload, and reads Restart= again for its
+/// next ending. Returns whether it was running.
 pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     validate_entry_name(&args.name)?;
     if args.restart.is_none()
@@ -943,7 +942,7 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     record.limits.check(record.mode)?;
     store.record_image(&record)?;
     let route = settings::namespace_route(sd, &args.name, record.mode, record.network).await?;
-    let mut reload = settings::write_hooks(
+    let reload = settings::write_hooks(
         &args.name,
         &ctx.config,
         &route,
@@ -951,18 +950,6 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
         &record.limits,
     )?;
     let running = state.active == "active";
-    if running {
-        let properties = record
-            .limits
-            .unit_properties()
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), zbus::zvariant::OwnedValue::from(value)))
-            .collect();
-        sd.set_unit_properties(&unit, true, properties).await?;
-        // The drop-in says the same now: the runtime copies would only outlive it, and
-        // win over a later start with other limits.
-        reload |= settings::clear_runtime_limits(&args.name)?;
-    }
     // always and unless-stopped start the machine at boot, as with `start`.
     let changed = if record.restart.enabled_at_boot() {
         sd.enable_unit(&unit).await?

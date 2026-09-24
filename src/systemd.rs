@@ -544,21 +544,6 @@ impl Systemd {
         }
     }
 
-    /// Changes resource settings of a unit that runs, in its cgroup at once. With
-    /// `runtime` systemd also writes them under /run/systemd/system.control, where they
-    /// win over the unit's own files until the next boot.
-    pub async fn set_unit_properties(
-        &self,
-        unit: &str,
-        runtime: bool,
-        properties: Vec<(String, zbus::zvariant::OwnedValue)>,
-    ) -> Result<()> {
-        self.manager
-            .set_unit_properties(unit.to_string(), runtime, properties)
-            .await
-            .with_context(|| format!("changing the limits of {unit}"))
-    }
-
     /// Queues a stop job for a unit and returns at once, without watching the job.
     pub async fn queue_stop(&self, unit: &str) -> Result<()> {
         self.manager
