@@ -322,6 +322,11 @@ pub async fn attach(
     }
     let sd = ctx.sd().await?;
     let unit = format!("systemd-nspawn@{name}.service");
+    // Before the socket: one of an earlier run of the same machine is not to be
+    // replaced by a run that `start` would refuse anyway.
+    if ctx.store.is_starting(&name) || sd.machine_exists(&name).await? {
+        bail!("machine {name} is already running");
+    }
     let (mode, handed, keep, terminal) = match (&request.terminal, request.stdin) {
         (Some(t), _) => {
             let (master, slave) = crate::nsenter::host_pty(t.rows, t.cols)?;
