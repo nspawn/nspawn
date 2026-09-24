@@ -1,3 +1,9 @@
+nspawn (1.1.2-1) unstable; urgency=medium
+
+  * run: a machine made from an image and started in one step.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Thu, 24 Sep 2026 12:00:00 -0500
+
 nspawn (1.1.1-1) unstable; urgency=medium
 
   * Progress of pulls and pushes on the terminal; fixes for hosts without
