@@ -265,3 +265,11 @@ runs commands inside through the PTY, stops it, removes it, checks that layers a
 and garbage collected, and (when mkosi is installed) builds `tests/build-context`, pushes
 it, pulls it back and pushes it again under another tag. It expects `NSPAWN_REGISTRY` (and `NSPAWN_CA_CERT` for a private
 CA) to point at a registry that serves the image given in `IMAGE` (default `fedora:44`).
+
+## AI use disclosure
+
+AI tools help write nspawn's code. Every change is reviewed by a person, comes with unit
+tests, and is checked by the end-to-end suite, which runs the distribution packages on
+virtual machines with different systemd versions and kernels: Ubuntu 24.04 (systemd 255,
+Linux 6.8), Fedora 44 (systemd 259, Linux 7.1, SELinux enforcing) and Arch Linux
+(systemd 261, Linux 7.2).
