@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 1.1.2
+%global upstream_version 1.2.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -148,6 +148,10 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Thu Sep 24 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.2.0-1
+- run stays attached like docker run (-d for the background, --rm, -i, -t);
+  user-defined networks; events, stats, update and kill.
+
 * Thu Sep 24 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.1.2-1
 - run: a machine made from an image and started in one step.
 

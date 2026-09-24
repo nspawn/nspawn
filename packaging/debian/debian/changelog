@@ -1,3 +1,10 @@
+nspawn (1.2.0-1) unstable; urgency=medium
+
+  * run stays attached like docker run (-d for the background, --rm, -i, -t).
+  * User-defined networks; events, stats, update and kill.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Thu, 24 Sep 2026 18:00:00 -0500
+
 nspawn (1.1.2-1) unstable; urgency=medium
 
   * run: a machine made from an image and started in one step.
