@@ -495,6 +495,9 @@ echo "$app_addr" | grep_q "^10\.99\.0\." || fail "no bridge address for the app"
 ipv4_only "$app" "$app_addr"
 $NSPAWN exec $app -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep_q "$app_addr/24" || fail "host0 not configured inside the app"
 $NSPAWN exec $app -- cat /etc/hosts </dev/null | tr -d '\r' | grep_q "host.nspawn.internal" || fail "generated /etc/hosts missing in the app"
+# The service ignores SIGPIPE; what exec runs must not inherit that.
+ignored=$($NSPAWN exec $app -- cat /proc/self/status </dev/null | tr -d '\r' | awk '/^SigIgn:/ {print $2}')
+[ $(( 16#${ignored:-0} & 0x1000 )) = 0 ] || fail "a command run by exec ignores SIGPIPE (SigIgn $ignored)"
 $NSPAWN exec $app -- nslookup download.opensuse.org </dev/null >/dev/null 2>&1 || fail "DNS does not work inside the app"
 $NSPAWN exec $app -- wget -qO- -T 5 http://detectportal.firefox.com/success.txt </dev/null | tr -d '\r' | grep_q success || fail "no internet from the app"
 curl -sf -m 5 http://127.0.0.1:18081/ | grep_q app-web || fail "published app port not reachable on 127.0.0.1"

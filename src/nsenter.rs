@@ -726,8 +726,17 @@ fn grandchild(
             return 127;
         }
     };
-    // Nothing of the service's but the three streams goes along into the machine.
+    // Nothing of the service's but the three streams goes along into the machine, and
+    // not its SIGPIPE either: the service ignores it, which execve would pass on, and a
+    // command in a pipeline must die of a closed pipe as it would anywhere else.
     close_from(3);
+    // SAFETY: only the default disposition is set, in a single-threaded child.
+    let _ = unsafe {
+        nix::sys::signal::signal(
+            nix::sys::signal::Signal::SIGPIPE,
+            nix::sys::signal::SigHandler::SigDfl,
+        )
+    };
     match execve(&program, argv, &env) {
         Ok(_) => 0,
         Err(e) => {
