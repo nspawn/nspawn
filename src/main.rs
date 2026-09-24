@@ -5,6 +5,7 @@
 //! systemd-machined and systemd itself, never through machinectl.
 
 mod api;
+mod attach;
 mod auth;
 mod backend;
 mod bridge;

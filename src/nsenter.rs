@@ -395,6 +395,39 @@ fn tell(socket: &OwnedFd, report: &Started, fds: &[RawFd]) {
     let _ = sendmsg::<()>(socket.as_raw_fd(), &iov, controls, MsgFlags::empty(), None);
 }
 
+/// Receives one message of at most 256 bytes and the descriptors attached to it.
+pub fn receive_fds(socket: &impl AsFd) -> Result<(Vec<u8>, Vec<OwnedFd>)> {
+    let mut buf = [0u8; 256];
+    let mut space = nix::cmsg_space!([RawFd; 4]);
+    let mut iov = [IoSliceMut::new(&mut buf)];
+    let message = recvmsg::<()>(
+        socket.as_fd().as_raw_fd(),
+        &mut iov,
+        Some(&mut space),
+        MsgFlags::MSG_CMSG_CLOEXEC,
+    )
+    .context("receiving descriptors")?;
+    let mut fds = Vec::new();
+    for control in message.cmsgs().context("reading the control messages")? {
+        if let ControlMessageOwned::ScmRights(received) = control {
+            // SAFETY: SCM_RIGHTS hands us fresh descriptors of our own.
+            fds.extend(
+                received
+                    .into_iter()
+                    .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) }),
+            );
+        }
+    }
+    let n = message.bytes;
+    Ok((buf[..n].to_vec(), fds))
+}
+
+/// Makes `tty` the controlling terminal of this process, which leads a session that has
+/// none: the kernel then sends it SIGWINCH when the terminal is resized.
+pub fn take_controlling_terminal(tty: &impl AsFd) -> nix::Result<()> {
+    unsafe { tiocsctty(tty.as_fd().as_raw_fd(), 0) }.map(drop)
+}
+
 /// Writes a line to standard error with write(2): Rust's stderr lock may be held by a
 /// thread of the parent that did not come along with the fork.
 fn complain(text: &str) {

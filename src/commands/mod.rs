@@ -24,6 +24,10 @@ use crate::output::{human_bytes, human_duration, table};
 use crate::search::SearchSource;
 
 pub async fn run(cli: Cli) -> Result<()> {
+    // Before anything else: the machine starts whatever the configuration says.
+    if let Command::AttachExec { name, argv } = &cli.command {
+        match crate::attach::exec(name, argv)? {}
+    }
     let config = Config::load(
         cli.config.as_deref(),
         cli.registry.clone(),
@@ -550,7 +554,11 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         Command::Shell(args) => machines::shell(args, client).await,
         Command::Logs(args) => machines::logs(args, client).await,
         Command::Cp(args) => copy::cp(args, client).await,
-        Command::Daemon(_) | Command::Network(_) | Command::Completions(_) | Command::Manpage => {
+        Command::Daemon(_)
+        | Command::Network(_)
+        | Command::Completions(_)
+        | Command::Manpage
+        | Command::AttachExec { .. } => {
             unreachable!("handled before")
         }
     }

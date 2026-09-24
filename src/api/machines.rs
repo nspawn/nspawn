@@ -313,7 +313,15 @@ pub async fn prepare(
         },
         &route,
     )?;
-    if settings::write_hooks(name, config, &route, record.restart, &record.limits)? {
+    let app_argv = settings::app_argv(sd, name, record.mode, &route).await?;
+    if settings::write_hooks(
+        name,
+        config,
+        &route,
+        app_argv.as_deref(),
+        record.restart,
+        &record.limits,
+    )? {
         sd.reload().await?;
     }
     if record.backend == BackendChoice::Mstack {
@@ -942,10 +950,12 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     record.limits.check(record.mode)?;
     store.record_image(&record)?;
     let route = settings::namespace_route(sd, &args.name, record.mode, record.network).await?;
+    let app_argv = settings::app_argv(sd, &args.name, record.mode, &route).await?;
     let reload = settings::write_hooks(
         &args.name,
         &ctx.config,
         &route,
+        app_argv.as_deref(),
         record.restart,
         &record.limits,
     )?;

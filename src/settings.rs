@@ -247,10 +247,18 @@ pub fn write_hooks(
     name: &str,
     config: &crate::config::Config,
     route: &NamespaceRoute,
+    app_argv: Option<&[String]>,
     restart: Restart,
     limits: &Limits,
 ) -> Result<bool> {
-    let text = render_hooks(&hook_command(config)?, name, route, restart, limits);
+    let text = render_hooks(
+        &hook_command(config)?,
+        name,
+        route,
+        app_argv,
+        restart,
+        limits,
+    );
     let dir = crate::backend::dropin_dir(name);
     let path = dir.join("nspawn-hooks.conf");
     if fs::read_to_string(&path)
@@ -280,12 +288,33 @@ fn hook_command(config: &crate::config::Config) -> Result<String> {
     Ok(command)
 }
 
-/// The text of the hooks drop-in. A machine without a policy or limits gets exactly what
-/// earlier versions wrote, so that an update does not rewrite every drop-in.
+/// The argv an app machine's unit runs, as systemd has it loaded: its ExecStart= is
+/// rewritten around it (see `exec_start_override`). None for a booted machine, whose
+/// ExecStart= stays the template's.
+pub async fn app_argv(
+    sd: &Systemd,
+    name: &str,
+    mode: Mode,
+    route: &NamespaceRoute,
+) -> Result<Option<Vec<String>>> {
+    if mode != Mode::App {
+        return Ok(None);
+    }
+    Ok(Some(match route {
+        NamespaceRoute::CommandLine(argv) => argv.clone(),
+        NamespaceRoute::Settings => {
+            sd.exec_start(&format!("systemd-nspawn@{name}.service"))
+                .await?
+        }
+    }))
+}
+
+/// The text of the hooks drop-in.
 pub fn render_hooks(
     command: &str,
     name: &str,
     route: &NamespaceRoute,
+    app_argv: Option<&[String]>,
     restart: Restart,
     limits: &Limits,
 ) -> String {
@@ -295,8 +324,10 @@ pub fn render_hooks(
         // Restarted as long as it keeps failing, with a growing delay, as docker does.
         text.push_str("[Unit]\nStartLimitIntervalSec=0\n");
     }
+    // What the machine writes goes to the journal whatever its pace: logs and attached
+    // runs read it back from there.
     text.push_str(&format!(
-        "[Service]\nExecStartPre={command} network prepare %i\nExecStartPost={command} network publish %i\nExecStopPost=-{command} network release %i\n"
+        "[Service]\nExecStartPre={command} network prepare %i\nExecStartPost={command} network publish %i\nExecStopPost=-{command} network release %i\nLogRateLimitIntervalSec=0\n"
     ));
     if let Some(setting) = restart_setting {
         text.push_str(&format!(
@@ -317,17 +348,26 @@ pub fn render_hooks(
     if limits.pids > 0 {
         text.push_str(&format!("TasksMax={}\n", limits.pids));
     }
-    if let NamespaceRoute::CommandLine(argv) = route {
-        text.push_str(&exec_start_override(argv, name));
+    match (route, app_argv) {
+        (NamespaceRoute::CommandLine(argv), _) => {
+            text.push_str(&exec_start_override(command, argv, name, true));
+        }
+        (NamespaceRoute::Settings, Some(argv)) => {
+            text.push_str(&exec_start_override(command, argv, name, false));
+        }
+        (NamespaceRoute::Settings, None) => {}
     }
     text
 }
 
-/// The ExecStart= lines that put the namespace on the unit's command line: the argv as
-/// loaded, without the options that conflict with --network-namespace-path= (only their
-/// `--option=value` form is recognised) and with that option added. Applied to its own
-/// result it gives the same lines again.
-pub fn exec_start_override(argv: &[String], name: &str) -> String {
+/// The ExecStart= lines of an app machine: systemd-nspawn behind `nspawn attach-exec`
+/// (src/attach.rs), which gives it the terminal or input of an attached run. The argv is
+/// the one systemd has loaded, without an earlier override of ours around it and without
+/// --console, which only a run chooses. With `namespace` the namespace prepared for the
+/// bridge goes on the command line, without the options that conflict with it (only
+/// their `--option=value` form is recognised); older systemd has no settings key for it.
+/// Applied to its own result it gives the same lines again.
+pub fn exec_start_override(command: &str, argv: &[String], name: &str, namespace: bool) -> String {
     const CONFLICTING: &[&str] = &[
         "--network-veth",
         "-n",
@@ -339,20 +379,33 @@ pub fn exec_start_override(argv: &[String], name: &str) -> String {
         "--network-ipvlan",
         "--network-veth-extra",
     ];
-    let kept: Vec<String> = argv
+    let is = |arg: &str, option: &str| arg == option || arg.starts_with(&format!("{option}="));
+    let argv = unwrapped(argv);
+    let mut kept: Vec<String> = argv
         .iter()
-        .filter(|arg| {
-            !CONFLICTING
-                .iter()
-                .any(|option| arg == option || arg.starts_with(&format!("{option}=")))
-        })
+        .filter(|arg| !is(arg, "--console") && !is(arg, "--network-namespace-path"))
+        .filter(|arg| !namespace || !CONFLICTING.iter().any(|option| is(arg, option)))
         .map(|arg| unit_quote(arg))
         .collect();
+    if namespace {
+        kept.push(format!(
+            "--network-namespace-path={}",
+            unit_quote(&crate::bridge::netns_path(name))
+        ));
+    }
     format!(
-        "ExecStart=\nExecStart={} --network-namespace-path={}\n",
-        kept.join(" "),
-        unit_quote(&crate::bridge::netns_path(name))
+        "ExecStart=\nExecStart={command} attach-exec {} -- {}\n",
+        unit_quote(name),
+        kept.join(" ")
     )
+}
+
+/// An argv without the `nspawn attach-exec NAME --` an earlier override put in front.
+fn unwrapped(argv: &[String]) -> &[String] {
+    match argv.iter().position(|a| a == "--") {
+        Some(end) if argv[..end].iter().any(|a| a == "attach-exec") => &argv[end + 1..],
+        _ => argv,
+    }
 }
 
 /// One argument of an ExecStart= line: `%` starts a specifier and is doubled, and
@@ -512,7 +565,8 @@ mod tests {
     }
 
     #[test]
-    fn command_line_namespace_for_older_systemd() {
+    fn app_machines_start_behind_attach_exec() {
+        let command = "/usr/bin/nspawn";
         let argv: Vec<String> = [
             "systemd-nspawn",
             "--quiet",
@@ -527,17 +581,30 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let text = exec_start_override(&argv, "web");
+        let text = exec_start_override(command, &argv, "web", true);
         assert_eq!(
             text,
-            "ExecStart=\nExecStart=systemd-nspawn --quiet --keep-unit --boot --link-journal=try-guest -U --settings=override --machine=web --network-namespace-path=/run/netns/nspawn-web\n"
+            "ExecStart=\nExecStart=/usr/bin/nspawn attach-exec web -- systemd-nspawn --quiet --keep-unit --boot --link-journal=try-guest -U --settings=override --machine=web --network-namespace-path=/run/netns/nspawn-web\n"
         );
         // What systemd loads from that drop-in gives the same drop-in again.
         let loaded: Vec<String> = text.lines().nth(1).unwrap()["ExecStart=".len()..]
             .split(' ')
             .map(|s| s.to_string())
             .collect();
-        assert_eq!(exec_start_override(&loaded, "web"), text);
+        assert_eq!(exec_start_override(command, &loaded, "web", true), text);
+        // Without the namespace on the command line (systemd 259 and newer, or a network
+        // other than the bridge), the path an earlier drop-in added goes, and so does a
+        // --console of whatever origin: only a run chooses that.
+        let mut console = loaded.clone();
+        console.push("--console=interactive".into());
+        assert_eq!(
+            exec_start_override(command, &console, "web", false),
+            "ExecStart=\nExecStart=/usr/bin/nspawn attach-exec web -- systemd-nspawn --quiet --keep-unit --boot --link-journal=try-guest -U --settings=override --machine=web\n"
+        );
+        assert_eq!(
+            exec_start_override(command, &argv, "web", false),
+            "ExecStart=\nExecStart=/usr/bin/nspawn attach-exec web -- systemd-nspawn --quiet --keep-unit --boot --link-journal=try-guest --network-veth -U --settings=override --machine=web\n"
+        );
         // Every option that cannot go with a namespace path is dropped, whatever its value.
         let bridged: Vec<String> = [
             "systemd-nspawn",
@@ -551,8 +618,8 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert_eq!(
-            exec_start_override(&bridged, "a"),
-            "ExecStart=\nExecStart=systemd-nspawn \"--machine=%%i\" --network-namespace-path=/run/netns/nspawn-a\n"
+            exec_start_override(command, &bridged, "a", true),
+            "ExecStart=\nExecStart=/usr/bin/nspawn attach-exec a -- systemd-nspawn \"--machine=%%i\" --network-namespace-path=/run/netns/nspawn-a\n"
         );
         assert_eq!(unit_quote("plain-arg=1"), "plain-arg=1");
         assert_eq!(unit_quote("with space"), "\"with space\"");
@@ -781,18 +848,20 @@ mod tests {
             command,
             "web",
             &NamespaceRoute::Settings,
+            None,
             Restart::No,
             &Limits::default(),
         );
         assert_eq!(
             plain,
-            "# Generated by nspawn; do not edit.\n[Service]\nExecStartPre=/usr/bin/nspawn network prepare %i\nExecStartPost=/usr/bin/nspawn network publish %i\nExecStopPost=-/usr/bin/nspawn network release %i\n",
-            "without a policy or limits the drop-in is what 1.0 wrote"
+            "# Generated by nspawn; do not edit.\n[Service]\nExecStartPre=/usr/bin/nspawn network prepare %i\nExecStartPost=/usr/bin/nspawn network publish %i\nExecStopPost=-/usr/bin/nspawn network release %i\nLogRateLimitIntervalSec=0\n",
+            "a booted machine without a policy or limits: the hooks alone"
         );
         let on_failure = render_hooks(
             command,
             "web",
             &NamespaceRoute::Settings,
+            None,
             Restart::OnFailure,
             &Limits::default(),
         );
@@ -807,6 +876,7 @@ mod tests {
                 command,
                 "web",
                 &NamespaceRoute::Settings,
+                None,
                 policy,
                 &Limits::default(),
             );
@@ -816,6 +886,7 @@ mod tests {
             command,
             "web",
             &NamespaceRoute::Settings,
+            None,
             Restart::No,
             &Limits {
                 memory: 64 << 20,
@@ -830,6 +901,7 @@ mod tests {
             command,
             "web",
             &NamespaceRoute::Settings,
+            None,
             Restart::No,
             &Limits {
                 memory: 0,
@@ -837,7 +909,9 @@ mod tests {
                 pids: 0,
             },
         );
-        assert!(only_cpus.ends_with("network release %i\nCPUQuota=33.3%\n"));
+        assert!(
+            only_cpus.ends_with("network release %i\nLogRateLimitIntervalSec=0\nCPUQuota=33.3%\n")
+        );
         let argv: Vec<String> = [
             "systemd-nspawn",
             "--quiet",
@@ -851,10 +925,20 @@ mod tests {
             command,
             "web",
             &NamespaceRoute::CommandLine(argv.clone()),
+            Some(&argv),
             Restart::Always,
             &Limits::default(),
         );
-        assert!(old_systemd.ends_with(&exec_start_override(&argv, "web")));
+        assert!(old_systemd.ends_with(&exec_start_override(command, &argv, "web", true)));
         assert!(old_systemd.contains("RestartMaxDelaySec=30s\nExecStart="));
+        let app = render_hooks(
+            command,
+            "web",
+            &NamespaceRoute::Settings,
+            Some(&argv),
+            Restart::No,
+            &Limits::default(),
+        );
+        assert!(app.ends_with(&exec_start_override(command, &argv, "web", false)));
     }
 }

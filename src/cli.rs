@@ -84,6 +84,14 @@ pub enum Command {
     Volume(VolumeArgs),
     /// Serve org.nspawn on the system bus (started by the bus; see --install).
     Daemon(DaemonArgs),
+    /// ExecStart of an app machine: runs systemd-nspawn with the terminal or input an
+    /// attached run hands over, or as it is.
+    #[command(hide = true)]
+    AttachExec {
+        name: String,
+        #[arg(last = true, required = true)]
+        argv: Vec<std::ffi::OsString>,
+    },
     /// Print the completions for a shell, which the packages install for you.
     Completions(CompletionsArgs),
     /// Print the manual page in roff, as the packages ship it.

@@ -63,7 +63,9 @@ files, and the machine units call nspawn back through drop-in hooks.
 /etc/systemd/system/systemd-nspawn@NAME.service.d/
   nspawn-overlay.conf   RequiresMountsFor= (overlay)
   nspawn-hooks.conf     ExecStartPre/Post, ExecStopPost calling nspawn,
-                        Restart= and MemoryMax=/MemorySwapMax=/CPUQuota=/TasksMax= when set
+                        LogRateLimitIntervalSec=0, Restart= and
+                        MemoryMax=/MemorySwapMax=/CPUQuota=/TasksMax= when set,
+                        for an app ExecStart= behind `nspawn attach-exec`
 /etc/systemd/system/machines.target.wants/systemd-nspawn@NAME.service
                         --restart always or unless-stopped: started at boot
 /etc/nspawn/auth.json  registry credentials, 0600
@@ -124,9 +126,17 @@ directory, user and stop signal. Apps on the bridge run with
 `PrivateUsers=no`, since a user namespace cannot join the network namespace
 prepared on the host; app images are assembled with overlay even where mstack
 exists. The namespace is named with `NamespacePath=` in the settings file on
-systemd 259 or newer; before that the key does not exist, and the hooks
-drop-in rewrites the unit's `ExecStart=` with `--network-namespace-path=`
-instead (the argv systemd has loaded, minus the options that conflict).
+systemd 259 or newer; before that the key does not exist, and the unit's
+`ExecStart=` gets `--network-namespace-path=` instead (minus the options that
+conflict). An app's `ExecStart=` is rewritten in the hooks drop-in on every
+systemd version anyway: the argv systemd has loaded runs behind `nspawn
+attach-exec NAME --` (`src/attach.rs`), which execs it as it is unless an
+attached `run` waits for the machine on `/run/nspawn/attach/NAME.sock`; then it
+receives the run's terminal or input there and adds `--console=interactive` or
+`--console=pipe`, the console mode being something systemd-nspawn only takes
+on its command line. The exec keeps the PID, so `Type=notify`, signals and the
+exit status are systemd-nspawn's; and since `nspawn_t` executes `bin_t`
+programs as `unconfined_service_t`, systemd-nspawn runs in the domain it had.
 
 Overlay machines run under a user namespace like the others, and no released
 kernel lets an overlayfs mount be idmapped, so nspawn shifts the tree with a
