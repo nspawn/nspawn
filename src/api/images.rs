@@ -185,6 +185,7 @@ pub async fn remove_machines(
         match outcome {
             Ok(()) => {
                 line(report, format!("removed {name}"));
+                crate::api::events::emit("machine", "remove", name, &[]);
                 removal.removed.push(name.clone());
             }
             Err(e) => removal.failed.push((name.clone(), format!("{e:#}"))),

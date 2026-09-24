@@ -194,6 +194,12 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
         let _ = fs::remove_dir_all(&output_dir);
         None
     };
+    crate::api::events::emit(
+        "machine",
+        "build",
+        &name,
+        &[("reference", &image.to_string())],
+    );
     Ok(Built {
         name,
         reference: image.to_string(),

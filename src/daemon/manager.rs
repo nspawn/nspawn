@@ -998,6 +998,112 @@ impl Manager {
         ))
     }
 
+    /// Like `events`: what happens to machines, networks and volumes, one JSON object
+    /// per line under "stdout" (time, time_usec, type, action, name, attributes,
+    /// labels), journalctl's complaints under "stderr". Options since and until (s,
+    /// journalctl's time syntax; without until it follows), filters (as, KEY=VALUE:
+    /// name, type, event, label). The process object is journalctl's; it ends when
+    /// the reader leaves, or at until.
+    async fn events(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)> {
+        let owner = self.allow(&hdr, Action::Inspect).await?;
+        let _busy = self.state.enter();
+        let mut options = Options::new(&options);
+        let since = options.string("since")?;
+        let until = options.string("until")?;
+        let filters = api::events::Filters::parse(&options.strings("filters")?)?;
+        options.finish()?;
+        let argv = api::events::journalctl_arguments(since.as_deref(), until.as_deref());
+        let pipe = || {
+            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+                .map_err(|e| Error::Failed(format!("creating a pipe: {e}")))
+        };
+        let (out_r, out_w) = pipe()?;
+        let (err_r, err_w) = pipe()?;
+        // As for Logs: a copy of the writing end reports an error once nobody reads.
+        let watch = out_w
+            .try_clone()
+            .map_err(|e| Error::Failed(e.to_string()))?;
+        let mut child = tokio::process::Command::new("journalctl")
+            .args(&argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(err_w))
+            .spawn()
+            .map_err(|e| Error::Failed(format!("running journalctl: {e}")))?;
+        let pid = child.id().unwrap_or(0);
+        let pidfd = nsenter::pidfd_open(nix::unistd::Pid::from_raw(pid as i32)).ok();
+        let entries = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Failed("journalctl has no output".to_string()))?;
+        let mut out = tokio::net::unix::pipe::Sender::from_owned_fd(out_w)
+            .map_err(|e| Error::Failed(format!("preparing the events' pipe: {e}")))?;
+        let ctx = self.state.ctx.clone();
+        let wait = async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let reader_gone = async {
+                match tokio::io::unix::AsyncFd::with_interest(watch, tokio::io::Interest::ERROR) {
+                    Ok(watch) => {
+                        let _ = watch.ready(tokio::io::Interest::ERROR).await;
+                    }
+                    Err(_) => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(reader_gone);
+            let mut lines = tokio::io::BufReader::new(entries).lines();
+            let mut mapper = api::events::Mapper::default();
+            loop {
+                tokio::select! {
+                    line = lines.next_line() => {
+                        let Ok(Some(line)) = line else { break };
+                        let Ok(entry) = serde_json::from_str(&line) else { continue };
+                        let Some(mut event) = mapper.map(&entry) else { continue };
+                        if event.kind == "machine" {
+                            if let Ok(Some(record)) = ctx.store.load_image(&event.name) {
+                                event.attributes.insert("image".into(), record.reference.clone());
+                                event.labels = record.effective_labels();
+                            }
+                        }
+                        if !filters.matches(&event) {
+                            continue;
+                        }
+                        let text = format!("{}\n", event.to_json());
+                        if out.write_all(text.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ = &mut reader_gone => break,
+                }
+            }
+            drop(out);
+            match child.try_wait() {
+                Ok(Some(status)) => status_code(status),
+                _ => {
+                    let _ = child.kill().await;
+                    match child.wait().await {
+                        // Ended at until on its own between the two looks.
+                        Ok(status) if status.success() => 0,
+                        _ => 128 + nix::libc::SIGKILL,
+                    }
+                }
+            }
+        };
+        let mut command = vec!["journalctl".to_string()];
+        command.extend(argv);
+        let path = processes::register(&self.state, owner, "", &command, pid, pidfd, wait).await?;
+        Ok((
+            HashMap::from([
+                ("stdout".to_string(), zbus::zvariant::OwnedFd::from(out_r)),
+                ("stderr".to_string(), zbus::zvariant::OwnedFd::from(err_r)),
+            ]),
+            path,
+        ))
+    }
+
     /// Like `exec`: runs argv inside the machine as `user` ("" for root), and hands out
     /// its streams: with option tty (b, default true) a pseudo terminal of rows x cols
     /// (t, default 24 x 80) under "tty", otherwise pipes under "stdin", "stdout" and

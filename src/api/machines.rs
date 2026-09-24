@@ -257,6 +257,7 @@ pub async fn prepare(
             }
             std::fs::create_dir_all(&source)
                 .with_context(|| format!("creating volume {}", source.display()))?;
+            crate::api::events::emit("volume", "create", &volume.source, &[]);
         }
         binds.push(Bind {
             source,
@@ -843,6 +844,7 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
             timeout: 0,
         };
         stop(ctx, &request, report).await?;
+        crate::api::events::emit("machine", "kill", &args.name, &[("signal", "9")]);
         return Ok(());
     }
     let record = ctx.store.load_image(&args.name)?;
@@ -865,6 +867,12 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
     } else {
         sd.kill_machine(&args.name, "leader", signal).await?;
     }
+    crate::api::events::emit(
+        "machine",
+        "kill",
+        &args.name,
+        &[("signal", &signal.to_string())],
+    );
     Ok(())
 }
 
@@ -955,6 +963,7 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     if reload || changed {
         sd.reload().await?;
     }
+    crate::api::events::emit("machine", "update", &args.name, &[]);
     Ok(running)
 }
 

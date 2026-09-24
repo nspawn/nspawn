@@ -128,6 +128,12 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
         report,
     )
     .await?;
+    crate::api::events::emit(
+        "machine",
+        "pull",
+        &name,
+        &[("reference", &image.to_string())],
+    );
     Ok(Pulled {
         name,
         reference: image.to_string(),

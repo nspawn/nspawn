@@ -6,6 +6,7 @@
 pub mod build;
 pub mod copy;
 pub mod create;
+pub mod events;
 pub mod hub;
 pub mod images;
 pub mod login;

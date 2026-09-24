@@ -29,6 +29,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `nsenter.rs`, `pty.rs` | exec through namespaces, terminal pumping |
 | `api/copy.rs` | cp: tar streams packed and unpacked relative to directory descriptors, paths resolved with openat2 inside the machine's root |
 | `systemd.rs` | typed D-Bus calls, job waiting |
+| `journal.rs`, `api/events.rs` | structured journal entries for nspawn's own events; the journal read back as events |
 
 ## On disk
 
@@ -149,6 +150,17 @@ become `JobOutput` signals and the object's `Output`, the progress of its
 downloads and uploads `JobProgress` signals, and `JobRemoved` says how it
 ended. machined's `MachineNew` and `MachineRemoved` are relayed as
 `MachineStarted` and `MachineStopped` for the machines nspawn installed.
+
+`Events` keeps no history of its own: systemd logs every start, end, restart
+and stop of a unit with a message ID of its own, and nspawn logs what it does
+(pulls, removals, kills) the same way, as structured entries under message ID
+`b0b60147942247cab22cc49510006a0b` with `NSPAWN_TYPE`, `NSPAWN_ACTION`,
+`NSPAWN_NAME` and `NSPAWN_ATTR_*` fields. The service runs `journalctl
+--output=json` with field matches only (PID 1's entries, nspawn's own, both
+from uid 0, fields journald sets itself), maps them to events, adds the image
+and labels of the machine's record and writes JSON lines into the client's
+pipe. A clean exit is not logged as such, only as the unit's success, so a
+success without an exit logged in the same invocation is `die` with code 0.
 
 The command line is a client of that service, so one code path does the
 work: `commands/` converts arguments into calls and prints what comes back,

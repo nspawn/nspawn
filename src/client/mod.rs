@@ -102,6 +102,10 @@ pub trait Manager {
         user: &str,
         options: Options<'_>,
     ) -> zbus::Result<(zbus::zvariant::OwnedFd, String)>;
+    fn events(
+        &self,
+        options: Options<'_>,
+    ) -> zbus::Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)>;
     fn logs(
         &self,
         machine: &str,

@@ -183,6 +183,12 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     record.restart = request.restart.unwrap_or_default();
     record.limits = limits;
     store.record_image(&record)?;
+    crate::api::events::emit(
+        "machine",
+        "create",
+        &request.name,
+        &[("from", &request.source), ("reference", &record.reference)],
+    );
     Ok(Created {
         name: request.name.clone(),
         mode,

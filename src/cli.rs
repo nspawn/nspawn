@@ -66,6 +66,8 @@ pub enum Command {
     Update(UpdateArgs),
     /// What running machines use: CPU, memory, network, disk, processes, like docker stats.
     Stats(StatsArgs),
+    /// What happens to machines, networks and volumes, as it happens, like docker events.
+    Events(EventsArgs),
     /// Remove machines and what they alone use, like docker rm (same as images rm).
     Rm(RmArgs),
     /// Run a command inside a running machine.
@@ -416,6 +418,25 @@ pub struct StatsArgs {
     #[arg(long)]
     pub no_stream: bool,
     /// One JSON object per machine and sample.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct EventsArgs {
+    /// Show events since this time (journalctl's syntax: "2026-09-24 10:00", "-1h",
+    /// "today"); without it, only new ones.
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Stop at this time instead of waiting for new events.
+    #[arg(long)]
+    pub until: Option<String>,
+    /// Only matching events: name=NAME, type=machine|network|volume, event=ACTION,
+    /// label=KEY or label=KEY=VALUE. Repeatable: the same key matches either value,
+    /// different keys must all match.
+    #[arg(long = "filter", short = 'f', value_name = "KEY=VALUE")]
+    pub filters: Vec<String>,
+    /// One JSON object per event.
     #[arg(long)]
     pub json: bool,
 }

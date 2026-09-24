@@ -122,6 +122,10 @@ iptables_domtrans(nspawn_t)
 kernel_rw_net_sysctls(nspawn_t)
 sysnet_read_ifconfig_run_files(nspawn_t)
 
+# nspawn's own events go to the journal as structured entries, through
+# journald's native socket.
+logging_send_syslog_msg(nspawn_t)
+
 # Logs come from journalctl, into a pipe of the service, and journalctl is stopped
 # once nobody reads it. For a machine's own journal (logs --inside) journalctl
 # receives the machine's root directory from machined over the bus and reads

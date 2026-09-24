@@ -27,6 +27,7 @@ nspawn stats                        # CPU, memory, network and disk of running m
 nspawn exec fedora-44 -- /usr/bin/systemctl is-system-running
 nspawn shell fedora-44
 nspawn logs fedora-44               # console output; --inside reads the machine's own journal
+nspawn events --filter name=web     # starts, exits, restarts, pulls and removals as they happen
 nspawn cp ./nginx.conf web:/etc/nginx/   # copy files in or out, like docker cp
 nspawn stop fedora-44
 nspawn kill -s HUP web              # a signal for the program, like docker kill (SIGKILL by default)
@@ -102,6 +103,13 @@ start, like docker update: a running machine gets the new limits in its cgroup a
 second (`--no-stream` for one reading, `--json` for scripts). With a policy, `stop --no-wait`
 of an app also lets the stub init send the program SIGTERM and SIGHUP, since nobody
 stays to stop the unit later.
+
+`events` is docker events: what happens to machines (`start`, `die` with its exit code,
+`stop`, `restart`, `oom`, `fail`, and nspawn's own `pull`, `build`, `create`, `push`,
+`kill`, `update`, `remove`), networks and volumes, as it happens or between `--since`
+and `--until`, filtered by name, type, event or label, as text or `--json`. It reads
+the journal, so machines started by `machinectl`, at boot or by a restart policy are
+there too, and so is what happened while nobody watched.
 
 `exec` enters the machine's namespaces for both kinds of machine, like docker exec: the
 exit code comes back, the image's environment applies and nothing is needed inside (no

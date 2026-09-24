@@ -109,6 +109,12 @@ pub async fn push(ctx: &Context, request: &PushRequest, report: Report<'_>) -> R
     let url = hub
         .push_manifest(&dest, &manifest_bytes, media_type)
         .await?;
+    crate::api::events::emit(
+        "machine",
+        "push",
+        &record.name,
+        &[("reference", &destination.to_string())],
+    );
     Ok(Pushed {
         name: record.name,
         destination: destination.to_string(),

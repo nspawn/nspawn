@@ -496,6 +496,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         Command::Kill(args) => machines::kill(args, client).await,
         Command::Update(args) => machines::update(args, client).await,
         Command::Stats(args) => stats::stats(args, client).await,
+        Command::Events(args) => machines::events(args, client).await,
         Command::Exec(args) => machines::exec(args, client).await,
         Command::Shell(args) => machines::shell(args, client).await,
         Command::Logs(args) => machines::logs(args, client).await,

@@ -712,6 +712,38 @@ $NSPAWN kill -s BOGUS $app 2>/dev/null && fail "kill -s BOGUS succeeded"
 $NSPAWN ps | grep_q "^ *$app " || fail "a refused kill ended the machine"
 $NSPAWN stop $app >/dev/null || fail "stop after the kill checks"
 
+step "events: what happens to machines, as it happens and afterwards"
+since=$(date '+%Y-%m-%d %H:%M:%S')
+$NSPAWN events --json > /tmp/e2e-events.json 2>/tmp/e2e-events.err &
+events_pid=$!
+sleep 2
+$NSPAWN start $app --restart no -p none -- /bin/sh -c 'sleep 1; exit 3' >/dev/null 2>&1
+retry 10 bash -c "! $NSPAWN ps | grep_q '^ *$app '" || fail "the program that exits 3 did not end"
+$NSPAWN start $app -- /bin/sleep 300 >/dev/null || fail "start before kill"
+$NSPAWN kill $app >/dev/null || fail "kill for the events"
+$NSPAWN volume create e2evol-events >/dev/null || fail "volume create for the events"
+$NSPAWN volume rm e2evol-events >/dev/null || fail "volume rm for the events"
+# A user cannot pass an entry of their own off as nspawn's.
+printf 'MESSAGE=forged\nMESSAGE_ID=b0b60147942247cab22cc49510006a0b\nNSPAWN_TYPE=machine\nNSPAWN_ACTION=start\nNSPAWN_NAME=e2e-forged\n' | runuser -u nobody -- logger --journald 2>/dev/null
+sleep 3
+kill $events_pid 2>/dev/null; wait $events_pid 2>/dev/null
+python3 - "$app" /tmp/e2e-events.json <<'PY' || fail "events did not report what happened: $(cat /tmp/e2e-events.json /tmp/e2e-events.err)"
+import json, sys
+app, path = sys.argv[1], sys.argv[2]
+events = [json.loads(l) for l in open(path) if l.strip()]
+seen = {(e["type"], e["action"], e["name"]) for e in events}
+for want in [("machine", "start", app), ("machine", "die", app), ("machine", "kill", app),
+             ("volume", "create", "e2evol-events"), ("volume", "remove", "e2evol-events")]:
+    assert want in seen, (want, sorted(seen))
+assert any(e["action"] == "die" and e["name"] == app and e["attributes"].get("exit_code") == "3" for e in events), events
+assert all(e["name"] != "e2e-forged" for e in events), "a forged entry was reported"
+assert all(e["time"].endswith("Z") for e in events)
+PY
+out=$(timeout 30 $NSPAWN events --since "$since" --until now --filter name=$app --filter event=die) || fail "events --since --until did not end by itself: $out"
+echo "$out" | grep_q "machine die $app (.*exit_code=3" || fail "events --since --until misses the exit: $out"
+echo "$out" | grep -v "machine die $app " | grep_q . && fail "events --filter let other events through: $out"
+$NSPAWN events --filter colour=red 2>/dev/null && fail "events with an unknown filter succeeded"
+
 step "resource limits: memory, cpus and processes of the whole machine"
 $NSPAWN start $app -m 64m --cpus 0.5 --pids-limit 100 -- /bin/sleep 300 || fail "start with limits"
 [ "$(systemctl show -p MemoryMax --value systemd-nspawn@$app.service)" = 67108864 ] || fail "MemoryMax not set"
@@ -843,7 +875,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine StopMachine KillMachine UpdateMachine Exec Shell Logs ListNetwork NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine StopMachine KillMachine UpdateMachine Exec Events Shell Logs ListNetwork NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do

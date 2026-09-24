@@ -90,7 +90,12 @@ pub async fn create(ctx: &Context, name: &str) -> Result<PathBuf> {
     require_root("volume create")?;
     let store = &ctx.store;
     let _lock = store.lock().await?;
-    create_in(store, name)
+    let new = !store.volumes_dir().join(name).is_dir();
+    let path = create_in(store, name)?;
+    if new {
+        crate::api::events::emit("volume", "create", name, &[]);
+    }
+    Ok(path)
 }
 
 fn create_in(store: &Store, name: &str) -> Result<PathBuf> {
@@ -138,6 +143,7 @@ fn remove_in(store: &Store, names: &[String], report: Report<'_>) -> Result<Remo
         match outcome {
             Ok(()) => {
                 line(report, format!("removed {name}"));
+                crate::api::events::emit("volume", "remove", name, &[]);
                 removal.removed.push(name.clone());
             }
             Err(e) => removal.failed.push((name.clone(), format!("{e:#}"))),
@@ -209,6 +215,7 @@ fn prune_in(store: &Store, report: Report<'_>) -> Result<Vec<String>> {
         }
         remove_one(store, &volume.name, &users)?;
         line(report, format!("removed {}", volume.name));
+        crate::api::events::emit("volume", "remove", &volume.name, &[]);
         removed.push(volume.name);
     }
     Ok(removed)

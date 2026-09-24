@@ -12,8 +12,8 @@ use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow, Signal};
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 use crate::cli::{
-    ExecArgs, KillArgs, LogsArgs, ModeChoice, PsArgs, PullPolicy, RunArgs, ShellArgs, StartArgs,
-    StartOptions, StopArgs, UpdateArgs,
+    EventsArgs, ExecArgs, KillArgs, LogsArgs, ModeChoice, PsArgs, PullPolicy, RunArgs, ShellArgs,
+    StartArgs, StartOptions, StopArgs, UpdateArgs,
 };
 use crate::client::{self, Client, Dict, Ended, Options};
 use crate::config::Config;
@@ -488,6 +488,79 @@ fn copy(mut from: File, mut to: impl Write) -> Result<()> {
     }
 }
 
+/// docker events: the service reads the journal and sends one JSON object per event.
+pub async fn events(args: EventsArgs, client: &Client) -> Result<()> {
+    // A bad filter is said before anything is asked.
+    crate::api::events::Filters::parse(&args.filters)?;
+    let mut options = Options::new();
+    if let Some(since) = args.since {
+        options.insert("since", Value::from(since));
+    }
+    if let Some(until) = args.until {
+        options.insert("until", Value::from(until));
+    }
+    if !args.filters.is_empty() {
+        options.insert("filters", Value::from(args.filters));
+    }
+    let (mut fds, process) = client
+        .manager
+        .events(options)
+        .await
+        .map_err(client::error)?;
+    let ended = Ended::watch(&client.connection, process).await?;
+    let (Some(stdout), Some(stderr)) = (fds.remove("stdout"), fds.remove("stderr")) else {
+        bail!("the service returned no streams for the events");
+    };
+    let json = args.json;
+    let err = thread::spawn(move || copy(File::from(OwnedFd::from(stderr)), io::stderr().lock()));
+    tokio::task::block_in_place(|| -> Result<()> {
+        use std::io::BufRead;
+        let mut out = io::stdout().lock();
+        for line in io::BufReader::new(File::from(OwnedFd::from(stdout))).lines() {
+            let line = line.context("reading the events")?;
+            if json {
+                writeln!(out, "{line}")?;
+            } else if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                writeln!(out, "{}", event_line(&event))?;
+            }
+            out.flush()?;
+        }
+        Ok(())
+    })?;
+    err.join()
+        .map_err(|_| anyhow::anyhow!("stderr pump panicked"))??;
+    let code = ended.status().await?;
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// An event as docker events prints it: time, type, action, name, then its attributes
+/// and labels.
+fn event_line(event: &serde_json::Value) -> String {
+    let text = |key: &str| event.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    let mut details: Vec<String> = Vec::new();
+    for key in ["attributes", "labels"] {
+        if let Some(map) = event.get(key).and_then(|v| v.as_object()) {
+            for (k, v) in map {
+                details.push(format!("{k}={}", v.as_str().unwrap_or("")));
+            }
+        }
+    }
+    let mut line = format!(
+        "{} {} {} {}",
+        text("time"),
+        text("type"),
+        text("action"),
+        text("name")
+    );
+    if !details.is_empty() {
+        line.push_str(&format!(" ({})", details.join(", ")));
+    }
+    line
+}
+
 /// docker logs: journalctl's output comes through pipes from the service, and its exit
 /// status through the process object.
 pub async fn logs(args: LogsArgs, client: &Client) -> Result<()> {
@@ -522,6 +595,24 @@ pub async fn logs(args: LogsArgs, client: &Client) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn events_read_like_docker_events() {
+        let event = serde_json::json!({
+            "time": "2026-09-24T10:00:00.000001Z",
+            "type": "machine",
+            "action": "die",
+            "name": "web",
+            "attributes": {"exit_code": "1", "code": "exited"},
+            "labels": {"caddy": "web.example"},
+        });
+        assert_eq!(
+            event_line(&event),
+            "2026-09-24T10:00:00.000001Z machine die web (code=exited, exit_code=1, caddy=web.example)"
+        );
+        let bare = serde_json::json!({"time": "t", "type": "volume", "action": "create", "name": "data", "attributes": {}, "labels": {}});
+        assert_eq!(event_line(&bare), "t volume create data");
+    }
 
     #[test]
     fn run_reuses_a_local_image_and_asks_the_registry_otherwise() {

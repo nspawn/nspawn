@@ -16,6 +16,7 @@ mod daemon;
 mod hostnet;
 mod hub;
 mod install;
+mod journal;
 mod layout;
 mod nsenter;
 mod oci;
@@ -44,6 +45,16 @@ async fn main() {
         );
     }
     let args = cli::Cli::parse();
+    // The service writes into its clients' pipes (events, attached runs): a client that
+    // leaves must cost it a write error, not its life.
+    if matches!(args.command, cli::Command::Daemon(_)) {
+        unsafe {
+            let _ = nix::sys::signal::signal(
+                nix::sys::signal::Signal::SIGPIPE,
+                nix::sys::signal::SigHandler::SigIgn,
+            );
+        }
+    }
     if let Err(err) = commands::run(args).await {
         eprintln!("error: {err:#}");
         std::process::exit(1);
