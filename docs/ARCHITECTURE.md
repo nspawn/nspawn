@@ -139,7 +139,8 @@ work: `commands/` converts arguments into calls and prints what comes back,
 follows jobs line by line (with a bar for each transfer when standard error is
 a terminal), attaches the terminal to the descriptors `Exec`,
 `Shell` and `Logs` hand over, and packs or unpacks the tar streams of `CopyTo`
-and `CopyFrom`. The registry and CA certificate the
+and `CopyFrom`. `run` is the one command made of several calls, as docker's
+is: `PullImage` or `CreateMachine`, then `StartMachine`. The registry and CA certificate the
 command line was given travel as options of each call, so `--registry`,
 `--ca-cert` and the environment keep their meaning. Only the service itself,
 `daemon --install` and the unit hooks (`network prepare`, `publish`,

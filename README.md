@@ -15,6 +15,7 @@ nspawn pull fedora:44               # download and assemble an image
 nspawn images ls                    # local images (all of them, not only ours)
 nspawn start fedora-44              # boot it as a machine
 nspawn create fedora-44 web2        # another machine from the same local image, docker create style
+nspawn run nginx:1.27 --name web -p 8080:80   # make a machine and start it, like docker run -d
 nspawn start web -p 8080:80 -e KEY=v -v /srv/data:/data -v pgdata:/var/lib/pg   # docker-style flags
 nspawn start web --label caddy=web.example   # labels for whoever reads them (inspect, ps --json)
 nspawn start web --restart unless-stopped -m 512m --cpus 1   # restart policy and limits, like docker
@@ -34,6 +35,12 @@ nspawn build -t team/app:1 ./app    # mkosi -t oci on ./app, imported as a local
 nspawn push team/app:1              # upload it to the hub (layers already there are skipped)
 nspawn push app-1 --to team/app:2   # push a local image under another tag
 ```
+
+`run` is `pull` (or `create` from a local image with the same reference, as docker's
+`--pull missing` has it) followed by `start`, with the flags of both; `--pull always` asks
+the registry every time and `--pull never` never. Like `docker run -d` it returns once the
+machine runs: `nspawn logs -f NAME` follows its output. A name that is taken is refused
+unless `--force`, which makes the machine anew.
 
 `build` runs `mkosi` in the given directory with `--format=oci`, so the same
 `mkosi.conf` tree that works on its own works here; `--distribution`, `--release`,

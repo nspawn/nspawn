@@ -1,5 +1,5 @@
-//! The terminal side of machines: the ps table, start and stop, and the commands that
-//! own the terminal (exec, shell, logs), whose streams come from the service.
+//! The terminal side of machines: the ps table, start, run and stop, and the commands
+//! that own the terminal (exec, shell, logs), whose streams come from the service.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -11,10 +11,15 @@ use anyhow::{bail, Context as _, Result};
 use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow, Signal};
 use zbus::zvariant::{OwnedObjectPath, Value};
 
-use crate::cli::{ExecArgs, LogsArgs, PsArgs, ShellArgs, StartArgs, StopArgs};
+use crate::cli::{
+    ExecArgs, LogsArgs, ModeChoice, PsArgs, PullPolicy, RunArgs, ShellArgs, StartArgs,
+    StartOptions, StopArgs,
+};
 use crate::client::{self, Client, Dict, Ended, Options};
+use crate::config::Config;
 use crate::output::{human_duration, table};
 use crate::pty;
+use crate::reference::ImageRef;
 use crate::store::now_unix;
 
 pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
@@ -113,6 +118,15 @@ fn describe(machine: &Dict) -> (String, String, String) {
 }
 
 pub async fn start(args: StartArgs, client: &Client) -> Result<()> {
+    let mut options = start_options(args.options)?;
+    if args.image_command {
+        options.insert("image_command", Value::from(true));
+    }
+    start_machine(client, &args.name, options).await
+}
+
+/// The options of a StartMachine call from what start or run was given.
+fn start_options(args: StartOptions) -> Result<Options<'static>> {
     let mut options = Options::new();
     options.insert("wait", Value::from(args.wait));
     if let Some(network) = args.network {
@@ -149,29 +163,121 @@ pub async fn start(args: StartArgs, client: &Client) -> Result<()> {
     if let Some(pids) = args.pids_limit {
         options.insert("pids_limit", Value::from(pids));
     }
-    if args.image_command {
-        options.insert("image_command", Value::from(true));
-    }
     if !args.command.is_empty() {
         options.insert("command", Value::from(args.command));
     }
+    Ok(options)
+}
+
+async fn start_machine(client: &Client, name: &str, options: Options<'_>) -> Result<()> {
     let (outcome, notes) = client
         .manager
-        .start_machine(&args.name, options)
+        .start_machine(name, options)
         .await
         .map_err(client::error)?;
     for note in &notes {
         eprintln!("{note}");
     }
     match outcome.as_str() {
-        "ended" => println!("{} ran and ended already", args.name),
+        "ended" => println!("{name} ran and ended already"),
         "restarting" => println!(
-            "{0} ended right after starting and is being restarted; see nspawn logs {0}",
-            args.name
+            "{name} ended right after starting and is being restarted; see nspawn logs {name}"
         ),
-        _ => println!("started {}", args.name),
+        _ => println!("started {name}"),
     }
     Ok(())
+}
+
+/// Where run takes a machine from.
+#[derive(Debug, PartialEq, Eq)]
+enum Source {
+    /// A local image with the reference: create, no registry.
+    Local(String),
+    Registry,
+}
+
+/// `images` are the local images as (name, reference). An existing machine of that name
+/// is started with start, or made anew with --force; a mode other than auto can only
+/// come with a pull.
+fn run_source(
+    images: &[(String, String)],
+    reference: &str,
+    name: &str,
+    force: bool,
+    pull: PullPolicy,
+    mode_given: bool,
+) -> Result<Source> {
+    if !force && images.iter().any(|(n, _)| n == name) {
+        bail!("machine {name} exists: nspawn start {name}, or nspawn run --force to make it anew");
+    }
+    let local = images
+        .iter()
+        .find(|(n, r)| r == reference && n != name)
+        .map(|(n, _)| n.clone());
+    Ok(match (pull, local) {
+        (PullPolicy::Always, _) => Source::Registry,
+        (PullPolicy::Never, _) if mode_given => {
+            bail!("--mode takes a pull of the image; drop it, or use --pull missing")
+        }
+        (PullPolicy::Never, None) => {
+            bail!("no local image of {reference}; pull it, or use --pull missing")
+        }
+        (_, Some(source)) if !mode_given => Source::Local(source),
+        _ => Source::Registry,
+    })
+}
+
+/// docker run -d: the machine from a local image with the reference or from the registry,
+/// then started with the options given, which it keeps like after start.
+pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> {
+    let registry = super::registry_name(client, config).await;
+    let image = ImageRef::parse(&args.reference, &registry)?;
+    let name = args.name.clone().unwrap_or_else(|| image.local_name());
+    let images: Vec<(String, String)> = client
+        .manager
+        .list_images()
+        .await
+        .map_err(client::error)?
+        .iter()
+        .map(|i| (client::string(i, "name"), client::string(i, "reference")))
+        .collect();
+    let source = run_source(
+        &images,
+        &image.to_string(),
+        &name,
+        args.force,
+        args.pull,
+        args.mode != ModeChoice::Auto,
+    )?;
+    let mut options = client::registry_options(config);
+    options.insert("force", Value::from(args.force));
+    if args.backend != crate::cli::BackendChoice::Auto {
+        options.insert(
+            "backend",
+            Value::from(format!("{:?}", args.backend).to_lowercase()),
+        );
+    }
+    let manager = &client.manager;
+    match source {
+        Source::Local(source) => {
+            client
+                .run_job(|| manager.create_machine(&source, &name, options))
+                .await?;
+        }
+        Source::Registry => {
+            options.insert("name", Value::from(name.clone()));
+            if args.mode != ModeChoice::Auto {
+                options.insert(
+                    "mode",
+                    Value::from(format!("{:?}", args.mode).to_lowercase()),
+                );
+            }
+            client
+                .run_job(|| manager.pull_image(&args.reference, options))
+                .await?;
+        }
+    }
+    start_machine(client, &name, start_options(args.options)?).await
 }
 
 pub async fn stop(args: StopArgs, client: &Client) -> Result<()> {
@@ -348,4 +454,64 @@ pub async fn logs(args: LogsArgs, client: &Client) -> Result<()> {
         std::process::exit(code);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_reuses_a_local_image_and_asks_the_registry_otherwise() {
+        let nginx = "docker.io/library/nginx:1.27";
+        let images = vec![
+            ("web".to_string(), nginx.to_string()),
+            (
+                "fedora-44".to_string(),
+                "hub.nspawn.org/fedora:44".to_string(),
+            ),
+            ("vm".to_string(), String::new()),
+        ];
+        let source = |name: &str, force: bool, pull: PullPolicy, mode: bool| {
+            run_source(&images, nginx, name, force, pull, mode)
+        };
+        assert_eq!(
+            source("web2", false, PullPolicy::Missing, false).unwrap(),
+            Source::Local("web".to_string()),
+            "a local image with the reference is made into another machine"
+        );
+        assert_eq!(
+            source("web2", false, PullPolicy::Always, false).unwrap(),
+            Source::Registry
+        );
+        assert_eq!(
+            source("web2", false, PullPolicy::Missing, true).unwrap(),
+            Source::Registry,
+            "a mode of its own takes a pull"
+        );
+        let taken = source("web", false, PullPolicy::Missing, false).unwrap_err();
+        assert!(taken.to_string().contains("nspawn start web"), "{taken}");
+        assert!(
+            source("vm", false, PullPolicy::Missing, false).is_err(),
+            "an image machined lists takes the name too"
+        );
+        assert_eq!(
+            source("web", true, PullPolicy::Missing, false).unwrap(),
+            Source::Registry,
+            "made anew from the registry: the one local copy is the machine itself"
+        );
+        assert!(run_source(
+            &images,
+            "hub.nspawn.org/x:1",
+            "x",
+            false,
+            PullPolicy::Never,
+            false
+        )
+        .is_err());
+        assert_eq!(
+            source("web2", false, PullPolicy::Never, false).unwrap(),
+            Source::Local("web".to_string())
+        );
+        assert!(source("web2", false, PullPolicy::Never, true).is_err());
+    }
 }

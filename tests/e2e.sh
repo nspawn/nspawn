@@ -69,7 +69,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -468,6 +468,21 @@ $NSPAWN ps | grep "^ *$app " | grep_q "18081->80/tcp" || fail "app port not show
 $NSPAWN stop $app || fail "stop busybox"
 retry 15 bash -c "! $NSPAWN machines ls | grep_q '^ *$app '" || fail "busybox still running after stop"
 [ -e /run/netns/nspawn-$app ] && fail "network namespace left behind for $app"
+
+step "run: a machine from an image and started in one step, like docker run -d"
+# busybox is here as $app: run makes another machine of it without the registry.
+$NSPAWN run docker.io/library/busybox:latest --name e2e-run -p 18082:80 -- /bin/sh -c "mkdir -p /www; echo run-$nonce > /www/index.html; exec /bin/httpd -f -p 80 -h /www" > /tmp/e2e-run.txt 2>&1 || { cat /tmp/e2e-run.txt; fail "run from a local image"; }
+cat /tmp/e2e-run.txt
+grep_q "started e2e-run" /tmp/e2e-run.txt || fail "run did not say it started e2e-run"
+grep_q "downloading" /tmp/e2e-run.txt && fail "run downloaded an image that is here already"
+retry 10 bash -c "curl -sf -m 5 http://127.0.0.1:18082/ | grep_q run-$nonce" || fail "the port run published does not answer"
+$NSPAWN inspect e2e-run | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['state'] == 'running' and d['origin'] == 'create' and d['ports'] == ['18082->80/tcp'], d" || fail "inspect of the machine run made"
+out=$($NSPAWN run docker.io/library/busybox:latest --name e2e-run 2>&1) && fail "run made a machine over a running one"
+echo "$out" | grep_q "nspawn start e2e-run" || fail "run over an existing name did not point to start: $out"
+out=$($NSPAWN run e2e/nothing-$nonce:1 --pull never 2>&1) && fail "run --pull never pulled"
+echo "$out" | grep_q "no local image" || fail "run --pull never without a local image was not explained: $out"
+$NSPAWN images ls | grep_q "nothing-$nonce" && fail "run --pull never left an image behind"
+$NSPAWN rm -f e2e-run >/dev/null || fail "rm -f e2e-run"
 systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit left in failed state after stop"
 
 step "host network, --no-wait, an app's shell and a missing program"

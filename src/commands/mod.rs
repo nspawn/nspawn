@@ -122,7 +122,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 }
 
 /// The registry a call went to: ours when we named one, the service's otherwise.
-async fn registry_name(client: &Client, config: &Config) -> String {
+pub(super) async fn registry_name(client: &Client, config: &Config) -> String {
     if config.registry_set {
         return config.registry.clone();
     }
@@ -488,6 +488,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             Ok(())
         }
         Command::Start(args) => machines::start(args, client).await,
+        Command::Run(args) => machines::run(args, client, config).await,
         Command::Stop(args) => machines::stop(args, client).await,
         Command::Exec(args) => machines::exec(args, client).await,
         Command::Shell(args) => machines::shell(args, client).await,

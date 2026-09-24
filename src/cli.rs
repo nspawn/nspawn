@@ -38,6 +38,9 @@ pub enum Command {
     Logout(LogoutArgs),
     /// Download an image from the hub and make it available to machinectl.
     Pull(PullArgs),
+    /// Make a machine from an image and start it, like docker run -d: a local image with
+    /// that reference is reused, the hub is asked otherwise.
+    Run(RunArgs),
     /// Build an image with mkosi and make it available locally, ready to push.
     Build(BuildArgs),
     /// Make another machine from a local image, like docker create (no registry needed).
@@ -414,6 +417,52 @@ pub struct InspectArgs {
 pub struct StartArgs {
     /// Image name.
     pub name: String,
+    #[command(flatten)]
+    pub options: StartOptions,
+    /// Forget the remembered entrypoint and arguments and run the image's own again.
+    #[arg(long)]
+    pub image_command: bool,
+}
+
+/// When `run` asks the registry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum PullPolicy {
+    /// Only when no local image has the reference.
+    Missing,
+    /// Every time, for the image the tag names now.
+    Always,
+    /// Never: a local image with the reference, or nothing.
+    Never,
+}
+
+#[derive(Args, Debug)]
+pub struct RunArgs {
+    /// Image reference: [registry/]repository[:tag|@digest], for example nginx:1.27.
+    pub reference: String,
+    /// Name of the machine (default: derived from the reference, e.g. nginx-1.27).
+    #[arg(long, short = 'n')]
+    pub name: Option<String>,
+    /// When to ask the registry: missing (a local image with the reference is reused),
+    /// always or never.
+    #[arg(long, value_enum, default_value_t = PullPolicy::Missing)]
+    pub pull: PullPolicy,
+    /// How to assemble the machine on this host.
+    #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
+    pub backend: BackendChoice,
+    /// Whether the image boots an init system or runs a single program; a mode other
+    /// than auto always pulls.
+    #[arg(long, value_enum, default_value_t = ModeChoice::Auto)]
+    pub mode: ModeChoice,
+    /// Make the machine anew when one of that name exists (it must be stopped).
+    #[arg(long, short = 'f')]
+    pub force: bool,
+    #[command(flatten)]
+    pub options: StartOptions,
+}
+
+/// What `start` and `run` give a machine; remembered for its next starts.
+#[derive(Args, Debug)]
+pub struct StartOptions {
     /// Do not wait for a booted machine's init to be up before returning (its
     /// registration is still awaited so that ports and firewall rules can be applied).
     #[arg(long = "no-wait", action = clap::ArgAction::SetFalse)]
@@ -458,9 +507,6 @@ pub struct StartArgs {
     /// Remembered; applied at the next start.
     #[arg(long, value_name = "N")]
     pub pids_limit: Option<u64>,
-    /// Forget the remembered entrypoint and arguments and run the image's own again.
-    #[arg(long)]
-    pub image_command: bool,
     /// For app images: the arguments after -- replace the image's cmd and follow its
     /// entrypoint, as with docker. Remembered for later starts.
     #[arg(last = true)]
@@ -557,6 +603,7 @@ mod tests {
             let text = String::from_utf8(out).expect("the generators write text");
             for word in [
                 "nspawn", "images", "machines", "network", "volume", "inspect", "rm", "restart",
+                "run",
             ] {
                 assert!(text.contains(word), "{shell} completions miss {word}");
             }
@@ -596,6 +643,7 @@ mod tests {
         let Command::Start(start) = cli.command else {
             panic!("not start");
         };
+        let start = start.options;
         assert_eq!(start.restart, Some(crate::policy::Restart::UnlessStopped));
         assert_eq!(start.memory, Some(64 << 20));
         assert_eq!(start.cpus, Some(0.5));
@@ -609,6 +657,35 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
         }
+        let cli = Cli::try_parse_from([
+            "nspawn",
+            "run",
+            "nginx:1.27",
+            "--name",
+            "web",
+            "-p",
+            "8080:80",
+            "--restart",
+            "always",
+            "--pull",
+            "never",
+            "--",
+            "nginx",
+            "-g",
+            "daemon off;",
+        ])
+        .unwrap();
+        let Command::Run(run) = cli.command else {
+            panic!("not run");
+        };
+        assert_eq!(run.reference, "nginx:1.27");
+        assert_eq!(run.name.as_deref(), Some("web"));
+        assert_eq!(run.pull, PullPolicy::Never);
+        assert_eq!(run.options.publish, ["8080:80"]);
+        assert_eq!(run.options.restart, Some(crate::policy::Restart::Always));
+        assert_eq!(run.options.command, ["nginx", "-g", "daemon off;"]);
+        assert!(run.options.wait, "run waits like start unless --no-wait");
+        assert!(Cli::try_parse_from(["nspawn", "run", "x", "--pull", "sometimes"]).is_err());
         let cli = Cli::try_parse_from(["nspawn", "rm", "-f", "a", "b"]).unwrap();
         let Command::Rm(rm) = cli.command else {
             panic!("not rm");
