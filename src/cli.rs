@@ -601,11 +601,7 @@ pub struct RunArgs {
     /// For app images, as with docker run: what follows the image replaces its cmd
     /// and follows its entrypoint (run -it alpine sh); after -- as well. Remembered for
     /// later starts.
-    #[arg(
-        trailing_var_arg = true,
-        allow_hyphen_values = true,
-        value_name = "COMMAND"
-    )]
+    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 }
 
@@ -859,6 +855,10 @@ mod tests {
         assert!(
             run.command.is_empty(),
             "options after the image are still options"
+        );
+        assert!(
+            Cli::try_parse_from(["nspawn", "run", "nginx", "--nmae", "web"]).is_err(),
+            "a mistyped option after the image is not taken for the command"
         );
         assert!(run.detach);
         assert_eq!(run.options.publish, ["80:80"]);
