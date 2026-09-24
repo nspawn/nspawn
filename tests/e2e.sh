@@ -377,8 +377,19 @@ $NSPAWN start e2e-a --restart no >/dev/null && $NSPAWN stop e2e-a >/dev/null || 
 layers_before=$(ls /var/lib/nspawn/layers | wc -l)
 $NSPAWN images rm e2e-a >/dev/null || fail "rm e2e-a"
 [ "$(ls /var/lib/nspawn/layers | wc -l)" = "$layers_before" ] || fail "layer removed while still referenced"
+# An image of the host's own may share the layer, which then rightly stays.
+shared=$(python3 -c "
+import glob, json
+layers = set(json.load(open('/var/lib/nspawn/images/e2e-b.json'))['layers'])
+print(' '.join(sorted(p for p in glob.glob('/var/lib/nspawn/images/*.json')
+    if not p.endswith('/e2e-b.json') and layers & set(json.load(open(p)).get('layers', [])))))")
 $NSPAWN images rm e2e-b | tee /tmp/e2e-rm.txt || fail "rm e2e-b"
-grep -q "freed 1 unused layer" /tmp/e2e-rm.txt || fail "unused layer not garbage collected"
+if [ -z "$shared" ]; then
+  grep -q "freed 1 unused layer" /tmp/e2e-rm.txt || fail "unused layer not garbage collected"
+else
+  echo "the layer of e2e-b is also used by $shared: its collection is not checked"
+  grep_q "unused layer" /tmp/e2e-rm.txt && fail "a layer another image uses was collected"
+fi
 [ -e /etc/systemd/system/machines.target.wants/systemd-nspawn@e2e-b.service ] && fail "images rm left e2e-b enabled at boot"
 
 step "build, push and pull round trip (docker-like flow)"
