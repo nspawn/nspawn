@@ -476,10 +476,15 @@ pub struct StatsArgs {
 pub struct EventsArgs {
     /// Show events since this time (journalctl's syntax: "2026-09-24 10:00", "-1h",
     /// "today"); without it, only new ones.
-    #[arg(long)]
+    #[arg(long, value_name = "WHEN", allow_hyphen_values = true)]
     pub since: Option<String>,
-    /// Stop at this time instead of waiting for new events.
-    #[arg(long)]
+    /// Stop at this time instead of waiting for new events (with --since).
+    #[arg(
+        long,
+        value_name = "WHEN",
+        allow_hyphen_values = true,
+        requires = "since"
+    )]
     pub until: Option<String>,
     /// Only matching events: name=NAME, type=machine|network|volume, event=ACTION,
     /// label=KEY or label=KEY=VALUE. Repeatable: the same key matches either value,
@@ -705,8 +710,8 @@ pub struct LogsArgs {
     /// Only the last N lines.
     #[arg(long, short = 'n', value_name = "N")]
     pub lines: Option<u32>,
-    /// Only output newer than this (journalctl --since syntax, e.g. "10 min ago").
-    #[arg(long, value_name = "WHEN")]
+    /// Only output newer than this (journalctl --since syntax, e.g. "10 min ago" or -1h).
+    #[arg(long, value_name = "WHEN", allow_hyphen_values = true)]
     pub since: Option<String>,
     /// Prefix every line with its timestamp.
     #[arg(long, short = 't')]
@@ -860,6 +865,15 @@ mod tests {
             Cli::try_parse_from(["nspawn", "run", "nginx", "--nmae", "web"]).is_err(),
             "a mistyped option after the image is not taken for the command"
         );
+        assert!(
+            Cli::try_parse_from(["nspawn", "events", "--until", "now"]).is_err(),
+            "until reads back and needs since"
+        );
+        assert!(
+            Cli::try_parse_from(["nspawn", "events", "--since", "-1h", "--until", "now"]).is_ok(),
+            "journalctl's relative times start with a hyphen"
+        );
+        assert!(Cli::try_parse_from(["nspawn", "logs", "web", "--since", "-10min"]).is_ok());
         assert!(run.detach);
         assert_eq!(run.options.publish, ["80:80"]);
         let cli = Cli::try_parse_from(["nspawn", "rm", "-f", "a", "b"]).unwrap();

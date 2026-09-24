@@ -1231,6 +1231,12 @@ impl Manager {
         let until = options.string("until")?;
         let filters = api::events::Filters::parse(&options.strings("filters")?)?;
         options.finish()?;
+        // A window of the past: without its start, it would read nothing and end.
+        if until.is_some() && since.is_none() {
+            return Err(Error::Failed(
+                "until reads events back and needs since as well".to_string(),
+            ));
+        }
         let argv = api::events::journalctl_arguments(since.as_deref(), until.as_deref());
         let pipe = || {
             nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
