@@ -611,6 +611,10 @@ $NSPAWN kill e2e-run >/dev/null || fail "kill of an attached run"
 wait $run_pid; rc=$?
 [ "$rc" = 137 ] || fail "run killed with SIGKILL did not exit with 137: $rc"
 retry 15 bash -c "! $NSPAWN images ls | grep_q '^ *e2e-run '" || fail "run --rm left a killed machine behind"
+# A reboot asked from inside ends a --rm run (the machine is not restarted then).
+timeout 60 $NSPAWN run --rm $bb --name e2e-run -- /bin/reboot -f >/dev/null 2>&1; rc=$?
+[ "$rc" = 133 ] || fail "run --rm of a program that reboots did not end with 133: $rc"
+retry 15 bash -c "! $NSPAWN images ls | grep_q '^ *e2e-run '" || fail "run --rm left a machine that rebooted behind"
 $NSPAWN run --name e2e-run $bb -- /bin/sh -c 'echo logged-$0' $nonce >/dev/null 2>&1 || fail "run without --rm"
 $NSPAWN logs e2e-run | grep_q "logged-$nonce" || fail "logs does not show what an attached run showed"
 $NSPAWN rm e2e-run >/dev/null || fail "rm the machine of an attached run"

@@ -63,6 +63,9 @@ pub struct UnitWatch {
     code: i32,
     status: i32,
     result: String,
+    /// The last run asked for a reboot (133): the next one follows, unless the unit is
+    /// not restarted (run --rm resets RestartForceExitStatus=).
+    rebooting: bool,
 }
 
 impl UnitWatch {
@@ -87,6 +90,7 @@ impl UnitWatch {
             code: 0,
             status: 0,
             result: String::new(),
+            rebooting: false,
         })
     }
 
@@ -99,14 +103,28 @@ impl UnitWatch {
     }
 
     /// Waits for the main process to end. A reboot asked from inside the machine is not
-    /// an end: systemd starts it again, and the watch goes on with the new run.
+    /// an end when systemd starts it again (the template restarts on 133): the watch
+    /// goes on with the new run.
     pub async fn ended(&mut self) -> Result<Ending> {
         while let Some(signal) = self.changes.next().await {
             let Ok(args) = signal.args() else { continue };
+            let changed: &HashMap<&str, zbus::zvariant::Value<'_>> = args.changed_properties();
+            if args.interface_name().as_str() == "org.freedesktop.systemd1.Unit" {
+                let active = changed
+                    .get("ActiveState")
+                    .and_then(|v| <&str>::try_from(v).ok());
+                if self.rebooting && matches!(active, Some("inactive" | "failed")) {
+                    return Ok(Ending {
+                        code: CLD_EXITED,
+                        status: REBOOT,
+                        result: self.result.clone(),
+                    });
+                }
+                continue;
+            }
             if args.interface_name().as_str() != "org.freedesktop.systemd1.Service" {
                 continue;
             }
-            let changed: &HashMap<&str, zbus::zvariant::Value<'_>> = args.changed_properties();
             let get_i32 = |key: &str| changed.get(key).and_then(|v| i32::try_from(v).ok());
             if let Some(pid) = changed
                 .get("ExecMainPID")
@@ -117,6 +135,7 @@ impl UnitWatch {
                     self.main_pid = pid;
                     self.code = 0;
                     self.status = 0;
+                    self.rebooting = false;
                 }
             }
             if let Some(code) = get_i32("ExecMainCode") {
@@ -133,6 +152,7 @@ impl UnitWatch {
             }
             if self.code == CLD_EXITED && self.status == REBOOT {
                 self.code = 0;
+                self.rebooting = true;
                 continue;
             }
             return Ok(Ending {
