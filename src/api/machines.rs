@@ -884,7 +884,10 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
     if policy != Restart::No && stop_signals(record.as_ref())?.contains(&signal) {
         ctx.store.mark_exit_on_next(&args.name)?;
     }
-    ctx.store.mark_signal(&args.name, signal)?;
+    // Only nspawn's machines keep marks; a machine of machinectl has no place for them.
+    if record.is_some() {
+        ctx.store.mark_signal(&args.name, signal)?;
+    }
     if mode == Some(Mode::App) {
         let (leader, payload) = wait_for_payload(sd, &args.name).await?;
         let payload = payload.with_context(|| {
@@ -960,6 +963,12 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     }
     let previous_policy = record.restart;
     if let Some(restart) = args.restart {
+        if record.remove_on_exit && restart != Restart::No {
+            bail!(
+                "{} was started with --rm: a machine removed when it ends cannot be restarted",
+                args.name
+            );
+        }
         record.restart = restart;
     }
     apply_limits(&mut record.limits, args.memory, args.cpus, args.pids_limit)?;
