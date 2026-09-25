@@ -86,7 +86,7 @@ cleanup_machines() {
   done
   $NSPAWN images rm busybox-1.37 >/dev/null 2>&1 || true
   $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || true
-  rm -rf /tmp/e2e-cp /tmp/e2e-cp-* /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol /var/lib/nspawn/volumes/e2evol2 /var/lib/nspawn/volumes/e2evol-free /var/lib/nspawn/volumes/e2evol-events /var/lib/nspawn/volumes/e2e-bootvol /var/lib/nspawn/volumes/.e2e-hidden
+  rm -rf /tmp/e2e-cp /tmp/e2e-cp-* /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol /var/lib/nspawn/volumes/e2evol2 /var/lib/nspawn/volumes/e2evol-free /var/lib/nspawn/volumes/e2evol-home /var/lib/nspawn/volumes/e2evol-etc /var/lib/nspawn/volumes/e2evol-events /var/lib/nspawn/volumes/e2e-bootvol /var/lib/nspawn/volumes/.e2e-hidden
   kill "${listener_pid:-}" 2>/dev/null || true
   if [ "$networkd_was" != active ]; then
     systemctl stop systemd-networkd.service systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-resolve-hook.socket >/dev/null 2>&1 || true
@@ -1162,6 +1162,15 @@ $NSPAWN volume rm e2evol2 e2e-no-such-volume > /tmp/e2e-volrm.txt 2>&1 && fail "
 grep -q "removed e2evol2" /tmp/e2e-volrm.txt || fail "volume rm stopped at the missing volume: $(cat /tmp/e2e-volrm.txt)"
 grep -q "no volume named e2e-no-such-volume" /tmp/e2e-volrm.txt || fail "a missing volume was not explained: $(cat /tmp/e2e-volrm.txt)"
 $NSPAWN volume rm ../images >/dev/null 2>&1 && fail "volume rm reached outside the volumes directory"
+# A volume made on first use takes what the image has at its path, owner included, as
+# docker seeds it: busybox's /home belongs to nobody, its /etc has files.
+$NSPAWN start $app -v e2evol-home:/home -v e2evol-etc:/etc -- /bin/sleep 300 >/dev/null || fail "start with volumes over image directories"
+[ "$(stat -c %u /var/lib/nspawn/volumes/e2evol-home)" = 65534 ] || fail "the volume over /home did not take nobody's ownership: $(stat -c '%u %a' /var/lib/nspawn/volumes/e2evol-home)"
+[ -f /var/lib/nspawn/volumes/e2evol-etc/passwd ] || fail "the volume over /etc was not seeded with the image's files"
+$NSPAWN exec $app -- sh -c 'grep -q "^root:" /etc/passwd && stat -c %u /home' </dev/null | tr -d '\r' | grep_q "^65534$" || fail "the seeded volumes are not what the machine sees"
+$NSPAWN stop $app >/dev/null || fail "stop the app with seeded volumes"
+$NSPAWN start $app -v none -- /bin/sleep 300 >/dev/null && $NSPAWN stop $app >/dev/null || fail "start with -v none after the seeded volumes"
+$NSPAWN volume rm e2evol-home e2evol-etc >/dev/null || fail "volume rm of the seeded volumes"
 rmdir /var/lib/nspawn/volumes/.e2e-hidden
 
 step "secrets: kept encrypted, handed to a machine as files, removed once unused"

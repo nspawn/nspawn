@@ -81,7 +81,8 @@ the entrypoint and `--entrypoint ""` drops it. Both are remembered, like the com
 docker container; `start --image-command` goes back to the image's own. `-e VAR=value`
 adds environment on top of the image's (`-e VAR` copies it from your shell), and
 `-v SOURCE:TARGET[:ro]` mounts a host directory (which has to exist), or a named volume
-that nspawn keeps under `/var/lib/nspawn/volumes/NAME` and creates on first use, into
+that nspawn keeps under `/var/lib/nspawn/volumes/NAME` and creates on first use with
+what the image has at that path, owner and files included, as docker seeds one, into
 any kind of machine; in machines that run
 with private users the mount is idmapped, so root inside owns what it writes on the
 host. Every booted machine with volumes gets a small unit mounted into it,
@@ -140,7 +141,9 @@ HOST[:CONTAINER[:rwm]]`, `--dns` and `--dns-search`, `--add-host HOST:IP` (with
 `host-gateway`), `--ulimit NAME=SOFT[:HARD]`, `--oom-score-adj`, `--stop-signal` and
 `--stop-timeout` (what `stop` uses unless `-t` says otherwise), `--init` (accepted; the
 stub init reaps anyway) and `--sysctl` (`net.*` keys, set in an app machine's network
-namespace). Each becomes a line of the machine's settings file or of its unit; `inspect`
+namespace). A `--tmpfs` that lands on `/run` (`/var/run` in most images) is left out
+with a note: `/run` is a tmpfs of every machine already. `--hostname` reaches a booted
+machine as its `/etc/hostname`. Each becomes a line of the machine's settings file or of its unit; `inspect`
 shows them all. A path the image declares as a volume and nothing is mounted over gets a
 note at start: nspawn has no anonymous volumes, so what is written there goes with the
 machine.

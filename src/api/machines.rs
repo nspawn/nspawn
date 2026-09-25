@@ -327,6 +327,9 @@ pub async fn prepare(
     }
     // Named volumes are made on first use; a host path must exist, as with podman: the
     // service does not make directories anywhere on the host.
+    if record.backend == BackendChoice::Overlay {
+        crate::backend::mount_root(sd, store, name).await?;
+    }
     let mut binds = Vec::new();
     for volume in &record.volumes {
         let source = volume.host_path(&store.volumes_dir());
@@ -339,6 +342,21 @@ pub async fn prepare(
             }
             std::fs::create_dir_all(&source)
                 .with_context(|| format!("creating volume {}", source.display()))?;
+            // What the image has there, owner included, as docker seeds a volume: from
+            // the layers, which earlier runs have not touched, or the tree itself
+            // where there are none.
+            let target = volume.target.trim_start_matches('/');
+            let image_path =
+                crate::backend::image_path(store, &record.layers, record.backend, target).or_else(
+                    || {
+                        (record.backend == BackendChoice::Flat)
+                            .then(|| crate::backend::root_path(store, name, record.backend, target))
+                            .flatten()
+                    },
+                );
+            if let Some(image_path) = image_path {
+                crate::volume::seed(&image_path, &source)?;
+            }
             crate::api::events::emit("volume", "create", &volume.source, &[]);
         }
         binds.push(Bind {
@@ -346,9 +364,6 @@ pub async fn prepare(
             target: volume.target.clone(),
             read_only: volume.read_only,
         });
-    }
-    if record.backend == BackendChoice::Overlay {
-        crate::backend::mount_root(sd, store, name).await?;
     }
     // /run is a tmpfs of every machine already, and one over it would hide what
     // systemd-nspawn keeps there; --tmpfs /var/run, docker's habit for a read-only

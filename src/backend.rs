@@ -356,6 +356,44 @@ pub fn root_path(
     }
 }
 
+/// Where `relative` is in the image itself, ahead of any run: the topmost layer that
+/// has it, unless a layer above whites it out. The assembled root would show what
+/// earlier runs did to it, such as a copy chowned into a picked user namespace. A
+/// tree without layers of its own (flat) is looked at as it is.
+pub fn image_path(
+    store: &Store,
+    layers: &[String],
+    backend: BackendChoice,
+    relative: &str,
+) -> Option<PathBuf> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let ownership = match backend {
+        BackendChoice::Mstack => Ownership::Foreign,
+        BackendChoice::Overlay | BackendChoice::Flat | BackendChoice::Auto => Ownership::Root,
+    };
+    let dirs: Vec<PathBuf> = layers
+        .iter()
+        .rev()
+        .map(|digest| store.layer_dir(digest, ownership))
+        .filter(|dir| dir.is_dir())
+        .collect();
+    if dirs.is_empty() {
+        return None;
+    }
+    for dir in dirs {
+        let path = dir.join(relative);
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        // An overlayfs whiteout: a character device 0:0.
+        if meta.file_type().is_char_device() && meta.rdev() == 0 {
+            return None;
+        }
+        return Some(path);
+    }
+    None
+}
+
 /// Whether a mount at `target` inside the machine would land on /run, which is a tmpfs
 /// of every machine already and holds what systemd-nspawn keeps there: through the
 /// image's own symlink, /var/run say, as much as by name.
@@ -619,6 +657,40 @@ mod tests {
         );
         assert_eq!(
             root_path(&store, "m", BackendChoice::Mstack, "bin/nope"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_image_is_looked_at_layer_by_layer_from_the_top() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let layers = vec!["sha256:base".to_string(), "sha256:top".to_string()];
+        let base = store.layer_dir("sha256:base", Ownership::Root);
+        let top = store.layer_dir("sha256:top", Ownership::Root);
+        fs::create_dir_all(base.join("data")).unwrap();
+        fs::create_dir_all(top.join("etc")).unwrap();
+        assert_eq!(
+            image_path(&store, &layers, BackendChoice::Overlay, "data"),
+            Some(base.join("data"))
+        );
+        fs::create_dir_all(top.join("data")).unwrap();
+        assert_eq!(
+            image_path(&store, &layers, BackendChoice::Overlay, "data"),
+            Some(top.join("data"))
+        );
+        assert_eq!(
+            image_path(&store, &layers, BackendChoice::Overlay, "nope"),
+            None
+        );
+        // No layers kept: nothing to say.
+        assert_eq!(
+            image_path(
+                &store,
+                &["sha256:gone".to_string()],
+                BackendChoice::Flat,
+                "data"
+            ),
             None
         );
     }

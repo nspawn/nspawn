@@ -3,11 +3,72 @@
 //! as bind mounts in the machine's settings.
 
 use std::fmt;
+use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+
+/// Fills a named volume made on first use with what the image has at its mount point,
+/// owner and mode included, as docker does: a program that runs as a user finds its
+/// data directory its own, and a volume over a directory with files starts with them.
+/// Devices, sockets and fifos are left out.
+pub fn seed(from: &Path, to: &Path) -> Result<()> {
+    let meta = from
+        .symlink_metadata()
+        .with_context(|| format!("looking at {}", from.display()))?;
+    if !meta.is_dir() {
+        return Ok(());
+    }
+    copy_tree(from, to)?;
+    take_over(&meta, to)
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    for entry in fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
+        let entry = entry.with_context(|| format!("reading {}", from.display()))?;
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        let meta = source
+            .symlink_metadata()
+            .with_context(|| format!("looking at {}", source.display()))?;
+        let kind = meta.file_type();
+        if kind.is_dir() {
+            fs::create_dir(&target).with_context(|| format!("creating {}", target.display()))?;
+            copy_tree(&source, &target)?;
+        } else if kind.is_symlink() {
+            let link = fs::read_link(&source)
+                .with_context(|| format!("reading the link {}", source.display()))?;
+            std::os::unix::fs::symlink(&link, &target)
+                .with_context(|| format!("creating the link {}", target.display()))?;
+        } else if kind.is_file() {
+            fs::copy(&source, &target).with_context(|| format!("copying {}", source.display()))?;
+        } else {
+            continue;
+        }
+        take_over(&meta, &target)?;
+    }
+    Ok(())
+}
+
+/// The owner, mode and times of the image's entry, on the copy.
+fn take_over(meta: &fs::Metadata, target: &Path) -> Result<()> {
+    std::os::unix::fs::lchown(target, Some(meta.uid()), Some(meta.gid()))
+        .with_context(|| format!("owning {}", target.display()))?;
+    if !meta.file_type().is_symlink() {
+        fs::set_permissions(target, fs::Permissions::from_mode(meta.mode() & 0o7777))
+            .with_context(|| format!("setting the mode of {}", target.display()))?;
+        let times = fs::FileTimes::new()
+            .set_modified(meta.modified()?)
+            .set_accessed(meta.accessed()?);
+        fs::File::open(target)
+            .and_then(|f| f.set_times(times))
+            .with_context(|| format!("setting the times of {}", target.display()))?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Volume {
@@ -338,5 +399,33 @@ mod tests {
         assert!("/srv://".parse::<Volume>().is_err());
         assert!("/srv:/data\n".parse::<Volume>().is_err());
         assert!("/srv:/data".parse::<Volume>().is_ok());
+    }
+    #[test]
+    fn a_new_volume_takes_what_the_image_has() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("image/data");
+        fs::create_dir_all(image.join("sub")).unwrap();
+        fs::write(image.join("sub/file"), "x").unwrap();
+        fs::set_permissions(image.join("sub/file"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(&image, fs::Permissions::from_mode(0o750)).unwrap();
+        std::os::unix::fs::symlink("sub/file", image.join("link")).unwrap();
+        let volume = tmp.path().join("volume");
+        fs::create_dir(&volume).unwrap();
+        seed(&image, &volume).unwrap();
+        assert_eq!(fs::read_to_string(volume.join("sub/file")).unwrap(), "x");
+        assert_eq!(
+            fs::metadata(volume.join("sub/file")).unwrap().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(fs::metadata(&volume).unwrap().mode() & 0o777, 0o750);
+        assert_eq!(
+            fs::read_link(volume.join("link")).unwrap(),
+            Path::new("sub/file")
+        );
+        // Nothing to take from a path the image lacks or that is not a directory.
+        let other = tmp.path().join("other");
+        fs::create_dir(&other).unwrap();
+        seed(&image.join("sub/file"), &other).unwrap();
+        assert_eq!(fs::read_dir(&other).unwrap().count(), 0);
     }
 }
