@@ -178,7 +178,7 @@ async fn caller_gone(connection: zbus::Connection, name: Option<String>) {
 /// What StartMachine and RunMachine are asked: wait (b, default `wait`), network (s) or
 /// networks (as), aliases (as), publish (as), entrypoint (s), env (as), volume (as),
 /// label (as), restart (s), memory (t), cpus (d), pids_limit (t), image_command (b),
-/// command (as), remove (b), and the flags of `health_overrides`.
+/// command (as), remove (b), and the flags of `health_overrides` and `tuning_overrides`.
 fn start_request(
     name: String,
     options: &mut Options<'_>,
@@ -205,6 +205,7 @@ fn start_request(
         command: options.strings("command")?,
         remove: options.bool("remove", false)?,
         health: health_overrides(options)?,
+        tuning: tuning_overrides(options)?,
     })
 }
 
@@ -225,6 +226,40 @@ fn health_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::health::
             })
             .transpose()?,
         disable: options.bool("no_healthcheck", false)?,
+    })
+}
+
+/// docker's other flags: hostname, user, working_dir, stop_signal (s), cap_add,
+/// cap_drop, tmpfs, devices (HOST:CONTAINER:PERMISSIONS), dns, dns_search, extra_hosts
+/// (HOST:IP), ulimits (NAME=SOFT:HARD), sysctls (KEY=VALUE) (as, "none" clears),
+/// privileged, read_only, init (b), shm_size, stop_timeout (t), oom_score_adj (i).
+fn tuning_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::tuning::Overrides> {
+    Ok(crate::tuning::Overrides {
+        hostname: options.string("hostname")?,
+        user: options.string("user")?,
+        working_dir: options.string("working_dir")?,
+        cap_add: options.strings("cap_add")?,
+        cap_drop: options.strings("cap_drop")?,
+        privileged: options.maybe_bool("privileged")?,
+        read_only: options.maybe_bool("read_only")?,
+        tmpfs: options.strings("tmpfs")?,
+        shm_size: options.maybe_u64("shm_size")?,
+        devices: options.strings("devices")?,
+        dns: options.strings("dns")?,
+        dns_search: options.strings("dns_search")?,
+        extra_hosts: options.strings("extra_hosts")?,
+        ulimits: options.strings("ulimits")?,
+        oom_score_adj: options
+            .i64("oom_score_adj")?
+            .map(|n| {
+                i32::try_from(n)
+                    .map_err(|_| anyhow::anyhow!("option oom_score_adj is out of range"))
+            })
+            .transpose()?,
+        stop_signal: options.string("stop_signal")?,
+        stop_timeout: options.maybe_u64("stop_timeout")?,
+        init: options.maybe_bool("init")?,
+        sysctls: options.strings("sysctls")?,
     })
 }
 
@@ -349,7 +384,7 @@ impl Manager {
     /// Like `create`. Options: backend (s), network (s) or networks (as), aliases (as),
     /// publish (as), force (b), entrypoint (s), env (as), volume (as), label (as),
     /// restart (s), memory (t, bytes), cpus (d), pids_limit (t), command (as), the flags
-    /// of `health_overrides`, registry (s), ca_cert (s).
+    /// of `health_overrides` and `tuning_overrides`, registry (s), ca_cert (s).
     async fn create_machine(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -382,6 +417,7 @@ impl Manager {
             pids_limit: options.maybe_u64("pids_limit")?,
             command: options.strings("command")?,
             health: health_overrides(&mut options)?,
+            tuning: tuning_overrides(&mut options)?,
         };
         options.finish()?;
         let state = self.state.clone();
@@ -1052,7 +1088,7 @@ impl Manager {
             name,
             force: options.bool("force", false)?,
             wait: options.bool("wait", true)?,
-            timeout: options.u64("timeout", 10)?.min(86_400),
+            timeout: options.maybe_u64("timeout")?.map(|t| t.min(86_400)),
         };
         options.finish()?;
         let notes = Notes::default();

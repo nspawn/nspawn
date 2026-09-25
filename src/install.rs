@@ -95,7 +95,9 @@ pub async fn install(
             volume_units: None,
             network,
             no_network: false,
+            hostname_file: None,
             bridge: None,
+            tuning: &Default::default(),
         },
         &route,
     )?;
@@ -107,9 +109,12 @@ pub async fn install(
         config,
         &route,
         app_argv.as_deref(),
-        crate::policy::Restart::No,
-        &crate::policy::Limits::default(),
-        false,
+        &settings::HookSpec {
+            restart: crate::policy::Restart::No,
+            limits: &crate::policy::Limits::default(),
+            remove_on_exit: false,
+            tuning: &Default::default(),
+        },
     )? {
         sd.reload().await?;
     }
@@ -145,6 +150,7 @@ pub async fn install(
         aliases: BTreeMap::new(),
         no_network: false,
         healthcheck: None,
+        tuning: Default::default(),
     })?;
     Ok(mode)
 }

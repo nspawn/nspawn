@@ -19,6 +19,7 @@ use crate::bridge::{Attachment, NetSpec, PortMap};
 use crate::health::Healthcheck;
 use crate::oci::{Mode, RunSpec};
 use crate::settings::Network;
+use crate::tuning::Tuning;
 use crate::volume::Volume;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +63,9 @@ pub struct ImageRecord {
     /// The --health-* flags, on top of the image's healthcheck (run.healthcheck).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<Healthcheck>,
+    /// docker's other per-container flags (hostname, user, capabilities, ...).
+    #[serde(default, skip_serializing_if = "Tuning::is_default")]
+    pub tuning: Tuning,
     /// Ports published on the host, like docker -p (bridge network only).
     #[serde(default)]
     pub ports: Vec<PortMap>,
@@ -97,6 +101,27 @@ impl ImageRecord {
     /// The machine's healthcheck, or the image's.
     pub fn effective_healthcheck(&self) -> Option<&Healthcheck> {
         self.healthcheck.as_ref().or(self.run.healthcheck.as_ref())
+    }
+
+    /// --user, or the image's.
+    pub fn effective_user(&self) -> Option<&str> {
+        self.tuning.user.as_deref().or(self.run.user.as_deref())
+    }
+
+    /// --workdir, or the image's.
+    pub fn effective_working_dir(&self) -> Option<&str> {
+        self.tuning
+            .working_dir
+            .as_deref()
+            .or(self.run.working_dir.as_deref())
+    }
+
+    /// --stop-signal, or the image's.
+    pub fn effective_stop_signal(&self) -> Option<&str> {
+        self.tuning
+            .stop_signal
+            .as_deref()
+            .or(self.run.stop_signal.as_deref())
     }
 
     /// The image's labels with the ones given to this machine on top.
@@ -1615,6 +1640,7 @@ mod tests {
             aliases: BTreeMap::new(),
             no_network: false,
             healthcheck: None,
+            tuning: Default::default(),
         };
         store.record_image(&rec).unwrap();
         assert_eq!(
@@ -1668,6 +1694,7 @@ mod tests {
             aliases: BTreeMap::new(),
             no_network: false,
             healthcheck: None,
+            tuning: Default::default(),
         };
         store.record_image(&rec).unwrap();
         store
@@ -1872,6 +1899,7 @@ mod tests {
             aliases: BTreeMap::new(),
             no_network: false,
             healthcheck: None,
+            tuning: Default::default(),
         };
         store
             .record_image(&record("ovl", BackendChoice::Overlay))

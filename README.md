@@ -72,7 +72,7 @@ image (blobs, manifest, assembled machine) and can be started right away or push
 Images that ship an init system (systemd) and whose entrypoint is that init are booted with
 `--boot`, like `machinectl start` does, and `shell` opens machined's login session
 there. Any other image, for example anything from Docker Hub, is an "app":
-its entrypoint runs as PID 2 under nspawn's stub init, with the environment, working
+its entrypoint runs under nspawn's stub init, with the environment, working
 directory, user and stop signal from the OCI config, and joins the bridge network like
 any other machine (see Networking). The arguments given to `create` or `start` after `--`
 replace the image's cmd and follow its entrypoint, exactly as with docker (`nspawn start
@@ -128,6 +128,22 @@ turns the image's off), run a probe inside the machine at the interval; `ps` sho
 probes with their output, and `events` a `health_status` on every change. The probes run
 from a unit of their own (`nspawn-health-NAME.service`) bound to the machine's, so they
 go with it.
+
+The other flags of `docker run` are there too, remembered like the rest: `--hostname`,
+`-u/--user` and `-w/--workdir` (instead of the image's; the user is resolved from the
+image's passwd and group files by a stand-in for getent that nspawn binds, since
+busybox has no getent, musl's answers no initgroups and neither takes a uid the passwd
+does not list, as docker does), `--cap-add`, `--cap-drop` (`--cap-drop
+ALL --cap-add NET_BIND_SERVICE` keeps that one, as with docker) and `--privileged`,
+`--read-only`, `--tmpfs PATH[:OPTIONS]`, `--shm-size`, `--device
+HOST[:CONTAINER[:rwm]]`, `--dns` and `--dns-search`, `--add-host HOST:IP` (with
+`host-gateway`), `--ulimit NAME=SOFT[:HARD]`, `--oom-score-adj`, `--stop-signal` and
+`--stop-timeout` (what `stop` uses unless `-t` says otherwise), `--init` (accepted; the
+stub init reaps anyway) and `--sysctl` (`net.*` keys, set in an app machine's network
+namespace). Each becomes a line of the machine's settings file or of its unit; `inspect`
+shows them all. A path the image declares as a volume and nothing is mounted over gets a
+note at start: nspawn has no anonymous volumes, so what is written there goes with the
+machine.
 
 `events` is docker events: what happens to machines (`start`, `die` with its exit code,
 `stop`, `restart`, `oom`, `fail`, `health_status`, and nspawn's own `pull`, `build`,

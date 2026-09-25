@@ -802,6 +802,59 @@ $NSPAWN ps | grep "^ *$app " | grep_q " sh " || fail "--image-command did not re
 grep -q "Bind=" /etc/systemd/nspawn/$app.nspawn && fail "-v none left volumes in the settings"
 $NSPAWN stop $app -t 2 || fail "stop app running its own cmd"
 
+step "docker's other flags: hostname, user, workdir, capabilities, read-only, tmpfs, devices, dns, hosts, ulimits, signals"
+$NSPAWN start $app --hostname h-$nonce -u nobody -w /tmp --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only --tmpfs /scratch:size=16m --device /dev/null:/dev/nullo:r --dns 10.99.0.1 --dns-search example.test --add-host peer:10.1.1.1 --add-host gw:host-gateway --ulimit nofile=64:128 --stop-signal SIGINT --stop-timeout 2 --oom-score-adj 100 --sysctl net.ipv4.icmp_echo_ignore_all=1 -p none -- /bin/sh -c 'trap "" INT; pwd; exec /bin/sleep 300' || fail "start with docker's other flags"
+x() { $NSPAWN exec $app -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
+[ "$(x hostname)" = "h-$nonce" ] || fail "--hostname not applied: $(x hostname)"
+# The program is the stub init's child: systemd-nspawn runs getent in the machine
+# ahead of it to resolve the user, which takes PIDs 2 and 3 (busybox has no getent;
+# nspawn stands one in).
+pid=$(x 'cat /proc/1/task/1/children' | tr -d ' ')
+[ -n "$pid" ] || fail "no program under the stub init: $(x 'ls /proc')"
+[ "$(x "awk '/^Uid:/ {print \$2}' /proc/$pid/status")" = 65534 ] || fail "--user not applied: $(x "cat /proc/$pid/status")"
+# The program prints its directory: exec runs with the machine's capabilities, and
+# without CAP_SYS_PTRACE root cannot read the cwd link of nobody's process.
+retry 5 bash -c "$NSPAWN logs $app -n 5 | tr -d '\r' | grep -qx /tmp" || fail "--workdir not applied: $($NSPAWN logs $app -n 5)"
+# --cap-drop ALL --cap-add X keeps X, as with docker: bit 10 is CAP_NET_BIND_SERVICE.
+[ "$(x 'awk "/^CapBnd:/ {print \$2}" /proc/1/status')" = 0000000000000400 ] || fail "--cap-drop ALL --cap-add NET_BIND_SERVICE left other capabilities: $(x 'grep CapBnd /proc/1/status')"
+[ "$(x 'touch /x 2>/dev/null && echo RW || echo RO')" = RO ] || fail "--read-only root is writable"
+[ "$(x 'touch /scratch/a && echo OK')" = OK ] || fail "--tmpfs is not writable"
+x 'cat /proc/mounts' | grep_q " /scratch tmpfs" || fail "--tmpfs is not a tmpfs: $(x 'cat /proc/mounts')"
+[ "$(x 'test -c /dev/nullo && echo DEV')" = DEV ] || fail "--device node missing inside"
+x 'cat /etc/resolv.conf' | grep_q "^nameserver 10.99.0.1$" || fail "--dns not applied: $(x 'cat /etc/resolv.conf')"
+x 'cat /etc/resolv.conf' | grep_q "^search example.test$" || fail "--dns-search not applied"
+x 'cat /etc/hosts' | grep_q "^10.1.1.1 peer$" || fail "--add-host not applied: $(x 'cat /etc/hosts')"
+x 'cat /etc/hosts' | grep_q "^10.99.0.1 gw$" || fail "--add-host host-gateway not applied: $(x 'cat /etc/hosts')"
+x "grep 'open files' /proc/$pid/limits" | grep_q "64 *128" || fail "--ulimit not applied: $(x "grep 'open files' /proc/$pid/limits")"
+[ "$(x "cat /proc/$pid/oom_score_adj")" = 100 ] || fail "--oom-score-adj not applied: $(x "cat /proc/$pid/oom_score_adj")"
+[ "$(x 'cat /proc/sys/net/ipv4/icmp_echo_ignore_all')" = 1 ] || fail "--sysctl not applied in the namespace"
+[ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all)" = 0 ] || fail "--sysctl leaked into the host"
+$NSPAWN inspect $app | python3 -c "
+import json, sys
+d = json.load(sys.stdin)[0]
+assert d['hostname'] == 'h-$nonce' and d['user'] == 'nobody' and d['working_dir'] == '/tmp', d
+assert d['cap_drop'] == ['ALL'] and d['cap_add'] == ['NET_BIND_SERVICE'] and d['read_only'] and d['tmpfs'] == ['/scratch:size=16m'], d
+assert d['devices'] == ['/dev/null:/dev/nullo:r'] and d['ulimits'] == {'nofile': '64:128'}, d
+assert d['stop_signal'] == 'SIGINT' and d['stop_timeout'] == 2 and d['oom_score_adj'] == 100, d
+assert d['extra_hosts'] == ['peer:10.1.1.1', 'gw:host-gateway'] and d['sysctls'] == {'net.ipv4.icmp_echo_ignore_all': '1'}, d" || fail "inspect does not show the flags"
+stop_start=$(date +%s)
+out=$($NSPAWN stop $app 2>&1) || fail "stop with --stop-signal and --stop-timeout: $out"
+echo "$out" | grep_q "ignored SIGINT for 2 seconds" || fail "stop did not use --stop-signal and --stop-timeout: $out"
+[ $(( $(date +%s) - stop_start )) -le 8 ] || fail "stop took longer than --stop-timeout allows"
+out=$($NSPAWN start $app -u 1000:1000 2>&1) && fail "a user with a group was accepted"
+echo "$out" | grep_q "without a group" || fail "the refused user was not explained: $out"
+out=$($NSPAWN start $app --sysctl kernel.shmmax=1 2>&1) && fail "a sysctl beyond net.* was accepted"
+# Everything back, and --privileged: the whole bounding set.
+$NSPAWN start $app --privileged --cap-drop none --cap-add none --read-only=false -u root -w / --tmpfs none --device none --dns none --dns-search none --add-host none --ulimit none --stop-signal "" --stop-timeout 10 --oom-score-adj 0 --sysctl none --hostname "" -- /bin/sleep 300 || fail "start with the flags taken back"
+[ "$(x hostname)" = "$app" ] || fail "--hostname \"\" did not restore the name: $(x hostname)"
+[ "$(x 'awk "/^CapBnd:/ {print \$2}" /proc/1/status')" != 0000000000000000 ] || fail "--privileged left no capabilities"
+[ "$(x 'touch /x 2>/dev/null && echo RW || echo RO')" = RW ] || fail "--read-only=false left the root read-only"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['privileged'] and not d['read_only'] and d['cap_drop'] == [] and d['cap_add'] == [] and d['hostname'] == '' and d['stop_signal'] == '', d" || fail "inspect after taking the flags back"
+$NSPAWN stop $app || fail "stop the privileged machine"
+$NSPAWN start $app --privileged=false -- /bin/sleep 300 >/dev/null || fail "start with --privileged=false"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert not d['privileged'], d" || fail "--privileged=false did not take it back"
+$NSPAWN stop $app || fail "stop"
+
 hooks=/etc/systemd/system/systemd-nspawn@$app.service.d/nspawn-hooks.conf
 step "restart policy on-failure: a killed program comes back with its network, stop keeps it down"
 $NSPAWN start $app --restart on-failure -p 18081:80 -- /bin/sh -c 'mkdir -p /www; echo app-web > /www/index.html; exec /bin/httpd -f -p 80 -h /www' || fail "start with --restart on-failure"

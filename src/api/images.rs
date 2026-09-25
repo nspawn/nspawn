@@ -127,7 +127,7 @@ pub async fn remove_machines(
                 name: name.clone(),
                 force: true,
                 wait: true,
-                timeout: 0,
+                timeout: Some(0),
             };
             if let Err(e) = crate::api::machines::stop(ctx, &stop, report).await {
                 removal.failed.push((name.clone(), format!("{e:#}")));

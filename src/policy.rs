@@ -114,9 +114,18 @@ impl Limits {
     }
 }
 
-/// docker's --memory: a number of bytes, or one with b, k, m, g or t (1024-based,
-/// case-insensitive, an optional trailing b or ib); decimals allowed; 0 for none.
+/// docker's --memory: a size of at least 4m, or 0 for none.
 pub fn parse_memory(text: &str) -> Result<u64> {
+    let bytes = parse_size(text)?;
+    if bytes > 0 && bytes < MIN_MEMORY {
+        bail!("{text}: --memory must be at least 4m (or 0 for no limit)");
+    }
+    Ok(bytes)
+}
+
+/// A size as docker takes it: a number of bytes, or one with b, k, m, g or t
+/// (1024-based, case-insensitive, an optional trailing b or ib); decimals allowed.
+pub fn parse_size(text: &str) -> Result<u64> {
     let lower = text.trim().to_ascii_lowercase();
     let unit_start = lower
         .find(|c: char| !(c.is_ascii_digit() || c == '.'))
@@ -140,11 +149,7 @@ pub fn parse_memory(text: &str) -> Result<u64> {
     if bytes >= u64::MAX as f64 {
         bail!("{text}: too large");
     }
-    let bytes = bytes as u64;
-    if bytes > 0 && bytes < MIN_MEMORY {
-        bail!("{text}: --memory must be at least 4m (or 0 for no limit)");
-    }
-    Ok(bytes)
+    Ok(bytes as u64)
 }
 
 /// docker's --cpus (0.5, 2) as thousandths of a CPU; 0 for none.

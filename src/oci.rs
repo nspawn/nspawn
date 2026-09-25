@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub enum Mode {
     /// The image contains systemd (or another init) and is booted with --boot.
     Boot,
-    /// The image's entrypoint runs as PID 2 under nspawn's stub init.
+    /// The image's entrypoint runs under nspawn's stub init, as its child.
     App,
 }
 
@@ -62,6 +62,9 @@ pub struct RunSpec {
     /// HEALTHCHECK of a Containerfile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<crate::health::Healthcheck>,
+    /// VOLUME of a Containerfile: paths the image expects a mount over.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<String>,
 }
 
 impl RunSpec {
@@ -74,8 +77,16 @@ impl RunSpec {
         // A docker extension the typed config leaves out.
         let raw: serde_json::Value =
             serde_json::from_slice(bytes).context("parsing the OCI image config")?;
+        let mut volumes: Vec<String> = raw
+            .get("config")
+            .and_then(|c| c.get("Volumes"))
+            .and_then(serde_json::Value::as_object)
+            .map(|v| v.keys().cloned().collect())
+            .unwrap_or_default();
+        volumes.sort();
         Ok(RunSpec {
             healthcheck: crate::health::Healthcheck::from_config(&raw),
+            volumes,
             entrypoint: config.entrypoint.unwrap_or_default(),
             cmd: config.cmd.unwrap_or_default(),
             command: Vec::new(),
@@ -211,7 +222,8 @@ mod tests {
             "config":{"Entrypoint":["/docker-entrypoint.sh"],"Cmd":["nginx","-g","daemon off;"],
             "Env":["PATH=/usr/bin","NGINX_VERSION=1.27"],"WorkingDir":"/srv","User":"nginx","StopSignal":"SIGQUIT",
             "Labels":{"org.opencontainers.image.title":"nginx","maintainer":"someone"},
-            "Healthcheck":{"Test":["CMD-SHELL","curl -f http://localhost/ || exit 1"],"Interval":30000000000,"Timeout":3000000000,"Retries":3}}}"#;
+            "Healthcheck":{"Test":["CMD-SHELL","curl -f http://localhost/ || exit 1"],"Interval":30000000000,"Timeout":3000000000,"Retries":3},
+            "Volumes":{"/var/lib/data":{},"/cache":{}}}}"#;
         let spec = RunSpec::from_config(json).unwrap();
         assert_eq!(spec.entrypoint(), ["/docker-entrypoint.sh"]);
         assert_eq!(spec.cmd(), ["nginx", "-g", "daemon off;"]);
@@ -233,6 +245,7 @@ mod tests {
             (hc.interval, hc.timeout, hc.retries),
             (30_000_000, 3_000_000, 3)
         );
+        assert_eq!(spec.volumes, ["/cache", "/var/lib/data"]);
         assert_eq!(
             spec.labels,
             BTreeMap::from([

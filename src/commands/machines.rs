@@ -183,6 +183,7 @@ fn start_options(args: StartOptions, command: Vec<String>) -> Result<Options<'st
         options.insert("command", Value::from(command));
     }
     super::put_health(&mut options, args.health);
+    super::put_tuning(&mut options, args.tuning);
     Ok(options)
 }
 
@@ -560,7 +561,9 @@ pub async fn stop(args: StopArgs, client: &Client) -> Result<()> {
     let mut options = Options::new();
     options.insert("force", Value::from(args.force));
     options.insert("wait", Value::from(args.wait));
-    options.insert("timeout", Value::from(args.timeout));
+    if let Some(timeout) = args.timeout {
+        options.insert("timeout", Value::from(timeout));
+    }
     let (outcome, notes) = client
         .manager
         .stop_machine(&args.name, options)

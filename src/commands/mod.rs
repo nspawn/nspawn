@@ -224,6 +224,44 @@ fn put_opt(options: &mut Options<'_>, key: &'static str, value: Option<String>) 
     }
 }
 
+/// docker's other flags as the service takes them.
+pub fn put_tuning(options: &mut Options<'_>, t: crate::cli::TuningArgs) {
+    put_opt(options, "hostname", t.hostname);
+    put_opt(options, "user", t.user);
+    put_opt(options, "working_dir", t.workdir);
+    put_opt(options, "stop_signal", t.stop_signal);
+    for (key, values) in [
+        ("cap_add", t.cap_add),
+        ("cap_drop", t.cap_drop),
+        ("tmpfs", t.tmpfs),
+        ("devices", t.device),
+        ("dns", t.dns),
+        ("dns_search", t.dns_search),
+        ("extra_hosts", t.add_host),
+        ("ulimits", t.ulimit),
+        ("sysctls", t.sysctl),
+    ] {
+        put_all(options, key, values);
+    }
+    for (key, value) in [
+        ("privileged", t.privileged),
+        ("read_only", t.read_only),
+        ("init", t.init),
+    ] {
+        if let Some(value) = value {
+            put(options, key, value);
+        }
+    }
+    for (key, value) in [("shm_size", t.shm_size), ("stop_timeout", t.stop_timeout)] {
+        if let Some(value) = value {
+            put(options, key, value);
+        }
+    }
+    if let Some(adj) = t.oom_score_adj {
+        put(options, "oom_score_adj", adj);
+    }
+}
+
 /// The --health-* flags as the service takes them.
 pub fn put_health(options: &mut Options<'_>, health: crate::cli::HealthArgs) {
     put_opt(options, "health_cmd", health.health_cmd);
@@ -432,6 +470,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             }
             put_all(&mut options, "command", a.command);
             put_health(&mut options, a.health);
+            put_tuning(&mut options, a.tuning);
             let done = client
                 .run_job(|| manager.create_machine(&a.source, &a.name, options))
                 .await?;

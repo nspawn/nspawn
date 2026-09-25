@@ -278,6 +278,147 @@ impl Assembler<'_> {
     }
 }
 
+/// Mounts an overlay machine's root ahead of its unit, which RequiresMountsFor= would
+/// do itself: `start` runs `prepare` before the unit, and what prepare looks at and
+/// makes in the root has to be there by then. Nothing to do once it is mounted.
+pub async fn mount_root(sd: &Systemd, store: &Store, name: &str) -> Result<()> {
+    let mp = store.machines_dir.join(name).to_string_lossy().to_string();
+    sd.start_unit(&unitname::mount_unit_for(&mp)).await
+}
+
+/// Where a mount point has to be made before the machine's root is mounted read-only
+/// (systemd-nspawn cannot make it then): the root itself for overlay and flat, since
+/// the overlay is mounted before the unit's hooks run and a file made behind its back
+/// in the upper layer is not seen through it; the writable layer of an mstack tree,
+/// which systemd-nspawn merges itself at start.
+pub fn mount_point_root(store: &Store, name: &str, backend: BackendChoice) -> Result<PathBuf> {
+    let root = store.machines_dir.join(name);
+    match backend {
+        BackendChoice::Overlay => {
+            if !is_mountpoint(&root)? {
+                bail!("{} is not mounted", root.display());
+            }
+            Ok(root)
+        }
+        BackendChoice::Mstack => Ok(store.machines_dir.join(format!("{name}.mstack")).join("rw")),
+        BackendChoice::Flat | BackendChoice::Auto => Ok(root),
+    }
+}
+
+/// Whether `relative` is in the root systemd-nspawn gives the machine, and `test` holds
+/// for what is there (a symlink is looked at, not followed: its target is the image's,
+/// not the host's): the assembled root, or any layer of an mstack tree, whose layers
+/// systemd-nspawn merges itself at start.
+pub fn root_has(
+    store: &Store,
+    name: &str,
+    backend: BackendChoice,
+    relative: &str,
+    test: impl Fn(&fs::Metadata) -> bool,
+) -> bool {
+    root_path(store, name, backend, relative)
+        .and_then(|path| path.symlink_metadata().ok())
+        .is_some_and(|m| test(&m))
+}
+
+/// Where `relative` is on the host, for what looks into the machine's root ahead of
+/// its start: the assembled root, or the topmost layer of an mstack tree that has it.
+pub fn root_path(
+    store: &Store,
+    name: &str,
+    backend: BackendChoice,
+    relative: &str,
+) -> Option<PathBuf> {
+    match backend {
+        BackendChoice::Mstack => {
+            let dir = store.machines_dir.join(format!("{name}.mstack"));
+            let mut layers: Vec<PathBuf> = fs::read_dir(dir)
+                .ok()?
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("layer@"))
+                })
+                .collect();
+            layers.sort();
+            layers
+                .into_iter()
+                .rev()
+                .map(|layer| layer.join(relative))
+                .find(|path| path.symlink_metadata().is_ok())
+        }
+        BackendChoice::Overlay | BackendChoice::Flat | BackendChoice::Auto => {
+            let path = store.machines_dir.join(name).join(relative);
+            path.symlink_metadata().is_ok().then_some(path)
+        }
+    }
+}
+
+/// Whether a mount at `target` inside the machine would land on /run, which is a tmpfs
+/// of every machine already and holds what systemd-nspawn keeps there: through the
+/// image's own symlink, /var/run say, as much as by name.
+pub fn lands_on_run(store: &Store, name: &str, backend: BackendChoice, target: &str) -> bool {
+    let link = root_path(store, name, backend, target.trim_start_matches('/'))
+        .and_then(|path| fs::read_link(path).ok());
+    resolves_to_run(target, link.as_deref())
+}
+
+fn resolves_to_run(target: &str, link: Option<&Path>) -> bool {
+    let is_run = |path: &Path| path == Path::new("/run") || path.starts_with("/run/");
+    if is_run(Path::new(target)) {
+        return true;
+    }
+    let Some(link) = link else {
+        return false;
+    };
+    let resolved = if link.is_absolute() {
+        link.to_path_buf()
+    } else {
+        Path::new(target)
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .join(link)
+    };
+    // The lexical form: a/../b is b.
+    let mut clean = PathBuf::from("/");
+    for part in resolved.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                clean.pop();
+            }
+            std::path::Component::Normal(c) => clean.push(c),
+            _ => {}
+        }
+    }
+    is_run(&clean)
+}
+
+/// Makes the mount points of a read-only machine ahead of its start, below `root`: a
+/// directory, or a file when `dir` is false. What exists already stays as it is.
+pub fn ensure_mount_points(root: &Path, targets: &[(String, bool)]) -> Result<()> {
+    for (target, dir) in targets {
+        if target.split('/').any(|c| c == "..") || !target.starts_with('/') {
+            bail!("{target}: a mount point is an absolute path inside the machine, without ..");
+        }
+        let path = root.join(target.trim_start_matches('/'));
+        if path.symlink_metadata().is_ok() {
+            continue;
+        }
+        if *dir {
+            fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
+        } else {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn dropin_dir(name: &str) -> PathBuf {
     Path::new(UNIT_DIR).join(format!("systemd-nspawn@{name}.service.d"))
 }
@@ -372,6 +513,149 @@ pub fn is_mountpoint(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_root_is_looked_at_where_nspawn_will_see_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let flat = store.machines_dir.join("flat");
+        fs::create_dir_all(flat.join("usr/bin")).unwrap();
+        fs::write(flat.join("usr/bin/getent"), "").unwrap();
+        fs::write(flat.join("bin-sh"), "#!/bin/sh").unwrap();
+        let program = |m: &fs::Metadata| !m.is_file() || m.len() > 0;
+        // An absolute symlink of the image is not followed on the host.
+        std::os::unix::fs::symlink("/bin/busybox-of-the-image", flat.join("sh-link")).unwrap();
+        assert!(root_has(
+            &store,
+            "flat",
+            BackendChoice::Flat,
+            "sh-link",
+            program
+        ));
+        assert_eq!(
+            root_path(&store, "flat", BackendChoice::Flat, "sh-link"),
+            Some(flat.join("sh-link"))
+        );
+        assert_eq!(root_path(&store, "flat", BackendChoice::Flat, "nope"), None);
+        assert!(root_has(
+            &store,
+            "flat",
+            BackendChoice::Flat,
+            "usr/bin",
+            program
+        ));
+        assert!(root_has(
+            &store,
+            "flat",
+            BackendChoice::Flat,
+            "bin-sh",
+            program
+        ));
+        // A mount point made ahead of an earlier start is an empty file, not a program.
+        assert!(!root_has(
+            &store,
+            "flat",
+            BackendChoice::Flat,
+            "usr/bin/getent",
+            program
+        ));
+        assert!(root_has(
+            &store,
+            "flat",
+            BackendChoice::Flat,
+            "usr/bin/getent",
+            |_| true
+        ));
+        assert!(!root_has(
+            &store,
+            "flat",
+            BackendChoice::Flat,
+            "bin/sh",
+            |_| true
+        ));
+        let mstack = store.machines_dir.join("m.mstack");
+        fs::create_dir_all(mstack.join("layer@0/bin")).unwrap();
+        fs::write(mstack.join("layer@0/bin/sh"), "#!/bin/sh").unwrap();
+        fs::create_dir_all(mstack.join("rw")).unwrap();
+        assert!(root_has(
+            &store,
+            "m",
+            BackendChoice::Mstack,
+            "bin/sh",
+            program
+        ));
+        assert!(!root_has(
+            &store,
+            "m",
+            BackendChoice::Mstack,
+            "bin/getent",
+            program
+        ));
+        assert!(!root_has(
+            &store,
+            "none",
+            BackendChoice::Mstack,
+            "bin/sh",
+            program
+        ));
+    }
+
+    #[test]
+    fn the_topmost_mstack_layer_with_the_path_is_the_one_seen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let mstack = store.machines_dir.join("m.mstack");
+        for layer in ["layer@0", "layer@1"] {
+            fs::create_dir_all(mstack.join(layer).join("bin")).unwrap();
+            fs::write(mstack.join(layer).join("bin/sh"), layer).unwrap();
+        }
+        fs::create_dir_all(mstack.join("rw")).unwrap();
+        assert_eq!(
+            root_path(&store, "m", BackendChoice::Mstack, "bin/sh"),
+            Some(mstack.join("layer@1/bin/sh"))
+        );
+        assert_eq!(
+            root_path(&store, "m", BackendChoice::Mstack, "bin/nope"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tmpfs_on_run_is_told_apart() {
+        assert!(resolves_to_run("/run", None));
+        assert!(resolves_to_run("/run/lock", None));
+        assert!(!resolves_to_run("/tmp", None));
+        assert!(!resolves_to_run("/runtime", None));
+        // Debian's /var/run -> /run, and a relative form of it.
+        assert!(resolves_to_run("/var/run", Some(Path::new("/run"))));
+        assert!(resolves_to_run("/var/run", Some(Path::new("../run"))));
+        assert!(!resolves_to_run("/var/run", Some(Path::new("../lib/run"))));
+        assert!(!resolves_to_run("/var/tmp", Some(Path::new("/tmp"))));
+    }
+
+    #[test]
+    fn mount_points_are_made_below_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path();
+        fs::create_dir_all(layer.join("etc")).unwrap();
+        fs::write(layer.join("etc/hosts"), "x").unwrap();
+        ensure_mount_points(
+            layer,
+            &[
+                ("/scratch".to_string(), true),
+                ("/etc/hosts".to_string(), false),
+                ("/dev/nullo".to_string(), false),
+                ("/a/b/c".to_string(), true),
+            ],
+        )
+        .unwrap();
+        assert!(layer.join("scratch").is_dir());
+        assert!(layer.join("dev/nullo").is_file());
+        assert!(layer.join("a/b/c").is_dir());
+        assert_eq!(fs::read_to_string(layer.join("etc/hosts")).unwrap(), "x");
+        assert!(ensure_mount_points(layer, &[("/../x".to_string(), true)]).is_err());
+        assert!(ensure_mount_points(layer, &[("x".to_string(), true)]).is_err());
+    }
 
     #[test]
     fn parses_systemd_versions() {

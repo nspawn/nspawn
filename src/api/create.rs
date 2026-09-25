@@ -50,6 +50,8 @@ pub struct CreateRequest {
     pub command: Vec<String>,
     /// The --health-* flags.
     pub health: crate::health::Overrides,
+    /// hostname, user, capabilities and the rest.
+    pub tuning: crate::tuning::Overrides,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +215,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         let hc = request.health.apply(record.effective_healthcheck())?;
         record.healthcheck = Some(hc);
     }
+    request.tuning.apply(&mut record.tuning)?;
     store.record_image(&record)?;
     crate::api::events::emit(
         "machine",

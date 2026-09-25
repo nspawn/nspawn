@@ -352,10 +352,82 @@ pub struct CreateArgs {
     pub pids_limit: Option<u64>,
     #[command(flatten)]
     pub health: HealthArgs,
+    #[command(flatten)]
+    pub tuning: TuningArgs,
     /// For app images: the arguments after -- replace the image's cmd and follow its
     /// entrypoint, as with docker.
     #[arg(last = true)]
     pub command: Vec<String>,
+}
+
+/// docker's other per-container flags; remembered, each one given replacing what the
+/// machine had.
+#[derive(Args, Debug, Default, Clone)]
+pub struct TuningArgs {
+    /// Hostname inside the machine (default: its name).
+    #[arg(long, value_name = "NAME")]
+    pub hostname: Option<String>,
+    /// User the program runs as (a name or a uid of the image), instead of the image's.
+    #[arg(long, short = 'u', value_name = "USER")]
+    pub user: Option<String>,
+    /// Working directory of the program, instead of the image's.
+    #[arg(long, short = 'w', value_name = "DIR")]
+    pub workdir: Option<String>,
+    /// Capability to keep on top of systemd-nspawn's default set (NET_ADMIN, ALL).
+    /// Repeatable; "none" forgets them.
+    #[arg(long, value_name = "CAP")]
+    pub cap_add: Vec<String>,
+    /// Capability to drop from the default set. Repeatable; "none" forgets them.
+    #[arg(long, value_name = "CAP")]
+    pub cap_drop: Vec<String>,
+    /// Every capability, like docker --privileged (--privileged=false takes it back).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    pub privileged: Option<bool>,
+    /// Mount the machine's root read-only (--read-only=false takes it back).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    pub read_only: Option<bool>,
+    /// An empty tmpfs at a path inside, PATH[:OPTIONS] (size=64m,mode=1777). Repeatable;
+    /// "none" forgets them.
+    #[arg(long, value_name = "PATH[:OPTIONS]")]
+    pub tmpfs: Vec<String>,
+    /// Size of /dev/shm, like docker: 64m, 1g; 0 for the default.
+    #[arg(long, value_name = "SIZE", value_parser = crate::policy::parse_size)]
+    pub shm_size: Option<u64>,
+    /// A device node of the host for the machine, HOST[:CONTAINER[:PERMISSIONS]], like
+    /// docker --device. Repeatable; "none" forgets them.
+    #[arg(long, value_name = "HOST[:CONTAINER[:rwm]]")]
+    pub device: Vec<String>,
+    /// DNS server for the machine, instead of the host's. Repeatable; "none" forgets
+    /// them.
+    #[arg(long, value_name = "IP")]
+    pub dns: Vec<String>,
+    /// DNS search domain. Repeatable; "none" forgets them.
+    #[arg(long, value_name = "DOMAIN")]
+    pub dns_search: Vec<String>,
+    /// A line for the machine's /etc/hosts, HOST:IP; host-gateway is the host's address
+    /// on the machine's network. Repeatable; "none" forgets them.
+    #[arg(long, value_name = "HOST:IP")]
+    pub add_host: Vec<String>,
+    /// A resource limit of the program, NAME=SOFT[:HARD], like docker --ulimit
+    /// (nofile=1024:4096). Repeatable; "none" forgets them.
+    #[arg(long, value_name = "NAME=SOFT[:HARD]")]
+    pub ulimit: Vec<String>,
+    /// OOM score adjustment of the machine, -1000 to 1000.
+    #[arg(long, value_name = "N", allow_hyphen_values = true)]
+    pub oom_score_adj: Option<i32>,
+    /// Signal `stop` sends the program, instead of the image's (SIGTERM).
+    #[arg(long, value_name = "SIGNAL")]
+    pub stop_signal: Option<String>,
+    /// Seconds `stop` waits after the signal before SIGKILL, unless -t says otherwise.
+    #[arg(long, value_name = "SECONDS")]
+    pub stop_timeout: Option<u64>,
+    /// Accepted for docker's sake: nspawn's stub init reaps orphans anyway.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    pub init: Option<bool>,
+    /// A net.* sysctl for an app machine's network namespace, KEY=VALUE. Repeatable;
+    /// "none" forgets them.
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub sysctl: Vec<String>,
 }
 
 /// docker's --health-* flags, on top of the image's HEALTHCHECK; remembered.
@@ -710,6 +782,8 @@ pub struct StartOptions {
     pub pids_limit: Option<u64>,
     #[command(flatten)]
     pub health: HealthArgs,
+    #[command(flatten)]
+    pub tuning: TuningArgs,
 }
 
 #[derive(Args, Debug)]
@@ -723,9 +797,10 @@ pub struct StopArgs {
     /// (no SIGKILL after --timeout; the unit hooks release its network when it ends).
     #[arg(long = "no-wait", action = clap::ArgAction::SetFalse)]
     pub wait: bool,
-    /// App images: seconds to wait after the stop signal before terminating the machine.
-    #[arg(long, short = 't', default_value_t = 10)]
-    pub timeout: u64,
+    /// App images: seconds to wait after the stop signal before terminating the machine
+    /// (default: the machine's --stop-timeout, else 10).
+    #[arg(long, short = 't', value_name = "SECONDS")]
+    pub timeout: Option<u64>,
 }
 
 #[derive(Args, Debug)]

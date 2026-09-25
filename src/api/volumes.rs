@@ -269,6 +269,7 @@ mod tests {
                 aliases: BTreeMap::new(),
                 no_network: false,
                 healthcheck: None,
+                tuning: Default::default(),
             })
             .unwrap();
     }

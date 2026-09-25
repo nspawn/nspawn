@@ -409,7 +409,7 @@ pub async fn attach(
                 name: name.clone(),
                 force: true,
                 wait: true,
-                timeout: 0,
+                timeout: Some(0),
             };
             let _ = crate::api::machines::stop(ctx, &stop, report).await;
             bail!("{name} did not get its terminal or input ({reason}); was its unit changed by hand?");
@@ -457,7 +457,7 @@ impl Attached {
                     name: self.name.clone(),
                     force: false,
                     wait: true,
-                    timeout: 10,
+                    timeout: None,
                 };
                 let _ = crate::api::machines::stop(&ctx, &stop, &|_| {}).await;
                 self.watch.ended().await

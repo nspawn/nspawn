@@ -25,6 +25,8 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `settings.rs` | the `.nspawn` settings file and the unit hook drop-in |
 | `policy.rs` | restart policies and resource limits (`--restart`, `-m`, `--cpus`, `--pids-limit`), written into the hook drop-in |
 | `health.rs` | healthchecks: the image's or the flags', the probe runner (`health-run`, a transient unit bound to the machine's), its verdict under `/run/nspawn/health` |
+| `tuning.rs` | docker's other per-container flags (hostname, user, capabilities, tmpfs, devices, dns, ulimits, signals, sysctls): parsing, and the settings and unit lines they become |
+| `getent.rs` | the getent stand-in bound into an app that runs as a user |
 | `bridge.rs`, `hostnet.rs` | the nspawn0 bridge, ports, firewalls; veth mode |
 | `volume.rs`, `volmount.rs` | `-v` parsing; host-side mounts for mstack machines |
 | `nsenter.rs`, `pty.rs` | exec through namespaces, terminal pumping |
@@ -49,7 +51,9 @@ files, and the machine units call nspawn back through drop-in hooks.
                      labels, restart policy, limits
   manifests/NAME.json raw manifest bytes (digest stays valid)
   machines/NAME/     overlay upper/work, host0.network (host1.. for the
-                     other networks), hosts, resolv.conf,
+                     other networks), hosts, resolv.conf, getent (the
+                     stand-in bound into an app that runs as a user),
+                     hostname (a booted machine's --hostname),
                      units/ for the volume wait unit, exit-on-next when
                      `kill` sent the stop signal, last-signal (what `kill`
                      or `stop` sent the current run); 0700 with a writable
@@ -136,9 +140,15 @@ requested user, so capabilities are dropped.
 ## Machines and apps
 
 An image with an init system whose entrypoint is that init is booted
-(`Boot=yes`). Anything else is an app: its command runs as PID 2 under the
-stub init (`ProcessTwo=yes`), with the OCI config's environment, working
-directory, user and stop signal. Apps on the bridge run with
+(`Boot=yes`). Anything else is an app: its command runs under the stub init
+(`ProcessTwo=yes`), with the OCI config's environment, working directory,
+user and stop signal. systemd-nspawn resolves the user with `getent passwd`
+and `getent initgroups` run inside the machine, which busybox lacks, musl's
+getent (alpine) cannot answer and glibc's refuses for a uid the passwd does
+not list; an app that runs as a user gets `getent.rs`'s stand-in, a shell
+script bound over `/usr/bin/getent` that answers those two from the image's
+passwd and group files as docker reads them and hands anything else to the
+image's own getent, bound at `/run/nspawn/getent`. Apps on the bridge run with
 `PrivateUsers=no`, since a user namespace cannot join the network namespace
 prepared on the host; app images are assembled with overlay even where mstack
 exists. The namespace is named with `NamespacePath=` in the settings file on

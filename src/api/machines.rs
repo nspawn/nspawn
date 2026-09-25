@@ -246,7 +246,7 @@ pub async fn prepare(
             let attached: Vec<(&crate::bridge::NetSpec, std::net::Ipv4Addr)> =
                 nets.iter().zip(addrs).collect();
             let gateway = nets[bridge::gateway_index(&nets)].subnet.gateway();
-            bridge::create_netns(&attached, name, gateway)?;
+            bridge::create_netns(&attached, name, gateway, &record.tuning.sysctls)?;
         }
         let extras: Vec<String> = (1..nets.len())
             .map(|i| bridge::host_end_name_at(name, i))
@@ -260,6 +260,19 @@ pub async fn prepare(
         store.record_image(&record)?;
         None
     };
+    if !record.tuning.sysctls.is_empty() && (record.mode != Mode::App || !bridged) {
+        bail!("--sysctl values are set in the network namespace nspawn makes for an app machine on a bridge network; {name} has none");
+    }
+    // nspawn has no anonymous volumes: what the image expects a volume at lives in the
+    // machine, and a recreate loses it.
+    for path in &record.run.volumes {
+        if !record.volumes.iter().any(|v| v.target == *path) {
+            note(
+                report,
+                format!("note: {path} is a volume of the image and nothing is mounted there: what {name} writes there goes with the machine; -v NAME:{path} keeps it"),
+            );
+        }
+    }
     // Named volumes are made on first use; a host path must exist, as with podman: the
     // service does not make directories anywhere on the host.
     let mut binds = Vec::new();
@@ -281,6 +294,68 @@ pub async fn prepare(
             target: volume.target.clone(),
             read_only: volume.read_only,
         });
+    }
+    if record.backend == BackendChoice::Overlay {
+        crate::backend::mount_root(sd, store, name).await?;
+    }
+    // /run is a tmpfs of every machine already, and one over it would hide what
+    // systemd-nspawn keeps there; --tmpfs /var/run, docker's habit for a read-only
+    // nginx, lands on it through the image's symlink.
+    let mut tuning = record.tuning.clone();
+    tuning.tmpfs.retain(|mount| {
+        let target = mount.split_once(':').map_or(mount.as_str(), |(p, _)| p);
+        if crate::backend::lands_on_run(store, name, record.backend, target) {
+            note(
+                report,
+                format!("note: {target} is /run in {name}, a tmpfs of every machine already; --tmpfs there is left out"),
+            );
+            return false;
+        }
+        true
+    });
+    // A booted machine's systemd sets the hostname from /etc/hostname, over the one
+    // systemd-nspawn set: --hostname goes in as that file, as docker writes it.
+    let hostname_file = match (&record.tuning.hostname, record.mode) {
+        (Some(hostname), Mode::Boot) => {
+            let dir = store.machine_files_dir(name);
+            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            let path = dir.join("hostname");
+            std::fs::write(&path, format!("{hostname}\n"))
+                .with_context(|| format!("writing {}", path.display()))?;
+            Some(path)
+        }
+        _ => None,
+    };
+    if record.mode == Mode::App {
+        binds.extend(crate::getent::shim(store, name, &record)?);
+    }
+    if record.tuning.read_only {
+        // systemd-nspawn makes mount points as it goes, which a read-only root refuses.
+        let mut points: Vec<(String, bool)> = tuning
+            .tmpfs
+            .iter()
+            .map(|t| {
+                (
+                    t.split_once(':').map_or(t.as_str(), |(p, _)| p).to_string(),
+                    true,
+                )
+            })
+            .collect();
+        points.extend(binds.iter().map(|b| (b.target.clone(), b.source.is_dir())));
+        points.extend(
+            record
+                .tuning
+                .devices
+                .iter()
+                .map(|d| (d.container.clone(), false)),
+        );
+        if hostname_file.is_some() {
+            points.push(("/etc/hostname".to_string(), false));
+        }
+        crate::backend::ensure_mount_points(
+            &crate::backend::mount_point_root(store, name, record.backend)?,
+            &points,
+        )?;
     }
     let managed_userns = record.backend == BackendChoice::Mstack;
     let volume_units = if record.mode == Mode::Boot && !binds.is_empty() {
@@ -312,11 +387,13 @@ pub async fn prepare(
             volume_units: volume_units.as_deref(),
             network: record.network,
             no_network: record.no_network,
+            hostname_file: hostname_file.as_deref(),
             bridge: files.as_ref().map(|(files, bridge, extras)| BridgeMount {
                 bridge: bridge.as_str(),
                 files: files.as_path(),
                 extras,
             }),
+            tuning: &tuning,
         },
         &route,
     )?;
@@ -326,9 +403,12 @@ pub async fn prepare(
         config,
         &route,
         app_argv.as_deref(),
-        record.restart,
-        &record.limits,
-        record.remove_on_exit,
+        &settings::HookSpec {
+            restart: record.restart,
+            limits: &record.limits,
+            remove_on_exit: record.remove_on_exit,
+            tuning: &record.tuning,
+        },
     )? {
         sd.reload().await?;
     }
@@ -380,6 +460,8 @@ pub struct StartRequest {
     pub remove: bool,
     /// The --health-* flags.
     pub health: crate::health::Overrides,
+    /// hostname, user, capabilities and the rest.
+    pub tuning: crate::tuning::Overrides,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,6 +558,15 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
                 let hc = args.health.apply(r.effective_healthcheck())?;
                 r.healthcheck = Some(hc);
             }
+            args.tuning.apply(&mut r.tuning)?;
+            if r.mode == Mode::Boot
+                && (r.tuning.user.is_some() || r.tuning.working_dir.is_some() || r.tuning.init)
+            {
+                bail!(
+                    "{} boots an init system; --user, --workdir and --init only apply to the program of an app image",
+                    args.name
+                );
+            }
             // Set on every start, so that a start without --rm keeps the machine.
             if args.remove && r.restart != Restart::No {
                 bail!("--rm and a restart policy exclude each other: a machine removed when it ends cannot be restarted (--restart no)");
@@ -495,6 +586,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             || args.cpus.is_some()
             || args.pids_limit.is_some()
             || !args.health.is_empty()
+            || !args.tuning.is_empty()
             || args.remove =>
         {
             bail!(
@@ -634,8 +726,9 @@ pub struct StopRequest {
     pub name: String,
     pub force: bool,
     pub wait: bool,
-    /// Seconds between an app's stop signal and SIGKILL.
-    pub timeout: u64,
+    /// Seconds between an app's stop signal and SIGKILL; None for the machine's own
+    /// --stop-timeout, 10 without one.
+    pub timeout: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -751,8 +844,12 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
             Some(Mode::App) => {
                 let signal = record
                     .as_ref()
-                    .and_then(|r| r.run.stop_signal.clone())
+                    .and_then(|r| r.effective_stop_signal().map(str::to_string))
                     .unwrap_or_else(|| "SIGTERM".to_string());
+                let timeout = args
+                    .timeout
+                    .or_else(|| record.as_ref().and_then(|r| r.tuning.stop_timeout))
+                    .unwrap_or(10);
                 let (leader, payload) = wait_for_payload(sd, &args.name).await?;
                 store.mark_signal(&args.name, signal_number(&signal)?)?;
                 match payload {
@@ -773,7 +870,7 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
                     job = Some(sd.stop_unit_job(&unit).await?);
                 }
                 if args.wait {
-                    let gone = wait_gone(sd, &args.name, Duration::from_secs(args.timeout)).await?;
+                    let gone = wait_gone(sd, &args.name, Duration::from_secs(timeout)).await?;
                     if latch == Latch::AfterSignal {
                         job = Some(sd.stop_unit_job(&unit).await?);
                     }
@@ -781,8 +878,8 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
                         note(
                             report,
                             format!(
-                                "{} ignored {signal} for {} seconds; killing it",
-                                args.name, args.timeout
+                                "{} ignored {signal} for {timeout} seconds; killing it",
+                                args.name
                             ),
                         );
                         store.mark_signal(&args.name, libc::SIGKILL)?;
@@ -833,7 +930,7 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
     Ok(StopOutcome::Stopped)
 }
 
-/// An app's program (PID 2), which signals go to, never the whole cgroup: the stub init
+/// An app's program (the stub init's child), which signals go to, never the whole cgroup: the stub init
 /// reboots on SIGINT and systemd-nspawn dies of SIGQUIT. Waits a moment for the stub to
 /// fork it. Returns the leader too.
 async fn wait_for_payload(sd: &Systemd, name: &str) -> Result<(u32, Option<i32>)> {
@@ -872,7 +969,7 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
             name: args.name.clone(),
             force: true,
             wait: true,
-            timeout: 0,
+            timeout: Some(0),
         };
         stop(ctx, &request, report).await?;
         crate::api::events::emit("machine", "kill", &args.name, &[("signal", "9")]);
@@ -989,9 +1086,12 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
         &ctx.config,
         &route,
         app_argv.as_deref(),
-        record.restart,
-        &record.limits,
-        record.remove_on_exit,
+        &settings::HookSpec {
+            restart: record.restart,
+            limits: &record.limits,
+            remove_on_exit: record.remove_on_exit,
+            tuning: &record.tuning,
+        },
     )?;
     let running = state.active == "active";
     let changed = if record.restart.enabled_at_boot() {
@@ -1024,7 +1124,7 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
 fn stop_signals(record: Option<&ImageRecord>) -> Result<Vec<i32>> {
     match record {
         Some(r) if r.mode == Mode::App => Ok(vec![signal_number(
-            r.run.stop_signal.as_deref().unwrap_or("SIGTERM"),
+            r.effective_stop_signal().unwrap_or("SIGTERM"),
         )?]),
         _ => Ok(vec![libc::SIGRTMIN() + 3, libc::SIGRTMIN() + 4]),
     }
@@ -1104,7 +1204,7 @@ async fn wait_gone(sd: &Systemd, name: &str, timeout: Duration) -> Result<bool> 
 }
 
 /// Signal names as OCI configs write them: SIGTERM, TERM, 15, SIGRTMIN+3, RTMAX-1.
-fn signal_number(name: &str) -> Result<i32> {
+pub fn signal_number(name: &str) -> Result<i32> {
     if let Ok(number) = name.trim().parse::<i32>() {
         if number >= 1 && number <= libc::SIGRTMAX() {
             return Ok(number);

@@ -142,13 +142,74 @@ pub fn record(r: &ImageRecord) -> Dict {
         ("image_labels".to_string(), map(&r.run.labels)),
         (
             "working_dir".to_string(),
-            opt_string(r.run.working_dir.as_deref()),
+            opt_string(r.effective_working_dir()),
         ),
-        ("user".to_string(), opt_string(r.run.user.as_deref())),
+        ("user".to_string(), opt_string(r.effective_user())),
         (
             "stop_signal".to_string(),
-            opt_string(r.run.stop_signal.as_deref()),
+            opt_string(r.effective_stop_signal()),
         ),
+        (
+            "hostname".to_string(),
+            opt_string(r.tuning.hostname.as_deref()),
+        ),
+        ("cap_add".to_string(), strings(&r.tuning.cap_add)),
+        ("cap_drop".to_string(), strings(&r.tuning.cap_drop)),
+        ("privileged".to_string(), v(r.tuning.privileged)),
+        ("read_only".to_string(), v(r.tuning.read_only)),
+        ("tmpfs".to_string(), strings(&r.tuning.tmpfs)),
+        ("shm_size".to_string(), v(r.tuning.shm_size.unwrap_or(0))),
+        (
+            "devices".to_string(),
+            strings(
+                &r.tuning
+                    .devices
+                    .iter()
+                    .map(|d| format!("{}:{}:{}", d.host, d.container, d.permissions))
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+        (
+            "dns".to_string(),
+            strings(
+                &r.tuning
+                    .dns
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+        ("dns_search".to_string(), strings(&r.tuning.dns_search)),
+        (
+            "extra_hosts".to_string(),
+            strings(
+                &r.tuning
+                    .extra_hosts
+                    .iter()
+                    .map(|h| format!("{}:{}", h.host, h.ip))
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+        (
+            "ulimits".to_string(),
+            map(&r
+                .tuning
+                .ulimits
+                .iter()
+                .map(|(name, (soft, hard))| (name.clone(), format!("{soft}:{hard}")))
+                .collect()),
+        ),
+        (
+            "oom_score_adj".to_string(),
+            v(i64::from(r.tuning.oom_score_adj.unwrap_or(0))),
+        ),
+        (
+            "stop_timeout".to_string(),
+            v(r.tuning.stop_timeout.unwrap_or(10)),
+        ),
+        ("init".to_string(), v(r.tuning.init)),
+        ("sysctls".to_string(), map(&r.tuning.sysctls)),
+        ("image_volumes".to_string(), strings(&r.run.volumes)),
         (
             "healthcheck".to_string(),
             v(r.effective_healthcheck()
@@ -349,6 +410,31 @@ impl<'a> Options<'a> {
             })
             .transpose()?
             .unwrap_or_default())
+    }
+
+    /// A boolean when one was given.
+    pub fn maybe_bool(&mut self, key: &'static str) -> anyhow::Result<Option<bool>> {
+        self.take(key)
+            .map(|value| {
+                bool::try_from(value.clone())
+                    .map_err(|_| anyhow::anyhow!("option {key} must be a boolean (b)"))
+            })
+            .transpose()
+    }
+
+    /// A signed integer of any kind when one was given.
+    pub fn i64(&mut self, key: &'static str) -> anyhow::Result<Option<i64>> {
+        self.take(key)
+            .map(|value| match &**value {
+                Value::I16(n) => Ok(i64::from(*n)),
+                Value::I32(n) => Ok(i64::from(*n)),
+                Value::I64(n) => Ok(*n),
+                Value::U8(n) => Ok(i64::from(*n)),
+                Value::U16(n) => Ok(i64::from(*n)),
+                Value::U32(n) => Ok(i64::from(*n)),
+                _ => Err(anyhow::anyhow!("option {key} must be an integer (i)")),
+            })
+            .transpose()
     }
 
     pub fn bool(&mut self, key: &'static str, default: bool) -> anyhow::Result<bool> {
