@@ -246,9 +246,11 @@ app images are assembled with the overlay backend even where mstack is available
 
 Ports are published like docker: `nspawn start web -p 8080:80 -p 5353:53/udp`. Each one
 is a DNAT entry in the same nftables table, reachable from other hosts, from the host's
-own addresses and from 127.0.0.1, and it goes away when the machine stops. A port another
-running machine publishes, or one a service of the host listens on, is refused. The list
-is remembered for the image; `-p none` forgets it. With firewalld running, the bridge is
+own addresses and from 127.0.0.1, and it goes away when the machine stops. `-p
+127.0.0.1:8080:80` publishes on one address of the host alone, for a reverse proxy in
+front; `-p 8000-8010:8000-8010` publishes a range, one mapping per port. A port another
+running machine publishes (on every address, or on that one), or one a service of the
+host listens on, is refused. The list is remembered for the image; `-p none` forgets it. With firewalld running, the bridge is
 bound to the trusted zone at runtime, which also lets published ports through; the
 binding does not survive `firewall-cmd --reload`, the next `start` or `nspawn network up`
 puts it back.

@@ -312,7 +312,7 @@ pub struct CreateArgs {
     #[arg(long, value_name = "[NETWORK=]NAME")]
     pub network_alias: Vec<String>,
     /// Ports to publish on the host, like start -p.
-    #[arg(long, short = 'p', value_name = "HOST:CONTAINER[/udp]")]
+    #[arg(long, short = 'p', value_name = "[IP:]HOST:CONTAINER[/udp]")]
     pub publish: Vec<String>,
     /// Replace an existing machine with the same name.
     #[arg(long, short = 'f')]
@@ -636,9 +636,11 @@ pub struct StartOptions {
     /// them.
     #[arg(long, value_name = "[NETWORK=]NAME")]
     pub network_alias: Vec<String>,
-    /// Publish a port on the host, like docker -p: HOST:CONTAINER[/udp]. Repeatable and
-    /// remembered for the image; "none" forgets them all.
-    #[arg(long, short = 'p', value_name = "HOST:CONTAINER[/udp]")]
+    /// Publish a port on the host, like docker -p: HOST:CONTAINER[/udp], on one address
+    /// of the host with IP:HOST:CONTAINER, several with a range on both sides
+    /// (8000-8010:8000-8010). Repeatable and remembered for the image; "none" forgets
+    /// them all.
+    #[arg(long, short = 'p', value_name = "[IP:]HOST:CONTAINER[/udp]")]
     pub publish: Vec<String>,
     /// Replace the image's entrypoint; an empty string runs the arguments alone.
     #[arg(long, value_name = "PROGRAM")]

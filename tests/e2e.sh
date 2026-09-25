@@ -73,7 +73,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-run-boot busybox-1.37; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-run-boot busybox-1.37; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -348,7 +348,7 @@ grep -q "freed" /tmp/e2e-rmc.txt && fail "removing the created machine freed a l
 
 step "two machines on the bridge: names and published ports"
 $NSPAWN start e2e-a || fail "start e2e-a"
-$NSPAWN start e2e-b -p 18080:80 || fail "start e2e-b with a published port"
+$NSPAWN start e2e-b -p 18080:80 -p 127.0.0.1:18082:80 -p 18100-18101:80-81 || fail "start e2e-b with published ports"
 $NSPAWN exec e2e-b -- /usr/bin/systemctl is-system-running --wait </dev/null >/dev/null 2>&1 || true
 # An echo service on port 80 inside e2e-b, from socket activation: no extra packages needed.
 $NSPAWN exec e2e-b -- /bin/sh -c 'printf "[Socket]\nListenStream=80\nAccept=yes\n" > /etc/systemd/system/echo.socket; printf "[Service]\nExecStart=/usr/bin/cat\nStandardInput=socket\n" > /etc/systemd/system/echo@.service; systemctl daemon-reload; systemctl start echo.socket && echo ECHO-UP' </dev/null | tr -d '\r' | grep_q ECHO-UP || fail "echo service inside e2e-b"
@@ -361,12 +361,23 @@ retry 5 echo_test "$b_addr" 80 direct || fail "e2e-b not reachable on its bridge
 echo_test 127.0.0.1 18080 loopback || fail "published port not reachable on 127.0.0.1"
 host_ip=$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i <= NF; i++) if ($i == "src") print $(i + 1); exit}')
 echo_test "$host_ip" 18080 hostaddr || fail "published port not reachable on the host address $host_ip"
+# One address of the host alone, and a range.
+echo_test 127.0.0.1 18082 onlyloop || fail "a port published on 127.0.0.1 does not answer there"
+echo_test "$host_ip" 18082 leaked && fail "a port published on 127.0.0.1 answered on $host_ip"
+nft list map ip nspawn addr_ports | grep_q "127.0.0.1 . tcp . 18082" || fail "the port on one address is not in addr_ports"
+echo_test 127.0.0.1 18100 range || fail "the first port of a range does not answer"
+$NSPAWN inspect e2e-b | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['ports'] == ['18080->80/tcp', '127.0.0.1:18082->80/tcp', '18100->80/tcp', '18101->81/tcp'], d['ports']" || fail "inspect does not list the published ports as expected"
+$NSPAWN create e2e-a e2e-pclash -p 127.0.0.1:18080:80 >/dev/null || fail "create e2e-pclash"
+out=$($NSPAWN start e2e-pclash 2>&1) && fail "a port published on every address was published again on one"
+echo "$out" | grep_q "already published by e2e-b" || fail "the clash was not explained: $out"
+$NSPAWN images rm e2e-pclash >/dev/null || fail "rm e2e-pclash"
 $NSPAWN exec e2e-a -- /bin/sh -c "getent hosts e2e-b" </dev/null | tr -d '\r' | grep_q "$b_addr" || fail "e2e-a does not resolve e2e-b"
 $NSPAWN exec e2e-a -- /bin/sh -c "getent hosts host.nspawn.internal" </dev/null | tr -d '\r' | grep_q "10.99.0.1" || fail "host.nspawn.internal not resolvable"
 $NSPAWN exec e2e-a -- /bin/bash -c 'exec 3<>/dev/tcp/e2e-b/80 && echo a-to-b >&3 && read -t 3 l <&3 && echo "reply:$l"' </dev/null | tr -d '\r' | grep_q "reply:a-to-b" || fail "e2e-a cannot reach e2e-b by name"
 $NSPAWN stop e2e-b || fail "stop e2e-b"
 $NSPAWN stop e2e-a || fail "stop e2e-a"
 nft list map ip nspawn ports | grep_q 18080 && fail "published port still mapped after stop"
+nft list map ip nspawn addr_ports | grep_q 18082 && fail "the port on one address is still mapped after stop"
 
 step "run of a booted image: its console until it powers off, a shell with -it"
 $NSPAWN run --rm "$IMAGE" --name e2e-run-boot > /tmp/e2e-run-boot.txt 2>/tmp/e2e-run-boot.err &

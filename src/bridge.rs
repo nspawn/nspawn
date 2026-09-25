@@ -266,12 +266,25 @@ impl Protocol {
     }
 }
 
-/// docker's -p: HOST:CONTAINER[/udp].
+/// docker's -p: [IP:]HOST:CONTAINER[/udp].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortMap {
+    /// One address of the host, or every address (0.0.0.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_ip: Option<Ipv4Addr>,
     pub host: u16,
     pub container: u16,
     pub protocol: Protocol,
+}
+
+impl PortMap {
+    /// Whether both take the same host port: on the same address, or one on every
+    /// address.
+    pub fn clashes(&self, other: &PortMap) -> bool {
+        self.protocol == other.protocol
+            && self.host == other.host
+            && (self.host_ip.is_none() || other.host_ip.is_none() || self.host_ip == other.host_ip)
+    }
 }
 
 impl FromStr for PortMap {
@@ -287,13 +300,18 @@ impl FromStr for PortMap {
             "udp" => Protocol::Udp,
             other => bail!("{text}: unknown protocol {other} (tcp or udp)"),
         };
-        let (host, container) = match ports.split_once(':') {
-            Some((host, container)) => (host, container),
-            None => (ports, ports),
+        let fields: Vec<&str> = ports.split(':').collect();
+        let (host_ip, host, container) = match fields[..] {
+            [port] => (None, port, port),
+            [host, container] => (None, host, container),
+            [ip, host, container] => {
+                let ip: Ipv4Addr = ip
+                    .parse()
+                    .with_context(|| format!("{text}: {ip} is not an IPv4 address of the host"))?;
+                ((ip != Ipv4Addr::UNSPECIFIED).then_some(ip), host, container)
+            }
+            _ => bail!("{text}: expected [IP:]HOST:CONTAINER[/udp], IPv4 addresses only"),
         };
-        if host.contains(':') || container.contains(':') {
-            bail!("{text}: binding to one host address is not supported; ports are published on every address of the host");
-        }
         let port = |s: &str| {
             s.parse::<u16>()
                 .ok()
@@ -301,6 +319,7 @@ impl FromStr for PortMap {
                 .with_context(|| format!("{text}: bad port {s}"))
         };
         Ok(PortMap {
+            host_ip,
             host: port(host)?,
             container: port(container)?,
             protocol,
@@ -310,6 +329,9 @@ impl FromStr for PortMap {
 
 impl fmt::Display for PortMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(ip) = self.host_ip {
+            write!(f, "{ip}:")?;
+        }
         write!(
             f,
             "{}->{}/{}",
@@ -320,6 +342,53 @@ impl fmt::Display for PortMap {
     }
 }
 
+/// One -p value, ranges expanded: HOST-HOST:CONTAINER-CONTAINER of equal lengths gives one
+/// mapping per port, as docker's inspect shows them.
+fn expand_ports(text: &str) -> Result<Vec<PortMap>> {
+    let (ports, suffix) = match text.rsplit_once('/') {
+        Some((ports, proto)) => (ports, format!("/{proto}")),
+        None => (text, String::new()),
+    };
+    let Some((left, right)) = ports.rsplit_once(':') else {
+        return Ok(vec![text.parse()?]);
+    };
+    let (Some((host_from, host_to)), Some((cont_from, cont_to))) =
+        (left.split_once('-'), right.split_once('-'))
+    else {
+        if left.contains('-') || right.contains('-') {
+            bail!("{text}: a range of host ports goes with a range of container ports of the same length");
+        }
+        return Ok(vec![text.parse()?]);
+    };
+    let (prefix, host_from) = match host_from.rsplit_once(':') {
+        Some((prefix, from)) => (format!("{prefix}:"), from),
+        None => (String::new(), host_from),
+    };
+    let range = |from: &str, to: &str| -> Result<std::ops::RangeInclusive<u16>> {
+        let from: u16 = from
+            .parse()
+            .with_context(|| format!("{text}: bad port {from}"))?;
+        let to: u16 = to
+            .parse()
+            .with_context(|| format!("{text}: bad port {to}"))?;
+        if from == 0 || to < from {
+            bail!("{text}: bad range {from}-{to}");
+        }
+        Ok(from..=to)
+    };
+    let hosts = range(host_from, host_to)?;
+    let containers = range(cont_from, cont_to)?;
+    if hosts.clone().count() != containers.clone().count() {
+        bail!(
+            "{text}: a range of host ports goes with a range of container ports of the same length"
+        );
+    }
+    hosts
+        .zip(containers)
+        .map(|(host, container)| format!("{prefix}{host}:{container}{suffix}").parse())
+        .collect()
+}
+
 /// "none" alone clears the list.
 pub fn parse_publish(values: &[String]) -> Result<Vec<PortMap>> {
     if values.len() == 1 && values[0] == "none" {
@@ -327,14 +396,12 @@ pub fn parse_publish(values: &[String]) -> Result<Vec<PortMap>> {
     }
     let mut out: Vec<PortMap> = Vec::new();
     for value in values {
-        let p: PortMap = value.parse()?;
-        if out
-            .iter()
-            .any(|o| o.host == p.host && o.protocol == p.protocol)
-        {
-            bail!("host port {}/{} given twice", p.host, p.protocol.name());
+        for p in expand_ports(value)? {
+            if out.iter().any(|o| o.clashes(&p)) {
+                bail!("host port {}/{} given twice", p.host, p.protocol.name());
+            }
+            out.push(p);
         }
-        out.push(p);
     }
     Ok(out)
 }
@@ -530,6 +597,9 @@ pub fn base_ruleset(all: &[NetSpec]) -> String {
 	map ports {{
 		type inet_proto . inet_service : ipv4_addr . inet_service
 	}}
+	map addr_ports {{
+		type ipv4_addr . inet_proto . inet_service : ipv4_addr . inet_service
+	}}
 	chain prerouting {{
 		type nat hook prerouting priority -100; policy accept;
 	}}
@@ -551,7 +621,9 @@ flush chain ip {TABLE} output
 flush chain ip {TABLE} postrouting
 flush chain ip {TABLE} input
 flush chain ip {TABLE} forward
+add rule ip {TABLE} prerouting dnat ip to ip daddr . meta l4proto . th dport map @addr_ports
 add rule ip {TABLE} prerouting fib daddr type local dnat ip to meta l4proto . th dport map @ports
+add rule ip {TABLE} output dnat ip to ip daddr . meta l4proto . th dport map @addr_ports
 add rule ip {TABLE} output fib daddr type local dnat ip to meta l4proto . th dport map @ports
 "
     );
@@ -638,11 +710,18 @@ pub fn withdraw_ports(record: &ImageRecord) -> Result<()> {
     }
     for p in &record.ports {
         // One script per element: a missing one fails the whole transaction.
-        let _ = nft(&format!(
-            "delete element ip {TABLE} ports {{ {} . {} }}\n",
-            p.protocol.name(),
-            p.host
-        ));
+        let _ = nft(&match p.host_ip {
+            Some(ip) => format!(
+                "delete element ip {TABLE} addr_ports {{ {ip} . {} . {} }}\n",
+                p.protocol.name(),
+                p.host
+            ),
+            None => format!(
+                "delete element ip {TABLE} ports {{ {} . {} }}\n",
+                p.protocol.name(),
+                p.host
+            ),
+        });
     }
     Ok(())
 }
@@ -1099,22 +1178,29 @@ pub fn write_hosts_files(store: &Store, all: &[NetSpec]) -> Result<()> {
     Ok(())
 }
 
-async fn ports_in_use(
-    store: &Store,
-    sd: &Systemd,
-    except: &str,
-) -> Result<BTreeMap<(Protocol, u16), (String, Ipv4Addr, u16)>> {
-    let mut used = BTreeMap::new();
+/// A published port of a running machine: the mapping, the machine and its address.
+struct PortInUse {
+    port: PortMap,
+    machine: String,
+    address: Ipv4Addr,
+}
+
+async fn ports_in_use(store: &Store, sd: &Systemd, except: &str) -> Result<Vec<PortInUse>> {
+    let mut used = Vec::new();
     for r in store.list_images_strict()? {
         if r.name == except || !bridge_kind(&r) || r.ports.is_empty() {
             continue;
         }
-        let Some(addr) = r.address else { continue };
+        let Some(address) = r.address else { continue };
         if !holds_ports(store, sd, &r.name).await? {
             continue;
         }
         for p in &r.ports {
-            used.insert((p.protocol, p.host), (r.name.clone(), addr, p.container));
+            used.push(PortInUse {
+                port: *p,
+                machine: r.name.clone(),
+                address,
+            });
         }
     }
     Ok(used)
@@ -1142,11 +1228,12 @@ async fn holds_ports(store: &Store, sd: &Systemd, name: &str) -> Result<bool> {
 pub async fn check_port_conflicts(store: &Store, sd: &Systemd, record: &ImageRecord) -> Result<()> {
     let used = ports_in_use(store, sd, &record.name).await?;
     for p in &record.ports {
-        if let Some((other, _, _)) = used.get(&(p.protocol, p.host)) {
+        if let Some(other) = used.iter().find(|u| u.port.clashes(p)) {
             bail!(
-                "host port {}/{} is already published by {other}",
+                "host port {}/{} is already published by {}",
                 p.host,
-                p.protocol.name()
+                p.protocol.name(),
+                other.machine
             );
         }
         if !host_port_free(*p) {
@@ -1160,10 +1247,14 @@ pub async fn check_port_conflicts(store: &Store, sd: &Systemd, record: &ImageRec
     Ok(())
 }
 
+/// Nothing on the host listens there: bound to the address the port is published on, so
+/// that a service on every address shows up for a port on one address, as the kernel
+/// refuses the second bind.
 fn host_port_free(port: PortMap) -> bool {
+    let address = (port.host_ip.unwrap_or(Ipv4Addr::UNSPECIFIED), port.host);
     match port.protocol {
-        Protocol::Tcp => std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port.host)).is_ok(),
-        Protocol::Udp => std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port.host)).is_ok(),
+        Protocol::Tcp => std::net::TcpListener::bind(address).is_ok(),
+        Protocol::Udp => std::net::UdpSocket::bind(address).is_ok(),
     }
 }
 
@@ -1176,12 +1267,23 @@ pub async fn sync_ports_except(store: &Store, sd: &Systemd, except: &str) -> Res
     if !table_exists() {
         return Ok(());
     }
-    let mut script = format!("flush map ip {TABLE} ports\n");
-    for ((protocol, host), (_, addr, container)) in ports_in_use(store, sd, except).await? {
-        script.push_str(&format!(
-            "add element ip {TABLE} ports {{ {} . {host} : {addr} . {container} }}\n",
-            protocol.name()
-        ));
+    let mut script = format!("flush map ip {TABLE} ports\nflush map ip {TABLE} addr_ports\n");
+    for used in ports_in_use(store, sd, except).await? {
+        let (p, addr) = (used.port, used.address);
+        script.push_str(&match p.host_ip {
+            Some(ip) => format!(
+                "add element ip {TABLE} addr_ports {{ {ip} . {} . {} : {addr} . {} }}\n",
+                p.protocol.name(),
+                p.host,
+                p.container
+            ),
+            None => format!(
+                "add element ip {TABLE} ports {{ {} . {} : {addr} . {} }}\n",
+                p.protocol.name(),
+                p.host,
+                p.container
+            ),
+        });
     }
     nft(&script)
 }
@@ -1265,7 +1367,39 @@ mod tests {
         assert!("0:80".parse::<PortMap>().is_err());
         assert!("80:x".parse::<PortMap>().is_err());
         assert!("80:80/sctp".parse::<PortMap>().is_err());
-        assert!("127.0.0.1:80:80".parse::<PortMap>().is_err());
+        let p: PortMap = "127.0.0.1:8080:80".parse().unwrap();
+        assert_eq!(p.host_ip, Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(p.to_string(), "127.0.0.1:8080->80/tcp");
+        assert_eq!(
+            "0.0.0.0:8080:80".parse::<PortMap>().unwrap().host_ip,
+            None,
+            "every address"
+        );
+        assert!("[::1]:80:80".parse::<PortMap>().is_err(), "IPv4 only");
+        assert!("::1:80:80".parse::<PortMap>().is_err());
+        assert!("1.2.3:80:80".parse::<PortMap>().is_err());
+        let any: PortMap = "8080:80".parse().unwrap();
+        assert!(
+            any.clashes(&p) && p.clashes(&any),
+            "one address against every address"
+        );
+        assert!(!"10.0.0.1:8080:80".parse::<PortMap>().unwrap().clashes(&p));
+        assert!(!"127.0.0.1:8080:80/udp"
+            .parse::<PortMap>()
+            .unwrap()
+            .clashes(&p));
+        // Ranges, one mapping per port; a range of host ports for one port is refused.
+        let range = expand_ports("127.0.0.1:8000-8002:80-82/udp").unwrap();
+        assert_eq!(range.len(), 3);
+        assert_eq!(range[2].to_string(), "127.0.0.1:8002->82/udp");
+        assert_eq!(
+            expand_ports("8000-8001:80-81").unwrap()[1].to_string(),
+            "8001->81/tcp"
+        );
+        assert!(expand_ports("8000-8002:80-81").is_err());
+        assert!(expand_ports("8000-8002:80").is_err());
+        assert!(expand_ports("8002-8000:80-82").is_err());
+        assert!(parse_publish(&["8000-8001:80-81".into(), "8001:81".into()]).is_err());
 
         assert!(parse_publish(&["none".to_string()]).unwrap().is_empty());
         assert_eq!(
@@ -1341,6 +1475,10 @@ mod tests {
         let rules = base_ruleset(&[net("bridge", "nspawn0", "10.99.0.0/24", false)]);
         assert!(rules.contains("ip saddr 10.99.0.0/24 oifname != \"nspawn0\" masquerade"));
         assert!(rules.contains("map @ports"));
+        assert!(
+            rules.find("map @addr_ports").unwrap() < rules.find("fib daddr type local").unwrap(),
+            "a port on one address is looked up before the ports on every address"
+        );
         for symbolic in ["priority dstnat", "priority srcnat", "priority filter"] {
             assert!(
                 !rules.contains(symbolic),

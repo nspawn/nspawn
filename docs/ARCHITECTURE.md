@@ -215,7 +215,8 @@ the library in the command line's own process.
 
 The default bridge (`nspawn0`, `10.99.0.0/24`) and those of user-defined
 networks (`nsbr-NAME`, a /24 of `network_pool` each) are created with `ip`;
-the nftables table `ip nspawn` holds the DNAT map for published ports, and for
+the nftables table `ip nspawn` holds the DNAT maps for published ports (`ports` for
+those on every address of the host, `addr_ports` for those on one), and for
 every network masquerading (not for internal ones), hairpin masquerading and a
 guard so that `route_localnet` cannot expose the host's loopback services. Its
 forward chain keeps the networks apart: an internal network forwards nothing,
