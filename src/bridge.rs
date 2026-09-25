@@ -799,6 +799,14 @@ pub fn host_end_name(name: &str) -> String {
 
 /// The host end of the machine's veth on its `index`th network: vb-NAME for the first,
 /// vb1-NAME, vb2-NAME.. for the others.
+/// The MAC of an app's interface, from its address as docker derives it: a restart
+/// keeps it, so what the host's neighbour cache knows of the address stays right
+/// instead of pointing at the interface that went, unreachable until it is probed.
+pub fn mac_of(addr: Ipv4Addr) -> String {
+    let o = addr.octets();
+    format!("02:42:{:02x}:{:02x}:{:02x}:{:02x}", o[0], o[1], o[2], o[3])
+}
+
 pub fn host_end_name_at(name: &str, index: usize) -> String {
     if index == 0 {
         return host_end_name(name);
@@ -830,10 +838,12 @@ pub fn create_netns(
         for (i, (net, addr)) in nets.iter().enumerate() {
             let host_end = host_end_name_at(name, i);
             let inside = format!("host{i}");
+            let mac = mac_of(*addr);
             run(
                 "ip",
                 &[
-                    "link", "add", &host_end, "type", "veth", "peer", "name", &inside, "netns", &ns,
+                    "link", "add", &host_end, "type", "veth", "peer", "name", &inside, "address",
+                    &mac, "netns", &ns,
                 ],
             )?;
             run(
@@ -1322,6 +1332,12 @@ pub async fn sync_ports_except(store: &Store, sd: &Systemd, except: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mac_follows_the_address() {
+        assert_eq!(mac_of("10.99.0.2".parse().unwrap()), "02:42:0a:63:00:02");
+        assert_eq!(mac_of("172.16.255.1".parse().unwrap()), "02:42:ac:10:ff:01");
+    }
 
     #[test]
     fn what_filters_forwarding_is_read_from_the_ruleset() {
