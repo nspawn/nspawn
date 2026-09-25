@@ -849,15 +849,28 @@ pub async fn processes(ctx: &Context, name: &str) -> Result<Vec<Process>> {
         .await?;
     let unit_cgroup = PathBuf::from(format!("/sys/fs/cgroup{cgroup}"));
     let mut pids = Vec::new();
-    // systemd-nspawn keeps itself in supervisor/ and the machine in payload/; without
-    // that split (another supervisor), what is in the machine's PID namespace is its.
+    // systemd-nspawn keeps itself in supervisor/ and the machine in payload/, which it
+    // makes a moment after the machine registers: right after a restart the old tree may
+    // still be going while the new one is not there yet. Without that split (another
+    // supervisor), what is in the machine's PID namespace is its, and never what is in
+    // the host's.
     let payload = unit_cgroup.join("payload");
+    for _ in 0..20 {
+        if payload.is_dir() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     if payload.is_dir() {
         cgroup_pids(&payload, &mut pids);
     } else {
+        let host = std::fs::read_link("/proc/self/ns/pid").ok();
         let inside = std::fs::read_link(format!("/proc/{leader}/ns/pid")).ok();
         cgroup_pids(&unit_cgroup, &mut pids);
-        pids.retain(|pid| std::fs::read_link(format!("/proc/{pid}/ns/pid")).ok() == inside);
+        pids.retain(|pid| {
+            let ns = std::fs::read_link(format!("/proc/{pid}/ns/pid")).ok();
+            ns.is_some() && ns != host && ns == inside
+        });
     }
     if pids.is_empty() {
         bail!("reading the processes of {name}: none in its cgroup {cgroup}");
