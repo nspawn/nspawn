@@ -73,7 +73,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-run-boot busybox-1.37 busybox-1.36; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-run-boot busybox-1.37 busybox-1.36; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -729,6 +729,8 @@ $NSPAWN stop $app >/dev/null || fail "stop after --no-wait start"
 
 step "stop: a program that ignores its stop signal is killed after --timeout"
 $NSPAWN start $app -- /bin/sh -c 'trap "" TERM; exec /bin/sleep 300' || fail "start stubborn app"
+# The shell has to have set its trap and become sleep before the signal comes.
+retry 5 bash -c "$NSPAWN top $app | grep -q 'sleep 300'" || fail "the stubborn program is not up: $($NSPAWN top $app)"
 t0=$(date +%s)
 out=$($NSPAWN stop $app -t 2 2>&1 >/dev/null) || fail "stop of a stubborn app"
 [ $(( $(date +%s) - t0 )) -lt 20 ] || fail "stop of a stubborn app took too long"
@@ -1203,6 +1205,97 @@ grep -q "removed e2e-pw" /tmp/e2e-secretrm.txt || fail "secret rm stopped at the
 grep -q "no secret named e2e-nope" /tmp/e2e-secretrm.txt || fail "a missing secret was not explained: $(cat /tmp/e2e-secretrm.txt)"
 ls /var/lib/nspawn/secrets/ | grep_q e2e-pw && fail "secret rm left files behind"
 $NSPAWN events --since "-2min" --until now --filter type=secret | grep_q "secret create e2e-pw" || fail "no event for the secret"
+
+step "everything at once: the features of 1.3.0 combined, on an app and on a booted machine"
+$NSPAWN network create e2e-nd --label tier=mix >/dev/null || fail "network create e2e-nd"
+$NSPAWN network create e2e-ne --internal >/dev/null || fail "network create e2e-ne"
+printf 'mix-secret' | $NSPAWN secret create e2e-pw >/dev/null || fail "secret create for the mix"
+mix_since=$(date +%s)
+mix_host_ip=$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i <= NF; i++) if ($i == "src") print $(i + 1); exit}')
+addr_on() { $NSPAWN inspect "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['addresses'].get('$2', ''))"; }
+# The app: two networks with aliases, a port on loopback, a healthcheck, a secret, a
+# read-only root with a tmpfs it writes, a user that binds port 80 through a sysctl, a
+# hostname, a stop signal and a restart policy, all on one machine.
+$NSPAWN create $app e2e-mix-app --network e2e-nd --network e2e-ne --network-alias mixweb --network-alias e2e-ne=inner \
+  -p 127.0.0.1:18095:80 --health-cmd "wget -qO- http://127.0.0.1/ >/dev/null" --health-interval 1s --health-retries 2 \
+  --secret e2e-pw:/run/secrets/token:0444 --read-only --tmpfs /www:size=8m,mode=1777 -u nobody \
+  --sysctl net.ipv4.ip_unprivileged_port_start=0 --hostname mix-$nonce --add-host peer:10.1.1.9 \
+  --stop-signal SIGINT --stop-timeout 2 --restart on-failure -l role=mix \
+  -- /bin/sh -c 'cat /run/secrets/token > /www/index.html; exec /bin/httpd -f -p 80 -h /www' >/dev/null || fail "create the mixed app"
+$NSPAWN start e2e-mix-app >/dev/null || fail "start the mixed app"
+mx() { $NSPAWN exec e2e-mix-app -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
+retry 10 bash -c "$NSPAWN ps | grep '^ *e2e-mix-app ' | grep_q '(healthy)'" || fail "the mixed app is not healthy: $($NSPAWN ps | grep e2e-mix-app; $NSPAWN logs e2e-mix-app -n 5)"
+retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18095/ | grep_q mix-secret" || fail "the port on loopback does not serve the secret: $(curl -s -m 2 http://127.0.0.1:18095/)"
+curl -sf -m 2 "http://$mix_host_ip:18095/" >/dev/null 2>&1 && fail "the port published on 127.0.0.1 answered on $mix_host_ip"
+[ "$(mx hostname)" = "mix-$nonce" ] || fail "hostname of the mixed app: $(mx hostname)"
+mx 'cat /etc/hosts' | grep_q "^10.1.1.9 peer$" || fail "--add-host missing in the mixed app: $(mx 'cat /etc/hosts')"
+mx 'cat /etc/hosts' | grep_q "mixweb" || fail "the app's own alias is not in its hosts file: $(mx 'cat /etc/hosts')"
+mx 'cat /etc/hosts' | grep_q "inner" || fail "the app's alias on the internal network is not in its hosts file: $(mx 'cat /etc/hosts')"
+[ "$(mx 'touch /x 2>/dev/null && echo RW || echo RO')" = RO ] || fail "the mixed app's root is writable"
+app_nd=$(addr_on e2e-mix-app e2e-nd); app_ne=$(addr_on e2e-mix-app e2e-ne)
+[ -n "$app_nd" ] && [ -n "$app_ne" ] && [ "$app_nd" != "$app_ne" ] || fail "the mixed app has no address on each network: $app_nd $app_ne"
+$NSPAWN inspect e2e-mix-app | python3 -c "
+import json, sys
+d = json.load(sys.stdin)[0]
+assert d['networks'] == ['e2e-nd', 'e2e-ne'] and d['aliases'] == ['e2e-nd=mixweb', 'e2e-ne=inner'], (d['networks'], d['aliases'])
+assert d['ports'] == ['127.0.0.1:18095->80/tcp'] and d['secrets'] == ['e2e-pw:/run/secrets/token:0444:0:0'], (d['ports'], d['secrets'])
+assert d['user'] == 'nobody' and d['read_only'] and d['restart'] == 'on-failure' and d['labels']['role'] == 'mix', d
+assert d['health'] == 'healthy' and d['healthcheck']['retries'] == 2, (d['health'], d['healthcheck'])" || fail "inspect of the mixed app"
+# The booted machine: the same networks with an alias, a healthcheck on its systemd, the
+# secret, a hostname, a tmpfs and a capability dropped.
+$NSPAWN pull "$IMAGE" --name e2e-mix-boot --backend overlay --force >/dev/null || fail "pull e2e-mix-boot"
+$NSPAWN start e2e-mix-boot --network e2e-nd --network e2e-ne --network-alias mixboot \
+  --health-cmd "systemctl is-system-running --wait | grep -Eq '^(running|degraded)\$'" --health-interval 2s --health-timeout 30s --health-retries 3 --health-start-period 40s \
+  --secret e2e-pw --hostname mixboot-$nonce --tmpfs /var/tmp:size=16m --cap-drop SYS_MODULE --add-host peer:10.1.1.9 >/dev/null || fail "start the mixed booted machine"
+mb() { $NSPAWN exec e2e-mix-boot -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
+retry 30 bash -c "$NSPAWN ps | grep '^ *e2e-mix-boot ' | grep_q '(healthy)'" || fail "the mixed booted machine is not healthy: $($NSPAWN ps | grep e2e-mix-boot; $NSPAWN inspect e2e-mix-boot | grep -A3 health_log)"
+[ "$(mb 'cat /run/secrets/e2e-pw')" = mix-secret ] || fail "the secret is not readable in the booted machine: $(mb 'ls -la /run/secrets')"
+# A minimal image has no hostname binary; the kernel's name is the same thing.
+[ "$(mb 'uname -n')" = "mixboot-$nonce" ] || fail "hostname of the booted machine: $(mb 'uname -n')"
+mb 'cat /proc/mounts' | grep_q " /var/tmp tmpfs" || fail "--tmpfs missing in the booted machine"
+[ $(( 0x$(mb "awk '/^CapBnd:/ {print \$2}' /proc/1/status") & 0x10000 )) = 0 ] || fail "--cap-drop SYS_MODULE left the capability in the booted machine: $(mb 'grep CapBnd /proc/1/status')"
+mb 'cat /etc/hosts' | grep_q "^10.1.1.9 peer$" || fail "--add-host missing in the booted machine"
+mb 'getent hosts mixweb' | grep_q "$app_nd" || fail "the booted machine does not resolve the app's alias on e2e-nd: $(mb 'getent hosts mixweb')"
+mb 'getent hosts inner' | grep_q "$app_ne" || fail "the booted machine does not resolve the app's alias on e2e-ne: $(mb 'getent hosts inner')"
+$NSPAWN exec e2e-mix-boot -- bash -c 'exec 3<>/dev/tcp/mixweb/80; printf "GET / HTTP/1.0\r\n\r\n" >&3; cat <&3' </dev/null | tr -d '\r' | grep_q mix-secret || fail "the booted machine does not reach the app by its alias"
+$NSPAWN exec e2e-mix-boot -- bash -c 'exec 3<>/dev/tcp/inner/80; printf "GET / HTTP/1.0\r\n\r\n" >&3; cat <&3' </dev/null | tr -d '\r' | grep_q mix-secret || fail "the booted machine does not reach the app through the internal network"
+mx 'cat /etc/hosts' | grep_q " mixboot" || fail "the app's hosts file misses the booted machine's alias: $(mx 'cat /etc/hosts')"
+retry 5 bash -c "$NSPAWN exec e2e-mix-app -- ping -c 1 -W 2 mixboot </dev/null >/dev/null 2>&1" || fail "the app does not reach the booted machine by its alias"
+# Operations on top of it all: pause, an update of the healthcheck, restart, top, exec
+# with its flags, the logs of both.
+$NSPAWN pause e2e-mix-app >/dev/null || fail "pause the mixed app"
+$NSPAWN ps | grep "^ *e2e-mix-app " | grep_q " paused " || fail "ps does not show the mixed app paused: $($NSPAWN ps | grep e2e-mix-app)"
+$NSPAWN unpause e2e-mix-app >/dev/null || fail "unpause the mixed app"
+retry 10 bash -c "$NSPAWN ps | grep '^ *e2e-mix-app ' | grep_q '(healthy)'" || fail "the mixed app is not healthy again after unpause: $($NSPAWN ps | grep e2e-mix-app)"
+$NSPAWN update e2e-mix-app --health-retries 3 --health-interval 2s >/dev/null || fail "update the healthcheck of the mixed app"
+retry 10 bash -c "$NSPAWN ps | grep '^ *e2e-mix-app ' | grep_q '(healthy)'" || fail "the mixed app is not healthy after update: $($NSPAWN ps | grep e2e-mix-app)"
+$NSPAWN restart e2e-mix-app -t 2 | grep_q "restarted e2e-mix-app" || fail "restart the mixed app"
+retry 10 bash -c "$NSPAWN ps | grep '^ *e2e-mix-app ' | grep_q '(healthy)'" || fail "the mixed app is not healthy after restart: $($NSPAWN ps | grep e2e-mix-app)"
+retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18095/ | grep_q mix-secret" || fail "the port does not answer after restart"
+[ "$(addr_on e2e-mix-app e2e-nd)" = "$app_nd" ] || fail "the address on e2e-nd changed across restart"
+$NSPAWN top e2e-mix-app | grep_q "httpd" || fail "top does not list httpd: $($NSPAWN top e2e-mix-app)"
+[ "$($NSPAWN exec e2e-mix-app -u nobody -w /www -T -- /bin/sh -c 'pwd; id -u' </dev/null | tr -d '\r' | tr '\n' ' ')" = "/www 65534 " ] || fail "exec -u -w -T in the mixed app: $($NSPAWN exec e2e-mix-app -u nobody -w /www -T -- /bin/sh -c 'pwd; id -u' </dev/null)"
+$NSPAWN logs e2e-mix-app e2e-mix-boot --until now > /tmp/e2e-mixlogs.txt 2>&1 || fail "logs of both mixed machines"
+grep -q "^e2e-mix-boot *| " /tmp/e2e-mixlogs.txt || fail "logs of both carry no names: $(head -3 /tmp/e2e-mixlogs.txt)"
+# Stop with the machine's own signal: the exit code follows it, the policy stays quiet,
+# nothing of the secret, the health or the port is left behind.
+$NSPAWN stop e2e-mix-app -t 2 | grep_q "stopped e2e-mix-app" || fail "stop the mixed app"
+sleep 3
+$NSPAWN ps | grep_q "^ *e2e-mix-app " && fail "the mixed app came back after stop despite its policy"
+$NSPAWN inspect e2e-mix-app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['state'] == 'stopped' and d['exit_code'] == 130, (d['state'], d.get('exit_code'))" || fail "the exit code of the mixed app after stop with SIGINT"
+[ -e /run/nspawn/secrets/e2e-mix-app ] && fail "the secret of the mixed app was left decrypted"
+[ -e /run/nspawn/health/e2e-mix-app.json ] && fail "the health file of the mixed app was left behind"
+nft list map ip nspawn addr_ports | grep_q 18095 && fail "the port of the mixed app is still mapped"
+$NSPAWN restart e2e-mix-boot -t 5 | grep_q "restarted e2e-mix-boot" || fail "restart the mixed booted machine"
+retry 30 bash -c "$NSPAWN ps | grep '^ *e2e-mix-boot ' | grep_q '(healthy)'" || fail "the booted machine is not healthy after restart: $($NSPAWN ps | grep e2e-mix-boot)"
+[ "$(mb 'cat /run/secrets/e2e-pw')" = mix-secret ] || fail "the secret is gone after the restart of the booted machine"
+$NSPAWN events --since "@$mix_since" --until now --filter name=e2e-mix-app --filter event=health_status | grep_q "status=healthy" || fail "no health_status event for the mixed app"
+$NSPAWN stop e2e-mix-boot >/dev/null || fail "stop the mixed booted machine"
+out=$($NSPAWN secret rm e2e-pw 2>&1) && fail "the secret was removed while the mixed machines take it"
+$NSPAWN rm e2e-mix-app e2e-mix-boot >/dev/null || fail "rm the mixed machines"
+$NSPAWN secret rm e2e-pw >/dev/null || fail "secret rm once the mixed machines are gone"
+$NSPAWN network rm e2e-nd e2e-ne >/dev/null || fail "network rm of the mix networks"
+ip -o link show | grep_q "nsbr-e2e-n[de]" && fail "a mix network left its bridge"
 
 step "rm: a running machine is refused, rm -f stops it first, named volumes stay"
 $NSPAWN start $app -v e2evol:/vol -- /bin/sleep 300 >/dev/null || fail "start the app with e2evol"

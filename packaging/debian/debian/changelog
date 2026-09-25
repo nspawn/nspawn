@@ -1,3 +1,10 @@
+nspawn (1.3.0-1) unstable; urgency=medium
+
+  * Several networks per machine with aliases, ports on one host address.
+  * Healthchecks, secrets, docker's other run flags, restart, pause and top.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Fri, 25 Sep 2026 12:00:00 -0500
+
 nspawn (1.2.0-1) unstable; urgency=medium
 
   * run stays attached like docker run (-d for the background, --rm, -i, -t).
