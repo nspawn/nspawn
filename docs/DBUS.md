@@ -149,7 +149,7 @@ machine to be gone, which can take longer than a client's default timeout
 | `CreateNetwork(s name, a{sv} options) -> a{sv}` | `network create`: options subnet (CIDR; the next free /24 of network_pool otherwise), internal (b); the network as ListNetworks has it, plus `notes` |
 | `RemoveNetworks(as names) -> o` | `network rm`: a job (kind network-rm); a network in use, unknown or the default one is refused without stopping the others; result `removed` (as) |
 | `PruneNetworks() -> o` | `network prune`: a job (kind network-prune) removing every user-defined network no machine names; result `removed` (as) |
-| `ListNetwork() -> (a{sv}, aa{sv})` | the default network (bridge, subnet, gateway, host_name) and the machines on it (name, address, ports, running) |
+| `ListNetwork() -> (a{sv}, aa{sv})` | deprecated, goes in the next release; `GetNetwork("bridge")` replaces it. The default network (bridge, subnet, gateway, host_name) and the machines on it (name, address, ports, running) |
 | `NetworkUp() -> a{sv}` | `network up`: every network's bridge comes up; the default one as ListNetwork has it, `networks` (as, every network) and `notes` |
 | `Login(s registry, s user, s password, a{sv} options) -> a{sv}` | `login`; "" for the hub; options registry (the hub "" stands for), ca_cert |
 | `Logout(s registry) -> b` | `logout` |
