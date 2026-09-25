@@ -249,6 +249,9 @@ pub fn machine(m: &MachineSummary) -> Dict {
     dict.insert("started".to_string(), v(m.started.unwrap_or(0)));
     dict.insert("leader".to_string(), v(u64::from(m.leader.unwrap_or(0))));
     dict.insert("os".to_string(), opt_string(m.os.as_deref()));
+    if let Some(code) = m.exit_code {
+        dict.insert("exit_code".to_string(), v(code));
+    }
     if let Some(health) = &m.health {
         dict.insert("health".to_string(), v(health.status.as_str()));
         dict.insert(
@@ -323,6 +326,15 @@ pub fn volume(vol: &VolumeInfo) -> Dict {
         ),
         ("used_by".to_string(), strings(&vol.used_by)),
         ("created".to_string(), v(vol.created)),
+    ])
+}
+
+pub fn process(p: &crate::api::machines::Process) -> Dict {
+    HashMap::from([
+        ("pid".to_string(), v(p.pid)),
+        ("user".to_string(), v(p.user.as_str())),
+        ("time".to_string(), v(p.time.as_str())),
+        ("command".to_string(), v(p.command.as_str())),
     ])
 }
 

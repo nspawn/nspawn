@@ -1220,6 +1220,33 @@ impl Manager {
         Ok(notes.into_lines())
     }
 
+    /// docker pause: the machine's cgroup is frozen, every process in it with it.
+    async fn pause_machine(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<()> {
+        self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        Ok(api::machines::pause(self.ctx(), &name, true).await?)
+    }
+
+    /// docker unpause.
+    async fn unpause_machine(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<()> {
+        self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        Ok(api::machines::pause(self.ctx(), &name, false).await?)
+    }
+
+    /// docker top: the processes of a running machine: pid (u), user (s, the uid as the
+    /// machine sees it), time (s, CPU time), command (s).
+    async fn machine_processes(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        name: String,
+    ) -> Result<Vec<Dict>> {
+        self.allow(&hdr, Action::Inspect).await?;
+        let _busy = self.state.enter();
+        let processes = api::machines::processes(self.ctx(), &name).await?;
+        Ok(processes.iter().map(values::process).collect())
+    }
+
     /// The login session machined offers for a booted machine, like `shell`: a pseudo
     /// terminal running the user's shell ("" for root), and the terminal's path. Apps
     /// have no login inside: Exec with a shell and a tty is the way for them. Options:

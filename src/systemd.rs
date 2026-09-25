@@ -466,6 +466,50 @@ impl Systemd {
 
     /// Clears the "failed" state a signal leaves on a unit, so that a stopped app machine
     /// is not listed by systemctl --failed.
+    /// Freezes the unit's cgroup (docker pause).
+    pub async fn freeze_unit(&self, unit: &str) -> Result<()> {
+        self.manager
+            .freeze_unit(unit.to_string())
+            .await
+            .with_context(|| format!("freezing {unit}"))
+    }
+
+    pub async fn thaw_unit(&self, unit: &str) -> Result<()> {
+        self.manager
+            .thaw_unit(unit.to_string())
+            .await
+            .with_context(|| format!("thawing {unit}"))
+    }
+
+    /// "frozen", "freezing", "thawing" or "running".
+    pub async fn freezer_state(&self, unit: &str) -> Result<String> {
+        let proxy = systemd1::UnitProxy::builder(&self.conn)
+            .path(self.unit_path(unit).await?)?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .with_context(|| format!("connecting to {unit}"))?;
+        proxy
+            .freezer_state()
+            .await
+            .with_context(|| format!("reading the freezer state of {unit}"))
+    }
+
+    /// How the main process of the unit's last run ended: (CLD_ code, status); None
+    /// before any run.
+    pub async fn exec_main_exit(&self, unit: &str) -> Result<Option<(i32, i32)>> {
+        let service = self.service(unit).await?;
+        let code = service
+            .exec_main_code()
+            .await
+            .with_context(|| format!("reading how {unit} ended"))?;
+        let status = service
+            .exec_main_status()
+            .await
+            .with_context(|| format!("reading how {unit} ended"))?;
+        Ok((code != 0).then_some((code, status)))
+    }
+
     pub async fn reset_failed(&self, unit: &str) -> Result<()> {
         match self.manager.reset_failed_unit(unit.to_string()).await {
             Ok(()) => Ok(()),

@@ -740,10 +740,13 @@ $NSPAWN stop $app || fail "stop after machinectl start"
 t0=$(date +%s)
 $NSPAWN start $app -- /bin/true || fail "start of a program that returns at once"
 [ $(( $(date +%s) - t0 )) -lt 15 ] || fail "start waited for a program that had already returned"
+# The unit of the program that returned at once may still be on its way down.
+retry 10 bash -c "systemctl show -p ActiveState --value systemd-nspawn@$app.service | grep -qE '^(failed|inactive)$'" || fail "the unit of the program that returned at once is still up"
 $NSPAWN start $app -- /bin/sh -c 'exit 3' >/dev/null 2>&1 || true
 retry 10 bash -c "! $NSPAWN ps | grep_q '^ *$app '" || fail "failed app still listed"
 # machined drops the machine a few milliseconds before its unit is down.
 retry 10 bash -c "systemctl show -p ActiveState --value systemd-nspawn@$app.service | grep -qE '^(failed|inactive)$'" || fail "the unit of the failed program is still up"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['state'] == 'stopped' and d['exit_code'] == 3, d" || fail "inspect does not show the exit code of the last run"
 out=$($NSPAWN stop $app 2>&1); echo "$out" | grep_q "was not running" || fail "stop after a failed program: $out"
 systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit left failed after stop of a program that exited 3"
 # A program that fails at once leaves the unit on its way down with the release hook
@@ -1094,6 +1097,27 @@ systemctl is-active nspawn-health-$app.service >/dev/null 2>&1 && fail "a runner
 $NSPAWN ps | grep "^ *$app " | grep_q "health" && fail "ps shows a health for a machine without healthcheck"
 $NSPAWN stop $app || fail "stop"
 
+step "restart, pause, unpause and top, like docker's"
+$NSPAWN start $app -- /bin/sleep 300 >/dev/null || fail "start for restart"
+pid_before=$(machinectl show $app -p Leader --value)
+$NSPAWN restart $app -t 2 | grep_q "restarted $app" || fail "restart"
+retry 5 bash -c "$NSPAWN ps | grep '^ *$app ' | grep_q ' running '" || fail "not running after restart"
+[ "$(machinectl show $app -p Leader --value)" != "$pid_before" ] || fail "restart did not start the machine anew"
+$NSPAWN pause $app || fail "pause"
+[ "$(systemctl show -p FreezerState --value systemd-nspawn@$app.service)" = frozen ] || fail "the unit is not frozen after pause"
+$NSPAWN ps | grep "^ *$app " | grep_q " paused " || fail "ps does not show the machine paused: $($NSPAWN ps | grep $app)"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['state'] == 'paused', d['state']" || fail "inspect does not show paused"
+$NSPAWN unpause $app || fail "unpause"
+[ "$(systemctl show -p FreezerState --value systemd-nspawn@$app.service)" = running ] || fail "the unit is still frozen after unpause"
+$NSPAWN ps | grep "^ *$app " | grep_q " running " || fail "ps does not show the machine running after unpause"
+$NSPAWN top $app | tee /tmp/e2e-top.txt | grep_q "/bin/sleep 300" || fail "top does not list the program: $(cat /tmp/e2e-top.txt)"
+grep -q "systemd-nspawn" /tmp/e2e-top.txt && fail "top lists systemd-nspawn itself"
+grep -q "^ *PID " /tmp/e2e-top.txt || fail "top has no header"
+$NSPAWN pause $app >/dev/null && $NSPAWN stop $app -t 2 | grep_q "stopped $app" || fail "stop of a paused machine"
+$NSPAWN pause $app 2>/dev/null && fail "pause of a stopped machine succeeded"
+$NSPAWN stop $app e2e-none-such-$nonce >/tmp/e2e-stop2.txt 2>&1 && fail "stop of several with an unknown one succeeded"
+grep -q "$app was not running" /tmp/e2e-stop2.txt || fail "stop of several did not go on after the first: $(cat /tmp/e2e-stop2.txt)"
+
 step "stats: what running machines use, rates from two samples"
 $NSPAWN start $app -m 64m --pids-limit 0 -- /bin/sh -c 'while :; do :; done' >/dev/null || fail "start a busy app"
 out=$($NSPAWN stats --no-stream --json $app) || fail "stats --no-stream --json"
@@ -1201,7 +1225,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine PauseMachine UnpauseMachine MachineProcesses UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do

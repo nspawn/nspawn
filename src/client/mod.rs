@@ -102,6 +102,9 @@ pub trait Manager {
     fn stop_machine(&self, name: &str, options: Options<'_>)
         -> zbus::Result<(String, Vec<String>)>;
     fn kill_machine(&self, name: &str, options: Options<'_>) -> zbus::Result<Vec<String>>;
+    fn pause_machine(&self, name: &str) -> zbus::Result<()>;
+    fn unpause_machine(&self, name: &str) -> zbus::Result<()>;
+    fn machine_processes(&self, name: &str) -> zbus::Result<Vec<Dict>>;
     fn update_machine(&self, name: &str, options: Options<'_>) -> zbus::Result<bool>;
     fn exec(
         &self,
@@ -529,14 +532,17 @@ pub fn strings(dict: &Dict, key: &str) -> Vec<String> {
 }
 
 pub fn u64(dict: &Dict, key: &str) -> u64 {
-    dict.get(key)
-        .and_then(|v| u64::try_from(v.clone()).ok())
-        .unwrap_or(0)
+    maybe_u64(dict, key).unwrap_or(0)
 }
 
-/// A number that may be absent, which is not the same as 0.
+/// A number that may be absent, which is not the same as 0. A `u` (a pid, say) is a
+/// number too.
 pub fn maybe_u64(dict: &Dict, key: &str) -> Option<u64> {
-    dict.get(key).and_then(|v| u64::try_from(v.clone()).ok())
+    dict.get(key).and_then(|v| {
+        u64::try_from(v.clone())
+            .ok()
+            .or_else(|| u32::try_from(v.clone()).ok().map(u64::from))
+    })
 }
 
 pub fn bool(dict: &Dict, key: &str) -> bool {

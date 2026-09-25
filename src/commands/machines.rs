@@ -12,8 +12,8 @@ use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow, Signal};
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 use crate::cli::{
-    EventsArgs, ExecArgs, KillArgs, LogsArgs, ModeChoice, PsArgs, PullPolicy, RunArgs, ShellArgs,
-    StartArgs, StartOptions, StopArgs, UpdateArgs,
+    EventsArgs, ExecArgs, KillArgs, LogsArgs, ModeChoice, NamesArgs, PsArgs, PullPolicy,
+    RestartArgs, RunArgs, ShellArgs, StartArgs, StartOptions, StopArgs, TopArgs, UpdateArgs,
 };
 use crate::client::{self, Client, Dict, Ended, Options};
 use crate::config::Config;
@@ -558,24 +558,138 @@ async fn removed(client: &Client, name: &str) {
 }
 
 pub async fn stop(args: StopArgs, client: &Client) -> Result<()> {
+    let mut failed = 0;
+    for name in &args.names {
+        match stop_one(client, name, args.force, args.wait, args.timeout).await {
+            Ok(was_running) => {
+                if was_running {
+                    println!("stopped {name}");
+                } else {
+                    println!("{name} was not running");
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        bail!(
+            "{failed} of {} machines could not be stopped",
+            args.names.len()
+        );
+    }
+    Ok(())
+}
+
+/// StopMachine for one name; whether it was running.
+async fn stop_one(
+    client: &Client,
+    name: &str,
+    force: bool,
+    wait: bool,
+    timeout: Option<u64>,
+) -> Result<bool> {
     let mut options = Options::new();
-    options.insert("force", Value::from(args.force));
-    options.insert("wait", Value::from(args.wait));
-    if let Some(timeout) = args.timeout {
+    options.insert("force", Value::from(force));
+    options.insert("wait", Value::from(wait));
+    if let Some(timeout) = timeout {
         options.insert("timeout", Value::from(timeout));
     }
     let (outcome, notes) = client
         .manager
-        .stop_machine(&args.name, options)
+        .stop_machine(name, options)
         .await
         .map_err(client::error)?;
     for note in &notes {
         eprintln!("{note}");
     }
-    match outcome.as_str() {
-        "was-not-running" => println!("{} was not running", args.name),
-        _ => println!("stopped {}", args.name),
+    Ok(outcome != "was-not-running")
+}
+
+/// docker restart: a stop and a start with the remembered options, each name in turn.
+pub async fn restart(args: RestartArgs, client: &Client) -> Result<()> {
+    let mut failed = 0;
+    for name in &args.names {
+        let outcome: Result<()> = async {
+            stop_one(client, name, false, true, args.timeout).await?;
+            let mut options = Options::new();
+            options.insert("wait", Value::from(true));
+            let (_, notes) = client
+                .manager
+                .start_machine(name, options)
+                .await
+                .map_err(client::error)?;
+            for note in &notes {
+                eprintln!("{note}");
+            }
+            Ok(())
+        }
+        .await;
+        match outcome {
+            Ok(()) => println!("restarted {name}"),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                failed += 1;
+            }
+        }
     }
+    if failed > 0 {
+        bail!(
+            "{failed} of {} machines could not be restarted",
+            args.names.len()
+        );
+    }
+    Ok(())
+}
+
+/// docker pause and unpause, each name in turn.
+pub async fn pause(args: NamesArgs, client: &Client, on: bool) -> Result<()> {
+    let mut failed = 0;
+    for name in &args.names {
+        let result = if on {
+            client.manager.pause_machine(name).await
+        } else {
+            client.manager.unpause_machine(name).await
+        };
+        match result {
+            Ok(()) => println!("{name}"),
+            Err(e) => {
+                eprintln!("error: {:#}", client::error(e));
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        bail!(
+            "{failed} of {} machines could not be {}",
+            args.names.len(),
+            if on { "paused" } else { "unpaused" }
+        );
+    }
+    Ok(())
+}
+
+/// docker top: the machine's processes.
+pub async fn top(args: TopArgs, client: &Client) -> Result<()> {
+    let processes = client
+        .manager
+        .machine_processes(&args.machine)
+        .await
+        .map_err(client::error)?;
+    let rows = processes
+        .iter()
+        .map(|p| {
+            vec![
+                client::u64(p, "pid").to_string(),
+                client::string(p, "user"),
+                client::string(p, "time"),
+                client::string(p, "command"),
+            ]
+        })
+        .collect();
+    println!("{}", table(&["PID", "USER", "TIME", "COMMAND"], rows));
     Ok(())
 }
 

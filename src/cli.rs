@@ -57,10 +57,18 @@ pub enum Command {
     Inspect(InspectArgs),
     /// Boot an image as a machine.
     Start(StartArgs),
-    /// Power off a running machine.
+    /// Power off running machines.
     Stop(StopArgs),
+    /// Stop machines and start them again, like docker restart.
+    Restart(RestartArgs),
     /// Send a signal to running machines, like docker kill (SIGKILL stops them for good).
     Kill(KillArgs),
+    /// Freeze running machines, every process in them, like docker pause.
+    Pause(NamesArgs),
+    /// Let paused machines run again.
+    Unpause(NamesArgs),
+    /// The processes of a running machine, like docker top.
+    Top(TopArgs),
     /// Change the restart policy and limits of machines, like docker update; a running
     /// machine gets the limits at once.
     Update(UpdateArgs),
@@ -833,8 +841,9 @@ pub struct StartOptions {
 
 #[derive(Args, Debug)]
 pub struct StopArgs {
-    /// Machine name.
-    pub name: String,
+    /// Machine names.
+    #[arg(required = true)]
+    pub names: Vec<String>,
     /// Kill the machine immediately instead of asking it to power off.
     #[arg(long, short = 'f')]
     pub force: bool,
@@ -846,6 +855,30 @@ pub struct StopArgs {
     /// (default: the machine's --stop-timeout, else 10).
     #[arg(long, short = 't', value_name = "SECONDS")]
     pub timeout: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct RestartArgs {
+    /// Machine names.
+    #[arg(required = true)]
+    pub names: Vec<String>,
+    /// App images: seconds to wait after the stop signal before terminating the machine
+    /// (default: the machine's --stop-timeout, else 10).
+    #[arg(long, short = 't', value_name = "SECONDS")]
+    pub timeout: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct NamesArgs {
+    /// Machine names.
+    #[arg(required = true)]
+    pub names: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct TopArgs {
+    /// Machine name.
+    pub machine: String,
 }
 
 #[derive(Args, Debug)]

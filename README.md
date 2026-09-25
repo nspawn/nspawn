@@ -167,7 +167,10 @@ exit code comes back, the image's environment applies and nothing is needed insi
 D-Bus, no PAM); `shell` opens machined's login session on booted machines and a plain
 shell on apps. `stop` sends the image's stop signal to the program of an app machine and
 SIGKILLs it after `--timeout` seconds, or asks a booted machine to power off; `--force`
-kills at once. Stopping a machine that already ended is not an error: it only drops what
+kills at once. `restart` is a stop and a start with the remembered options, `pause` and
+`unpause` freeze and thaw a machine's cgroup like docker pause (`ps` shows it paused),
+`top` lists a machine's processes, and `inspect` of a stopped machine shows the exit code
+of its last run. Stopping a machine that already ended is not an error: it only drops what
 the machine left behind.
 
 Every machine's unit gets a drop-in that calls nspawn around its life (ExecStartPre,

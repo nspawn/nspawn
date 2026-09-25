@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
@@ -36,6 +37,38 @@ pub struct MachineSummary {
     pub os: Option<String>,
     /// The verdict of its healthcheck, while it runs and has one.
     pub health: Option<crate::health::Status>,
+    /// How its last run ended, for a stopped machine: docker's exit code.
+    pub exit_code: Option<i32>,
+}
+
+/// The exit code of the machine's last run, as an attached run would have given it.
+async fn last_exit_code(sd: &Systemd, store: &Store, record: &ImageRecord) -> Option<i32> {
+    let unit = format!("systemd-nspawn@{}.service", record.name);
+    // The unit's own ExecMainCode= goes with it when it is unloaded; the journal keeps
+    // what systemd logged when it reaped the process.
+    let (code, status) = match sd.exec_main_exit(&unit).await {
+        Ok(Some(exit)) => exit,
+        _ => crate::journal::last_main_exit(&unit).await?,
+    };
+    let ending = crate::api::run::Ending {
+        code,
+        status,
+        result: String::new(),
+    };
+    Some(crate::api::run::exit_code(
+        &ending,
+        store.last_signal(&record.name),
+        record.mode == Mode::App,
+    ))
+}
+
+/// machined's state, or "paused" while the unit's cgroup is frozen.
+async fn running_state(sd: &Systemd, name: &str, state: String) -> String {
+    let unit = format!("systemd-nspawn@{name}.service");
+    if state == "running" && sd.freezer_state(&unit).await.ok().as_deref() == Some("frozen") {
+        return "paused".to_string();
+    }
+    state
 }
 
 /// Refuses machined's non-containers (libvirt's virtual machines), which nspawn can neither
@@ -55,13 +88,14 @@ pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
     if sd.machine_exists(name).await? {
         let details = sd.machine_details(name).await.ok();
         let now = now_unix();
+        let state = details
+            .as_ref()
+            .map(|d| d.state.clone())
+            .unwrap_or_else(|| "-".to_string());
         return Ok(MachineSummary {
             name: name.to_string(),
             record,
-            state: details
-                .as_ref()
-                .map(|d| d.state.clone())
-                .unwrap_or_else(|| "-".to_string()),
+            state: running_state(sd, name, state).await,
             started: details
                 .as_ref()
                 .filter(|d| d.started > 0 && d.started <= now)
@@ -69,21 +103,31 @@ pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
             leader: details.as_ref().map(|d| d.leader),
             os: sd.machine_os(name).await,
             health: crate::health::read_status(name),
+            exit_code: None,
         });
     }
     let unit = sd
         .unit_status(&format!("systemd-nspawn@{name}.service"))
         .await?;
     match record {
-        Some(record) => Ok(MachineSummary {
-            name: name.to_string(),
-            record: Some(record),
-            state: unit_word(&unit).to_string(),
-            started: None,
-            leader: None,
-            os: None,
-            health: None,
-        }),
+        Some(record) => {
+            let state = unit_word(&unit).to_string();
+            let exit_code = if state == "stopped" {
+                last_exit_code(sd, &ctx.store, &record).await
+            } else {
+                None
+            };
+            Ok(MachineSummary {
+                name: name.to_string(),
+                record: Some(record),
+                state,
+                started: None,
+                leader: None,
+                os: None,
+                health: None,
+                exit_code,
+            })
+        }
         None => bail!("no machine or image named {name}"),
     }
 }
@@ -104,13 +148,14 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
     let mut summaries = Vec::new();
     for m in &machines {
         let details = sd.machine_details(&m.name).await.ok();
+        let state = details
+            .as_ref()
+            .map(|d| d.state.clone())
+            .unwrap_or_else(|| "-".to_string());
         summaries.push(MachineSummary {
             name: m.name.clone(),
             record: records.get(&m.name).cloned(),
-            state: details
-                .as_ref()
-                .map(|d| d.state.clone())
-                .unwrap_or_else(|| "-".to_string()),
+            state: running_state(sd, &m.name, state).await,
             started: details
                 .as_ref()
                 .filter(|d| d.started > 0 && d.started <= now)
@@ -118,6 +163,7 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
             leader: details.as_ref().map(|d| d.leader),
             os: sd.machine_os(&m.name).await,
             health: crate::health::read_status(&m.name),
+            exit_code: None,
         });
     }
     // Records machined does not list. Those between two runs of a restart policy show
@@ -141,6 +187,11 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
             .unwrap_or("stopped")
             .to_string();
         if listed(all, &state) {
+            let exit_code = if state == "stopped" {
+                last_exit_code(sd, &ctx.store, r).await
+            } else {
+                None
+            };
             summaries.push(MachineSummary {
                 name: r.name.clone(),
                 record: Some(r.clone()),
@@ -149,6 +200,7 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
                 leader: None,
                 os: None,
                 health: None,
+                exit_code,
             });
         }
     }
@@ -723,6 +775,139 @@ async fn wait_for_init(sd: &Systemd, name: &str) -> Result<StartOutcome> {
     }
 }
 
+/// docker pause: the machine's cgroup is frozen, every process in it with it.
+pub async fn pause(ctx: &Context, name: &str, on: bool) -> Result<()> {
+    validate_entry_name(name)?;
+    let sd = ctx.sd().await?;
+    refuse_foreign(sd, name).await?;
+    if !sd.machine_exists(name).await? {
+        bail!("machine {name} is not running");
+    }
+    let unit = format!("systemd-nspawn@{name}.service");
+    if on {
+        sd.freeze_unit(&unit).await?;
+    } else {
+        sd.thaw_unit(&unit).await?;
+    }
+    crate::api::events::emit("machine", if on { "pause" } else { "unpause" }, name, &[]);
+    Ok(())
+}
+
+/// A process of a running machine, as docker top shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Process {
+    pub pid: u32,
+    /// The uid as the machine sees it, "root" for 0.
+    pub user: String,
+    /// CPU time, HH:MM:SS.
+    pub time: String,
+    pub command: String,
+}
+
+/// docker top: the processes in the machine's PID namespace, from its cgroup.
+pub async fn processes(ctx: &Context, name: &str) -> Result<Vec<Process>> {
+    validate_entry_name(name)?;
+    let sd = ctx.sd().await?;
+    refuse_foreign(sd, name).await?;
+    if !sd.machine_exists(name).await? {
+        bail!("machine {name} is not running");
+    }
+    let leader = sd.machine_leader(name).await?;
+    let shift = sd.machine_uid_shift(name).await.unwrap_or(0);
+    let cgroup = sd
+        .control_group(&format!("systemd-nspawn@{name}.service"))
+        .await?;
+    let unit_cgroup = PathBuf::from(format!("/sys/fs/cgroup{cgroup}"));
+    let mut pids = Vec::new();
+    // systemd-nspawn keeps itself in supervisor/ and the machine in payload/; without
+    // that split (another supervisor), what is in the machine's PID namespace is its.
+    let payload = unit_cgroup.join("payload");
+    if payload.is_dir() {
+        cgroup_pids(&payload, &mut pids);
+    } else {
+        let inside = std::fs::read_link(format!("/proc/{leader}/ns/pid")).ok();
+        cgroup_pids(&unit_cgroup, &mut pids);
+        pids.retain(|pid| std::fs::read_link(format!("/proc/{pid}/ns/pid")).ok() == inside);
+    }
+    if pids.is_empty() {
+        bail!("reading the processes of {name}: none in its cgroup {cgroup}");
+    }
+    pids.sort_unstable();
+    Ok(pids
+        .into_iter()
+        .filter_map(|pid| read_process(pid, shift))
+        .collect())
+}
+
+/// The PIDs of a cgroup and everything below it, where a booted machine's systemd
+/// makes a tree of its own.
+fn cgroup_pids(dir: &Path, out: &mut Vec<u32>) {
+    if let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) {
+        out.extend(procs.lines().filter_map(|l| l.trim().parse::<u32>().ok()));
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            cgroup_pids(&entry.path(), out);
+        }
+    }
+}
+
+fn read_process(pid: u32, shift: u32) -> Option<Process> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let uid: u32 = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let uid = uid.checked_sub(shift).unwrap_or(uid);
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // rest starts at field 3 (state): utime is field 14, stime 15.
+    let ticks: u64 = fields.get(11)?.parse::<u64>().ok()? + fields.get(12)?.parse::<u64>().ok()?;
+    let seconds = ticks
+        / nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
+            .ok()
+            .flatten()
+            .unwrap_or(100) as u64;
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let command = if cmdline.is_empty() {
+        let comm = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Name:"))
+            .unwrap_or("")
+            .trim();
+        format!("[{comm}]")
+    } else {
+        cmdline
+            .split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    Some(Process {
+        pid,
+        user: if uid == 0 {
+            "root".to_string()
+        } else {
+            uid.to_string()
+        },
+        time: format!(
+            "{:02}:{:02}:{:02}",
+            seconds / 3600,
+            (seconds % 3600) / 60,
+            seconds % 60
+        ),
+        command,
+    })
+}
+
 /// The network namespace and published ports of a machine that ended. Safe to repeat.
 pub fn release_machine(name: &str, record: Option<&ImageRecord>) -> Result<()> {
     if record.map(|r| r.network) == Some(Network::Bridge) {
@@ -794,6 +979,8 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
     let record = store.load_image(&args.name)?;
     let unit = format!("systemd-nspawn@{}.service", args.name);
     let policy = record.as_ref().map(|r| r.restart).unwrap_or_default();
+    // A paused machine cannot act on a signal.
+    let _ = sd.thaw_unit(&unit).await;
     // unless-stopped: stopped by hand means not at boot either, until the next start.
     if policy == Restart::UnlessStopped && sd.disable_unit(&unit).await? {
         sd.reload().await?;
@@ -1441,6 +1628,26 @@ pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn processes_are_collected_below_the_unit_cgroup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("cgroup.procs"), "").unwrap();
+        for (dir, procs) in [
+            ("supervisor", "100\n"),
+            ("payload", "101\n102\n"),
+            ("payload/system.slice", "\n"),
+            ("payload/system.slice/a.service", "103\n"),
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("cgroup.procs"), procs).unwrap();
+        }
+        let mut pids = Vec::new();
+        cgroup_pids(root, &mut pids);
+        pids.sort_unstable();
+        assert_eq!(pids, [100, 101, 102, 103]);
+    }
 
     #[test]
     fn the_stop_job_goes_where_nothing_is_lost() {
