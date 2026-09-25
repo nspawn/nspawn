@@ -1870,7 +1870,7 @@ mod tests {
         let until = LogsRequest {
             follow: true,
             until: Some("now".into()),
-            ..base.clone()
+            ..base
         };
         let argv = journalctl_arguments(&until);
         assert!(argv.contains(&"--until=now".to_string()));

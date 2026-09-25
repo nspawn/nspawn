@@ -17,7 +17,9 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Unit tests need no root and touch nothing outside temporary directories.
+Unit tests need no root and touch nothing outside temporary directories. The
+`[lints.clippy]` table of Cargo.toml turns on a few lints about clones and
+allocations beyond clippy's default set; they are part of the same check.
 
 ## End-to-end suite
 

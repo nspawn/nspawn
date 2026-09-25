@@ -356,7 +356,7 @@ impl Systemd {
                     let Some(event) = event else { bail!("lost the job events while starting {unit}") };
                     let Ok(args) = event.args() else { continue };
                     if args.job() != &job { continue }
-                    let result = args.result().to_string();
+                    let result = args.result().clone();
                     if result == "done" || result == "skipped" {
                         return Ok(false);
                     }
@@ -713,7 +713,7 @@ async fn job_result(
     while let Some(event) = jobs.next().await {
         if let Ok(args) = event.args() {
             if args.job() == job {
-                return args.result().to_string();
+                return args.result().clone();
             }
         }
     }
@@ -768,7 +768,7 @@ mod tests {
             (
                 ".host".to_string(),
                 "host".to_string(),
-                "".to_string(),
+                String::new(),
                 path("_2ehost"),
             ),
             (

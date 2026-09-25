@@ -141,7 +141,7 @@ pub fn apply(record: &mut ImageRecord, choice: &NetworkChoice) {
         .filter_map(|n| bridge::address_on(record, n).map(|a| (n.to_string(), a)))
         .collect();
     record.network = choice.kind;
-    record.network_name = choice.name.clone();
+    record.network_name.clone_from(&choice.name);
     record.no_network = choice.none;
     record.address = had.get(bridge::network_of(record)).copied();
     record.extra_networks = choice
@@ -311,10 +311,10 @@ pub async fn create(
     let subnet = match subnet {
         Some(text) => {
             let wanted: Subnet = text.parse()?;
-            if let Some(n) = all.iter().find(|n| n.subnet.overlaps(&wanted)) {
+            if let Some(n) = all.iter().find(|n| n.subnet.overlaps(wanted)) {
                 bail!("{wanted} overlaps {} of network {}", n.subnet, n.name);
             }
-            if let Some(t) = taken.iter().find(|t| t.overlaps(&wanted)) {
+            if let Some(t) = taken.iter().find(|t| t.overlaps(wanted)) {
                 bail!("{wanted} overlaps {t}, which this host already uses");
             }
             wanted

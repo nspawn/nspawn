@@ -291,16 +291,16 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         assert!(!has_init(&[base.clone(), top.clone()]));
         std::os::unix::fs::symlink("systemd", top.join("usr/lib/systemd/systemd")).unwrap();
-        assert!(has_init(&[base.clone(), top.clone()]));
+        assert!(has_init(&[base, top.clone()]));
         // A base layer with init and a top layer that says nothing: still an init.
         let quiet = tmp.path().join("quiet");
         std::fs::create_dir_all(&quiet).unwrap();
-        assert!(has_init(&[top.clone(), quiet.clone()]));
+        assert!(has_init(&[top.clone(), quiet]));
         // A top layer that turns the directory into a file hides the lower init.
         let flattened = tmp.path().join("flattened");
         std::fs::create_dir_all(flattened.join("usr/lib")).unwrap();
         std::fs::write(flattened.join("usr/lib/systemd"), "not a dir").unwrap();
-        assert!(!has_init(&[top.clone(), flattened]));
+        assert!(!has_init(&[top, flattened]));
         // An absolute symlink must not make the host's own init count.
         let hostlink = tmp.path().join("hostlink");
         std::fs::create_dir_all(&hostlink).unwrap();

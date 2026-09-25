@@ -126,11 +126,15 @@ pub fn record(r: &ImageRecord) -> Dict {
         ("env".to_string(), strings(&r.env)),
         (
             "entrypoint".to_string(),
-            strings(r.entrypoint.as_deref().unwrap_or(r.run.entrypoint())),
+            strings(
+                r.entrypoint
+                    .as_deref()
+                    .unwrap_or_else(|| r.run.entrypoint()),
+            ),
         ),
         (
             "cmd".to_string(),
-            strings(r.cmd.as_deref().unwrap_or(r.run.cmd())),
+            strings(r.cmd.as_deref().unwrap_or_else(|| r.run.cmd())),
         ),
         ("command".to_string(), strings(&r.effective_command())),
         ("image_env".to_string(), strings(&r.run.env)),

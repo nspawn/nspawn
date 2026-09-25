@@ -138,9 +138,9 @@ impl ImageRecord {
         let mut argv = self
             .entrypoint
             .as_deref()
-            .unwrap_or(self.run.entrypoint())
+            .unwrap_or_else(|| self.run.entrypoint())
             .to_vec();
-        argv.extend_from_slice(self.cmd.as_deref().unwrap_or(self.run.cmd()));
+        argv.extend_from_slice(self.cmd.as_deref().unwrap_or_else(|| self.run.cmd()));
         argv
     }
 
@@ -2224,7 +2224,7 @@ mod tests {
         }
         assert_eq!(
             store.gc_blobs().unwrap(),
-            vec![orphan.clone()],
+            vec![orphan],
             "the hold of a live pull stands however old, a dead one's goes"
         );
         assert!(store.has_blob(&ours));

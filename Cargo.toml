@@ -40,3 +40,11 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 strip = true
+
+[lints.clippy]
+# Clones and allocations the default set lets through.
+assigning_clones = "warn"
+implicit_clone = "warn"
+manual_string_new = "warn"
+or_fun_call = "warn"
+trivially_copy_pass_by_ref = "warn"

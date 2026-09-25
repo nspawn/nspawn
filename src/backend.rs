@@ -417,7 +417,7 @@ fn resolves_to_run(target: &str, link: Option<&Path>) -> bool {
     } else {
         Path::new(target)
             .parent()
-            .unwrap_or(Path::new("/"))
+            .unwrap_or_else(|| Path::new("/"))
             .join(link)
     };
     // The lexical form: a/../b is b.

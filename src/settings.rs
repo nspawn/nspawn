@@ -482,7 +482,7 @@ fn write_private(path: &Path, wanted: &str) -> Result<()> {
         return fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("restricting {} to root", path.display()));
     }
-    let dir = path.parent().unwrap_or(Path::new("."));
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     // Through a new file and a rename: never half written, never readable by others.
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -625,7 +625,7 @@ mod tests {
         // Without the namespace on the command line (systemd 259 and newer, or a network
         // other than the bridge), the path a loaded drop-in added goes, and so does a
         // --console of whatever origin: only a run chooses that.
-        let mut console = loaded.clone();
+        let mut console = loaded;
         console.push("--console=interactive".into());
         assert_eq!(
             exec_start_override(command, &console, "web", false),

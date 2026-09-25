@@ -158,11 +158,11 @@ async fn relay_machine_signals(state: Arc<State>) {
     loop {
         let (name, started) = tokio::select! {
             Some(signal) = new.next() => match signal.args() {
-                Ok(args) => (args.machine.to_string(), true),
+                Ok(args) => (args.machine.clone(), true),
                 Err(_) => continue,
             },
             Some(signal) = removed.next() => match signal.args() {
-                Ok(args) => (args.machine.to_string(), false),
+                Ok(args) => (args.machine.clone(), false),
                 Err(_) => continue,
             },
             else => break,

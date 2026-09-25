@@ -128,8 +128,8 @@ fn status_code(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(126)
 }
 
-fn backend_choice(text: Option<String>) -> anyhow::Result<BackendChoice> {
-    Ok(match text.as_deref() {
+fn backend_choice(text: Option<&str>) -> anyhow::Result<BackendChoice> {
+    Ok(match text {
         None | Some("") | Some("auto") => BackendChoice::Auto,
         Some("overlay") => BackendChoice::Overlay,
         Some("flat") => BackendChoice::Flat,
@@ -138,8 +138,8 @@ fn backend_choice(text: Option<String>) -> anyhow::Result<BackendChoice> {
     })
 }
 
-fn mode_choice(text: Option<String>) -> anyhow::Result<Option<Mode>> {
-    Ok(match text.as_deref() {
+fn mode_choice(text: Option<&str>) -> anyhow::Result<Option<Mode>> {
+    Ok(match text {
         None | Some("") | Some("auto") => None,
         Some("boot") => Some(Mode::Boot),
         Some("app") => Some(Mode::App),
@@ -352,8 +352,8 @@ impl Manager {
         let request = api::pull::PullRequest {
             reference,
             name: options.string("name")?,
-            backend: backend_choice(options.string("backend")?)?,
-            mode: mode_choice(options.string("mode")?)?,
+            backend: backend_choice(options.string("backend")?.as_deref())?,
+            mode: mode_choice(options.string("mode")?.as_deref())?,
             force: options.bool("force", false)?,
         };
         options.finish()?;
@@ -401,7 +401,7 @@ impl Manager {
         let request = api::create::CreateRequest {
             source,
             name: name.clone(),
-            backend: backend_choice(options.string("backend")?)?,
+            backend: backend_choice(options.string("backend")?.as_deref())?,
             network: network_choice(options.string("network")?, options.strings("networks")?)?,
             aliases: options.strings("aliases")?,
             publish: options.strings("publish")?,
@@ -499,8 +499,8 @@ impl Manager {
             distribution: options.string("distribution")?,
             release: options.string("release")?,
             profile: options.strings("profile")?,
-            backend: backend_choice(options.string("backend")?)?,
-            mode: mode_choice(options.string("mode")?)?,
+            backend: backend_choice(options.string("backend")?.as_deref())?,
+            mode: mode_choice(options.string("mode")?.as_deref())?,
             force: options.bool("force", false)?,
             keep_output: options.bool("keep_output", false)?,
             mkosi_args: options.strings("mkosi_args")?,

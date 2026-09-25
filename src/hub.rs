@@ -209,7 +209,9 @@ impl Hub {
             .pull_blob_stream(image, layer)
             .await
             .with_context(|| format!("fetching layer {}", layer.digest))?;
-        let total = sized.content_length.unwrap_or(layer.size.max(0) as u64);
+        let total = sized
+            .content_length
+            .unwrap_or_else(|| layer.size.max(0) as u64);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }

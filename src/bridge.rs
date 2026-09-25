@@ -41,29 +41,29 @@ pub struct Subnet {
 }
 
 impl Subnet {
-    fn mask(&self) -> u32 {
+    fn mask(self) -> u32 {
         u32::MAX << (32 - self.prefix)
     }
 
     /// The bridge's own address.
-    pub fn gateway(&self) -> Ipv4Addr {
+    pub fn gateway(self) -> Ipv4Addr {
         Ipv4Addr::from(u32::from(self.network) + 1)
     }
 
-    pub fn contains(&self, addr: Ipv4Addr) -> bool {
+    pub fn contains(self, addr: Ipv4Addr) -> bool {
         u32::from(addr) & self.mask() == u32::from(self.network)
     }
 
     /// An address a machine may keep: in the subnet, and not the network, gateway or
     /// broadcast address (the subnet may have changed since it was given).
-    pub fn usable(&self, addr: Ipv4Addr) -> bool {
+    pub fn usable(self, addr: Ipv4Addr) -> bool {
         self.contains(addr)
             && addr != self.network
             && addr != self.gateway()
             && u32::from(addr) != (u32::from(self.network) | !self.mask())
     }
 
-    pub fn allocate(&self, used: &[Ipv4Addr]) -> Result<Ipv4Addr> {
+    pub fn allocate(self, used: &[Ipv4Addr]) -> Result<Ipv4Addr> {
         let first = u32::from(self.network) + 2;
         let last = (u32::from(self.network) | !self.mask()) - 1;
         (first..=last)
@@ -74,7 +74,7 @@ impl Subnet {
 }
 
 impl Subnet {
-    pub fn overlaps(&self, other: &Subnet) -> bool {
+    pub fn overlaps(self, other: Subnet) -> bool {
         self.contains(other.network) || other.contains(self.network)
     }
 }
@@ -183,7 +183,7 @@ pub fn free_subnet(pool: Subnet, taken: &[Subnet]) -> Result<Subnet> {
             network: Ipv4Addr::from(at as u32),
             prefix,
         };
-        if !taken.iter().any(|t| t.overlaps(&candidate)) {
+        if !taken.iter().any(|t| t.overlaps(candidate)) {
             return Ok(candidate);
         }
         at += size;
@@ -1626,8 +1626,8 @@ mod tests {
         assert!(free_subnet(small, &[small]).is_err());
         let a: Subnet = "10.0.0.0/8".parse().unwrap();
         let b: Subnet = "10.99.5.0/24".parse().unwrap();
-        assert!(a.overlaps(&b) && b.overlaps(&a));
-        assert!(!b.overlaps(&"10.99.6.0/24".parse().unwrap()));
+        assert!(a.overlaps(b) && b.overlaps(a));
+        assert!(!b.overlaps("10.99.6.0/24".parse().unwrap()));
         assert_eq!(serde_json::to_string(&b).unwrap(), "\"10.99.5.0/24\"");
         assert_eq!(
             serde_json::from_str::<Subnet>("\"10.99.5.0/24\"").unwrap(),
