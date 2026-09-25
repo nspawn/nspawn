@@ -62,10 +62,8 @@ impl Manager {
         &self.state.ctx
     }
 
-    /// Whether the caller may do this, which on a host with polkit is polkit's
-    /// answer and on one without is root or nothing.
-    /// Returns the caller: a job or a command started here belongs to its uid afterwards,
-    /// and their signals go to its bus name.
+    /// polkit's answer, or root only on a host without polkit. Returns the caller, whose
+    /// uid owns what is started here and whose bus name gets its signals.
     async fn allow(&self, header: &Header<'_>, action: Action) -> Result<polkit::Caller> {
         let sender = header
             .sender()
@@ -939,15 +937,13 @@ impl Manager {
         Ok((outcome.to_string(), notes.into_lines()))
     }
 
-    /// Like `run` without -d: starts a machine PullImage or CreateMachine made, attached.
-    /// Options: those of StartMachine (wait defaults to false), tty (b), rows and cols
-    /// (t, 24 x 80), term (s, xterm); descriptors: stdin (the program's input without
-    /// tty). An app's program gets a pseudo terminal with tty, whose master comes back
-    /// under "tty"; otherwise what the machine writes comes back under "stdout", a line
-    /// at a time. The process object's Signal reaches the program (a booted machine is
-    /// powered off), and its exit status is docker run's: the program's, 128 plus a
-    /// signal it died of. Returns the descriptors, the process object and the notes
-    /// made by the start.
+    /// Like `run` without -d. Options: StartMachine's (wait defaults to false), tty (b),
+    /// rows and cols (t, 24 x 80), term (s, xterm); descriptor stdin (the program's input
+    /// without tty). With tty an app's program gets a pseudo terminal whose master comes
+    /// back under "tty"; otherwise the output comes back under "stdout", a line at a
+    /// time. The process object's Signal reaches the program (a booted machine is
+    /// powered off), and its exit status is docker run's. Also returns the start's
+    /// notes.
     async fn run_machine(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -1159,9 +1155,8 @@ impl Manager {
         };
         let (out_r, out_w) = pipe()?;
         let (err_r, err_w) = pipe()?;
-        // A copy of the output's writing end stays here: it reports an error once nobody
-        // reads, which is how a journalctl --follow learns that its client is gone
-        // instead of waiting for the next line forever.
+        // A copy of the writing end stays here: it reports an error once nobody reads,
+        // which is how a journalctl --follow learns that its client is gone.
         let watch = out_w
             .try_clone()
             .map_err(|e| Error::Failed(e.to_string()))?;
@@ -1400,8 +1395,8 @@ impl Manager {
         Ok((fds, path))
     }
 
-    /// Like `network ls`: the bridge (bridge, subnet, gateway, host_name) and the
-    /// machines on it (name, address, ports, running).
+    /// The default network (bridge, subnet, gateway, host_name) and the machines on it
+    /// (name, address, ports, running).
     async fn list_network(&self, #[zbus(header)] hdr: Header<'_>) -> Result<(Dict, Vec<Dict>)> {
         self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
@@ -1412,7 +1407,8 @@ impl Manager {
         ))
     }
 
-    /// Like `network up`: the bridge, plus the notes made on the way under "notes".
+    /// Like `network up`: the default network as ListNetwork has it, the names of the
+    /// networks brought up under "networks", and the notes made on the way under "notes".
     async fn network_up(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Dict> {
         self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();

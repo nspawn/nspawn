@@ -1,14 +1,10 @@
-//! The nspawn bridges: docker0 style networks for the machines, run by nspawn itself so
-//! that they behave the same whatever manages the host's network (systemd-networkd,
-//! NetworkManager or nothing at all). The default one comes from nspawn.toml; more are
-//! made with `network create`, like docker's user-defined networks.
+//! docker0-style bridges run by nspawn itself, so that they work whatever manages the
+//! host's network. The default one comes from nspawn.toml, others from `network create`.
 //!
-//! A bridge carries the first address of its subnet. Every machine gets a fixed address
-//! from its network's subnet, handed to the systemd-networkd inside it through a .network
-//! file mounted at /run/systemd/network/10-host0.network, plus a generated /etc/hosts with
-//! the names of the other machines on the same network. Outgoing traffic is masqueraded
-//! and published ports are DNAT'ed in the nftables table `ip nspawn`, which also keeps
-//! the networks apart; loopback access to published ports works through route_localnet,
+//! A bridge carries the first address of its subnet; each machine gets a fixed address,
+//! handed to its systemd-networkd through a mounted .network file, and a generated
+//! /etc/hosts. The nftables table `ip nspawn` masquerades, DNATs published ports and keeps
+//! the networks apart; loopback access to published ports goes through route_localnet,
 //! as docker does without its userland proxy.
 
 use std::collections::BTreeMap;
@@ -38,7 +34,6 @@ const FALLBACK_DNS: [IpAddr; 2] = [
     IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
 ];
 
-/// An IPv4 subnet in CIDR notation, for example 10.99.0.0/24.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Subnet {
     pub network: Ipv4Addr,
@@ -50,7 +45,7 @@ impl Subnet {
         u32::MAX << (32 - self.prefix)
     }
 
-    /// The bridge's own address: the first usable one.
+    /// The bridge's own address.
     pub fn gateway(&self) -> Ipv4Addr {
         Ipv4Addr::from(u32::from(self.network) + 1)
     }
@@ -59,8 +54,8 @@ impl Subnet {
         u32::from(addr) & self.mask() == u32::from(self.network)
     }
 
-    /// An address a machine may keep: inside the subnet and not the network, the gateway
-    /// or the broadcast address (the subnet may have changed since it was given).
+    /// An address a machine may keep: in the subnet, and not the network, gateway or
+    /// broadcast address (the subnet may have changed since it was given).
     pub fn usable(&self, addr: Ipv4Addr) -> bool {
         self.contains(addr)
             && addr != self.network
@@ -68,8 +63,6 @@ impl Subnet {
             && u32::from(addr) != (u32::from(self.network) | !self.mask())
     }
 
-    /// The lowest address not in `used`, leaving out the network, the gateway and the
-    /// broadcast address.
     pub fn allocate(&self, used: &[Ipv4Addr]) -> Result<Ipv4Addr> {
         let first = u32::from(self.network) + 2;
         let last = (u32::from(self.network) | !self.mask()) - 1;
@@ -81,7 +74,6 @@ impl Subnet {
 }
 
 impl Subnet {
-    /// Whether the two share any address.
     pub fn overlaps(&self, other: &Subnet) -> bool {
         self.contains(other.network) || other.contains(self.network)
     }
@@ -130,21 +122,18 @@ impl fmt::Display for Subnet {
     }
 }
 
-/// The default network's name, as `--network` and `network ls` spell it.
 pub const DEFAULT_NETWORK: &str = "bridge";
 
-/// Names `--network` gives a meaning of its own, which no network may take.
+/// Names `--network` gives a meaning of its own.
 pub const RESERVED_NETWORKS: [&str; 5] = [DEFAULT_NETWORK, "veth", "host", "none", "default"];
 
-/// A bridge network: the default one of nspawn.toml or one made with `network create`.
+/// The default network of nspawn.toml or one of `network create`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetSpec {
     pub name: String,
-    /// The bridge interface.
     pub interface: String,
     pub subnet: Subnet,
-    /// Its machines reach each other and the host, nothing beyond it, and nothing
-    /// reaches them through it but the host.
+    /// Its machines reach each other and the host, nothing beyond.
     #[serde(default)]
     pub internal: bool,
     /// Unix seconds; 0 for the default network.
@@ -152,8 +141,7 @@ pub struct NetSpec {
     pub created: u64,
 }
 
-/// The interface of a user-defined network: nsbr-NAME, hashed when the name is too long
-/// for an interface name (15 characters).
+/// nsbr-NAME, hashed when too long for an interface name (15 characters).
 pub fn network_interface(name: &str) -> String {
     let plain = format!("nsbr-{name}");
     if plain.len() <= 15 {
@@ -163,7 +151,6 @@ pub fn network_interface(name: &str) -> String {
     }
 }
 
-/// FNV-1a of a name, as eight hex digits.
 fn short_hash(name: &str) -> String {
     let mut hash: u32 = 0x811c_9dc5;
     for byte in name.bytes() {
@@ -173,8 +160,7 @@ fn short_hash(name: &str) -> String {
     format!("{hash:08x}")
 }
 
-/// The first /24 of `pool` that overlaps nothing in `taken` (other networks, the host's
-/// own addresses and routes).
+/// The first /24 of `pool` that overlaps nothing in `taken`.
 pub fn free_subnet(pool: Subnet, taken: &[Subnet]) -> Result<Subnet> {
     let prefix = pool.prefix.max(24);
     let size = 1u64 << (32 - prefix);
@@ -194,8 +180,7 @@ pub fn free_subnet(pool: Subnet, taken: &[Subnet]) -> Result<Subnet> {
     bail!("no free /{prefix} left in {pool}; give one with --subnet or widen network_pool in nspawn.toml")
 }
 
-/// The IPv4 networks the host already has: its addresses and its main routing table,
-/// but those of nspawn's own bridges and the default route.
+/// The host's IPv4 addresses and main routes, but those on nspawn's own bridges.
 pub fn host_subnets(own: &[String]) -> Vec<Subnet> {
     let mut out = Vec::new();
     for args in [
@@ -209,8 +194,6 @@ pub fn host_subnets(own: &[String]) -> Vec<Subnet> {
     out
 }
 
-/// The networks in `ip -4 -o addr show` or `ip -4 route show` output, leaving out lines
-/// about the interfaces in `own`.
 fn subnets_in(text: &str, own: &[String]) -> Vec<Subnet> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -272,7 +255,7 @@ impl Protocol {
     }
 }
 
-/// A port published on the host, like docker's -p: HOST:CONTAINER[/udp].
+/// docker's -p: HOST:CONTAINER[/udp].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortMap {
     pub host: u16,
@@ -326,7 +309,7 @@ impl fmt::Display for PortMap {
     }
 }
 
-/// Parses the -p/--publish values; "none" alone clears the list.
+/// "none" alone clears the list.
 pub fn parse_publish(values: &[String]) -> Result<Vec<PortMap>> {
     if values.len() == 1 && values[0] == "none" {
         return Ok(Vec::new());
@@ -345,9 +328,8 @@ pub fn parse_publish(values: &[String]) -> Result<Vec<PortMap>> {
     Ok(out)
 }
 
-/// Creates a network's bridge with its address, forwarding, the NAT table (written for
-/// `all` the networks, so that no other network loses its rules) and the firewalld
-/// exception. Safe to repeat: everything is idempotent.
+/// Creates a network's bridge, forwarding, NAT and firewall exceptions; idempotent. The
+/// table is written for `all` networks, so that no other network loses its rules.
 pub async fn up(net: &NetSpec, all: &[NetSpec], sd: &Systemd, report: Report<'_>) -> Result<()> {
     let name = net.interface.as_str();
     let subnet = net.subnet;
@@ -357,9 +339,8 @@ pub async fn up(net: &NetSpec, all: &[NetSpec], sd: &Systemd, report: Report<'_>
         run("ip", &["link", "add", name, "type", "bridge"])?;
         run("ip", &["link", "set", "dev", name, "alias", MANAGED_ALIAS])?;
     } else {
-        // An interface with that name already exists: only a bridge nspawn made (or an
-        // unmarked one carrying nothing but our address) may be taken over. Stripping
-        // docker0 or virbr0 of their addresses is what this guards against.
+        // Only a bridge nspawn made, or an unmarked one with nothing but our address, is
+        // taken over: never strip docker0 or virbr0 of their addresses.
         let is_bridge = sys.join("bridge").is_dir();
         let alias = fs::read_to_string(sys.join("ifalias")).unwrap_or_default();
         let addresses = ipv4_addresses(name)?;
@@ -384,15 +365,14 @@ pub async fn up(net: &NetSpec, all: &[NetSpec], sd: &Systemd, report: Report<'_>
     }
     run("ip", &["addr", "replace", &address, "dev", name])?;
     prune_addresses(name, &address)?;
-    // IPv4 only: no IPv6 link-local address on the bridge either, including the one an
-    // earlier version left. Hosts booted without IPv6 refuse both, which is fine.
+    // IPv4 only: no IPv6 link-local address on the bridge. Hosts booted without IPv6
+    // refuse both, which is fine.
     let _ = run("ip", &["link", "set", "dev", name, "addrgenmode", "none"]);
     let _ = run("ip", &["-6", "addr", "flush", "dev", name, "scope", "link"]);
     run("ip", &["link", "set", name, "up"])?;
     sysctl("net/ipv4/ip_forward", "1")?;
     sysctl(&format!("net/ipv4/conf/{name}/route_localnet"), "1")?;
     nft(&base_ruleset(all))?;
-    // An internal network forwards nothing, so nothing needs to get past a firewall.
     if !net.internal {
         allow_forwarding_past_iptables(name, report)?;
     }
@@ -402,8 +382,7 @@ pub async fn up(net: &NetSpec, all: &[NetSpec], sd: &Systemd, report: Report<'_>
     Ok(())
 }
 
-/// Undoes `up` for a network being removed: its bridge, its rules in the table (written
-/// again for the `remaining` networks), its iptables exceptions and firewalld binding.
+/// Undoes `up` for a network being removed; the table is written for `remaining`.
 pub async fn down(net: &NetSpec, remaining: &[NetSpec], sd: &Systemd) -> Result<()> {
     let name = net.interface.as_str();
     let sys = Path::new("/sys/class/net").join(name);
@@ -431,19 +410,17 @@ pub async fn down(net: &NetSpec, remaining: &[NetSpec], sd: &Systemd) -> Result<
     Ok(())
 }
 
-/// Docker (in its default iptables mode) and ufw set the FORWARD policy to DROP, which
-/// would silence every machine on the bridge. Docker reserves the DOCKER-USER chain for
-/// rules like ours and never flushes it; without docker, a DROP policy gets the accept
-/// rules at the top of FORWARD itself. Nothing happens on hosts without iptables.
+/// docker (iptables mode) and ufw set FORWARD to DROP. The accept rules go into
+/// DOCKER-USER, which docker keeps for this and never flushes, or else to the top of
+/// FORWARD.
 fn allow_forwarding_past_iptables(bridge: &str, report: Report<'_>) -> Result<()> {
     let chain = if iptables(&["-S", "DOCKER-USER"]) {
         "DOCKER-USER"
     } else if iptables(&["-S", "FORWARD"]) && forward_policy_is_drop() {
         "FORWARD"
     } else {
-        // The kernel keeps the rules whether or not the command that wrote them is
-        // installed, and a ruleset of its own is invisible to iptables. Either way the
-        // machines would lose the outside world with nothing said, so say it.
+        // Rules without the iptables command to edit them, or an nftables ruleset of its
+        // own: the machines would lose the outside world silently, so say it.
         if let Some(who) = filtered_forwarding() {
             note(
                 report,
@@ -469,8 +446,7 @@ fn allow_forwarding_past_iptables(bridge: &str, report: Report<'_>) -> Result<()
     Ok(())
 }
 
-/// Out of the bridge: anything. Into the bridge: only what was published (DNAT) or
-/// belongs to a connection a machine opened, like docker does.
+/// Out of the bridge anything; in, only published ports and replies, as docker does.
 fn forwarding_rules(bridge: &str) -> [Vec<&str>; 2] {
     [
         vec!["-i", bridge, "-j", "ACCEPT"],
@@ -487,9 +463,7 @@ fn forwarding_rules(bridge: &str) -> [Vec<&str>; 2] {
     ]
 }
 
-/// What drops forwarded traffic on this host, as nftables sees it: nft reads the rules
-/// of iptables-nft as well as the rulesets written for it directly. None when forwarding
-/// is not filtered, or when nothing could be read.
+/// What drops forwarded traffic, as nft sees it (iptables-nft rules included).
 fn filtered_forwarding() -> Option<&'static str> {
     let ruleset = Command::new("nft")
         .args(["list", "ruleset"])
@@ -498,8 +472,6 @@ fn filtered_forwarding() -> Option<&'static str> {
     filtered_forwarding_in(&String::from_utf8_lossy(&ruleset.stdout))
 }
 
-/// Docker keeps a DOCKER-USER chain for exactly these exceptions; anything else that
-/// filters forwarding shows as a chain on the forward hook that drops by default.
 fn filtered_forwarding_in(ruleset: &str) -> Option<&'static str> {
     let mut lines = ruleset.lines().map(str::trim);
     if lines.clone().any(|l| l.starts_with("chain DOCKER-USER")) {
@@ -510,7 +482,6 @@ fn filtered_forwarding_in(ruleset: &str) -> Option<&'static str> {
         .then_some("a firewall on this host")
 }
 
-/// Runs iptables quietly; false when it is missing or the command fails.
 fn iptables(args: &[&str]) -> bool {
     Command::new("iptables")
         .arg("-w")
@@ -536,18 +507,12 @@ fn forward_policy_is_drop() -> bool {
         .unwrap_or(false)
 }
 
-/// Priorities are numeric on purpose: the symbolic names (dstnat, srcnat, filter) are not
-/// accepted in every hook by older nft (1.0.6 on Debian 12 rejects dstnat in output).
-///
-/// The nftables table, for every network at once: DNAT of published ports (from outside
-/// and from the host itself, loopback included), masquerading of what leaves a bridge
-/// (not for an internal network), hairpin masquerading when a machine reaches a
-/// published port through the host's address (otherwise the reply would bypass the
-/// NAT), a guard so that route_localnet does not let a machine at the host's
-/// loopback-only services, and the forward chain that keeps the networks apart: nothing
-/// crosses from one bridge to another but connections to published ports, which every
-/// network reaches as the LAN does, and an internal network forwards nothing at all. A
-/// drop here is final whatever other tables accept.
+/// The nftables table for every network: DNAT of published ports (loopback included),
+/// masquerading out of each non-internal bridge, hairpin masquerading for a machine that
+/// reaches a published port through the host's address, a guard so that route_localnet
+/// does not expose the host's loopback services, and a forward chain that keeps networks
+/// apart but for published ports. A drop here is final whatever other tables accept.
+/// Priorities are numeric: older nft (1.0.6) rejects dstnat in the output hook.
 pub fn base_ruleset(all: &[NetSpec]) -> String {
     let mut text = format!(
         "table ip {TABLE} {{
@@ -622,16 +587,13 @@ add rule ip {TABLE} forward oifname \"{bridge}\" iifname != \"{bridge}\" drop
     text
 }
 
-/// The mark nspawn leaves on the bridge it creates (its ifalias).
+/// The ifalias nspawn puts on its bridges.
 pub const MANAGED_ALIAS: &str = "nspawn";
 
-/// Whether an existing interface may serve as the bridge: one nspawn marked, or an
-/// unmarked bridge that carries no address but ours.
 pub fn adoptable(is_bridge: bool, alias: &str, addresses: &[String], wanted: &str) -> bool {
     is_bridge && (alias == MANAGED_ALIAS || addresses.iter().all(|a| a == wanted))
 }
 
-/// IPv4 addresses (with prefix) of an interface.
 fn ipv4_addresses(interface: &str) -> Result<Vec<String>> {
     let output = Command::new("ip")
         .args(["-4", "-o", "addr", "show", "dev", interface])
@@ -648,7 +610,6 @@ fn ipv4_addresses(interface: &str) -> Result<Vec<String>> {
         .collect())
 }
 
-/// Drops IPv4 addresses the bridge carries from an earlier subnet setting.
 fn prune_addresses(bridge: &str, wanted: &str) -> Result<()> {
     for addr in ipv4_addresses(bridge)? {
         if addr != wanted {
@@ -658,15 +619,14 @@ fn prune_addresses(bridge: &str, wanted: &str) -> Result<()> {
     Ok(())
 }
 
-/// Removes a machine's own published ports from the map, entry by entry, so that it can
-/// run without the store lock next to another machine's publish.
+/// Removes a machine's ports from the map entry by entry, so that it can run without
+/// the store lock.
 pub fn withdraw_ports(record: &ImageRecord) -> Result<()> {
     if !table_exists() {
         return Ok(());
     }
     for p in &record.ports {
-        // A missing element fails the whole transaction, so one script per element and
-        // a failure means it was gone already.
+        // One script per element: a missing one fails the whole transaction.
         let _ = nft(&format!(
             "delete element ip {TABLE} ports {{ {} . {} }}\n",
             p.protocol.name(),
@@ -730,7 +690,6 @@ fn sysctl(key: &str, value: &str) -> Result<()> {
     fs::write(&path, value).with_context(|| format!("writing {path}"))
 }
 
-/// Path of the network namespace nspawn prepares for an app machine.
 pub fn netns_path(name: &str) -> String {
     format!("/run/netns/{}", netns_name(name))
 }
@@ -739,8 +698,7 @@ fn netns_name(name: &str) -> String {
     format!("nspawn-{name}")
 }
 
-/// Host end of an app machine's veth pair: vb-<name>, hashed when the name is too long
-/// for an interface name (15 characters).
+/// vb-NAME, hashed when too long for an interface name.
 pub fn host_end_name(name: &str) -> String {
     let plain = format!("vb-{name}");
     if plain.len() <= 15 {
@@ -749,10 +707,8 @@ pub fn host_end_name(name: &str) -> String {
     format!("vb-{}", short_hash(name))
 }
 
-/// Builds the network namespace of an app machine before it starts, so that its process
-/// finds host0 configured from its first instruction: a veth pair with the host end on
-/// its network's bridge, the machine's address, the bridge as default route. The pair
-/// disappears with the namespace.
+/// An app machine's network namespace, ready before its program starts: a veth pair on
+/// the bridge, the address and the default route.
 pub fn create_netns(net: &NetSpec, name: &str, addr: Ipv4Addr) -> Result<()> {
     let ns = netns_name(name);
     delete_netns(name);
@@ -773,9 +729,8 @@ pub fn create_netns(net: &NetSpec, name: &str, addr: Ipv4Addr) -> Result<()> {
         run("ip", &["-n", &ns, "link", "set", "lo", "up"])?;
         let address = format!("{addr}/{}", net.subnet.prefix);
         run("ip", &["-n", &ns, "addr", "add", &address, "dev", "host0"])?;
-        // IPv4 only, like the bridge: no link-local IPv6 address for machined to hand
-        // out under the machine's name. A host booted without IPv6 refuses the setting
-        // and gives host0 no such address anyway.
+        // No link-local IPv6 address for machined to hand out under the machine's name.
+        // A host booted without IPv6 refuses the setting and has none anyway.
         let _ = run(
             "ip",
             &["-n", &ns, "link", "set", "host0", "addrgenmode", "none"],
@@ -793,10 +748,9 @@ pub fn create_netns(net: &NetSpec, name: &str, addr: Ipv4Addr) -> Result<()> {
     result
 }
 
-/// Under managed user namespaces (mstack) nspawn has systemd-nsresourced create the veth
-/// pair and leaves the host end (ns-*) alone: Bridge= is not applied there and machined
-/// is even told the bridge is the machine's interface. The peer of the machine's host0
-/// is found through the machine's sysfs and put on the bridge. Idempotent.
+/// Under managed user namespaces (mstack) systemd-nsresourced makes the veth and Bridge=
+/// is not applied, so the host end (the peer of host0, found through the machine's
+/// sysfs) is put on the bridge here. Idempotent.
 pub fn adopt_managed_veth(bridge: &str, leader: u32) -> Result<()> {
     let iflink = fs::read_to_string(format!("/proc/{leader}/root/sys/class/net/host0/iflink"))
         .context("reading the peer index of host0 inside the machine")?;
@@ -817,7 +771,6 @@ pub fn adopt_managed_veth(bridge: &str, leader: u32) -> Result<()> {
     run("ip", &["link", "set", &name, "master", bridge, "up"])
 }
 
-/// The name of the interface with `index`, from a sysfs class/net directory.
 pub fn interface_by_index(sys_net: &Path, index: u32) -> Option<String> {
     for entry in fs::read_dir(sys_net).ok()?.flatten() {
         let Ok(text) = fs::read_to_string(entry.path().join("ifindex")) else {
@@ -830,14 +783,13 @@ pub fn interface_by_index(sys_net: &Path, index: u32) -> Option<String> {
     None
 }
 
-/// Removes an app machine's network namespace and with it its veth pair. Best effort.
+/// Best effort; the veth goes with the namespace.
 pub fn delete_netns(name: &str) {
     if Path::new(&netns_path(name)).exists() {
         let _ = run("ip", &["netns", "del", &netns_name(name)]);
     }
 }
 
-/// The resolv.conf for machines without systemd-resolved.
 pub fn resolv_conf(dns: &[IpAddr]) -> String {
     let mut out = String::from("# Generated by nspawn; do not edit.\n");
     for server in dns {
@@ -846,9 +798,8 @@ pub fn resolv_conf(dns: &[IpAddr]) -> String {
     out
 }
 
-/// The .network file for host0 inside a machine: fixed address, the bridge as gateway.
-/// The bridge carries IPv4 only, so host0 gets no IPv6 link-local address either:
-/// machined would hand it out with the machine's name, ahead of the IPv4 one.
+/// host0's .network file. No IPv6 link-local address: machined would hand it out under
+/// the machine's name, ahead of the IPv4 one.
 pub fn network_file(addr: Ipv4Addr, subnet: Subnet, dns: &[IpAddr]) -> String {
     let mut out = format!(
         "# Generated by nspawn; do not edit.\n[Match]\nName=host0\n\n[Network]\nAddress={addr}/{}\nGateway={}\nLLMNR=yes\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n",
@@ -861,7 +812,6 @@ pub fn network_file(addr: Ipv4Addr, subnet: Subnet, dns: &[IpAddr]) -> String {
     out
 }
 
-/// The /etc/hosts of one machine: itself, the host and every other machine on the bridge.
 pub fn hosts_file(
     name: &str,
     addr: Ipv4Addr,
@@ -879,8 +829,8 @@ pub fn hosts_file(
     out
 }
 
-/// DNS servers for the machines: the configured ones, else the host's upstream servers,
-/// else public resolvers (the host's loopback resolver is out of reach from a machine).
+/// The configured servers, else the host's upstream ones (its loopback resolver is out
+/// of the machines' reach), else public resolvers.
 pub fn upstream_dns(configured: &[IpAddr]) -> Vec<IpAddr> {
     if !configured.is_empty() {
         return configured.to_vec();
@@ -910,14 +860,12 @@ fn nameservers(resolv_conf: &str) -> Vec<IpAddr> {
                 .flatten()
         })
         .filter_map(|word| word.parse::<IpAddr>().ok())
-        // The bridge carries no IPv6, so only IPv4 servers are reachable from a machine.
         .filter(|addr| addr.is_ipv4() && !addr.is_loopback())
         .collect()
 }
 
-/// Gives the machine an address on its network if it has none there, writes its .network
-/// file and refreshes the hosts files of every machine on a bridge. The record is saved
-/// when it changes.
+/// Gives the machine an address on its network if it has none there, writes its files
+/// and refreshes every machine's hosts file.
 pub fn prepare_machine(
     store: &Store,
     config: &Config,
@@ -928,9 +876,8 @@ pub fn prepare_machine(
     let addr = match record.address.filter(|a| net.subnet.usable(*a)) {
         Some(addr) => addr,
         None => {
-            // Every record counts, readable or not: an address handed out twice is worse
-            // than a start refused over a record that needs fixing. The subnets do not
-            // overlap, so the addresses of other networks never stand in the way.
+            // Strict: an address handed out twice is worse than a start refused over an
+            // unreadable record.
             let used: Vec<Ipv4Addr> = store
                 .list_images_strict()?
                 .iter()
@@ -957,14 +904,12 @@ pub fn prepare_machine(
     Ok(addr)
 }
 
-/// The network a machine on a bridge is on: its record's, or the default one.
 pub fn network_of(record: &ImageRecord) -> &str {
     record.network_name.as_deref().unwrap_or(DEFAULT_NETWORK)
 }
 
-/// Rewrites the hosts file of every machine on a bridge in place, so that running
-/// machines see the change through their bind mount. Each one lists the machines of its
-/// own network, whose gateway is the host.
+/// Rewrites every hosts file in place (running machines see it through the bind mount),
+/// each with the machines of its own network.
 pub fn write_hosts_files(store: &Store, all: &[NetSpec]) -> Result<()> {
     let mut networks: BTreeMap<String, BTreeMap<String, Ipv4Addr>> = BTreeMap::new();
     for r in store.list_images_strict()? {
@@ -979,7 +924,7 @@ pub fn write_hosts_files(store: &Store, all: &[NetSpec]) -> Result<()> {
         }
     }
     for (network, members) in &networks {
-        // A network removed from under a stopped machine: its start will say so.
+        // A network removed under a stopped machine: its start says so.
         let Some(net) = all.iter().find(|n| &n.name == network) else {
             continue;
         };
@@ -999,7 +944,6 @@ pub fn write_hosts_files(store: &Store, all: &[NetSpec]) -> Result<()> {
     Ok(())
 }
 
-/// Host ports published by the running machines, other than `except`.
 async fn ports_in_use(
     store: &Store,
     sd: &Systemd,
@@ -1021,9 +965,8 @@ async fn ports_in_use(
     Ok(used)
 }
 
-/// Whether a machine holds its published ports: being started (machined does not list
-/// it yet), or registered and not on its way down (machined keeps a closing machine
-/// listed while its unit runs ExecStopPost, which has already withdrawn the ports).
+/// Starting (not listed by machined yet), or registered and not closing (machined lists
+/// a closing machine while ExecStopPost has already withdrawn its ports).
 async fn holds_ports(store: &Store, sd: &Systemd, name: &str) -> Result<bool> {
     if store.is_starting(name) {
         return Ok(true);
@@ -1040,8 +983,7 @@ async fn holds_ports(store: &Store, sd: &Systemd, name: &str) -> Result<bool> {
     ))
 }
 
-/// Fails when a port the machine wants to publish is taken by another running machine
-/// or by a service of the host itself (the DNAT would silently hijack it).
+/// A port taken by another machine or by a host service (the DNAT would hijack it).
 pub async fn check_port_conflicts(store: &Store, sd: &Systemd, record: &ImageRecord) -> Result<()> {
     let used = ports_in_use(store, sd, &record.name).await?;
     for p in &record.ports {
@@ -1063,7 +1005,6 @@ pub async fn check_port_conflicts(store: &Store, sd: &Systemd, record: &ImageRec
     Ok(())
 }
 
-/// Whether nothing on the host listens on the port: a bind test on every address.
 fn host_port_free(port: PortMap) -> bool {
     match port.protocol {
         Protocol::Tcp => std::net::TcpListener::bind((Ipv4Addr::UNSPECIFIED, port.host)).is_ok(),
@@ -1071,13 +1012,11 @@ fn host_port_free(port: PortMap) -> bool {
     }
 }
 
-/// Rebuilds the DNAT map from the machines that are running on the bridge.
 pub async fn sync_ports(store: &Store, sd: &Systemd) -> Result<()> {
     sync_ports_except(store, sd, "").await
 }
 
-/// Like `sync_ports`, leaving out a machine that machined may still list while it is
-/// closing.
+/// Leaves out a machine machined may still list while it closes.
 pub async fn sync_ports_except(store: &Store, sd: &Systemd, except: &str) -> Result<()> {
     if !table_exists() {
         return Ok(());

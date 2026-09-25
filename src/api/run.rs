@@ -1,11 +1,7 @@
-//! docker run, attached: the machine's output as it comes, its end and its exit code,
-//! and, for an app, a terminal or an input for its program (src/attach.rs).
-//!
-//! The end is systemd's to tell, over D-Bus: the unit's PropertiesChanged carries the
-//! main process's exit code and status as they were when it ended, which a later read
-//! could miss once a restart began. The output is the journal's: systemd-nspawn copies
-//! the machine's console to the unit's standard output, so what `run` shows is what
-//! `logs` shows later, and the machine goes on if the caller goes away.
+//! docker run, attached: a machine's output, end and exit code, and a terminal or an
+//! input for an app's program (src/attach.rs). The end comes from the unit's
+//! PropertiesChanged, which carries the exit status as it was (a later read can race a
+//! restart); the output comes from the journal, so `logs` has it too.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -21,7 +17,7 @@ use zbus::zvariant::OwnedValue;
 
 use crate::systemd::Systemd;
 
-/// How the main process of the unit ended, as systemd says it.
+/// How the unit's main process ended.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ending {
     /// CLD_EXITED (1), CLD_KILLED (2) or CLD_DUMPED (3).
@@ -37,10 +33,9 @@ const CLD_DUMPED: i32 = 3;
 /// What systemd-nspawn exits with when the machine asked for a reboot.
 const REBOOT: i32 = 133;
 
-/// The exit code `run` gives, docker's way: the program's, 128 plus the signal it died
-/// of. systemd-nspawn exits 255 whatever signal killed an app's program; when nspawn
-/// sent one itself (`sent`), that is the one. SIGKILL of the whole machine makes it exit
-/// 1 on systemd 259 and newer, and die of it before; that and the OOM killer give 137.
+/// docker's exit code: the program's, or 128 plus the signal it died of. systemd-nspawn
+/// reports 255 for any signal that killed an app's program, and 1 after a SIGKILL of
+/// the whole machine on 259 and newer, so the signal nspawn itself sent decides.
 pub fn exit_code(ending: &Ending, sent: Option<i32>, app: bool) -> i32 {
     if ending.result == "oom-kill" {
         return 128 + 9;
@@ -54,8 +49,7 @@ pub fn exit_code(ending: &Ending, sent: Option<i32>, app: bool) -> i32 {
     }
 }
 
-/// The unit of a run, watched from before its start: its PropertiesChanged signals say
-/// when the main process started and how it ended.
+/// A run's unit, watched from before its start.
 pub struct UnitWatch {
     unit: String,
     changes: zbus::fdo::PropertiesChangedStream,
@@ -63,8 +57,8 @@ pub struct UnitWatch {
     code: i32,
     status: i32,
     result: String,
-    /// The last run asked for a reboot (133): the next one follows, unless the unit is
-    /// not restarted (run --rm resets RestartForceExitStatus=).
+    /// The last run exited 133 (reboot): the next one is followed, unless the unit stops
+    /// instead (run --rm resets RestartForceExitStatus=).
     rebooting: bool,
 }
 
@@ -94,17 +88,15 @@ impl UnitWatch {
         })
     }
 
-    /// A main process learned otherwise (read after the start, in case its signal came
-    /// before the watch was listening).
+    /// The main PID read after the start, in case its signal came first.
     pub fn saw(&mut self, pid: u32) {
         if pid != 0 && self.main_pid == 0 {
             self.main_pid = pid;
         }
     }
 
-    /// Waits for the main process to end. A reboot asked from inside the machine is not
-    /// an end when systemd starts it again (the template restarts on 133): the watch
-    /// goes on with the new run.
+    /// Waits for the main process to end. A reboot (133) that systemd restarts is not an
+    /// end.
     pub async fn ended(&mut self) -> Result<Ending> {
         while let Some(signal) = self.changes.next().await {
             let Ok(args) = signal.args() else { continue };
@@ -131,7 +123,6 @@ impl UnitWatch {
                 .and_then(|v| u32::try_from(v).ok())
             {
                 if pid != 0 && pid != self.main_pid {
-                    // A new run: what the last one left is over.
                     self.main_pid = pid;
                     self.code = 0;
                     self.status = 0;
@@ -165,8 +156,7 @@ impl UnitWatch {
     }
 }
 
-/// The journal's cursor now, so that a follower started later misses nothing written
-/// after it. None without a journal to follow.
+/// The journal's current cursor, for a follower to start after; None without a journal.
 pub async fn journal_cursor() -> Option<String> {
     let output = tokio::process::Command::new("journalctl")
         .args(["--lines=0", "--show-cursor", "--quiet", "--no-pager"])
@@ -198,9 +188,8 @@ pub fn follower_arguments(unit: &str, cursor: Option<&str>) -> Vec<String> {
     argv
 }
 
-/// A journal entry's message as bytes: journalctl writes a message with control
-/// characters or invalid UTF-8 as an array of numbers. The carriage return a console
-/// ends its lines with is dropped.
+/// A journal entry's message as bytes, without the console's trailing CR. journalctl
+/// writes a message with control characters or invalid UTF-8 as an array of numbers.
 pub fn message_bytes(entry: &Value) -> Option<Vec<u8>> {
     let mut bytes = match entry.get("MESSAGE")? {
         Value::String(text) => text.clone().into_bytes(),
@@ -216,18 +205,16 @@ pub fn message_bytes(entry: &Value) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Whether a journal entry is what the machine wrote rather than what one of the unit's
-/// hooks (`nspawn network ...`) said. The machine's output comes from systemd-nspawn
-/// copying its console, or, with --console=pipe, from the program's own processes
-/// writing into the same stream; journald names the writer of every line.
+/// Whether an entry is the machine's output rather than a hook's (`nspawn network`).
+/// With --console=pipe the program's processes write into the stream themselves, so
+/// the writer's name tells them apart, not the PID.
 fn from_machine(entry: &Value) -> bool {
     entry.get("_COMM").and_then(Value::as_str) != Some("nspawn")
 }
 
-/// Copies what the machine writes into `out`, a line at a time. It is started before
-/// the machine, so that journalctl, which takes its time to start on a big journal,
-/// reads along as the program writes; `finish` ends it once the output has been quiet
-/// for a moment after the end, so that the last lines are not cut.
+/// Copies the machine's output into `out`, a line at a time. Started before the machine:
+/// journalctl can take long to start on a big journal, and a quick program would end
+/// before it read anything.
 pub struct Follower {
     stop: tokio::sync::watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -258,8 +245,8 @@ impl Follower {
         let (stop, mut stopping) = tokio::sync::watch::channel(false);
         let task = tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(entries).lines();
-            // After the end: at least half a second, for what journald still has to
-            // take from the stream, then until nothing came for 300 ms; three at most.
+            // After the end: at least half a second, for what journald still has to take
+            // from the stream, then until 300 ms pass without a line; three at most.
             let quiet = Duration::from_millis(300);
             let mut last_line = tokio::time::Instant::now();
             let mut floor = tokio::time::Instant::now();
@@ -302,8 +289,7 @@ impl Follower {
         })
     }
 
-    /// Ends the copy once the output has been quiet for a moment (three seconds at
-    /// most), and closes the pipe.
+    /// Ends the copy once the output has been quiet for a moment, and closes the pipe.
     pub async fn finish(mut self) {
         let _ = self.stop.send(true);
         if let Some(task) = self.task.take() {
@@ -327,14 +313,14 @@ pub struct RunRequest {
     pub stdin: Option<OwnedFd>,
 }
 
-/// A machine started for an attached run, and what goes on watching it.
+/// A machine started for an attached run.
 pub struct Attached {
     pub name: String,
     pub app: bool,
     /// The terminal's master for the caller (-t).
     pub terminal: Option<OwnedFd>,
-    /// The service's own copy: the terminal stays open should the caller go, until the
-    /// machine has been stopped the normal way.
+    /// The service's copy, so that the terminal stays open until the machine is stopped
+    /// should the caller go (systemd-nspawn SIGKILLs the machine on a hangup).
     keep: Option<OwnedFd>,
     /// Where the caller reads the output (without -t).
     pub output: Option<OwnedFd>,
@@ -344,8 +330,8 @@ pub struct Attached {
     pub main_pid: u32,
 }
 
-/// Starts a machine attached: its terminal or input handed to its systemd-nspawn
-/// (src/attach.rs), its end watched and its output followed from before the start.
+/// Starts a machine attached: terminal or input handed over, end watched, output
+/// followed, all set up before the start.
 pub async fn attach(
     ctx: &crate::api::Context,
     request: RunRequest,
@@ -363,8 +349,7 @@ pub async fn attach(
     }
     let sd = ctx.sd().await?;
     let unit = format!("systemd-nspawn@{name}.service");
-    // Before the socket: one of an earlier run of the same machine is not to be
-    // replaced by a run that `start` would refuse anyway.
+    // Refused before binding: the socket would replace the one an earlier run waits on.
     if ctx.store.is_starting(&name) || sd.machine_exists(&name).await? {
         bail!("machine {name} is already running");
     }
@@ -445,9 +430,8 @@ pub async fn attach(
 }
 
 impl Attached {
-    /// Waits for the run to end and gives its exit code. Should the caller go first, a
-    /// machine with a terminal is stopped the normal way (nothing would read it any
-    /// more), and any other one goes on alone: the wait ends there.
+    /// Waits for the end and gives the exit code. If the caller goes first, a machine with
+    /// a terminal is stopped (nothing would read it); any other one goes on alone.
     pub async fn finish(
         mut self,
         ctx: Arc<crate::api::Context>,
@@ -479,8 +463,7 @@ impl Attached {
                 self.watch.ended().await
             }
         };
-        // A signal forwarded through the process object, or one kill or stop sent, read
-        // at once: run --rm removes the machine, and what it kept, right after.
+        // Read now: run --rm removes the machine, and its last-signal mark, right after.
         let sent = sent
             .lock()
             .unwrap()

@@ -372,8 +372,6 @@ impl Systemd {
         }
     }
 
-    /// State ("opening", "running", "closing"), leader PID and start time (unix seconds)
-    /// of a machine.
     async fn machine(&self, name: &str) -> Result<machine1::MachineProxy<'static>> {
         let path = self
             .machined
@@ -387,6 +385,8 @@ impl Systemd {
             .with_context(|| format!("connecting to machine {name}"))
     }
 
+    /// State ("opening", "running", "closing"), leader PID and start time (unix seconds)
+    /// of a machine.
     pub async fn machine_details(&self, name: &str) -> Result<MachineDetails> {
         let machine = self.machine(name).await?;
         Ok(MachineDetails {
@@ -464,8 +464,8 @@ impl Systemd {
             .with_context(|| format!("powering off {name}"))
     }
 
-    /// Clears the "failed" state a unit keeps after its process died of a signal, so that
-    /// a docker-style stop does not leave every app machine listed by systemctl --failed.
+    /// Clears the "failed" state a signal leaves on a unit, so that a stopped app machine
+    /// is not listed by systemctl --failed.
     pub async fn reset_failed(&self, unit: &str) -> Result<()> {
         match self.manager.reset_failed_unit(unit.to_string()).await {
             Ok(()) => Ok(()),

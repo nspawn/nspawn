@@ -677,7 +677,7 @@ fn grandchild(
     // The capabilities of the machine's own processes and no more, as docker exec gives:
     // the service's bounding set is the host's whole one, and the command is theirs to
     // trace once it runs. Best effort: a security module that refuses (an SELinux
-    // policy older than this) must not stop the command, which ran so before.
+    // policy without the rule) must not stop the command.
     if let Some(bounding) = bounding {
         let _ = limit_bounding_set(bounding);
     }
@@ -726,9 +726,9 @@ fn grandchild(
             return 127;
         }
     };
-    // Nothing of the service's but the three streams goes along into the machine, and
-    // not its SIGPIPE either: the service ignores it, which execve would pass on, and a
-    // command in a pipeline must die of a closed pipe as it would anywhere else.
+    // Only the three streams go along. SIGPIPE goes back to its default: execve would
+    // pass on the service's SIG_IGN, and a command in a pipeline must die of a closed
+    // pipe.
     close_from(3);
     // SAFETY: only the default disposition is set, in a single-threaded child.
     let _ = unsafe {

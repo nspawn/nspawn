@@ -34,7 +34,7 @@ pub struct ImageRecord {
     /// Booted with an init system, or a single program under nspawn's stub init.
     #[serde(default = "default_mode")]
     pub mode: Mode,
-    /// Command, environment and friends from the OCI config.
+    /// The OCI config's command, environment and the rest.
     #[serde(default)]
     pub run: RunSpec,
     #[serde(default = "default_network")]
@@ -54,8 +54,8 @@ pub struct ImageRecord {
     /// the cmd alone.
     #[serde(default)]
     pub entrypoint: Option<Vec<String>>,
-    /// Cmd override (the arguments after --); None keeps the image's. Older records kept
-    /// a whole command under "command".
+    /// Cmd override (the arguments after --); None keeps the image's. Also read from a
+    /// "command" key.
     #[serde(default, alias = "command")]
     pub cmd: Option<Vec<String>>,
     /// Environment on top of the image's (-e).
@@ -73,8 +73,7 @@ pub struct ImageRecord {
     /// --memory, --cpus and --pids-limit.
     #[serde(default)]
     pub limits: crate::policy::Limits,
-    /// run --rm: the machine is removed once its current run ends. Set by the start
-    /// that began that run.
+    /// run --rm: removed once its current run ends.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub remove_on_exit: bool,
 }
@@ -100,8 +99,8 @@ impl ImageRecord {
         argv
     }
 
-    /// Older records stored an empty "command" list meaning "no override", and kept the
-    /// image's entrypoint and cmd joined; both take the current shape here.
+    /// An empty cmd override means none, and a run config with only `command` has it as
+    /// its cmd.
     fn normalize(mut self) -> Self {
         if self.cmd.as_ref().is_some_and(|c| c.is_empty()) {
             self.cmd = None;
@@ -162,10 +161,9 @@ pub fn foreign_id(id: u32) -> u32 {
 /// Exclusive hold on the store; see `Store::lock`.
 pub struct StoreLock(#[allow(dead_code)] Flock<File>);
 
-/// Blobs a pull is bringing in, kept from the garbage collector until the image's record
-/// refers to them: a file under the blobs directory listing the digests, gone with the
-/// guard. Downloads run without the store lock, so an `images rm` meanwhile must not
-/// collect them.
+/// Blobs a pull is bringing in, kept from the garbage collector until a record refers to
+/// them, since downloads run without the store lock: a file under the blobs directory
+/// listing the digests, gone with the guard.
 pub struct BlobHold(PathBuf);
 
 impl Drop for BlobHold {
@@ -174,9 +172,9 @@ impl Drop for BlobHold {
     }
 }
 
-/// A machine's start in progress, from the moment its files are prepared until it is
-/// registered or the start failed: what keeps a second start, a removal or a
-/// replacement off it meanwhile, since machined does not list it yet.
+/// A start in progress, from the preparation of its files until the machine registers or
+/// the start fails: keeps a second start, a removal or a replacement off it while
+/// machined does not list it yet.
 pub struct Starting(PathBuf);
 
 impl Drop for Starting {
@@ -202,11 +200,10 @@ impl Store {
         }
     }
 
-    /// Serialises the commands that change the store (pull, create, build, rm, the
-    /// preparation done by start and the unit hooks), so that two of them never hand out
-    /// the same address or extract the same layer at once. Released when dropped. The
-    /// wait happens on a blocking thread: the service must keep answering the bus, and
-    /// reading the replies the lock's holder waits for, while a caller queues.
+    /// Serialises the commands that change the store (pull, create, build, rm, a start's
+    /// preparation, the unit hooks). Released when dropped. The wait runs on a blocking
+    /// thread: while a caller queues, the service must keep answering the bus, the
+    /// lock's holder among its callers.
     pub async fn lock(&self) -> Result<StoreLock> {
         let root = self.root.clone();
         tokio::task::spawn_blocking(move || lock_blocking(&root, None))
@@ -230,15 +227,14 @@ impl Store {
         }
         create_dir_with_mode(&self.machines_private_dir(), PASSAGE)?;
         self.protect()?;
-        // As systemd's tmpfiles makes it: the trees of machines are nobody else's business.
+        // As systemd-tmpfiles makes it.
         create_dir_with_mode(&self.machines_dir, PRIVATE)?;
         check_writable(&self.machines_dir)
     }
 
-    /// What below the state directory is root's alone: the layers hold what the images
-    /// hold, setuid programs and device nodes among them, which would work for any local
-    /// user who reached them; the records hold the machines' environment; volumes and
-    /// builds hold the machines' data and trees.
+    /// Root's alone: layers hold setuid programs and device nodes that would work for any
+    /// local user reaching them, records hold the machines' environment, volumes and
+    /// builds their data.
     fn private_dirs(&self) -> [PathBuf; 10] {
         [
             self.layers_dir(Ownership::Root),
@@ -254,8 +250,8 @@ impl Store {
         ]
     }
 
-    /// Closes what earlier versions left open. The state directory and the machines'
-    /// directory stay passable: systemd-nspawn binds a machine's generated files from
+    /// Gives what exists below the state directory the modes of the table. The state
+    /// directory and the machines' directory stay passable: systemd-nspawn binds a machine's generated files from
     /// inside the managed user namespace of an mstack machine, where it is nobody. A
     /// machine's own directory is passable too, unless it holds the writable layer of an
     /// overlay machine, which is as private as the image's.
@@ -880,8 +876,8 @@ pub fn validate_digest(digest: &str) -> Result<()> {
 /// directories with inode 2.
 pub fn check_writable(dir: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    // One probe per call: two pulls at once must not remove each other's. The one name
-    // of versions before 1.1.0 goes if a crash left it.
+    // One probe per call: two pulls at once must not remove each other's. A probe under
+    // the fixed name, left by a crash, goes.
     let _ = fs::remove_dir(dir.join(".nspawn-write-test"));
     let probe = dir.join(format!(".nspawn-write-test-{}", unique_suffix()));
     match fs::create_dir(&probe) {

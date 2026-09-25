@@ -1,8 +1,6 @@
-//! docker events: what happens to machines, read from the journal. systemd logs every
-//! start, end, restart and stop of a machine's unit with a message ID of its own, so
-//! machines started by machinectl, at boot or by a restart policy are seen too; what
-//! nspawn itself does (pull, create, remove...) it logs the same way under its own
-//! message ID. Nothing is kept in the service: the journal is the history.
+//! docker events, from the journal: systemd's entries about the machines' units (so
+//! machines started by machinectl, at boot or by a restart policy count too) and
+//! nspawn's own entries for what it does. The service keeps no history.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -14,7 +12,6 @@ use crate::journal;
 /// The message ID of nspawn's own entries.
 pub const MESSAGE_ID: &str = "b0b60147942247cab22cc49510006a0b";
 
-/// systemd's message IDs for a unit's life, and the action each one is.
 const UNIT_STARTED: &str = "39f53479d3a045ac8e11786248231fbf";
 const UNIT_PROCESS_EXIT: &str = "98e322203f7a4ed290d09fe03c09fe15";
 const UNIT_SUCCESS: &str = "7ad2d189f7e94e70a38c781354912448";
@@ -32,8 +29,7 @@ const SYSTEMD_IDS: [&str; 7] = [
     UNIT_FAILURE_RESULT,
 ];
 
-/// Logs one of nspawn's own events. Best effort: an operation that worked is not undone
-/// because the journal could not take the entry.
+/// Logs one of nspawn's events. Best effort: a failed entry does not fail the operation.
 pub fn emit(kind: &str, action: &str, name: &str, attributes: &[(&str, &str)]) {
     let message = format!("{kind} {action} {name}");
     let mut fields: Vec<(String, String)> = vec![
@@ -55,7 +51,6 @@ pub fn emit(kind: &str, action: &str, name: &str, attributes: &[(&str, &str)]) {
     let _ = journal::send(&fields);
 }
 
-/// The journal field of an attribute: letters, digits and underscores in capitals.
 fn attribute_field(key: &str) -> String {
     let key: String = key
         .chars()
@@ -70,11 +65,9 @@ fn attribute_field(key: &str) -> String {
     format!("NSPAWN_ATTR_{key}")
 }
 
-/// journalctl's arguments: JSON entries of PID 1 about units, and nspawn's own, both
-/// from root alone (journald sets _UID and _PID itself, so nobody else can pass off an
-/// entry as one of these). Pure field matches: a unit glob would be expanded once, when
-/// journalctl starts, and fail when no machine ran yet. Without `until` it follows,
-/// from `since` or from now on.
+/// journalctl's arguments. Only entries from uid 0 (PID 1's and nspawn's) count: journald
+/// sets _UID and _PID itself, so nobody else can forge them. Field matches only: a unit
+/// glob is expanded once at start, and fails before any machine ran.
 pub fn journalctl_arguments(since: Option<&str>, until: Option<&str>) -> Vec<String> {
     let mut argv = vec![
         "--no-pager".to_string(),
@@ -98,12 +91,10 @@ pub fn journalctl_arguments(since: Option<&str>, until: Option<&str>) -> Vec<Str
     argv
 }
 
-/// One event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     /// Microseconds since the epoch.
     pub time_usec: u64,
-    /// machine, network or volume.
     pub kind: String,
     pub action: String,
     pub name: String,
@@ -126,8 +117,8 @@ impl Event {
     }
 }
 
-/// Turns journal entries into events. A clean exit is not logged as such (only as the
-/// unit's success), so it remembers which runs had their exit logged.
+/// Turns journal entries into events. systemd does not log a clean exit, only the unit's
+/// success, so the runs whose exit was logged are remembered.
 #[derive(Default)]
 pub struct Mapper {
     exited: VecDeque<String>,
@@ -167,7 +158,7 @@ impl Mapper {
         let action = match id {
             UNIT_STARTED => "start",
             UNIT_PROCESS_EXIT => {
-                // The machine's own end; hooks and control processes are the unit's.
+                // The machine's end, not a hook's.
                 if field("COMMAND") != Some("ExecStart") {
                     return None;
                 }
@@ -229,8 +220,8 @@ impl Mapper {
     }
 }
 
-/// docker's --filter: the same key given twice matches either value, different keys
-/// must all match.
+/// docker's --filter: the same key twice matches either value; different keys must all
+/// match.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filters {
     names: Vec<String>,
@@ -282,7 +273,7 @@ impl Filters {
     }
 }
 
-/// A time as RFC 3339 in UTC with microseconds: 2026-09-24T10:00:00.123456Z.
+/// RFC 3339 in UTC with microseconds: 2026-09-24T10:00:00.123456Z.
 pub fn rfc3339(usec: u64) -> String {
     let secs = usec / 1_000_000;
     let days = (secs / 86_400) as i64;

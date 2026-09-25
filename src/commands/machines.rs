@@ -235,8 +235,8 @@ fn run_name(base: &str) -> Result<String> {
     Ok(format!("{base}-{}", hex::encode(bytes)))
 }
 
-/// docker run: the machine from a local image with the reference or from the registry,
-/// then started with the options given, which it keeps like after start.
+/// docker run: a machine from a local image or from the registry, started with the
+/// options given, which it keeps as after start.
 pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> {
     if !args.detach && !args.options.wait {
         bail!("--no-wait goes with -d: an attached run follows the machine anyway");
@@ -278,10 +278,9 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
         );
     }
     let manager = &client.manager;
-    // In nspawn a pulled image is a machine; with --rm the one pulled for this run would
-    // go with it, and the next run would download it again. So it is pulled under its
-    // own name and kept, and the machine is made from it, unless that name is taken by
-    // another image.
+    // A pulled image is a machine, so --rm would remove the image too and the next run
+    // would download it again: it is pulled under its own name and kept, and the machine
+    // is made from it, unless another image has that name.
     let base = image.local_name();
     let keep_image = args.rm
         && matches!(source, Source::Registry)

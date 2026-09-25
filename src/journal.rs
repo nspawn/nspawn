@@ -1,7 +1,6 @@
-//! Structured entries for the journal, sent the way sd_journal_send() does: one datagram
-//! of FIELD=value lines to journald's socket. Values with a newline use the binary form
-//! (the field name, a newline, the length as 64 bit little endian, the value, a
-//! newline).
+//! Structured journal entries, sent as sd_journal_send() does: one datagram of
+//! FIELD=value lines. A value with a newline uses the binary form (name, newline, length
+//! as u64 little endian, value, newline).
 
 use std::os::unix::net::UnixDatagram;
 
@@ -9,7 +8,6 @@ use anyhow::{Context, Result};
 
 const SOCKET: &str = "/run/systemd/journal/socket";
 
-/// One journal entry from its fields; MESSAGE should be among them.
 pub fn send(fields: &[(&str, &str)]) -> Result<()> {
     let socket = UnixDatagram::unbound().context("creating a socket for the journal")?;
     socket

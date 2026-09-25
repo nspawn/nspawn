@@ -683,7 +683,7 @@ pub struct ExecArgs {
     /// User inside the machine.
     #[arg(long, short = 'u', default_value = "root")]
     pub user: String,
-    /// Kept for compatibility: exec always enters the machine's namespaces now.
+    /// Accepted and ignored: exec always enters the machine's namespaces.
     #[arg(long, hide = true)]
     pub nsenter: bool,
     /// Command and arguments.

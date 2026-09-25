@@ -1,6 +1,5 @@
-//! The trusted systemd.nspawn(5) settings file nspawn keeps for every machine it manages.
-//! The systemd-nspawn@.service template runs with --settings=override, so these values win
-//! over its command line.
+//! The trusted systemd.nspawn(5) file of each machine, and the unit's hooks drop-in. The
+//! template runs with --settings=override, so the file wins over its command line.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,19 +16,14 @@ pub const SETTINGS_DIR: &str = "/etc/systemd/nspawn";
 /// The settings key NamespacePath= exists since this systemd version.
 pub const NAMESPACE_PATH_SETTING_SINCE: u32 = 259;
 
-/// How the network namespace prepared on the host for an app on the bridge reaches
-/// nspawn.
+/// How an app on the bridge gets the network namespace prepared on the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NamespaceRoute {
-    /// NamespacePath= in the settings file.
     Settings,
-    /// --network-namespace-path= on the unit's command line, rewritten from the argv
-    /// systemd has for the unit: older systemd has no settings key for it.
+    /// --network-namespace-path= on the command line: systemd before 259 has no key.
     CommandLine(Vec<String>),
 }
 
-/// Apps on the bridge before systemd 259 need the command line; everything else the
-/// settings file.
 pub async fn namespace_route(
     sd: &Systemd,
     name: &str,
@@ -53,12 +47,11 @@ pub async fn namespace_route(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Network {
-    /// The nspawn bridge (docker0 style): fixed address, NAT, published ports, names of
-    /// the other machines. Needs nothing from the host's own network manager.
+    /// The nspawn bridge: fixed address, NAT, published ports, the other machines' names.
     Bridge,
     /// A virtual ethernet pair configured by systemd-networkd on the host.
     Veth,
-    /// Share the host's network namespace, like docker run --network host.
+    /// The host's network namespace.
     Host,
 }
 
@@ -67,20 +60,16 @@ pub struct MachineSettings<'a> {
     /// mstack images: boot with managed user namespaces instead of the template's -U.
     pub managed_userns: bool,
     pub mode: Mode,
-    /// Working directory, user, environment and stop signal of the image.
     pub run: &'a RunSpec,
-    /// What an app machine runs: entrypoint and cmd, overrides applied.
+    /// Entrypoint and cmd, overrides applied.
     pub command: &'a [String],
-    /// Environment given with -e, after the image's.
+    /// -e, after the image's environment.
     pub extra_env: &'a [String],
-    /// Volumes, resolved to host paths.
     pub binds: &'a [Bind],
-    /// Directory with the units that make a booted machine wait for its volumes (see
-    /// `volume_wait_units`), when it has any.
+    /// The units that make a booted machine wait for its volumes (`volume_wait_units`).
     pub volume_units: Option<&'a Path>,
     pub network: Network,
-    /// Bridge networking: the bridge to join and the directory with the machine's
-    /// generated host0.network and hosts files.
+    /// The bridge to join and the directory of the generated host0.network and hosts.
     pub bridge: Option<BridgeMount<'a>>,
 }
 
@@ -89,7 +78,6 @@ pub struct BridgeMount<'a> {
     pub files: &'a Path,
 }
 
-/// A volume ready to mount.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bind {
     pub source: PathBuf,
@@ -144,9 +132,8 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
                     out.push_str(&format!("User={user}\n"));
                 }
             }
-            // What nspawn forwards to the stub init when the unit is stopped: a poweroff
-            // request, which the stub answers with SIGTERM to the program and waits. The
-            // image's own stop signal is what `nspawn stop` sends to the program itself.
+            // What a stop of the unit sends the stub init: a poweroff request. The image's
+            // stop signal is what `nspawn stop` sends the program itself.
             out.push_str("KillSignal=SIGRTMIN+4\n");
         }
     }
@@ -157,7 +144,6 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
             if let Some(b) = &s.bridge {
                 let dir = b.files.display();
                 match s.mode {
-                    // systemd-networkd inside configures host0 from the mounted file.
                     Mode::Boot => {
                         out.push_str(&format!("\n[Network]\nBridge={}\n", b.bridge));
                         files.push(format!(
@@ -165,7 +151,6 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
                         ));
                         files.push(format!("BindReadOnly={dir}/hosts:/etc/hosts"));
                     }
-                    // Nothing inside to configure anything: the namespace comes ready.
                     Mode::App => {
                         if *route == NamespaceRoute::Settings {
                             out.push_str(&format!(
@@ -181,11 +166,9 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
         }
         Network::Veth => {}
     }
-    // Under managed user namespaces nspawn cannot idmap binds; those volumes are attached
-    // from the host once the machine runs (see volmount). Every booted machine with
-    // volumes gets the unit that holds local-fs.target until they are all there: the same
-    // guarantee whatever the backend, and on overlay and flat the binds below make them
-    // present before the init even runs.
+    // Under managed user namespaces nspawn cannot idmap binds: those volumes are attached
+    // from the host once the machine runs (volmount), and a booted machine's
+    // local-fs.target waits for them (on every backend, for the same guarantee).
     let rendered_binds: &[Bind] = if s.managed_userns { &[] } else { s.binds };
     if s.mode == Mode::Boot && !s.binds.is_empty() {
         if let Some(units) = s.volume_units {
@@ -238,11 +221,8 @@ pub fn volume_wait_units(targets: &[String]) -> (String, String) {
     (service, dropin)
 }
 
-/// The drop-in that makes the machine's unit call nspawn around its life: the network is
-/// prepared before it starts, ports are published once it runs and everything is released
-/// however it ends, whether it was started by nspawn, machinectl or at boot. It also
-/// carries the machine's restart policy and resource limits. Returns whether the file
-/// changed (a daemon-reload is then due).
+/// The drop-in that calls nspawn around the unit's life, whoever starts it, and carries
+/// the restart policy and limits. Returns whether it changed (a reload is due).
 pub fn write_hooks(
     name: &str,
     config: &crate::config::Config,
@@ -274,8 +254,7 @@ pub fn write_hooks(
     Ok(true)
 }
 
-/// How the hooks call this binary: its canonical path (the one being replaced by a
-/// package update still names the new one) and the configuration file it was given.
+/// How the hooks call this binary: its canonical path and the configuration it was given.
 fn hook_command(config: &crate::config::Config) -> Result<String> {
     Ok(hook_argv(config)?
         .iter()
@@ -284,7 +263,7 @@ fn hook_command(config: &crate::config::Config) -> Result<String> {
         .join(" "))
 }
 
-/// `hook_command` as an argv, for units made over the bus.
+/// `hook_command` as an argv.
 pub fn hook_argv(config: &crate::config::Config) -> Result<Vec<String>> {
     let exe = std::env::current_exe().context("locating the nspawn binary")?;
     let exe = replaced_binary(&exe)
@@ -299,9 +278,8 @@ pub fn hook_argv(config: &crate::config::Config) -> Result<Vec<String>> {
     Ok(argv)
 }
 
-/// The argv an app machine's unit runs, as systemd has it loaded: its ExecStart= is
-/// rewritten around it (see `exec_start_override`). None for a booted machine, whose
-/// ExecStart= stays the template's.
+/// The argv systemd has loaded for an app machine's ExecStart=, which the drop-in
+/// rewrites (`exec_start_override`). None for a booted machine.
 pub async fn app_argv(
     sd: &Systemd,
     name: &str,
@@ -320,7 +298,6 @@ pub async fn app_argv(
     }))
 }
 
-/// The text of the hooks drop-in.
 pub fn render_hooks(
     command: &str,
     name: &str,
@@ -333,11 +310,10 @@ pub fn render_hooks(
     let mut text = String::from("# Generated by nspawn; do not edit.\n");
     let restart_setting = restart.unit_setting();
     if restart_setting.is_some() {
-        // Restarted as long as it keeps failing, with a growing delay, as docker does.
+        // Restarted as long as it keeps failing, with a growing delay, as docker does it.
         text.push_str("[Unit]\nStartLimitIntervalSec=0\n");
     }
-    // What the machine writes goes to the journal whatever its pace: logs and attached
-    // runs read it back from there.
+    // No rate limit: logs and attached runs read the machine's output from the journal.
     text.push_str(&format!(
         "[Service]\nExecStartPre={command} network prepare %i\nExecStartPost={command} network publish %i\nExecStopPost=-{command} network release %i\nLogRateLimitIntervalSec=0\n"
     ));
@@ -347,13 +323,11 @@ pub fn render_hooks(
         ));
     }
     if remove_on_exit {
-        // run --rm: the template restarts a machine that asked for a reboot (133); one
-        // that goes once it ends ends there.
+        // run --rm: the template restarts on a reboot (133); this machine ends instead.
         text.push_str("RestartForceExitStatus=\n");
     }
     if limits.memory > 0 {
-        // As much swap again as memory, which is what docker allows when --memory-swap
-        // is not given; without it a machine on a host with swap is not bounded at all.
+        // As much swap again, docker's default; without it swap would be unbounded.
         text.push_str(&format!(
             "MemoryMax={0}\nMemorySwapMax={0}\n",
             limits.memory
@@ -377,13 +351,12 @@ pub fn render_hooks(
     text
 }
 
-/// The ExecStart= lines of an app machine: systemd-nspawn behind `nspawn attach-exec`
-/// (src/attach.rs), which gives it the terminal or input of an attached run. The argv is
-/// the one systemd has loaded, without an earlier override of ours around it and without
-/// --console, which only a run chooses. With `namespace` the namespace prepared for the
-/// bridge goes on the command line, without the options that conflict with it (only
-/// their `--option=value` form is recognised); older systemd has no settings key for it.
-/// Applied to its own result it gives the same lines again.
+/// An app machine's ExecStart=: the loaded argv behind `nspawn attach-exec` (src/attach.rs),
+/// without the override of ours it may carry and without --console, which only a run
+/// chooses.
+/// With `namespace` it carries --network-namespace-path= instead of the options that
+/// conflict with it (in their `--option=value` form). Applied to its own output it gives
+/// the same lines.
 pub fn exec_start_override(command: &str, argv: &[String], name: &str, namespace: bool) -> String {
     const CONFLICTING: &[&str] = &[
         "--network-veth",
@@ -417,7 +390,6 @@ pub fn exec_start_override(command: &str, argv: &[String], name: &str, namespace
     )
 }
 
-/// An argv without the `nspawn attach-exec NAME --` an earlier override put in front.
 fn unwrapped(argv: &[String]) -> &[String] {
     match argv.iter().position(|a| a == "--") {
         Some(end) if argv[..end].iter().any(|a| a == "attach-exec") => &argv[end + 1..],
@@ -425,8 +397,7 @@ fn unwrapped(argv: &[String]) -> &[String] {
     }
 }
 
-/// One argument of an ExecStart= line: `%` starts a specifier and is doubled, and
-/// anything beyond plain characters goes in double quotes with backslash escapes.
+/// One ExecStart= argument: `%` doubled, anything unusual double-quoted with escapes.
 pub fn unit_quote(arg: &str) -> String {
     let plain = !arg.is_empty()
         && arg
@@ -448,8 +419,7 @@ pub fn unit_quote(arg: &str) -> String {
     quoted
 }
 
-/// Writes the file when it differs from what is there. It is root's alone: the
-/// environment given with -e often carries passwords and tokens.
+/// Writes the file when it changed, root's alone: -e often carries secrets.
 pub fn write(s: &MachineSettings, route: &NamespaceRoute) -> Result<()> {
     write_private(&path(s.name), &render_with(s, route))
 }
@@ -461,14 +431,13 @@ fn write_private(path: &Path, wanted: &str) -> Result<()> {
         .map(|current| current == wanted)
         .unwrap_or(false)
     {
-        // Written by a version that left it readable by everyone.
+        // Same content: only the mode may be wrong.
         return fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("restricting {} to root", path.display()));
     }
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    // Through a new file and a rename: a start never reads half of it, and the file
-    // is never readable by others for a moment.
+    // Through a new file and a rename: never half written, never readable by others.
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = dir.join(format!(".{name}.{}", crate::store::unique_suffix()));
     let written = fs::OpenOptions::new()
@@ -488,10 +457,9 @@ pub fn remove(name: &str) {
     let _ = fs::remove_file(path(name));
 }
 
-/// Quotes one argument the way systemd's config parser (config_parse_strv) reads it:
-/// quotes group, backslashes are kept literally and never escape anything, and adjacent
-/// quoted pieces join into one word. So the whole argument goes in single quotes, and
-/// each single quote it contains rides in double quotes between two such pieces.
+/// Quotes an argument for config_parse_strv, where backslashes escape nothing and
+/// adjacent quoted pieces join: single quotes around it, and each single quote inside in
+/// double quotes between two such pieces.
 pub fn quote(arg: &str) -> String {
     if !arg.is_empty()
         && !arg
@@ -518,10 +486,8 @@ pub fn quote(arg: &str) -> String {
     }
 }
 
-/// Once the file a process runs has been replaced, as a package upgrade does,
-/// /proc/self/exe (which is what current_exe reads) reports "<path> (deleted)". The
-/// hooks must name the path itself, where the new file sits, or every machine started
-/// afterwards fails to execute them.
+/// After a package upgrade replaced the binary, /proc/self/exe reads "<path> (deleted)";
+/// the hooks must name the path itself.
 fn replaced_binary(exe: &Path) -> Option<PathBuf> {
     exe.to_str()?.strip_suffix(" (deleted)").map(PathBuf::from)
 }
@@ -610,7 +576,7 @@ mod tests {
             .collect();
         assert_eq!(exec_start_override(command, &loaded, "web", true), text);
         // Without the namespace on the command line (systemd 259 and newer, or a network
-        // other than the bridge), the path an earlier drop-in added goes, and so does a
+        // other than the bridge), the path a loaded drop-in added goes, and so does a
         // --console of whatever origin: only a run chooses that.
         let mut console = loaded.clone();
         console.push("--console=interactive".into());

@@ -1,5 +1,4 @@
-//! docker stats: the service hands out counters, the rates come from two samples a
-//! second apart, and the table is drawn again at every sample.
+//! docker stats: rates from two samples a second apart, the table redrawn at each.
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -11,7 +10,6 @@ use crate::cli::StatsArgs;
 use crate::client::{self, Client, Dict};
 use crate::output::{human_bytes, table};
 
-/// The counters of one sample.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Counters {
     name: String,
@@ -40,11 +38,10 @@ impl Counters {
     }
 }
 
-/// One line of the table.
 #[derive(Debug, Clone, PartialEq)]
 struct Row {
     name: String,
-    /// Of one CPU, as docker counts it: 200 is two CPUs busy.
+    /// 100 per busy CPU, as docker counts it.
     cpu_percent: Option<f64>,
     memory: Option<u64>,
     memory_limit: Option<u64>,
@@ -54,8 +51,7 @@ struct Row {
     pids: Option<u64>,
 }
 
-/// The rates between two samples of a machine; without an earlier one the CPU is
-/// unknown.
+/// The rates between two samples; the CPU is unknown without an earlier one.
 fn row(prev: Option<&Counters>, cur: &Counters) -> Row {
     let cpu_percent = prev.and_then(|prev| {
         let used = cur.cpu_usec?.checked_sub(prev.cpu_usec?)?;
@@ -143,7 +139,6 @@ pub async fn stats(args: StatsArgs, client: &Client) -> Result<()> {
             }
         } else {
             if terminal && !args.no_stream {
-                // Drawn over the last one, like docker stats.
                 print!("\x1b[2J\x1b[H");
             }
             println!(

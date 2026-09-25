@@ -1,7 +1,6 @@
-//! docker stats: what running machines consume. Everything comes from the cgroup of the
-//! machine's unit, which holds systemd-nspawn and the whole machine, and for the network
-//! from the machine's own view of its interfaces. The service hands out raw counters;
-//! rates are the caller's business, from two samples.
+//! docker stats: counters from the cgroup of each machine's unit (systemd-nspawn and the
+//! whole machine) and from its interfaces as the machine sees them. Rates are the
+//! caller's, from two samples.
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -14,29 +13,27 @@ use crate::api::machines::refuse_foreign;
 use crate::api::Context;
 use crate::reference::validate_entry_name;
 
-/// One reading of a machine's counters; what could not be read is None.
+/// One reading; None where a file could not be read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Sample {
     pub name: String,
     /// CLOCK_MONOTONIC when it was taken, in microseconds.
     pub time_usec: u64,
-    /// CPU time used so far.
     pub cpu_usec: Option<u64>,
-    /// Memory in use, the page cache the kernel may drop left out, as docker counts it.
+    /// Without the reclaimable page cache, as docker counts it.
     pub memory: Option<u64>,
-    /// The machine's memory limit, or the host's memory without one.
+    /// The limit, or the host's memory without one.
     pub memory_limit: Option<u64>,
     pub pids: Option<u64>,
     pub io_read: Option<u64>,
     pub io_write: Option<u64>,
-    /// Bytes through the machine's interfaces but loopback; None on the host's network.
+    /// All interfaces but loopback; None on the host's network.
     pub net_rx: Option<u64>,
     pub net_tx: Option<u64>,
 }
 
-/// One sample of each named machine that runs, or of every running container when no
-/// name is given. Names that do not run are left out: the caller tells whether that is
-/// an error.
+/// One sample of each named machine (every running container without names). Machines
+/// that do not run are left out; the caller decides whether that is an error.
 pub async fn sample(ctx: &Context, names: &[String]) -> Result<Vec<Sample>> {
     let sd = ctx.sd().await?;
     let names: Vec<String> = if names.is_empty() {
@@ -54,7 +51,7 @@ pub async fn sample(ctx: &Context, names: &[String]) -> Result<Vec<Sample>> {
     };
     let mut samples = Vec::new();
     for name in names {
-        // A machine may end between the listing and the reading: it is then left out.
+        // It may have ended since the listing.
         let Ok(unit) = sd.machine_unit(&name).await else {
             continue;
         };
@@ -114,18 +111,16 @@ fn own_network(leader: u32) -> bool {
     }
 }
 
-/// usage_usec of cpu.stat.
 fn cpu_usec(cpu_stat: &str) -> Option<u64> {
     field(cpu_stat, "usage_usec")
 }
 
-/// memory.current less inactive_file of memory.stat, what docker shows on cgroup v2.
+/// memory.current less inactive_file, as docker shows it on cgroup v2.
 fn memory_used(current: &str, stat: &str) -> Option<u64> {
     let current: u64 = current.trim().parse().ok()?;
     Some(current.saturating_sub(field(stat, "inactive_file").unwrap_or(0)))
 }
 
-/// memory.max, or MemTotal of /proc/meminfo when it says "max".
 fn memory_limit(max: &str, meminfo: &str) -> Option<u64> {
     match max.trim() {
         "max" => meminfo
@@ -138,7 +133,6 @@ fn memory_limit(max: &str, meminfo: &str) -> Option<u64> {
     }
 }
 
-/// Bytes read and written, over every device of io.stat.
 fn io_bytes(io_stat: &str) -> (u64, u64) {
     let mut read = 0;
     let mut written = 0;
@@ -154,7 +148,6 @@ fn io_bytes(io_stat: &str) -> (u64, u64) {
     (read, written)
 }
 
-/// Bytes received and sent over every interface of a /proc/PID/net/dev but loopback.
 fn net_bytes(net_dev: &str) -> (u64, u64) {
     let mut rx = 0;
     let mut tx = 0;
@@ -175,7 +168,7 @@ fn net_bytes(net_dev: &str) -> (u64, u64) {
     (rx, tx)
 }
 
-/// The number after `key` on its line of a flat keyed cgroup file.
+/// The value of `key` in a flat keyed cgroup file.
 fn field(text: &str, key: &str) -> Option<u64> {
     text.lines().find_map(|line| {
         let (k, v) = line.split_once(' ')?;

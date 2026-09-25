@@ -1,4 +1,4 @@
-//! Machines: what runs, and how one is started, stopped, entered and read.
+//! Machines: listing, start, stop, kill, update, exec and logs.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -21,8 +21,7 @@ use crate::store::{now_unix, ImageRecord, Store};
 use crate::systemd::{Systemd, UnitState};
 use crate::volume;
 
-/// One machine as `ps` shows it: machined's state plus nspawn's record when it installed
-/// the image.
+/// A machine as `ps` shows it: machined's state and nspawn's record when there is one.
 #[derive(Debug, Clone)]
 pub struct MachineSummary {
     pub name: String,
@@ -31,14 +30,14 @@ pub struct MachineSummary {
     pub state: String,
     /// Unix seconds, for running machines.
     pub started: Option<u64>,
-    /// PID of the machine's init as seen from the host.
+    /// The machine's init, as the host sees it.
     pub leader: Option<u32>,
     /// PRETTY_NAME of the machine's os-release.
     pub os: Option<String>,
 }
 
-/// Refuses a name machined lists but that is not a container: libvirt's virtual
-/// machines are registered there too, and nspawn can neither enter nor stop them.
+/// Refuses machined's non-containers (libvirt's virtual machines), which nspawn can neither
+/// enter nor stop.
 pub async fn refuse_foreign(sd: &Systemd, name: &str) -> Result<()> {
     if let Some(runner) = sd.foreign_machine(name).await? {
         bail!("{name} is a machine of {runner}, not a container; nspawn manages systemd-nspawn machines only");
@@ -46,8 +45,6 @@ pub async fn refuse_foreign(sd: &Systemd, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// One machine or image by name, as `list` shows it: machined's view when it runs, the
-/// record as stopped otherwise.
 pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
     validate_entry_name(name)?;
     let sd = ctx.sd().await?;
@@ -87,8 +84,7 @@ pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
     }
 }
 
-/// The machines machined knows, and with `all` also the images of nspawn that are not
-/// running, as stopped.
+/// With `all`, nspawn's machines that do not run too.
 pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
     let sd = ctx.sd().await?;
     let records: HashMap<String, ImageRecord> = ctx
@@ -119,9 +115,8 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
             os: sd.machine_os(&m.name).await,
         });
     }
-    // Records that machined does not list: stopped, or between two runs of a restart
-    // policy, which ps shows without -a like docker ps. A machine only starting or
-    // closing is left to -a: without it ps lists what runs.
+    // Records machined does not list. Those between two runs of a restart policy show
+    // without -a, as in docker ps; starting, closing and stopped ones only with -a.
     let running: std::collections::HashSet<&str> =
         machines.iter().map(|m| m.name.as_str()).collect();
     let mut others: Vec<&ImageRecord> = records
@@ -154,14 +149,12 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
     Ok(summaries)
 }
 
-/// Whether ps shows a machine machined does not list, by the word `unit_word` has for it.
 fn listed(all: bool, state: &str) -> bool {
     all || state == "restarting"
 }
 
-/// How ps names a machine machined does not list, from its unit's state. systemd-nspawn
-/// registers the machine before it tells systemd it is ready, so a unit that is active
-/// without a machine is one whose machine has just ended.
+/// ps's state for a machine machined does not list. systemd-nspawn registers the machine
+/// before it is ready, so an active unit without a machine is one whose machine ended.
 pub fn unit_word(state: &UnitState) -> &'static str {
     if state.restarting() {
         "restarting"
@@ -174,9 +167,8 @@ pub fn unit_word(state: &UnitState) -> &'static str {
     }
 }
 
-/// Why a machine that machined does not list cannot be removed or replaced: its unit is
-/// still up, starting, or waiting to restart it. Removing its record then would leave a
-/// unit restarting forever with nothing to start.
+/// Why a machine machined does not list cannot be removed or replaced yet: its unit is up
+/// or restarting, and would go on restarting with nothing to start.
 pub async fn unit_busy(sd: &Systemd, name: &str) -> Result<Option<String>> {
     let state = sd
         .unit_status(&format!("systemd-nspawn@{name}.service"))
@@ -194,9 +186,8 @@ pub async fn unit_busy(sd: &Systemd, name: &str) -> Result<Option<String>> {
     })
 }
 
-/// Everything a machine needs before its unit starts: checks, address and files on the
-/// bridge, settings, unit hooks. Shared by `start` and the ExecStartPre hook, so it is
-/// idempotent. The caller holds the store lock. Returns the network the machine uses.
+/// Everything a machine needs before its unit starts. Shared by `start` and the
+/// ExecStartPre hook, so idempotent; the caller holds the store lock.
 pub async fn prepare(
     sd: &Systemd,
     store: &Store,
@@ -206,11 +197,11 @@ pub async fn prepare(
     report: Report<'_>,
 ) -> Result<Network> {
     let Some(mut record) = record else {
-        // Not ours: the stock systemd-nspawn@.service template uses --network-veth.
+        // Not ours: the stock template uses --network-veth.
         hostnet::ensure_networkd(sd, report).await?;
         return Ok(Network::Veth);
     };
-    // A new run: what `kill` asked of the last one is over.
+    // A new run: the marks `kill` and `stop` left for the last one go.
     store.take_exit_on_next(name)?;
     store.forget_signal(name)?;
     if record.network == Network::Bridge
@@ -240,7 +231,6 @@ pub async fn prepare(
         }
         bridge::up(&net, &all, sd, report).await?;
         bridge::check_port_conflicts(store, sd, &record).await?;
-        // Only now, past the checks, does the record keep what it was given.
         store.record_image(&record)?;
         let addr = bridge::prepare_machine(store, config, &net, &all, &mut record)?;
         if record.mode == Mode::App {
@@ -251,9 +241,8 @@ pub async fn prepare(
         store.record_image(&record)?;
         None
     };
-    // Named volumes live under the state directory and are created on first use; a
-    // host path has to exist, as with podman (the service cannot make directories
-    // anywhere on the host, nor should it).
+    // Named volumes are made on first use; a host path must exist, as with podman: the
+    // service does not make directories anywhere on the host.
     let mut binds = Vec::new();
     for volume in &record.volumes {
         let source = volume.host_path(&store.volumes_dir());
@@ -274,8 +263,6 @@ pub async fn prepare(
             read_only: volume.read_only,
         });
     }
-    // Every booted machine with volumes waits for them before local-fs.target through the
-    // units mounted here (mstack machines get them from the host after their init started).
     let managed_userns = record.backend == BackendChoice::Mstack;
     let volume_units = if record.mode == Mode::Boot && !binds.is_empty() {
         let dir = store.machine_files_dir(name).join("units");
@@ -293,8 +280,6 @@ pub async fn prepare(
     } else {
         None
     };
-    // The settings file is regenerated every time: it carries the command and comes back
-    // if it went missing.
     let route = settings::namespace_route(sd, name, record.mode, record.network).await?;
     settings::write(
         &MachineSettings {
@@ -327,8 +312,7 @@ pub async fn prepare(
         sd.reload().await?;
     }
     if record.backend == BackendChoice::Mstack {
-        // Managed user namespaces come from socket activated services that
-        // distributions ship disabled.
+        // Socket-activated services that distributions ship disabled.
         for unit in MANAGED_NS_SOCKETS {
             sd.start_unit(unit).await?;
         }
@@ -339,25 +323,25 @@ pub async fn prepare(
     Ok(record.network)
 }
 
-/// What `start` may be asked for. Everything but the name is remembered for the image.
+/// Everything but the name is remembered.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StartRequest {
     pub name: String,
     /// Wait for a booted machine's init to be up before returning.
     pub wait: bool,
-    /// bridge, veth, host or the name of a network made with `network create`.
+    /// bridge, veth, host or a network's name.
     pub network: Option<String>,
     /// HOST:CONTAINER[/udp]; "none" forgets them all.
     pub publish: Vec<String>,
-    /// Replaces the image's entrypoint; an empty string runs the arguments alone.
+    /// An empty string runs the arguments alone.
     pub entrypoint: Option<String>,
     /// VAR=value or VAR; "none" forgets them.
     pub env: Vec<String>,
     /// SOURCE:TARGET[:ro]; "none" forgets them.
     pub volume: Vec<String>,
-    /// KEY=VALUE labels on top of the image's; "none" forgets them.
+    /// On top of the image's; "none" forgets them.
     pub label: Vec<String>,
-    /// docker's --restart; None keeps the remembered one.
+    /// None keeps the remembered one.
     pub restart: Option<Restart>,
     /// Bytes, 0 for none; None keeps the remembered limit.
     pub memory: Option<u64>,
@@ -365,21 +349,20 @@ pub struct StartRequest {
     pub cpus: Option<f64>,
     /// Processes, 0 for none; None keeps the remembered limit.
     pub pids_limit: Option<u64>,
-    /// Forget the remembered entrypoint and arguments and run the image's own again.
     pub image_command: bool,
-    /// App images: replaces the image's cmd and follows its entrypoint.
+    /// Replaces an app image's cmd.
     pub command: Vec<String>,
-    /// run --rm: remove the machine once this run ends.
+    /// run --rm.
     pub remove: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartOutcome {
-    /// The machine is registered (and, when asked, its init is up).
+    /// Registered (and, when asked, its init is up).
     Started,
-    /// A short program ran and returned before the machine registered.
+    /// A short program returned before the machine registered.
     Ended,
-    /// Its program ended right away and its restart policy is bringing it back.
+    /// It ended right away and its restart policy brings it back.
     Restarting,
 }
 
@@ -399,9 +382,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     let mode = store.load_image(&args.name)?.map(|r| r.mode);
     wait_for_previous(sd, &args.name, &unit, mode).await?;
     let lock = store.lock().await?;
-    // Under the lock, what wait_for_previous saw may have changed: another start may be
-    // preparing this machine (its files and network namespace would be redone under it),
-    // or it may be up already.
+    // Again under the lock: another start may be preparing it, or it may be up by now.
     if store.is_starting(&args.name) {
         bail!("machine {} is starting already", args.name);
     }
@@ -457,7 +438,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             }
             apply_limits(&mut r.limits, args.memory, args.cpus, args.pids_limit)?;
             r.limits.check(r.mode)?;
-            // Each start says it anew, so that a machine kept once is not removed later.
+            // Set on every start, so that a start without --rm keeps the machine.
             if args.remove && r.restart != Restart::No {
                 bail!("--rm and a restart policy exclude each other: a machine removed when it ends cannot be restarted (--restart no)");
             }
@@ -495,9 +476,9 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     let network = prepare(sd, store, config, &args.name, record, report).await?;
     // The unit's own hooks take the lock; it must be free while the unit starts.
     drop(lock);
-    // always and unless-stopped start the machine at boot too, as machinectl enable
-    // would. A unit is only disabled when its policy was changed away from those, so
-    // that one an administrator enabled by hand stays enabled.
+    // always and unless-stopped enable the unit, as machinectl enable does. It is only
+    // disabled when the policy changes away from those, so that a unit an administrator
+    // enabled stays enabled.
     if let Some(policy) = policy {
         let changed = if policy.enabled_at_boot() {
             sd.enable_unit(&unit).await?
@@ -510,8 +491,8 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             sd.reload().await?;
         }
     }
-    // firewalld only knows a veth once the machine is registered; published ports need
-    // the machine to count as running.
+    // firewalld only knows a veth once the machine is registered, and published ports
+    // need it registered too.
     let firewalld = network == Network::Veth && hostnet::firewalld_running(sd).await;
     if sd.start_machine(&args.name).await? {
         return Ok(StartOutcome::Restarting);
@@ -520,7 +501,6 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
         let unit = format!("systemd-nspawn@{}.service", args.name);
         let deadline = Instant::now() + Duration::from_secs(30);
         while !sd.machine_exists(&args.name).await? {
-            // A short program may have run and returned already: not a failure.
             let state = sd.unit_status(&unit).await?;
             if state.restarting() {
                 return Ok(StartOutcome::Restarting);
@@ -555,7 +535,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     Ok(StartOutcome::Started)
 }
 
-/// Sets the limits given on this call (0 removes one), keeping the others.
+/// 0 removes a limit; None keeps it.
 fn apply_limits(
     limits: &mut Limits,
     memory: Option<u64>,
@@ -574,14 +554,12 @@ fn apply_limits(
     Ok(())
 }
 
-/// Registration comes early in a booted machine's life; a command run right after `start`
-/// would find no service manager to talk to. Wait, within reason, until the machine's
-/// systemd listens on its private socket.
+/// Registration comes early in a boot: waits, within reason, until the machine's systemd
+/// listens, so that a command run right after `start` finds it.
 async fn wait_for_init(sd: &Systemd, name: &str) -> Result<StartOutcome> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let Ok(leader) = sd.machine_leader(name).await else {
-            // Gone while booting: say so instead of "started".
             let state = sd
                 .unit_status(&format!("systemd-nspawn@{name}.service"))
                 .await?;
@@ -602,13 +580,10 @@ async fn wait_for_init(sd: &Systemd, name: &str) -> Result<StartOutcome> {
     }
 }
 
-/// What must go when a machine is gone, however it went: its network namespace and its
-/// published ports. Safe to repeat.
+/// The network namespace and published ports of a machine that ended. Safe to repeat.
 pub fn release_machine(name: &str, record: Option<&ImageRecord>) -> Result<()> {
     if record.map(|r| r.network) == Some(Network::Bridge) {
         bridge::delete_netns(name);
-        // Only this machine's entries: release runs without the store lock, next to
-        // another machine's publish.
         record.map(bridge::withdraw_ports).transpose()?;
     }
     Ok(())
@@ -617,35 +592,31 @@ pub fn release_machine(name: &str, record: Option<&ImageRecord>) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopRequest {
     pub name: String,
-    /// SIGKILL right away, like docker kill.
     pub force: bool,
-    /// Wait until the machine is gone; otherwise return after the stop request.
     pub wait: bool,
-    /// App images: seconds between the stop signal and SIGKILL.
+    /// Seconds between an app's stop signal and SIGKILL.
     pub timeout: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopOutcome {
     Stopped,
-    /// It had ended on its own or elsewhere; what it left behind is gone now.
+    /// It had ended already; what it left behind is gone now.
     WasNotRunning,
 }
 
-/// Where `stop` queues the unit's stop job, which is what keeps a restart policy from
-/// bringing the machine back.
+/// Where `stop` queues the unit's stop job, which keeps a restart policy from bringing the
+/// machine back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Latch {
-    /// No policy: nothing restarts it, stop as before.
+    /// No policy, nothing to keep from restarting.
     NotNeeded,
-    /// Before the first signal: a booted machine's init shuts down the same way either
-    /// way.
+    /// Before the first signal: a booted init shuts down the same way either way.
     BeforeSignal,
-    /// Right after the signal: SIGKILL with `--force` (a stop job first would have
-    /// machined refuse the kill of a machine it already closes), or an app's stop
-    /// signal, after its time to act on it when `wait`, so that the stub init does not
-    /// add SIGTERM and SIGHUP while the program handles its own. Should the machine end
-    /// in between, the stop job also cancels the restart systemd has scheduled.
+    /// After the signal: SIGKILL with `--force` (machined refuses to kill a machine it
+    /// already closes), or an app's stop signal, after its timeout when waiting (a stop
+    /// job would have the stub init add SIGTERM and SIGHUP meanwhile). The stop job also
+    /// cancels a restart already scheduled.
     AfterSignal,
 }
 
@@ -659,14 +630,14 @@ pub fn latch(restart: Restart, force: bool, mode: Option<Mode>) -> Latch {
     }
 }
 
-/// Whether `stop` has something to do for a machine machined does not list: nspawn's
-/// own leaves files and a network behind, anybody's unit may be restarting it.
+/// For a machine machined does not list: nspawn's leaves files and a network behind, and
+/// anybody's unit may be restarting.
 fn stoppable_when_gone(recorded: bool, unit: &UnitState) -> bool {
     recorded || unit.busy()
 }
 
-/// Whether `stop --force` queues the unit's stop job right after its SIGKILL: for the
-/// latch, and whenever the kill failed, since the job is then what makes the machine go.
+/// After SIGKILL the stop job goes in for the latch, and whenever the kill failed, since
+/// the job is then what makes the machine go.
 fn stop_job_after_kill(latch: Latch, killed: bool) -> bool {
     latch == Latch::AfterSignal || !killed
 }
@@ -684,16 +655,13 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         sd.reload().await?;
     }
     if !sd.machine_exists(&args.name).await? {
-        // A start of nspawn's is preparing it: releasing its network now would pull it
-        // from under that start.
+        // A start is preparing it: its network must not be released under it.
         if store.is_starting(&args.name) {
             bail!("machine {} is starting; stop it once it runs", args.name);
         }
-        // It ended on its own or elsewhere, or it is between two runs of its restart
-        // policy (nspawn's, or an administrator's Restart= on a machine that is not
-        // nspawn's); leave nothing of it behind, like docker stop on a stopped container.
-        // The stop job ends a pending restart, and it completes once the release hook of
-        // the last run is done, so nothing is released beside it.
+        // Ended, or between two runs of a restart policy (nspawn's or an administrator's):
+        // the stop job ends a pending restart and completes once the last release hook
+        // is done, so nothing is released beside it.
         let state = sd.unit_status(&unit).await?;
         if !stoppable_when_gone(record.is_some(), &state) {
             bail!("machine {} is not running", args.name);
@@ -721,12 +689,9 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         job = Some(sd.stop_unit_job(&unit).await?);
     }
     if args.force {
-        // docker kill: no questions asked. systemd 255 answers "Invalid argument" when it
-        // cannot signal some process of the unit although the machine got its SIGKILL,
-        // and machined may keep it listed for a while: the stop job goes in whatever the
-        // answer, so that a restart policy does not bring it back meanwhile, and what
-        // counts is that the machine goes (awaited below when `wait`). When the kill
-        // failed, the stop job is also what makes the machine go, `--no-wait` or not.
+        // systemd 255 answers "Invalid argument" when some process of the unit cannot be
+        // signalled although the machine got its SIGKILL, so the answer decides nothing:
+        // the stop job goes in either way, and what counts is that the machine goes.
         if record.is_some() {
             store.mark_signal(&args.name, libc::SIGKILL)?;
         }
@@ -742,7 +707,7 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         }
     } else {
         match mode {
-            // Like docker stop: the image's stop signal to every process, then the hammer.
+            // docker stop: the image's stop signal, then SIGKILL after the timeout.
             Some(Mode::App) => {
                 let signal = record
                     .as_ref()
@@ -814,8 +779,8 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
                 args.name
             );
         }
-        // Let the service finish its own teardown so that the image can be removed right
-        // away, and clear the failure a signal-killed program leaves on the unit.
+        // The unit's teardown finishes, so that the image can be removed right away, and
+        // the failure a killed program leaves on the unit is cleared.
         match job {
             Some(job) => job.wait().await?,
             None => sd.stop_unit(&unit).await?,
@@ -828,10 +793,9 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
     Ok(StopOutcome::Stopped)
 }
 
-/// The program an app machine runs, to be signalled itself (PID 2, the stub init's
-/// child), never the whole cgroup: systemd-nspawn and its stub react to signals in their
-/// own ways (the stub reboots the machine on SIGINT, nspawn dies of SIGQUIT). Right after
-/// start the stub init may not have forked it yet. Returns the leader too.
+/// An app's program (PID 2), which signals go to, never the whole cgroup: the stub init
+/// reboots on SIGINT and systemd-nspawn dies of SIGQUIT. Waits a moment for the stub to
+/// fork it. Returns the leader too.
 async fn wait_for_payload(sd: &Systemd, name: &str) -> Result<(u32, Option<i32>)> {
     let leader = sd.machine_leader(name).await?;
     let mut payload = payload_pid(leader);
@@ -846,15 +810,12 @@ async fn wait_for_payload(sd: &Systemd, name: &str) -> Result<(u32, Option<i32>)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KillRequest {
     pub name: String,
-    /// A name or number as `signal_number` reads it.
     pub signal: String,
 }
 
-/// docker kill. SIGKILL is `stop --force`: the machine goes and stays gone. Any other
-/// signal goes to what the machine runs, an app's program or a booted machine's init,
-/// and the machine lives on unless the signal ends it, in which case its restart policy
-/// applies, as with docker. Docker's exception holds too: the machine's own stop signal
-/// ends it for good, through the mark the release hook reads.
+/// docker kill. SIGKILL is `stop --force`. Other signals go to an app's program or a
+/// booted machine's init, and a machine they end is restarted by its policy, unless it
+/// was its stop signal (docker's rule, through the mark the release hook reads).
 pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Result<()> {
     validate_entry_name(&args.name)?;
     let signal = signal_number(&args.signal)?;
@@ -862,8 +823,7 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
     refuse_foreign(sd, &args.name).await?;
     let unit = format!("systemd-nspawn@{}.service", args.name);
     let registered = sd.machine_exists(&args.name).await?;
-    // Between two runs of its restart policy there is nothing to signal, but SIGKILL still
-    // ends it, as docker kill ends a restarting container.
+    // Between two runs of a restart policy only SIGKILL means something: it ends it.
     if !registered && !(signal == libc::SIGKILL && sd.unit_status(&unit).await?.restarting()) {
         bail!("machine {} is not running", args.name);
     }
@@ -884,7 +844,7 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
     if policy != Restart::No && stop_signals(record.as_ref())?.contains(&signal) {
         ctx.store.mark_exit_on_next(&args.name)?;
     }
-    // Only nspawn's machines keep marks; a machine of machinectl has no place for them.
+    // Only nspawn's machines have a place for marks.
     if record.is_some() {
         ctx.store.mark_signal(&args.name, signal)?;
     }
@@ -911,8 +871,7 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
     Ok(())
 }
 
-/// What `update` may change, docker update's subset that nspawn has: None keeps the
-/// remembered value.
+/// None keeps the remembered value.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UpdateRequest {
     pub name: String,
@@ -925,10 +884,9 @@ pub struct UpdateRequest {
     pub pids_limit: Option<u64>,
 }
 
-/// docker update: the record and the hooks drop-in get the new policy and limits. The
-/// reload that follows is what a running machine needs too: systemd applies a unit's
-/// changed limits to its cgroup at a daemon-reload, and reads Restart= again for its
-/// next ending. Returns whether it was running.
+/// docker update, through the record and the drop-in: at the reload systemd applies a
+/// running unit's new limits to its cgroup, and reads Restart= again. Returns whether it
+/// was running.
 pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     validate_entry_name(&args.name)?;
     if args.restart.is_none()
@@ -950,8 +908,7 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     })?;
     let unit = format!("systemd-nspawn@{}.service", args.name);
     let state = sd.unit_status(&unit).await?;
-    // Between states the unit's settings are about to be read again: nothing to change
-    // under a start or a restart.
+    // A start or restart is about to read the unit's settings.
     if state.restarting() {
         bail!(
             "machine {} is restarting; update it once it runs, or stop it first",
@@ -986,7 +943,6 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
         record.remove_on_exit,
     )?;
     let running = state.active == "active";
-    // always and unless-stopped start the machine at boot, as with `start`.
     let changed = if record.restart.enabled_at_boot() {
         sd.enable_unit(&unit).await?
     } else if args.restart.is_some() && previous_policy.enabled_at_boot() {
@@ -1001,8 +957,8 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     Ok(running)
 }
 
-/// The signals that ask a machine to end: an app's stop signal (SIGTERM unless its image
-/// names another), a booted machine's halt and poweroff requests to its init.
+/// An app's stop signal (SIGTERM unless its image names one), or a booted init's halt and
+/// poweroff requests.
 fn stop_signals(record: Option<&ImageRecord>) -> Result<Vec<i32>> {
     match record {
         Some(r) if r.mode == Mode::App => Ok(vec![signal_number(
@@ -1012,11 +968,9 @@ fn stop_signals(record: Option<&ImageRecord>) -> Result<Vec<i32>> {
     }
 }
 
-/// Waits, within reason, until nothing of a previous instance stands in the way of a new
-/// start: the unit still up with its program gone (nspawn shutting down), the machine
-/// not yet dropped by machined, or the release hook running while the unit deactivates,
-/// which would undo what the start prepares. A machine that is really running, or one
-/// starting elsewhere, is an error.
+/// Waits, within reason, until nothing of the previous run is left: a unit shutting
+/// down, a machine machined still lists, a release hook that would undo what the start
+/// prepares. A machine that really runs, or starts elsewhere, is an error.
 async fn wait_for_previous(sd: &Systemd, name: &str, unit: &str, mode: Option<Mode>) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -1033,10 +987,7 @@ async fn wait_for_previous(sd: &Systemd, name: &str, unit: &str, mode: Option<Mo
                 }
                 bail!("machine {name} is already running");
             }
-            // Up but not registered yet, or registered with nothing running inside, or
-            // on its way down: the next poll tells more.
             "active" | "activating" | "reloading" | "deactivating" => {}
-            // Down, but machined has yet to drop it.
             _ if registered => {}
             _ => return Ok(()),
         }
@@ -1047,8 +998,7 @@ async fn wait_for_previous(sd: &Systemd, name: &str, unit: &str, mode: Option<Mo
     }
 }
 
-/// Whether a registered machine still has something running: its leader, and for an app
-/// the program under the stub init (the leader outlives it for a moment).
+/// The leader, and for an app its program: the leader outlives it for a moment.
 async fn machine_alive(sd: &Systemd, name: &str, mode: Option<Mode>) -> bool {
     let Ok(leader) = sd.machine_leader(name).await else {
         return false;
@@ -1059,10 +1009,8 @@ async fn machine_alive(sd: &Systemd, name: &str, mode: Option<Mode>) -> bool {
     mode != Some(Mode::App) || payload_pid(leader).is_some()
 }
 
-/// Asks a booted machine to power off and waits until it is gone, repeating the request
-/// every couple of seconds: right after `start` the machine's init may not have installed
-/// its signal handlers yet, and the kernel silently drops signals that PID 1 of a PID
-/// namespace does not handle.
+/// Repeats the poweroff request every couple of seconds: right after a start the init may
+/// have no handler yet, and the kernel drops what PID 1 of a namespace does not handle.
 async fn poweroff_until_gone(sd: &Systemd, name: &str, timeout: Duration) -> Result<bool> {
     let deadline = Instant::now() + timeout;
     if sd.poweroff_machine(name).await.is_err() && !sd.machine_exists(name).await? {
@@ -1074,7 +1022,6 @@ async fn poweroff_until_gone(sd: &Systemd, name: &str, timeout: Duration) -> Res
             return Ok(false);
         }
         if requested.elapsed() > Duration::from_secs(2) {
-            // The machine may vanish between the check and the signal; that is success.
             let _ = sd.poweroff_machine(name).await;
             requested = Instant::now();
         }
@@ -1132,8 +1079,6 @@ fn signal_number(name: &str) -> Result<i32> {
     Ok(signal as i32)
 }
 
-/// Sends `signal` to the program of an app machine, waiting a moment for the stub init
-/// to have started it.
 pub async fn signal_program(sd: &Systemd, name: &str, signal: i32) -> Result<()> {
     let (leader, payload) = wait_for_payload(sd, name).await?;
     let payload = payload.with_context(|| {
@@ -1143,9 +1088,8 @@ pub async fn signal_program(sd: &Systemd, name: &str, signal: i32) -> Result<()>
         .with_context(|| format!("sending signal {signal} to PID {payload} of {name}"))
 }
 
-/// The program an app machine runs: the child of its stub init (the leader). The kernel's
-/// children list gives it directly when available; otherwise the oldest child by start
-/// time, since anything re-parented to the stub came later.
+/// The stub init's child: from the kernel's children list, or else the oldest child by
+/// start time, since anything re-parented to the stub came later.
 fn payload_pid(leader: u32) -> Option<i32> {
     if let Ok(children) = std::fs::read_to_string(format!("/proc/{leader}/task/{leader}/children"))
     {
@@ -1178,8 +1122,8 @@ fn payload_pid(leader: u32) -> Option<i32> {
     oldest.map(|(_, pid)| pid)
 }
 
-/// Parent PID and start time from a /proc/PID/stat line, whose comm may contain spaces
-/// and parentheses: "pid (comm) state ppid ... starttime" (field 22).
+/// Parent PID and start time (field 22) of a /proc/PID/stat line, whose comm may hold
+/// spaces and parentheses.
 fn stat_ppid_and_start(stat: &str) -> Option<(u32, u64)> {
     let rest = &stat[stat.rfind(')')? + 1..];
     let fields: Vec<&str> = rest.split_whitespace().collect();
@@ -1187,14 +1131,13 @@ fn stat_ppid_and_start(stat: &str) -> Option<(u32, u64)> {
     Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
 }
 
-/// kill(2) with a raw number: nix's Signal enum stops at the standard signals and images
-/// may ask for realtime ones (SIGRTMIN+3 is common for systemd-based images).
+/// kill(2) with a raw number: nix's Signal has no realtime signals, which images use.
 fn send_signal(pid: i32, signal: i32) -> nix::Result<()> {
     nix::errno::Errno::result(unsafe { libc::kill(pid, signal) }).map(drop)
 }
 
-/// Starts a command inside a machine without waiting for it: what the bus service hands
-/// out with its streams. `extra_env` comes after the image's and the remembered one.
+/// Starts a command inside a machine without waiting for it. `extra_env` comes after the
+/// image's and the remembered one.
 pub async fn spawn_in_namespaces(
     ctx: &Context,
     machine: &str,
@@ -1212,8 +1155,7 @@ pub async fn spawn_in_namespaces(
     let record = ctx.store.load_image(machine)?;
     let record = record.as_ref();
     let leader = sd.machine_leader(machine).await?;
-    // Held from before the machine names its leader again: from then on the PID cannot
-    // be another process's without the pidfd saying so.
+    // Held before the leader is checked again, so the PID cannot be reused unnoticed.
     let leader_fd = nsenter::pidfd_open(nix::unistd::Pid::from_raw(leader as i32))
         .with_context(|| format!("opening the leader of {machine}"))?;
     if sd.machine_leader(machine).await? != leader {
@@ -1235,9 +1177,8 @@ pub async fn spawn_in_namespaces(
     .with_context(|| format!("running a command inside {machine}"))
 }
 
-/// The login session machined offers for a booted machine: a PTY running `path` (the
-/// user's shell when empty) with `args` and `env`. A machine that has just been started
-/// has no D-Bus yet for a few seconds; OpenMachineShell is retried for a while.
+/// machined's login session on a booted machine (`path` empty for the user's shell). A
+/// machine just started has no D-Bus for a few seconds, so it is retried for a while.
 pub async fn open_shell(
     ctx: &Context,
     machine: &str,
@@ -1267,7 +1208,6 @@ pub async fn open_shell(
     }
 }
 
-/// What `logs` may be asked for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogsRequest {
     pub machine: String,
@@ -1277,22 +1217,18 @@ pub struct LogsRequest {
     /// journalctl --since syntax.
     pub since: Option<String>,
     pub timestamps: bool,
-    /// Also what systemd says about the unit, not only what the machine wrote.
+    /// Also systemd's messages about the unit.
     pub all: bool,
     /// Booted machines: the machine's own journal instead of its console output.
     pub inside: bool,
 }
 
-/// Lines shown before following when --lines is not given.
 const FOLLOW_TAIL: u32 = 10;
 
-/// docker logs: the machine's console output lives in the journal of its service (nspawn
-/// pipes the payload's stdout and stderr there); boot machines also have a journal of
-/// their own. journalctl is the journal's reader, so it does the work: these are its
-/// arguments. Everything the unit ever logged is shown, earlier runs included.
+/// journalctl's arguments for docker logs: the console output is in the unit's journal,
+/// earlier runs included; a booted machine also has a journal of its own.
 pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
-    // --all: a line with colours or a carriage return, which is most of what a console
-    // shows, would read "[N B blob data]" otherwise.
+    // --all: a line with colours or a CR would read "[N B blob data]" otherwise.
     let mut argv = vec![
         "--no-pager".to_string(),
         "--quiet".to_string(),
@@ -1306,7 +1242,6 @@ pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
         argv.push(format!("--unit=systemd-nspawn@{}.service", args.machine));
         argv.push(format!("--output={output}"));
         if !args.all {
-            // Only what the machine itself wrote, not systemd's messages about the unit.
             argv.push("_TRANSPORT=stdout".to_string());
         }
     }

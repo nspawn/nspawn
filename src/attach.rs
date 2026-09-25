@@ -1,11 +1,9 @@
-//! A terminal or an input for the program of an app machine, the way docker run -it
-//! gives one. systemd-nspawn only takes its console mode on the command line, and uses a
-//! terminal when its own standard input and output are one; the unit's stdio is fixed
-//! in its files. So the ExecStart of an app machine runs `nspawn attach-exec NAME --
-//! ARGV`: when an attached run of that machine is waiting, it receives the descriptors
-//! over a socket of the service and execs systemd-nspawn on them with the matching
-//! --console; when none is, it execs ARGV as it is. No drop-in, no reload and no path
-//! of a terminal is involved, so nothing is left that a later start could pick up.
+//! A terminal or an input for an app's program (run -i, -t). systemd-nspawn takes its
+//! console mode only on its command line, and the unit's stdio is fixed in its files, so
+//! an app machine's ExecStart is `nspawn attach-exec NAME -- ARGV`: when a run waits on
+//! the service's socket for that machine, it receives the descriptors there and execs
+//! ARGV on them with the matching --console; otherwise it execs ARGV as it is. Nothing is
+//! written to the unit, so no later start can pick up a stale terminal.
 
 use std::convert::Infallible;
 use std::ffi::OsString;
@@ -20,7 +18,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::nsenter;
 
-/// Where the service waits for the machine's systemd-nspawn, one socket per run.
+/// One socket per waiting run.
 pub const DIR: &str = "/run/nspawn/attach";
 
 pub fn socket_path(name: &str) -> PathBuf {
@@ -30,9 +28,9 @@ pub fn socket_path(name: &str) -> PathBuf {
 /// What a run hands over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    /// A pseudo terminal, for standard input and output; its TERM goes along.
+    /// A pseudo terminal for stdin and stdout, and its TERM.
     Tty { term: String },
-    /// The caller's standard input; the output stays the unit's (the journal).
+    /// The caller's stdin; the output stays in the journal.
     Stdin,
 }
 
@@ -56,7 +54,6 @@ impl Mode {
         }
     }
 
-    /// systemd-nspawn's --console for the mode.
     fn console(&self) -> &'static str {
         match self {
             Mode::Tty { .. } => "--console=interactive",
@@ -65,8 +62,7 @@ impl Mode {
     }
 }
 
-/// The ExecStart of an app machine: `argv` (systemd-nspawn and its options), with what a
-/// waiting run hands over when there is one.
+/// The ExecStart of an app machine.
 pub fn exec(name: &str, argv: &[OsString]) -> Result<Infallible> {
     let Some((program, rest)) = argv.split_first() else {
         bail!("attach-exec: nothing to run");
@@ -77,8 +73,8 @@ pub fn exec(name: &str, argv: &[OsString]) -> Result<Infallible> {
             nix::unistd::dup2_stdin(&fd).context("attaching standard input")?;
             if let Mode::Tty { term } = &mode {
                 nix::unistd::dup2_stdout(&fd).context("attaching standard output")?;
-                // systemd made the service a session leader: the terminal becomes its
-                // controlling one, and resizes reach systemd-nspawn as SIGWINCH.
+                // As the controlling terminal of the session systemd made, resizes reach
+                // systemd-nspawn as SIGWINCH.
                 let _ = nix::unistd::setsid();
                 if let Err(e) = nsenter::take_controlling_terminal(&fd) {
                     eprintln!("attach-exec: the terminal cannot be the controlling one: {e}");
@@ -86,18 +82,16 @@ pub fn exec(name: &str, argv: &[OsString]) -> Result<Infallible> {
                 command.env("TERM", term);
             }
             command.arg(mode.console());
-            // The run goes on once systemd-nspawn has its descriptors.
             stream.write_all(b"ok").context("answering the run")?;
         }
         Ok(None) => {}
-        // The run notices that nobody answered and says so; the machine starts anyway.
+        // The run notices that nothing arrived; the machine starts anyway.
         Err(e) => eprintln!("attach-exec: {e:#}"),
     }
     let error = command.args(rest).exec();
     bail!("running {}: {error}", program.to_string_lossy())
 }
 
-/// The descriptors of a run waiting for `name`, if one is.
 fn receive(name: &str) -> Result<Option<(Mode, OwnedFd, UnixStream)>> {
     let path = socket_path(name);
     if !path.exists() {
@@ -116,7 +110,7 @@ fn receive(name: &str) -> Result<Option<(Mode, OwnedFd, UnixStream)>> {
     Ok(Some((mode, fd, stream)))
 }
 
-/// The service's end: a socket for one run of one machine, removed when dropped.
+/// The service's end of one run's socket, removed when dropped.
 pub struct Listener {
     name: String,
     path: PathBuf,
@@ -141,9 +135,8 @@ impl Listener {
         })
     }
 
-    /// Hands `fd` to the machine's systemd-nspawn when it asks, within `timeout`, and
-    /// waits for it to take it. Only a root process in the machine's own unit is
-    /// answered.
+    /// Hands `fd` over when the machine's ExecStart asks, and waits for it to take it.
+    /// Only a root process in the machine's own unit is answered.
     pub async fn hand_over(&self, mode: &Mode, fd: &OwnedFd, timeout: Duration) -> Result<()> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -182,7 +175,7 @@ impl Drop for Listener {
     }
 }
 
-/// Whether a /proc/PID/cgroup names the unit of machine `name` (or a group below it).
+/// Whether a /proc/PID/cgroup is the unit of machine `name` or below it.
 fn in_machine_unit(cgroup: &str, name: &str) -> bool {
     let unit = format!("/systemd-nspawn@{name}.service");
     cgroup.lines().any(|line| {
@@ -193,7 +186,7 @@ fn in_machine_unit(cgroup: &str, name: &str) -> bool {
     })
 }
 
-/// Sockets left by a service that went away: no run waits on them any more.
+/// Removes the sockets a previous service left.
 pub fn sweep() {
     if let Ok(entries) = std::fs::read_dir(DIR) {
         for entry in entries.flatten() {

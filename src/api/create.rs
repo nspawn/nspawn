@@ -23,7 +23,7 @@ pub struct CreateRequest {
     /// Auto: like the source.
     pub backend: BackendChoice,
     /// None: like the source.
-    /// bridge, veth, host or the name of a network made with `network create`.
+    /// bridge, veth, host or a network's name.
     pub network: Option<String>,
     /// HOST:CONTAINER[/udp], like start -p.
     pub publish: Vec<String>,
@@ -161,10 +161,9 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         report,
     )
     .await?;
-    // The network kind is inherited; ports are not, two machines cannot publish the
-    // same, and neither is a network made with `network create`, which a machine joins
-    // when told to, as with docker (run makes its machine from any local image with the
-    // reference, whatever network that one was put on).
+    // The network kind is inherited; ports are not (two machines cannot publish the same
+    // one), nor a user-defined network, which a machine joins only when told to, as with
+    // docker.
     let mut record = store
         .load_image(&request.name)?
         .context("the record of the new machine is missing")?;

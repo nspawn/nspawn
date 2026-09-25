@@ -85,7 +85,7 @@ impl RunSpec {
         &self.entrypoint
     }
 
-    /// The image's own cmd (older records: the joined command).
+    /// The image's own cmd, or `command` in a config that has only that.
     pub fn cmd(&self) -> &[String] {
         if self.entrypoint.is_empty() && self.cmd.is_empty() {
             &self.command

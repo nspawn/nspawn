@@ -162,8 +162,6 @@ pub fn merge_env(base: &[String], extra: &[String]) -> Vec<String> {
     out
 }
 
-/// Parses the -e values: VAR=value as given, VAR alone copied from this environment.
-/// "none" alone clears the list; a later value of the same variable wins.
 /// Copies the value of every bare `VAR` from this process's environment, so that a
 /// caller's variables reach a service that has an environment of its own. `VAR=value`
 /// and "none" pass through as they are.
@@ -182,6 +180,8 @@ pub fn expand_env(values: &[String]) -> Result<Vec<String>> {
         .collect()
 }
 
+/// Parses the -e values: VAR=value as given, VAR alone copied from this environment.
+/// "none" alone clears the list; a later value of the same variable wins.
 pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
     if values.len() == 1 && values[0] == "none" {
         return Ok(Vec::new());

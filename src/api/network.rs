@@ -1,5 +1,5 @@
-//! The bridge networks: the default one and those made with `network create`, what is
-//! on them, and the hooks the machine units run around a start and a stop.
+//! The bridge networks (the default one and those of `network create`) and the hooks the
+//! machine units run around a start and a stop.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -26,7 +26,6 @@ pub struct BridgeInfo {
     pub host_name: String,
 }
 
-/// One machine on a network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkEntry {
     pub name: String,
@@ -35,7 +34,7 @@ pub struct NetworkEntry {
     pub running: bool,
 }
 
-/// A network as `network ls` shows it: what it is and the machines it has.
+/// A network and the machines that name it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkSummary {
     pub spec: NetSpec,
@@ -51,14 +50,13 @@ fn bridge_info(ctx: &Context) -> BridgeInfo {
     }
 }
 
-/// Every network: the default one first, then those made with `network create`.
+/// Every network, the default one first.
 pub fn all(store: &Store, config: &Config) -> Result<Vec<NetSpec>> {
     let mut out = vec![config.default_network()];
     out.extend(store.list_networks()?);
     Ok(out)
 }
 
-/// A network by name.
 pub fn find(store: &Store, config: &Config, name: &str) -> Result<NetSpec> {
     if name == DEFAULT_NETWORK {
         return Ok(config.default_network());
@@ -68,13 +66,11 @@ pub fn find(store: &Store, config: &Config, name: &str) -> Result<NetSpec> {
     })
 }
 
-/// The network of a machine on a bridge.
 pub fn of(store: &Store, config: &Config, record: &ImageRecord) -> Result<NetSpec> {
     find(store, config, bridge::network_of(record))
 }
 
-/// What `--network` names: one of the kinds, or a network made with `network create`,
-/// which is of the bridge kind.
+/// `--network`: a kind, or a user-defined network (of the bridge kind).
 pub fn choice(text: &str) -> Result<(Network, Option<String>)> {
     Ok(match text {
         DEFAULT_NETWORK => (Network::Bridge, None),
@@ -87,8 +83,7 @@ pub fn choice(text: &str) -> Result<(Network, Option<String>)> {
     })
 }
 
-/// Names of user-defined networks: letters, digits, '_' and '-', not one `--network`
-/// gives a meaning of its own.
+/// Letters, digits, '_' and '-', and none of the names `--network` reserves.
 pub fn validate_network_name(name: &str) -> Result<()> {
     if RESERVED_NETWORKS.contains(&name) {
         bail!("{name} is not a name a network can take: --network gives it a meaning of its own");
@@ -105,9 +100,8 @@ pub fn validate_network_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Brings up every network with its NAT and firewall exceptions (start does this for
-/// its machine's network on its own; here for boot-time setup and troubleshooting).
-/// Returns the default network and the names of all.
+/// Brings up every network, for boot-time setup and troubleshooting (start brings up its
+/// machine's own). Returns the default network and the names of all.
 pub async fn up(ctx: &Context, report: Report<'_>) -> Result<(BridgeInfo, Vec<String>)> {
     let sd = ctx.sd().await?;
     let store = &ctx.store;
@@ -120,7 +114,6 @@ pub async fn up(ctx: &Context, report: Report<'_>) -> Result<(BridgeInfo, Vec<St
     Ok((bridge_info(ctx), all.into_iter().map(|n| n.name).collect()))
 }
 
-/// The machines of one network, with their addresses and published ports.
 async fn entries(ctx: &Context, network: &str) -> Result<Vec<NetworkEntry>> {
     let sd = ctx.sd().await?;
     let mut entries = Vec::new();
@@ -138,13 +131,11 @@ async fn entries(ctx: &Context, network: &str) -> Result<Vec<NetworkEntry>> {
     Ok(entries)
 }
 
-/// The default network and the machines on it (the listing of 1.1, kept for its
-/// clients; `inspect` covers every network).
+/// The default network and its machines (ListNetwork).
 pub async fn list(ctx: &Context) -> Result<(BridgeInfo, Vec<NetworkEntry>)> {
     Ok((bridge_info(ctx), entries(ctx, DEFAULT_NETWORK).await?))
 }
 
-/// Every network with the machines it has, like docker network ls.
 pub fn list_networks(ctx: &Context) -> Result<Vec<NetworkSummary>> {
     let records = ctx.store.list_images()?;
     Ok(all(&ctx.store, &ctx.config)?
@@ -160,14 +151,13 @@ pub fn list_networks(ctx: &Context) -> Result<Vec<NetworkSummary>> {
         .collect())
 }
 
-/// One network and its machines, like docker network inspect.
 pub async fn inspect(ctx: &Context, name: &str) -> Result<(NetSpec, Vec<NetworkEntry>)> {
     let spec = find(&ctx.store, &ctx.config, name)?;
     Ok((spec, entries(ctx, name).await?))
 }
 
-/// docker network create: a bridge of its own with a subnet of its own (the next free
-/// /24 of network_pool unless one is given), brought up at once.
+/// docker network create: a bridge and a subnet of its own (the next free /24 of
+/// network_pool unless given), brought up at once.
 pub async fn create(
     ctx: &Context,
     name: &str,
@@ -223,7 +213,6 @@ pub async fn create(
     store.record_network(&spec)?;
     all.push(spec.clone());
     if let Err(e) = bridge::up(&spec, &all, sd, report).await {
-        // Nothing half made stays behind.
         all.pop();
         let _ = bridge::down(&spec, &all, sd).await;
         store.remove_network(name)?;
@@ -238,8 +227,8 @@ pub async fn create(
     Ok(spec)
 }
 
-/// docker network rm: a network no machine names goes with its bridge and rules. One
-/// that is in use, unknown or the default is refused and does not stop the others.
+/// docker network rm, bridge and rules included. A network in use, unknown or the default
+/// is refused without stopping the others.
 pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Result<Removal> {
     require_root("network rm")?;
     let sd = ctx.sd().await?;
@@ -286,7 +275,6 @@ async fn remove_one(
     store.remove_network(name)
 }
 
-/// The machines whose records name a network, sorted.
 fn users(records: &[ImageRecord], network: &str) -> Vec<String> {
     let mut users: Vec<String> = records
         .iter()
@@ -297,7 +285,6 @@ fn users(records: &[ImageRecord], network: &str) -> Vec<String> {
     users
 }
 
-/// docker network prune: every user-defined network no machine names.
 pub async fn prune(ctx: &Context, report: Report<'_>) -> Result<Vec<String>> {
     require_root("network prune")?;
     let unused: Vec<String> = {
@@ -316,8 +303,7 @@ pub async fn prune(ctx: &Context, report: Report<'_>) -> Result<Vec<String>> {
     Ok(removal.removed)
 }
 
-/// ExecStartPre of systemd-nspawn@NAME.service: the same preparation `start` does, so
-/// that machinectl, a boot-time enablement or a restart get their network too.
+/// ExecStartPre: what `start` prepares, so that machinectl, boot and restarts get it too.
 pub async fn prepare(ctx: &Context, name: &str) -> Result<()> {
     crate::reference::validate_entry_name(name)?;
     let sd = ctx.sd().await?;
@@ -329,16 +315,15 @@ pub async fn prepare(ctx: &Context, name: &str) -> Result<()> {
         .map(|_| ())
 }
 
-/// The hooks run under systemd: what the library remarks goes to the unit's journal.
 fn to_journal(event: Event) {
     if let Event::Line(text) | Event::Note(text) = event {
         eprintln!("{text}");
     }
 }
 
-/// ExecStartPost: the machine is registered, its ports can be published. Volumes of an
-/// mstack machine are attached first and without the store lock: the machine's boot is
-/// waiting for them, and a long pull or create must not hold them up.
+/// ExecStartPost: the machine is registered, its ports can be published. An mstack
+/// machine's volumes go first and without the store lock: its boot waits for them, and a
+/// long pull holding the lock must not hold them up.
 pub async fn publish(ctx: &Context, name: &str) -> Result<()> {
     let sd = ctx.sd().await?;
     let store = &ctx.store;
@@ -368,15 +353,14 @@ pub async fn publish(ctx: &Context, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// ExecStopPost: runs however the machine ended (stop, exit, crash, machinectl). No lock:
-/// it runs inside the stop job that `images rm` and friends wait for while holding it.
+/// ExecStopPost, however the machine ended. No lock: it runs inside the stop job that
+/// `images rm` waits for while holding it.
 pub async fn release(ctx: &Context, name: &str) -> Result<()> {
     crate::reference::validate_entry_name(name)?;
     let record = ctx.store.load_image(name)?;
     machines::release_machine(name, record.as_ref())?;
-    // `kill` sent the machine its stop signal: a stop job queued while the unit is still
-    // winding down is what keeps systemd from restarting it (it is not waited for, it
-    // ends after this hook). Best effort: at shutdown nothing restarts anyway.
+    // `kill` sent the stop signal: a stop job queued while the unit winds down keeps
+    // systemd from restarting it. Not waited for: it ends after this hook.
     if ctx.store.take_exit_on_next(name)? {
         if let Ok(sd) = ctx.sd().await {
             let unit = format!("systemd-nspawn@{name}.service");
@@ -385,9 +369,8 @@ pub async fn release(ctx: &Context, name: &str) -> Result<()> {
             }
         }
     }
-    // run --rm: the removal cannot happen here, inside the unit's own stop, so a unit of
-    // its own does it once this one is down. At shutdown that start is refused, and the
-    // service removes the machine when it next starts.
+    // run --rm: not from inside the unit's own stop; a transient unit does it once this
+    // one is down. At shutdown that is refused, and the service sweeps it up later.
     if record.as_ref().is_some_and(|r| r.remove_on_exit) {
         if let Err(e) = remove_later(ctx, name).await {
             eprintln!("warning: {e:#}; nspawn removes {name} when its service next starts");
@@ -419,9 +402,8 @@ async fn remove_later(ctx: &Context, name: &str) -> Result<()> {
     .await
 }
 
-/// run --rm, from the unit `release` starts: waits for the machine's unit to be down
-/// after the run `invocation`, then removes the machine, unless it was started again
-/// meanwhile or kept (started since without --rm).
+/// run --rm, from the transient unit: waits for the machine's unit to be down after run
+/// `invocation`, then removes it, unless it was started again or kept meanwhile.
 pub async fn remove_after_exit(ctx: &Context, name: &str, invocation: &str) -> Result<()> {
     crate::reference::validate_entry_name(name)?;
     let sd = ctx.sd().await?;
@@ -456,8 +438,8 @@ pub async fn remove_after_exit(ctx: &Context, name: &str, invocation: &str) -> R
     Ok(())
 }
 
-/// run --rm machines whose run ended while nothing could remove them (the host shut
-/// down, the removal unit was refused): removed now. One being started is left alone.
+/// Removes the run --rm machines that ended while nothing could remove them (at
+/// shutdown).
 pub async fn remove_ended(ctx: &Context) -> Result<()> {
     let sd = ctx.sd().await?;
     let ended: Vec<String> = {
@@ -560,13 +542,13 @@ mod tests {
         assert!(!hosts("web").contains(" db\n"), "db is on another network");
         assert!(!hosts("db").contains(" web\n"));
         assert!(hosts("db").contains("10.99.0.1 host.nspawn.internal\n"));
-        // What a 1.1 record reads as, and a round trip.
+        // A machine of the default network has no network_name, in memory or on disk.
         let loaded = store.load_image("db").unwrap().unwrap();
         assert_eq!(loaded.network_name, None);
         let text = std::fs::read_to_string(store.images_dir().join("db.json")).unwrap();
         assert!(
             !text.contains("network_name"),
-            "the default network writes what 1.1 wrote"
+            "the default network writes no network_name"
         );
         assert_eq!(
             store
