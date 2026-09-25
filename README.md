@@ -322,8 +322,9 @@ stream. See `docs/DBUS.md`.
 ## Requirements
 
 - A host with systemd-nspawn and systemd-machined 255 or newer (255, 259 and 261 are
-  tested; 252 cannot mount the generated files under `/run` of a machine), overlayfs for
-  the `overlay` backend and cgroup v2.
+  tested; 252 cannot mount the generated files under `/run` of a machine), Linux 6.5 or
+  newer with overlayfs for the `overlay` backend (its layers are mounted with
+  `lowerdir+=`) and cgroup v2.
 - The service on the system bus: a package installs it, `sudo nspawn daemon --install`
   does the same for a binary built by hand. It runs as root and does everything below
   `/var/lib/machines`, `/var/lib/nspawn`, `/etc/systemd` and `/etc/nspawn`; who may call
