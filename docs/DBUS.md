@@ -34,9 +34,10 @@ alone otherwise.
 
 Every user may call; who may do what is polkit's answer. The methods that
 only read (`ListImages`, `GetImage`, `ListMachines`, `GetMachine`,
-`ListNetwork`, `ListVolumes`) ask for
+`MachineStats`, `Events`, `ListNetworks`, `GetNetwork`, `ListNetwork`,
+`ListVolumes`) ask for
 `org.nspawn.inspect`, the rest for `org.nspawn.manage`, and both are for
-administrators by default, so `sudo nspawn ...` works as before and a
+administrators by default, so `sudo nspawn ...` works and a
 desktop or `pkttyagent` session is asked for a password. Root is allowed
 without asking, which is also how the service keeps working where polkit is
 not installed: there, nobody else can call it.
@@ -148,7 +149,7 @@ machine to be gone, which can take longer than a client's default timeout
 | `CreateNetwork(s name, a{sv} options) -> a{sv}` | `network create`: options subnet (CIDR; the next free /24 of network_pool otherwise), internal (b); the network as ListNetworks has it, plus `notes` |
 | `RemoveNetworks(as names) -> o` | `network rm`: a job (kind network-rm); a network in use, unknown or the default one is refused without stopping the others; result `removed` (as) |
 | `PruneNetworks() -> o` | `network prune`: a job (kind network-prune) removing every user-defined network no machine names; result `removed` (as) |
-| `ListNetwork() -> (a{sv}, aa{sv})` | 1.1's `network ls`, kept for its clients: the default bridge (bridge, subnet, gateway, host_name) and the machines on it (name, address, ports, running) |
+| `ListNetwork() -> (a{sv}, aa{sv})` | the default network (bridge, subnet, gateway, host_name) and the machines on it (name, address, ports, running) |
 | `NetworkUp() -> a{sv}` | `network up`: every network's bridge comes up; the default one as ListNetwork has it, `networks` (as, every network) and `notes` |
 | `Login(s registry, s user, s password, a{sv} options) -> a{sv}` | `login`; "" for the hub; options registry (the hub "" stands for), ca_cert |
 | `Logout(s registry) -> b` | `logout` |

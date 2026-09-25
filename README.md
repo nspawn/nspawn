@@ -56,7 +56,7 @@ program this standard input, `-t` a terminal (`-it` for a shell), `--rm` removes
 machine once it ends (named volumes stay; an image it had to pull is kept under its own
 name, as docker keeps images, and the machine gets a name of its own unless `--name`
 says one), and `-d` starts it in the background and
-returns, as `run` did before 1.2.0. A booted image shows its console until it powers off
+returns. A booted image shows its console until it powers off
 (Ctrl-C powers it off); `run -it` on one waits for its boot, opens a root shell and powers
 the machine off when the shell ends, with the shell's exit code. Closing the terminal of
 `run -t` stops the machine, since nothing would read its terminal any more; `-d` and

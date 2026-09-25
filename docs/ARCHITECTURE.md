@@ -231,8 +231,8 @@ peer of the machine's host0 through its sysfs). `/etc/hosts` lists every machine
 same network and `host.nspawn.internal`, that network's gateway. With firewalld the
 bridges are bound to the trusted zone; with docker or ufw, accept rules go into
 DOCKER-USER or FORWARD. `network rm` undoes all of it for its bridge. The
-bridge is IPv4 only: it gets `addrgenmode none` (and loses the `fe80::`
-address an earlier version left), host0 gets `LinkLocalAddressing=no` in its
+bridge is IPv4 only: it gets `addrgenmode none` and no `fe80::` address,
+host0 gets `LinkLocalAddressing=no` in its
 `.network` file or `addrgenmode none` in an app's namespace, so machined never
 hands out a link-local address under a machine's name.
 
