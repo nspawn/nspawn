@@ -2,7 +2,6 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -297,7 +296,7 @@ mod pagination_tests {
 
     #[test]
     fn a_transfer_reports_its_start_a_few_times_and_its_end() {
-        let events = Mutex::new(Vec::new());
+        let events = std::sync::Mutex::new(Vec::new());
         let report = |event: Event| events.lock().unwrap().push(event);
         let at = |done: u64| Event::Progress {
             item: "aaef90e06523".to_string(),
@@ -395,25 +394,33 @@ impl Hub {
             .await
             .with_context(|| format!("opening {}", path.display()))?;
         let size = file.metadata().await?.len();
-        let progress = Mutex::new(Progress::start(
-            report,
-            short_digest(digest),
-            size,
-            PROGRESS_INTERVAL,
-        ));
+        let mut progress = Progress::start(report, short_digest(digest), size, PROGRESS_INTERVAL);
+        // The client keeps the stream for itself, so it cannot borrow this call's
+        // progress: each chunk sends its size over a channel, which closes with the
+        // stream, and the counting side advances the progress from here.
+        let (sent, mut counts) = tokio::sync::mpsc::unbounded_channel();
         let stream = futures_util::TryStreamExt::map_err(
-            futures_util::StreamExt::inspect(ReaderStream::with_capacity(file, 1 << 20), |chunk| {
-                if let Ok(c) = chunk {
-                    progress.lock().unwrap().advance(c.len() as u64);
-                }
-            }),
+            futures_util::StreamExt::inspect(
+                ReaderStream::with_capacity(file, 1 << 20),
+                move |chunk| {
+                    if let Ok(c) = chunk {
+                        let _ = sent.send(c.len() as u64);
+                    }
+                },
+            ),
             |e| oci_client::errors::OciDistributionError::GenericError(Some(e.to_string())),
         );
-        self.client
-            .push_blob_stream(image, stream, digest)
-            .await
-            .with_context(|| format!("uploading blob {digest}"))?;
-        progress.lock().unwrap().finish();
+        let upload = self
+            .client
+            .push_blob_stream(image, stream, digest, Some(size));
+        let count = async {
+            while let Some(bytes) = counts.recv().await {
+                progress.advance(bytes);
+            }
+        };
+        let (uploaded, ()) = tokio::join!(upload, count);
+        uploaded.with_context(|| format!("uploading blob {digest}"))?;
+        progress.finish();
         Ok(())
     }
 

@@ -11,7 +11,7 @@ cp -r packaging/debian/debian .
 dpkg-buildpackage -us -uc -b -d
 ```
 
-The build needs rust 1.85 or newer (`rust-version` in Cargo.toml). Ubuntu
+The build needs rust 1.88 or newer (`rust-version` in Cargo.toml). Ubuntu
 24.04 ships 1.75, so the workflow installs rustup there and passes `-d`, which
 leaves the `cargo` and `rustc` build dependencies unchecked; on a distribution
 whose own rust is new enough they are what gets used, and `-d` can go.

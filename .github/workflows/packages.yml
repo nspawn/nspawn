@@ -51,7 +51,7 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git build-essential debhelper curl ca-certificates
           # The package must run on the oldest supported host, so it is built there;
-          # that distribution's rust (1.75) is older than this crate asks for (1.85).
+          # that distribution's rust (1.75) is older than this crate asks for (1.88).
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - uses: actions/checkout@v7
