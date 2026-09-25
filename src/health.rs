@@ -231,7 +231,7 @@ pub fn format_duration(usec: u64) -> String {
     if usec == 0 {
         return "0s".to_string();
     }
-    if usec % 1_000_000 != 0 {
+    if !usec.is_multiple_of(1_000_000) {
         return format!("{}ms", usec / 1000);
     }
     let seconds = usec / 1_000_000;
