@@ -7,7 +7,7 @@ mod login;
 mod machines;
 mod stats;
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 use zbus::zvariant::Value;
 
 use crate::api::{self, Context};
@@ -473,8 +473,40 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             put_all(&mut options, "command", a.command);
             put_health(&mut options, a.health);
             put_tuning(&mut options, a.tuning);
+            // A reference that is not local is pulled first, under its own name, as run
+            // does: the machine is then made from that image.
+            let images: Vec<(String, String)> = manager
+                .list_images()
+                .await
+                .map_err(client::error)?
+                .iter()
+                .map(|i| (client::string(i, "name"), client::string(i, "reference")))
+                .collect();
+            let mut source = a.source.clone();
+            if !images.iter().any(|(n, r)| *n == a.source || *r == a.source) {
+                let registry = registry_name(client, config).await;
+                if let Ok(image) = crate::reference::ImageRef::parse(&a.source, &registry) {
+                    let base = image.local_name();
+                    if images
+                        .iter()
+                        .any(|(n, r)| *n == base && *r != image.to_string())
+                    {
+                        bail!(
+                            "{base} is an image of another reference; pull {} under a name of your own first (nspawn pull --name)",
+                            image
+                        );
+                    }
+                    let mut pull = client::registry_options(config);
+                    put(&mut pull, "name", base.clone());
+                    backend(&mut pull, a.backend);
+                    client
+                        .run_job_to_stderr(|| manager.pull_image(&a.source, pull))
+                        .await?;
+                    source = base;
+                }
+            }
             let done = client
-                .run_job(|| manager.create_machine(&a.source, &a.name, options))
+                .run_job(|| manager.create_machine(&source, &a.name, options))
                 .await?;
             let name = client::string(&done, "name");
             println!(

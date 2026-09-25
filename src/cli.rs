@@ -345,7 +345,8 @@ pub struct PullArgs {
 
 #[derive(Args, Debug)]
 pub struct CreateArgs {
-    /// Local image to start from: its name, or the reference it was pulled from.
+    /// Image to start from: a local one by its name or reference, or a reference to pull
+    /// first (kept under its own name, as run does).
     pub source: String,
     /// Name of the new machine.
     pub name: String,

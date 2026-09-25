@@ -73,7 +73,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-run-boot busybox-1.37; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-run-boot busybox-1.37 busybox-1.36; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -644,6 +644,13 @@ echo "$out" | grep_q "nspawn start e2e-run" || fail "run over an existing name d
 out=$($NSPAWN run e2e/nothing-$nonce:1 --pull never 2>&1) && fail "run --pull never pulled"
 echo "$out" | grep_q "no local image" || fail "run --pull never without a local image was not explained: $out"
 $NSPAWN images ls | grep_q "nothing-$nonce" && fail "run --pull never left an image behind"
+# create takes a reference too: what is not local is pulled under its own name first.
+$NSPAWN create docker.io/library/busybox:1.36 e2e-cpull -- /bin/sleep 300 > /tmp/e2e-cpull.txt 2>&1 || { cat /tmp/e2e-cpull.txt; fail "create from a reference"; }
+$NSPAWN images ls | grep "^ *busybox-1.36 " | grep_q pull || fail "create did not keep the pulled image under its name"
+$NSPAWN images ls | grep "^ *e2e-cpull " | grep_q create || fail "create from a reference did not make the machine"
+$NSPAWN create docker.io/library/busybox:1.36 e2e-cpull --force > /tmp/e2e-cpull.txt 2>&1 || fail "create again from the reference"
+grep -q "downloading" /tmp/e2e-cpull.txt && fail "create pulled an image that is here already"
+$NSPAWN rm e2e-cpull >/dev/null && $NSPAWN images rm busybox-1.36 >/dev/null || fail "rm the created machine and its image"
 # Several machines at once: every line carries its machine's name; --until ends a follow.
 $NSPAWN logs $app e2e-run --until now > /tmp/e2e-logs2.txt 2>&1 || fail "logs of two machines"
 grep -q "^e2e-run  *| " /tmp/e2e-logs2.txt || fail "logs of two machines carry no names: $(head -3 /tmp/e2e-logs2.txt)"

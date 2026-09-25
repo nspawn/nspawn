@@ -200,7 +200,8 @@ directory mounted with `-v` keeps its own label, which the service may not be al
 write (docker needs `:z` for the same); named volumes are nspawn's and always work.
 
 One image, as many machines as you like: `nspawn create SOURCE NAME` makes another
-machine from an image that is already local, without touching the registry. It shares the
+machine from an image that is already local, without touching the registry (a reference
+that is not local is pulled first, under its own name, as `run` does). It shares the
 source's layers and gets a writable layer, an address, settings and ports of its own
 (`-p`, `--network`); removing one never affects the others. A pulled image is a machine
 too, so `nspawn rm NAME` and `nspawn images rm NAME` remove the same thing: the record,
