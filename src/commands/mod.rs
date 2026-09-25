@@ -15,7 +15,8 @@ use crate::backend::BackendChoice;
 use clap::CommandFactory;
 
 use crate::cli::{
-    Cli, Command, HubCommand, ImagesCommand, MachinesCommand, NetworkCommand, VolumeCommand,
+    Cli, Command, HubCommand, ImagesCommand, MachinesCommand, NetworkCommand, SecretCommand,
+    VolumeCommand,
 };
 use crate::client::{self, Client, Options};
 use crate::config::Config;
@@ -240,6 +241,7 @@ pub fn put_tuning(options: &mut Options<'_>, t: crate::cli::TuningArgs) {
         ("extra_hosts", t.add_host),
         ("ulimits", t.ulimit),
         ("sysctls", t.sysctl),
+        ("secrets", t.secret),
     ] {
         put_all(options, key, values);
     }
@@ -594,6 +596,70 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                     return Ok(());
                 }
                 client.run_job(|| manager.prune_volumes()).await?;
+                Ok(())
+            }
+        },
+        Command::Secret(args) => match args.command {
+            SecretCommand::Ls(output) => {
+                let secrets = manager.list_secrets().await.map_err(client::error)?;
+                if output.json {
+                    client::print_json(&serde_json::Value::Array(
+                        secrets.iter().map(client::dict_to_json).collect(),
+                    ));
+                    return Ok(());
+                }
+                let now = crate::store::now_unix();
+                let rows = secrets
+                    .iter()
+                    .map(|s| {
+                        let created = client::u64(s, "created");
+                        vec![
+                            client::string(s, "name"),
+                            human_bytes(client::u64(s, "size")),
+                            if created > 0 {
+                                format!("{} ago", human_duration(now.saturating_sub(created)))
+                            } else {
+                                "-".to_string()
+                            },
+                            client::dash(client::strings(s, "used_by").join(" ")),
+                        ]
+                    })
+                    .collect();
+                println!("{}", table(&["SECRET", "SIZE", "CREATED", "USED BY"], rows));
+                Ok(())
+            }
+            SecretCommand::Create { name, file, label } => {
+                let content = match &file {
+                    Some(path) => std::fs::read(path)
+                        .with_context(|| format!("reading {}", path.display()))?,
+                    None => {
+                        let mut bytes = Vec::new();
+                        std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
+                            .context("reading the secret from standard input")?;
+                        bytes
+                    }
+                };
+                let mut options = Options::new();
+                put_all(&mut options, "labels", label);
+                manager
+                    .create_secret(&name, &content, options)
+                    .await
+                    .map_err(client::error)?;
+                println!("{name}");
+                Ok(())
+            }
+            SecretCommand::Inspect { names } => {
+                let mut out = Vec::new();
+                for name in &names {
+                    out.push(client::dict_to_json(
+                        &manager.get_secret(name).await.map_err(client::error)?,
+                    ));
+                }
+                client::print_json(&serde_json::Value::Array(out));
+                Ok(())
+            }
+            SecretCommand::Rm { names } => {
+                client.run_job(|| manager.remove_secrets(&names)).await?;
                 Ok(())
             }
         },

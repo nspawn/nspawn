@@ -231,8 +231,9 @@ fn health_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::health::
 
 /// docker's other flags: hostname, user, working_dir, stop_signal (s), cap_add,
 /// cap_drop, tmpfs, devices (HOST:CONTAINER:PERMISSIONS), dns, dns_search, extra_hosts
-/// (HOST:IP), ulimits (NAME=SOFT:HARD), sysctls (KEY=VALUE) (as, "none" clears),
-/// privileged, read_only, init (b), shm_size, stop_timeout (t), oom_score_adj (i).
+/// (HOST:IP), ulimits (NAME=SOFT:HARD), sysctls (KEY=VALUE), secrets
+/// (NAME[:TARGET[:MODE[:UID:GID]]]) (as, "none" clears), privileged, read_only, init (b),
+/// shm_size, stop_timeout (t), oom_score_adj (i).
 fn tuning_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::tuning::Overrides> {
     Ok(crate::tuning::Overrides {
         hostname: options.string("hostname")?,
@@ -260,6 +261,7 @@ fn tuning_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::tuning::
         stop_timeout: options.maybe_u64("stop_timeout")?,
         init: options.maybe_bool("init")?,
         sysctls: options.strings("sysctls")?,
+        secrets: options.strings("secrets")?,
     })
 }
 
@@ -750,6 +752,72 @@ impl Manager {
             move |ctx, reporter| async move {
                 let removed = api::volumes::prune(&ctx, jobs::report(&reporter)).await?;
                 Ok(HashMap::from([("removed".to_string(), values::v(removed))]))
+            },
+        )
+        .await?)
+    }
+
+    /// Like `secret ls`: every secret with name, created (unix seconds), size (t, bytes
+    /// of the plaintext), labels (a{ss}) and used_by (as); never the content.
+    async fn list_secrets(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Vec<Dict>> {
+        self.allow(&hdr, Action::Inspect).await?;
+        let _busy = self.state.enter();
+        let secrets = api::secrets::list(&self.ctx().store)?;
+        Ok(secrets.iter().map(values::secret).collect())
+    }
+
+    /// Like `secret inspect`: one secret as ListSecrets has it.
+    async fn get_secret(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<Dict> {
+        self.allow(&hdr, Action::Inspect).await?;
+        let _busy = self.state.enter();
+        Ok(values::secret(&api::secrets::get(
+            &self.ctx().store,
+            &name,
+        )?))
+    }
+
+    /// Like `secret create`: the content, encrypted for this host with systemd-creds.
+    /// Options: labels (as, KEY=VALUE). A name in use is refused.
+    async fn create_secret(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        name: String,
+        content: Vec<u8>,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<()> {
+        self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        let mut options = Options::new(&options);
+        let labels = crate::volume::parse_labels(&options.strings("labels")?)?;
+        options.finish()?;
+        Ok(api::secrets::create(self.ctx(), &name, &content, labels).await?)
+    }
+
+    /// Like `secret rm`: a job; every name is tried, the result lists the ones removed,
+    /// and the job fails at the end when one was in use or unknown.
+    async fn remove_secrets(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        names: Vec<String>,
+    ) -> Result<OwnedObjectPath> {
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let _busy = self.state.enter();
+        let target = names.join(" ");
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "secret-rm",
+            &target,
+            move |ctx, reporter| async move {
+                let removal = api::secrets::remove(&ctx, &names, jobs::report(&reporter)).await?;
+                if let Some(error) = removal.error() {
+                    anyhow::bail!("{error}");
+                }
+                Ok(HashMap::from([(
+                    "removed".to_string(),
+                    values::v(removal.removed),
+                )]))
             },
         )
         .await?)

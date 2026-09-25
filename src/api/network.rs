@@ -495,6 +495,7 @@ pub async fn release(ctx: &Context, name: &str) -> Result<()> {
     let record = ctx.store.load_image(name)?;
     machines::release_machine(name, record.as_ref())?;
     crate::health::clear_status(name);
+    crate::api::secrets::clear(name);
     // `kill` sent the stop signal: a stop job queued while the unit winds down keeps
     // systemd from restarting it. Not waited for: it ends after this hook.
     if ctx.store.take_exit_on_next(name)? {

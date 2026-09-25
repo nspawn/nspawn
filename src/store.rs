@@ -280,7 +280,7 @@ impl Store {
     /// Root's alone: layers hold setuid programs and device nodes that would work for any
     /// local user reaching them, records hold the machines' environment, volumes and
     /// builds their data.
-    fn private_dirs(&self) -> [PathBuf; 10] {
+    fn private_dirs(&self) -> [PathBuf; 11] {
         [
             self.layers_dir(Ownership::Root),
             self.layers_dir(Ownership::Foreign),
@@ -292,6 +292,7 @@ impl Store {
             self.root.join("cache"),
             self.root.join("starting"),
             self.networks_dir(),
+            self.secrets_dir(),
         ]
     }
 
@@ -338,6 +339,10 @@ impl Store {
     /// User-defined networks, one NAME.json each.
     pub fn networks_dir(&self) -> PathBuf {
         self.root.join("networks")
+    }
+    /// Secrets: NAME.cred (encrypted with systemd-creds) and NAME.json.
+    pub fn secrets_dir(&self) -> PathBuf {
+        self.root.join("secrets")
     }
 
     pub fn record_network(&self, net: &NetSpec) -> Result<()> {

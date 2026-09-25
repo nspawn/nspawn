@@ -244,9 +244,11 @@ impl Filters {
             match key {
                 "name" | "machine" => out.names.push(value.to_string()),
                 "type" => match value {
-                    "machine" | "network" | "volume" => out.kinds.push(value.to_string()),
+                    "machine" | "network" | "volume" | "secret" => {
+                        out.kinds.push(value.to_string())
+                    }
                     other => {
-                        bail!("filter {filter}: unknown type {other} (machine, network or volume)")
+                        bail!("filter {filter}: unknown type {other} (machine, network, volume or secret)")
                     }
                 },
                 "event" | "action" => out.actions.push(value.to_string()),

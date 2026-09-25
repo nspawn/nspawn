@@ -82,6 +82,8 @@ pub enum Command {
     Network(NetworkArgs),
     /// Manage named volumes (-v NAME:/path), like docker volume.
     Volume(VolumeArgs),
+    /// Manage secrets (--secret NAME), like docker secret: kept encrypted for this host.
+    Secret(SecretArgs),
     /// Serve org.nspawn on the system bus (started by the bus; see --install).
     Daemon(DaemonArgs),
     /// run --rm: removes a machine once its unit is down after that run.
@@ -214,6 +216,44 @@ pub enum VolumeCommand {
         /// Do not ask first (without it, nothing is removed when no yes comes).
         #[arg(long, short = 'f')]
         force: bool,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct SecretArgs {
+    #[command(subcommand)]
+    pub command: SecretCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SecretCommand {
+    /// List the secrets with the machines that take them; never their content.
+    #[command(alias = "list")]
+    Ls(OutputArgs),
+    /// Keep a secret, read from a file or from standard input, encrypted for this host
+    /// (systemd-creds: the TPM2 where there is one, the host's key otherwise).
+    Create {
+        /// Secret name: letters, digits, _ . and -.
+        name: String,
+        /// Read the content from this file instead of standard input.
+        #[arg(long, short = 'f', value_name = "FILE")]
+        file: Option<std::path::PathBuf>,
+        /// Label the secret, KEY=VALUE, like docker secret create --label. Repeatable.
+        #[arg(long, short = 'l', value_name = "KEY=VALUE")]
+        label: Vec<String>,
+    },
+    /// What nspawn keeps about secrets, as JSON: never their content.
+    Inspect {
+        /// Secret names.
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Remove secrets no machine takes.
+    #[command(alias = "remove")]
+    Rm {
+        /// Secret names.
+        #[arg(required = true)]
+        names: Vec<String>,
     },
 }
 
@@ -428,6 +468,11 @@ pub struct TuningArgs {
     /// "none" forgets them.
     #[arg(long, value_name = "KEY=VALUE")]
     pub sysctl: Vec<String>,
+    /// A secret (nspawn secret create) as a read-only file inside the machine, like
+    /// docker's --secret: NAME alone is /run/secrets/NAME with mode 0444, root's.
+    /// Repeatable; "none" forgets them.
+    #[arg(long, value_name = "NAME[:TARGET[:MODE[:UID:GID]]]")]
+    pub secret: Vec<String>,
 }
 
 /// docker's --health-* flags, on top of the image's HEALTHCHECK; remembered.

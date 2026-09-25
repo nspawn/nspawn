@@ -145,6 +145,16 @@ shows them all. A path the image declares as a volume and nothing is mounted ove
 note at start: nspawn has no anonymous volumes, so what is written there goes with the
 machine.
 
+Secrets are docker's too, without a swarm: `nspawn secret create db-password` reads the
+content from standard input (or `--file`) and keeps it encrypted with `systemd-creds`,
+bound to the host's TPM2 where there is one and to its credential key otherwise;
+`--secret db-password` on `run`, `start` or `create` gives the machine the plaintext at
+`/run/secrets/db-password`, a read-only file of root's with mode 0444
+(`NAME:TARGET:MODE:UID:GID` says otherwise), decrypted into a tmpfs of root's alone for
+as long as the machine runs. `secret ls` shows who takes each one, `secret inspect` what
+is known about it (never the content), and `secret rm` refuses one a machine still
+takes. Not on mstack machines yet.
+
 `events` is docker events: what happens to machines (`start`, `die` with its exit code,
 `stop`, `restart`, `oom`, `fail`, `health_status`, and nspawn's own `pull`, `build`,
 `create`, `push`, `kill`, `update`, `remove`), networks and volumes, as it happens or between `--since`

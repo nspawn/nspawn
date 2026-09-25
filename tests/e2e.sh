@@ -78,6 +78,8 @@ cleanup_machines() {
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
   $NSPAWN network rm e2e-na e2e-nb e2e-nc e2e-nd e2e-ne >/dev/null 2>&1 || true
+  $NSPAWN secret rm e2e-pw e2e-pw2 >/dev/null 2>&1 || true
+  rm -f /var/lib/nspawn/secrets/e2e-pw.cred /var/lib/nspawn/secrets/e2e-pw.json /var/lib/nspawn/secrets/e2e-pw2.cred /var/lib/nspawn/secrets/e2e-pw2.json
   # Machines of run --rm have names of their own.
   for m in $($NSPAWN images ls 2>/dev/null | awk '$1 ~ /^busybox-1\.37-/ {print $1}'); do
     $NSPAWN rm -f "$m" >/dev/null 2>&1 || true
@@ -1123,6 +1125,37 @@ grep -q "no volume named e2e-no-such-volume" /tmp/e2e-volrm.txt || fail "a missi
 $NSPAWN volume rm ../images >/dev/null 2>&1 && fail "volume rm reached outside the volumes directory"
 rmdir /var/lib/nspawn/volumes/.e2e-hidden
 
+step "secrets: kept encrypted, handed to a machine as files, removed once unused"
+printf 'hunter2' | $NSPAWN secret create e2e-pw --label env=e2e || fail "secret create from stdin"
+printf 'other' > /tmp/e2e-secret.txt; $NSPAWN secret create e2e-pw2 --file /tmp/e2e-secret.txt >/dev/null || fail "secret create from a file"; rm -f /tmp/e2e-secret.txt
+[ "$(stat -c '%u %a' /var/lib/nspawn/secrets)" = "0 700" ] || fail "the secrets directory is open to others"
+grep -q hunter2 /var/lib/nspawn/secrets/e2e-pw.cred && fail "the secret is stored in the clear"
+printf 'x' | $NSPAWN secret create e2e-pw >/dev/null 2>&1 && fail "secret create replaced a secret"
+printf 'x' | $NSPAWN secret create 'bad name' >/dev/null 2>&1 && fail "secret create accepted a bad name"
+$NSPAWN secret ls | grep "^ *e2e-pw " | grep_q " 7 B " || fail "secret ls does not show the size: $($NSPAWN secret ls)"
+$NSPAWN secret inspect e2e-pw | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['labels'] == {'env': 'e2e'} and d['used_by'] == [] and 'hunter2' not in json.dumps(d), d" || fail "secret inspect"
+$NSPAWN start $app --secret e2e-pw --secret e2e-pw2:/etc/other/key:0400:65534:65534 -- /bin/sleep 300 || fail "start with secrets"
+[ "$($NSPAWN exec $app -- cat /run/secrets/e2e-pw </dev/null | tr -d '\r')" = hunter2 ] || fail "the secret is not readable inside"
+[ "$($NSPAWN exec $app -- stat -c '%u %a' /run/secrets/e2e-pw </dev/null | tr -d '\r')" = "0 444" ] || fail "the secret file has the wrong mode or owner: $($NSPAWN exec $app -- stat -c '%u %a' /run/secrets/e2e-pw </dev/null)"
+[ "$($NSPAWN exec $app -- stat -c '%u %g %a' /etc/other/key </dev/null | tr -d '\r')" = "65534 65534 400" ] || fail "the second secret has the wrong mode or owner: $($NSPAWN exec $app -- stat -c '%u %g %a' /etc/other/key </dev/null)"
+[ "$($NSPAWN exec $app -- cat /etc/other/key </dev/null | tr -d '\r')" = other ] || fail "the second secret is not readable inside"
+$NSPAWN exec $app -- /bin/sh -c 'echo x > /run/secrets/e2e-pw' </dev/null 2>/dev/null && fail "a secret was writable inside"
+[ "$(stat -c '%u %a' /run/nspawn/secrets/$app)" = "0 700" ] || fail "the decrypted secrets are open to others on the host"
+$NSPAWN secret ls | grep "^ *e2e-pw " | grep_q "$app" || fail "secret ls does not show who takes e2e-pw"
+out=$($NSPAWN secret rm e2e-pw 2>&1) && fail "a secret in use was removed"
+echo "$out" | grep_q "in use by $app" || fail "secret rm did not say who takes it: $out"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['secrets'] == ['e2e-pw:/run/secrets/e2e-pw:0444:0:0', 'e2e-pw2:/etc/other/key:0400:65534:65534'], d['secrets']" || fail "inspect does not list the secrets"
+$NSPAWN stop $app >/dev/null || fail "stop the app with secrets"
+[ -e /run/nspawn/secrets/$app ] && fail "the decrypted secrets were left behind after stop"
+out=$($NSPAWN start $app --secret e2e-missing -- /bin/sleep 1 2>&1) && fail "a missing secret was accepted"
+echo "$out" | grep_q "no secret named e2e-missing" || fail "the missing secret was not explained: $out"
+$NSPAWN start $app --secret none -- /bin/sleep 300 >/dev/null && $NSPAWN stop $app >/dev/null || fail "start with --secret none"
+$NSPAWN secret rm e2e-pw e2e-pw2 e2e-nope > /tmp/e2e-secretrm.txt 2>&1 && fail "secret rm of a missing secret succeeded"
+grep -q "removed e2e-pw" /tmp/e2e-secretrm.txt || fail "secret rm stopped at the missing secret: $(cat /tmp/e2e-secretrm.txt)"
+grep -q "no secret named e2e-nope" /tmp/e2e-secretrm.txt || fail "a missing secret was not explained: $(cat /tmp/e2e-secretrm.txt)"
+ls /var/lib/nspawn/secrets/ | grep_q e2e-pw && fail "secret rm left files behind"
+$NSPAWN events --since "-2min" --until now --filter type=secret | grep_q "secret create e2e-pw" || fail "no event for the secret"
+
 step "rm: a running machine is refused, rm -f stops it first, named volumes stay"
 $NSPAWN start $app -v e2evol:/vol -- /bin/sleep 300 >/dev/null || fail "start the app with e2evol"
 out=$($NSPAWN rm $app 2>&1) && fail "rm removed a running machine"
@@ -1160,7 +1193,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine UpdateMachine Exec Events Shell Logs ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do

@@ -209,6 +209,16 @@ pub fn record(r: &ImageRecord) -> Dict {
         ),
         ("init".to_string(), v(r.tuning.init)),
         ("sysctls".to_string(), map(&r.tuning.sysctls)),
+        (
+            "secrets".to_string(),
+            strings(
+                &r.tuning
+                    .secrets
+                    .iter()
+                    .map(|s| format!("{}:{}:{:04o}:{}:{}", s.name, s.target, s.mode, s.uid, s.gid))
+                    .collect::<Vec<_>>(),
+            ),
+        ),
         ("image_volumes".to_string(), strings(&r.run.volumes)),
         (
             "healthcheck".to_string(),
@@ -313,6 +323,17 @@ pub fn volume(vol: &VolumeInfo) -> Dict {
         ),
         ("used_by".to_string(), strings(&vol.used_by)),
         ("created".to_string(), v(vol.created)),
+    ])
+}
+
+/// A secret: name, created, size, labels, used_by; never its content.
+pub fn secret(s: &crate::api::secrets::SecretInfo) -> Dict {
+    HashMap::from([
+        ("name".to_string(), v(s.name.as_str())),
+        ("created".to_string(), v(s.created)),
+        ("size".to_string(), v(s.size)),
+        ("labels".to_string(), map(&s.labels)),
+        ("used_by".to_string(), strings(&s.used_by)),
     ])
 }
 

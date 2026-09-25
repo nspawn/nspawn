@@ -17,6 +17,17 @@ pub struct Device {
     pub permissions: String,
 }
 
+/// A secret handed to the machine, as docker's long --secret form has it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretRef {
+    pub name: String,
+    /// An absolute path inside the machine.
+    pub target: String,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
 /// An entry of --add-host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtraHost {
@@ -74,6 +85,9 @@ pub struct Tuning {
     /// net.* keys, applied in an app machine's network namespace.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sysctls: BTreeMap<String, String>,
+    /// --secret: decrypted for the machine while it runs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<SecretRef>,
 }
 
 impl Tuning {
@@ -246,6 +260,7 @@ pub struct Overrides {
     pub stop_timeout: Option<u64>,
     pub init: Option<bool>,
     pub sysctls: Vec<String>,
+    pub secrets: Vec<String>,
 }
 
 fn cleared(values: &[String]) -> bool {
@@ -361,6 +376,15 @@ impl Overrides {
                     .map(|s| sysctl(s))
                     .collect::<Result<_>>()?
             };
+        }
+        if !self.secrets.is_empty() {
+            t.secrets = list(&self.secrets, crate::api::secrets::parse_ref)?;
+            let mut targets = std::collections::BTreeSet::new();
+            for secret in &t.secrets {
+                if !targets.insert(&secret.target) {
+                    bail!("--secret: two secrets at {}", secret.target);
+                }
+            }
         }
         Ok(())
     }
@@ -555,6 +579,7 @@ mod tests {
             stop_timeout: Some(2),
             init: Some(true),
             sysctls: vec!["net.ipv4.ip_forward=1".into()],
+            secrets: vec!["pw".into(), "tls:/etc/key:0400:1000:1000".into()],
             privileged: None,
         };
         let mut t = Tuning::default();
@@ -598,6 +623,13 @@ mod tests {
         assert_eq!(t.extra_hosts[1].ip, "host-gateway");
         assert_eq!(t.sysctls["net.ipv4.ip_forward"], "1");
         assert_eq!((t.user.as_deref(), t.stop_timeout), (Some("1000"), Some(2)));
+        assert_eq!(t.secrets[1].target, "/etc/key");
+        assert!(Overrides {
+            secrets: vec!["a:/x".into(), "b:/x".into()],
+            ..Overrides::default()
+        }
+        .apply(&mut Tuning::default())
+        .is_err());
         let text = serde_json::to_string(&t).unwrap();
         assert_eq!(serde_json::from_str::<Tuning>(&text).unwrap(), t);
         assert_eq!(serde_json::to_string(&Tuning::default()).unwrap(), "{}");

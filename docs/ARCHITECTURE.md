@@ -25,6 +25,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `settings.rs` | the `.nspawn` settings file and the unit hook drop-in |
 | `policy.rs` | restart policies and resource limits (`--restart`, `-m`, `--cpus`, `--pids-limit`), written into the hook drop-in |
 | `health.rs` | healthchecks: the image's or the flags', the probe runner (`health-run`, a transient unit bound to the machine's), its verdict under `/run/nspawn/health` |
+| `api/secrets.rs` | secrets: systemd-creds around them, their files under the state directory, decrypted into a root-only tmpfs for a running machine and bind-mounted read-only |
 | `tuning.rs` | docker's other per-container flags (hostname, user, capabilities, tmpfs, devices, dns, ulimits, signals, sysctls): parsing, and the settings and unit lines they become |
 | `getent.rs` | the getent stand-in bound into an app that runs as a user |
 | `bridge.rs`, `hostnet.rs` | the nspawn0 bridge, ports, firewalls; veth mode |
@@ -60,6 +61,9 @@ files, and the machine units call nspawn back through drop-in hooks.
                      layer, 0711 otherwise (an mstack machine binds its
                      files from inside its user namespace)
   volumes/NAME/      named volumes
+  secrets/NAME.cred  secrets encrypted with systemd-creds, NAME.json next to
+                     each (created, size, labels); decrypted for a machine into
+                     /run/nspawn/secrets/MACHINE while it runs
   networks/NAME.json user-defined networks: interface, subnet, internal,
                      labels
   starting/NAME      a start in progress, until the machine is registered:

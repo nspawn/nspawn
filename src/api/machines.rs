@@ -326,6 +326,11 @@ pub async fn prepare(
         }
         _ => None,
     };
+    let managed_userns = record.backend == BackendChoice::Mstack;
+    if managed_userns && !record.tuning.secrets.is_empty() {
+        bail!("{name} runs under managed user namespaces (mstack), where secrets cannot be attached yet; pull it again with --backend overlay");
+    }
+    binds.extend(crate::api::secrets::materialize(store, &record)?);
     if record.mode == Mode::App {
         binds.extend(crate::getent::shim(store, name, &record)?);
     }
@@ -352,12 +357,18 @@ pub async fn prepare(
         if hostname_file.is_some() {
             points.push(("/etc/hostname".to_string(), false));
         }
+        // The generated hosts and resolv.conf go over files an image may lack.
+        if files.is_some() {
+            points.push(("/etc/hosts".to_string(), false));
+            if record.mode == Mode::App {
+                points.push(("/etc/resolv.conf".to_string(), false));
+            }
+        }
         crate::backend::ensure_mount_points(
             &crate::backend::mount_point_root(store, name, record.backend)?,
             &points,
         )?;
     }
-    let managed_userns = record.backend == BackendChoice::Mstack;
     let volume_units = if record.mode == Mode::Boot && !binds.is_empty() {
         let dir = store.machine_files_dir(name).join("units");
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;

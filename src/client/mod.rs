@@ -76,6 +76,10 @@ pub trait Manager {
         stream: zbus::zvariant::Fd<'_>,
         options: Options<'_>,
     ) -> zbus::Result<OwnedObjectPath>;
+    fn list_secrets(&self) -> zbus::Result<Vec<Dict>>;
+    fn get_secret(&self, name: &str) -> zbus::Result<Dict>;
+    fn create_secret(&self, name: &str, content: &[u8], options: Options<'_>) -> zbus::Result<()>;
+    fn remove_secrets(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
     fn list_volumes(&self) -> zbus::Result<Vec<Dict>>;
     fn create_volume(&self, name: &str) -> zbus::Result<String>;
     fn remove_volumes(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
