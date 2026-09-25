@@ -268,6 +268,7 @@ mod tests {
                 extra_networks: Vec::new(),
                 aliases: BTreeMap::new(),
                 no_network: false,
+                healthcheck: None,
             })
             .unwrap();
     }

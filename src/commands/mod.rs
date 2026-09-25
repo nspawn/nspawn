@@ -62,6 +62,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::RemoveAfterExit { name, invocation } => {
             api::network::remove_after_exit(&Context::new(config), &name, &invocation).await
         }
+        Command::HealthRun { name } => crate::health::run(&Context::new(config), &name).await,
         // The unit hooks must not depend on the service: a machine starts on its own.
         Command::Network(args) => match args.command {
             NetworkCommand::Prepare { name } => {
@@ -220,6 +221,27 @@ fn put(options: &mut Options<'_>, key: &'static str, value: impl Into<Value<'sta
 fn put_opt(options: &mut Options<'_>, key: &'static str, value: Option<String>) {
     if let Some(value) = value {
         put(options, key, value);
+    }
+}
+
+/// The --health-* flags as the service takes them.
+pub fn put_health(options: &mut Options<'_>, health: crate::cli::HealthArgs) {
+    put_opt(options, "health_cmd", health.health_cmd);
+    for (key, value) in [
+        ("health_interval", health.health_interval),
+        ("health_timeout", health.health_timeout),
+        ("health_start_period", health.health_start_period),
+        ("health_start_interval", health.health_start_interval),
+    ] {
+        if let Some(value) = value {
+            put(options, key, value);
+        }
+    }
+    if let Some(retries) = health.health_retries {
+        put(options, "health_retries", retries);
+    }
+    if health.no_healthcheck {
+        put(options, "no_healthcheck", true);
     }
 }
 
@@ -409,6 +431,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 put(&mut options, "pids_limit", pids);
             }
             put_all(&mut options, "command", a.command);
+            put_health(&mut options, a.health);
             let done = client
                 .run_job(|| manager.create_machine(&a.source, &a.name, options))
                 .await?;
@@ -564,6 +587,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         | Command::Completions(_)
         | Command::Manpage
         | Command::RemoveAfterExit { .. }
+        | Command::HealthRun { .. }
         | Command::AttachExec { .. } => {
             unreachable!("handled before")
         }

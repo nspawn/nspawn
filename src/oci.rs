@@ -59,6 +59,9 @@ pub struct RunSpec {
     /// The image's own labels (LABEL in a Containerfile, OciLabels= in mkosi).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// HEALTHCHECK of a Containerfile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<crate::health::Healthcheck>,
 }
 
 impl RunSpec {
@@ -68,7 +71,11 @@ impl RunSpec {
         let Some(config) = file.config else {
             return Ok(RunSpec::default());
         };
+        // A docker extension the typed config leaves out.
+        let raw: serde_json::Value =
+            serde_json::from_slice(bytes).context("parsing the OCI image config")?;
         Ok(RunSpec {
+            healthcheck: crate::health::Healthcheck::from_config(&raw),
             entrypoint: config.entrypoint.unwrap_or_default(),
             cmd: config.cmd.unwrap_or_default(),
             command: Vec::new(),
@@ -203,7 +210,8 @@ mod tests {
         let json = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},
             "config":{"Entrypoint":["/docker-entrypoint.sh"],"Cmd":["nginx","-g","daemon off;"],
             "Env":["PATH=/usr/bin","NGINX_VERSION=1.27"],"WorkingDir":"/srv","User":"nginx","StopSignal":"SIGQUIT",
-            "Labels":{"org.opencontainers.image.title":"nginx","maintainer":"someone"}}}"#;
+            "Labels":{"org.opencontainers.image.title":"nginx","maintainer":"someone"},
+            "Healthcheck":{"Test":["CMD-SHELL","curl -f http://localhost/ || exit 1"],"Interval":30000000000,"Timeout":3000000000,"Retries":3}}}"#;
         let spec = RunSpec::from_config(json).unwrap();
         assert_eq!(spec.entrypoint(), ["/docker-entrypoint.sh"]);
         assert_eq!(spec.cmd(), ["nginx", "-g", "daemon off;"]);
@@ -219,6 +227,12 @@ mod tests {
         assert_eq!(spec.working_dir.as_deref(), Some("/srv"));
         assert_eq!(spec.user.as_deref(), Some("nginx"));
         assert_eq!(spec.stop_signal.as_deref(), Some("SIGQUIT"));
+        let hc = spec.healthcheck.as_ref().unwrap();
+        assert_eq!(hc.test[1], "curl -f http://localhost/ || exit 1");
+        assert_eq!(
+            (hc.interval, hc.timeout, hc.retries),
+            (30_000_000, 3_000_000, 3)
+        );
         assert_eq!(
             spec.labels,
             BTreeMap::from([

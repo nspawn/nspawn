@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::BackendChoice;
 use crate::bridge::{Attachment, NetSpec, PortMap};
+use crate::health::Healthcheck;
 use crate::oci::{Mode, RunSpec};
 use crate::settings::Network;
 use crate::volume::Volume;
@@ -58,6 +59,9 @@ pub struct ImageRecord {
     /// still reads the record (as a machine of the default network).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_network: bool,
+    /// The --health-* flags, on top of the image's healthcheck (run.healthcheck).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<Healthcheck>,
     /// Ports published on the host, like docker -p (bridge network only).
     #[serde(default)]
     pub ports: Vec<PortMap>,
@@ -90,6 +94,11 @@ pub struct ImageRecord {
 }
 
 impl ImageRecord {
+    /// The machine's healthcheck, or the image's.
+    pub fn effective_healthcheck(&self) -> Option<&Healthcheck> {
+        self.healthcheck.as_ref().or(self.run.healthcheck.as_ref())
+    }
+
     /// The image's labels with the ones given to this machine on top.
     pub fn effective_labels(&self) -> BTreeMap<String, String> {
         let mut labels = self.run.labels.clone();
@@ -777,6 +786,11 @@ pub const PRIVATE: u32 = 0o700;
 pub const PASSAGE: u32 = 0o711;
 
 /// Creates a directory with `mode`, its missing parents too.
+/// A directory of root's alone, its parents too.
+pub fn create_private_dir(dir: &str) -> Result<()> {
+    create_dir_with_mode(Path::new(dir), PRIVATE)
+}
+
 fn create_dir_with_mode(dir: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new()
@@ -1600,6 +1614,7 @@ mod tests {
             extra_networks: Vec::new(),
             aliases: BTreeMap::new(),
             no_network: false,
+            healthcheck: None,
         };
         store.record_image(&rec).unwrap();
         assert_eq!(
@@ -1652,6 +1667,7 @@ mod tests {
             extra_networks: Vec::new(),
             aliases: BTreeMap::new(),
             no_network: false,
+            healthcheck: None,
         };
         store.record_image(&rec).unwrap();
         store
@@ -1855,6 +1871,7 @@ mod tests {
             extra_networks: Vec::new(),
             aliases: BTreeMap::new(),
             no_network: false,
+            healthcheck: None,
         };
         store
             .record_image(&record("ovl", BackendChoice::Overlay))

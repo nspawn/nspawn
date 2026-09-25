@@ -120,9 +120,18 @@ second (`--no-stream` for one reading, `--json` for scripts). With a policy, `st
 of an app also lets the stub init send the program SIGTERM and SIGHUP, since nobody
 stays to stop the unit later.
 
+Healthchecks are docker's: an image's `HEALTHCHECK`, or `--health-cmd` with
+`--health-interval`, `--health-timeout`, `--health-retries`, `--health-start-period` and
+`--health-start-interval` on `run`, `start`, `create` and `update` (`--no-healthcheck`
+turns the image's off), run a probe inside the machine at the interval; `ps` shows
+`(healthy)`, `(unhealthy)` or `(health: starting)` next to the state, `inspect` the last
+probes with their output, and `events` a `health_status` on every change. The probes run
+from a unit of their own (`nspawn-health-NAME.service`) bound to the machine's, so they
+go with it.
+
 `events` is docker events: what happens to machines (`start`, `die` with its exit code,
-`stop`, `restart`, `oom`, `fail`, and nspawn's own `pull`, `build`, `create`, `push`,
-`kill`, `update`, `remove`), networks and volumes, as it happens or between `--since`
+`stop`, `restart`, `oom`, `fail`, `health_status`, and nspawn's own `pull`, `build`,
+`create`, `push`, `kill`, `update`, `remove`), networks and volumes, as it happens or between `--since`
 and `--until`, filtered by name, type, event or label, as text or `--json`. It reads
 the journal, so machines started by `machinectl`, at boot or by a restart policy are
 there too, and so is what happened while nobody watched.

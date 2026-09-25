@@ -1002,6 +1002,35 @@ $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0];
 $NSPAWN update $app 2>/dev/null && fail "update with nothing to change succeeded"
 $NSPAWN update e2e-nope -m 64m 2>/dev/null && fail "update of an unknown machine succeeded"
 
+step "healthchecks: a probe inside the machine, its verdict in ps, inspect and events"
+health_since=$(date +%s)
+$NSPAWN start $app --health-cmd "test -f /ok" --health-interval 1s --health-retries 2 --health-timeout 5s -- /bin/sleep 300 || fail "start with a healthcheck"
+retry 5 systemctl is-active nspawn-health-$app.service >/dev/null || fail "the health runner unit is not running"
+retry 5 bash -c "$NSPAWN ps | grep '^ *$app ' | grep_q 'health: starting'" || fail "ps does not show the health as starting: $($NSPAWN ps | grep $app)"
+retry 10 bash -c "$NSPAWN ps | grep '^ *$app ' | grep_q '(unhealthy)'" || fail "two failed probes did not make the machine unhealthy: $($NSPAWN ps | grep $app)"
+$NSPAWN exec $app -- touch /ok </dev/null || fail "touch /ok"
+retry 10 bash -c "$NSPAWN ps | grep '^ *$app ' | grep_q '(healthy)'" || fail "a successful probe did not make the machine healthy: $($NSPAWN ps | grep $app)"
+$NSPAWN inspect $app | python3 -c "
+import json, sys
+d = json.load(sys.stdin)[0]
+assert d['health'] == 'healthy' and d['health_failing_streak'] == 0, d
+assert d['healthcheck']['test'] == ['CMD-SHELL', 'test -f /ok'] and d['healthcheck']['retries'] == 2 and d['healthcheck']['interval'] == 1000000, d['healthcheck']
+assert len(d['health_log']) >= 1, d" || fail "inspect does not show the health"
+out=$($NSPAWN events --since "@$health_since" --until now --filter name=$app --filter event=health_status)
+echo "$out" | grep_q "status=unhealthy" || fail "no health_status event for unhealthy: $out"
+echo "$out" | grep_q "status=healthy" || fail "no health_status event for healthy: $out"
+$NSPAWN update $app --health-retries 5 >/dev/null || fail "update the healthcheck"
+retry 5 systemctl is-active nspawn-health-$app.service >/dev/null || fail "the health runner did not come back after update"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['healthcheck']['retries'] == 5, d['healthcheck']" || fail "update did not change the retries"
+$NSPAWN stop $app || fail "stop the machine with a healthcheck"
+systemctl is-active nspawn-health-$app.service >/dev/null 2>&1 && fail "the health runner outlived the machine"
+[ -e /run/nspawn/health/$app.json ] && fail "the health status file was left behind"
+$NSPAWN start $app --no-healthcheck -- /bin/sleep 300 || fail "start with --no-healthcheck"
+sleep 1
+systemctl is-active nspawn-health-$app.service >/dev/null 2>&1 && fail "a runner started for a disabled healthcheck"
+$NSPAWN ps | grep "^ *$app " | grep_q "health" && fail "ps shows a health for a machine without healthcheck"
+$NSPAWN stop $app || fail "stop"
+
 step "stats: what running machines use, rates from two samples"
 $NSPAWN start $app -m 64m --pids-limit 0 -- /bin/sh -c 'while :; do :; done' >/dev/null || fail "start a busy app"
 out=$($NSPAWN stats --no-stream --json $app) || fail "stats --no-stream --json"

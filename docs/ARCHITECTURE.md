@@ -24,6 +24,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `install.rs`, `backend.rs` | turning blobs into a machine (overlay, flat, mstack) |
 | `settings.rs` | the `.nspawn` settings file and the unit hook drop-in |
 | `policy.rs` | restart policies and resource limits (`--restart`, `-m`, `--cpus`, `--pids-limit`), written into the hook drop-in |
+| `health.rs` | healthchecks: the image's or the flags', the probe runner (`health-run`, a transient unit bound to the machine's), its verdict under `/run/nspawn/health` |
 | `bridge.rs`, `hostnet.rs` | the nspawn0 bridge, ports, firewalls; veth mode |
 | `volume.rs`, `volmount.rs` | `-v` parsing; host-side mounts for mstack machines |
 | `nsenter.rs`, `pty.rs` | exec through namespaces, terminal pumping |
@@ -88,7 +89,16 @@ lock, starts `systemd-nspawn@NAME.service` and waits for machined to register
 the machine. The unit's hooks repeat the preparation (`network prepare`),
 publish ports and attach mstack volumes once it runs (`network publish`) and
 release everything however it ends (`network release`), so `machinectl start`,
-enabled units and programs that exit on their own behave the same.
+enabled units and programs that exit on their own behave the same. When the
+machine has a healthcheck, `network publish` also starts
+`nspawn-health-NAME.service`, a transient unit with `BindsTo=` the machine's
+that runs `nspawn health-run NAME`: the test through `nsenter` at its interval
+(the start interval during the start period), docker's rule for the verdict
+(a success is healthy, `retries` failures in a row are unhealthy, failures
+during the start period of a machine never healthy do not count), the verdict
+and the last five probes in `/run/nspawn/health/NAME.json`, which `ps` and
+`inspect` read, and a `health_status` event on every change; `network release`
+removes the file, the unit goes with the machine's.
 
 `stop` sends the image's stop signal to the program of an app machine and
 SIGKILLs the cgroup after `--timeout`; a booted machine gets SIGRTMIN+4

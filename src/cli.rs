@@ -87,6 +87,9 @@ pub enum Command {
     /// run --rm: removes a machine once its unit is down after that run.
     #[command(hide = true)]
     RemoveAfterExit { name: String, invocation: String },
+    /// From a transient unit: runs a machine's health probes until it is gone.
+    #[command(hide = true)]
+    HealthRun { name: String },
     /// ExecStart of an app machine: runs systemd-nspawn with the terminal or input an
     /// attached run hands over, or as it is.
     #[command(hide = true)]
@@ -347,10 +350,39 @@ pub struct CreateArgs {
     /// Remembered; applied at the next start.
     #[arg(long, value_name = "N")]
     pub pids_limit: Option<u64>,
+    #[command(flatten)]
+    pub health: HealthArgs,
     /// For app images: the arguments after -- replace the image's cmd and follow its
     /// entrypoint, as with docker.
     #[arg(last = true)]
     pub command: Vec<String>,
+}
+
+/// docker's --health-* flags, on top of the image's HEALTHCHECK; remembered.
+#[derive(Args, Debug, Default, Clone)]
+pub struct HealthArgs {
+    /// Command that says whether the machine is healthy, run inside it through /bin/sh
+    /// -c at every --health-interval, like docker --health-cmd: exit 0 is healthy.
+    #[arg(long, value_name = "COMMAND")]
+    pub health_cmd: Option<String>,
+    /// Time between probes, like docker: 10s, 1m30s, 500ms (default 30s).
+    #[arg(long, value_name = "DURATION", value_parser = crate::health::parse_duration)]
+    pub health_interval: Option<u64>,
+    /// Time a probe may take before it counts as failed (default 30s).
+    #[arg(long, value_name = "DURATION", value_parser = crate::health::parse_duration)]
+    pub health_timeout: Option<u64>,
+    /// Consecutive failed probes that make the machine unhealthy (default 3).
+    #[arg(long, value_name = "N")]
+    pub health_retries: Option<u32>,
+    /// Time after the start during which failed probes do not count (default 0).
+    #[arg(long, value_name = "DURATION", value_parser = crate::health::parse_duration)]
+    pub health_start_period: Option<u64>,
+    /// Time between probes during the start period (default 5s).
+    #[arg(long, value_name = "DURATION", value_parser = crate::health::parse_duration)]
+    pub health_start_interval: Option<u64>,
+    /// No probes, whatever the image says.
+    #[arg(long, conflicts_with_all = ["health_cmd", "health_interval", "health_timeout", "health_retries", "health_start_period", "health_start_interval"])]
+    pub no_healthcheck: bool,
 }
 
 #[derive(Args, Debug)]
@@ -466,6 +498,8 @@ pub struct UpdateArgs {
     /// Most processes and threads the machine may have; 0 removes the limit.
     #[arg(long, value_name = "N")]
     pub pids_limit: Option<u64>,
+    #[command(flatten)]
+    pub health: HealthArgs,
 }
 
 #[derive(Args, Debug)]
@@ -674,6 +708,8 @@ pub struct StartOptions {
     /// Remembered; applied at the next start.
     #[arg(long, value_name = "N")]
     pub pids_limit: Option<u64>,
+    #[command(flatten)]
+    pub health: HealthArgs,
 }
 
 #[derive(Args, Debug)]

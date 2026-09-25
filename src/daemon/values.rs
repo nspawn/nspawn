@@ -149,6 +149,25 @@ pub fn record(r: &ImageRecord) -> Dict {
             "stop_signal".to_string(),
             opt_string(r.run.stop_signal.as_deref()),
         ),
+        (
+            "healthcheck".to_string(),
+            v(r.effective_healthcheck()
+                .map(healthcheck)
+                .unwrap_or_default()),
+        ),
+    ])
+}
+
+/// A healthcheck: test (as), interval, timeout, start_period, start_interval (t,
+/// microseconds, 0 for the default), retries (u).
+fn healthcheck(h: &crate::health::Healthcheck) -> Dict {
+    HashMap::from([
+        ("test".to_string(), strings(&h.test)),
+        ("interval".to_string(), v(h.interval)),
+        ("timeout".to_string(), v(h.timeout)),
+        ("start_period".to_string(), v(h.start_period)),
+        ("start_interval".to_string(), v(h.start_interval)),
+        ("retries".to_string(), v(h.retries)),
     ])
 }
 
@@ -159,6 +178,23 @@ pub fn machine(m: &MachineSummary) -> Dict {
     dict.insert("started".to_string(), v(m.started.unwrap_or(0)));
     dict.insert("leader".to_string(), v(u64::from(m.leader.unwrap_or(0))));
     dict.insert("os".to_string(), opt_string(m.os.as_deref()));
+    if let Some(health) = &m.health {
+        dict.insert("health".to_string(), v(health.status.as_str()));
+        dict.insert(
+            "health_failing_streak".to_string(),
+            v(health.failing_streak),
+        );
+        dict.insert(
+            "health_log".to_string(),
+            strings(
+                &health
+                    .log
+                    .iter()
+                    .map(|p| format!("{} {} {}", p.end, p.exit_code, p.output))
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
     dict.insert(
         "machine_path".to_string(),
         v(if m.leader.is_some() {

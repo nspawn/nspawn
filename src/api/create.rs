@@ -48,6 +48,8 @@ pub struct CreateRequest {
     pub pids_limit: Option<u64>,
     /// App images: replaces the image's cmd and follows its entrypoint.
     pub command: Vec<String>,
+    /// The --health-* flags.
+    pub health: crate::health::Overrides,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +209,10 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     record.labels = labels;
     record.restart = request.restart.unwrap_or_default();
     record.limits = limits;
+    if !request.health.is_empty() {
+        let hc = request.health.apply(record.effective_healthcheck())?;
+        record.healthcheck = Some(hc);
+    }
     store.record_image(&record)?;
     crate::api::events::emit(
         "machine",

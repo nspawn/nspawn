@@ -600,13 +600,16 @@ impl Systemd {
     }
 
     /// Starts a transient unit with these properties and returns without waiting.
+    /// `mode` as StartTransientUnit takes it: "fail" when a job for the unit is pending,
+    /// "replace" to take over.
     pub async fn start_transient(
         &self,
         unit: &str,
         properties: Vec<(String, zbus::zvariant::OwnedValue)>,
+        mode: &str,
     ) -> Result<()> {
         self.manager
-            .start_transient_unit(unit.to_string(), "fail".to_string(), properties, Vec::new())
+            .start_transient_unit(unit.to_string(), mode.to_string(), properties, Vec::new())
             .await
             .with_context(|| format!("starting {unit}"))?;
         Ok(())

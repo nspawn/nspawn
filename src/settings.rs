@@ -829,6 +829,7 @@ mod tests {
         assert!(app_volume.ends_with("BindReadOnly=/var/lib/nspawn/machines/web/resolv.conf:/etc/resolv.conf\nBind=/srv/www:/www\n"));
 
         let run = RunSpec {
+            healthcheck: None,
             entrypoint: Vec::new(),
             cmd: vec!["nginx".into(), "-g".into(), "daemon off;".into()],
             command: Vec::new(),

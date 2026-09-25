@@ -178,7 +178,7 @@ async fn caller_gone(connection: zbus::Connection, name: Option<String>) {
 /// What StartMachine and RunMachine are asked: wait (b, default `wait`), network (s) or
 /// networks (as), aliases (as), publish (as), entrypoint (s), env (as), volume (as),
 /// label (as), restart (s), memory (t), cpus (d), pids_limit (t), image_command (b),
-/// command (as), remove (b).
+/// command (as), remove (b), and the flags of `health_overrides`.
 fn start_request(
     name: String,
     options: &mut Options<'_>,
@@ -204,6 +204,27 @@ fn start_request(
         image_command: options.bool("image_command", false)?,
         command: options.strings("command")?,
         remove: options.bool("remove", false)?,
+        health: health_overrides(options)?,
+    })
+}
+
+/// The --health-* flags: health_cmd (s), health_interval, health_timeout,
+/// health_start_period, health_start_interval (t, microseconds), health_retries (u),
+/// no_healthcheck (b).
+fn health_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::health::Overrides> {
+    Ok(crate::health::Overrides {
+        cmd: options.string("health_cmd")?,
+        interval: options.maybe_u64("health_interval")?,
+        timeout: options.maybe_u64("health_timeout")?,
+        start_period: options.maybe_u64("health_start_period")?,
+        start_interval: options.maybe_u64("health_start_interval")?,
+        retries: options
+            .maybe_u64("health_retries")?
+            .map(|n| {
+                u32::try_from(n).map_err(|_| anyhow::anyhow!("option health_retries is too large"))
+            })
+            .transpose()?,
+        disable: options.bool("no_healthcheck", false)?,
     })
 }
 
@@ -327,8 +348,8 @@ impl Manager {
 
     /// Like `create`. Options: backend (s), network (s) or networks (as), aliases (as),
     /// publish (as), force (b), entrypoint (s), env (as), volume (as), label (as),
-    /// restart (s), memory (t, bytes), cpus (d), pids_limit (t), command (as), registry
-    /// (s), ca_cert (s).
+    /// restart (s), memory (t, bytes), cpus (d), pids_limit (t), command (as), the flags
+    /// of `health_overrides`, registry (s), ca_cert (s).
     async fn create_machine(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -360,6 +381,7 @@ impl Manager {
             cpus: options.f64("cpus")?,
             pids_limit: options.maybe_u64("pids_limit")?,
             command: options.strings("command")?,
+            health: health_overrides(&mut options)?,
         };
         options.finish()?;
         let state = self.state.clone();
@@ -1042,9 +1064,9 @@ impl Manager {
     }
 
     /// docker update: options restart (s), memory (t, bytes), cpus (d), pids_limit (t),
-    /// 0 removing a limit, absent keeping it. A running machine gets the limits at once
-    /// (the restart policy applies to its next ending anyway). Returns whether it was
-    /// running.
+    /// 0 removing a limit, absent keeping it, and the flags of `health_overrides`. A
+    /// running machine gets the limits at once (the restart policy applies to its next
+    /// ending anyway) and its probes start over. Returns whether it was running.
     async fn update_machine(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -1063,6 +1085,7 @@ impl Manager {
             memory: options.maybe_u64("memory")?,
             cpus: options.f64("cpus")?,
             pids_limit: options.maybe_u64("pids_limit")?,
+            health: health_overrides(&mut options)?,
         };
         options.finish()?;
         Ok(api::machines::update(self.ctx(), &request).await?)

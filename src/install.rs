@@ -144,6 +144,7 @@ pub async fn install(
         extra_networks: Vec::new(),
         aliases: BTreeMap::new(),
         no_network: false,
+        healthcheck: None,
     })?;
     Ok(mode)
 }

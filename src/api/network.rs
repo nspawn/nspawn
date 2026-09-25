@@ -479,6 +479,12 @@ pub async fn publish(ctx: &Context, name: &str) -> Result<()> {
         }
         _ => {}
     }
+    if record
+        .effective_healthcheck()
+        .is_some_and(|h| !h.disabled())
+    {
+        crate::health::start_runner(ctx, name).await?;
+    }
     Ok(())
 }
 
@@ -488,6 +494,7 @@ pub async fn release(ctx: &Context, name: &str) -> Result<()> {
     crate::reference::validate_entry_name(name)?;
     let record = ctx.store.load_image(name)?;
     machines::release_machine(name, record.as_ref())?;
+    crate::health::clear_status(name);
     // `kill` sent the stop signal: a stop job queued while the unit winds down keeps
     // systemd from restarting it. Not waited for: it ends after this hook.
     if ctx.store.take_exit_on_next(name)? {
@@ -527,6 +534,7 @@ async fn remove_later(ctx: &Context, name: &str) -> Result<()> {
             &format!("Remove machine {name} once it stopped"),
             &argv,
         ),
+        "fail",
     )
     .await
 }

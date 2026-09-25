@@ -14,6 +14,7 @@ mod client;
 mod commands;
 mod config;
 mod daemon;
+mod health;
 mod hostnet;
 mod hub;
 mod install;

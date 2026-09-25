@@ -34,6 +34,8 @@ pub struct MachineSummary {
     pub leader: Option<u32>,
     /// PRETTY_NAME of the machine's os-release.
     pub os: Option<String>,
+    /// The verdict of its healthcheck, while it runs and has one.
+    pub health: Option<crate::health::Status>,
 }
 
 /// Refuses machined's non-containers (libvirt's virtual machines), which nspawn can neither
@@ -66,6 +68,7 @@ pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
                 .map(|d| d.started),
             leader: details.as_ref().map(|d| d.leader),
             os: sd.machine_os(name).await,
+            health: crate::health::read_status(name),
         });
     }
     let unit = sd
@@ -79,6 +82,7 @@ pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
             started: None,
             leader: None,
             os: None,
+            health: None,
         }),
         None => bail!("no machine or image named {name}"),
     }
@@ -113,6 +117,7 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
                 .map(|d| d.started),
             leader: details.as_ref().map(|d| d.leader),
             os: sd.machine_os(&m.name).await,
+            health: crate::health::read_status(&m.name),
         });
     }
     // Records machined does not list. Those between two runs of a restart policy show
@@ -143,6 +148,7 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
                 started: None,
                 leader: None,
                 os: None,
+                health: None,
             });
         }
     }
@@ -372,6 +378,8 @@ pub struct StartRequest {
     pub command: Vec<String>,
     /// run --rm.
     pub remove: bool,
+    /// The --health-* flags.
+    pub health: crate::health::Overrides,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -464,6 +472,10 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             }
             apply_limits(&mut r.limits, args.memory, args.cpus, args.pids_limit)?;
             r.limits.check(r.mode)?;
+            if !args.health.is_empty() {
+                let hc = args.health.apply(r.effective_healthcheck())?;
+                r.healthcheck = Some(hc);
+            }
             // Set on every start, so that a start without --rm keeps the machine.
             if args.remove && r.restart != Restart::No {
                 bail!("--rm and a restart policy exclude each other: a machine removed when it ends cannot be restarted (--restart no)");
@@ -482,10 +494,11 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             || args.memory.is_some()
             || args.cpus.is_some()
             || args.pids_limit.is_some()
+            || !args.health.is_empty()
             || args.remove =>
         {
             bail!(
-                "{} is not an image managed by nspawn; a command, network, ports, variables, volumes, labels, a restart policy or limits need one",
+                "{} is not an image managed by nspawn; a command, network, ports, variables, volumes, labels, a restart policy, limits or a healthcheck need one",
                 args.name
             )
         }
@@ -909,6 +922,8 @@ pub struct UpdateRequest {
     pub cpus: Option<f64>,
     /// Processes, 0 for none.
     pub pids_limit: Option<u64>,
+    /// The --health-* flags.
+    pub health: crate::health::Overrides,
 }
 
 /// docker update, through the record and the drop-in: at the reload systemd applies a
@@ -920,8 +935,11 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
         && args.memory.is_none()
         && args.cpus.is_none()
         && args.pids_limit.is_none()
+        && args.health.is_empty()
     {
-        bail!("nothing to update; give --memory, --cpus, --pids-limit or --restart");
+        bail!(
+            "nothing to update; give --memory, --cpus, --pids-limit, --restart or a --health flag"
+        );
     }
     let sd = ctx.sd().await?;
     refuse_foreign(sd, &args.name).await?;
@@ -957,6 +975,10 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     }
     apply_limits(&mut record.limits, args.memory, args.cpus, args.pids_limit)?;
     record.limits.check(record.mode)?;
+    if !args.health.is_empty() {
+        let hc = args.health.apply(record.effective_healthcheck())?;
+        record.healthcheck = Some(hc);
+    }
     store.record_image(&record)?;
     let route =
         settings::namespace_route(sd, &args.name, record.mode, bridge::bridge_kind(&record))
@@ -981,6 +1003,17 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     };
     if reload || changed {
         sd.reload().await?;
+    }
+    // The runner reads the record once, at its start.
+    if running && !args.health.is_empty() {
+        crate::health::stop_runner(sd, &args.name).await?;
+        crate::health::clear_status(&args.name);
+        if record
+            .effective_healthcheck()
+            .is_some_and(|h| !h.disabled())
+        {
+            crate::health::start_runner(ctx, &args.name).await?;
+        }
     }
     crate::api::events::emit("machine", "update", &args.name, &[]);
     Ok(running)

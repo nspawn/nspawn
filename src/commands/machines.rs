@@ -46,7 +46,7 @@ pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
                 image,
                 mode,
                 command,
-                client::string(m, "state"),
+                state_column(m),
                 if started > 0 {
                     human_duration(now.saturating_sub(started))
                 } else {
@@ -70,6 +70,16 @@ pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
         )
     );
     Ok(())
+}
+
+/// The state, and the healthcheck's verdict next to it as docker ps shows it.
+fn state_column(machine: &Dict) -> String {
+    let state = client::string(machine, "state");
+    match client::string(machine, "health").as_str() {
+        "" => state,
+        "starting" => format!("{state} (health: starting)"),
+        health => format!("{state} ({health})"),
+    }
 }
 
 /// Whether nspawn installed the machine's image: only then is there a record.
@@ -172,6 +182,7 @@ fn start_options(args: StartOptions, command: Vec<String>) -> Result<Options<'st
     if !command.is_empty() {
         options.insert("command", Value::from(command));
     }
+    super::put_health(&mut options, args.health);
     Ok(options)
 }
 
@@ -611,6 +622,7 @@ pub async fn update(args: UpdateArgs, client: &Client) -> Result<()> {
         if let Some(pids) = args.pids_limit {
             options.insert("pids_limit", Value::from(pids));
         }
+        super::put_health(&mut options, args.health.clone());
         match client.manager.update_machine(name, options).await {
             Ok(_) => println!("{name}"),
             Err(e) => {

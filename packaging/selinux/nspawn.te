@@ -24,7 +24,8 @@ files_type(nspawn_var_lib_t)
 type nspawn_etc_t;
 files_config_file(nspawn_etc_t)
 
-# /run/nspawn: the sockets an attached run waits on for its machine.
+# /run/nspawn: the sockets an attached run waits on for its machine, the verdicts of
+# the health probes, the secrets decrypted for a running machine.
 type nspawn_var_run_t;
 files_pid_file(nspawn_var_run_t)
 
@@ -66,8 +67,11 @@ manage_files_pattern(nspawn_t, nspawn_etc_t, nspawn_etc_t)
 files_etc_filetrans(nspawn_t, nspawn_etc_t, dir, "nspawn")
 # An attached run listens under /run/nspawn/attach, and the machine's ExecStart
 # (nspawn attach-exec, nspawn_t too) connects there for its terminal or input
-# before it execs systemd-nspawn.
+# before it execs systemd-nspawn. The health runner (nspawn health-run, a
+# transient unit) writes its verdict under /run/nspawn/health, and a machine's
+# secrets are decrypted under /run/nspawn/secrets while it runs.
 manage_dirs_pattern(nspawn_t, nspawn_var_run_t, nspawn_var_run_t)
+manage_files_pattern(nspawn_t, nspawn_var_run_t, nspawn_var_run_t)
 manage_sock_files_pattern(nspawn_t, nspawn_var_run_t, nspawn_var_run_t)
 files_pid_filetrans(nspawn_t, nspawn_var_run_t, dir, "nspawn")
 stream_connect_pattern(nspawn_t, nspawn_var_run_t, nspawn_var_run_t, nspawn_t)
