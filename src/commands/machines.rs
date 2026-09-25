@@ -535,7 +535,7 @@ async fn booted_shell(client: &Client, name: &str, options: Options<'_>) -> Resu
         "-c".to_string(),
         "if [ -x /bin/bash ]; then exec /bin/bash -l; else exec /bin/sh -l; fi".to_string(),
     ];
-    let code = run_command(client, name, &shell, "").await;
+    let code = run_command(client, name, &shell, "", ExecSpec::default()).await;
     let mut stop = Options::new();
     stop.insert("wait", Value::from(true));
     let stopped = client.manager.stop_machine(name, stop).await;
@@ -647,8 +647,30 @@ pub async fn update(args: UpdateArgs, client: &Client) -> Result<()> {
 /// over, a pseudo terminal when this is one, pipes otherwise; the exit status comes
 /// back through the process object.
 pub async fn exec(args: ExecArgs, client: &Client) -> Result<()> {
-    let code = run_command(client, &args.machine, &args.command, &args.user).await?;
+    let spec = ExecSpec {
+        env: crate::volume::expand_env(&args.env)?,
+        workdir: args.workdir,
+        tty: if args.tty {
+            Some(true)
+        } else if args.no_tty {
+            Some(false)
+        } else {
+            None
+        },
+        detach: args.detach,
+    };
+    let code = run_command(client, &args.machine, &args.command, &args.user, spec).await?;
     std::process::exit(code);
+}
+
+/// What `exec` asks beyond the command.
+#[derive(Debug, Default)]
+struct ExecSpec {
+    env: Vec<String>,
+    workdir: Option<String>,
+    /// None: a terminal when this is one.
+    tty: Option<bool>,
+    detach: bool,
 }
 
 /// A shell: the login session machined offers for a booted machine, the namespaces
@@ -657,7 +679,14 @@ pub async fn shell(args: ShellArgs, client: &Client) -> Result<()> {
     let image = client.manager.get_image(&args.machine).await.ok();
     if image.is_some_and(|i| client::string(&i, "mode") == "app") {
         let shell = vec!["/bin/sh".to_string()];
-        let code = run_command(client, &args.machine, &shell, &args.user).await?;
+        let code = run_command(
+            client,
+            &args.machine,
+            &shell,
+            &args.user,
+            ExecSpec::default(),
+        )
+        .await?;
         std::process::exit(code);
     }
     let mut options = Options::new();
@@ -680,23 +709,45 @@ fn terminal_env() -> Option<String> {
         .map(|t| format!("TERM={t}"))
 }
 
-async fn run_command(client: &Client, machine: &str, argv: &[String], user: &str) -> Result<i32> {
-    let tty = nix::unistd::isatty(io::stdin()).unwrap_or(false);
+async fn run_command(
+    client: &Client,
+    machine: &str,
+    argv: &[String],
+    user: &str,
+    spec: ExecSpec,
+) -> Result<i32> {
+    let tty = !spec.detach
+        && spec
+            .tty
+            .unwrap_or_else(|| nix::unistd::isatty(io::stdin()).unwrap_or(false));
     let (rows, cols) = pty::window_size().unwrap_or((24, 80));
     let mut options = Options::new();
     options.insert("tty", Value::from(tty));
     options.insert("rows", Value::from(rows as u64));
     options.insert("cols", Value::from(cols as u64));
+    let mut env = spec.env;
     if tty {
         if let Some(term) = terminal_env() {
-            options.insert("env", Value::from(vec![term]));
+            env.push(term);
         }
+    }
+    if !env.is_empty() {
+        options.insert("env", Value::from(env));
+    }
+    if let Some(workdir) = spec.workdir {
+        options.insert("workdir", Value::from(workdir));
+    }
+    if spec.detach {
+        options.insert("detach", Value::from(true));
     }
     let (mut fds, process): (HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath) = client
         .manager
         .exec(machine, argv, user, options)
         .await
         .map_err(client::error)?;
+    if spec.detach {
+        return Ok(0);
+    }
     let ended = Ended::watch(&client.connection, process).await?;
     let mut take = |name: &str| fds.remove(name).map(OwnedFd::from);
     if let Some(master) = take("tty") {

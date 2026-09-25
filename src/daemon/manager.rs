@@ -1471,10 +1471,12 @@ impl Manager {
         let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
         let mut options = Options::new(&options);
-        let tty = options.bool("tty", true)?;
+        let detach = options.bool("detach", false)?;
+        let tty = options.bool("tty", true)? && !detach;
         let rows = options.u64("rows", 24)?;
         let cols = options.u64("cols", 80)?;
         let env = options.strings("env")?;
+        let workdir = options.string("workdir")?;
         options.finish()?;
         let stdio = if tty {
             crate::nsenter::Stdio::Pty {
@@ -1492,8 +1494,16 @@ impl Manager {
             stdin,
             stdout,
             stderr,
-        } = api::machines::spawn_in_namespaces(self.ctx(), &machine, &argv, &user, &env, stdio)
-            .await?;
+        } = api::machines::spawn_in_namespaces(
+            self.ctx(),
+            &machine,
+            &argv,
+            &user,
+            &env,
+            workdir.as_deref(),
+            stdio,
+        )
+        .await?;
         let handle = pidfd
             .try_clone()
             .map_err(|e| Error::Failed(format!("duplicating the command's pidfd: {e}")))?;
@@ -1517,6 +1527,17 @@ impl Manager {
                 }
             };
         let mut fds = HashMap::new();
+        if detach {
+            // Nobody reads the command: its output is drained here, as docker exec -d
+            // discards it, so that it never blocks on a full pipe.
+            drop(stdin);
+            for fd in [stdout, stderr].into_iter().flatten() {
+                tokio::task::spawn_blocking(move || {
+                    let _ = std::io::copy(&mut std::fs::File::from(fd), &mut std::io::sink());
+                });
+            }
+            return Ok((fds, path));
+        }
         for (name, fd) in [
             ("tty", master),
             ("stdin", stdin),

@@ -855,6 +855,25 @@ pub struct ExecArgs {
     /// User inside the machine.
     #[arg(long, short = 'u', default_value = "root")]
     pub user: String,
+    /// Environment for the command, VAR=value or VAR (copied from here), like docker
+    /// exec -e. Repeatable.
+    #[arg(long, short = 'e', value_name = "VAR[=VALUE]")]
+    pub env: Vec<String>,
+    /// Working directory of the command, instead of the machine's.
+    #[arg(long, short = 'w', value_name = "DIR")]
+    pub workdir: Option<String>,
+    /// No terminal, even from one: pipes, as in a script.
+    #[arg(long = "no-tty", short = 'T', conflicts_with = "tty")]
+    pub no_tty: bool,
+    /// A terminal for the command, even without one here.
+    #[arg(long, short = 't')]
+    pub tty: bool,
+    /// Accepted for docker's sake: the command's input is always this one.
+    #[arg(long, short = 'i')]
+    pub interactive: bool,
+    /// Leave the command running in the background and return at once.
+    #[arg(long, short = 'd', conflicts_with_all = ["tty", "no_tty"])]
+    pub detach: bool,
     /// Accepted and ignored: exec always enters the machine's namespaces.
     #[arg(long, hide = true)]
     pub nsenter: bool,

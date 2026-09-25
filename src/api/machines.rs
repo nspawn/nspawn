@@ -1317,6 +1317,7 @@ pub async fn spawn_in_namespaces(
     command: &[String],
     user: &str,
     extra_env: &[String],
+    workdir: Option<&str>,
     stdio: nsenter::Stdio,
 ) -> Result<nsenter::Process> {
     validate_entry_name(machine)?;
@@ -1339,7 +1340,7 @@ pub async fn spawn_in_namespaces(
     } else {
         Some(user)
     };
-    let working_dir = record.and_then(|r| r.run.working_dir.as_deref());
+    let working_dir = workdir.or_else(|| record.and_then(|r| r.effective_working_dir()));
     let env = record
         .map(|r| volume::merge_env(&r.run.env, &r.env))
         .unwrap_or_default();

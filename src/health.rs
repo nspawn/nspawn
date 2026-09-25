@@ -417,6 +417,7 @@ async fn probe(ctx: &Context, name: &str, argv: &[String], timeout: Duration) ->
         argv,
         "root",
         &[],
+        None,
         nsenter::Stdio::Pipes,
     )
     .await?;

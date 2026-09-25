@@ -785,6 +785,9 @@ grep -q "RO-OK-$nonce" /tmp/e2e-logs.txt || fail "read-only volume was writable"
 [ "$(cat /var/lib/nspawn/volumes/e2evol/written 2>/dev/null)" = from-app ] || fail "named volume not written on the host"
 $NSPAWN ps | grep "^ *$app " | grep_q "/bin/sh -c" || fail "ps does not show the entrypoint plus arguments"
 [ "$($NSPAWN exec $app -- /bin/sh -c 'echo $GREETING' </dev/null | tr -d '\r')" = hola ] || fail "exec does not see -e variables"
+[ "$($NSPAWN exec -e X=1 -e E2E_HOST_VAR -w /tmp $app -- /bin/sh -c 'echo $X $E2E_HOST_VAR $(pwd)' </dev/null | tr -d '\r')" = "1 fromhost /tmp" ] || fail "exec -e or -w not applied"
+$NSPAWN exec -d $app -- /bin/sleep 7 </dev/null || fail "exec -d"
+$NSPAWN exec $app -- /bin/sh -c 'ps -o args | grep -q "^/bin/sleep 7$"' </dev/null || fail "exec -d did not leave the command running"
 # exec's command gets the machine's capabilities and nothing of the service's descriptors.
 leader_bnd=$(grep CapBnd "/proc/$(machinectl show $app -p Leader --value)/status")
 [ "$($NSPAWN exec $app -- /bin/grep CapBnd /proc/self/status </dev/null | tr -d '\r')" = "$leader_bnd" ] || fail "exec's command has other capabilities than the machine ($leader_bnd)"
