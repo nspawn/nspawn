@@ -131,11 +131,6 @@ async fn entries(ctx: &Context, network: &str) -> Result<Vec<NetworkEntry>> {
     Ok(entries)
 }
 
-/// The default network and its machines (ListNetwork).
-pub async fn list(ctx: &Context) -> Result<(BridgeInfo, Vec<NetworkEntry>)> {
-    Ok((bridge_info(ctx), entries(ctx, DEFAULT_NETWORK).await?))
-}
-
 pub fn list_networks(ctx: &Context) -> Result<Vec<NetworkSummary>> {
     let records = ctx.store.list_images()?;
     Ok(all(&ctx.store, &ctx.config)?

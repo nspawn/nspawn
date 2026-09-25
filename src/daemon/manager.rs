@@ -1395,20 +1395,9 @@ impl Manager {
         Ok((fds, path))
     }
 
-    /// The default network (bridge, subnet, gateway, host_name) and the machines on it
-    /// (name, address, ports, running).
-    async fn list_network(&self, #[zbus(header)] hdr: Header<'_>) -> Result<(Dict, Vec<Dict>)> {
-        self.allow(&hdr, Action::Inspect).await?;
-        let _busy = self.state.enter();
-        let (info, entries) = api::network::list(self.ctx()).await?;
-        Ok((
-            values::bridge(&info),
-            entries.iter().map(values::network_entry).collect(),
-        ))
-    }
-
-    /// Like `network up`: the default network as ListNetwork has it, the names of the
-    /// networks brought up under "networks", and the notes made on the way under "notes".
+    /// Like `network up`: the default network (bridge, subnet, gateway, host_name), the
+    /// names of the networks brought up under "networks", and the notes made on the way
+    /// under "notes".
     async fn network_up(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Dict> {
         self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();

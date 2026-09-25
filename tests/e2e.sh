@@ -1026,7 +1026,7 @@ if command -v busctl >/dev/null 2>&1; then
   B="busctl --system --timeout=120"
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine UpdateMachine Exec Events Shell Logs ListNetwork ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
+  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine UpdateMachine Exec Events Shell Logs ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do
@@ -1060,7 +1060,7 @@ if command -v busctl >/dev/null 2>&1; then
   grep -q '"machine_path" s "/org/freedesktop/machine1/machine/e2e_2ddbus"' /tmp/e2e-lm.txt || fail "ListMachines has no machined path"
   grep -q '"state" s "running"' /tmp/e2e-lm.txt || fail "ListMachines: not running"
   $B call $M GetMachine s e2e-dbus | grep_q '"state" s "running"' || fail "GetMachine of a running machine"
-  $B call $M ListNetwork | grep_q '"name" s "e2e-dbus"' || fail "ListNetwork misses the machine"
+  $B call $M GetNetwork s bridge | grep_q '"name" s "e2e-dbus"' || fail "GetNetwork misses the machine"
   # Every exec of this run went through Exec; each left a process object behind.
   out=$($NSPAWN exec e2e-dbus -- /bin/sh -c "echo via-bus-$nonce; exit 7" </dev/null); code=$?
   [ "$code" = 7 ] || fail "exec did not propagate the exit code (got $code)"
