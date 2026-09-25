@@ -73,7 +73,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-run-boot busybox-1.37 busybox-1.36; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot busybox-1.37 busybox-1.36; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -138,11 +138,24 @@ $NSPAWN hub tags "${IMAGE%%:*}" > /tmp/e2e-tags.txt || fail "hub tags"
 grep -qx "${IMAGE##*:}" /tmp/e2e-tags.txt || fail "tag ${IMAGE##*:} missing"
 
 # mstack images need systemd 261 with managed user namespaces (nsresourced, mountfsd).
+systemd_major=$(systemctl --version | awk 'NR==1{print $2}' | tr -dc 0-9)
 mstack_supported=no
-if [ "$(systemctl --version | awk 'NR==1{print $2}' | tr -dc 0-9)" -ge 261 ] 2>/dev/null \
+if [ "$systemd_major" -ge 261 ] 2>/dev/null \
   && [ -e /usr/lib/systemd/system/systemd-nsresourced.socket ] \
   && [ -e /usr/lib/systemd/system/systemd-mountfsd.socket ]; then
   mstack_supported=yes
+fi
+step "the default backend is overlay, whatever the host; mstack only by name"
+$NSPAWN pull "$IMAGE" --name e2e-auto --force > /tmp/e2e-auto.txt 2>&1 || { cat /tmp/e2e-auto.txt; fail "pull without --backend"; }
+$NSPAWN images ls | grep "^ *e2e-auto " | grep_q " overlay " || fail "auto did not choose overlay: $($NSPAWN images ls | grep e2e-auto)"
+grep -q "experimental" /tmp/e2e-auto.txt && fail "a pull without mstack was told mstack is experimental"
+$NSPAWN images rm e2e-auto >/dev/null || fail "rm e2e-auto"
+# The 262 release itself (not its later point releases, once the fix lands) cannot boot
+# a managed user namespace: systemd/systemd#43899. mstack is experimental, so that is
+# the host's business, not nspawn's to check; the suite only skips what cannot work.
+if [ "$mstack_supported" = yes ] && [ "$(systemctl --version | awk 'NR==1{print $2}')" = 262 ]; then
+  echo "mstack: the systemd 262 release cannot boot managed user namespaces (systemd/systemd#43899); skipped on this host"
+  mstack_supported=no
 fi
 for backend in overlay flat mstack; do
   if [ "$backend" = mstack ] && [ "$mstack_supported" != yes ]; then
@@ -154,6 +167,9 @@ for backend in overlay flat mstack; do
   $NSPAWN pull "$IMAGE" --name "$name" --backend "$backend" --force > /tmp/e2e-pull.txt 2>&1 || { cat /tmp/e2e-pull.txt; fail "pull ($backend)"; continue; }
   cat /tmp/e2e-pull.txt
   grep -q "(boot image)" /tmp/e2e-pull.txt || fail "$IMAGE not detected as a boot image"
+  if [ "$backend" = mstack ]; then
+    grep -q "mstack backend is experimental" /tmp/e2e-pull.txt || fail "pull --backend mstack did not say it is experimental"
+  fi
   step "images ls"
   $NSPAWN images ls | tee /tmp/e2e-img.txt
   grep -q "^ *$name " /tmp/e2e-img.txt || fail "$name not listed"

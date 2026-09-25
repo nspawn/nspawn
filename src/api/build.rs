@@ -8,7 +8,7 @@ use std::process::{ExitStatus, Stdio};
 use anyhow::{bail, Context as _, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::api::{line, require_root, Context, Report};
+use crate::api::{line, note, require_root, Context, Report};
 use crate::backend::{Backend, BackendChoice};
 use crate::hub::short_digest;
 use crate::install::{ensure_replaceable, install, remove_existing, Install};
@@ -73,6 +73,9 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
         request.backend
     };
     let backend = Backend::choose(choice, sd).await?;
+    if backend == Backend::Mstack {
+        note(report, crate::backend::MSTACK_EXPERIMENTAL);
+    }
 
     let build_id = format!("{name}-{}-{}", now_unix(), crate::store::unique_suffix());
     let output_dir = config.state_dir.join("builds").join(&build_id);

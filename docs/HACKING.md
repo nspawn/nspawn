@@ -32,7 +32,9 @@ is the oldest host the suite runs on; Debian 12 with systemd 252 does not
 work), overlayfs, `ip`, `nft`, `curl`, `python3`, access to Docker Hub, a
 registry with the test image (`fedora:44` by default), and mkosi for the build
 step. The mstack pass runs only on systemd 261 with systemd-nsresourced and
-systemd-mountfsd installed (Arch); elsewhere it is skipped and says so. The
+systemd-mountfsd installed; elsewhere it is skipped and says so, and so on
+the systemd 262 release, which cannot boot a managed user namespace until
+the fix for systemd/systemd#43899 lands in a later version. The
 suite installs the bus service first with `nspawn daemon --install` (a
 configuration file, /etc/nspawn/e2e.toml, carries the registry and CA), since the command
 line is its client; a section drives the service with `busctl` as well, and

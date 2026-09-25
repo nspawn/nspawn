@@ -21,7 +21,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `hub.rs`, `auth.rs`, `search.rs` | registry client, credentials, search |
 | `layout.rs`, `oci.rs` | OCI image layout reader, image config, boot/app detection |
 | `store.rs` | layers, blobs, records, manifests, gc, the store lock |
-| `install.rs`, `backend.rs` | turning blobs into a machine (overlay, flat, mstack) |
+| `install.rs`, `backend.rs` | turning blobs into a machine (overlay by default, flat without overlayfs, mstack only by name: experimental) |
 | `settings.rs` | the `.nspawn` settings file and the unit hook drop-in |
 | `policy.rs` | restart policies and resource limits (`--restart`, `-m`, `--cpus`, `--pids-limit`), written into the hook drop-in |
 | `health.rs` | healthchecks: the image's or the flags', the probe runner (`health-run`, a transient unit bound to the machine's), its verdict under `/run/nspawn/health` |

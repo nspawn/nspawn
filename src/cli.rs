@@ -332,7 +332,8 @@ pub struct PullArgs {
     /// Local image name (default: derived from the reference, e.g. fedora-44).
     #[arg(long, short = 'n')]
     pub name: Option<String>,
-    /// How to assemble the image on this host.
+    /// How to assemble the image on this host: auto is overlay, or flat without overlayfs;
+    /// mstack (systemd 261 or newer, managed user namespaces) is experimental.
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     pub backend: BackendChoice,
     /// Whether the image boots an init system or runs a single program.
@@ -531,7 +532,8 @@ pub struct BuildArgs {
     /// mkosi profile to enable (repeatable).
     #[arg(long)]
     pub profile: Vec<String>,
-    /// How to assemble the image on this host.
+    /// How to assemble the image on this host: auto is overlay, or flat without overlayfs;
+    /// mstack (systemd 261 or newer, managed user namespaces) is experimental.
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     pub backend: BackendChoice,
     /// Whether the image boots an init system or runs a single program.
@@ -745,7 +747,8 @@ pub struct RunArgs {
     /// always or never.
     #[arg(long, value_enum, default_value_t = PullPolicy::Missing)]
     pub pull: PullPolicy,
-    /// How to assemble the machine on this host.
+    /// How to assemble the machine on this host: auto is overlay, or flat without
+    /// overlayfs; mstack (systemd 261 or newer, managed user namespaces) is experimental.
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     pub backend: BackendChoice,
     /// Whether the image boots an init system or runs a single program; a mode other

@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 
-use crate::api::{line, require_root, Context, Report};
+use crate::api::{line, note, require_root, Context, Report};
 use crate::backend::{Backend, BackendChoice};
 use crate::hub::{short_digest, Hub};
 use crate::install::{ensure_replaceable, install, remove_existing, Install};
@@ -50,6 +50,9 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
         request.backend
     };
     let backend = Backend::choose(choice, sd).await?;
+    if backend == Backend::Mstack {
+        note(report, crate::backend::MSTACK_EXPERIMENTAL);
+    }
     let hub = Hub::new(config)?;
     let (manifest, manifest_digest) = hub.resolve(&oci).await?;
     // Digests become path components in the store; the registry does not get to choose them.

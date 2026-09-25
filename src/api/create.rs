@@ -4,7 +4,7 @@
 use anyhow::{bail, Context as _, Result};
 use oci_client::manifest::OciImageManifest;
 
-use crate::api::{line, require_root, Context, Report};
+use crate::api::{line, note, require_root, Context, Report};
 use crate::backend::{Backend, BackendChoice};
 use crate::bridge;
 use crate::hub::short_digest;
@@ -144,6 +144,9 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         request.backend
     };
     let backend = Backend::choose(choice, sd).await?;
+    if backend == Backend::Mstack {
+        note(report, crate::backend::MSTACK_EXPERIMENTAL);
+    }
     remove_existing(store, sd, &request.name, report).await?;
     line(
         report,

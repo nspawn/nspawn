@@ -74,18 +74,16 @@ impl Backend {
             BackendChoice::Overlay => Ok(Backend::Overlay),
             BackendChoice::Flat => Ok(Backend::Flat),
             BackendChoice::Mstack => {
-                if mstack_supported(sd).await {
-                    Ok(Backend::Mstack)
-                } else {
+                if !mstack_supported(sd).await {
                     bail!(
                         "mstack images need systemd 261 or newer with systemd-nsresourced running"
                     )
                 }
+                Ok(Backend::Mstack)
             }
+            // mstack is experimental and only ever chosen by name.
             BackendChoice::Auto => {
-                if mstack_supported(sd).await {
-                    Ok(Backend::Mstack)
-                } else if overlay_supported() {
+                if overlay_supported() {
                     Ok(Backend::Overlay)
                 } else {
                     Ok(Backend::Flat)
@@ -94,6 +92,9 @@ impl Backend {
         }
     }
 }
+
+/// What every pull, build or create with the mstack backend says.
+pub const MSTACK_EXPERIMENTAL: &str = "note: the mstack backend is experimental: it boots the machine in a managed user namespace through systemd-nsresourced and systemd-mountfsd, which are still settling; overlay is the default";
 
 pub fn systemd_major(version: &str) -> Option<u32> {
     version
