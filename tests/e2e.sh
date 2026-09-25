@@ -644,6 +644,11 @@ echo "$out" | grep_q "nspawn start e2e-run" || fail "run over an existing name d
 out=$($NSPAWN run e2e/nothing-$nonce:1 --pull never 2>&1) && fail "run --pull never pulled"
 echo "$out" | grep_q "no local image" || fail "run --pull never without a local image was not explained: $out"
 $NSPAWN images ls | grep_q "nothing-$nonce" && fail "run --pull never left an image behind"
+# Several machines at once: every line carries its machine's name; --until ends a follow.
+$NSPAWN logs $app e2e-run --until now > /tmp/e2e-logs2.txt 2>&1 || fail "logs of two machines"
+grep -q "^e2e-run  *| " /tmp/e2e-logs2.txt || fail "logs of two machines carry no names: $(head -3 /tmp/e2e-logs2.txt)"
+grep -q "^$app | " /tmp/e2e-logs2.txt || fail "logs of two machines miss $app"
+timeout 20 $NSPAWN logs e2e-run -f --until now >/dev/null 2>&1 || fail "logs -f --until did not end by itself"
 $NSPAWN rm -f e2e-run >/dev/null || fail "rm -f e2e-run"
 systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit left in failed state after stop"
 

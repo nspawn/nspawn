@@ -895,30 +895,88 @@ fn event_line(event: &serde_json::Value) -> String {
 /// docker logs: journalctl's output comes through pipes from the service, and its exit
 /// status through the process object.
 pub async fn logs(args: LogsArgs, client: &Client) -> Result<()> {
-    let mut options = Options::new();
-    options.insert("follow", Value::from(args.follow));
-    if let Some(lines) = args.lines {
-        options.insert("lines", Value::from(lines as u64));
+    let mut streams = Vec::new();
+    for machine in &args.machines {
+        let mut options = Options::new();
+        options.insert("follow", Value::from(args.follow));
+        if let Some(lines) = args.lines {
+            options.insert("lines", Value::from(lines as u64));
+        }
+        if let Some(since) = &args.since {
+            options.insert("since", Value::from(since.clone()));
+        }
+        if let Some(until) = &args.until {
+            options.insert("until", Value::from(until.clone()));
+        }
+        options.insert("timestamps", Value::from(args.timestamps));
+        options.insert("all", Value::from(args.all));
+        options.insert("inside", Value::from(args.inside));
+        let (mut fds, process) = client
+            .manager
+            .logs(machine, options)
+            .await
+            .map_err(client::error)?;
+        let ended = Ended::watch(&client.connection, process).await?;
+        let (Some(stdout), Some(stderr)) = (fds.remove("stdout"), fds.remove("stderr")) else {
+            bail!("the service returned no streams for the logs of {machine}");
+        };
+        streams.push((
+            machine.clone(),
+            OwnedFd::from(stdout),
+            OwnedFd::from(stderr),
+            ended,
+        ));
     }
-    if let Some(since) = args.since {
-        options.insert("since", Value::from(since));
+    let mut ended = Vec::new();
+    if streams.len() == 1 {
+        let (_, stdout, stderr, end) = streams.remove(0);
+        tokio::task::block_in_place(|| pump_output(stdout, stderr))?;
+        ended.push(end);
+    } else {
+        let mut pumps = Vec::new();
+        for (name, stdout, stderr, end) in streams {
+            pumps.push((name, stdout, stderr));
+            ended.push(end);
+        }
+        tokio::task::block_in_place(|| pump_prefixed(pumps))?;
     }
-    options.insert("timestamps", Value::from(args.timestamps));
-    options.insert("all", Value::from(args.all));
-    options.insert("inside", Value::from(args.inside));
-    let (mut fds, process) = client
-        .manager
-        .logs(&args.machine, options)
-        .await
-        .map_err(client::error)?;
-    let ended = Ended::watch(&client.connection, process).await?;
-    let (Some(stdout), Some(stderr)) = (fds.remove("stdout"), fds.remove("stderr")) else {
-        bail!("the service returned no streams for the logs");
-    };
-    tokio::task::block_in_place(|| pump_output(OwnedFd::from(stdout), OwnedFd::from(stderr)))?;
-    let code = ended.status().await?;
+    let mut code = 0;
+    for end in ended {
+        code = code.max(end.status().await?);
+    }
     if code != 0 {
         std::process::exit(code);
+    }
+    Ok(())
+}
+
+/// Several machines' output on this process's streams, every line behind its machine's
+/// name, the way docker compose shows them. Lines are printed whole, so they never mix.
+fn pump_prefixed(streams: Vec<(String, OwnedFd, OwnedFd)>) -> Result<()> {
+    let width = streams.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
+    let mut threads = Vec::new();
+    for (name, stdout, stderr) in streams {
+        for (fd, to_stderr) in [(stdout, false), (stderr, true)] {
+            let prefix = format!("{name:width$} | ");
+            threads.push(thread::spawn(move || -> Result<()> {
+                let reader = io::BufReader::new(File::from(fd));
+                for line in io::BufRead::split(reader, b'\n') {
+                    let line = line.context("reading the logs")?;
+                    let text = String::from_utf8_lossy(&line);
+                    if to_stderr {
+                        eprintln!("{prefix}{text}");
+                    } else {
+                        println!("{prefix}{text}");
+                    }
+                }
+                Ok(())
+            }));
+        }
+    }
+    for thread in threads {
+        thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("logs pump panicked"))??;
     }
     Ok(())
 }

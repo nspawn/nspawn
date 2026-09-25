@@ -1390,6 +1390,8 @@ pub struct LogsRequest {
     pub lines: Option<u32>,
     /// journalctl --since syntax.
     pub since: Option<String>,
+    /// journalctl --until syntax; nothing is followed then.
+    pub until: Option<String>,
     pub timestamps: bool,
     /// Also systemd's messages about the unit.
     pub all: bool,
@@ -1427,7 +1429,10 @@ pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
     if let Some(since) = &args.since {
         argv.push(format!("--since={since}"));
     }
-    if args.follow {
+    if let Some(until) = &args.until {
+        argv.push(format!("--until={until}"));
+    }
+    if args.follow && args.until.is_none() {
         argv.push("--follow".to_string());
     }
     argv
@@ -1596,6 +1601,17 @@ mod tests {
                 "_TRANSPORT=stdout"
             ]
         );
+        let until = LogsRequest {
+            follow: true,
+            until: Some("now".into()),
+            ..base.clone()
+        };
+        let argv = journalctl_arguments(&until);
+        assert!(argv.contains(&"--until=now".to_string()));
+        assert!(
+            !argv.iter().any(|a| a == "--follow"),
+            "nothing is followed up to a time"
+        );
         let follow = LogsRequest {
             machine: "web".into(),
             follow: true,
@@ -1608,6 +1624,7 @@ mod tests {
             follow: true,
             lines: Some(50),
             since: Some("10 min ago".into()),
+            until: None,
             timestamps: true,
             all: true,
             inside: false,

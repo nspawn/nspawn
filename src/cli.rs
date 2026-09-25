@@ -893,8 +893,9 @@ pub struct ShellArgs {
 
 #[derive(Args, Debug, Default)]
 pub struct LogsArgs {
-    /// Machine name.
-    pub machine: String,
+    /// Machine names; with several, every line carries its machine's name.
+    #[arg(required = true)]
+    pub machines: Vec<String>,
     /// Keep printing new output (starts from the last 10 lines unless --lines says otherwise).
     #[arg(long, short = 'f')]
     pub follow: bool,
@@ -904,6 +905,9 @@ pub struct LogsArgs {
     /// Only output newer than this (journalctl --since syntax, e.g. "10 min ago" or -1h).
     #[arg(long, value_name = "WHEN", allow_hyphen_values = true)]
     pub since: Option<String>,
+    /// Only output older than this (journalctl --until syntax); nothing is followed then.
+    #[arg(long, value_name = "WHEN", allow_hyphen_values = true)]
+    pub until: Option<String>,
     /// Prefix every line with its timestamp.
     #[arg(long, short = 't')]
     pub timestamps: bool,

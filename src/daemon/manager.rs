@@ -1267,6 +1267,7 @@ impl Manager {
             follow: options.bool("follow", false)?,
             lines: Some(options.u64("lines", 0)?.min(u32::MAX as u64) as u32).filter(|n| *n > 0),
             since: options.string("since")?,
+            until: options.string("until")?,
             timestamps: options.bool("timestamps", false)?,
             all: options.bool("all", false)?,
             inside: options.bool("inside", false)?,
