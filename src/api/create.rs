@@ -22,9 +22,11 @@ pub struct CreateRequest {
     pub name: String,
     /// Auto: like the source.
     pub backend: BackendChoice,
-    /// None: like the source.
-    /// bridge, veth, host or a network's name.
-    pub network: Option<String>,
+    /// bridge, veth, host, none or networks' names, the first one primary; empty: the
+    /// source's kind.
+    pub network: Vec<String>,
+    /// NAME or NETWORK=NAME.
+    pub aliases: Vec<String>,
     /// HOST:CONTAINER[/udp], like start -p.
     pub publish: Vec<String>,
     pub force: bool,
@@ -96,6 +98,11 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     // Everything given is checked before the old machine goes or the new one is
     // assembled.
     let ports = bridge::parse_publish(&request.publish)?;
+    let network = if request.network.is_empty() {
+        None
+    } else {
+        Some(crate::api::network::choices(&request.network)?)
+    };
     let env = volume::parse_env(&request.env)?;
     let volumes = volume::parse_volumes(&request.volume)?;
     let labels = volume::parse_labels(&request.label)?;
@@ -167,14 +174,22 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     let mut record = store
         .load_image(&request.name)?
         .context("the record of the new machine is missing")?;
-    match &request.network {
-        Some(network) => {
-            (record.network, record.network_name) = crate::api::network::choice(network)?;
-        }
+    match &network {
+        Some(choice) => crate::api::network::apply(&mut record, choice),
         None => {
             record.network = source.network;
             record.network_name = None;
         }
+    }
+    if !request.aliases.is_empty() {
+        if !bridge::bridge_kind(&record) {
+            bail!(
+                "aliases are names on a bridge network; {} joins none",
+                request.name
+            );
+        }
+        record.aliases =
+            crate::api::network::parse_aliases(&request.aliases, &bridge::networks_of(&record))?;
     }
     record.ports = ports;
     if let Some(entrypoint) = &request.entrypoint {

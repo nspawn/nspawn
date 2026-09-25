@@ -265,6 +265,9 @@ mod tests {
                 restart: Default::default(),
                 limits: Default::default(),
                 remove_on_exit: false,
+                extra_networks: Vec::new(),
+                aliases: BTreeMap::new(),
+                no_network: false,
             })
             .unwrap();
     }

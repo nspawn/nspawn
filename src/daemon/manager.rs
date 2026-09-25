@@ -175,9 +175,10 @@ async fn caller_gone(connection: zbus::Connection, name: Option<String>) {
     }
 }
 
-/// What StartMachine and RunMachine are asked: wait (b, default `wait`), network (s),
-/// publish (as), entrypoint (s), env (as), volume (as), label (as), restart (s), memory
-/// (t), cpus (d), pids_limit (t), image_command (b), command (as), remove (b).
+/// What StartMachine and RunMachine are asked: wait (b, default `wait`), network (s) or
+/// networks (as), aliases (as), publish (as), entrypoint (s), env (as), volume (as),
+/// label (as), restart (s), memory (t), cpus (d), pids_limit (t), image_command (b),
+/// command (as), remove (b).
 fn start_request(
     name: String,
     options: &mut Options<'_>,
@@ -186,7 +187,8 @@ fn start_request(
     Ok(api::machines::StartRequest {
         name,
         wait: options.bool("wait", wait)?,
-        network: network_choice(options.string("network")?)?,
+        network: network_choice(options.string("network")?, options.strings("networks")?)?,
+        aliases: options.strings("aliases")?,
         publish: options.strings("publish")?,
         entrypoint: options.string("entrypoint")?,
         env: options.strings("env")?,
@@ -205,17 +207,18 @@ fn start_request(
     })
 }
 
-/// The network option: bridge, veth, host or a network's name, checked before anything
-/// is done.
-fn network_choice(text: Option<String>) -> anyhow::Result<Option<String>> {
-    match text {
-        None => Ok(None),
-        Some(text) if text.is_empty() => Ok(None),
-        Some(text) => {
-            api::network::choice(&text)?;
-            Ok(Some(text))
-        }
+/// The network options: `networks` (as) when given, else `network` (s): bridge, veth,
+/// host, none or networks' names, checked before anything is done.
+fn network_choice(one: Option<String>, several: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let texts = if !several.is_empty() {
+        several
+    } else {
+        one.filter(|t| !t.is_empty()).into_iter().collect()
+    };
+    if !texts.is_empty() {
+        api::network::choices(&texts)?;
     }
+    Ok(texts)
 }
 
 #[zbus::interface(name = "org.nspawn.Manager")]
@@ -263,8 +266,8 @@ impl Manager {
     }
 
     /// Everything nspawn keeps about one image: reference, digest, backend, mode,
-    /// network, address, ports, volumes, env, entrypoint, cmd, command, and the OCI
-    /// config's image_env, working_dir, user and stop_signal.
+    /// network, networks, address, addresses, aliases, ports, volumes, env, entrypoint,
+    /// cmd, command, and the OCI config's image_env, working_dir, user and stop_signal.
     async fn get_image(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<Dict> {
         self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
@@ -322,9 +325,10 @@ impl Manager {
         .await?)
     }
 
-    /// Like `create`. Options: backend (s), network (s), publish (as), force (b),
-    /// entrypoint (s), env (as), volume (as), label (as), restart (s), memory (t, bytes),
-    /// cpus (d), pids_limit (t), command (as), registry (s), ca_cert (s).
+    /// Like `create`. Options: backend (s), network (s) or networks (as), aliases (as),
+    /// publish (as), force (b), entrypoint (s), env (as), volume (as), label (as),
+    /// restart (s), memory (t, bytes), cpus (d), pids_limit (t), command (as), registry
+    /// (s), ca_cert (s).
     async fn create_machine(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -340,7 +344,8 @@ impl Manager {
             source,
             name: name.clone(),
             backend: backend_choice(options.string("backend")?)?,
-            network: network_choice(options.string("network")?)?,
+            network: network_choice(options.string("network")?, options.strings("networks")?)?,
+            aliases: options.strings("aliases")?,
             publish: options.strings("publish")?,
             force: options.bool("force", false)?,
             entrypoint: options.string("entrypoint")?,
@@ -718,8 +723,9 @@ impl Manager {
     }
 
     /// Like `network create`: options subnet (s, CIDR; the next free /24 of
-    /// network_pool otherwise), internal (b). The bridge comes up at once. Returns the
-    /// network as ListNetworks has it, and the notes made on the way under "notes".
+    /// network_pool otherwise), internal (b), labels (as, KEY=VALUE). The bridge comes up
+    /// at once. Returns the network as ListNetworks has it, and the notes made on the way
+    /// under "notes".
     async fn create_network(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -731,6 +737,7 @@ impl Manager {
         let mut options = Options::new(&options);
         let subnet = options.string("subnet")?;
         let internal = options.bool("internal", false)?;
+        let labels = crate::volume::parse_labels(&options.strings("labels")?)?;
         options.finish()?;
         let notes = Notes::default();
         let spec = api::network::create(
@@ -738,6 +745,7 @@ impl Manager {
             &name,
             subnet.as_deref(),
             internal,
+            labels,
             &notes.report(),
         )
         .await?;

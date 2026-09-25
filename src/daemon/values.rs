@@ -68,16 +68,52 @@ pub fn record(r: &ImageRecord) -> Dict {
         ("origin".to_string(), v(r.origin.as_str())),
         ("mode".to_string(), v(r.mode.name())),
         ("created".to_string(), v(r.created)),
-        // As --network spells it: bridge, veth, host or the network's name.
+        // As --network spells it: bridge, veth, host, none or the primary network's name.
         (
             "network".to_string(),
-            v(r.network_name
-                .clone()
-                .unwrap_or_else(|| format!("{:?}", r.network).to_lowercase())),
+            v(if r.no_network {
+                "none".to_string()
+            } else {
+                r.network_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{:?}", r.network).to_lowercase())
+            }),
         ),
         (
             "address".to_string(),
             opt_string(r.address.map(|a| a.to_string()).as_deref()),
+        ),
+        (
+            "networks".to_string(),
+            strings(&if crate::bridge::bridge_kind(r) {
+                crate::bridge::networks_of(r)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            } else {
+                Vec::new()
+            }),
+        ),
+        (
+            "addresses".to_string(),
+            map(&crate::bridge::networks_of(r)
+                .into_iter()
+                .filter(|_| crate::bridge::bridge_kind(r))
+                .filter_map(|n| {
+                    crate::bridge::address_on(r, n).map(|a| (n.to_string(), a.to_string()))
+                })
+                .collect()),
+        ),
+        (
+            "aliases".to_string(),
+            strings(
+                &r.aliases
+                    .iter()
+                    .flat_map(|(network, names)| {
+                        names.iter().map(move |a| format!("{network}={a}"))
+                    })
+                    .collect::<Vec<_>>(),
+            ),
         ),
         (
             "ports".to_string(),
@@ -193,7 +229,7 @@ pub fn bridge(b: &BridgeInfo) -> Dict {
 }
 
 /// A network: name, interface, subnet, gateway, internal, created (unix seconds, 0 for
-/// the default one).
+/// the default one), labels.
 pub fn network(n: &NetSpec) -> Dict {
     HashMap::from([
         ("name".to_string(), v(n.name.as_str())),
@@ -202,6 +238,7 @@ pub fn network(n: &NetSpec) -> Dict {
         ("gateway".to_string(), v(n.subnet.gateway().to_string())),
         ("internal".to_string(), v(n.internal)),
         ("created".to_string(), v(n.created)),
+        ("labels".to_string(), map(&n.labels)),
     ])
 }
 
@@ -219,6 +256,7 @@ pub fn network_entry(e: &NetworkEntry) -> Dict {
             "address".to_string(),
             opt_string(e.address.map(|a| a.to_string()).as_deref()),
         ),
+        ("aliases".to_string(), strings(&e.aliases)),
         (
             "ports".to_string(),
             strings(&e.ports.iter().map(|p| p.to_string()).collect::<Vec<_>>()),

@@ -43,17 +43,20 @@ files, and the machine units call nspawn back through drop-in hooks.
                      of a pull in flight, which the collector leaves alone
   images/NAME.json   the record: reference, backend, mode, network (and
                      network_name for a user-defined one), address,
-                     ports, entrypoint/cmd, env, volumes, labels,
-                     restart policy, limits
+                     extra_networks with their addresses, aliases,
+                     no_network, ports, entrypoint/cmd, env, volumes,
+                     labels, restart policy, limits
   manifests/NAME.json raw manifest bytes (digest stays valid)
-  machines/NAME/     overlay upper/work, host0.network, hosts, resolv.conf,
+  machines/NAME/     overlay upper/work, host0.network (host1.. for the
+                     other networks), hosts, resolv.conf,
                      units/ for the volume wait unit, exit-on-next when
                      `kill` sent the stop signal, last-signal (what `kill`
                      or `stop` sent the current run); 0700 with a writable
                      layer, 0711 otherwise (an mstack machine binds its
                      files from inside its user namespace)
   volumes/NAME/      named volumes
-  networks/NAME.json user-defined networks: interface, subnet, internal
+  networks/NAME.json user-defined networks: interface, subnet, internal,
+                     labels
   starting/NAME      a start in progress, until the machine is registered:
                      nothing removes or replaces the image meanwhile
   .lock              flock serialising commands that change the store
@@ -220,15 +223,26 @@ connections to published ports cross (DNAT), anything else from one bridge to
 another is dropped, which holds whatever firewalld or iptables accept. The
 table is always written for all networks at once, so bringing one bridge up
 never drops another's rules. A machine's record says its network kind
-(`network`) and, for a user-defined network, its name in `network_name`: an
-older nspawn reads such a record as a machine of the default network. Booted machines get a fixed address through a
-`.network` file mounted at `/run/systemd/network/10-host0.network`; app
-machines get a namespace built beforehand (`ip netns`, veth, address, route)
-referenced by `NamespacePath=`. Under managed user namespaces (mstack) nspawn
-has systemd-nsresourced create the veth and does not put its host end on the
-bridge, so the publish hook does (`bridge::adopt_managed_veth`, which finds the
-peer of the machine's host0 through its sysfs). `/etc/hosts` lists every machine of the
-same network and `host.nspawn.internal`, that network's gateway. With firewalld the
+(`network`) and, for a user-defined network, its name in `network_name`; the
+other bridge networks it joins are `extra_networks`, each with the machine's
+address there, its extra names on each network are `aliases`, and `--network
+none` is `no_network` (`Private=yes`). All three are separate fields, so an
+older nspawn reads such a record as a machine of its primary network alone.
+The primary network is the first `--network`; the default route goes through
+the first network that is not internal (`bridge::gateway_index`). Booted
+machines get a fixed address on each network through `.network` files mounted
+at `/run/systemd/network/10-host0.network`, `11-host1.network`.., host0 on the
+primary bridge through `Bridge=` and the others through `VirtualEthernetExtra=`,
+whose host ends (`vb1-NAME`..) the publish hook puts on their bridges; app
+machines get a namespace built beforehand (`ip netns`, one veth per network,
+addresses, route) referenced by `NamespacePath=`. Under managed user
+namespaces (mstack) nspawn has systemd-nsresourced create the veths and does
+not put their host ends on the bridges, so the publish hook does
+(`bridge::adopt_managed_veth`, which finds the peer of each `hostN` through the
+machine's sysfs). `/etc/hosts` lists, for each network the machine joins, every
+member with its address there, its name and its aliases on that network (an
+alias several members share names the first of them by name), and
+`host.nspawn.internal`, the gateway of the machine's gateway network. With firewalld the
 bridges are bound to the trusted zone; with docker or ufw, accept rules go into
 DOCKER-USER or FORWARD. `network rm` undoes all of it for its bridge. The
 bridge is IPv4 only: it gets `addrgenmode none` and no `fe80::` address,

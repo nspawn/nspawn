@@ -139,6 +139,17 @@ pub struct NetSpec {
     /// Unix seconds; 0 for the default network.
     #[serde(default)]
     pub created: u64,
+    /// KEY=VALUE, as docker network create --label.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+}
+
+/// A network a machine joins besides its primary one, and its address there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub network: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<Ipv4Addr>,
 }
 
 /// nsbr-NAME, hashed when too long for an interface name (15 characters).
@@ -707,36 +718,55 @@ pub fn host_end_name(name: &str) -> String {
     format!("vb-{}", short_hash(name))
 }
 
+/// The host end of the machine's veth on its `index`th network: vb-NAME for the first,
+/// vb1-NAME, vb2-NAME.. for the others.
+pub fn host_end_name_at(name: &str, index: usize) -> String {
+    if index == 0 {
+        return host_end_name(name);
+    }
+    let plain = format!("vb{index}-{name}");
+    if plain.len() <= 15 {
+        return plain;
+    }
+    format!("vb{index}-{}", short_hash(name))
+}
+
 /// An app machine's network namespace, ready before its program starts: a veth pair on
-/// the bridge, the address and the default route.
-pub fn create_netns(net: &NetSpec, name: &str, addr: Ipv4Addr) -> Result<()> {
+/// each of its bridges (host0 on the first), the addresses and the default route through
+/// `gateway`.
+pub fn create_netns(nets: &[(&NetSpec, Ipv4Addr)], name: &str, gateway: Ipv4Addr) -> Result<()> {
     let ns = netns_name(name);
     delete_netns(name);
-    let host_end = host_end_name(name);
-    let _ = run("ip", &["link", "del", &host_end]);
+    for i in 0..nets.len() {
+        let _ = run("ip", &["link", "del", &host_end_name_at(name, i)]);
+    }
     run("ip", &["netns", "add", &ns])?;
     let result = (|| {
-        run(
-            "ip",
-            &[
-                "link", "add", &host_end, "type", "veth", "peer", "name", "host0", "netns", &ns,
-            ],
-        )?;
-        run(
-            "ip",
-            &["link", "set", &host_end, "master", &net.interface, "up"],
-        )?;
         run("ip", &["-n", &ns, "link", "set", "lo", "up"])?;
-        let address = format!("{addr}/{}", net.subnet.prefix);
-        run("ip", &["-n", &ns, "addr", "add", &address, "dev", "host0"])?;
-        // No link-local IPv6 address for machined to hand out under the machine's name.
-        // A host booted without IPv6 refuses the setting and has none anyway.
-        let _ = run(
-            "ip",
-            &["-n", &ns, "link", "set", "host0", "addrgenmode", "none"],
-        );
-        run("ip", &["-n", &ns, "link", "set", "host0", "up"])?;
-        let gateway = net.subnet.gateway().to_string();
+        for (i, (net, addr)) in nets.iter().enumerate() {
+            let host_end = host_end_name_at(name, i);
+            let inside = format!("host{i}");
+            run(
+                "ip",
+                &[
+                    "link", "add", &host_end, "type", "veth", "peer", "name", &inside, "netns", &ns,
+                ],
+            )?;
+            run(
+                "ip",
+                &["link", "set", &host_end, "master", &net.interface, "up"],
+            )?;
+            let address = format!("{addr}/{}", net.subnet.prefix);
+            run("ip", &["-n", &ns, "addr", "add", &address, "dev", &inside])?;
+            // No link-local IPv6 address for machined to hand out under the machine's
+            // name. A host booted without IPv6 refuses the setting and has none anyway.
+            let _ = run(
+                "ip",
+                &["-n", &ns, "link", "set", &inside, "addrgenmode", "none"],
+            );
+            run("ip", &["-n", &ns, "link", "set", &inside, "up"])?;
+        }
+        let gateway = gateway.to_string();
         run(
             "ip",
             &["-n", &ns, "route", "add", "default", "via", &gateway],
@@ -748,27 +778,35 @@ pub fn create_netns(net: &NetSpec, name: &str, addr: Ipv4Addr) -> Result<()> {
     result
 }
 
-/// Under managed user namespaces (mstack) systemd-nsresourced makes the veth and Bridge=
-/// is not applied, so the host end (the peer of host0, found through the machine's
-/// sysfs) is put on the bridge here. Idempotent.
-pub fn adopt_managed_veth(bridge: &str, leader: u32) -> Result<()> {
-    let iflink = fs::read_to_string(format!("/proc/{leader}/root/sys/class/net/host0/iflink"))
-        .context("reading the peer index of host0 inside the machine")?;
+/// Under managed user namespaces (mstack) systemd-nsresourced makes the veths and Bridge=
+/// is not applied, so the host end (the peer of `interface` inside, found through the
+/// machine's sysfs) is put on the bridge here. Idempotent.
+pub fn adopt_managed_veth(bridge: &str, leader: u32, interface: &str) -> Result<()> {
+    let iflink = fs::read_to_string(format!(
+        "/proc/{leader}/root/sys/class/net/{interface}/iflink"
+    ))
+    .with_context(|| format!("reading the peer index of {interface} inside the machine"))?;
     let index: u32 = iflink
         .trim()
         .parse()
-        .context("parsing the peer index of host0")?;
+        .with_context(|| format!("parsing the peer index of {interface}"))?;
     let name = interface_by_index(Path::new("/sys/class/net"), index).with_context(|| {
-        format!("no host interface with index {index} is the peer of the machine's host0")
+        format!("no host interface with index {index} is the peer of the machine's {interface}")
     })?;
+    attach_to_bridge(&name, bridge)
+}
+
+/// Puts a veth's host end on a bridge and up; one on another bridge is an error, not
+/// moved.
+pub fn attach_to_bridge(name: &str, bridge: &str) -> Result<()> {
     if let Ok(master) = fs::read_link(format!("/sys/class/net/{name}/master")) {
         let master = master.file_name().and_then(|f| f.to_str()).unwrap_or("");
         if master == bridge {
-            return Ok(());
+            return run("ip", &["link", "set", name, "up"]);
         }
         bail!("{name}, the host end of the machine's veth, is already on {master}");
     }
-    run("ip", &["link", "set", &name, "master", bridge, "up"])
+    run("ip", &["link", "set", name, "master", bridge, "up"])
 }
 
 pub fn interface_by_index(sys_net: &Path, index: u32) -> Option<String> {
@@ -798,33 +836,48 @@ pub fn resolv_conf(dns: &[IpAddr]) -> String {
     out
 }
 
-/// host0's .network file. No IPv6 link-local address: machined would hand it out under
-/// the machine's name, ahead of the IPv4 one.
-pub fn network_file(addr: Ipv4Addr, subnet: Subnet, dns: &[IpAddr]) -> String {
+/// The .network file of one of the machine's interfaces; the default route and the DNS
+/// servers go on the `gateway` one. No IPv6 link-local address: machined would hand it
+/// out under the machine's name, ahead of the IPv4 one.
+pub fn network_file(
+    interface: &str,
+    addr: Ipv4Addr,
+    subnet: Subnet,
+    gateway: bool,
+    dns: &[IpAddr],
+) -> String {
     let mut out = format!(
-        "# Generated by nspawn; do not edit.\n[Match]\nName=host0\n\n[Network]\nAddress={addr}/{}\nGateway={}\nLLMNR=yes\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n",
-        subnet.prefix,
-        subnet.gateway()
+        "# Generated by nspawn; do not edit.\n[Match]\nName={interface}\n\n[Network]\nAddress={addr}/{}\n",
+        subnet.prefix
     );
-    for server in dns {
-        out.push_str(&format!("DNS={server}\n"));
+    if gateway {
+        out.push_str(&format!("Gateway={}\n", subnet.gateway()));
+    }
+    out.push_str("LLMNR=yes\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n");
+    if gateway {
+        for server in dns {
+            out.push_str(&format!("DNS={server}\n"));
+        }
     }
     out
 }
 
+/// A machine's /etc/hosts: its own names on each of its networks, the host, then the
+/// other members of those networks with their names there.
 pub fn hosts_file(
-    name: &str,
-    addr: Ipv4Addr,
+    own: &[(Ipv4Addr, Vec<String>)],
     gateway: Ipv4Addr,
-    members: &BTreeMap<String, Ipv4Addr>,
+    others: &[(Ipv4Addr, Vec<String>)],
 ) -> String {
-    let mut out = format!(
-        "# Generated by nspawn; do not edit.\n127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n{addr} {name}\n{gateway} {HOST_NAME}\n"
+    let mut out = String::from(
+        "# Generated by nspawn; do not edit.\n127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n",
     );
-    for (other, other_addr) in members {
-        if other != name {
-            out.push_str(&format!("{other_addr} {other}\n"));
-        }
+    for (addr, names) in own {
+        out.push_str(&format!("{addr} {}\n", names.join(" ")));
+    }
+    out.push_str(&format!("{gateway} {HOST_NAME}\n"));
+    for (addr, names) in others {
+        out.push_str(&format!("{addr} {}\n", names.join(" ")));
     }
     out
 }
@@ -864,82 +917,184 @@ fn nameservers(resolv_conf: &str) -> Vec<IpAddr> {
         .collect()
 }
 
-/// Gives the machine an address on its network if it has none there, writes its files
-/// and refreshes every machine's hosts file.
+/// Gives the machine an address on each of its networks (`nets`, the primary one first)
+/// where it has none yet, writes its files and refreshes every machine's hosts file.
+/// Returns the addresses, in the order of `nets`.
 pub fn prepare_machine(
     store: &Store,
     config: &Config,
-    net: &NetSpec,
+    nets: &[NetSpec],
     all: &[NetSpec],
     record: &mut ImageRecord,
-) -> Result<Ipv4Addr> {
-    let addr = match record.address.filter(|a| net.subnet.usable(*a)) {
-        Some(addr) => addr,
-        None => {
-            // Strict: an address handed out twice is worse than a start refused over an
-            // unreadable record.
-            let used: Vec<Ipv4Addr> = store
-                .list_images_strict()?
-                .iter()
-                .filter(|r| r.name != record.name)
-                .filter_map(|r| r.address)
-                .collect();
-            let addr = net.subnet.allocate(&used)?;
-            record.address = Some(addr);
-            store.record_image(record)?;
-            addr
-        }
-    };
+) -> Result<Vec<Ipv4Addr>> {
+    let mut addrs = Vec::new();
+    let mut changed = false;
+    for net in nets {
+        let addr = match address_on(record, &net.name).filter(|a| net.subnet.usable(*a)) {
+            Some(addr) => addr,
+            None => {
+                // Strict: an address handed out twice is worse than a start refused over an
+                // unreadable record.
+                let used: Vec<Ipv4Addr> = store
+                    .list_images_strict()?
+                    .iter()
+                    .filter(|r| r.name != record.name)
+                    .filter_map(|r| address_on(r, &net.name))
+                    .collect();
+                let addr = net.subnet.allocate(&used)?;
+                set_address(record, &net.name, addr);
+                changed = true;
+                addr
+            }
+        };
+        addrs.push(addr);
+    }
+    if changed {
+        store.record_image(record)?;
+    }
     let dir = store.machine_files_dir(&record.name);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let dns = upstream_dns(&config.dns);
-    for (file, text) in [
-        ("host0.network", network_file(addr, net.subnet, &dns)),
-        ("resolv.conf", resolv_conf(&dns)),
-    ] {
-        let path = dir.join(file);
-        fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    let gateway = gateway_index(nets);
+    for (i, (net, addr)) in nets.iter().zip(&addrs).enumerate() {
+        let interface = format!("host{i}");
+        let path = dir.join(format!("{interface}.network"));
+        fs::write(
+            &path,
+            network_file(&interface, *addr, net.subnet, i == gateway, &dns),
+        )
+        .with_context(|| format!("writing {}", path.display()))?;
     }
+    let path = dir.join("resolv.conf");
+    fs::write(&path, resolv_conf(&dns)).with_context(|| format!("writing {}", path.display()))?;
     write_hosts_files(store, all)?;
-    Ok(addr)
+    Ok(addrs)
 }
 
+/// The primary network's name: the first of `--network`, or the default network.
 pub fn network_of(record: &ImageRecord) -> &str {
     record.network_name.as_deref().unwrap_or(DEFAULT_NETWORK)
 }
 
+/// The networks a machine of the bridge kind joins, the primary one first.
+pub fn networks_of(record: &ImageRecord) -> Vec<&str> {
+    let mut out = vec![network_of(record)];
+    out.extend(record.extra_networks.iter().map(|a| a.network.as_str()));
+    out
+}
+
+/// On bridge networks, as opposed to veth, host or none.
+pub fn bridge_kind(record: &ImageRecord) -> bool {
+    record.network == Network::Bridge && !record.no_network
+}
+
+/// Whether the machine joins `network`, as its primary one or besides it.
+pub fn joins(record: &ImageRecord, network: &str) -> bool {
+    bridge_kind(record) && networks_of(record).contains(&network)
+}
+
+/// The machine's address on `network`, once it has one.
+pub fn address_on(record: &ImageRecord, network: &str) -> Option<Ipv4Addr> {
+    if network_of(record) == network {
+        return record.address;
+    }
+    record
+        .extra_networks
+        .iter()
+        .find(|a| a.network == network)
+        .and_then(|a| a.address)
+}
+
+fn set_address(record: &mut ImageRecord, network: &str, addr: Ipv4Addr) {
+    if network_of(record) == network {
+        record.address = Some(addr);
+    } else if let Some(a) = record
+        .extra_networks
+        .iter_mut()
+        .find(|a| a.network == network)
+    {
+        a.address = Some(addr);
+    }
+}
+
+/// Which of the machine's networks carries its default route: the first that leads out,
+/// or the primary one when all are internal.
+pub fn gateway_index<'a>(nets: impl IntoIterator<Item = &'a NetSpec>) -> usize {
+    nets.into_iter().position(|n| !n.internal).unwrap_or(0)
+}
+
 /// Rewrites every hosts file in place (running machines see it through the bind mount),
-/// each with the machines of its own network.
+/// each with the members of the machine's own networks and their names there. An alias
+/// several members share goes to the first of them by name.
 pub fn write_hosts_files(store: &Store, all: &[NetSpec]) -> Result<()> {
-    let mut networks: BTreeMap<String, BTreeMap<String, Ipv4Addr>> = BTreeMap::new();
-    for r in store.list_images_strict()? {
-        if r.network != Network::Bridge {
-            continue;
-        }
-        if let Some(addr) = r.address {
-            networks
-                .entry(network_of(&r).to_string())
-                .or_default()
-                .insert(r.name, addr);
+    let records: Vec<ImageRecord> = store
+        .list_images_strict()?
+        .into_iter()
+        .filter(bridge_kind)
+        .collect();
+    // Per network, each member's address and names there.
+    struct Member<'a> {
+        name: &'a str,
+        address: Ipv4Addr,
+        aliases: Vec<String>,
+    }
+    let mut members: BTreeMap<&str, Vec<Member>> = BTreeMap::new();
+    for r in &records {
+        for network in networks_of(r) {
+            if let Some(address) = address_on(r, network) {
+                members.entry(network).or_default().push(Member {
+                    name: r.name.as_str(),
+                    address,
+                    aliases: Vec::new(),
+                });
+            }
         }
     }
-    for (network, members) in &networks {
-        // A network removed under a stopped machine: its start says so.
-        let Some(net) = all.iter().find(|n| &n.name == network) else {
-            continue;
-        };
-        for (name, addr) in members {
-            let dir = store.machine_files_dir(name);
-            if !dir.is_dir() {
-                continue; // never started on the bridge yet; its start creates the files
+    for (network, list) in members.iter_mut() {
+        list.sort_by(|a, b| a.name.cmp(b.name));
+        let mut taken: std::collections::BTreeSet<&str> = list.iter().map(|m| m.name).collect();
+        for member in list.iter_mut() {
+            let aliases = records
+                .iter()
+                .find(|r| r.name == member.name)
+                .and_then(|r| r.aliases.get(*network));
+            for alias in aliases.into_iter().flatten() {
+                if taken.insert(alias.as_str()) {
+                    member.aliases.push(alias.clone());
+                }
             }
-            let path = dir.join("hosts");
-            fs::write(
-                &path,
-                hosts_file(name, *addr, net.subnet.gateway(), members),
-            )
-            .with_context(|| format!("writing {}", path.display()))?;
         }
+    }
+    for r in &records {
+        let dir = store.machine_files_dir(&r.name);
+        if !dir.is_dir() {
+            continue; // never started on a bridge yet; its start creates the files
+        }
+        // A network removed under a stopped machine: its start says so.
+        let nets: Vec<&NetSpec> = networks_of(r)
+            .into_iter()
+            .filter_map(|n| all.iter().find(|s| s.name == n))
+            .collect();
+        if nets.is_empty() {
+            continue;
+        }
+        let mut own = Vec::new();
+        let mut others = Vec::new();
+        for net in &nets {
+            for member in members.get(net.name.as_str()).into_iter().flatten() {
+                let mut names = vec![member.name.to_string()];
+                names.extend(member.aliases.iter().cloned());
+                if member.name == r.name {
+                    own.push((member.address, names));
+                } else {
+                    others.push((member.address, names));
+                }
+            }
+        }
+        let gateway = nets[gateway_index(nets.iter().copied())].subnet.gateway();
+        let path = dir.join("hosts");
+        fs::write(&path, hosts_file(&own, gateway, &others))
+            .with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(())
 }
@@ -951,7 +1106,7 @@ async fn ports_in_use(
 ) -> Result<BTreeMap<(Protocol, u16), (String, Ipv4Addr, u16)>> {
     let mut used = BTreeMap::new();
     for r in store.list_images_strict()? {
-        if r.name == except || r.network != Network::Bridge || r.ports.is_empty() {
+        if r.name == except || !bridge_kind(&r) || r.ports.is_empty() {
             continue;
         }
         let Some(addr) = r.address else { continue };
@@ -1146,26 +1301,39 @@ mod tests {
             "192.168.1.1".parse().unwrap(),
             "2001:db8::53".parse().unwrap(),
         ];
-        let text = network_file(Ipv4Addr::new(10, 99, 0, 5), subnet, &dns);
+        let text = network_file("host0", Ipv4Addr::new(10, 99, 0, 5), subnet, true, &dns);
         assert!(text.contains("[Match]\nName=host0\n"));
         assert!(text.contains("Address=10.99.0.5/24\nGateway=10.99.0.1\n"));
         assert!(text.contains("\nLinkLocalAddressing=no\nIPv6AcceptRA=no\n"));
         assert!(text.ends_with("DNS=192.168.1.1\nDNS=2001:db8::53\n"));
+        // A network besides the gateway one: the address alone.
+        let back: Subnet = "10.99.1.0/24".parse().unwrap();
+        let extra = network_file("host1", Ipv4Addr::new(10, 99, 1, 5), back, false, &dns);
+        assert!(extra.contains("Name=host1\n"));
+        assert!(extra.contains("Address=10.99.1.5/24\nLLMNR=yes\n"));
+        assert!(!extra.contains("Gateway=") && !extra.contains("DNS="));
+        assert_eq!(
+            gateway_index(&[
+                net("a", "nsbr-a", "10.99.2.0/24", true),
+                net("b", "nsbr-b", "10.99.3.0/24", false)
+            ]),
+            1
+        );
+        assert_eq!(
+            gateway_index(&[net("a", "nsbr-a", "10.99.2.0/24", true)]),
+            0
+        );
 
-        let members: BTreeMap<String, Ipv4Addr> = [
-            ("web".to_string(), Ipv4Addr::new(10, 99, 0, 2)),
-            ("db".to_string(), Ipv4Addr::new(10, 99, 0, 3)),
-        ]
-        .into_iter()
-        .collect();
         let hosts = hosts_file(
-            "web",
-            Ipv4Addr::new(10, 99, 0, 2),
+            &[(
+                Ipv4Addr::new(10, 99, 0, 2),
+                vec!["web".into(), "www".into()],
+            )],
             subnet.gateway(),
-            &members,
+            &[(Ipv4Addr::new(10, 99, 0, 3), vec!["db".into()])],
         );
         assert!(hosts.contains("127.0.0.1 localhost\n"));
-        assert!(hosts.contains("10.99.0.2 web\n"));
+        assert!(hosts.contains("10.99.0.2 web www\n"));
         assert!(hosts.contains("10.99.0.1 host.nspawn.internal\n"));
         assert!(hosts.ends_with("10.99.0.3 db\n"));
         assert_eq!(hosts.matches("web").count(), 1);
@@ -1190,6 +1358,7 @@ mod tests {
             subnet: subnet.parse().unwrap(),
             internal,
             created: 0,
+            labels: BTreeMap::new(),
         }
     }
 
@@ -1319,6 +1488,11 @@ mod tests {
         assert_eq!(long.len(), 11);
         assert!(long.starts_with("vb-"));
         assert_ne!(long, host_end_name("a-rather-long-machine-nam3"));
+        assert_eq!(host_end_name_at("web", 0), "vb-web");
+        assert_eq!(host_end_name_at("web", 1), "vb1-web");
+        let long = host_end_name_at("twelve-chars", 2);
+        assert_eq!(long.len(), 12);
+        assert!(long.starts_with("vb2-"));
         assert_eq!(
             resolv_conf(&["10.0.0.53".parse().unwrap(), "2001:db8::1".parse().unwrap()]),
             "# Generated by nspawn; do not edit.\nnameserver 10.0.0.53\nnameserver 2001:db8::1\n"

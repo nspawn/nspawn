@@ -156,6 +156,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let mut options = Options::new();
                 put_opt(&mut options, "subnet", a.subnet);
                 put(&mut options, "internal", a.internal);
+                put_all(&mut options, "labels", a.label);
                 let info = client
                     .manager
                     .create_network(&a.name, options)
@@ -387,7 +388,8 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         Command::Create(a) => {
             let mut options = client::registry_options(config);
             backend(&mut options, a.backend);
-            put_opt(&mut options, "network", a.network);
+            put_all(&mut options, "networks", a.network);
+            put_all(&mut options, "aliases", a.network_alias);
             put_all(&mut options, "publish", a.publish);
             put(&mut options, "force", a.force);
             put_opt(&mut options, "entrypoint", a.entrypoint);

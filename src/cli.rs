@@ -132,6 +132,9 @@ pub struct NetworkCreateArgs {
     /// ports; they reach each other and the host.
     #[arg(long)]
     pub internal: bool,
+    /// Label the network, KEY=VALUE, like docker network create --label. Repeatable.
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub label: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -298,11 +301,16 @@ pub struct CreateArgs {
     /// How to assemble it (default: like the source).
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     pub backend: BackendChoice,
-    /// Network of the new machine: bridge, veth, host or a network made with network
-    /// create (default: the source's kind; a network made with network create is not
+    /// Network of the new machine: bridge, veth, host, none or a network made with
+    /// network create; repeatable to join several bridge networks, the first one primary
+    /// (default: the source's kind; a network made with network create is not
     /// inherited).
     #[arg(long, value_name = "NETWORK")]
-    pub network: Option<String>,
+    pub network: Vec<String>,
+    /// Another name for the machine on a network, like docker --network-alias: NAME on
+    /// its primary network, or NETWORK=NAME. Repeatable.
+    #[arg(long, value_name = "[NETWORK=]NAME")]
+    pub network_alias: Vec<String>,
     /// Ports to publish on the host, like start -p.
     #[arg(long, short = 'p', value_name = "HOST:CONTAINER[/udp]")]
     pub publish: Vec<String>,
@@ -619,9 +627,15 @@ pub struct StartOptions {
     pub wait: bool,
     /// Network of the machine, remembered for the image: bridge (the default network),
     /// veth (systemd-networkd on the host, booted images), host (the host's own
-    /// network) or the name of a network made with network create.
+    /// network), none (no network) or the name of a network made with network create;
+    /// repeatable to join several bridge networks, the first one primary.
     #[arg(long, value_name = "NETWORK")]
-    pub network: Option<String>,
+    pub network: Vec<String>,
+    /// Another name for the machine on a network, like docker --network-alias: NAME on
+    /// its primary network, or NETWORK=NAME. Repeatable and remembered; "none" forgets
+    /// them.
+    #[arg(long, value_name = "[NETWORK=]NAME")]
+    pub network_alias: Vec<String>,
     /// Publish a port on the host, like docker -p: HOST:CONTAINER[/udp]. Repeatable and
     /// remembered for the image; "none" forgets them all.
     #[arg(long, short = 'p', value_name = "HOST:CONTAINER[/udp]")]

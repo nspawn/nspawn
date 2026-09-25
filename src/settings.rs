@@ -24,13 +24,14 @@ pub enum NamespaceRoute {
     CommandLine(Vec<String>),
 }
 
+/// `bridged`: the machine joins bridge networks (not veth, host or none).
 pub async fn namespace_route(
     sd: &Systemd,
     name: &str,
     mode: Mode,
-    network: Network,
+    bridged: bool,
 ) -> Result<NamespaceRoute> {
-    if mode != Mode::App || network != Network::Bridge {
+    if mode != Mode::App || !bridged {
         return Ok(NamespaceRoute::Settings);
     }
     if sd
@@ -69,13 +70,18 @@ pub struct MachineSettings<'a> {
     /// The units that make a booted machine wait for its volumes (`volume_wait_units`).
     pub volume_units: Option<&'a Path>,
     pub network: Network,
-    /// The bridge to join and the directory of the generated host0.network and hosts.
+    /// --network none: no interface but lo.
+    pub no_network: bool,
+    /// The bridges to join and the directory of the generated .network files and hosts.
     pub bridge: Option<BridgeMount<'a>>,
 }
 
 pub struct BridgeMount<'a> {
+    /// The primary network's bridge.
     pub bridge: &'a str,
     pub files: &'a Path,
+    /// The host ends of the veths on the other networks, host1.. inside.
+    pub extras: &'a [String],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,15 +146,26 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
     let mut files: Vec<String> = Vec::new();
     match s.network {
         Network::Host => out.push_str("\n[Network]\nVirtualEthernet=no\n"),
+        Network::Bridge if s.no_network => out.push_str("\n[Network]\nPrivate=yes\n"),
         Network::Bridge => {
             if let Some(b) = &s.bridge {
                 let dir = b.files.display();
                 match s.mode {
                     Mode::Boot => {
                         out.push_str(&format!("\n[Network]\nBridge={}\n", b.bridge));
-                        files.push(format!(
-                            "BindReadOnly={dir}/host0.network:/run/systemd/network/10-host0.network"
-                        ));
+                        // The extra veths come up unattached; the publish hook puts
+                        // their host ends on their bridges.
+                        for (i, host_end) in b.extras.iter().enumerate() {
+                            out.push_str(&format!(
+                                "VirtualEthernetExtra={host_end}:host{}\n",
+                                i + 1
+                            ));
+                        }
+                        for i in 0..=b.extras.len() {
+                            files.push(format!(
+                                "BindReadOnly={dir}/host{i}.network:/run/systemd/network/1{i}-host{i}.network"
+                            ));
+                        }
                         files.push(format!("BindReadOnly={dir}/hosts:/etc/hosts"));
                     }
                     Mode::App => {
@@ -611,6 +628,50 @@ mod tests {
     }
 
     #[test]
+    fn renders_several_networks_and_none() {
+        let run = RunSpec::default();
+        let extras = vec!["vb1-fedora-44".to_string(), "vb2-fedora-44".to_string()];
+        let booted = render(&MachineSettings {
+            name: "fedora-44",
+            managed_userns: false,
+            mode: Mode::Boot,
+            run: &run,
+            command: &run.argv(),
+            extra_env: &[],
+            binds: &[],
+            volume_units: None,
+            network: Network::Bridge,
+            no_network: false,
+            bridge: Some(BridgeMount {
+                bridge: "nsbr-front",
+                files: Path::new("/var/lib/nspawn/machines/fedora-44"),
+                extras: &extras,
+            }),
+        });
+        assert!(booted.contains("[Network]\nBridge=nsbr-front\nVirtualEthernetExtra=vb1-fedora-44:host1\nVirtualEthernetExtra=vb2-fedora-44:host2\n"));
+        assert!(booted.contains("host1.network:/run/systemd/network/11-host1.network\n"));
+        assert!(booted.contains("host2.network:/run/systemd/network/12-host2.network\n"));
+        let none = render(&MachineSettings {
+            name: "web",
+            managed_userns: false,
+            mode: Mode::App,
+            run: &run,
+            command: &run.argv(),
+            extra_env: &[],
+            binds: &[],
+            volume_units: None,
+            network: Network::Bridge,
+            no_network: true,
+            bridge: None,
+        });
+        assert!(none.contains("[Network]\nPrivate=yes\n"));
+        assert!(
+            !none.contains("PrivateUsers=no"),
+            "a user namespace goes with no network"
+        );
+    }
+
+    #[test]
     fn renders_boot_and_app_machines() {
         let run = RunSpec::default();
         let boot = render(&MachineSettings {
@@ -623,6 +684,7 @@ mod tests {
             binds: &[],
             volume_units: None,
             network: Network::Veth,
+            no_network: false,
             bridge: None,
         });
         assert_eq!(boot, "# Generated by nspawn for image fedora-44; do not edit.\n[Exec]\nPrivateUsers=managed\nBoot=yes\n");
@@ -637,9 +699,11 @@ mod tests {
             binds: &[],
             volume_units: None,
             network: Network::Bridge,
+            no_network: false,
             bridge: Some(BridgeMount {
                 bridge: "nspawn0",
                 files: Path::new("/var/lib/nspawn/machines/fedora-44"),
+                extras: &[],
             }),
         });
         assert!(bridged.contains("Boot=yes\n\n[Network]\nBridge=nspawn0\n\n[Files]\n"));
@@ -658,9 +722,11 @@ mod tests {
             binds: &[],
             volume_units: None,
             network: Network::Bridge,
+            no_network: false,
             bridge: Some(BridgeMount {
                 bridge: "nspawn0",
                 files: Path::new("/var/lib/nspawn/machines/web"),
+                extras: &[],
             }),
         });
         assert!(app_bridged.contains("[Exec]\nPrivateUsers=no\nBoot=no\n"));
@@ -679,9 +745,11 @@ mod tests {
                 binds: &[],
                 volume_units: None,
                 network: Network::Bridge,
+                no_network: false,
                 bridge: Some(BridgeMount {
                     bridge: "nspawn0",
                     files: Path::new("/var/lib/nspawn/machines/web"),
+                    extras: &[],
                 }),
             },
             &NamespaceRoute::CommandLine(vec!["systemd-nspawn".to_string()]),
@@ -703,9 +771,11 @@ mod tests {
             }],
             volume_units: None,
             network: Network::Bridge,
+            no_network: false,
             bridge: Some(BridgeMount {
                 bridge: "nspawn0",
                 files: Path::new("/var/lib/nspawn/machines/web"),
+                extras: &[],
             }),
         });
         let mstack_volume = render(&MachineSettings {
@@ -722,6 +792,7 @@ mod tests {
             }],
             volume_units: Some(Path::new("/var/lib/nspawn/machines/db/units")),
             network: Network::Host,
+            no_network: false,
             bridge: None,
         });
         // Managed user namespaces: no Bind= (attached from the host), but the wait units.
@@ -740,6 +811,7 @@ mod tests {
             }],
             volume_units: Some(Path::new("/var/lib/nspawn/machines/db/units")),
             network: Network::Host,
+            no_network: false,
             bridge: None,
         });
         // Other backends: the bind itself plus the same wait units.
@@ -776,6 +848,7 @@ mod tests {
             binds: &[],
             volume_units: None,
             network: Network::Host,
+            no_network: false,
             bridge: None,
         });
         assert!(app.contains("Boot=no\nProcessTwo=yes\n"));
@@ -810,6 +883,7 @@ mod tests {
             binds: &binds,
             volume_units: None,
             network: Network::Veth,
+            no_network: false,
             bridge: None,
         });
         assert!(

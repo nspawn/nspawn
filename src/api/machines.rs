@@ -204,15 +204,16 @@ pub async fn prepare(
     // A new run: the marks `kill` and `stop` left for the last one go.
     store.take_exit_on_next(name)?;
     store.forget_signal(name)?;
-    if record.network == Network::Bridge
-        && record.mode == Mode::App
-        && record.backend == BackendChoice::Mstack
-    {
+    let bridged = bridge::bridge_kind(&record);
+    if bridged && record.mode == Mode::App && record.backend == BackendChoice::Mstack {
         bail!(
             "{name} is an mstack app: managed user namespaces cannot join the network namespace prepared for the bridge; pull it again with --backend overlay, or start it with --network host"
         );
     }
-    if !record.ports.is_empty() && record.network != Network::Bridge {
+    if !record.ports.is_empty() && !bridged {
+        if record.no_network {
+            bail!("ports are published through a bridge network; {name} has no network (--network none)");
+        }
         bail!("ports are published through the bridge network; start {name} with --network bridge");
     }
     if record.network == Network::Veth && record.mode == Mode::App {
@@ -220,23 +221,35 @@ pub async fn prepare(
             "{name} is an app image, with nothing inside to configure a veth; use --network bridge or --network host"
         );
     }
-    let files = if record.network == Network::Bridge {
+    let files = if bridged {
         let all = crate::api::network::all(store, config)?;
-        let net = crate::api::network::of(store, config, &record)?;
-        if net.internal && !record.ports.is_empty() {
+        let nets = crate::api::network::nets_of(store, config, &record)?;
+        if nets[0].internal && !record.ports.is_empty() {
             bail!(
                 "network {} is internal: nothing is published from it; start {name} with -p none or on another network",
-                net.name
+                nets[0].name
             );
         }
-        bridge::up(&net, &all, sd, report).await?;
+        for net in &nets {
+            bridge::up(net, &all, sd, report).await?;
+        }
         bridge::check_port_conflicts(store, sd, &record).await?;
         store.record_image(&record)?;
-        let addr = bridge::prepare_machine(store, config, &net, &all, &mut record)?;
+        let addrs = bridge::prepare_machine(store, config, &nets, &all, &mut record)?;
         if record.mode == Mode::App {
-            bridge::create_netns(&net, name, addr)?;
+            let attached: Vec<(&crate::bridge::NetSpec, std::net::Ipv4Addr)> =
+                nets.iter().zip(addrs).collect();
+            let gateway = nets[bridge::gateway_index(&nets)].subnet.gateway();
+            bridge::create_netns(&attached, name, gateway)?;
         }
-        Some((store.machine_files_dir(name), net.interface))
+        let extras: Vec<String> = (1..nets.len())
+            .map(|i| bridge::host_end_name_at(name, i))
+            .collect();
+        Some((
+            store.machine_files_dir(name),
+            nets[0].interface.clone(),
+            extras,
+        ))
     } else {
         store.record_image(&record)?;
         None
@@ -280,7 +293,7 @@ pub async fn prepare(
     } else {
         None
     };
-    let route = settings::namespace_route(sd, name, record.mode, record.network).await?;
+    let route = settings::namespace_route(sd, name, record.mode, bridged).await?;
     settings::write(
         &MachineSettings {
             name,
@@ -292,9 +305,11 @@ pub async fn prepare(
             binds: &binds,
             volume_units: volume_units.as_deref(),
             network: record.network,
-            bridge: files.as_ref().map(|(files, bridge)| BridgeMount {
+            no_network: record.no_network,
+            bridge: files.as_ref().map(|(files, bridge, extras)| BridgeMount {
                 bridge: bridge.as_str(),
                 files: files.as_path(),
+                extras,
             }),
         },
         &route,
@@ -329,8 +344,11 @@ pub struct StartRequest {
     pub name: String,
     /// Wait for a booted machine's init to be up before returning.
     pub wait: bool,
-    /// bridge, veth, host or a network's name.
-    pub network: Option<String>,
+    /// bridge, veth, host, none, or networks' names, the first one primary; empty keeps
+    /// the remembered ones.
+    pub network: Vec<String>,
+    /// NAME or NETWORK=NAME; "none" forgets them.
+    pub aliases: Vec<String>,
     /// HOST:CONTAINER[/udp]; "none" forgets them all.
     pub publish: Vec<String>,
     /// An empty string runs the arguments alone.
@@ -394,10 +412,18 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     let previous_policy = record.as_ref().map(|r| r.restart).unwrap_or_default();
     match record.as_mut() {
         Some(r) => {
-            if let Some(network) = &args.network {
-                let (kind, name) = crate::api::network::choice(network)?;
-                r.network = kind;
-                r.network_name = name;
+            if !args.network.is_empty() {
+                crate::api::network::apply(r, &crate::api::network::choices(&args.network)?);
+            }
+            if !args.aliases.is_empty() {
+                if !bridge::bridge_kind(r) {
+                    bail!(
+                        "aliases are names on a bridge network; {} joins none",
+                        args.name
+                    );
+                }
+                r.aliases =
+                    crate::api::network::parse_aliases(&args.aliases, &bridge::networks_of(r))?;
             }
             if !args.publish.is_empty() {
                 r.ports = bridge::parse_publish(&args.publish)?;
@@ -445,7 +471,8 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             r.remove_on_exit = args.remove;
         }
         None if !args.command.is_empty()
-            || args.network.is_some()
+            || !args.network.is_empty()
+            || !args.aliases.is_empty()
             || !args.publish.is_empty()
             || args.entrypoint.is_some()
             || !args.env.is_empty()
@@ -931,7 +958,9 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     apply_limits(&mut record.limits, args.memory, args.cpus, args.pids_limit)?;
     record.limits.check(record.mode)?;
     store.record_image(&record)?;
-    let route = settings::namespace_route(sd, &args.name, record.mode, record.network).await?;
+    let route =
+        settings::namespace_route(sd, &args.name, record.mode, bridge::bridge_kind(&record))
+            .await?;
     let app_argv = settings::app_argv(sd, &args.name, record.mode, &route).await?;
     let reload = settings::write_hooks(
         &args.name,

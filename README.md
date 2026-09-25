@@ -226,8 +226,13 @@ machine on it. Machines of one network reach each other by name, and nothing of 
 network, the default one included, reaches them; a port they publish is reachable from
 every network through the host, as from the LAN. `--internal` makes a network with no
 way out: its machines reach each other and the host, publish nothing and are reached by
-nothing else. A machine joins one network. `network ls` lists them, `network rm` and
-`network prune` remove the ones no machine names, bridge and rules included.
+nothing else. `--network` given several times joins several networks, the first one
+primary (its gateway is the default route, unless it is internal): a proxy on `front` and
+`back` reaches both, while `front` and `back` still do not reach each other.
+`--network-alias NAME` (or `NETWORK=NAME`) gives a machine another name on a network, as
+docker does; `--network none` gives it no interface but `lo`. `network ls` lists the
+networks, `network rm` and `network prune` remove the ones no machine joins, bridge and
+rules included; `network create --label KEY=VALUE` tags one.
 
 App images have nothing inside to configure `host0`, so for them nspawn builds the
 network namespace before the process starts (`ip netns`, a veth pair on the bridge, the

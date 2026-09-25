@@ -166,6 +166,7 @@ impl Config {
             subnet: self.subnet,
             internal: false,
             created: 0,
+            labels: std::collections::BTreeMap::new(),
         }
     }
 }

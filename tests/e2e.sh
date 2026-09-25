@@ -73,7 +73,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-run-boot busybox-1.37; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-run-boot busybox-1.37; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -550,12 +550,51 @@ curl -sf -m 5 http://127.0.0.1:18090/ | grep_q nb-web || fail "the published por
 get e2e-na-cli "http://detectportal.firefox.com/success.txt" | grep_q success || fail "no internet from e2e-na"
 get e2e-nc-web "http://detectportal.firefox.com/success.txt" | grep_q success && fail "a machine of an internal network got out"
 get e2e-na-cli "http://$nc_web/" | grep_q nc-web && fail "a machine reached one of an internal network"
+# One machine on two networks, with aliases: reached from both, and listed on both.
+$NSPAWN create $app e2e-nab --network e2e-na --network e2e-nb --network-alias both --network-alias e2e-nb=web-b -- /bin/sh -c "$web" nab >/dev/null || fail "create on two networks"
+$NSPAWN start e2e-nab >/dev/null || fail "start e2e-nab"
+$NSPAWN inspect e2e-nab | python3 -c "
+import json, sys
+d = json.load(sys.stdin)[0]
+assert d['network'] == 'e2e-na' and d['networks'] == ['e2e-na', 'e2e-nb'], d
+assert d['addresses']['e2e-na'].startswith('${na_subnet%.*}.') and d['addresses']['e2e-nb'].startswith('10.98.7.'), d
+assert sorted(d['aliases']) == ['e2e-na=both', 'e2e-nb=web-b'], d" || fail "inspect does not show both networks of e2e-nab"
+[ "$($NSPAWN exec e2e-nab -- ip -4 -o addr show </dev/null | tr -d '\r' | grep -c 'host[01] ')" = 2 ] || fail "e2e-nab does not have host0 and host1"
+retry 5 bash -c "$NSPAWN exec e2e-na-cli -- wget -qO- -T 3 http://both/ </dev/null 2>/dev/null | grep_q nab" || fail "an alias on e2e-na does not resolve"
+get e2e-nab "http://e2e-nb-web/" | grep_q nb-web || fail "e2e-nab does not reach e2e-nb by name"
+get e2e-nab "http://e2e-na-web/" | grep_q na-web || fail "e2e-nab does not reach e2e-na by name"
+get e2e-nab "http://detectportal.firefox.com/success.txt" | grep_q success || fail "no internet from e2e-nab"
+$NSPAWN exec e2e-nb-web -- cat /etc/hosts </dev/null | tr -d '\r' | grep_q " e2e-nab web-b" || fail "the alias of e2e-nab on e2e-nb is not in the hosts file of e2e-nb-web"
+$NSPAWN exec e2e-nb-web -- cat /etc/hosts </dev/null | tr -d '\r' | grep_q "both" && fail "an alias of another network leaked into the hosts file of e2e-nb-web"
+$NSPAWN network inspect e2e-nb | python3 -c "
+import json, sys
+m = [m for m in json.load(sys.stdin)[0]['machines'] if m['name'] == 'e2e-nab'][0]
+assert m['aliases'] == ['web-b'] and m['address'].startswith('10.98.7.'), m" || fail "network inspect does not list e2e-nab on e2e-nb"
+$NSPAWN ps | grep "^ *e2e-nab " | grep_q "e2e-nb:10.98.7." || fail "ps does not show the second network of e2e-nab"
+out=$($NSPAWN network rm e2e-nb 2>&1) && fail "network rm removed a network a machine joins besides its primary one"
+echo "$out" | grep_q "in use by e2e-nab, e2e-nb-web" || fail "network rm of e2e-nb was not explained: $out"
+# A booted machine on two networks: both interfaces up, both networks in its hosts.
+$NSPAWN pull "$IMAGE" --name e2e-boot2 --backend overlay --force >/dev/null || fail "pull e2e-boot2"
+$NSPAWN start e2e-boot2 --network e2e-nb --network e2e-na >/dev/null || fail "start a booted machine on two networks"
+retry 20 bash -c "$NSPAWN exec e2e-boot2 -- ip -4 -o addr show </dev/null | tr -d '\r' | grep -q 'host1 .*10\.' " || fail "the booted machine has no address on host1"
+$NSPAWN exec e2e-boot2 -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep_q "10.98.7." || fail "host0 of the booted machine is not on e2e-nb"
+$NSPAWN exec e2e-boot2 -- ip -4 route show default </dev/null | tr -d '\r' | grep_q "via 10.98.7.1" || fail "the default route of the booted machine does not go through its primary network"
+$NSPAWN exec e2e-boot2 -- cat /etc/hosts </dev/null | tr -d '\r' | grep_q " e2e-na-web" || fail "the booted machine's hosts file misses e2e-na-web"
+$NSPAWN exec e2e-boot2 -- bash -c 'exec 3<>/dev/tcp/e2e-na-web/80; printf "GET / HTTP/1.0\r\n\r\n" >&3; cat <&3' </dev/null | tr -d '\r' | grep_q na-web || fail "the booted machine does not reach e2e-na-web through host1"
+$NSPAWN stop e2e-boot2 >/dev/null || fail "stop e2e-boot2"
+ip -o link show | grep_q "vb1-e2e-boot2" && fail "the extra veth of the booted machine was left behind"
+# No network at all.
+$NSPAWN create $app e2e-none --network none -- /bin/sleep 600 >/dev/null || fail "create with --network none"
+$NSPAWN start e2e-none >/dev/null || fail "start e2e-none"
+[ "$($NSPAWN exec e2e-none -- ip -o link show </dev/null | tr -d '\r' | grep -vc ' lo:')" = 0 ] || fail "a machine with --network none has an interface besides lo"
+$NSPAWN inspect e2e-none | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['network'] == 'none' and d['networks'] == [], d" || fail "inspect of a machine without network"
+$NSPAWN ps | grep "^ *e2e-none " | grep_q " none " || fail "ps does not show none"
 $NSPAWN create $app e2e-nc-pub --network e2e-nc -p 18091:80 -- /bin/sleep 1 >/dev/null || fail "create with a port on an internal network"
 out=$($NSPAWN start e2e-nc-pub 2>&1) && fail "a port was published from an internal network"
 echo "$out" | grep_q internal || fail "publishing from an internal network was not explained: $out"
 $NSPAWN images rm e2e-nc-pub >/dev/null || fail "rm e2e-nc-pub"
 out=$($NSPAWN network rm e2e-na 2>&1) && fail "network rm removed a network in use"
-echo "$out" | grep_q "in use by e2e-na-cli, e2e-na-web" || fail "network rm of a network in use was not explained: $out"
+echo "$out" | grep_q "in use by e2e-boot2, e2e-na-cli, e2e-na-web, e2e-nab" || fail "network rm of a network in use was not explained: $out"
 $NSPAWN network rm bridge 2>/dev/null && fail "network rm removed the default network"
 nft list table ip nspawn | grep_q nsbr-e2e-na || fail "no rules for e2e-na in the nspawn table"
 # A bridge deleted by hand comes back with the next start of one of its machines.
@@ -563,7 +602,7 @@ $NSPAWN stop e2e-na-web >/dev/null && $NSPAWN stop e2e-na-cli >/dev/null || fail
 ip link del nsbr-e2e-na || fail "delete the bridge by hand"
 $NSPAWN start e2e-na-web >/dev/null && $NSPAWN start e2e-na-cli >/dev/null || fail "start after the bridge went"
 retry 5 bash -c "$NSPAWN exec e2e-na-cli -- wget -qO- -T 3 http://e2e-na-web/ </dev/null 2>/dev/null | grep_q na-web" || fail "the network did not come back with its machines"
-for m in e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-def-cli; do
+for m in e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-def-cli e2e-nab e2e-none e2e-boot2; do
   $NSPAWN rm -f $m >/dev/null || fail "rm -f $m"
 done
 $NSPAWN network create e2e-ne >/dev/null || fail "network create e2e-ne"
@@ -685,6 +724,8 @@ $NSPAWN start $app -- /bin/true || fail "start of a program that returns at once
 [ $(( $(date +%s) - t0 )) -lt 15 ] || fail "start waited for a program that had already returned"
 $NSPAWN start $app -- /bin/sh -c 'exit 3' >/dev/null 2>&1 || true
 retry 10 bash -c "! $NSPAWN ps | grep_q '^ *$app '" || fail "failed app still listed"
+# machined drops the machine a few milliseconds before its unit is down.
+retry 10 bash -c "systemctl show -p ActiveState --value systemd-nspawn@$app.service | grep -qE '^(failed|inactive)$'" || fail "the unit of the failed program is still up"
 out=$($NSPAWN stop $app 2>&1); echo "$out" | grep_q "was not running" || fail "stop after a failed program: $out"
 systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit left failed after stop of a program that exited 3"
 # A program that fails at once leaves the unit on its way down with the release hook

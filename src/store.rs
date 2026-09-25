@@ -15,7 +15,7 @@ use nix::sys::stat::{mknod, Mode as FileMode, SFlag};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::BackendChoice;
-use crate::bridge::{NetSpec, PortMap};
+use crate::bridge::{Attachment, NetSpec, PortMap};
 use crate::oci::{Mode, RunSpec};
 use crate::settings::Network;
 use crate::volume::Volume;
@@ -44,9 +44,20 @@ pub struct ImageRecord {
     /// record (as a machine of the default network).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
-    /// Fixed address on the nspawn bridge, once assigned.
+    /// Fixed address on the primary network, once assigned.
     #[serde(default)]
     pub address: Option<Ipv4Addr>,
+    /// The networks joined besides the primary one, with the address on each.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_networks: Vec<Attachment>,
+    /// Extra names on each network (--network-alias), by network; the machine's own name
+    /// is always there.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub aliases: BTreeMap<String, Vec<String>>,
+    /// --network none: nothing but lo. Kept apart from `network` so that an older nspawn
+    /// still reads the record (as a machine of the default network).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_network: bool,
     /// Ports published on the host, like docker -p (bridge network only).
     #[serde(default)]
     pub ports: Vec<PortMap>,
@@ -1586,6 +1597,9 @@ mod tests {
             restart: Default::default(),
             limits: Default::default(),
             remove_on_exit: false,
+            extra_networks: Vec::new(),
+            aliases: BTreeMap::new(),
+            no_network: false,
         };
         store.record_image(&rec).unwrap();
         assert_eq!(
@@ -1635,6 +1649,9 @@ mod tests {
             restart: Default::default(),
             limits: Default::default(),
             remove_on_exit: false,
+            extra_networks: Vec::new(),
+            aliases: BTreeMap::new(),
+            no_network: false,
         };
         store.record_image(&rec).unwrap();
         store
@@ -1835,6 +1852,9 @@ mod tests {
             restart: Default::default(),
             limits: Default::default(),
             remove_on_exit: false,
+            extra_networks: Vec::new(),
+            aliases: BTreeMap::new(),
+            no_network: false,
         };
         store
             .record_image(&record("ovl", BackendChoice::Overlay))

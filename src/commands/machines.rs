@@ -77,25 +77,31 @@ fn recorded(machine: &Dict) -> bool {
     machine.contains_key("reference")
 }
 
-/// Address and published ports on the bridge, or the kind of network otherwise.
+/// The kind of network, or the address on each bridge network (with the network's name
+/// unless it is the default one) and the published ports.
 fn network_column(machine: &Dict) -> String {
     if !recorded(machine) {
         return "-".to_string();
     }
-    match client::string(machine, "network").as_str() {
-        "bridge" => {
-            let address = client::string(machine, "address");
-            let mut parts = vec![if address.is_empty() {
-                "bridge".to_string()
-            } else {
-                address
-            }];
-            parts.extend(client::strings(machine, "ports"));
-            parts.join(" ")
-        }
-        "host" => "host".to_string(),
-        _ => "veth".to_string(),
+    let networks = client::strings(machine, "networks");
+    if networks.is_empty() {
+        return client::string(machine, "network");
     }
+    let addresses = client::dict_to_json(machine);
+    let mut parts: Vec<String> = networks
+        .iter()
+        .map(|network| {
+            let address = addresses["addresses"][network].as_str().unwrap_or("");
+            match (network.as_str(), address) {
+                ("bridge", "") => "bridge".to_string(),
+                ("bridge", address) => address.to_string(),
+                (network, "") => network.to_string(),
+                (network, address) => format!("{network}:{address}"),
+            }
+        })
+        .collect();
+    parts.extend(client::strings(machine, "ports"));
+    parts.join(" ")
 }
 
 /// Image reference, mode and command of a machine, when nspawn installed its image.
@@ -129,8 +135,11 @@ pub async fn start(args: StartArgs, client: &Client) -> Result<()> {
 fn start_options(args: StartOptions, command: Vec<String>) -> Result<Options<'static>> {
     let mut options = Options::new();
     options.insert("wait", Value::from(args.wait));
-    if let Some(network) = args.network {
-        options.insert("network", Value::from(network));
+    if !args.network.is_empty() {
+        options.insert("networks", Value::from(args.network));
+    }
+    if !args.network_alias.is_empty() {
+        options.insert("aliases", Value::from(args.network_alias));
     }
     if !args.publish.is_empty() {
         options.insert("publish", Value::from(args.publish));

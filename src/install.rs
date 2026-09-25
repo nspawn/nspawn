@@ -82,7 +82,7 @@ pub async fn install(
     }
     // Both kinds join the bridge, like docker; --network host is one flag away.
     let network = Network::Bridge;
-    let route = settings::namespace_route(sd, spec.name, mode, network).await?;
+    let route = settings::namespace_route(sd, spec.name, mode, true).await?;
     settings::write(
         &MachineSettings {
             name: spec.name,
@@ -94,6 +94,7 @@ pub async fn install(
             binds: &[],
             volume_units: None,
             network,
+            no_network: false,
             bridge: None,
         },
         &route,
@@ -140,6 +141,9 @@ pub async fn install(
         restart: Default::default(),
         limits: Default::default(),
         remove_on_exit: false,
+        extra_networks: Vec::new(),
+        aliases: BTreeMap::new(),
+        no_network: false,
     })?;
     Ok(mode)
 }
