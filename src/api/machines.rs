@@ -357,7 +357,12 @@ pub async fn prepare(
             if let Some(image_path) = image_path {
                 crate::volume::seed(&image_path, &source)?;
             }
-            crate::api::events::emit("volume", "create", &volume.source, &[]);
+            crate::api::events::emit(
+                "volume",
+                "create",
+                &volume.source,
+                &[("path", &source.to_string_lossy())],
+            );
         }
         binds.push(Bind {
             source,
@@ -804,7 +809,17 @@ pub async fn pause(ctx: &Context, name: &str, on: bool) -> Result<()> {
     } else {
         sd.thaw_unit(&unit).await?;
     }
-    crate::api::events::emit("machine", if on { "pause" } else { "unpause" }, name, &[]);
+    let image = ctx
+        .store
+        .load_image(name)?
+        .map(|r| r.reference)
+        .unwrap_or_default();
+    crate::api::events::emit(
+        "machine",
+        if on { "pause" } else { "unpause" },
+        name,
+        &[("image", &image)],
+    );
     Ok(())
 }
 
@@ -1185,7 +1200,17 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
             timeout: Some(0),
         };
         stop(ctx, &request, report).await?;
-        crate::api::events::emit("machine", "kill", &args.name, &[("signal", "9")]);
+        let image = ctx
+            .store
+            .load_image(&args.name)?
+            .map(|r| r.reference)
+            .unwrap_or_default();
+        crate::api::events::emit(
+            "machine",
+            "kill",
+            &args.name,
+            &[("image", &image), ("signal", "9")],
+        );
         return Ok(());
     }
     let record = ctx.store.load_image(&args.name)?;
@@ -1212,11 +1237,12 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
     } else {
         sd.kill_machine(&args.name, "leader", signal).await?;
     }
+    let image = record.as_ref().map(|r| r.reference.as_str()).unwrap_or("");
     crate::api::events::emit(
         "machine",
         "kill",
         &args.name,
-        &[("signal", &signal.to_string())],
+        &[("image", image), ("signal", &signal.to_string())],
     );
     Ok(())
 }
@@ -1328,7 +1354,12 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
             crate::health::start_runner(ctx, &args.name).await?;
         }
     }
-    crate::api::events::emit("machine", "update", &args.name, &[]);
+    crate::api::events::emit(
+        "machine",
+        "update",
+        &args.name,
+        &[("image", &record.reference)],
+    );
     Ok(running)
 }
 

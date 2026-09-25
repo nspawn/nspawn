@@ -1442,8 +1442,13 @@ impl Manager {
                         let Ok(entry) = serde_json::from_str(&line) else { continue };
                         let Some(mut event) = mapper.map(&entry) else { continue };
                         if event.kind == "machine" {
+                            // systemd's own events (start, die, ...) say nothing of the
+                            // image; ours carry it, and it stays once the record is gone.
                             if let Ok(Some(record)) = ctx.store.load_image(&event.name) {
-                                event.attributes.insert("image".into(), record.reference.clone());
+                                event
+                                    .attributes
+                                    .entry("image".into())
+                                    .or_insert_with(|| record.reference.clone());
                                 event.labels = record.effective_labels();
                             }
                         }

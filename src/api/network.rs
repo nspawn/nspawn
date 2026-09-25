@@ -337,12 +337,8 @@ pub async fn create(
         store.remove_network(name)?;
         return Err(e);
     }
-    crate::api::events::emit(
-        "network",
-        "create",
-        name,
-        &[("subnet", &subnet.to_string())],
-    );
+    let attributes = network_attributes(&spec);
+    crate::api::events::emit("network", "create", name, &borrowed(&attributes));
     Ok(spec)
 }
 
@@ -357,9 +353,10 @@ pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Resu
     let mut removal = Removal::default();
     for name in names {
         match remove_one(ctx, sd, &records, name).await {
-            Ok(()) => {
+            Ok(spec) => {
                 line(report, format!("removed {name}"));
-                crate::api::events::emit("network", "remove", name, &[]);
+                let attributes = network_attributes(&spec);
+                crate::api::events::emit("network", "remove", name, &borrowed(&attributes));
                 removal.removed.push(name.clone());
             }
             Err(e) => removal.failed.push((name.clone(), format!("{e:#}"))),
@@ -373,7 +370,7 @@ async fn remove_one(
     sd: &crate::systemd::Systemd,
     records: &[ImageRecord],
     name: &str,
-) -> Result<()> {
+) -> Result<NetSpec> {
     if name == DEFAULT_NETWORK {
         bail!("the default network cannot be removed");
     }
@@ -391,7 +388,8 @@ async fn remove_one(
         .filter(|n| n.name != name)
         .collect();
     bridge::down(&spec, &remaining, sd).await?;
-    store.remove_network(name)
+    store.remove_network(name)?;
+    Ok(spec)
 }
 
 fn users(records: &[ImageRecord], network: &str) -> Vec<String> {
@@ -603,6 +601,19 @@ pub async fn remove_ended(ctx: &Context) -> Result<()> {
     }
     crate::api::images::remove_machines(ctx, &ended, false, &|_| {}).await?;
     Ok(())
+}
+
+/// What every event of a network says of it.
+fn network_attributes(spec: &NetSpec) -> [(&'static str, String); 3] {
+    [
+        ("subnet", spec.subnet.to_string()),
+        ("interface", spec.interface.clone()),
+        ("internal", spec.internal.to_string()),
+    ]
+}
+
+fn borrowed<'a>(attributes: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    attributes.iter().map(|(k, v)| (*k, v.as_str())).collect()
 }
 
 #[cfg(test)]

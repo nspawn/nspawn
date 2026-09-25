@@ -135,7 +135,10 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
         "machine",
         "pull",
         &name,
-        &[("reference", &image.to_string())],
+        &[
+            ("image", &image.to_string()),
+            ("reference", &image.to_string()),
+        ],
     );
     Ok(Pulled {
         name,

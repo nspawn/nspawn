@@ -126,7 +126,7 @@ Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 | `Shell(s machine, s user, a{sv} options) -> (h, s)` | `shell` | the login session machined offers for a booted machine: its pseudo terminal and the terminal's path; options env, as for `Exec`; apps get `Exec` of a shell with a tty instead |
 | `CopyFrom(s machine, s path, a{sv} options) -> (h, o)` | `cp NAME:PATH ...` | a tar stream of `path` on the pipe, owners as the machine sees them, and a job with the outcome (its result: entries, bytes); a running machine, or a stopped overlay or flat one |
 | `CopyTo(s machine, s path, h stream, a{sv} options) -> o` | `cp ... NAME:PATH` | the tar stream read from `stream` unpacked at `path` by docker cp's rules, everything root's inside; option contents (the source was `DIR/.`); a job |
-| `Events(a{sv} options) -> (a{sh}, o)` | `events` | options since, until (journalctl's time syntax; without until it follows, and until needs since), filters (as: name=, type=, event=, label=KEY or KEY=VALUE); under "stdout" one JSON object per line: time (RFC 3339, UTC), time_usec, type (machine, network, volume, secret), action (start, die, stop, restart, oom, fail, health_status with attribute status, and nspawn's own), name, attributes, labels; journalctl's complaints under "stderr" and a process object for its end; entries are PID 1's about systemd-nspawn@ units and nspawn's own (message ID b0b60147942247cab22cc49510006a0b), both only from root |
+| `Events(a{sv} options) -> (a{sh}, o)` | `events` | options since, until (journalctl's time syntax; without until it follows, and until needs since), filters (as: name=, type=, event=, label=KEY or KEY=VALUE); under "stdout" one JSON object per line: time (RFC 3339, UTC), time_usec, type (machine, network, volume, secret), action (start, die, stop, restart, oom, fail, health_status with attribute status, and nspawn's own), name, attributes (the same for every action of a type: image on a machine's, subnet, interface and internal on a network's, path on a volume's, size on a secret's, plus the action's own), labels; journalctl's complaints under "stderr" and a process object for its end; entries are PID 1's about systemd-nspawn@ units and nspawn's own (message ID b0b60147942247cab22cc49510006a0b), both only from root |
 | `Logs(s machine, a{sv} options) -> (a{sh}, o)` | `logs` | options follow, lines, since, until (journalctl's time syntax; with until nothing is followed), timestamps, all, inside; journalctl's "stdout" and "stderr" and a process object for its exit status; journalctl is stopped once nobody reads its output |
 
 `StartMachine` waits for a booted machine's init and `StopMachine` for the
@@ -173,6 +173,30 @@ machine to be gone, which can take longer than a client's default timeout
 | `JobRemoved(o job, s result)` | a job ended, "done" or "failed" |
 | `ImageAdded(s name)`, `ImageRemoved(s name)` | after a pull, create, build or removal |
 | `MachineStarted(s name)`, `MachineStopped(s name)` | machined's own events, for the machines nspawn installed |
+
+### Events
+
+`Events` hands out one JSON object per line, the shape `nspawn events --json`
+prints (`Event` in `src/api/events.rs`):
+
+```json
+{"time": "2026-09-25T10:20:16.502186Z", "time_usec": 1790331616502186,
+ "type": "machine", "action": "health_status", "name": "web",
+ "attributes": {"image": "docker.io/library/busybox:latest", "status": "healthy"},
+ "labels": {"role": "web"}}
+```
+
+`attributes` are the same for every action of a type, plus what the action
+adds; they travel with the journal entry, so a `remove` says as much as a
+`create` once the record is gone. `labels` are the machine's while it has a
+record, and empty otherwise.
+
+| Type | Actions | Attributes of every action | The action's own |
+|---|---|---|---|
+| `machine` | `start`, `die`, `stop`, `restart`, `oom`, `fail` (systemd's, for every `systemd-nspawn@` unit), `pull`, `build`, `create`, `push`, `kill`, `update`, `pause`, `unpause`, `health_status`, `remove` (nspawn's) | `image` (the record's reference; on systemd's actions only while the record exists) | `die`: `code` (`exited`, `killed`, `dumped`), `exit_code`, `signal`; `restart`: `restarts`; `fail`: `result`; `pull`, `build`: `reference`; `create`: `from`, `reference`; `push`: `reference` (the destination); `kill`: `signal`; `health_status`: `status` |
+| `network` | `create`, `remove` | `subnet`, `interface`, `internal` | |
+| `volume` | `create`, `remove` | `path` | |
+| `secret` | `create`, `remove` | `size` (bytes of the plaintext) | |
 
 `nspawn exec` is a client of `Exec`: it asks for a pseudo terminal when run
 from one and for pipes otherwise, pumps them, and takes the exit status from

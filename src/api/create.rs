@@ -224,7 +224,11 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         "machine",
         "create",
         &request.name,
-        &[("from", &request.source), ("reference", &record.reference)],
+        &[
+            ("from", &request.source),
+            ("image", &record.reference),
+            ("reference", &record.reference),
+        ],
     );
     Ok(Created {
         name: request.name.clone(),

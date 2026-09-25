@@ -636,6 +636,7 @@ for m in e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-def-cli e2e-nab e2e-non
 done
 $NSPAWN network create e2e-ne >/dev/null || fail "network create e2e-ne"
 $NSPAWN network prune -f >/dev/null || fail "network prune"
+$NSPAWN events --since "-10min" --until now --filter type=network --filter event=remove | grep_q "network remove e2e-ne (interface=nsbr-e2e-ne, internal=false, subnet=" || fail "network remove carries no metadata: $($NSPAWN events --since -10min --until now --filter type=network | tail -3)"
 $NSPAWN network ls | grep_q "^ *e2e-n[a-e] " && fail "network prune left an unused network: $($NSPAWN network ls)"
 ip -o link show | grep_q nsbr-e2e && fail "a removed network left its bridge"
 nft list table ip nspawn | grep_q nsbr-e2e && fail "a removed network left rules in the nspawn table"
@@ -1030,6 +1031,14 @@ for want in [("machine", "start", app), ("machine", "die", app), ("machine", "ki
              ("volume", "create", "e2evol-events"), ("volume", "remove", "e2evol-events")]:
     assert want in seen, (want, sorted(seen))
 assert any(e["action"] == "die" and e["name"] == app and e["attributes"].get("exit_code") == "3" for e in events), events
+# Every event of a kind carries the same metadata, whatever the action: what an event
+# says of a volume or an image must not depend on the record still being there.
+image = "docker.io/library/busybox:latest"
+for e in events:
+    if e["type"] == "machine" and e["name"] == app:
+        assert e["attributes"].get("image") == image, e
+    if e["type"] == "volume" and e["name"] == "e2evol-events":
+        assert e["attributes"].get("path") == "/var/lib/nspawn/volumes/e2evol-events", e
 assert all(e["name"] != "e2e-forged" for e in events), "a forged entry was reported"
 assert all(e["time"].endswith("Z") for e in events)
 PY
@@ -1220,7 +1229,8 @@ $NSPAWN secret rm e2e-pw e2e-pw2 e2e-nope > /tmp/e2e-secretrm.txt 2>&1 && fail "
 grep -q "removed e2e-pw" /tmp/e2e-secretrm.txt || fail "secret rm stopped at the missing secret: $(cat /tmp/e2e-secretrm.txt)"
 grep -q "no secret named e2e-nope" /tmp/e2e-secretrm.txt || fail "a missing secret was not explained: $(cat /tmp/e2e-secretrm.txt)"
 ls /var/lib/nspawn/secrets/ | grep_q e2e-pw && fail "secret rm left files behind"
-$NSPAWN events --since "-2min" --until now --filter type=secret | grep_q "secret create e2e-pw" || fail "no event for the secret"
+$NSPAWN events --since "-2min" --until now --filter type=secret | grep_q "secret create e2e-pw (size=7)" || fail "no event for the secret"
+$NSPAWN events --since "-2min" --until now --filter type=secret --filter event=remove | grep_q "secret remove e2e-pw (size=7)" || fail "secret remove carries no metadata: $($NSPAWN events --since -2min --until now --filter type=secret | tail -3)"
 
 step "everything at once: the features of 1.3.0 combined, on an app and on a booted machine"
 $NSPAWN network create e2e-nd --label tier=mix >/dev/null || fail "network create e2e-nd"
@@ -1322,6 +1332,7 @@ grep -q "removed $app" /tmp/e2e-rmf.txt || fail "rm -f did not say it removed $a
 grep -q "volume e2evol kept" /tmp/e2e-rmf.txt || fail "rm did not say the named volume was kept: $(cat /tmp/e2e-rmf.txt)"
 [ -d /var/lib/nspawn/volumes/e2evol ] || fail "rm removed a named volume"
 $NSPAWN ps -a | grep_q "^ *$app " && fail "$app still listed after rm -f"
+$NSPAWN events --since "-2min" --until now --filter name=$app --filter event=remove | grep_q "machine remove $app (image=docker.io/library/busybox:latest)" || fail "machine remove carries no image: $($NSPAWN events --since -2min --until now --filter name=$app | tail -2)"
 [ -e "/var/lib/machines/$app" ] && fail "/var/lib/machines/$app left after rm -f"
 systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "rm -f left the unit failed"
 [ -e /etc/systemd/nspawn/$app.nspawn ] && fail "settings file left behind for $app"

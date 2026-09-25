@@ -160,8 +160,12 @@ takes. Not on mstack machines yet.
 
 `events` is docker events: what happens to machines (`start`, `die` with its exit code,
 `stop`, `restart`, `oom`, `fail`, `health_status`, and nspawn's own `pull`, `build`,
-`create`, `push`, `kill`, `update`, `remove`), networks and volumes, as it happens or between `--since`
-and `--until`, filtered by name, type, event or label, as text or `--json`. It reads
+`create`, `push`, `kill`, `update`, `pause`, `unpause`, `remove`), networks, volumes and
+secrets, as it happens or between `--since` and `--until`, filtered by name, type, event
+or label, as text or `--json`. Every event of a kind carries the same metadata whatever
+the action, so a `remove` says as much as a `create`: `image=` on a machine's (and its
+labels while it has a record), `subnet=`, `interface=` and `internal=` on a network's,
+`path=` on a volume's, `size=` on a secret's. It reads
 the journal, so machines started by `machinectl`, at boot or by a restart policy are
 there too, and so is what happened while nobody watched.
 

@@ -201,7 +201,10 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
         "machine",
         "build",
         &name,
-        &[("reference", &image.to_string())],
+        &[
+            ("image", &image.to_string()),
+            ("reference", &image.to_string()),
+        ],
     );
     Ok(Built {
         name,

@@ -113,7 +113,10 @@ pub async fn push(ctx: &Context, request: &PushRequest, report: Report<'_>) -> R
         "machine",
         "push",
         &record.name,
-        &[("reference", &destination.to_string())],
+        &[
+            ("image", &record.reference),
+            ("reference", &destination.to_string()),
+        ],
     );
     Ok(Pushed {
         name: record.name,

@@ -171,7 +171,12 @@ pub async fn create(
         labels,
     };
     write_atomically(&meta_path(store, name), &serde_json::to_vec(&meta)?)?;
-    crate::api::events::emit("secret", "create", name, &[]);
+    crate::api::events::emit(
+        "secret",
+        "create",
+        name,
+        &[("size", &content.len().to_string())],
+    );
     Ok(())
 }
 
@@ -184,10 +189,15 @@ pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Resu
     let users = users(&store.list_images_strict()?);
     let mut removal = Removal::default();
     for name in names {
+        let size = read_meta(store, name)
+            .ok()
+            .flatten()
+            .map(|m| m.size.to_string())
+            .unwrap_or_default();
         match remove_one(store, name, &users) {
             Ok(()) => {
                 line(report, format!("removed {name}"));
-                crate::api::events::emit("secret", "remove", name, &[]);
+                crate::api::events::emit("secret", "remove", name, &[("size", &size)]);
                 removal.removed.push(name.clone());
             }
             Err(e) => removal.failed.push((name.clone(), format!("{e:#}"))),

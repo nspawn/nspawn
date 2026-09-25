@@ -93,7 +93,12 @@ pub async fn create(ctx: &Context, name: &str) -> Result<PathBuf> {
     let new = !store.volumes_dir().join(name).is_dir();
     let path = create_in(store, name)?;
     if new {
-        crate::api::events::emit("volume", "create", name, &[]);
+        crate::api::events::emit(
+            "volume",
+            "create",
+            name,
+            &[("path", &path.to_string_lossy())],
+        );
     }
     Ok(path)
 }
@@ -143,7 +148,12 @@ fn remove_in(store: &Store, names: &[String], report: Report<'_>) -> Result<Remo
         match outcome {
             Ok(()) => {
                 line(report, format!("removed {name}"));
-                crate::api::events::emit("volume", "remove", name, &[]);
+                crate::api::events::emit(
+                    "volume",
+                    "remove",
+                    name,
+                    &[("path", &store.volumes_dir().join(name).to_string_lossy())],
+                );
                 removal.removed.push(name.clone());
             }
             Err(e) => removal.failed.push((name.clone(), format!("{e:#}"))),
@@ -215,7 +225,15 @@ fn prune_in(store: &Store, report: Report<'_>) -> Result<Vec<String>> {
         }
         remove_one(store, &volume.name, &users)?;
         line(report, format!("removed {}", volume.name));
-        crate::api::events::emit("volume", "remove", &volume.name, &[]);
+        crate::api::events::emit(
+            "volume",
+            "remove",
+            &volume.name,
+            &[(
+                "path",
+                &store.volumes_dir().join(&volume.name).to_string_lossy(),
+            )],
+        );
         removed.push(volume.name);
     }
     Ok(removed)

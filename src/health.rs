@@ -402,7 +402,12 @@ pub async fn run(ctx: &Context, name: &str) -> Result<()> {
         };
         let in_start_period = started.elapsed() < hc.start_period();
         if let Some(status) = monitor.observe(probe, in_start_period) {
-            crate::api::events::emit("machine", "health_status", name, &[("status", status)]);
+            crate::api::events::emit(
+                "machine",
+                "health_status",
+                name,
+                &[("image", &record.reference), ("status", status)],
+            );
         }
         write_status(name, &monitor.status)?;
     }

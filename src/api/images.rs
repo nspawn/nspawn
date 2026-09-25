@@ -142,7 +142,7 @@ pub async fn remove_machines(
         ", or use nspawn rm --force"
     };
     for name in names.iter().filter(|n| !skip.contains(*n)) {
-        let outcome: Result<()> = async {
+        let outcome: Result<Option<String>> = async {
             if store.is_starting(name) {
                 bail!("machine {name} is starting; wait for it or stop it first");
             }
@@ -169,6 +169,7 @@ pub async fn remove_machines(
                             ),
                         );
                     }
+                    Ok(Some(rec.reference))
                 }
                 None => {
                     // Not recorded: an image machined knows, or leftovers of ours.
@@ -177,15 +178,19 @@ pub async fn remove_machines(
                         sd.remove_image(name).await?;
                     }
                     crate::install::take_off_boot(sd, name, report).await;
+                    Ok(None)
                 }
             }
-            Ok(())
         }
         .await;
         match outcome {
-            Ok(()) => {
+            Ok(image) => {
                 line(report, format!("removed {name}"));
-                crate::api::events::emit("machine", "remove", name, &[]);
+                // The record is gone: what the event says of the image has to travel
+                // with it.
+                let attributes: Vec<(&str, &str)> =
+                    image.iter().map(|i| ("image", i.as_str())).collect();
+                crate::api::events::emit("machine", "remove", name, &attributes);
                 removal.removed.push(name.clone());
             }
             Err(e) => removal.failed.push((name.clone(), format!("{e:#}"))),
