@@ -1,3 +1,10 @@
+nspawn (1.3.1-1) unstable; urgency=medium
+
+  * The mstack backend is experimental and opt-in; auto is overlay everywhere.
+  * systemd 262 cannot boot managed user namespaces: mstack is refused there.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Fri, 25 Sep 2026 20:00:00 -0500
+
 nspawn (1.3.0-1) unstable; urgency=medium
 
   * Several networks per machine with aliases, ports on one host address.
