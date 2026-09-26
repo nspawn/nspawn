@@ -73,7 +73,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi busybox-1.37 busybox-1.36; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot busybox-1.37 busybox-1.36; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -647,6 +647,43 @@ if firewall-cmd --state >/dev/null 2>&1; then
   firewall-cmd --zone=trusted --list-interfaces | grep_q nsbr-e2e && fail "a removed network is still in the trusted zone"
 fi
 $NSPAWN network ls | grep_q "^ *bridge " || fail "the default network is not listed"
+
+step "--network container: a machine in another one's network namespace, like docker's"
+$NSPAWN create $app e2e-side-net -p 18095:8080 -- /bin/sleep 300 >/dev/null || fail "create the owner of the shared network"
+$NSPAWN start e2e-side-net >/dev/null || fail "start the owner of the shared network"
+$NSPAWN create $app e2e-side --network container:e2e-side-net -- /bin/sh -c "mkdir -p /www && echo side-$nonce > /www/index.html && exec /bin/httpd -f -p 8080 -h /www" >/dev/null || fail "create a machine in another one's network"
+$NSPAWN start e2e-side >/dev/null || fail "start a machine in another one's network"
+owner_addr=$($NSPAWN inspect e2e-side-net | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['address'])")
+$NSPAWN exec e2e-side -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep_q " $owner_addr/" || fail "the sharing machine does not see the owner's address: $($NSPAWN exec e2e-side -- ip -4 -o addr show </dev/null)"
+retry 10 bash -c "curl -s -m 3 http://127.0.0.1:18095/ | grep -q side-$nonce" || fail "the port the owner publishes does not reach the sharing machine's program"
+$NSPAWN exec e2e-side -- cat /etc/hosts </dev/null | tr -d '\r' | grep_q " host.nspawn.internal" || fail "the sharing machine lacks the hosts file of the network: $($NSPAWN exec e2e-side -- cat /etc/hosts </dev/null)"
+$NSPAWN ps | grep "^ *e2e-side " | grep_q " container:e2e-side-net " || fail "ps does not show the shared network: $($NSPAWN ps)"
+$NSPAWN inspect e2e-side | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['network'] == 'container:e2e-side-net' and d['networks'] == [] and d['address'] == '', d" || fail "inspect of a machine in another one's network"
+$NSPAWN network inspect bridge | python3 -c "import json,sys; ms = [m['name'] for m in json.load(sys.stdin)[0]['machines']]; assert 'e2e-side-net' in ms and 'e2e-side' not in ms, ms" || fail "network inspect lists the sharing machine as a member"
+out=$($NSPAWN start e2e-side --network-alias side 2>&1) && fail "an alias was accepted on a machine without a network of its own"
+out=$($NSPAWN create $app e2e-side-p --network container:e2e-side-net --network e2e-x -- /bin/sleep 1 2>&1) && fail "container: was combined with another network"
+echo "$out" | grep_q "stands alone" || fail "the combination was not explained: $out"
+$NSPAWN create $app e2e-side-p --network container:e2e-side-net -p 18096:8080 -- /bin/sleep 1 >/dev/null || fail "create with container: and a port"
+out=$($NSPAWN start e2e-side-p 2>&1) && fail "a port was published from a machine in another one's network"
+echo "$out" | grep_q "with -p on e2e-side-net" || fail "the refused port was not explained: $out"
+$NSPAWN rm e2e-side-p >/dev/null || fail "rm e2e-side-p"
+out=$($NSPAWN rm -f e2e-side-net 2>&1) && fail "the owner of a shared network was removed"
+echo "$out" | grep_q "network of e2e-side" || fail "the refused removal was not explained: $out"
+$NSPAWN ps | grep_q "^ *e2e-side-net .* running" || fail "the refused rm -f stopped the owner: $($NSPAWN ps)"
+$NSPAWN stop e2e-side >/dev/null || fail "stop the sharing machine"
+ip netns list | grep_q -E "^nspawn-e2e-side( |$)" && fail "the namespace name of the sharing machine was left behind"
+ip netns list | grep_q -E "^nspawn-e2e-side-net( |$)" || fail "stopping the sharing machine took the owner's namespace"
+$NSPAWN stop e2e-side-net >/dev/null || fail "stop the owner"
+out=$($NSPAWN start e2e-side 2>&1) && fail "a machine started in the network of a stopped one"
+echo "$out" | grep_q "not running" || fail "the stopped owner was not explained: $out"
+# A booted machine's network is shared the same way.
+$NSPAWN pull "$IMAGE" --name e2e-side-boot --backend overlay --force >/dev/null || fail "pull e2e-side-boot"
+$NSPAWN start e2e-side-boot >/dev/null || fail "start a booted owner"
+boot_addr=$($NSPAWN inspect e2e-side-boot | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['address'])")
+$NSPAWN start e2e-side --network container:e2e-side-boot -- /bin/sh -c 'ip -4 -o addr show host0' >/dev/null 2>&1
+retry 10 bash -c "$NSPAWN logs e2e-side | tr -d '\r' | grep -q ' $boot_addr/'" || fail "the sharing machine does not see the booted owner's address: $($NSPAWN logs e2e-side)"
+$NSPAWN rm -f e2e-side >/dev/null || fail "rm e2e-side"
+$NSPAWN rm -f e2e-side-boot e2e-side-net >/dev/null || fail "rm the owners"
 
 step "run -d: a machine from an image and started in one step, like docker run -d"
 # busybox is here as $app: run makes another machine of it without the registry.

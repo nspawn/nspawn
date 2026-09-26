@@ -73,6 +73,8 @@ pub fn record(r: &ImageRecord) -> Dict {
             "network".to_string(),
             v(if r.no_network {
                 "none".to_string()
+            } else if let Some(owner) = &r.network_container {
+                format!("container:{owner}")
             } else {
                 r.network_name
                     .clone()

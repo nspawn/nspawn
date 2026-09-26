@@ -923,6 +923,17 @@ pub fn interface_by_index(sys_net: &Path, index: u32) -> Option<String> {
     None
 }
 
+/// Names the network namespace of the process `leader` after the machine, where
+/// systemd-nspawn looks for the machine's own: what --network container: shares. The
+/// name goes with `delete_netns`, the namespace stays the other machine's.
+pub fn attach_netns(name: &str, leader: u32) -> Result<()> {
+    delete_netns(name);
+    run(
+        "ip",
+        &["netns", "attach", &netns_name(name), &leader.to_string()],
+    )
+}
+
 /// Best effort; the veth goes with the namespace.
 pub fn delete_netns(name: &str) {
     if Path::new(&netns_path(name)).exists() {
@@ -1094,9 +1105,17 @@ pub fn networks_of(record: &ImageRecord) -> Vec<&str> {
     out
 }
 
-/// On bridge networks, as opposed to veth, host or none.
+/// On bridge networks, as opposed to veth, host, none or another machine's namespace.
 pub fn bridge_kind(record: &ImageRecord) -> bool {
-    record.network == Network::Bridge && !record.no_network
+    record.network == Network::Bridge && !record.no_network && record.network_container.is_none()
+}
+
+/// The machine whose network namespace this one takes (--network container:NAME).
+pub fn shares_network(record: &ImageRecord) -> Option<&str> {
+    if record.network != Network::Bridge || record.no_network {
+        return None;
+    }
+    record.network_container.as_deref()
 }
 
 /// Whether the machine joins `network`, as its primary one or besides it.

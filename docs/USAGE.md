@@ -276,6 +276,17 @@ docker does; `--network none` gives it no interface but `lo`. `network ls` lists
 networks, `network rm` and `network prune` remove the ones no machine joins, bridge and
 rules included; `network create --label KEY=VALUE` tags one.
 
+`--network container:NAME` puts an app machine in the network namespace of NAME, as
+docker's `--network container:` does: the same interfaces and address, NAME's hosts
+and resolv.conf files, nothing of its own, and a port its program serves is published
+with `-p` on NAME. NAME has to be running on a bridge network when the machine starts,
+and cannot be removed while a machine names it; when NAME stops or restarts, the
+machine keeps the namespace it joined and has to be restarted to join the new one, as
+with docker. `-p`, `--network-alias`, `--dns`, `--dns-search`, `--add-host` and
+`--sysctl` are refused on such a machine, since they shape a network of its own, and
+so is a booted image, whose systemd would configure the shared interfaces again. `ps`
+and `inspect` show it as `container:NAME`.
+
 ### App machines
 
 App images have nothing inside to configure `host0`, so for them nspawn builds the

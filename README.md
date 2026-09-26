@@ -51,9 +51,10 @@ the shells; `man nspawn` is the same reference the packages install.
   it, sharing its layers, each with settings, ports and an address of its own.
 - **A network of its own.** Machines join the `nspawn0` bridge (docker0 style, managed
   with nftables, fixed addresses, names in `/etc/hosts`); `network create` adds
-  isolated networks with aliases, `-p` publishes ports, and `--network host`, `veth`
-  and `none` cover the other cases. Every machine's unit calls nspawn around its life,
-  so `machinectl start`, a unit at boot and a restart policy get the same network.
+  isolated networks with aliases, `-p` publishes ports, and `--network host`, `veth`,
+  `none` and `container:NAME` cover the other cases. Every machine's unit calls nspawn
+  around its life, so `machinectl start`, a unit at boot and a restart policy get the
+  same network.
 - **Everything through the bus.** Every command is a method of `org.nspawn` on the
   system bus and polkit decides who may call; `inspect` and `--json` print what the
   service answered, with the keys of the D-Bus interface.

@@ -268,6 +268,24 @@ pub async fn prepare(
             "{name} is an mstack app: managed user namespaces cannot join the network namespace prepared for the bridge; pull it again with --backend overlay, or start it with --network host"
         );
     }
+    let shared = bridge::shares_network(&record).map(str::to_string);
+    if let Some(owner) = &shared {
+        if record.mode != Mode::App {
+            bail!("{name} boots an init system, whose systemd would configure the interfaces of {owner} again; --network container: is for app images");
+        }
+        if !record.ports.is_empty() {
+            bail!("{name} shares the network of {owner}: ports are published there, with -p on {owner}");
+        }
+        if !record.tuning.sysctls.is_empty() {
+            bail!("--sysctl values are set in the network namespace nspawn makes for a machine; {name} shares the one of {owner}");
+        }
+        if !record.tuning.dns.is_empty()
+            || !record.tuning.dns_search.is_empty()
+            || !record.tuning.extra_hosts.is_empty()
+        {
+            bail!("--dns, --dns-search and --add-host shape the resolv.conf and hosts files of a machine with a network of its own; {name} takes the ones of {owner}");
+        }
+    }
     if !record.ports.is_empty() && !bridged {
         if record.no_network {
             bail!("ports are published through a bridge network; {name} has no network (--network none)");
@@ -307,6 +325,29 @@ pub async fn prepare(
             store.machine_files_dir(name),
             nets[0].interface.clone(),
             extras,
+        ))
+    } else if let Some(owner) = &shared {
+        // The other machine's namespace under this machine's name, and its generated
+        // hosts and resolv.conf files, which follow that network's members.
+        let owner_record = store.load_image(owner)?.with_context(|| {
+            format!("{name} shares the network of {owner}, which is not a machine of nspawn's")
+        })?;
+        if !bridge::bridge_kind(&owner_record) {
+            bail!("{name} shares the network of {owner}, which has no network of its own to share");
+        }
+        if !sd.machine_exists(owner).await? {
+            bail!(
+                "{name} shares the network of {owner}, which is not running; start {owner} first"
+            );
+        }
+        let nets = crate::api::network::nets_of(store, config, &owner_record)?;
+        let leader = sd.machine_leader(owner).await?;
+        bridge::attach_netns(name, leader)?;
+        store.record_image(&record)?;
+        Some((
+            store.machine_files_dir(owner),
+            nets[0].interface.clone(),
+            Vec::new(),
         ))
     } else {
         store.record_image(&record)?;
@@ -457,7 +498,8 @@ pub async fn prepare(
     } else {
         None
     };
-    let route = settings::namespace_route(sd, name, record.mode, bridged).await?;
+    let route =
+        settings::namespace_route(sd, name, record.mode, bridged || shared.is_some()).await?;
     settings::write(
         &MachineSettings {
             name,

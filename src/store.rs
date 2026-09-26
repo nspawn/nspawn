@@ -60,6 +60,11 @@ pub struct ImageRecord {
     /// still reads the record (as a machine of the default network).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_network: bool,
+    /// --network container:NAME: the network namespace of that machine, with no address
+    /// or interface of its own. Kept apart from `network` so that an older nspawn still
+    /// reads the record (as a machine of the default network).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_container: Option<String>,
     /// The --health-* flags, on top of the image's healthcheck (run.healthcheck).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<Healthcheck>,
@@ -1644,6 +1649,7 @@ mod tests {
             extra_networks: Vec::new(),
             aliases: BTreeMap::new(),
             no_network: false,
+            network_container: None,
             healthcheck: None,
             tuning: Default::default(),
         };
@@ -1698,6 +1704,7 @@ mod tests {
             extra_networks: Vec::new(),
             aliases: BTreeMap::new(),
             no_network: false,
+            network_container: None,
             healthcheck: None,
             tuning: Default::default(),
         };
@@ -1903,6 +1910,7 @@ mod tests {
             extra_networks: Vec::new(),
             aliases: BTreeMap::new(),
             no_network: false,
+            network_container: None,
             healthcheck: None,
             tuning: Default::default(),
         };

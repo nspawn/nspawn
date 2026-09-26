@@ -91,6 +91,8 @@ pub struct NetworkChoice {
     pub extras: Vec<String>,
     /// --network none.
     pub none: bool,
+    /// --network container:NAME: that machine's network namespace.
+    pub container: Option<String>,
 }
 
 pub fn choices(texts: &[String]) -> Result<NetworkChoice> {
@@ -102,7 +104,16 @@ pub fn choices(texts: &[String]) -> Result<NetworkChoice> {
         name: None,
         extras: Vec::new(),
         none: false,
+        container: None,
     };
+    if let Some(machine) = first.strip_prefix("container:") {
+        crate::reference::validate_machine_name(machine)?;
+        if !rest.is_empty() {
+            bail!("--network {first} stands alone: the machine takes the network of {machine}, and joins no other");
+        }
+        choice.container = Some(machine.to_string());
+        return Ok(choice);
+    }
     match first.as_str() {
         DEFAULT_NETWORK => {}
         "veth" => choice.kind = Network::Veth,
@@ -121,6 +132,9 @@ pub fn choices(texts: &[String]) -> Result<NetworkChoice> {
             "veth" | "host" | "none" => {
                 bail!("--network {text} stands alone; a machine joins several networks of the bridge kind only")
             }
+            text if text.starts_with("container:") => {
+                bail!("--network {text} stands alone: the machine takes that network, and joins no other")
+            }
             DEFAULT_NETWORK => {}
             name => validate_network_name(name)?,
         }
@@ -136,6 +150,17 @@ pub fn choices(texts: &[String]) -> Result<NetworkChoice> {
 /// Puts the choice on a record, keeping the addresses it has on networks it stays on and
 /// the aliases on them.
 pub fn apply(record: &mut ImageRecord, choice: &NetworkChoice) {
+    record.network_container.clone_from(&choice.container);
+    if choice.container.is_some() {
+        // Another machine's namespace: no network, address or names of its own.
+        record.network = Network::Bridge;
+        record.network_name = None;
+        record.no_network = false;
+        record.address = None;
+        record.extra_networks.clear();
+        record.aliases.clear();
+        return;
+    }
     let had: BTreeMap<String, Ipv4Addr> = bridge::networks_of(record)
         .into_iter()
         .filter_map(|n| bridge::address_on(record, n).map(|a| (n.to_string(), a)))
@@ -629,7 +654,8 @@ mod tests {
                 kind: Network::Bridge,
                 name: None,
                 extras: Vec::new(),
-                none: false
+                none: false,
+                container: None,
             }
         );
         assert_eq!(one("veth").unwrap().kind, Network::Veth);
@@ -648,8 +674,16 @@ mod tests {
             ["none", "front"],
             ["front", "front"],
             ["bridge", "bridge"],
+            ["container:vpn", "front"],
+            ["front", "container:vpn"],
         ] {
             assert!(choices(&[bad[0].into(), bad[1].into()]).is_err(), "{bad:?}");
+        }
+        let shared = choices(&["container:vpn".into()]).unwrap();
+        assert_eq!(shared.container.as_deref(), Some("vpn"));
+        assert!(shared.kind == Network::Bridge && !shared.none && shared.extras.is_empty());
+        for bad in ["container:", "container:bad name", "container:a/b"] {
+            assert!(choices(&[bad.into()]).is_err(), "{bad:?}");
         }
         assert!(validate_network_name("bridge").is_err());
         assert!(validate_network_name("front_end-2").is_ok());
@@ -700,6 +734,17 @@ mod tests {
         apply(&mut r, &choices(&["host".into()]).unwrap());
         assert_eq!(r.network, Network::Host);
         assert!(!r.no_network);
+        // Another machine's namespace: nothing of the machine's own is left.
+        r.aliases.insert("bridge".into(), vec!["www".into()]);
+        apply(&mut r, &choices(&["container:vpn".into()]).unwrap());
+        assert_eq!(r.network_container.as_deref(), Some("vpn"));
+        assert!(r.network == Network::Bridge && !r.no_network && r.network_name.is_none());
+        assert!(r.address.is_none() && r.extra_networks.is_empty() && r.aliases.is_empty());
+        assert!(!bridge::bridge_kind(&r) && !bridge::joins(&r, "bridge"));
+        assert_eq!(bridge::shares_network(&r), Some("vpn"));
+        apply(&mut r, &choices(&["bridge".into()]).unwrap());
+        assert!(r.network_container.is_none() && bridge::bridge_kind(&r));
+        assert_eq!(bridge::shares_network(&r), None);
     }
 
     #[test]
@@ -782,7 +827,13 @@ mod tests {
         let loaded = store.load_image("db").unwrap().unwrap();
         assert_eq!(loaded.network_name, None);
         let text = std::fs::read_to_string(store.images_dir().join("db.json")).unwrap();
-        for key in ["network_name", "extra_networks", "aliases", "no_network"] {
+        for key in [
+            "network_name",
+            "extra_networks",
+            "aliases",
+            "no_network",
+            "network_container",
+        ] {
             assert!(
                 !text.contains(key),
                 "a machine of one network writes no {key}"

@@ -264,7 +264,12 @@ at `/run/systemd/network/10-host0.network`, `11-host1.network`.., host0 on the
 primary bridge through `Bridge=` and the others through `VirtualEthernetExtra=`,
 whose host ends (`vb1-NAME`..) the publish hook puts on their bridges; app
 machines get a namespace built beforehand (`ip netns`, one veth per network,
-addresses, route) referenced by `NamespacePath=`; each veth's inside end takes
+addresses, route) referenced by `NamespacePath=`; a machine with `--network
+container:NAME` (`network_container` in its record, the other network fields
+empty) gets no address of its own: its namespace name is attached to the
+leader of NAME (`ip netns attach`), so the same `NamespacePath=` applies, it
+binds NAME's generated hosts and resolv.conf, and `release` drops the name
+while the namespace stays NAME's; each veth's inside end takes
 its MAC from its address (`02:42:` and the four octets, as docker's), so a
 restart keeps it and the host's neighbour cache stays right. Under managed user
 namespaces (mstack) nspawn has systemd-nsresourced create the veths and does

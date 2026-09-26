@@ -354,10 +354,10 @@ pub struct CreateArgs {
     /// How to assemble it (default: like the source).
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     pub backend: BackendChoice,
-    /// Network of the new machine: bridge, veth, host, none or a network made with
-    /// network create; repeatable to join several bridge networks, the first one primary
-    /// (default: the source's kind; a network made with network create is not
-    /// inherited).
+    /// Network of the new machine: bridge, veth, host, none, container:NAME (that
+    /// machine's network, as docker's) or a network made with network create;
+    /// repeatable to join several bridge networks, the first one primary (default: the
+    /// source's kind; a network made with network create is not inherited).
     #[arg(long, value_name = "NETWORK")]
     pub network: Vec<String>,
     /// Another name for the machine on a network, like docker --network-alias: NAME on
@@ -791,8 +791,9 @@ pub struct StartOptions {
     pub wait: bool,
     /// Network of the machine, remembered for the image: bridge (the default network),
     /// veth (systemd-networkd on the host, booted images), host (the host's own
-    /// network), none (no network) or the name of a network made with network create;
-    /// repeatable to join several bridge networks, the first one primary.
+    /// network), none (no network), container:NAME (the network of that running
+    /// machine, as docker's --network container:) or the name of a network made with
+    /// network create; repeatable to join several bridge networks, the first one primary.
     #[arg(long, value_name = "NETWORK")]
     pub network: Vec<String>,
     /// Another name for the machine on a network, like docker --network-alias: NAME on

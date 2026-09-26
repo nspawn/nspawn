@@ -111,6 +111,29 @@ pub async fn remove_machines(
             skip.insert(name.clone());
         }
     }
+    // A machine another one takes its network from stays, running or not: the other
+    // could not start again without it.
+    let records = store.list_images()?;
+    let shared: Vec<(String, String)> = names
+        .iter()
+        .filter(|n| !skip.contains(*n))
+        .map(|name| {
+            let sharing: Vec<&str> = records
+                .iter()
+                .filter(|r| r.network_container.as_deref() == Some(name.as_str()))
+                .map(|r| r.name.as_str())
+                .collect();
+            (name.clone(), sharing.join(", "))
+        })
+        .filter(|(_, sharing)| !sharing.is_empty())
+        .collect();
+    for (name, sharing) in shared {
+        removal.failed.push((
+            name.clone(),
+            format!("{name} is the network of {sharing} (--network container:{name}); remove them or give them a network of their own first"),
+        ));
+        skip.insert(name);
+    }
     if force {
         let valid: Vec<&String> = names.iter().filter(|n| !skip.contains(*n)).collect();
         for name in valid {
