@@ -1,4 +1,5 @@
 README.md
+docs/USAGE.md
 docs/ARCHITECTURE.md
 docs/DBUS.md
 packaging/polkit/nspawn-wheel.rules

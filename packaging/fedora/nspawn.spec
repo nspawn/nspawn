@@ -130,7 +130,7 @@ fi
 
 %files
 %license LICENSE
-%doc README.md docs/ARCHITECTURE.md docs/DBUS.md packaging/polkit/nspawn-wheel.rules
+%doc README.md docs/USAGE.md docs/ARCHITECTURE.md docs/DBUS.md packaging/polkit/nspawn-wheel.rules
 %{_bindir}/%{name}
 %{_unitdir}/%{name}.service
 %{_datadir}/dbus-1/system-services/org.nspawn.service

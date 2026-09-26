@@ -17,7 +17,8 @@ version and the documentation; the AUR packages are the maintainer's.
    in and pushes, which a public registry is not for.
 2. The documentation in this repository says what the code does. The pages that
    go stale first are the ones that quote paths, flags or defaults: README.md,
-   docs/ARCHITECTURE.md, docs/DBUS.md and the `--help` texts in `src/cli.rs`.
+   docs/USAGE.md, docs/ARCHITECTURE.md, docs/DBUS.md and the `--help` texts in
+   `src/cli.rs`.
 3. The website follows, in the same pass. It is a separate repository
    (`github.com/nspawn/website`), maintained from here because this is where
    the change was made:

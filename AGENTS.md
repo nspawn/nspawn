@@ -5,7 +5,7 @@ systemd-machined: images come from an OCI registry, machines are driven over
 D-Bus, and the tool runs its own bridge network. Read these before changing
 anything:
 
-- README.md: what the tool does and how it is used.
+- README.md: what the tool does; docs/USAGE.md: how it is used, command by command.
 - docs/ARCHITECTURE.md: modules, on-disk layout, networking, unit hooks.
 - docs/DBUS.md: the org.nspawn interface on the system bus.
 - docs/HACKING.md: building, unit tests, clippy, the end-to-end suite, the test VM.

@@ -7,8 +7,8 @@
 - New behaviour has a unit test. Changes to machines, networking or registry
   access also get a step in `tests/e2e.sh`, and the suite has been run on a VM
   (see docs/HACKING.md).
-- README.md describes what users see; docs/ARCHITECTURE.md describes how it
-  works. Update whichever applies.
+- README.md and docs/USAGE.md describe what users see; docs/ARCHITECTURE.md
+  describes how it works. Update whichever applies.
 
 ## Commit messages
 
