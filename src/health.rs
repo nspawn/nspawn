@@ -468,15 +468,27 @@ async fn probe(ctx: &Context, name: &str, argv: &[String], timeout: Duration) ->
     })
 }
 
+/// The first OUTPUT_LIMIT bytes of a stream; the rest is read and dropped, as docker
+/// does, so that a probe which says more never dies of SIGPIPE on a pipe closed early.
 fn read_capped(fd: Option<OwnedFd>) -> String {
     let Some(fd) = fd else {
         return String::new();
     };
-    let mut bytes = Vec::new();
-    let _ = std::fs::File::from(fd)
-        .take(OUTPUT_LIMIT as u64)
-        .read_to_end(&mut bytes);
-    String::from_utf8_lossy(&bytes).into_owned()
+    let mut file = std::fs::File::from(fd);
+    let mut kept = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let room = OUTPUT_LIMIT.saturating_sub(kept.len());
+                kept.extend_from_slice(&buf[..n.min(room)]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&kept).into_owned()
 }
 
 #[cfg(test)]
@@ -573,6 +585,32 @@ mod tests {
         .apply(Some(&image))
         .is_err());
         assert!(Overrides::default().is_empty() && !off.is_empty());
+    }
+
+    #[test]
+    fn a_chatty_probe_is_drained_and_its_output_capped() {
+        use std::io::Write;
+        let (read, write) = nix::unistd::pipe().unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut pipe = std::fs::File::from(write);
+            // Well past the pipe's buffer: a reader that stopped at the cap would leave
+            // this write hanging, and one that closed the pipe would break it.
+            let chunk = vec![b'x'; 65536];
+            for _ in 0..4 {
+                pipe.write_all(&chunk)?;
+            }
+            Ok::<(), std::io::Error>(())
+        });
+        let output = read_capped(Some(read));
+        assert_eq!(output.len(), OUTPUT_LIMIT);
+        writer
+            .join()
+            .unwrap()
+            .expect("the probe's writes all went through");
+        let (read, write) = nix::unistd::pipe().unwrap();
+        std::fs::File::from(write).write_all(b"ok\n").unwrap();
+        assert_eq!(read_capped(Some(read)), "ok\n");
+        assert_eq!(read_capped(None), "");
     }
 
     #[test]

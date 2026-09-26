@@ -1179,6 +1179,17 @@ assert len(d['health_log']) >= 1, d" || fail "inspect does not show the health"
 out=$($NSPAWN events --since "@$health_since" --until now --filter name=$app --filter event=health_status)
 echo "$out" | grep_q "status=unhealthy" || fail "no health_status event for unhealthy: $out"
 echo "$out" | grep_q "status=healthy" || fail "no health_status event for healthy: $out"
+# A probe that says more than the 4 KiB kept is drained rather than cut off: cut off, it
+# would die of SIGPIPE and count as a failure.
+$NSPAWN update $app --health-cmd "yes | head -c 300000; test -f /ok" >/dev/null || fail "update to a chatty probe"
+chatty_probe_ok() {
+  $NSPAWN inspect $app | python3 -c "
+import json, sys
+d = json.load(sys.stdin)[0]
+probes = [p.split(' ', 2) for p in d['health_log']]
+assert d['health'] == 'healthy' and probes and probes[-1][1] == '0' and len(probes[-1][2]) == 4096, (d['health'], [(p[1], len(p[2])) for p in probes])"
+}
+retry 10 chatty_probe_ok 2>/dev/null || fail "a chatty probe was not drained: $($NSPAWN inspect $app | python3 -c 'import json, sys; d = json.load(sys.stdin)[0]; print(d[\"health\"], [(p.split(\" \", 2)[1], len(p.split(\" \", 2)[2])) for p in d[\"health_log\"]])')"
 $NSPAWN update $app --health-retries 5 >/dev/null || fail "update the healthcheck"
 retry 5 systemctl is-active nspawn-health-$app.service >/dev/null || fail "the health runner did not come back after update"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['healthcheck']['retries'] == 5, d['healthcheck']" || fail "update did not change the retries"
