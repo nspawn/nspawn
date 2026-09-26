@@ -1,4 +1,4 @@
-policy_module(nspawn, 1.3.0)
+policy_module(nspawn, 1.4.0)
 
 ########################################
 #
@@ -136,6 +136,11 @@ sysnet_domtrans_ifconfig(nspawn_t)
 iptables_domtrans(nspawn_t)
 kernel_rw_net_sysctls(nspawn_t)
 sysnet_read_ifconfig_run_files(nspawn_t)
+# --network container: binds another machine's network namespace under /run/netns
+# itself, as ip netns attach would: the name file is made, mounted on and removed
+# there, and the directory becomes a shared mount point on a host's first name.
+allow nspawn_t ifconfig_var_run_t:dir { add_name remove_name write mounton };
+allow nspawn_t ifconfig_var_run_t:file { create write mounton unlink };
 
 # nspawn's own events go to the journal as structured entries, through
 # journald's native socket.

@@ -780,8 +780,11 @@ fn sysctl(key: &str, value: &str) -> Result<()> {
     fs::write(&path, value).with_context(|| format!("writing {path}"))
 }
 
+/// Where ip netns keeps the names.
+const NETNS_DIR: &str = "/run/netns";
+
 pub fn netns_path(name: &str) -> String {
-    format!("/run/netns/{}", netns_name(name))
+    format!("{NETNS_DIR}/{}", netns_name(name))
 }
 
 fn netns_name(name: &str) -> String {
@@ -924,14 +927,55 @@ pub fn interface_by_index(sys_net: &Path, index: u32) -> Option<String> {
 }
 
 /// Names the network namespace of the process `leader` after the machine, where
-/// systemd-nspawn looks for the machine's own: what --network container: shares. The
-/// name goes with `delete_netns`, the namespace stays the other machine's.
+/// systemd-nspawn looks for the machine's own: what --network container: shares. Done
+/// as `ip netns attach` does it, but by the service itself: reaching the namespace of
+/// a process in a user namespace (a booted machine's init) takes the service's own
+/// rights, which the ip command runs without under SELinux. The name goes with
+/// `delete_netns`, the namespace stays the other machine's.
 pub fn attach_netns(name: &str, leader: u32) -> Result<()> {
+    use nix::mount::{mount, MsFlags};
     delete_netns(name);
-    run(
-        "ip",
-        &["netns", "attach", &netns_name(name), &leader.to_string()],
-    )
+    let dir = Path::new(NETNS_DIR);
+    fs::create_dir_all(dir).with_context(|| format!("creating {NETNS_DIR}"))?;
+    // A shared mount point, so that the names propagate between mount namespaces:
+    // made one on the first name of the host, as ip netns does.
+    let share = || {
+        mount(
+            None::<&str>,
+            dir,
+            None::<&str>,
+            MsFlags::MS_REC | MsFlags::MS_SHARED,
+            None::<&str>,
+        )
+    };
+    if let Err(e) = share() {
+        if e != nix::errno::Errno::EINVAL {
+            bail!("making {NETNS_DIR} a shared mount: {e}");
+        }
+        mount(
+            Some(dir),
+            dir,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .with_context(|| format!("making {NETNS_DIR} a mount point"))?;
+        share().with_context(|| format!("making {NETNS_DIR} a shared mount"))?;
+    }
+    let target = netns_path(name);
+    fs::File::create(&target).with_context(|| format!("creating {target}"))?;
+    let source = format!("/proc/{leader}/ns/net");
+    if let Err(e) = mount(
+        Some(source.as_str()),
+        target.as_str(),
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    ) {
+        let _ = fs::remove_file(&target);
+        bail!("binding the network namespace of process {leader} at {target}: {e}");
+    }
+    Ok(())
 }
 
 /// Best effort; the veth goes with the namespace.
