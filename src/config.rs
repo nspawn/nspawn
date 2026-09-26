@@ -1,5 +1,6 @@
 //! Configuration: defaults, /etc/nspawn/nspawn.toml, environment and flags.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -38,6 +39,42 @@ pub struct FileConfig {
     pub network_pool: Option<String>,
     /// DNS servers handed to the machines (default: the host's upstream servers).
     pub dns: Option<Vec<IpAddr>>,
+    /// What the images of a registry must carry, by registry (host or host:port).
+    #[serde(default)]
+    pub registries: BTreeMap<String, RegistryFile>,
+}
+
+/// What the file says of a registry's signatures. Every field is optional.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryFile {
+    /// false: nothing is checked for this registry (the hub's built-in policy included).
+    pub verify: Option<bool>,
+    /// A cosign public key (PEM) the images may be signed with; `keys` for several.
+    pub key: Option<PathBuf>,
+    #[serde(default)]
+    pub keys: Vec<PathBuf>,
+    /// A keyless signer: the certificate's identity and the issuer of its token.
+    pub identity: Option<String>,
+    pub issuer: Option<String>,
+    /// Default true: no verifying signature fails the pull; false: a note, and it goes on.
+    pub required: Option<bool>,
+    /// Default true: the transparency log entry of a signature must verify.
+    pub rekor: Option<bool>,
+    /// The trusted root of another Sigstore deployment (trusted_root.json).
+    pub trusted_root: Option<PathBuf>,
+}
+
+/// The signature policy of a registry, as configured; the keys are read when it applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryPolicy {
+    pub verify: bool,
+    pub keys: Vec<PathBuf>,
+    /// (identity, issuer)
+    pub identity: Option<(String, String)>,
+    pub required: bool,
+    pub rekor: bool,
+    pub trusted_root: Option<PathBuf>,
 }
 
 /// Effective configuration after merging file, environment and command line.
@@ -54,6 +91,8 @@ pub struct Config {
     pub subnet: Subnet,
     pub network_pool: Subnet,
     pub dns: Vec<IpAddr>,
+    /// Signature policies by registry, the name as `auth::canonical` spells it.
+    pub registries: BTreeMap<String, RegistryPolicy>,
     /// The file given with --config, so that unit hooks can use the same one.
     pub config_path: Option<PathBuf>,
 }
@@ -141,6 +180,7 @@ impl Config {
             anyhow::bail!("bridge name {bridge:?}: 1 to 15 letters, digits, - or _");
         }
         let registry_set = registry.is_some() || file.registry.is_some();
+        let registries = registry_policies(file.registries)?;
         Ok(Config {
             registry: registry
                 .or(file.registry)
@@ -154,10 +194,69 @@ impl Config {
             subnet,
             network_pool,
             dns,
+            registries,
             config_path: None,
         })
     }
+}
 
+/// The `[registries."host"]` tables, checked without reading a file: the command line
+/// loads the configuration too, and must not fail on a key only the service may read.
+fn registry_policies(
+    tables: BTreeMap<String, RegistryFile>,
+) -> Result<BTreeMap<String, RegistryPolicy>> {
+    let mut policies = BTreeMap::new();
+    for (name, table) in tables {
+        if name.is_empty() || name.contains('/') || name.contains(char::is_whitespace) {
+            anyhow::bail!("registries.{name:?}: a registry is a host, or host:port");
+        }
+        let registry = crate::auth::canonical(&name);
+        let mut keys = table.keys;
+        if let Some(key) = table.key {
+            keys.insert(0, key);
+        }
+        let identity = match (table.identity, table.issuer) {
+            (Some(identity), Some(issuer)) => Some((identity, issuer)),
+            (None, None) => None,
+            _ => anyhow::bail!(
+                "registries.{name:?}: identity and issuer go together (the certificate's identity and the issuer of its token)"
+            ),
+        };
+        let verify = table.verify.unwrap_or(true);
+        if verify && keys.is_empty() && identity.is_none() {
+            anyhow::bail!(
+                "registries.{name:?}: name a key (key or keys), an identity with its issuer, or set verify = false"
+            );
+        }
+        for path in keys.iter().chain(table.trusted_root.iter()) {
+            if !path.is_absolute() {
+                anyhow::bail!(
+                    "registries.{name:?}: {} must be an absolute path",
+                    path.display()
+                );
+            }
+        }
+        if policies
+            .insert(
+                registry.clone(),
+                RegistryPolicy {
+                    verify,
+                    keys,
+                    identity,
+                    required: table.required.unwrap_or(true),
+                    rekor: table.rekor.unwrap_or(true),
+                    trusted_root: table.trusted_root,
+                },
+            )
+            .is_some()
+        {
+            anyhow::bail!("registries.{name:?}: {registry} is configured twice");
+        }
+    }
+    Ok(policies)
+}
+
+impl Config {
     /// The default network, the one of `bridge` and `subnet`.
     pub fn default_network(&self) -> crate::bridge::NetSpec {
         crate::bridge::NetSpec {
@@ -168,6 +267,86 @@ impl Config {
             created: 0,
             labels: std::collections::BTreeMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    #[test]
+    fn a_registry_table_names_what_its_images_must_carry() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[registries."registry.example.com"]
+key = "/etc/nspawn/keys/example.pub"
+keys = ["/etc/nspawn/keys/other.pub"]
+identity = "https://github.com/org/repo/.github/workflows/x.yml@refs/heads/main"
+issuer = "https://token.actions.githubusercontent.com"
+rekor = false
+trusted_root = "/etc/nspawn/trusted_root.json"
+
+[registries."Index.Docker.IO"]
+verify = false
+
+[registries."hub.nspawn.test:8443"]
+keys = ["/etc/nspawn/e2e.pub"]
+required = false
+"#,
+        )
+        .unwrap();
+        let c = Config::merge(file, None, None).unwrap();
+        let example = &c.registries["registry.example.com"];
+        assert_eq!(
+            example,
+            &RegistryPolicy {
+                verify: true,
+                keys: vec![
+                    PathBuf::from("/etc/nspawn/keys/example.pub"),
+                    PathBuf::from("/etc/nspawn/keys/other.pub")
+                ],
+                identity: Some((
+                    "https://github.com/org/repo/.github/workflows/x.yml@refs/heads/main".into(),
+                    "https://token.actions.githubusercontent.com".into()
+                )),
+                required: true,
+                rekor: false,
+                trusted_root: Some(PathBuf::from("/etc/nspawn/trusted_root.json")),
+            }
+        );
+        assert!(
+            !c.registries["docker.io"].verify,
+            "the name as auth spells it"
+        );
+        let test = &c.registries["hub.nspawn.test:8443"];
+        assert!(test.verify && !test.required && test.rekor);
+        assert!(!c.registries.contains_key("hub.nspawn.org"));
+        assert!(Config::merge(FileConfig::default(), None, None)
+            .unwrap()
+            .registries
+            .is_empty());
+    }
+
+    #[test]
+    fn a_table_that_names_nothing_or_names_it_wrong_is_refused() {
+        for bad in [
+            "[registries.\"x.example\"]\nkey = \"/k.pub\"\nkeyx = 1\n",
+            "[registries.\"x.example\"]\nkey = \"/k.pub\"\nidentity = \"me\"\n",
+            "[registries.\"x.example\"]\nkey = \"/k.pub\"\nissuer = \"https://x\"\n",
+            "[registries.\"x.example\"]\nrequired = false\n",
+            "[registries.\"x.example\"]\nkey = \"keys/k.pub\"\n",
+            "[registries.\"x.example\"]\nkey = \"/k.pub\"\ntrusted_root = \"root.json\"\n",
+            "[registries.\"x.example/repo\"]\nkey = \"/k.pub\"\n",
+            "[registries.\"docker.io\"]\nverify = false\n[registries.\"index.docker.io\"]\nverify = false\n",
+        ] {
+            let outcome = toml::from_str::<FileConfig>(bad)
+                .map_err(|e| anyhow::anyhow!(e))
+                .and_then(|file| Config::merge(file, None, None));
+            assert!(outcome.is_err(), "{bad}");
+        }
+        let off: FileConfig =
+            toml::from_str("[registries.\"x.example\"]\nverify = false\n").unwrap();
+        assert!(!Config::merge(off, None, None).unwrap().registries["x.example"].verify);
     }
 }
 

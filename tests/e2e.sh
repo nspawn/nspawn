@@ -95,10 +95,10 @@ cleanup_machines() {
 cleanup_service() {
   systemctl stop nspawn.service >/dev/null 2>&1 || true
   if [ "$packaged" = yes ]; then
-    rm -f /etc/systemd/system/nspawn.service.d/50-e2e.conf /etc/nspawn/e2e.toml
+    rm -f /etc/systemd/system/nspawn.service.d/50-e2e.conf /etc/nspawn/e2e.toml /etc/nspawn/e2e-cosign.pub
     rmdir /etc/systemd/system/nspawn.service.d 2>/dev/null || true
   else
-    rm -f /etc/dbus-1/system.d/org.nspawn.conf /usr/share/dbus-1/system-services/org.nspawn.service /etc/systemd/system/nspawn.service /etc/nspawn/e2e.toml
+    rm -f /etc/dbus-1/system.d/org.nspawn.conf /usr/share/dbus-1/system-services/org.nspawn.service /etc/systemd/system/nspawn.service /etc/nspawn/e2e.toml /etc/nspawn/e2e-cosign.pub
   fi
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
@@ -1501,6 +1501,147 @@ else
   $NSPAWN images rm "fedora-$old" >/dev/null || fail "images rm fedora-$old"
 fi
 $NSPAWN images rm e2e-signed >/dev/null || fail "images rm e2e-signed"
+
+step "signatures: a policy of the configuration, a key of our own on the test registry"
+# busybox goes to the test registry under a repository of this run's own (referrers
+# hang from the repository, and the registry is shared with the other hosts of the
+# matrix), gets a policy there, and a signature made without cosign: the statement,
+# its DSSE envelope signed with openssl, a timestamp from a TSA of ours (a bundle has
+# to carry a log entry or a timestamp), the bundle as a referrer of the manifest.
+sig=/tmp/e2e-sig; rm -rf $sig; mkdir -p $sig
+repo=e2e/sig-$nonce
+$NSPAWN pull docker.io/library/busybox:latest --name e2e-nv --backend overlay --force >/dev/null 2>&1 || fail "pull busybox for the signing test"
+$NSPAWN push e2e-nv --to $repo:1 > /tmp/e2e-pushsig.txt || fail "push busybox to the test registry"
+$NSPAWN images rm e2e-nv >/dev/null || fail "images rm e2e-nv"
+ca="--cacert $NSPAWN_CA_CERT"
+base="https://$NSPAWN_REGISTRY/v2/$repo"
+curl -sS $ca -H 'Accept: application/vnd.oci.image.manifest.v1+json' "$base/manifests/1" -o $sig/image.manifest.json || fail "fetch the manifest of $repo:1"
+digest="sha256:$(sha256sum $sig/image.manifest.json | cut -d' ' -f1)"
+openssl ecparam -name prime256v1 -genkey -noout -out $sig/key.pem
+openssl ec -in $sig/key.pem -pubout -out /etc/nspawn/e2e-cosign.pub 2>/dev/null
+openssl ec -in $sig/key.pem -pubout -outform DER -out $sig/pub.der 2>/dev/null
+cat > $sig/tsa.cnf <<CNF
+[req]
+distinguished_name = dn
+x509_extensions = tsa_ext
+prompt = no
+[dn]
+CN = e2e TSA
+[tsa_ext]
+extendedKeyUsage = critical,timeStamping
+keyUsage = digitalSignature
+[tsa]
+default_tsa = tsa_config
+[tsa_config]
+dir = $sig
+serial = $sig/tsa.serial
+signer_cert = $sig/tsa.crt
+signer_key = $sig/tsa.key
+certs = $sig/tsa.crt
+default_policy = 1.3.6.1.4.1.99999.1
+signer_digest = sha256
+digests = sha256
+crypto_device = builtin
+accuracy = secs:1
+ordering = no
+tsa_name = no
+ess_cert_id_chain = no
+CNF
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout $sig/tsa.key -out $sig/tsa.crt -days 2 -config $sig/tsa.cnf 2>/dev/null || fail "make a TSA certificate"
+echo 01 > $sig/tsa.serial
+hint=$(python3 - $sig "${digest#sha256:}" <<'PY'
+import base64, hashlib, json, subprocess, sys
+d, hexdigest = sys.argv[1], sys.argv[2]
+statement = json.dumps({"_type": "https://in-toto.io/Statement/v1", "subject": [{"digest": {"sha256": hexdigest}}], "predicateType": "https://sigstore.dev/cosign/sign/v1", "predicate": {}}).encode()
+kind = b"application/vnd.in-toto+json"
+pae = b"DSSEv1 " + str(len(kind)).encode() + b" " + kind + b" " + str(len(statement)).encode() + b" " + statement
+open(f"{d}/pae.bin", "wb").write(pae)
+subprocess.run(["openssl", "dgst", "-sha256", "-sign", f"{d}/key.pem", "-out", f"{d}/sig.der", f"{d}/pae.bin"], check=True)
+subprocess.run(["openssl", "ts", "-query", "-data", f"{d}/sig.der", "-sha256", "-cert", "-out", f"{d}/req.tsq"], check=True, capture_output=True)
+subprocess.run(["openssl", "ts", "-reply", "-config", f"{d}/tsa.cnf", "-queryfile", f"{d}/req.tsq", "-out", f"{d}/resp.tsr"], check=True, capture_output=True)
+b64 = lambda b: base64.b64encode(b).decode()
+sig = open(f"{d}/sig.der", "rb").read()
+hint = b64(hashlib.sha256(open(f"{d}/pub.der", "rb").read()).digest())
+bundle = {"mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+          "verificationMaterial": {"publicKey": {"hint": hint}, "tlogEntries": [],
+                                   "timestampVerificationData": {"rfc3161Timestamps": [{"signedTimestamp": b64(open(f"{d}/resp.tsr", "rb").read())}]}},
+          "dsseEnvelope": {"payload": b64(statement), "payloadType": "application/vnd.in-toto+json", "signatures": [{"sig": b64(sig)}]}}
+open(f"{d}/bundle.json", "w").write(json.dumps(bundle))
+bad = bytearray(sig); bad[10] ^= 1
+bundle["dsseEnvelope"]["signatures"][0]["sig"] = b64(bytes(bad))
+open(f"{d}/tampered.json", "w").write(json.dumps(bundle))
+print(hint)
+PY
+) || fail "make the bundle"
+[ -s $sig/bundle.json ] || fail "no bundle was made"
+printf '{}' > $sig/config.json
+# A blob and a manifest to the registry with curl, as any OCI client would.
+push_blob() {
+  local file=$1 d="sha256:$(sha256sum "$1" | cut -d' ' -f1)" location sep code
+  location=$(curl -sS $ca -u tester:s3cret -X POST -D - -o /dev/null "$base/blobs/uploads/" | tr -d '\r' | awk -F': ' 'tolower($1) == "location" {print $2}')
+  case "$location" in /*) location="https://$NSPAWN_REGISTRY$location" ;; esac
+  case "$location" in *\?*) sep='&' ;; *) sep='?' ;; esac
+  code=$(curl -sS $ca -u tester:s3cret -X PUT -H 'Content-Type: application/octet-stream' --data-binary @"$file" -o /dev/null -w '%{http_code}' "$location${sep}digest=$d")
+  [ "$code" = 201 ] || { echo "upload of $file answered $code"; return 1; }
+  echo "$d"
+}
+push_signature() { # bundle file -> the digest of its manifest
+  local bundle=$1 bd cd m md code
+  cd=$(push_blob $sig/config.json) || return 1
+  bd=$(push_blob "$bundle") || return 1
+  m=$sig/$(basename "$bundle" .json).manifest.json
+  python3 - "$m" "$cd" "$bd" "$(stat -c %s "$bundle")" "$digest" "$(stat -c %s $sig/image.manifest.json)" <<'PY'
+import json, sys
+out, cd, bd, bsize, subject, ssize = sys.argv[1:]
+json.dump({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+           "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+           "config": {"mediaType": "application/vnd.oci.empty.v1+json", "size": 2, "digest": cd},
+           "layers": [{"mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json", "size": int(bsize), "digest": bd}],
+           "subject": {"mediaType": "application/vnd.oci.image.manifest.v1+json", "size": int(ssize), "digest": subject},
+           "annotations": {"dev.sigstore.bundle.content": "dsse-envelope", "dev.sigstore.bundle.predicateType": "https://sigstore.dev/cosign/sign/v1"}},
+          open(out, "w"), separators=(",", ":"))
+PY
+  md="sha256:$(sha256sum "$m" | cut -d' ' -f1)"
+  code=$(curl -sS $ca -u tester:s3cret -X PUT -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' --data-binary @"$m" -o /dev/null -w '%{http_code}' "$base/manifests/$md")
+  [ "$code" = 201 ] || { echo "push of the signature manifest answered $code"; return 1; }
+  echo "$md"
+}
+policy() { # the service's configuration with a table for the test registry, then a restart
+  printf 'registry = "%s"\nca_cert = "%s"\n\n[registries."%s"]\n%s\n' "$NSPAWN_REGISTRY" "$NSPAWN_CA_CERT" "$NSPAWN_REGISTRY" "$1" > /etc/nspawn/e2e.toml
+  systemctl stop nspawn.service
+}
+policy 'keys = ["/etc/nspawn/e2e-cosign.pub"]
+rekor = false'
+out=$($NSPAWN pull $NSPAWN_REGISTRY/$repo:1 --name e2e-nvc 2>&1) && fail "an unsigned image of a registry with a policy was pulled"
+echo "$out" | grep_q "carries no signature on $NSPAWN_REGISTRY; the policy requires one" || fail "the refusal reads wrong: $out"
+$NSPAWN create --no-verify $NSPAWN_REGISTRY/$repo:1 e2e-nvc >/dev/null || fail "create --no-verify against a configured policy"
+$NSPAWN rm e2e-nvc >/dev/null && $NSPAWN images rm e2e-sig-$nonce-1 >/dev/null || fail "rm e2e-nvc and its image"
+policy 'verify = false'
+$NSPAWN pull $NSPAWN_REGISTRY/$repo:1 --name e2e-nvc > /tmp/e2e-nvc.txt 2>&1 || { cat /tmp/e2e-nvc.txt; fail "pull with verify = false"; }
+grep -q -i "signature" /tmp/e2e-nvc.txt && fail "verify = false still said something of signatures: $(cat /tmp/e2e-nvc.txt)"
+$NSPAWN images rm e2e-nvc >/dev/null || fail "images rm e2e-nvc"
+policy 'keys = ["/etc/nspawn/e2e-cosign.pub"]
+rekor = false'
+tampered=$(push_signature $sig/tampered.json) || fail "push the tampered signature"
+curl -sS $ca "$base/referrers/$digest" | grep_q "$tampered" || fail "the registry does not list the signature among the referrers"
+out=$($NSPAWN pull $NSPAWN_REGISTRY/$repo:1 --name e2e-nvc 2>&1) && fail "an image whose signature does not verify was pulled"
+echo "$out" | grep_q "no signature verifies under the policy for $NSPAWN_REGISTRY: ${tampered:7:12}: key ${hint:0:12}: /etc/nspawn/e2e-cosign.pub (" || fail "the failure does not name the bundle and the key: $out"
+good=$(push_signature $sig/bundle.json) || fail "push the good signature"
+$NSPAWN pull $NSPAWN_REGISTRY/$repo:1 --name e2e-nvc > /tmp/e2e-nvc.txt 2>&1 || { cat /tmp/e2e-nvc.txt; fail "pull of the image once signed"; }
+grep -q "^$NSPAWN_REGISTRY/$repo:1: signature verified (key ${hint:0:12})$" /tmp/e2e-nvc.txt || fail "the pull did not say the key signed it: $(cat /tmp/e2e-nvc.txt)"
+$NSPAWN inspect e2e-nvc | python3 -c "import json, sys; d = json.load(sys.stdin)[0]; assert d['signed_by'] == 'key $hint' and d['signed_at'] == 0, d" || fail "inspect of the key-signed image"
+$NSPAWN images rm e2e-nvc >/dev/null || fail "images rm e2e-nvc"
+policy 'keys = ["/etc/nspawn/e2e-cosign.pub"]
+rekor = false
+required = false'
+$NSPAWN pull "$IMAGE" --name e2e-unsigned --backend overlay --force > /tmp/e2e-unsigned.txt 2>&1 || { cat /tmp/e2e-unsigned.txt; fail "pull of an unsigned image under required = false"; }
+grep -q "^note: $NSPAWN_REGISTRY/$IMAGE carries no signature; the policy for $NSPAWN_REGISTRY does not require one" /tmp/e2e-unsigned.txt || fail "required = false did not note the missing signature: $(cat /tmp/e2e-unsigned.txt)"
+$NSPAWN images rm e2e-unsigned >/dev/null || fail "images rm e2e-unsigned"
+printf 'registry = "%s"\nca_cert = "%s"\n' "$NSPAWN_REGISTRY" "$NSPAWN_CA_CERT" > /etc/nspawn/e2e.toml
+# The registry may refuse deletions; the repository is this run's alone either way.
+for m in 1 $tampered $good; do curl -sS $ca -u tester:s3cret -X DELETE "$base/manifests/$m" -o /dev/null || true; done
+rm -f /etc/nspawn/e2e-cosign.pub; rm -rf $sig
+systemctl stop nspawn.service
 
 step "pull: several blobs at once, each verified, nothing left behind"
 # memcached:alpine has six small layers. The first three transfers begin before any

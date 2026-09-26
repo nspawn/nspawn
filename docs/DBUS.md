@@ -30,8 +30,9 @@ another file on the unit's command line. The methods that reach a registry
 take `registry` and `ca_cert` options that override that configuration for
 one call; the command line passes them when it was given a registry (flag,
 `NSPAWN_REGISTRY` or its own configuration file) and leaves the service's
-alone otherwise. The signature policy of a registry is the service's own
-(the hub's is built in): a client chooses the registry, never the policy.
+alone otherwise. The signature policy of a registry is the service's own,
+from the `[registries."host"]` tables of its file (the hub's is built in):
+a client chooses the registry, never the policy.
 
 Every user may call; who may do what is polkit's answer. The methods that
 only read (`ListImages`, `GetImage`, `ListMachines`, `GetMachine`,

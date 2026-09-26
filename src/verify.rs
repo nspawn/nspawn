@@ -4,6 +4,7 @@
 //! keyless, and one of the two has to verify.
 
 use std::fmt;
+use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context as _, Result};
@@ -83,13 +84,77 @@ impl Policy {
         }
     }
 
-    /// The policy for a registry: the built-in one for the hub, none for the rest.
-    pub fn for_registry(_config: &Config, registry: &str) -> Result<Option<Policy>> {
-        if crate::auth::canonical(registry) == DEFAULT_REGISTRY {
+    /// The policy for a registry: the table of the configuration for it, else the
+    /// built-in one for the hub, else none. Reads the key files the table names; one
+    /// that cannot be read or is no public key is an error naming it.
+    pub fn for_registry(config: &Config, registry: &str) -> Result<Option<Policy>> {
+        let registry = crate::auth::canonical(registry);
+        if let Some(configured) = config.registries.get(&registry) {
+            if !configured.verify {
+                return Ok(None);
+            }
+            let keys = configured
+                .keys
+                .iter()
+                .map(|path| {
+                    let pem = fs::read_to_string(path).with_context(|| {
+                        format!(
+                            "reading key {} of the policy for {registry}",
+                            path.display()
+                        )
+                    })?;
+                    DerPublicKey::from_pem(&pem).with_context(|| {
+                        format!(
+                            "key {} of the policy for {registry} is no public key",
+                            path.display()
+                        )
+                    })?;
+                    Ok(PolicyKey {
+                        label: path.display().to_string(),
+                        pem,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Some(Policy {
+                registry,
+                keys,
+                identity: configured
+                    .identity
+                    .clone()
+                    .map(|(identity, issuer)| Identity { identity, issuer }),
+                required: configured.required,
+                rekor: configured.rekor,
+                trusted_root: configured.trusted_root.clone(),
+            }));
+        }
+        if registry == DEFAULT_REGISTRY {
             return Ok(Some(Policy::hub()));
         }
         Ok(None)
     }
+}
+
+/// What is wrong with the configured policies, for the service to say when it starts:
+/// a key or a trusted root that cannot be read shows up before the first pull.
+pub fn check_configuration(config: &Config) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for registry in config.registries.keys() {
+        match Policy::for_registry(config, registry) {
+            Err(e) => warnings.push(format!("{e:#}")),
+            Ok(Some(policy)) => {
+                if let Some(path) = &policy.trusted_root {
+                    if let Err(e) = TrustedRoot::from_file(path) {
+                        warnings.push(format!(
+                            "trusted root {} of the policy for {registry}: {e}",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+            Ok(None) => {}
+        }
+    }
+    warnings
 }
 
 /// Who signed, as the verification found it.
@@ -661,5 +726,66 @@ mod tests {
             Policy::for_registry(&config, "hub.nspawn.test:8443").unwrap(),
             None
         );
+        assert!(check_configuration(&config).is_empty());
+    }
+
+    #[test]
+    fn a_configured_table_is_the_policy_keys_read_from_their_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = tmp.path().join("other.pub");
+        fs::write(&key, OTHER_KEY).unwrap();
+        let text = format!(
+            "[registries.\"hub.nspawn.test:8443\"]\nkeys = [\"{k}\"]\nrekor = false\nrequired = false\n\n[registries.\"hub.nspawn.org\"]\nidentity = \"https://example/x\"\nissuer = \"https://issuer\"\n\n[registries.\"docker.io\"]\nkey = \"{missing}\"\n\n[registries.\"quay.io\"]\nverify = false\n",
+            k = key.display(),
+            missing = tmp.path().join("missing.pub").display()
+        );
+        let config = Config::merge(toml::from_str(&text).unwrap(), None, None).unwrap();
+        let test = Policy::for_registry(&config, "hub.nspawn.test:8443")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            test,
+            Policy {
+                registry: "hub.nspawn.test:8443".to_string(),
+                keys: vec![PolicyKey {
+                    label: key.display().to_string(),
+                    pem: OTHER_KEY.to_string()
+                }],
+                identity: None,
+                required: false,
+                rekor: false,
+                trusted_root: None,
+            }
+        );
+        let hub = Policy::for_registry(&config, "hub.nspawn.org")
+            .unwrap()
+            .unwrap();
+        assert!(
+            hub.keys.is_empty(),
+            "a table for the hub replaces the built-in policy"
+        );
+        assert_eq!(
+            hub.identity,
+            Some(Identity {
+                identity: "https://example/x".to_string(),
+                issuer: "https://issuer".to_string()
+            })
+        );
+        let e = Policy::for_registry(&config, "index.docker.io")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("reading key") && e.contains("missing.pub") && e.contains("docker.io"),
+            "{e}"
+        );
+        assert_eq!(Policy::for_registry(&config, "quay.io").unwrap(), None);
+        let warnings = check_configuration(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("missing.pub"));
+        fs::write(&key, "not a key").unwrap();
+        let e = Policy::for_registry(&config, "hub.nspawn.test:8443")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("is no public key"), "{e}");
     }
 }

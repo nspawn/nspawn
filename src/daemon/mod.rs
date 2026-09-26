@@ -107,6 +107,9 @@ pub async fn run(config: Config, idle_exit: Option<Duration>) -> Result<()> {
     if let Err(e) = state.ctx.store.protect() {
         eprintln!("warning: {e:#}");
     }
+    for warning in crate::verify::check_configuration(&state.ctx.config) {
+        eprintln!("warning: {warning}");
+    }
     // Nothing waits on a socket of an earlier service, and a machine of run --rm that
     // ended while nothing could remove it goes now.
     crate::attach::sweep();

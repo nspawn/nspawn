@@ -259,8 +259,39 @@ signatures do not verify, with the reason of each. `--no-verify` on `pull`, `run
 `create` skips the check for that command, like docker's `--disable-content-trust`;
 `create` checks only an image it has to pull, never a local source. `inspect` and
 `GetImage` show who signed (`signed_by`: `key <hint>, keyless <identity>`) and when
-(`signed_at`), which a machine made with `create` inherits from its source. Images of
-other registries are pulled as before, unverified.
+(`signed_at`), which a machine made with `create` inherits from its source.
+
+Images of other registries are pulled unverified until `/etc/nspawn/nspawn.toml` says
+what they must carry, one table per registry (host, or host:port):
+
+```toml
+[registries."registry.example.com"]
+key = "/etc/nspawn/keys/example.pub"      # a cosign public key (PEM); keys = [...] for several
+identity = "https://github.com/org/repo/.github/workflows/build.yml@refs/heads/main"
+issuer = "https://token.actions.githubusercontent.com"   # goes with identity
+required = true            # default: no verifying signature fails the pull
+rekor = true               # default: the signature's transparency log entry must verify
+trusted_root = "/etc/nspawn/trusted_root.json"   # another Sigstore deployment; the public one otherwise
+```
+
+A signature verifies when it was made with one of the keys, or keyless with the
+identity and issuer; a table names at least one of the two. `required = false` turns a
+missing signature into a note and lets the pull go on, while a signature that is there
+but does not verify still fails it. `rekor = false` trusts the key or certificate alone,
+without the log entry (a private deployment that keeps no log); a bundle still has to
+carry a log entry or a timestamp, which cosign always adds. A table for
+`hub.nspawn.org` replaces the built-in policy, and `verify = false` in a table turns
+verification off for that registry, the hub included:
+
+```toml
+[registries."hub.nspawn.org"]
+verify = false
+```
+
+The policies are the service's: what the command line was given with `--registry`
+chooses the registry, never the policy. A key or a trusted root the service cannot
+read is reported when it starts (`journalctl -u nspawn`) and fails the pulls of that
+registry.
 
 Registries are used anonymously until `nspawn login [REGISTRY] -u USER` (password asked on
 the terminal, or `--password-stdin`) checks the credentials the way docker login does and
