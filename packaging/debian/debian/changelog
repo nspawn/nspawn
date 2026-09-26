@@ -1,3 +1,11 @@
+nspawn (1.4.0-1) unstable; urgency=medium
+
+  * A machine in another machine's network with --network container:NAME.
+  * A group with --user, as docker's USER:GROUP.
+  * Pulls fetch three blobs at a time.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Fri, 25 Sep 2026 22:00:31 -0500
+
 nspawn (1.3.1-1) unstable; urgency=medium
 
   * The mstack backend is experimental and opt-in; auto is overlay everywhere.

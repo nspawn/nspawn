@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 1.3.1
+%global upstream_version 1.4.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -148,6 +148,11 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Fri Sep 25 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.4.0-1
+- A machine in another machine's network with --network container:NAME.
+- A group with --user, as docker's USER:GROUP.
+- Pulls fetch three blobs at a time.
+
 * Fri Sep 25 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.3.1-1
 - The mstack backend is experimental and opt-in; auto is overlay everywhere.
   systemd 262 cannot boot managed user namespaces, so mstack is refused there.
