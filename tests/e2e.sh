@@ -73,7 +73,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot busybox-1.37 busybox-1.36; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi busybox-1.37 busybox-1.36; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -1361,6 +1361,22 @@ python3 "$(dirname "$0")/terminal.py" $NSPAWN pull docker.io/library/busybox:lat
 tr -d '\r' < /tmp/e2e-progress.txt | grep_q "blob .*: downloading" || fail "the pull after rm -f downloaded nothing: $(tr -d '\r' < /tmp/e2e-progress.txt)"
 grep_q -aE "$bar" /tmp/e2e-progress.txt || fail "no progress bar on a terminal: $(tr -d '\r' < /tmp/e2e-progress.txt)"
 $NSPAWN rm $app >/dev/null || fail "rm $app after the pull on a terminal"
+
+step "pull: several blobs at once, each verified, nothing left behind"
+# memcached:alpine has six small layers. The first three transfers begin before any
+# ends: their "downloading" lines come first, then each "downloaded" as it completes.
+$NSPAWN pull docker.io/library/memcached:alpine --name e2e-multi --backend overlay --force > /tmp/e2e-multi.txt 2>&1 || { cat /tmp/e2e-multi.txt; fail "pull of an image with several layers"; }
+[ "$(grep -c '^blob .*: downloading' /tmp/e2e-multi.txt)" -ge 6 ] || fail "the layers were not all downloaded: $(cat /tmp/e2e-multi.txt)"
+[ "$(grep -E '^blob .*: (downloading|downloaded)$' /tmp/e2e-multi.txt | head -3 | grep -c downloading)" = 3 ] || fail "the blobs were not fetched several at a time: $(cat /tmp/e2e-multi.txt)"
+[ "$(grep -c '^blob .*: downloaded$' /tmp/e2e-multi.txt)" = "$(grep -c '^blob .*: downloading$' /tmp/e2e-multi.txt)" ] || fail "a download was not reported done: $(cat /tmp/e2e-multi.txt)"
+for blob in /var/lib/nspawn/blobs/sha256-*; do
+  [ -e "$blob" ] || continue
+  [ "sha256-$(sha256sum "$blob" | awk '{print $1}')" = "$(basename "$blob")" ] || fail "blob $(basename "$blob") does not match its digest after a pull of several at once"
+done
+ls /var/lib/nspawn/blobs/ | grep_q "^\.part-" && fail "part files left after the pull: $(ls -a /var/lib/nspawn/blobs/ | grep '^\.')"
+$NSPAWN start e2e-multi -- /bin/sh -c "echo multi-$nonce" >/dev/null 2>&1
+retry 10 bash -c "$NSPAWN logs e2e-multi | tr -d '\r' | grep -q multi-$nonce" || fail "the image pulled several blobs at a time does not run: $($NSPAWN logs e2e-multi)"
+$NSPAWN rm -f e2e-multi >/dev/null || fail "rm e2e-multi"
 
 step "pipelines: a reader that closes early must not make nspawn fail"
 $NSPAWN hub ls | head -c 1 >/dev/null; rc=${PIPESTATUS[0]}

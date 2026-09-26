@@ -188,7 +188,11 @@ with the command line's spellings. Pull, push, build, create, the removals
 the method returns `/org/nspawn/job/N` at once, the job's report events
 become `JobOutput` signals and the object's `Output`, the progress of its
 downloads and uploads `JobProgress` signals, and `JobRemoved` says how it
-ended. machined's `MachineNew` and `MachineRemoved` are relayed as
+ended. A pull fetches the blobs the store lacks three at a time, as docker
+does, each verified against its digest as it streams and written next to its
+final name until then; the progress signals name the blob, so the client
+draws one bar per transfer under way, and a download that ends any other way
+takes its part file with it. machined's `MachineNew` and `MachineRemoved` are relayed as
 `MachineStarted` and `MachineStopped` for the machines nspawn installed.
 
 `Events` keeps no history of its own: systemd logs every start, end, restart

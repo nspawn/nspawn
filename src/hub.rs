@@ -215,11 +215,13 @@ impl Hub {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         // Written next to its final name and renamed once verified, so that an interrupted
-        // download never passes for a complete blob.
+        // download never passes for a complete blob; a download that ends any other way,
+        // dropped when another one failed included, takes its part file with it.
         let part = part_path(dest);
         let mut file = tokio::fs::File::create(&part)
             .await
             .with_context(|| format!("creating {}", part.display()))?;
+        let unfinished = PartFile(Some(part.clone()));
         let mut hasher = Sha256::new();
         let mut stream = sized.stream;
         let mut progress = Progress::start(
@@ -241,22 +243,15 @@ impl Hub {
             progress.finish();
             Ok::<String, anyhow::Error>(hex::encode(hasher.finalize()))
         };
-        let outcome = transfer.await;
-        let actual = match outcome {
-            Ok(actual) => actual,
-            Err(e) => {
-                let _ = fs::remove_file(&part);
-                return Err(e);
-            }
-        };
+        let actual = transfer.await?;
         if actual != expected {
-            let _ = fs::remove_file(&part);
             bail!(
                 "layer {} failed verification: downloaded sha256:{actual}",
                 layer.digest
             );
         }
         fs::rename(&part, dest).with_context(|| format!("moving {} into place", dest.display()))?;
+        unfinished.keep();
         Ok(())
     }
 }
@@ -264,6 +259,23 @@ impl Hub {
 /// Where a blob is written while it is incomplete (".part-<name>.<pid>.<n>", skipped by
 /// the store): a name of its own per download, since downloads run without the store
 /// lock and the service runs several at once, the same blob among them.
+/// The part file of a download under way, removed unless the download kept it.
+struct PartFile(Option<PathBuf>);
+
+impl PartFile {
+    fn keep(mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for PartFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 pub fn part_path(dest: &Path) -> PathBuf {
     let name = dest
         .file_name()

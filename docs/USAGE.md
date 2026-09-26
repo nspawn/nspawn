@@ -28,6 +28,10 @@ the machine off when the shell ends, with the shell's exit code. Closing the ter
 `run -t` stops the machine, since nothing would read its terminal any more; `-d` and
 `exec` are for machines that stay.
 
+`pull` fetches the layers the store lacks three at a time, as docker does, and says
+of each blob whether it was already present, is downloading or has been downloaded;
+on a terminal a bar follows every transfer under way.
+
 `build` runs `mkosi` in the given directory with `--format=oci`, so the same
 `mkosi.conf` tree that works on its own works here; `--distribution`, `--release`,
 `--profile` and anything after `--` are passed through. The result is stored like a pulled

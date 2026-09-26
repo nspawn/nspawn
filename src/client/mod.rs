@@ -423,10 +423,14 @@ impl JobWatch {
     }
 }
 
-/// The bar of the transfer a job is at, drawn where `target` says, or nowhere.
+/// A bar for each transfer a job has under way, drawn where `target` says, or nowhere.
 struct Transfers {
     target: Option<fn() -> indicatif::ProgressDrawTarget>,
-    bar: Option<(String, indicatif::ProgressBar)>,
+    /// The bars on the terminal, by item, once the first transfer began.
+    bars: Option<(
+        indicatif::MultiProgress,
+        std::collections::BTreeMap<String, indicatif::ProgressBar>,
+    )>,
     /// Transfers that ended: a late word about one does not draw it again.
     finished: std::collections::HashSet<String>,
 }
@@ -435,7 +439,7 @@ impl Transfers {
     fn new(target: Option<fn() -> indicatif::ProgressDrawTarget>) -> Self {
         Transfers {
             target,
-            bar: None,
+            bars: None,
             finished: Default::default(),
         }
     }
@@ -445,10 +449,18 @@ impl Transfers {
         if self.finished.contains(item) {
             return;
         }
-        if self.current() != Some(item) {
-            self.clear();
-            let bar =
-                indicatif::ProgressBar::with_draw_target((total > 0).then_some(total), target());
+        let (multi, bars) = self.bars.get_or_insert_with(|| {
+            (
+                indicatif::MultiProgress::with_draw_target(target()),
+                Default::default(),
+            )
+        });
+        let bar = bars.entry(item.to_string()).or_insert_with(|| {
+            let bar = multi.add(if total > 0 {
+                indicatif::ProgressBar::new(total)
+            } else {
+                indicatif::ProgressBar::no_length()
+            });
             let template = if total > 0 {
                 "{msg} {bar:30} {bytes}/{total_bytes} ({bytes_per_sec}, {eta})"
             } else {
@@ -458,32 +470,41 @@ impl Transfers {
                 indicatif::ProgressStyle::with_template(template).expect("valid template"),
             );
             bar.set_message(item.to_string());
-            self.bar = Some((item.to_string(), bar));
-        }
-        if let Some((_, bar)) = &self.bar {
-            bar.set_position(done);
-        }
+            bar
+        });
+        bar.set_position(done);
         if total > 0 && done >= total {
+            if let Some(bar) = bars.remove(item) {
+                bar.finish_and_clear();
+                multi.remove(&bar);
+            }
             self.finished.insert(item.to_string());
-            self.clear();
         }
     }
 
-    fn current(&self) -> Option<&str> {
-        self.bar.as_ref().map(|(item, _)| item.as_str())
+    /// The transfers with a bar, by item.
+    #[cfg(test)]
+    fn under_way(&self) -> Vec<&str> {
+        self.bars
+            .as_ref()
+            .map(|(_, bars)| bars.keys().map(String::as_str).collect())
+            .unwrap_or_default()
     }
 
-    /// Prints a line without tearing the bar.
+    /// Prints a line without tearing the bars.
     fn print(&self, print: impl FnOnce()) {
-        match &self.bar {
-            Some((_, bar)) => bar.suspend(print),
-            None => print(),
+        match &self.bars {
+            Some((multi, bars)) if !bars.is_empty() => multi.suspend(print),
+            _ => print(),
         }
     }
 
     fn clear(&mut self) {
-        if let Some((_, bar)) = self.bar.take() {
-            bar.finish_and_clear();
+        if let Some((multi, bars)) = self.bars.take() {
+            for bar in bars.values() {
+                bar.finish_and_clear();
+            }
+            let _ = multi.clear();
         }
     }
 }
@@ -620,31 +641,34 @@ mod tests {
     use crate::daemon::values::v;
 
     #[test]
-    fn one_bar_follows_the_transfer_under_way() {
+    fn a_bar_follows_each_transfer_under_way() {
         let mut shown = Transfers::new(Some(indicatif::ProgressDrawTarget::hidden));
         shown.progress("aaa", 0, 100);
-        assert_eq!(shown.current(), Some("aaa"));
         shown.progress("aaa", 50, 100);
         shown.progress("bbb", 10, 0);
         assert_eq!(
-            shown.current(),
-            Some("bbb"),
-            "the next transfer takes the bar"
+            shown.under_way(),
+            ["aaa", "bbb"],
+            "transfers at once each have a bar"
         );
         shown.progress("aaa", 100, 100);
-        assert_eq!(shown.current(), None, "a finished transfer leaves no bar");
+        assert_eq!(
+            shown.under_way(),
+            ["bbb"],
+            "a finished transfer leaves no bar"
+        );
         shown.progress("aaa", 80, 100);
-        assert_eq!(shown.current(), None, "nor does a late word about it");
+        assert_eq!(shown.under_way(), ["bbb"], "nor does a late word about it");
         shown.progress("ccc", 5, 10);
         let mut printed = false;
         shown.print(|| printed = true);
         assert!(printed);
         shown.clear();
-        assert_eq!(shown.current(), None);
+        assert!(shown.under_way().is_empty());
 
         let mut hidden = Transfers::new(None);
         hidden.progress("aaa", 0, 100);
-        assert_eq!(hidden.current(), None, "no bar without a terminal");
+        assert!(hidden.under_way().is_empty(), "no bar without a terminal");
     }
 
     fn method_error(name: &str, message: Option<&str>) -> zbus::Error {

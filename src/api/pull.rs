@@ -2,6 +2,8 @@
 //! assemble the image with a backend and record it.
 
 use anyhow::Result;
+use futures_util::{StreamExt, TryStreamExt};
+use oci_client::manifest::OciDescriptor;
 
 use crate::api::{line, note, require_root, Context, Report};
 use crate::backend::{Backend, BackendChoice};
@@ -10,6 +12,9 @@ use crate::install::{ensure_replaceable, install, remove_existing, Install};
 use crate::oci::Mode;
 use crate::reference::{validate_machine_name, ImageRef};
 use crate::store::validate_digest;
+
+/// Blobs fetched at once, docker's default for a pull.
+const CONCURRENT_DOWNLOADS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
@@ -29,6 +34,24 @@ pub struct Pulled {
     pub name: String,
     pub reference: String,
     pub mode: Mode,
+}
+
+/// The blobs to fetch, each once (a manifest may name a layer twice), and the digests
+/// of those already there, in the manifest's order.
+fn missing_once<'a>(
+    descriptors: impl Iterator<Item = &'a OciDescriptor>,
+    present: impl Fn(&str) -> bool,
+) -> (Vec<&'a OciDescriptor>, Vec<&'a str>) {
+    let mut wanted: Vec<&OciDescriptor> = Vec::new();
+    let mut there = Vec::new();
+    for descriptor in descriptors {
+        if present(&descriptor.digest) {
+            there.push(descriptor.digest.as_str());
+        } else if !wanted.iter().any(|d| d.digest == descriptor.digest) {
+            wanted.push(descriptor);
+        }
+    }
+    (wanted, there)
 }
 
 pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> Result<Pulled> {
@@ -84,30 +107,48 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
         ),
     );
 
-    for descriptor in manifest
-        .layers
-        .iter()
-        .chain(std::iter::once(&manifest.config))
-    {
-        if store.has_blob(&descriptor.digest) {
-            line(
-                report,
-                format!("blob {}: already present", short_digest(&descriptor.digest)),
-            );
-        } else {
-            line(
-                report,
-                format!("blob {}: downloading", short_digest(&descriptor.digest)),
-            );
-            hub.download_blob(
-                &oci,
-                descriptor,
-                &store.blob_path(&descriptor.digest),
-                report,
-            )
-            .await?;
-        }
+    let (wanted, present) = missing_once(
+        manifest
+            .layers
+            .iter()
+            .chain(std::iter::once(&manifest.config)),
+        |digest| store.has_blob(digest),
+    );
+    for digest in present {
+        line(
+            report,
+            format!("blob {}: already present", short_digest(digest)),
+        );
     }
+    // Several at a time, as docker fetches layers; each transfer reports under its own
+    // digest, so their bars keep apart. The first failure ends the others, whose part
+    // files go with them.
+    let (hub, oci) = (&hub, &oci);
+    // Owned descriptors: a future that borrowed its argument could not be handed to
+    // the job's task.
+    let wanted: Vec<OciDescriptor> = wanted.into_iter().cloned().collect();
+    let downloads = wanted.into_iter().map(|descriptor| async move {
+        line(
+            report,
+            format!("blob {}: downloading", short_digest(&descriptor.digest)),
+        );
+        hub.download_blob(
+            oci,
+            &descriptor,
+            &store.blob_path(&descriptor.digest),
+            report,
+        )
+        .await?;
+        line(
+            report,
+            format!("blob {}: downloaded", short_digest(&descriptor.digest)),
+        );
+        Ok::<(), anyhow::Error>(())
+    });
+    futures_util::stream::iter(downloads)
+        .buffer_unordered(CONCURRENT_DOWNLOADS)
+        .try_collect::<Vec<()>>()
+        .await?;
 
     // The store is locked only now: a long download must not hold up other commands or
     // the unit hooks. The name is checked again, the old image goes only at this point.
@@ -145,4 +186,26 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
         reference: image.to_string(),
         mode,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor(digest: &str) -> OciDescriptor {
+        OciDescriptor {
+            digest: digest.to_string(),
+            ..OciDescriptor::default()
+        }
+    }
+
+    #[test]
+    fn each_missing_blob_is_fetched_once_and_the_rest_reported() {
+        let descriptors =
+            ["sha256:a", "sha256:b", "sha256:a", "sha256:c", "sha256:b"].map(descriptor);
+        let (wanted, present) = missing_once(descriptors.iter(), |d| d == "sha256:b");
+        let wanted: Vec<&str> = wanted.iter().map(|d| d.digest.as_str()).collect();
+        assert_eq!(wanted, ["sha256:a", "sha256:c"]);
+        assert_eq!(present, ["sha256:b", "sha256:b"]);
+    }
 }
