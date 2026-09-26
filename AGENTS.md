@@ -28,7 +28,7 @@ Rules of the road:
 - Commit messages: short imperative subject, a body only for the why. No tool
   names, no signatures, no trailers.
 - Do not push, tag or release unless asked.
-- The website (github.com/nspawn/website, checked out next to this repository)
+- The website (github.com/nspawn/nspawn.org, checked out next to this repository)
   is maintained from here, since this is where the change is made: a stable
   release updates it in the same pass, and docs/RELEASING.md says which page
   follows which files. Its examples are checked against a real run.

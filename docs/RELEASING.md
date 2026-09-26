@@ -20,7 +20,7 @@ version and the documentation; the AUR packages are the maintainer's.
    docs/USAGE.md, docs/ARCHITECTURE.md, docs/DBUS.md and the `--help` texts in
    `src/cli.rs`.
 3. The website follows, in the same pass. It is a separate repository
-   (`github.com/nspawn/website`), maintained from here because this is where
+   (`github.com/nspawn/nspawn.org`), maintained from here because this is where
    the change was made:
 
    | Page | Follows |
