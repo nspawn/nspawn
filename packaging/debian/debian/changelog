@@ -1,3 +1,11 @@
+nspawn (1.5.0-1) unstable; urgency=medium
+
+  * Signatures of the hub's images are verified at pull; --no-verify skips it.
+  * A signature policy per registry in nspawn.toml.
+  * The overlay module loads under SELinux on a freshly booted host.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Sat, 26 Sep 2026 08:31:11 -0500
+
 nspawn (1.4.0-1) unstable; urgency=medium
 
   * A machine in another machine's network with --network container:NAME.

@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 1.4.0
+%global upstream_version 1.5.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -148,6 +148,11 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Sat Sep 26 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.5.0-1
+- Signatures of the hub's images are verified at pull; --no-verify skips it.
+- A signature policy per registry in nspawn.toml.
+- The overlay module loads under SELinux on a freshly booted host.
+
 * Fri Sep 25 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.4.0-1
 - A machine in another machine's network with --network container:NAME.
 - A group with --user, as docker's USER:GROUP.
