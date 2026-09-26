@@ -223,8 +223,20 @@ impl Ended {
     pub async fn status(mut self) -> Result<i32> {
         // The service sets the state before it sends the signal: "running" here means
         // the signal is still to come.
-        if self.proxy.state().await.map_err(error)? == "exited" {
-            return self.proxy.exit_status().await.map_err(error);
+        match self.proxy.state().await {
+            Ok(state) if state == "exited" => {
+                return self.proxy.exit_status().await.map_err(error);
+            }
+            Ok(_) => {}
+            // The service keeps an exited command for a while only: one that ended
+            // long before its streams were done with has said so already.
+            Err(e) => match self.exited.next().now_or_never() {
+                Some(Some(signal)) => {
+                    let args = signal.args().map_err(|e| anyhow!("{e}"))?;
+                    return Ok(*args.status());
+                }
+                _ => return Err(error(e)),
+            },
         }
         loop {
             tokio::select! {

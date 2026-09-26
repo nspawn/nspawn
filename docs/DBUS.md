@@ -90,7 +90,8 @@ unsigned type (`t`, `u`, `q` or `y`). Errors come back as
 `org.nspawn.Error.Failed` with the same message the command line prints.
 
 Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
-`Processes` (`ao`, every job and every Exec since the service came up).
+`Processes` (`ao`: every job and every command still running, and the last
+hundred that ended; older ones are gone with their objects).
 
 ### Images
 

@@ -1529,6 +1529,10 @@ if command -v busctl >/dev/null 2>&1; then
   [ "$($B get-property org.nspawn $proc org.nspawn.Process State)" = 's "exited"' ] || fail "the process object did not see the exit"
   [ "$($B get-property org.nspawn $proc org.nspawn.Process ExitStatus)" = "i 7" ] || fail "the process object kept the wrong exit status"
   $B get-property org.nspawn $proc org.nspawn.Process Argv | grep_q "via-bus-$nonce" || fail "the process object has the wrong argv"
+  # The service keeps the last hundred exited commands; older ones go with their objects.
+  for i in $(seq 1 105); do $NSPAWN exec e2e-dbus -- /bin/true </dev/null >/dev/null 2>&1 || fail "exec $i of many"; done
+  retry 3 bash -c "[ \"\$($B get-property $M Processes | awk '{print \$2}')\" -le 105 ]" || fail "the service keeps every exited command ($($B get-property $M Processes | awk '{print $2}') process objects)"
+  $B get-property org.nspawn $proc org.nspawn.Process State >/dev/null 2>&1 && fail "an exited command older than the last hundred kept its object"
   # A command nobody pumps: signalled through its object, it ends with 128 plus the signal.
   proc=$($B call $M Exec 'sassa{sv}' e2e-dbus 2 /bin/sleep 300 "" 1 tty b false | grep -oE '"/org/nspawn/process/[0-9]+"' | tr -d '"')
   [ -n "$proc" ] || fail "Exec over the bus returned no process object"

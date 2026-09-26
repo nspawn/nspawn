@@ -302,13 +302,13 @@ impl Manager {
         self.ctx().config.subnet.to_string()
     }
 
-    /// Jobs started since the service came up, done ones included.
+    /// Jobs running, and the last ones that ended.
     #[zbus(property)]
     fn jobs(&self) -> Vec<OwnedObjectPath> {
         self.state.jobs.paths()
     }
 
-    /// Commands started with Exec since the service came up, exited ones included.
+    /// Commands running, and the last ones that exited.
     #[zbus(property)]
     fn processes(&self) -> Vec<OwnedObjectPath> {
         self.state.processes.paths()

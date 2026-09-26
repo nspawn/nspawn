@@ -1,6 +1,7 @@
 //! Long operations (pull, push, build, create, rm) run as jobs: the method returns the job's
 //! object path at once, the job's lines arrive as JobOutput signals and its end as
-//! JobRemoved, and the object keeps the outcome for whoever asks later.
+//! JobRemoved, and the object keeps the outcome for whoever asks later, until it is
+//! among the oldest ended ones.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -18,6 +19,11 @@ use crate::daemon::polkit;
 use crate::daemon::State;
 
 pub type Dict = HashMap<String, OwnedValue>;
+
+/// How many ended jobs stay for whoever asks about them later. A client reads the outcome
+/// right after JobRemoved; the rest is history, and a service that never goes idle must
+/// not keep every job it ever ran.
+const ENDED_KEPT: usize = 100;
 
 /// What a job carries; served as org.nspawn.Job.
 pub struct JobState {
@@ -48,6 +54,29 @@ impl Jobs {
             .iter()
             .map(|j| j.path.clone())
             .collect()
+    }
+
+    /// Forgets the oldest ended jobs beyond `ENDED_KEPT`; their paths, for the object
+    /// server to drop.
+    fn retire(&self) -> Vec<OwnedObjectPath> {
+        let mut all = self.all.lock().unwrap();
+        let ended = |job: &JobState| *job.state.lock().unwrap() != "running";
+        let mut excess = all
+            .iter()
+            .filter(|j| ended(j))
+            .count()
+            .saturating_sub(ENDED_KEPT);
+        let mut retired = Vec::new();
+        all.retain(|job| {
+            if excess > 0 && ended(job) {
+                excess -= 1;
+                retired.push(job.path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        retired
     }
 }
 
@@ -231,6 +260,13 @@ where
         {
             let _ = Manager::job_removed(&emitter, job.path.as_ref(), result).await;
         }
+        for path in state.jobs.retire() {
+            let _ = state
+                .connection()
+                .object_server()
+                .remove::<Job, _>(&path)
+                .await;
+        }
         drop(busy);
     });
     Ok(path)
@@ -239,4 +275,61 @@ where
 /// Reporter to Report, for the library's signatures.
 pub fn report(reporter: &Arc<dyn Fn(Event) + Send + Sync>) -> Report<'_> {
     &**reporter
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(id: u64, state: &str) -> Arc<JobState> {
+        Arc::new(JobState {
+            path: OwnedObjectPath::try_from(format!("/org/nspawn/job/{id}")).unwrap(),
+            owner: 0,
+            client: None,
+            kind: "pull".to_string(),
+            target: format!("image-{id}"),
+            state: Mutex::new(state.to_string()),
+            output: Mutex::new(Vec::new()),
+            error: Mutex::new(String::new()),
+            result: Mutex::new(Dict::new()),
+        })
+    }
+
+    #[test]
+    fn ended_jobs_are_kept_up_to_a_point_and_running_ones_always() {
+        let jobs = Jobs::default();
+        // Every tenth job still runs; the rest ended, half of them badly.
+        let total = ENDED_KEPT as u64 + 30;
+        let running = (total / 10) as usize;
+        for id in 1..=total {
+            let state = if id.is_multiple_of(10) {
+                "running"
+            } else if id.is_multiple_of(2) {
+                "done"
+            } else {
+                "failed"
+            };
+            jobs.all.lock().unwrap().push(job(id, state));
+        }
+        let path = |id: u64| format!("/org/nspawn/job/{id}");
+        let retired = jobs.retire();
+        let expected: Vec<String> = (1..=total)
+            .filter(|id| !id.is_multiple_of(10))
+            .take(total as usize - running - ENDED_KEPT)
+            .map(path)
+            .collect();
+        assert_eq!(
+            retired.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+            expected,
+            "the oldest ended ones, never a running one"
+        );
+        let kept = jobs.paths();
+        assert_eq!(kept.len(), ENDED_KEPT + running);
+        assert!(
+            kept.iter().any(|p| p.as_str() == path(10)),
+            "the oldest running one"
+        );
+        assert!(kept.iter().any(|p| p.as_str() == path(total)));
+        assert!(jobs.retire().is_empty(), "nothing more to retire");
+    }
 }

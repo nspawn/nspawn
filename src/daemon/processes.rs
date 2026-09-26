@@ -15,6 +15,11 @@ use crate::daemon::polkit;
 use crate::daemon::State;
 use crate::nsenter;
 
+/// How many exited commands stay for whoever asks about them later. A client reads the
+/// exit status once it has pumped the streams; the rest is history, and a service that
+/// never goes idle must not keep every command it ever ran.
+const EXITED_KEPT: usize = 100;
+
 pub struct ProcessState {
     pub path: OwnedObjectPath,
     /// The user who started it: nobody else reads it or signals it.
@@ -59,6 +64,29 @@ impl Processes {
             .iter()
             .map(|p| p.path.clone())
             .collect()
+    }
+
+    /// Forgets the oldest exited commands beyond `EXITED_KEPT`; their paths, for the
+    /// object server to drop.
+    fn retire(&self) -> Vec<OwnedObjectPath> {
+        let mut all = self.all.lock().unwrap();
+        let exited = |process: &ProcessState| *process.state.lock().unwrap() != "running";
+        let mut excess = all
+            .iter()
+            .filter(|p| exited(p))
+            .count()
+            .saturating_sub(EXITED_KEPT);
+        let mut retired = Vec::new();
+        all.retain(|process| {
+            if excess > 0 && exited(process) {
+                excess -= 1;
+                retired.push(process.path.clone());
+                false
+            } else {
+                true
+            }
+        });
+        retired
     }
 }
 
@@ -258,8 +286,55 @@ pub async fn register_with(
         if let Ok(emitter) = state.emitter_to(entry.path.as_ref(), entry.client.as_deref()) {
             let _ = Process::exited(&emitter, status).await;
         }
+        for path in state.processes.retire() {
+            let _ = state
+                .connection()
+                .object_server()
+                .remove::<Process, _>(&path)
+                .await;
+        }
         // Only now may the service go idle: a client is about to read the outcome.
         drop(busy);
     });
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn process(id: u64, state: &str) -> Arc<ProcessState> {
+        Arc::new(ProcessState {
+            path: OwnedObjectPath::try_from(format!("/org/nspawn/process/{id}")).unwrap(),
+            owner: 0,
+            client: None,
+            machine: "web".to_string(),
+            argv: vec!["true".to_string()],
+            pid: id as u32,
+            pidfd: None,
+            state: Mutex::new(state.to_string()),
+            exit_status: Mutex::new(0),
+            signals: Signals::default(),
+        })
+    }
+
+    #[test]
+    fn exited_commands_are_kept_up_to_a_point_and_running_ones_always() {
+        let processes = Processes::default();
+        for id in 1..=(EXITED_KEPT as u64 + 5) {
+            let state = if id <= 3 { "running" } else { "exited" };
+            processes.all.lock().unwrap().push(process(id, state));
+        }
+        let retired = processes.retire();
+        assert_eq!(
+            retired.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+            ["/org/nspawn/process/4", "/org/nspawn/process/5"],
+            "the oldest exited ones, never a running one"
+        );
+        let kept = processes.paths();
+        assert_eq!(kept.len(), EXITED_KEPT + 3);
+        assert!(kept.iter().any(|p| p.as_str() == "/org/nspawn/process/1"));
+        assert!(kept.iter().any(|p| p.as_str() == "/org/nspawn/process/6"));
+        assert!(processes.retire().is_empty());
+    }
 }
