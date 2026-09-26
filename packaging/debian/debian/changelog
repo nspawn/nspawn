@@ -1,3 +1,9 @@
+nspawn (1.5.2-1) unstable; urgency=medium
+
+  * Offered under MIT or Apache-2.0 from this version on; the binary is 1.5.1's.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Sat, 26 Sep 2026 16:51:23 -0500
+
 nspawn (1.5.1-1) unstable; urgency=medium
 
   * A command whose version differs from the service's warns and says how to restart it.
