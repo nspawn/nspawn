@@ -73,7 +73,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side busybox-1.37 busybox-1.36; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -357,6 +357,14 @@ $NSPAWN create e2e-a e2e-bad -v "bad volume" >/dev/null 2>&1 && fail "create acc
 step "create: another machine from a local image, without the registry"
 env NSPAWN_REGISTRY=127.0.0.1:9 $NSPAWN create e2e-a e2e-c || fail "create from a local image"
 $NSPAWN images ls | grep "^ *e2e-c " | grep_q "create" || fail "created machine not listed with origin create"
+# An image pulled under its own name is found by its short reference too, and not
+# pulled again under that name.
+own=$(basename "$IMAGE" | tr : -)
+$NSPAWN pull "$IMAGE" --backend overlay --force >/dev/null || fail "pull $IMAGE under its own name"
+out=$($NSPAWN create "$IMAGE" e2e-cshort 2>&1) || fail "create by the short reference of a local image: $out"
+echo "$out" | grep_q "manifest" && fail "create by a short reference pulled the image again: $out"
+$NSPAWN images ls | grep "^ *e2e-cshort " | grep_q "create" || fail "e2e-cshort not listed with origin create"
+$NSPAWN rm e2e-cshort >/dev/null && $NSPAWN images rm "$own" >/dev/null || fail "rm e2e-cshort and $own"
 $NSPAWN start e2e-c || fail "start created machine"
 retry 10 $NSPAWN exec e2e-c -- /usr/bin/test -f /etc/os-release </dev/null || fail "exec in created machine"
 $NSPAWN network inspect bridge | grep_q '"name": "e2e-c"' || fail "created machine not on the bridge"
