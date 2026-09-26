@@ -1,0 +1,16 @@
+Signatures of hub.nspawn.org/kali:rolling as the hub kept them on 2026-09-26, for the
+unit tests of src/verify.rs and src/hub.rs. Image manifest digest:
+sha256:24a0bba642e3ed90b94428a0bf8e9cfaac49d46f4844fc1801a0267a9b9d693a
+
+  kali-rolling.referrers.json  GET /v2/kali/referrers/<digest>
+  keyless.manifest.json        GET /v2/kali/manifests/sha256:7b5b8bc25c8392e980edcdefba7fcb85805ad18301b006b68183cf540ba30ed3
+  keyless.bundle.json          its layer, GET /v2/kali/blobs/sha256:97957d2623f5b9383ae908a2ed12448a2d2fc9b8ea458a236b9928911dbb8fd4
+  key.manifest.json            GET /v2/kali/manifests/sha256:aafdb47c55dcf12192e2818c588603a3c7285809d32a32eedda045a639372d3c
+  key.bundle.json              its layer, GET /v2/kali/blobs/sha256:ecfda5c374357d5d7ec835bfc61fc2e259ba339bd0412bfed2f8c3c6e86ac166
+  cosign.pub                   the project's public key, as in nspawn/mkosi-definitions
+  other.pub                    a key of nobody's, which must not verify
+
+Manifests were fetched with Accept: application/vnd.oci.image.manifest.v1+json. The
+bundles verify offline against the trusted root sigstore-verify embeds; refresh them from
+the hub (any signed image and its referrers) if a rotation of Sigstore's keys ever makes
+them fail.

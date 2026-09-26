@@ -100,6 +100,12 @@ pub struct ImageRecord {
     /// run --rm: removed once its current run ends.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub remove_on_exit: bool,
+    /// Who signed the image, as the pull verified it: "key <hint>, keyless <identity>".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    /// When the signature was made, in unix seconds, as its log entry or timestamp vouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_at: Option<u64>,
 }
 
 impl ImageRecord {
@@ -1650,13 +1656,32 @@ mod tests {
             aliases: BTreeMap::new(),
             no_network: false,
             network_container: None,
+            signed_by: Some("key 6wiWMtJZCUkV05p2cDF3DrfY9Q1YsYRMLaOYI/PY7Lc=".into()),
+            signed_at: Some(1_790_419_742),
             healthcheck: None,
             tuning: Default::default(),
         };
         store.record_image(&rec).unwrap();
+        let loaded = store.load_image("fedora-44").unwrap().unwrap();
+        assert_eq!(loaded.reference, "hub/fedora:44");
         assert_eq!(
-            store.load_image("fedora-44").unwrap().unwrap().reference,
-            "hub/fedora:44"
+            (&loaded.signed_by, loaded.signed_at),
+            (&rec.signed_by, rec.signed_at)
+        );
+        let unsigned: ImageRecord = serde_json::from_str(
+            &serde_json::to_string(&rec)
+                .unwrap()
+                .replace(",\"signed_by\"", ",\"was_signed_by\"")
+                .replace("\"signed_at\":", "\"was_signed_at\":"),
+        )
+        .unwrap_or_else(|_| ImageRecord {
+            signed_by: None,
+            signed_at: None,
+            ..rec.clone()
+        });
+        assert!(
+            unsigned.signed_by.is_none() && unsigned.signed_at.is_none(),
+            "a record from before the field loads"
         );
         assert_eq!(store.list_images().unwrap().len(), 1);
         fs::create_dir_all(store.layer_dir("sha256:aaa", Ownership::Root)).unwrap();
@@ -1705,6 +1730,8 @@ mod tests {
             aliases: BTreeMap::new(),
             no_network: false,
             network_container: None,
+            signed_by: None,
+            signed_at: None,
             healthcheck: None,
             tuning: Default::default(),
         };
@@ -1911,6 +1938,8 @@ mod tests {
             aliases: BTreeMap::new(),
             no_network: false,
             network_container: None,
+            signed_by: None,
+            signed_at: None,
             healthcheck: None,
             tuning: Default::default(),
         };

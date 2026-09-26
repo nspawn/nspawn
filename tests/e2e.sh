@@ -73,7 +73,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -1456,6 +1456,51 @@ python3 "$(dirname "$0")/terminal.py" $NSPAWN pull docker.io/library/busybox:lat
 tr -d '\r' < /tmp/e2e-progress.txt | grep_q "blob .*: downloading" || fail "the pull after rm -f downloaded nothing: $(tr -d '\r' < /tmp/e2e-progress.txt)"
 grep_q -aE "$bar" /tmp/e2e-progress.txt || fail "no progress bar on a terminal: $(tr -d '\r' < /tmp/e2e-progress.txt)"
 $NSPAWN rm $app >/dev/null || fail "rm $app after the pull on a terminal"
+
+step "signatures: a hub image is verified before anything is downloaded"
+# The hub's build workflow signs every image twice (the project's key and keyless);
+# the policy for hub.nspawn.org is built in and requires one of them.
+$NSPAWN pull hub.nspawn.org/dnsmasq:latest --name e2e-signed --force > /tmp/e2e-signed.txt 2>&1 || { cat /tmp/e2e-signed.txt; fail "pull of a signed hub image"; }
+grep_q "^hub.nspawn.org/dnsmasq:latest: signature verified (key 6wiWMtJZCUkV, keyless https://github.com/nspawn/mkosi-definitions/.github/workflows/mkosi.yml@refs/heads/master)" /tmp/e2e-signed.txt || fail "the pull did not say who signed the image: $(cat /tmp/e2e-signed.txt)"
+[ "$(grep -n "signature verified" /tmp/e2e-signed.txt | cut -d: -f1)" = 1 ] || fail "the signature was not checked first: $(cat /tmp/e2e-signed.txt)"
+$NSPAWN inspect e2e-signed | python3 -c "
+import json, sys
+d = json.load(sys.stdin)[0]
+assert d['signed_by'].startswith('key 6wiWMtJZCUkV05p2cDF3DrfY9Q1YsYRMLaOYI/PY7Lc=, keyless https://github.com/nspawn/mkosi-definitions/'), d['signed_by']
+assert d['signed_at'] > 1790000000, d['signed_at']" || fail "inspect does not show the signature"
+$NSPAWN images ls --json | python3 -c "
+import json, sys
+d = [i for i in json.load(sys.stdin) if i['name'] == 'e2e-signed'][0]
+assert d['signed_by'].startswith('key '), d" || fail "images ls --json has no signed_by"
+$NSPAWN create e2e-signed e2e-nvc >/dev/null || fail "create from the signed image"
+$NSPAWN inspect e2e-nvc | python3 -c "import json, sys; d = json.load(sys.stdin)[0]; assert d['signed_by'].startswith('key ') and d['signed_at'] > 0, d" || fail "a created machine does not inherit its source's signature"
+$NSPAWN rm e2e-nvc >/dev/null || fail "rm e2e-nvc"
+# An image without a signature is refused, unless --no-verify says so; the dated tags
+# older than the signing (2026-09-26) are such images while the hub keeps them.
+old=$($NSPAWN --registry hub.nspawn.org hub tags fedora 2>/dev/null | awk -F- '$1 == "44" && NF == 2 && $2 ~ /^[0-9]{8}$/ && $2 < "20260926" {print; exit}')
+if [ -z "$old" ]; then
+  echo "no unsigned dated tag of fedora left on the hub: the refusal is not checked"
+else
+  $NSPAWN images rm "fedora-$old" >/dev/null 2>&1 || true
+  out=$($NSPAWN pull hub.nspawn.org/fedora:$old --name e2e-unsigned 2>&1) && fail "an unsigned hub image was pulled"
+  echo "$out" | grep_q "hub.nspawn.org/fedora:$old (.*) carries no signature on hub.nspawn.org; the policy requires one (--no-verify pulls it anyway)" || fail "the refusal of an unsigned image reads wrong: $out"
+  $NSPAWN images ls | grep_q "^ *e2e-unsigned " && fail "a refused pull left an image behind"
+  out=$($NSPAWN create hub.nspawn.org/fedora:$old e2e-nvc 2>&1) && fail "create pulled an unsigned image"
+  echo "$out" | grep_q "carries no signature" || fail "create did not explain the refusal: $out"
+  out=$($NSPAWN run -d --pull always --name e2e-nv hub.nspawn.org/fedora:$old 2>&1) && fail "run pulled an unsigned image"
+  echo "$out" | grep_q "carries no signature" || fail "run did not explain the refusal: $out"
+  $NSPAWN pull hub.nspawn.org/fedora:$old --name e2e-unsigned --no-verify > /tmp/e2e-unsigned.txt 2>&1 || { cat /tmp/e2e-unsigned.txt; fail "pull --no-verify"; }
+  grep_q "^note: signature verification of hub.nspawn.org/fedora:$old skipped (--no-verify)" /tmp/e2e-unsigned.txt || fail "pull --no-verify did not say so: $(cat /tmp/e2e-unsigned.txt)"
+  $NSPAWN inspect e2e-unsigned | python3 -c "import json, sys; d = json.load(sys.stdin)[0]; assert d['signed_by'] == '' and d['signed_at'] == 0, d" || fail "an unverified image claims a signature"
+  $NSPAWN images rm e2e-unsigned >/dev/null || fail "images rm e2e-unsigned"
+  $NSPAWN create --no-verify hub.nspawn.org/fedora:$old e2e-nvc >/dev/null || fail "create --no-verify"
+  $NSPAWN images ls | grep_q "^ *fedora-$old " || fail "create --no-verify did not keep the pulled image under its name"
+  $NSPAWN run -d --no-verify --pull always --name e2e-nv hub.nspawn.org/fedora:$old >/dev/null || fail "run --no-verify"
+  $NSPAWN stop e2e-nv >/dev/null || fail "stop e2e-nv"
+  $NSPAWN rm e2e-nv e2e-nvc >/dev/null || fail "rm e2e-nv e2e-nvc"
+  $NSPAWN images rm "fedora-$old" >/dev/null || fail "images rm fedora-$old"
+fi
+$NSPAWN images rm e2e-signed >/dev/null || fail "images rm e2e-signed"
 
 step "pull: several blobs at once, each verified, nothing left behind"
 # memcached:alpine has six small layers. The first three transfers begin before any

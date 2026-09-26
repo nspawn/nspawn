@@ -9,7 +9,7 @@ and `systemctl` are clients of machined and systemd.
 
 ```
 nspawn search fedora                # images on the hub and on Docker Hub, with their source
-nspawn pull fedora:44               # download and assemble an image
+nspawn pull fedora:44               # verify its signature, download and assemble it
 nspawn start fedora-44              # boot it as a machine
 nspawn run -d nginx:1.27 --name web -p 8080:80   # an app from Docker Hub, detached
 nspawn run -it --rm docker.io/library/alpine:3 sh   # a terminal, removed at the end
@@ -49,6 +49,10 @@ the shells; `man nspawn` is the same reference the packages install.
   secrets are kept encrypted with systemd-creds and handed to a machine as files.
 - **One image, many machines.** A pulled image is a machine; `create` makes more from
   it, sharing its layers, each with settings, ports and an address of its own.
+- **Signed images.** Every image on hub.nspawn.org is signed by its build workflow,
+  with the project's key and keyless through Sigstore; `pull` verifies one of the two
+  before downloading anything, refuses an image without a valid signature and
+  remembers who signed it. `--no-verify` skips the check for one command.
 - **A network of its own.** Machines join the `nspawn0` bridge (docker0 style, managed
   with nftables, fixed addresses, names in `/etc/hosts`); `network create` adds
   isolated networks with aliases, `-p` publishes ports, and `--network host`, `veth`,

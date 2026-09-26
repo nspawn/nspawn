@@ -52,6 +52,7 @@ pub fn image(i: &ImageSummary) -> Dict {
         ("reference".to_string(), opt_string(i.reference.as_deref())),
         ("size".to_string(), v(i.size.unwrap_or(0))),
         ("read_only".to_string(), v(i.read_only)),
+        ("signed_by".to_string(), opt_string(i.signed_by.as_deref())),
     ])
 }
 
@@ -68,6 +69,8 @@ pub fn record(r: &ImageRecord) -> Dict {
         ("origin".to_string(), v(r.origin.as_str())),
         ("mode".to_string(), v(r.mode.name())),
         ("created".to_string(), v(r.created)),
+        ("signed_by".to_string(), opt_string(r.signed_by.as_deref())),
+        ("signed_at".to_string(), v(r.signed_at.unwrap_or(0))),
         // As --network spells it: bridge, veth, host, none or the primary network's name.
         (
             "network".to_string(),
@@ -593,7 +596,13 @@ mod tests {
             .to_string()
             .contains("unsigned integer"));
         assert!(options.string("force").is_err());
+        assert!(
+            options.bool("verify", true).unwrap(),
+            "a check is on unless the caller says otherwise"
+        );
         options.finish().unwrap();
+        let off: HashMap<String, OwnedValue> = HashMap::from([("verify".to_string(), v(false))]);
+        assert!(!Options::new(&off).bool("verify", true).unwrap());
 
         let limits: HashMap<String, OwnedValue> = HashMap::from([
             ("memory".to_string(), v(0u64)),

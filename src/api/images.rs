@@ -22,6 +22,8 @@ pub struct ImageSummary {
     pub reference: Option<String>,
     pub size: Option<u64>,
     pub read_only: bool,
+    /// Who signed it, when the pull verified a signature.
+    pub signed_by: Option<String>,
 }
 
 pub async fn list(ctx: &Context) -> Result<Vec<ImageSummary>> {
@@ -43,6 +45,7 @@ pub async fn list(ctx: &Context) -> Result<Vec<ImageSummary>> {
                 backend: record.map(|r| r.backend),
                 origin: record.map(|r| r.origin.clone()),
                 reference: record.map(|r| r.reference.clone()),
+                signed_by: record.and_then(|r| r.signed_by.clone()),
                 name: i.name,
                 kind: i.kind,
                 size: i.usage,

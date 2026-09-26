@@ -7,7 +7,7 @@ use oci_client::manifest::OciDescriptor;
 
 use crate::api::{line, note, require_root, Context, Report};
 use crate::backend::{Backend, BackendChoice};
-use crate::hub::{short_digest, Hub};
+use crate::hub::{short_digest, Hub, Resolved};
 use crate::install::{ensure_replaceable, install, remove_existing, Install};
 use crate::oci::Mode;
 use crate::reference::{validate_machine_name, ImageRef};
@@ -27,6 +27,8 @@ pub struct PullRequest {
     pub mode: Option<Mode>,
     /// Replace an existing image of that name.
     pub force: bool,
+    /// Check the image's signature as the registry's policy says; off with --no-verify.
+    pub verify: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +36,8 @@ pub struct Pulled {
     pub name: String,
     pub reference: String,
     pub mode: Mode,
+    /// Who signed it, when the pull verified a signature.
+    pub signed_by: Option<String>,
 }
 
 /// The blobs to fetch, each once (a manifest may name a layer twice), and the digests
@@ -77,16 +81,42 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
         note(report, crate::backend::MSTACK_EXPERIMENTAL);
     }
     let hub = Hub::new(config)?;
-    let (manifest, manifest_digest) = hub.resolve(&oci).await?;
+    let resolved = hub.resolve(&oci).await?;
     // Digests become path components in the store; the registry does not get to choose them.
-    validate_digest(&manifest_digest)?;
-    for descriptor in manifest
+    validate_digest(&resolved.digest)?;
+    if let Some(index) = &resolved.index_digest {
+        validate_digest(index)?;
+    }
+    for descriptor in resolved
+        .manifest
         .layers
         .iter()
-        .chain(std::iter::once(&manifest.config))
+        .chain(std::iter::once(&resolved.manifest.config))
     {
         validate_digest(&descriptor.digest)?;
     }
+    // Before a single layer comes down: an image that is not what it claims is not
+    // worth the download.
+    let signed = if !request.verify {
+        note(
+            report,
+            format!("note: signature verification of {image} skipped (--no-verify)"),
+        );
+        None
+    } else {
+        match crate::verify::Policy::for_registry(config, &image.registry)? {
+            Some(policy) => {
+                crate::verify::check(&hub, &oci, &image.to_string(), &resolved, &policy, report)
+                    .await?
+            }
+            None => None,
+        }
+    };
+    let Resolved {
+        manifest,
+        digest: manifest_digest,
+        ..
+    } = resolved;
     let manifest_bytes = hub.manifest_bytes(&oci, &manifest_digest).await?;
     // Held from here until the record refers to them: an images rm meanwhile must not
     // collect what this pull is bringing in.
@@ -168,23 +198,26 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
             manifest_digest: &manifest_digest,
             origin: "pull",
             mode: request.mode,
+            signed_by: signed.as_ref().map(|s| s.signed_by.as_str()),
+            signed_at: signed.as_ref().and_then(|s| s.signed_at),
         },
         report,
     )
     .await?;
-    crate::api::events::emit(
-        "machine",
-        "pull",
-        &name,
-        &[
-            ("image", &image.to_string()),
-            ("reference", &image.to_string()),
-        ],
-    );
+    let reference = image.to_string();
+    let mut attributes = vec![
+        ("image", reference.as_str()),
+        ("reference", reference.as_str()),
+    ];
+    if let Some(signed) = &signed {
+        attributes.push(("signed_by", signed.signed_by.as_str()));
+    }
+    crate::api::events::emit("machine", "pull", &name, &attributes);
     Ok(Pulled {
         name,
-        reference: image.to_string(),
+        reference,
         mode,
+        signed_by: signed.map(|s| s.signed_by),
     })
 }
 

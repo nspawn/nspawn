@@ -33,6 +33,7 @@ zbus_systemd = { version = "0.26100", features = ["machine1", "systemd1", "zbus-
 zstd = "0.14"
 clap_complete = "4"
 clap_mangen = "0.3"
+sigstore-verify = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

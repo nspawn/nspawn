@@ -342,6 +342,11 @@ pub struct PullArgs {
     /// Replace an existing image with the same name.
     #[arg(long, short = 'f')]
     pub force: bool,
+    /// Skip the signature check: the hub's images are signed and refused without a valid
+    /// signature, and nspawn.toml can ask the same of other registries; like docker's
+    /// --disable-content-trust.
+    #[arg(long)]
+    pub no_verify: bool,
 }
 
 #[derive(Args, Debug)]
@@ -370,6 +375,10 @@ pub struct CreateArgs {
     /// Replace an existing machine with the same name.
     #[arg(long, short = 'f')]
     pub force: bool,
+    /// Skip the signature check of an image that has to be pulled (a local source is not
+    /// checked); like docker's --disable-content-trust.
+    #[arg(long)]
+    pub no_verify: bool,
     /// Replace the image's entrypoint; an empty string runs the arguments alone.
     #[arg(long, value_name = "PROGRAM")]
     pub entrypoint: Option<String>,
@@ -759,6 +768,11 @@ pub struct RunArgs {
     /// Make the machine anew when one of that name exists (it must be stopped).
     #[arg(long, short = 'f')]
     pub force: bool,
+    /// Skip the signature check: the hub's images are signed and refused without a valid
+    /// signature, and nspawn.toml can ask the same of other registries; like docker's
+    /// --disable-content-trust.
+    #[arg(long)]
+    pub no_verify: bool,
     /// Start it in the background and return, like docker run -d; without it the
     /// output follows until the machine ends and run exits with its exit code.
     #[arg(long, short = 'd')]
@@ -1066,7 +1080,25 @@ mod tests {
         assert_eq!(run.options.restart, Some(crate::policy::Restart::Always));
         assert_eq!(run.command, ["nginx", "-g", "daemon off;"]);
         assert!(run.options.wait, "run waits like start unless --no-wait");
+        assert!(
+            !run.no_verify,
+            "signatures are checked unless told otherwise"
+        );
         assert!(Cli::try_parse_from(["nspawn", "run", "x", "--pull", "sometimes"]).is_err());
+        for args in [
+            &["nspawn", "pull", "fedora:44", "--no-verify"][..],
+            &["nspawn", "run", "-d", "--no-verify", "fedora:44"][..],
+            &["nspawn", "create", "--no-verify", "fedora:44", "web"][..],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let skipped = match cli.command {
+                Command::Pull(a) => a.no_verify,
+                Command::Run(a) => a.no_verify,
+                Command::Create(a) => a.no_verify,
+                _ => panic!("{args:?}"),
+            };
+            assert!(skipped, "{args:?}");
+        }
         // docker's order: options, the image, then its command and arguments as they are.
         let cli = Cli::try_parse_from([
             "nspawn",

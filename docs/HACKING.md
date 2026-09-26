@@ -31,9 +31,9 @@ firewall zones, units), so it runs as root on a disposable VM only.
 
 Requirements on the VM: systemd-nspawn and machined 255 or newer (Ubuntu 24.04
 is the oldest host the suite runs on; Debian 12 with systemd 252 does not
-work), overlayfs, `ip`, `nft`, `curl`, `python3`, access to Docker Hub, a
-registry with the test image (`fedora:44` by default), and mkosi for the build
-step. The mstack pass runs only on systemd 261 with systemd-nsresourced and
+work), overlayfs, `ip`, `nft`, `curl`, `python3`, access to Docker Hub and to
+hub.nspawn.org (a signed image is pulled from it), a registry with the test
+image (`fedora:44` by default), and mkosi for the build step. The mstack pass runs only on systemd 261 with systemd-nsresourced and
 systemd-mountfsd installed; elsewhere it is skipped and says so, and so on
 the systemd 262 release, which cannot boot a managed user namespace until
 the fix for systemd/systemd#43899 lands in a later version. The

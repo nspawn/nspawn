@@ -25,6 +25,9 @@ pub struct Install<'a> {
     pub origin: &'a str,
     /// Force boot or app instead of detecting it from the image.
     pub mode: Option<Mode>,
+    /// Who signed the image, when its signature was verified, and when it was made.
+    pub signed_by: Option<&'a str>,
+    pub signed_at: Option<u64>,
 }
 
 /// All blobs named in the manifest (layers and config) must already be in the store.
@@ -152,6 +155,8 @@ pub async fn install(
         network_container: None,
         healthcheck: None,
         tuning: Default::default(),
+        signed_by: spec.signed_by.map(str::to_string),
+        signed_at: spec.signed_at,
     })?;
     Ok(mode)
 }

@@ -18,6 +18,8 @@ use tokio_util::io::ReaderStream;
 use crate::api::{Event, Report};
 use crate::auth;
 use crate::config::Config;
+use crate::store::validate_digest;
+use crate::verify::{Candidate, BUNDLE_ARTIFACT_TYPE, BUNDLE_MAX_SIZE};
 
 /// How often a transfer says how far it got: often enough for a progress bar, seldom
 /// enough that the bus signals cost nothing next to the transfer.
@@ -181,12 +183,98 @@ impl Hub {
     }
 
     /// Resolves a reference to the image manifest for this platform (indexes are followed)
-    /// and returns it with its digest.
-    pub async fn resolve(&self, image: &Reference) -> Result<(OciImageManifest, String)> {
-        self.client
-            .pull_image_manifest(image, &self.auth(image.registry()))
+    /// and returns it with its digest, and the index's when the reference named one.
+    pub async fn resolve(&self, image: &Reference) -> Result<Resolved> {
+        let (manifest, digest, index_digest) = self
+            .client
+            .pull_image_manifest_and_list_digest(image, &self.auth(image.registry()))
             .await
-            .with_context(|| format!("fetching the manifest of {image}"))
+            .with_context(|| format!("fetching the manifest of {image}"))?;
+        Ok(Resolved {
+            manifest,
+            digest,
+            index_digest,
+        })
+    }
+
+    /// The Sigstore bundles kept as referrers of `subject`, a digest in the image's
+    /// repository: the referrers index filtered by artifact type, each entry's manifest
+    /// checked to be a signature of `subject`, its one layer read. Called after `resolve`
+    /// on the same Hub, which cached the token the registry wants for the repository.
+    pub async fn signature_bundles(
+        &self,
+        image: &Reference,
+        subject: &str,
+    ) -> Result<Vec<Candidate>> {
+        let by_digest = Reference::with_digest(
+            image.registry().to_string(),
+            image.repository().to_string(),
+            subject.to_string(),
+        );
+        let index = self
+            .client
+            .pull_referrers(&by_digest, Some(BUNDLE_ARTIFACT_TYPE))
+            .await
+            .with_context(|| format!("fetching the signatures of {image}"))?;
+        let mut bundles = Vec::new();
+        for entry in index
+            .manifests
+            .iter()
+            .filter(|e| e.artifact_type.as_deref() == Some(BUNDLE_ARTIFACT_TYPE))
+        {
+            validate_digest(&entry.digest)?;
+            let bytes = self.manifest_bytes(image, &entry.digest).await?;
+            // A referrer that is not a signature of this image is somebody else's business.
+            let Ok(manifest) = serde_json::from_slice::<OciImageManifest>(&bytes) else {
+                continue;
+            };
+            let Ok(layer) = signature_layer(&manifest, subject) else {
+                continue;
+            };
+            let json = self.small_blob(image, layer, BUNDLE_MAX_SIZE).await?;
+            bundles.push(Candidate {
+                manifest_digest: entry.digest.clone(),
+                json: String::from_utf8_lossy(&json).into_owned(),
+            });
+        }
+        Ok(bundles)
+    }
+
+    /// A blob small enough to hold in memory, checked against its digest; refused past `cap`.
+    async fn small_blob(
+        &self,
+        image: &Reference,
+        layer: &OciDescriptor,
+        cap: u64,
+    ) -> Result<Vec<u8>> {
+        let expected = layer
+            .digest
+            .strip_prefix("sha256:")
+            .with_context(|| format!("blob digest {} is not sha256", layer.digest))?;
+        let sized = self
+            .client
+            .pull_blob_stream(image, layer)
+            .await
+            .with_context(|| format!("fetching blob {}", layer.digest))?;
+        let mut stream = sized.stream;
+        let mut bytes = Vec::new();
+        let mut hasher = Sha256::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.with_context(|| format!("downloading blob {}", layer.digest))?;
+            if bytes.len() as u64 + chunk.len() as u64 > cap {
+                bail!("blob {} is bigger than {cap} bytes", layer.digest);
+            }
+            hasher.update(&chunk);
+            bytes.extend_from_slice(&chunk);
+        }
+        let actual = hex::encode(hasher.finalize());
+        if actual != expected {
+            bail!(
+                "blob {} failed verification: downloaded sha256:{actual}",
+                layer.digest
+            );
+        }
+        Ok(bytes)
     }
 
     /// Downloads one blob (layer or config) to `dest`, verifying its sha256 digest while
@@ -254,6 +342,50 @@ impl Hub {
         unfinished.keep();
         Ok(())
     }
+}
+
+/// A reference resolved on the registry.
+#[derive(Debug, Clone)]
+pub struct Resolved {
+    /// The manifest for this platform.
+    pub manifest: OciImageManifest,
+    pub digest: String,
+    /// The index the reference named, when it named one rather than a manifest: what
+    /// cosign signs unless told to sign each platform's manifest too.
+    pub index_digest: Option<String>,
+}
+
+/// The bundle layer of a manifest that is a signature of `subject`, or why it is not one:
+/// the artifact type, the subject, one layer of the bundle media type, a size a bundle has.
+pub fn signature_layer<'a>(
+    manifest: &'a OciImageManifest,
+    subject: &str,
+) -> Result<&'a OciDescriptor> {
+    if manifest.artifact_type.as_deref() != Some(BUNDLE_ARTIFACT_TYPE) {
+        bail!(
+            "artifact type {} is not a Sigstore bundle",
+            manifest.artifact_type.as_deref().unwrap_or("none")
+        );
+    }
+    match &manifest.subject {
+        Some(s) if s.digest == subject => {}
+        Some(s) => bail!("a signature of {} rather than {subject}", s.digest),
+        None => bail!("no subject"),
+    }
+    let [layer] = manifest.layers.as_slice() else {
+        bail!("{} layers instead of one", manifest.layers.len());
+    };
+    if layer.media_type != BUNDLE_ARTIFACT_TYPE {
+        bail!(
+            "layer media type {} is not a Sigstore bundle",
+            layer.media_type
+        );
+    }
+    if layer.size <= 0 || layer.size as u64 > BUNDLE_MAX_SIZE {
+        bail!("a bundle of {} bytes", layer.size);
+    }
+    validate_digest(&layer.digest)?;
+    Ok(layer)
 }
 
 /// Where a blob is written while it is incomplete (".part-<name>.<pid>.<n>", skipped by
@@ -459,6 +591,51 @@ pub fn short_digest(digest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KALI_DIGEST: &str =
+        "sha256:24a0bba642e3ed90b94428a0bf8e9cfaac49d46f4844fc1801a0267a9b9d693a";
+
+    fn signature_manifest() -> OciImageManifest {
+        serde_json::from_str(include_str!(
+            "../tests/fixtures/signatures/key.manifest.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_signature_manifest_is_one_of_the_subject_with_one_bundle_layer() {
+        let manifest = signature_manifest();
+        assert_eq!(
+            signature_layer(&manifest, KALI_DIGEST).unwrap().digest,
+            "sha256:ecfda5c374357d5d7ec835bfc61fc2e259ba339bd0412bfed2f8c3c6e86ac166"
+        );
+        let keyless: OciImageManifest = serde_json::from_str(include_str!(
+            "../tests/fixtures/signatures/keyless.manifest.json"
+        ))
+        .unwrap();
+        assert!(signature_layer(&keyless, KALI_DIGEST).is_ok());
+        let other = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let e = signature_layer(&manifest, other).unwrap_err().to_string();
+        assert!(e.contains("a signature of sha256:24a0bba6"), "{e}");
+        let mut m = signature_manifest();
+        m.artifact_type = Some("application/vnd.example".to_string());
+        assert!(signature_layer(&m, KALI_DIGEST).is_err());
+        let mut m = signature_manifest();
+        m.subject = None;
+        assert!(signature_layer(&m, KALI_DIGEST).is_err());
+        let mut m = signature_manifest();
+        m.layers.push(m.layers[0].clone());
+        assert!(signature_layer(&m, KALI_DIGEST).is_err());
+        let mut m = signature_manifest();
+        m.layers[0].media_type = "application/octet-stream".to_string();
+        assert!(signature_layer(&m, KALI_DIGEST).is_err());
+        let mut m = signature_manifest();
+        m.layers[0].size = BUNDLE_MAX_SIZE as i64 + 1;
+        assert!(signature_layer(&m, KALI_DIGEST).is_err());
+        let mut m = signature_manifest();
+        m.layers[0].digest = "sha256:short".to_string();
+        assert!(signature_layer(&m, KALI_DIGEST).is_err());
+    }
 
     #[test]
     fn short_digests() {

@@ -30,7 +30,8 @@ another file on the unit's command line. The methods that reach a registry
 take `registry` and `ca_cert` options that override that configuration for
 one call; the command line passes them when it was given a registry (flag,
 `NSPAWN_REGISTRY` or its own configuration file) and leaves the service's
-alone otherwise.
+alone otherwise. The signature policy of a registry is the service's own
+(the hub's is built in): a client chooses the registry, never the policy.
 
 Every user may call; who may do what is polkit's answer. The methods that
 only read (`ListImages`, `GetImage`, `ListMachines`, `GetMachine`,
@@ -97,9 +98,9 @@ hundred that ended; older ones are gone with their objects).
 
 | Method | Like | Notes |
 |---|---|---|
-| `ListImages() -> aa{sv}` | `images ls` | name, kind, backend, origin, reference, size, read_only |
-| `GetImage(s name) -> a{sv}` | | everything recorded: name, reference, digest, backend, origin, mode, created, network (bridge, veth, host, none, container:NAME or the primary network's name), networks (as, every bridge network joined, the primary one first), address (on the primary network), addresses (a{ss}, by network), aliases (as, NETWORK=NAME), ports, volumes, env, entrypoint, cmd, command, image_env, working_dir, user, stop_signal, labels (a{ss}: the image's with the machine's on top), image_labels, restart, memory (bytes), cpus (d), pids_limit, and docker's other flags as the machine has them: hostname, cap_add, cap_drop, tmpfs, dns, dns_search, extra_hosts (HOST:IP), devices (HOST:CONTAINER:PERMISSIONS) (as), privileged, read_only, init (b), shm_size, stop_timeout (t), oom_score_adj (x), ulimits, sysctls (a{ss}), secrets (as, NAME:TARGET:MODE:UID:GID), image_volumes (as, what the image declares as volumes); working_dir, user and stop_signal are the flags' when given, the image's otherwise; healthcheck (a{sv}: test (as), interval, timeout, start_period, start_interval (t, microseconds, 0 for docker's default), retries (u); empty without one) |
-| `PullImage(s reference, a{sv} options) -> o` | `pull` | options name, backend, mode, force, registry, ca_cert; a job |
+| `ListImages() -> aa{sv}` | `images ls` | name, kind, backend, origin, reference, size, read_only, signed_by |
+| `GetImage(s name) -> a{sv}` | | everything recorded: name, reference, digest, backend, origin, mode, created, signed_by and signed_at (who signed the image and when, as the pull verified it; empty and 0 without a verified signature), network (bridge, veth, host, none, container:NAME or the primary network's name), networks (as, every bridge network joined, the primary one first), address (on the primary network), addresses (a{ss}, by network), aliases (as, NETWORK=NAME), ports, volumes, env, entrypoint, cmd, command, image_env, working_dir, user, stop_signal, labels (a{ss}: the image's with the machine's on top), image_labels, restart, memory (bytes), cpus (d), pids_limit, and docker's other flags as the machine has them: hostname, cap_add, cap_drop, tmpfs, dns, dns_search, extra_hosts (HOST:IP), devices (HOST:CONTAINER:PERMISSIONS) (as), privileged, read_only, init (b), shm_size, stop_timeout (t), oom_score_adj (x), ulimits, sysctls (a{ss}), secrets (as, NAME:TARGET:MODE:UID:GID), image_volumes (as, what the image declares as volumes); working_dir, user and stop_signal are the flags' when given, the image's otherwise; healthcheck (a{sv}: test (as), interval, timeout, start_period, start_interval (t, microseconds, 0 for docker's default), retries (u); empty without one) |
+| `PullImage(s reference, a{sv} options) -> o` | `pull` | options name, backend, mode, force, verify (b, default true: the signature check the registry's policy asks for; `--no-verify` sends false), registry, ca_cert; a job |
 | `CreateMachine(s source, s name, a{sv} options) -> o` | `create` | options backend, network (s) or networks (as, several bridge networks, the first one primary), aliases (as, NAME or NETWORK=NAME), publish (as, [IP:]HOST:CONTAINER[/udp], or ranges of equal length on both sides), force, entrypoint, env, volume, label, restart, memory (t, bytes), cpus (d), pids_limit (t), command, registry, ca_cert; a job |
 | `PushImage(s image, a{sv} options) -> o` | `push` | options to, registry, ca_cert; a job |
 | `BuildImage(s directory, s tag, a{sv} options) -> o` | `build` | options name, distribution, release, profile, backend, mode, force, keep_output, mkosi_args, registry, ca_cert; a job whose output includes mkosi's |
@@ -219,7 +220,7 @@ poweroff request for a booted one); the signal `Exited(i status)`, sent after
 A job is returned by the long operations and keeps what happened: properties
 `Kind` (pull, create, push, build, rm, volume-rm, volume-prune, cp), `Target`, `State` (running, done,
 failed), `Output` (every line so far), `Error` and `Result` (a dictionary:
-for a pull its name, reference and mode; for a build its name, reference,
+for a pull its name, reference, mode and signed_by; for a build its name, reference,
 mode and output; for a push its name, destination and url; for a create its
 name and mode; for an rm, volume-rm or volume-prune the names removed; for a cp
 the entries and bytes copied). The

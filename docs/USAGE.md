@@ -30,7 +30,10 @@ the machine off when the shell ends, with the shell's exit code. Closing the ter
 
 `pull` fetches the layers the store lacks three at a time, as docker does, and says
 of each blob whether it was already present, is downloading or has been downloaded;
-on a terminal a bar follows every transfer under way.
+on a terminal a bar follows every transfer under way. An image of hub.nspawn.org is
+verified before any layer comes down (see [Signed images](#signed-images)): `pull`
+says who signed it, refuses it without a valid signature, and `--no-verify` skips the
+check for that command, on `run` and `create` too.
 
 `build` runs `mkosi` in the given directory with `--format=oci`, so the same
 `mkosi.conf` tree that works on its own works here; `--distribution`, `--release`,
@@ -200,7 +203,8 @@ write (docker needs `:z` for the same); named volumes are nspawn's and always wo
 
 One image, as many machines as you like: `nspawn create SOURCE NAME` makes another
 machine from an image that is already local, without touching the registry (a reference
-that is not local is pulled first, under its own name, as `run` does). It shares the
+that is not local is pulled first, under its own name and with the same signature check,
+as `run` does). It shares the
 source's layers and gets a writable layer, an address, settings and ports of its own
 (`-p`, `--network`); removing one never affects the others. A pulled image is a machine
 too, so `nspawn rm NAME` and `nspawn images rm NAME` remove the same thing: the record,
@@ -229,6 +233,34 @@ therefore works everywhere; to drive nspawn without a password, hand one of thos
 actions to a group with a polkit rule, as in `nspawn-wheel.rules` in the documentation
 directory. Doing that makes the group administrators of the host, since a machine's
 commands run as root and any host path can be mounted into one.
+
+### Signed images
+
+Every image on hub.nspawn.org is signed twice by its build workflow
+(nspawn/mkosi-definitions) with cosign: with the project's key, whose public half
+(`cosign.pub` there) is built into nspawn, and keyless, with the workflow's own
+identity through Sigstore (`https://github.com/nspawn/mkosi-definitions/.github/workflows/mkosi.yml@refs/heads/master`,
+issued by GitHub). The signatures are referrers of the image on the registry: Sigstore
+bundles that carry the certificate or the key's hint, the transparency log entry and a
+timestamp, so `pull` verifies them offline, with nothing but the registry consulted,
+against the Sigstore trusted root the binary embeds. One of the two has to verify, and
+the check comes before a single layer is downloaded:
+
+```
+$ sudo nspawn pull fedora:44
+hub.nspawn.org/fedora:44: signature verified (key 6wiWMtJZCUkV, keyless https://github.com/nspawn/mkosi-definitions/.github/workflows/mkosi.yml@refs/heads/master)
+hub.nspawn.org/fedora:44: manifest 9240778b2c77 with 1 layer(s), assembling as overlay
+...
+```
+
+An image without a signature (a tag dated before the signing began, or one pushed by
+hand with `nspawn push`) is refused with `carries no signature`, and so is one whose
+signatures do not verify, with the reason of each. `--no-verify` on `pull`, `run` and
+`create` skips the check for that command, like docker's `--disable-content-trust`;
+`create` checks only an image it has to pull, never a local source. `inspect` and
+`GetImage` show who signed (`signed_by`: `key <hint>, keyless <identity>`) and when
+(`signed_at`), which a machine made with `create` inherits from its source. Images of
+other registries are pulled as before, unverified.
 
 Registries are used anonymously until `nspawn login [REGISTRY] -u USER` (password asked on
 the terminal, or `--password-stdin`) checks the credentials the way docker login does and

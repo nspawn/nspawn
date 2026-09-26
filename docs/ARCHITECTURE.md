@@ -19,6 +19,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `config.rs` | `/etc/nspawn/nspawn.toml`, environment and flags |
 | `reference.rs` | image references, local names, machine name rules |
 | `hub.rs`, `auth.rs`, `search.rs` | registry client, credentials, search |
+| `verify.rs` | image signatures: the policy per registry, the Sigstore bundles among an image's referrers, checked with sigstore-verify |
 | `layout.rs`, `oci.rs` | OCI image layout reader, image config, boot/app detection |
 | `store.rs` | layers, blobs, records, manifests, gc, the store lock |
 | `install.rs`, `backend.rs` | turning blobs into a machine (overlay by default, flat without overlayfs, mstack only by name: experimental) |
@@ -49,7 +50,8 @@ files, and the machine units call nspawn back through drop-in hooks.
                      network_name for a user-defined one), address,
                      extra_networks with their addresses, aliases,
                      no_network, ports, entrypoint/cmd, env, volumes,
-                     labels, restart policy, limits
+                     labels, restart policy, limits, signed_by and
+                     signed_at when the pull verified a signature
   manifests/NAME.json raw manifest bytes (digest stays valid)
   machines/NAME/     overlay upper/work, host0.network (host1.. for the
                      other networks), hosts, resolv.conf, getent (the
@@ -188,7 +190,13 @@ with the command line's spellings. Pull, push, build, create, the removals
 the method returns `/org/nspawn/job/N` at once, the job's report events
 become `JobOutput` signals and the object's `Output`, the progress of its
 downloads and uploads `JobProgress` signals, and `JobRemoved` says how it
-ended. A pull fetches the blobs the store lacks three at a time, as docker
+ended. A pull first checks the image's signatures where its registry has a
+policy (the hub's is built in: the project's key or the build workflow's
+keyless identity, one of them required): the Sigstore bundles among the
+referrers of the manifest, or of the index the reference named, are verified
+offline with the log entry and the timestamp they carry, against the trusted
+root sigstore-verify embeds, and the pull ends there when none verifies. It
+then fetches the blobs the store lacks three at a time, as docker
 does, each verified against its digest as it streams and written next to its
 final name until then; the progress signals name the blob, so the client
 draws one bar per transfer under way, and a download that ends any other way

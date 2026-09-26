@@ -171,6 +171,8 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
             manifest_digest: &source.manifest_digest,
             origin: "create",
             mode: Some(source.mode),
+            signed_by: source.signed_by.as_deref(),
+            signed_at: source.signed_at,
         },
         report,
     )

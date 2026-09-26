@@ -333,6 +333,9 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
                     Value::from(format!("{:?}", args.mode).to_lowercase()),
                 );
             }
+            if args.no_verify {
+                options.insert("verify", Value::from(false));
+            }
             client
                 .run_job_to_stderr(|| manager.pull_image(&args.reference, options))
                 .await?;
@@ -347,6 +350,9 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
                     "mode",
                     Value::from(format!("{:?}", args.mode).to_lowercase()),
                 );
+            }
+            if args.no_verify {
+                options.insert("verify", Value::from(false));
             }
             client
                 .run_job_to_stderr(|| manager.pull_image(&args.reference, options))

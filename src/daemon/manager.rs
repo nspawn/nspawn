@@ -337,8 +337,9 @@ impl Manager {
         Ok(values::record(&record))
     }
 
-    /// Like `pull`. Options: name (s), backend (s), mode (s), force (b), registry (s),
-    /// ca_cert (s). The job's result carries name, reference and mode.
+    /// Like `pull`. Options: name (s), backend (s), mode (s), force (b), verify (b, default
+    /// true: the signature check the registry's policy asks for), registry (s), ca_cert
+    /// (s). The job's result carries name, reference, mode and signed_by.
     async fn pull_image(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -355,6 +356,7 @@ impl Manager {
             backend: backend_choice(options.string("backend")?.as_deref())?,
             mode: mode_choice(options.string("mode")?.as_deref())?,
             force: options.bool("force", false)?,
+            verify: options.bool("verify", true)?,
         };
         options.finish()?;
         let target = request
@@ -377,6 +379,10 @@ impl Manager {
                     ("name".to_string(), values::v(pulled.name)),
                     ("reference".to_string(), values::v(pulled.reference)),
                     ("mode".to_string(), values::v(pulled.mode.name())),
+                    (
+                        "signed_by".to_string(),
+                        values::v(pulled.signed_by.unwrap_or_default()),
+                    ),
                 ]))
             },
         )

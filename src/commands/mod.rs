@@ -408,6 +408,9 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             backend(&mut options, a.backend);
             mode(&mut options, a.mode);
             put(&mut options, "force", a.force);
+            if a.no_verify {
+                put(&mut options, "verify", false);
+            }
             let done = client
                 .run_job(|| manager.pull_image(&a.reference, options))
                 .await?;
@@ -489,6 +492,9 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                     let mut pull = client::registry_options(config);
                     put(&mut pull, "name", base.clone());
                     backend(&mut pull, a.backend);
+                    if a.no_verify {
+                        put(&mut pull, "verify", false);
+                    }
                     client
                         .run_job_to_stderr(|| manager.pull_image(&reference, pull))
                         .await?;

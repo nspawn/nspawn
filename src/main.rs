@@ -33,6 +33,7 @@ mod store;
 mod systemd;
 mod tuning;
 mod unitname;
+mod verify;
 mod volmount;
 mod volume;
 

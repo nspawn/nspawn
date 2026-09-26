@@ -287,6 +287,8 @@ mod tests {
                 aliases: BTreeMap::new(),
                 no_network: false,
                 network_container: None,
+                signed_by: None,
+                signed_at: None,
                 healthcheck: None,
                 tuning: Default::default(),
             })
