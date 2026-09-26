@@ -468,7 +468,54 @@ pub fn unit_quote(arg: &str) -> String {
 
 /// Writes the file when it changed, root's alone: -e often carries secrets.
 pub fn write(s: &MachineSettings, route: &NamespaceRoute) -> Result<()> {
+    check_plain(s)?;
     write_private(&path(s.name), &render_with(s, route))
+}
+
+/// The file is line based: a control character in a value would end its line and
+/// start a directive of the value's author, an image's config among them. Every input
+/// is checked where it comes in; this is the last look before the file is written.
+pub fn check_plain(s: &MachineSettings) -> Result<()> {
+    let mut values: Vec<(&str, String)> = Vec::new();
+    let mut take = |what: &'static str, value: &str| values.push((what, value.to_string()));
+    for arg in s.command {
+        take("the command", arg);
+    }
+    for var in s.run.env.iter().chain(s.extra_env) {
+        take("the environment", var);
+    }
+    for dir in s.run.working_dir.iter().chain(&s.tuning.working_dir) {
+        take("the working directory", dir);
+    }
+    for user in s.run.user.iter().chain(&s.tuning.user) {
+        take("the user", user);
+    }
+    if let Some(hostname) = &s.tuning.hostname {
+        take("the hostname", hostname);
+    }
+    for mount in &s.tuning.tmpfs {
+        take("a tmpfs", mount);
+    }
+    for device in &s.tuning.devices {
+        take("a device", &device.host);
+        take("a device", &device.container);
+    }
+    for bind in s.binds {
+        take("a bind", &bind.source.to_string_lossy());
+        take("a bind", &bind.target);
+    }
+    if let Some(file) = s.hostname_file {
+        take("the hostname file", &file.to_string_lossy());
+    }
+    for (what, value) in values {
+        if value.chars().any(char::is_control) {
+            anyhow::bail!(
+                "{what} of {} holds a control character ({value:?}), which the settings file cannot carry",
+                s.name
+            );
+        }
+    }
+    Ok(())
 }
 
 fn write_private(path: &Path, wanted: &str) -> Result<()> {
@@ -703,6 +750,49 @@ mod tests {
             !none.contains("PrivateUsers=no"),
             "a user namespace goes with no network"
         );
+    }
+
+    #[test]
+    fn a_value_with_a_control_character_never_reaches_the_file() {
+        let run = RunSpec {
+            cmd: vec!["nginx".into()],
+            ..RunSpec::default()
+        };
+        let plain = |command: &[String], run: &RunSpec, tuning: &Tuning| {
+            check_plain(&MachineSettings {
+                name: "web",
+                managed_userns: false,
+                mode: Mode::App,
+                run,
+                command,
+                extra_env: &[],
+                binds: &[],
+                volume_units: None,
+                network: Network::Bridge,
+                no_network: false,
+                hostname_file: None,
+                tuning,
+                bridge: None,
+            })
+            .is_ok()
+        };
+        let none = Tuning::default();
+        assert!(plain(&["nginx".into()], &run, &none));
+        assert!(!plain(&["x\n[Files]\nBind=/:/host".into()], &run, &none));
+        let mut bad = run.clone();
+        bad.working_dir = Some("/srv\nBind=/:/host".into());
+        assert!(!plain(&[], &bad, &none));
+        let mut bad = run.clone();
+        bad.env = vec!["A=1\nBind=/:/x".into()];
+        assert!(!plain(&[], &bad, &none));
+        let mut bad = run.clone();
+        bad.user = Some("nginx\nPrivateUsers=no".into());
+        assert!(!plain(&[], &bad, &none));
+        let tuning = Tuning {
+            tmpfs: vec!["/x:size=1m\nBind=/:/host".into()],
+            ..Tuning::default()
+        };
+        assert!(!plain(&[], &run, &tuning));
     }
 
     #[test]

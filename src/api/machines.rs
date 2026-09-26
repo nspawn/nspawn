@@ -656,6 +656,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
                 );
             }
             if let Some(entrypoint) = &args.entrypoint {
+                volume::reject_control_characters(entrypoint)?;
                 r.entrypoint = Some(if entrypoint.is_empty() {
                     Vec::new()
                 } else {
@@ -663,6 +664,9 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
                 });
             }
             if !args.command.is_empty() {
+                for arg in &args.command {
+                    volume::reject_control_characters(arg)?;
+                }
                 r.cmd = Some(args.command.clone());
             }
             if !args.env.is_empty() {

@@ -84,7 +84,7 @@ impl RunSpec {
             .map(|v| v.keys().cloned().collect())
             .unwrap_or_default();
         volumes.sort();
-        Ok(RunSpec {
+        let spec = RunSpec {
             healthcheck: crate::health::Healthcheck::from_config(&raw),
             volumes,
             entrypoint: config.entrypoint.unwrap_or_default(),
@@ -95,7 +95,35 @@ impl RunSpec {
             user: config.user.filter(|u| !u.is_empty()),
             stop_signal: config.stop_signal.filter(|s| !s.is_empty()),
             labels: config.labels.unwrap_or_default().into_iter().collect(),
-        })
+        };
+        spec.check_plain()?;
+        Ok(spec)
+    }
+
+    /// Refuses a config whose values carry control characters: they go into the
+    /// machine's settings file, which is line based, and an image does not get to
+    /// write directives there (a newline in WorkingDir would be one).
+    pub fn check_plain(&self) -> Result<()> {
+        let fields = [
+            ("Entrypoint", &self.entrypoint[..]),
+            ("Cmd", &self.cmd[..]),
+            ("Env", &self.env[..]),
+        ];
+        for (field, values) in fields {
+            for value in values {
+                plain(field, value)?;
+            }
+        }
+        for (field, value) in [
+            ("WorkingDir", &self.working_dir),
+            ("User", &self.user),
+            ("StopSignal", &self.stop_signal),
+        ] {
+            if let Some(value) = value {
+                plain(field, value)?;
+            }
+        }
+        Ok(())
     }
 
     /// The image's own entrypoint.
@@ -118,6 +146,15 @@ impl RunSpec {
         argv.extend_from_slice(self.cmd());
         argv
     }
+}
+
+fn plain(field: &str, value: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        anyhow::bail!(
+            "the image config's {field} holds a control character ({value:?}); refusing the image"
+        );
+    }
+    Ok(())
 }
 
 const INIT_PATHS: [&str; 4] = [
@@ -263,6 +300,34 @@ mod tests {
             br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#;
         assert_eq!(RunSpec::from_config(minimal).unwrap(), RunSpec::default());
         assert!(RunSpec::from_config(b"nope").is_err());
+    }
+
+    #[test]
+    fn a_config_that_would_write_settings_directives_is_refused() {
+        // A newline in any of these would end the line of the settings file and start a
+        // directive of the image's choosing.
+        for (field, value) in [
+            ("WorkingDir", r#""/srv\n[Files]\nBind=/:/host""#),
+            ("User", r#""nginx\nPrivateUsers=no""#),
+            ("StopSignal", r#""SIGTERM\nCapability=all""#),
+            ("Entrypoint", r#"["/bin/sh\nBind=/:/host"]"#),
+            ("Cmd", r#"["a", "b\n"]"#),
+            ("Env", r#"["A=1\nBind=/:/x"]"#),
+        ] {
+            let json = format!(
+                r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":[]}},"config":{{"{field}":{value}}}}}"#
+            );
+            let err = RunSpec::from_config(json.as_bytes()).unwrap_err();
+            assert!(
+                err.to_string().contains(field) && err.to_string().contains("control"),
+                "{field}: {err}"
+            );
+        }
+        let tab = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{"Cmd":["a	b"]}}"#;
+        assert!(
+            RunSpec::from_config(tab).is_err(),
+            "a tab is a control character too"
+        );
     }
 
     #[test]

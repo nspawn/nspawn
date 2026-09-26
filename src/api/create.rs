@@ -200,6 +200,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     }
     record.ports = ports;
     if let Some(entrypoint) = &request.entrypoint {
+        volume::reject_control_characters(entrypoint)?;
         record.entrypoint = Some(if entrypoint.is_empty() {
             Vec::new()
         } else {
@@ -207,6 +208,9 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         });
     }
     if !request.command.is_empty() {
+        for arg in &request.command {
+            volume::reject_control_characters(arg)?;
+        }
         record.cmd = Some(request.command.clone());
     }
     record.env = env;

@@ -450,6 +450,8 @@ fn tmpfs(text: &str) -> Result<String> {
     if !path.starts_with('/') || path == "/" || path.chars().any(char::is_whitespace) {
         bail!("--tmpfs {text}: an absolute path inside the machine, optionally :OPTIONS");
     }
+    // The options become part of a settings line.
+    reject_whitespace("--tmpfs", text)?;
     Ok(text.to_string())
 }
 
@@ -683,6 +685,7 @@ mod tests {
             ("workdir", "srv"),
             ("cap", "NET ADMIN"),
             ("tmpfs", "run"),
+            ("tmpfs", "/x:size=1m\nBind=/:/host"),
             ("device", "/etc/passwd:/x"),
             ("device", "/dev/null:/x:q"),
             ("dns", "10.0.0"),
