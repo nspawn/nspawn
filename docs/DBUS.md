@@ -91,7 +91,9 @@ error, so a typo never passes as a default. An integer option takes any
 unsigned type (`t`, `u`, `q` or `y`). Errors come back as
 `org.nspawn.Error.Failed` with the same message the command line prints.
 
-Properties: `Version`, `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
+Properties: `Version` (the command line compares it with its own version and
+warns when they differ, since the service keeps running the binary it started
+with), `Registry` (the hub), `Bridge`, `Subnet`, `Jobs` and
 `Processes` (`ao`: every job and every command still running, and the last
 hundred that ended; older ones are gone with their objects).
 

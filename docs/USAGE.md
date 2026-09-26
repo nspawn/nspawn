@@ -232,7 +232,11 @@ through polkit who may do what: `org.nspawn.inspect` for the commands that only 
 therefore works everywhere; to drive nspawn without a password, hand one of those
 actions to a group with a polkit rule, as in `nspawn-wheel.rules` in the documentation
 directory. Doing that makes the group administrators of the host, since a machine's
-commands run as root and any host path can be mounted into one.
+commands run as root and any host path can be mounted into one. The service keeps
+running the binary it started with: after an upgrade it is the old one until it goes
+idle (a minute without work) or is restarted, so a command whose version differs from
+the service's warns and says to run `sudo systemctl restart nspawn.service`; the rpm
+and the deb restart it on upgrade themselves.
 
 ### Signed images
 

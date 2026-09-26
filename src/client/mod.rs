@@ -286,6 +286,13 @@ impl Client {
         let manager = ManagerProxy::new(&connection)
             .await
             .context("reaching org.nspawn")?;
+        // The service keeps running the binary it started with: after an upgrade it is
+        // the old one until it goes idle or is restarted, and it would do the old thing
+        // without a word.
+        let service = manager.version().await.map_err(error)?;
+        if let Some(warning) = version_warning(&service, env!("CARGO_PKG_VERSION")) {
+            eprintln!("{warning}");
+        }
         Ok(Client {
             connection,
             manager,
@@ -521,6 +528,15 @@ impl Transfers {
     }
 }
 
+/// What to say when the service is not this command's version.
+pub fn version_warning(service: &str, client: &str) -> Option<String> {
+    (service != client).then(|| {
+        format!(
+            "warning: the nspawn service runs {service} and this command is {client}; restart it to match: sudo systemctl restart nspawn.service"
+        )
+    })
+}
+
 /// What the service's error reads like here: the message alone for the service's own
 /// errors, and a word of advice when the service is not there or refuses the caller.
 pub fn error(e: zbus::Error) -> anyhow::Error {
@@ -649,6 +665,18 @@ pub fn dash(text: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_service_of_another_version_is_pointed_out() {
+        assert_eq!(super::version_warning("1.5.1", "1.5.1"), None);
+        let warning = super::version_warning("1.4.0", "1.5.1").unwrap();
+        assert!(
+            warning
+                .starts_with("warning: the nspawn service runs 1.4.0 and this command is 1.5.1;"),
+            "{warning}"
+        );
+        assert!(warning.contains("systemctl restart nspawn.service"));
+    }
+
     use super::*;
     use crate::daemon::values::v;
 
