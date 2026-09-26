@@ -338,6 +338,7 @@ pub fn root_has(
 
 /// Where `relative` is on the host, for what looks into the machine's root ahead of
 /// its start: the assembled root, or the topmost layer of an mstack tree that has it.
+/// Symlinks on the way are followed inside the root (`chase`), never onto the host.
 pub fn root_path(
     store: &Store,
     name: &str,
@@ -361,14 +362,60 @@ pub fn root_path(
             layers
                 .into_iter()
                 .rev()
-                .map(|layer| layer.join(relative))
+                .filter_map(|layer| chase(&layer, Path::new(relative)))
                 .find(|path| path.symlink_metadata().is_ok())
         }
         BackendChoice::Overlay | BackendChoice::Flat | BackendChoice::Auto => {
-            let path = store.machines_dir.join(name).join(relative);
-            path.symlink_metadata().is_ok().then_some(path)
+            chase(&store.machines_dir.join(name), Path::new(relative))
+                .filter(|path| path.symlink_metadata().is_ok())
         }
     }
+}
+
+/// `relative` below `root` as the machine would see it: a symlink on the way is
+/// followed inside `root`, an absolute one from `root` itself, and `..` never climbs
+/// above it, as openat2's RESOLVE_IN_ROOT resolves. The last component is not followed.
+/// None when a component on the way is not a directory (nor a link to one), or the
+/// links loop. A path built from an image's own links must never reach the host: what
+/// is read or made there is the machine's, not the host's.
+pub fn chase(root: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut pending: Vec<std::ffi::OsString> =
+        relative.iter().rev().map(|c| c.to_os_string()).collect();
+    let mut current = root.to_path_buf();
+    let mut followed = 0;
+    while let Some(name) = pending.pop() {
+        if name == "." || name == "/" {
+            continue;
+        }
+        if name == ".." {
+            if current != root {
+                current.pop();
+            }
+            continue;
+        }
+        let next = current.join(&name);
+        if pending.is_empty() {
+            return Some(next);
+        }
+        match fs::symlink_metadata(&next) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                followed += 1;
+                if followed > 40 {
+                    return None;
+                }
+                let target = fs::read_link(&next).ok()?;
+                if target.is_absolute() {
+                    current = root.to_path_buf();
+                }
+                for part in target.iter().rev() {
+                    pending.push(part.to_os_string());
+                }
+            }
+            Ok(meta) if meta.is_dir() => current = next,
+            _ => return None,
+        }
+    }
+    Some(current)
 }
 
 /// Where `relative` is in the image itself, ahead of any run: the topmost layer that
@@ -396,7 +443,9 @@ pub fn image_path(
         return None;
     }
     for dir in dirs {
-        let path = dir.join(relative);
+        let Some(path) = chase(&dir, Path::new(relative)) else {
+            continue;
+        };
         let Ok(meta) = path.symlink_metadata() else {
             continue;
         };
@@ -449,25 +498,53 @@ fn resolves_to_run(target: &str, link: Option<&Path>) -> bool {
 }
 
 /// Makes the mount points of a read-only machine ahead of its start, below `root`: a
-/// directory, or a file when `dir` is false. What exists already stays as it is.
+/// directory, or a file when `dir` is false. What exists already stays as it is. The
+/// path is walked as the machine sees it (`chase`): a link of the image never has
+/// anything made on the host.
 pub fn ensure_mount_points(root: &Path, targets: &[(String, bool)]) -> Result<()> {
     for (target, dir) in targets {
         if target.split('/').any(|c| c == "..") || !target.starts_with('/') {
             bail!("{target}: a mount point is an absolute path inside the machine, without ..");
         }
-        let path = root.join(target.trim_start_matches('/'));
+        let relative = Path::new(target.trim_start_matches('/'));
+        let (parent, leaf) = match (relative.parent(), relative.file_name()) {
+            (Some(parent), Some(leaf)) => (parent, leaf),
+            _ => bail!("{target}: not a path inside the machine"),
+        };
+        // The parents first, each made where the machine would find it.
+        let mut made = PathBuf::new();
+        for component in parent.iter() {
+            made.push(component);
+            let Some(path) = chase(root, &made) else {
+                bail!(
+                    "{target}: {} of the image is not a directory",
+                    made.display()
+                );
+            };
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&path)
+                        .with_context(|| format!("creating {}", path.display()))?;
+                }
+                Err(e) => return Err(e).with_context(|| format!("inspecting {}", path.display())),
+            }
+        }
+        let Some(path) = chase(root, relative) else {
+            bail!(
+                "{target}: {} of the image is not a directory",
+                parent.display()
+            );
+        };
         if path.symlink_metadata().is_ok() {
             continue;
         }
         if *dir {
-            fs::create_dir_all(&path).with_context(|| format!("creating {}", path.display()))?;
+            fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?;
         } else {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("creating {}", parent.display()))?;
-            }
             fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
         }
+        let _ = leaf;
     }
     Ok(())
 }
@@ -569,6 +646,75 @@ pub fn is_mountpoint(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paths_are_chased_inside_the_root_never_onto_the_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(root.join("usr/lib/x")).unwrap();
+        fs::write(root.join("usr/lib/x/file"), "in").unwrap();
+        // A merged-usr image (lib -> usr/lib), an absolute link, and two that would
+        // leave the image on the host.
+        symlink("usr/lib", root.join("lib")).unwrap();
+        symlink("/usr/lib", root.join("etc")).unwrap();
+        symlink("/", root.join("out")).unwrap();
+        symlink("../../../..", root.join("up")).unwrap();
+        symlink("loop", root.join("loop")).unwrap();
+        let file = root.join("usr/lib/x/file");
+        assert_eq!(chase(&root, Path::new("lib/x/file")), Some(file.clone()));
+        assert_eq!(chase(&root, Path::new("etc/x/file")), Some(file.clone()));
+        assert_eq!(
+            chase(&root, Path::new("out/usr/lib/x/file")),
+            Some(file.clone()),
+            "an absolute link starts over at the root"
+        );
+        assert_eq!(
+            chase(&root, Path::new("up/usr/lib/x/file")),
+            Some(file),
+            ".. never climbs above the root"
+        );
+        assert_eq!(chase(&root, Path::new("loop/x")), None);
+        assert_eq!(chase(&root, Path::new("usr/lib/x/file/y")), None);
+        assert_eq!(chase(&root, Path::new("missing/x")), None);
+        // The last component is not followed.
+        assert_eq!(chase(&root, Path::new("out")), Some(root.join("out")));
+        assert_eq!(
+            chase(&root, Path::new("usr/./lib")),
+            Some(root.join("usr/lib"))
+        );
+    }
+
+    #[test]
+    fn mount_points_are_made_where_the_machine_sees_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(root.join("usr")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("run")).unwrap();
+        symlink("usr", root.join("opt")).unwrap();
+        ensure_mount_points(
+            &root,
+            &[
+                ("/opt/data".to_string(), true),
+                ("/new/dir/file".to_string(), false),
+                ("/usr".to_string(), true),
+            ],
+        )
+        .unwrap();
+        assert!(
+            root.join("usr/data").is_dir(),
+            "through the image's own link"
+        );
+        assert!(root.join("new/dir/file").is_file());
+        // A link to the host leads nowhere inside the image: nothing is made on the host.
+        let err =
+            ensure_mount_points(&root, &[("/run/secrets/token".to_string(), false)]).unwrap_err();
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        assert!(ensure_mount_points(&root, &[("/a/../b".to_string(), true)]).is_err());
+        assert!(ensure_mount_points(&root, &[("relative".to_string(), true)]).is_err());
+    }
 
     #[test]
     fn the_root_is_looked_at_where_nspawn_will_see_it() {
