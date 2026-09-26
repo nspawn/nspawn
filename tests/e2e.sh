@@ -880,8 +880,21 @@ stop_start=$(date +%s)
 out=$($NSPAWN stop $app 2>&1) || fail "stop with --stop-signal and --stop-timeout: $out"
 echo "$out" | grep_q "ignored SIGINT for 2 seconds" || fail "stop did not use --stop-signal and --stop-timeout: $out"
 [ $(( $(date +%s) - stop_start )) -le 8 ] || fail "stop took longer than --stop-timeout allows"
-out=$($NSPAWN start $app -u 1000:1000 2>&1) && fail "a user with a group was accepted"
-echo "$out" | grep_q "without a group" || fail "the refused user was not explained: $out"
+# USER:GROUP as docker takes it: the group is the primary one and the only one, a
+# number the image's group file does not list included; a name it lacks is refused.
+$NSPAWN start $app -u 1000:1000 -- /bin/sleep 300 >/dev/null || fail "start with -u UID:GID"
+pid=$(x 'cat /proc/1/task/1/children' | tr -d ' ')
+[ "$(x "awk '/^Uid:/ {print \$2} /^Gid:/ {print \$2}' /proc/$pid/status" | tr '\n' ' ')" = "1000 1000 " ] || fail "-u 1000:1000 not applied: $(x "grep -E '^(Uid|Gid|Groups):' /proc/$pid/status")"
+[ "$(x "awk '/^Groups:/ {print \$2}' /proc/$pid/status")" = 1000 ] || fail "-u UID:GID left other groups: $(x "grep ^Groups: /proc/$pid/status")"
+$NSPAWN stop $app >/dev/null || fail "stop after -u UID:GID"
+$NSPAWN start $app -u nobody:root -- /bin/sleep 300 >/dev/null || fail "start with -u NAME:GROUP"
+pid=$(x 'cat /proc/1/task/1/children' | tr -d ' ')
+[ "$(x "awk '/^Uid:/ {print \$2} /^Gid:/ {print \$2}' /proc/$pid/status" | tr '\n' ' ')" = "65534 0 " ] || fail "-u nobody:root not applied: $(x "grep -E '^(Uid|Gid):' /proc/$pid/status")"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['user'] == 'nobody:root', d" || fail "inspect does not show the user with its group"
+$NSPAWN stop $app >/dev/null || fail "stop after -u NAME:GROUP"
+out=$($NSPAWN start $app -u nobody:nosuch 2>&1) && fail "an unknown group was accepted"
+echo "$out" | grep_q "unable to find group nosuch" || fail "the unknown group was not explained: $out"
+out=$($NSPAWN start $app -u nobody: 2>&1) && fail "an empty group was accepted"
 out=$($NSPAWN start $app --sysctl kernel.shmmax=1 2>&1) && fail "a sysctl beyond net.* was accepted"
 # Everything back, and --privileged: the whole bounding set.
 $NSPAWN start $app --privileged --cap-drop none --cap-add none --read-only=false -u root -w / --tmpfs none --device none --dns none --dns-search none --add-host none --ulimit none --stop-signal "" --stop-timeout 10 --oom-score-adj 0 --sysctl none --hostname "" -- /bin/sleep 300 || fail "start with the flags taken back"

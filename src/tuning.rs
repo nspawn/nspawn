@@ -40,7 +40,7 @@ pub struct ExtraHost {
 pub struct Tuning {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
-    /// Overrides the image's user (a name or a uid).
+    /// Overrides the image's user: USER[:GROUP], each a name or a number of the image.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -287,10 +287,8 @@ impl Overrides {
             t.hostname = some_unless_empty(hostname);
         }
         if let Some(user) = &self.user {
-            if user.contains(':') {
-                bail!("--user {user}: systemd-nspawn takes a user name or a uid, without a group");
-            }
             reject_whitespace("--user", user)?;
+            validate_user(user)?;
             t.user = some_unless_empty(user);
         }
         if let Some(dir) = &self.working_dir {
@@ -387,6 +385,18 @@ impl Overrides {
             }
         }
         Ok(())
+    }
+}
+
+/// docker's USER[:GROUP]: neither side empty when the colon is there.
+fn validate_user(text: &str) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    match text.split(':').collect::<Vec<_>>().as_slice() {
+        [user] if !user.is_empty() => Ok(()),
+        [user, group] if !user.is_empty() && !group.is_empty() => Ok(()),
+        _ => bail!("--user {text}: USER or USER:GROUP, each a name or a number of the image"),
     }
 }
 
@@ -667,7 +677,9 @@ mod tests {
         for (field, value) in [
             ("hostname", "bad host"),
             ("hostname", "-x"),
-            ("user", "1000:1000"),
+            ("user", "1000:"),
+            ("user", ":1000"),
+            ("user", "a:b:c"),
             ("workdir", "srv"),
             ("cap", "NET ADMIN"),
             ("tmpfs", "run"),

@@ -417,8 +417,9 @@ pub struct TuningArgs {
     /// Hostname inside the machine (default: its name).
     #[arg(long, value_name = "NAME")]
     pub hostname: Option<String>,
-    /// User the program runs as (a name or a uid of the image), instead of the image's.
-    #[arg(long, short = 'u', value_name = "USER")]
+    /// User the program runs as, instead of the image's: USER or USER:GROUP, each a
+    /// name or a number of the image, as docker takes them.
+    #[arg(long, short = 'u', value_name = "USER[:GROUP]")]
     pub user: Option<String>,
     /// Working directory of the program, instead of the image's.
     #[arg(long, short = 'w', value_name = "DIR")]

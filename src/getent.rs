@@ -3,9 +3,10 @@
 //! systemd-nspawn resolves the user an app runs as (`User=`) by running `getent passwd`
 //! and `getent initgroups` inside the machine. busybox and static images have no
 //! getent, musl's (alpine) has no `initgroups`, and neither takes a uid the image's
-//! passwd does not list, which docker allows. So nspawn binds a shell script over the
-//! path systemd-nspawn looks at that answers those two from `/etc/passwd` and
-//! `/etc/group`, and hands anything else to the image's own getent, bound at
+//! passwd does not list, which docker allows, nor the group of docker's USER:GROUP.
+//! So nspawn binds a shell script over the path systemd-nspawn looks at that answers
+//! those two from `/etc/passwd` and `/etc/group`, with the group asked for as the
+//! primary and only one, and hands anything else to the image's own getent, bound at
 //! `/run/nspawn/getent` where the image has one.
 
 use std::fs;
@@ -22,26 +23,34 @@ use crate::store::{ImageRecord, Store};
 pub const REAL: &str = "/run/nspawn/getent";
 
 /// Answers `passwd KEY` and `initgroups KEY` by name or by uid; a uid the file does not
-/// list runs all the same, with gid 0 and no home, as docker has it. Nothing but shell
-/// builtins: systemd-nspawn runs it with an empty environment.
+/// list runs all the same, with gid 0 and no home, as docker has it, and a group asked
+/// for (`group=`, filled in by `script`) is the primary one and the only one. Nothing
+/// but shell builtins: systemd-nspawn runs it with an empty environment.
 pub const SCRIPT: &str = r#"#!/bin/sh
 # Written by nspawn: systemd-nspawn resolves the user an app runs as with getent, and
 # this answers passwd and initgroups from /etc/passwd and /etc/group, by name or by
 # uid, as docker reads them. Anything else goes to the image's own getent.
+# The gid of --user USER:GROUP; empty for the passwd entry's own group and the ones
+# /etc/group adds.
+group=''
 case "$1:$#" in
 passwd:2)
     while IFS=: read -r name pw uid gid rest; do
         if [ "$name" = "$2" ] || [ "$uid" = "$2" ]; then
-            printf '%s:%s:%s:%s:%s\n' "$name" "$pw" "$uid" "$gid" "$rest"
+            printf '%s:%s:%s:%s:%s\n' "$name" "$pw" "$uid" "${group:-$gid}" "$rest"
             exit 0
         fi
     done < /etc/passwd
     case "$2" in
     ''|*[!0-9]*) exit 2 ;;
     esac
-    printf '%s:x:%s:0::/:/bin/sh\n' "$2" "$2"
+    printf '%s:x:%s:%s::/:/bin/sh\n' "$2" "$2" "${group:-0}"
     ;;
 initgroups:2)
+    if [ -n "$group" ]; then
+        printf '%s %s\n' "$2" "$group"
+        exit 0
+    fi
     name=$2
     while IFS=: read -r n pw uid gid rest; do
         if [ "$n" = "$2" ] || [ "$uid" = "$2" ]; then
@@ -74,6 +83,10 @@ pub fn shim(store: &Store, name: &str, record: &ImageRecord) -> Result<Vec<Bind>
     let Some(user) = switches_to(record.effective_user()) else {
         return Ok(Vec::new());
     };
+    let group = match group_of(record.effective_user()) {
+        Some(group) => Some(resolve_group(store, name, record.backend, group)?),
+        None => None,
+    };
     let has = |path: &str| {
         crate::backend::root_has(store, name, record.backend, path, |m| {
             // A mount point made ahead of an earlier start is an empty file, not a
@@ -87,7 +100,7 @@ pub fn shim(store: &Store, name: &str, record: &ImageRecord) -> Result<Vec<Bind>
     let dir = store.machine_files_dir(name);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let mut binds = vec![Bind {
-        source: write(&dir)?,
+        source: write(&dir, group)?,
         target: placement.target.to_string(),
         read_only: true,
     }];
@@ -108,12 +121,55 @@ pub fn shim(store: &Store, name: &str, record: &ImageRecord) -> Result<Vec<Bind>
     Ok(binds)
 }
 
-/// The user systemd-nspawn switches to, if any: root and 0 are no switch, and the
-/// group of docker's "uid:gid" is not its concern.
+/// The user systemd-nspawn switches to, if any: root and 0 are no switch unless a group
+/// comes with them, which only the stand-in can hand over.
 fn switches_to(user: Option<&str>) -> Option<&str> {
     let user = user?;
-    let user = user.split_once(':').map_or(user, |(u, _)| u);
-    (!user.is_empty() && user != "root" && user != "0").then_some(user)
+    let (user, group) = match user.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (user, None),
+    };
+    if user.is_empty() || (group.is_none() && (user == "root" || user == "0")) {
+        return None;
+    }
+    Some(user)
+}
+
+/// The group of docker's USER:GROUP, when given.
+fn group_of(user: Option<&str>) -> Option<&str> {
+    user?
+        .split_once(':')
+        .map(|(_, g)| g)
+        .filter(|g| !g.is_empty())
+}
+
+/// The gid `group` stands for: itself when numeric, else the image's /etc/group entry
+/// of that name, refused as docker refuses it when there is none.
+fn resolve_group(store: &Store, name: &str, backend: BackendChoice, group: &str) -> Result<u32> {
+    if let Ok(gid) = group.parse::<u32>() {
+        return Ok(gid);
+    }
+    let text = crate::backend::root_path(store, name, backend, "etc/group")
+        .and_then(|path| fs::read_to_string(path).ok())
+        .unwrap_or_default();
+    gid_in(&text, group)
+        .with_context(|| format!("unable to find group {group}: no matching entries in group file"))
+}
+
+/// The gid of `group` in a group file's text.
+fn gid_in(text: &str, group: &str) -> Option<u32> {
+    text.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        (fields.next()? == group).then(|| fields.nth(1)?.parse().ok())?
+    })
+}
+
+/// The stand-in with the group filled in, when one was asked for.
+pub fn script(group: Option<u32>) -> String {
+    match group {
+        Some(gid) => SCRIPT.replacen("group=''", &format!("group='{gid}'"), 1),
+        None => SCRIPT.to_string(),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -147,9 +203,9 @@ fn target(name: &str, user: &str, has: impl Fn(&str) -> bool) -> Result<Option<P
     }))
 }
 
-fn write(dir: &Path) -> Result<PathBuf> {
+fn write(dir: &Path, group: Option<u32>) -> Result<PathBuf> {
     let path = dir.join("getent");
-    fs::write(&path, SCRIPT).with_context(|| format!("writing {}", path.display()))?;
+    fs::write(&path, script(group)).with_context(|| format!("writing {}", path.display()))?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
         .with_context(|| format!("making {} executable", path.display()))?;
     Ok(path)
@@ -165,9 +221,28 @@ mod tests {
         assert_eq!(switches_to(Some("")), None);
         assert_eq!(switches_to(Some("root")), None);
         assert_eq!(switches_to(Some("0")), None);
-        assert_eq!(switches_to(Some("0:0")), None);
         assert_eq!(switches_to(Some("nobody")), Some("nobody"));
         assert_eq!(switches_to(Some("1000:1000")), Some("1000"));
+        // A group for root goes through the stand-in too.
+        assert_eq!(switches_to(Some("0:0")), Some("0"));
+        assert_eq!(switches_to(Some("root:1000")), Some("root"));
+        assert_eq!(group_of(Some("root:1000")), Some("1000"));
+        assert_eq!(group_of(Some("nobody")), None);
+        assert_eq!(group_of(Some("nobody:")), None);
+    }
+
+    #[test]
+    fn the_group_is_read_from_the_image_or_taken_as_a_number() {
+        let text = "root:x:0:\nnogroup:x:65534:\nusers:x:100:alice,bob\nbroken\n";
+        assert_eq!(gid_in(text, "nogroup"), Some(65534));
+        assert_eq!(gid_in(text, "users"), Some(100));
+        assert_eq!(gid_in(text, "alice"), None);
+        assert_eq!(gid_in(text, "broken"), None);
+        assert_eq!(gid_in("", "root"), None);
+        assert!(script(None).contains("\ngroup=''\n"));
+        let filled = script(Some(65534));
+        assert!(filled.contains("\ngroup='65534'\n"));
+        assert!(!filled.contains("group=''"));
     }
 
     #[test]
@@ -212,8 +287,10 @@ mod tests {
     #[test]
     fn the_script_is_written_executable() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = write(tmp.path()).unwrap();
+        let path = write(tmp.path(), None).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), SCRIPT);
+        write(tmp.path(), Some(7)).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("group='7'"));
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o755

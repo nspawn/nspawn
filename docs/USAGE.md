@@ -103,10 +103,12 @@ go with it.
 ### The other flags of docker run
 
 The other flags of `docker run` are there too, remembered like the rest: `--hostname`,
-`-u/--user` and `-w/--workdir` (instead of the image's; the user is resolved from the
-image's passwd and group files by a stand-in for getent that nspawn binds, since
-busybox has no getent, musl's answers no initgroups and neither takes a uid the passwd
-does not list, as docker does), `--cap-add`, `--cap-drop` (`--cap-drop
+`-u/--user USER[:GROUP]` and `-w/--workdir` (instead of the image's; the user is
+resolved from the image's passwd and group files by a stand-in for getent that nspawn
+binds, since busybox has no getent, musl's answers no initgroups and neither takes a
+uid the passwd does not list, as docker does; a group, a name of the image's group
+file or a number, becomes the primary and only group, as with docker, and a name the
+image lacks is refused), `--cap-add`, `--cap-drop` (`--cap-drop
 ALL --cap-add NET_BIND_SERVICE` keeps that one, as with docker) and `--privileged`,
 `--read-only`, `--tmpfs PATH[:OPTIONS]`, `--shm-size`, `--device
 HOST[:CONTAINER[:rwm]]`, `--dns` and `--dns-search`, `--add-host HOST:IP` (with

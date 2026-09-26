@@ -141,8 +141,8 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
             {
                 out.push_str(&format!("WorkingDirectory={dir}\n"));
             }
-            // nspawn's User= takes a name or a uid; the gid of docker's "uid:gid" form has
-            // no counterpart and is left to the image's passwd.
+            // nspawn's User= takes a name or a uid and asks getent inside for the rest;
+            // the group of docker's USER:GROUP form is what nspawn's stand-in answers.
             if let Some(user) = s.tuning.user.as_deref().or(s.run.user.as_deref()) {
                 let user = user.split_once(':').map(|(u, _)| u).unwrap_or(user);
                 if !user.is_empty() {
