@@ -20,7 +20,7 @@ Name:           nspawn
 Version:        %{base_version}
 Release:        %{base_release}%{?dist}
 Summary:        Docker-like management of systemd-nspawn machines
-License:        GPL-3.0-or-later
+License:        MIT OR Apache-2.0
 URL:            https://github.com/nspawn/nspawn
 Source0:        %{name}-%{upstream_version}.tar.gz
 Source1:        %{name}-%{upstream_version}-vendor.tar.xz
@@ -129,7 +129,7 @@ fi
 %selinux_relabel_post -s %{selinuxtype}
 
 %files
-%license LICENSE
+%license LICENSE LICENSE-MIT LICENSE-APACHE
 %doc README.md docs/USAGE.md docs/ARCHITECTURE.md docs/DBUS.md packaging/polkit/nspawn-wheel.rules
 %{_bindir}/%{name}
 %{_unitdir}/%{name}.service

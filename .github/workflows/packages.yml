@@ -75,7 +75,7 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           mkdir -p dist/nspawn-${version}
-          cp target/release/nspawn README.md LICENSE dist/nspawn-${version}/
+          cp target/release/nspawn README.md LICENSE LICENSE-MIT LICENSE-APACHE dist/nspawn-${version}/
           tar -czf dist/nspawn-${version}-x86_64-linux.tar.gz -C dist nspawn-${version}
           rm -rf dist/nspawn-${version}
           cp ../*.deb dist/

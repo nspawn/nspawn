@@ -19,6 +19,12 @@
 - One logical change per commit. Fixups are squashed before merging.
 - No trailers, signatures or tool names.
 
+## License
+
+nspawn is offered under the MIT license or the Apache License 2.0, at the
+user's option (LICENSE-MIT, LICENSE-APACHE). By sending a change you offer it
+under both, without further terms, so that it can be included as it is.
+
 ## Style
 
 - Plain ASCII in code comments, documentation and messages. No emojis.
