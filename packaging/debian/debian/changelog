@@ -1,3 +1,10 @@
+nspawn (1.5.1-1) unstable; urgency=medium
+
+  * A command whose version differs from the service's warns and says how to restart it.
+  * rm and images rm refuse a name nothing is behind.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Sat, 26 Sep 2026 11:13:27 -0500
+
 nspawn (1.5.0-1) unstable; urgency=medium
 
   * Signatures of the hub's images are verified at pull; --no-verify skips it.

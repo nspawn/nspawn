@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 1.5.0
+%global upstream_version 1.5.1
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -148,6 +148,10 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Sat Sep 26 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.5.1-1
+- A command whose version differs from the service's warns and says how to restart it.
+- rm and images rm refuse a name nothing is behind.
+
 * Sat Sep 26 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.5.0-1
 - Signatures of the hub's images are verified at pull; --no-verify skips it.
 - A signature policy per registry in nspawn.toml.
