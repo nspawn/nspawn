@@ -106,13 +106,27 @@ pub fn systemd_major(version: &str) -> Option<u32> {
         .ok()
 }
 
+/// Whether the kernel has overlayfs: listed once its module is loaded, which a fresh
+/// boot has not done yet, so loading it is tried first when it is not.
 pub fn overlay_supported() -> bool {
-    fs::read_to_string("/proc/filesystems")
-        .map(|s| {
-            s.lines()
-                .any(|l| l.split_whitespace().last() == Some("overlay"))
-        })
-        .unwrap_or(false)
+    let listed = || {
+        fs::read_to_string("/proc/filesystems")
+            .map(|text| filesystem_listed(&text, "overlay"))
+            .unwrap_or(false)
+    };
+    if listed() {
+        return true;
+    }
+    let _ = std::process::Command::new("modprobe")
+        .args(["-q", "overlay"])
+        .status();
+    listed()
+}
+
+/// Whether /proc/filesystems names `name`.
+fn filesystem_listed(text: &str, name: &str) -> bool {
+    text.lines()
+        .any(|line| line.split_whitespace().last() == Some(name))
 }
 
 /// mstack images boot with managed user namespaces; the sockets are started on demand, so
