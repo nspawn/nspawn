@@ -194,21 +194,26 @@ pub async fn ensure_replaceable(
 /// Takes the unit of a machine that is gone off the boot list: a link left behind would
 /// start a unit with nothing to run at every boot. Best effort, said in a note: the
 /// removal is done by then, and machined allows image names systemd refuses as units.
-pub async fn take_off_boot(sd: &Systemd, name: &str, report: Report<'_>) {
+/// Whether there was a link to take.
+pub async fn take_off_boot(sd: &Systemd, name: &str, report: Report<'_>) -> bool {
     match sd
         .disable_unit(&format!("systemd-nspawn@{name}.service"))
         .await
     {
-        Ok(false) => {}
+        Ok(false) => false,
         Ok(true) => {
             if let Err(e) = sd.reload().await {
                 note(report, format!("note: {e:#}"));
             }
+            true
         }
-        Err(e) => note(
-            report,
-            format!("note: {name} is gone, but its unit may still be started at boot: {e:#}"),
-        ),
+        Err(e) => {
+            note(
+                report,
+                format!("note: {name} is gone, but its unit may still be started at boot: {e:#}"),
+            );
+            false
+        }
     }
 }
 

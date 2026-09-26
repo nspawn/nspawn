@@ -547,8 +547,9 @@ fn write_private(path: &Path, wanted: &str) -> Result<()> {
     written.with_context(|| format!("writing {}", path.display()))
 }
 
-pub fn remove(name: &str) {
-    let _ = fs::remove_file(path(name));
+/// Whether there was a file to remove.
+pub fn remove(name: &str) -> bool {
+    fs::remove_file(path(name)).is_ok()
 }
 
 /// Quotes an argument for config_parse_strv, where backslashes escape nothing and

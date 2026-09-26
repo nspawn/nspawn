@@ -256,8 +256,9 @@ impl Assembler<'_> {
     }
 
     /// Removes everything `assemble` created for `name`.
-    pub async fn remove(&self, name: &str, backend: BackendChoice) -> Result<()> {
-        match backend {
+    /// Removes what a backend made for `name`; whether anything was there to remove.
+    pub async fn remove(&self, name: &str, backend: BackendChoice) -> Result<bool> {
+        let mut found = match backend {
             BackendChoice::Overlay => {
                 let mountpoint = self.machine_dir(name);
                 let mp = mountpoint.to_string_lossy().to_string();
@@ -269,27 +270,29 @@ impl Assembler<'_> {
                         mountpoint.display()
                     );
                 }
-                let _ = fs::remove_file(Path::new(UNIT_DIR).join(&unit));
-                let _ = fs::remove_dir_all(self.store.machines_private_dir().join(name));
-                remove_dir_if_exists(&mountpoint)?;
+                let unit_file = fs::remove_file(Path::new(UNIT_DIR).join(&unit)).is_ok();
+                let private =
+                    fs::remove_dir_all(self.store.machines_private_dir().join(name)).is_ok();
+                remove_dir_if_exists(&mountpoint)? || unit_file || private
             }
             BackendChoice::Flat => remove_dir_if_exists(&self.machine_dir(name))?,
             BackendChoice::Mstack => remove_dir_if_exists(&self.mstack_dir(name))?,
             BackendChoice::Auto => bail!("image record for {name} has no concrete backend"),
-        }
+        };
         // Every backend gets the unit hooks, overlay also a mount dependency.
-        remove_dropins(name);
+        found |= remove_dropins(name);
         self.sd.reload().await?;
-        crate::settings::remove(name);
-        Ok(())
+        found |= crate::settings::remove(name);
+        Ok(found)
     }
 
     /// Best-effort removal of whatever any backend may have left for `name` when no
     /// record says which one made it: the overlay path also covers a flat directory
-    /// (same mount point) and refuses while something is still mounted there.
-    pub async fn remove_leftovers(&self, name: &str) -> Result<()> {
-        self.remove(name, BackendChoice::Overlay).await?;
-        remove_dir_if_exists(&self.mstack_dir(name))
+    /// (same mount point) and refuses while something is still mounted there. Whether
+    /// anything was there.
+    pub async fn remove_leftovers(&self, name: &str) -> Result<bool> {
+        let found = self.remove(name, BackendChoice::Overlay).await?;
+        Ok(remove_dir_if_exists(&self.mstack_dir(name))? || found)
     }
 }
 
@@ -557,19 +560,25 @@ pub fn dropin_dir(name: &str) -> PathBuf {
 pub const DROPINS: [&str; 2] = ["nspawn-overlay.conf", "nspawn-hooks.conf"];
 
 /// Removes nspawn's own drop-ins, and the directory when nothing else is left in it, so
-/// that an administrator's drop-ins survive.
-pub fn remove_dropins(name: &str) {
-    let dir = dropin_dir(name);
-    for file in DROPINS {
-        let _ = fs::remove_file(dir.join(file));
-    }
-    let _ = fs::remove_dir(&dir);
+/// that an administrator's drop-ins survive. Whether there was one to remove.
+pub fn remove_dropins(name: &str) -> bool {
+    remove_dropins_in(&dropin_dir(name))
 }
 
-fn remove_dir_if_exists(path: &Path) -> Result<()> {
+fn remove_dropins_in(dir: &Path) -> bool {
+    let mut found = false;
+    for file in DROPINS {
+        found |= fs::remove_file(dir.join(file)).is_ok();
+    }
+    let _ = fs::remove_dir(dir);
+    found
+}
+
+/// Whether the directory was there to remove.
+fn remove_dir_if_exists(path: &Path) -> Result<bool> {
     match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
     }
 }
@@ -645,6 +654,32 @@ pub fn is_mountpoint(path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn removals_say_whether_anything_was_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("machine");
+        assert!(!super::remove_dir_if_exists(&dir).unwrap());
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        assert!(super::remove_dir_if_exists(&dir).unwrap());
+        assert!(!dir.exists());
+        let dropins = tmp.path().join("systemd-nspawn@web.service.d");
+        assert!(!super::remove_dropins_in(&dropins), "nothing there");
+        std::fs::create_dir_all(&dropins).unwrap();
+        std::fs::write(dropins.join(super::DROPINS[1]), "[Service]\n").unwrap();
+        std::fs::write(dropins.join("50-admin.conf"), "[Service]\n").unwrap();
+        assert!(super::remove_dropins_in(&dropins));
+        assert!(
+            dropins.join("50-admin.conf").exists(),
+            "an administrator's drop-in survives, and so does the directory"
+        );
+        std::fs::remove_file(dropins.join("50-admin.conf")).unwrap();
+        assert!(
+            !super::remove_dropins_in(&dropins),
+            "ours were gone already"
+        );
+        assert!(!dropins.exists(), "an empty directory goes");
+    }
+
     use super::*;
 
     #[test]

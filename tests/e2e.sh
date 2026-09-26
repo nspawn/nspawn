@@ -1702,8 +1702,8 @@ if command -v busctl >/dev/null 2>&1; then
   [ "$($B call $M StartMachine 'sa{sv}' e2e-dbus 0)" = 'sas "started" 0' ] || fail "StartMachine"
   out=$($NSPAWN images rm e2e-nothing-$nonce e2e-dbus 2>&1); rc=$?
   [ "$rc" != 0 ] || fail "images rm of a running machine succeeded"
-  echo "$out" | grep_q "removed e2e-nothing-$nonce" || fail "images rm stopped at the first failure: $out"
-  echo "$out" | grep_q "machine e2e-dbus is running" || fail "images rm did not explain the failure: $out"
+  echo "$out" | grep_q "no machine or image named e2e-nothing-$nonce" || fail "images rm of a name nothing is behind was not refused: $out"
+  echo "$out" | grep_q "machine e2e-dbus is running" || fail "images rm stopped at the first failure: $out"
   $B call $M ListMachines b false > /tmp/e2e-lm.txt
   grep -q '"name" s "e2e-dbus"' /tmp/e2e-lm.txt || fail "ListMachines misses the machine"
   grep -q '"machine_path" s "/org/freedesktop/machine1/machine/e2e_2ddbus"' /tmp/e2e-lm.txt || fail "ListMachines has no machined path"
@@ -1853,6 +1853,11 @@ echo "$out"
 [ $rc -ne 0 ] || fail "start of an unknown image succeeded"
 echo "$out" | grep_q "no image named" || fail "start of an unknown image gave no hint"
 out=$($NSPAWN stop e2e-nonexistent 2>&1); [ $? -ne 0 ] && echo "$out" | grep_q "not running" || fail "stop of unknown machine"
+for cmd in rm "images rm"; do
+  out=$($NSPAWN $cmd e2e-nonexistent 2>&1); rc=$?
+  [ $rc -ne 0 ] || fail "$cmd of an unknown name succeeded: $out"
+  echo "$out" | grep_q "no machine or image named e2e-nonexistent" || fail "$cmd of an unknown name was not explained: $out"
+done
 # A name is joined to paths: one that climbs out of its directory reaches none of them.
 mkdir -p /tmp/e2e-sentinel/keep
 for cmd in "images rm" "rm" "rm -f" "stop" "inspect"; do

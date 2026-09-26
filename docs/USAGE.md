@@ -209,7 +209,10 @@ source's layers and gets a writable layer, an address, settings and ports of its
 (`-p`, `--network`); removing one never affects the others. A pulled image is a machine
 too, so `nspawn rm NAME` and `nspawn images rm NAME` remove the same thing: the record,
 the tree, the unit files and whatever layers nobody else uses. `rm --force` stops a
-running machine first (SIGKILL, like `docker rm -f`) where both refuse otherwise. `pull` with `--name`
+running machine first (SIGKILL, like `docker rm -f`) where both refuse otherwise. A
+name with nothing behind it (no record, no image machined knows, no leftovers of a
+failed install) is refused with `no machine or image named NAME`; the other names of
+the same command are still tried. `pull` with `--name`
 ends up the same way but resolves the manifest through the registry first.
 
 ### Completions, the man page and JSON

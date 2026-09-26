@@ -198,12 +198,17 @@ pub async fn remove_machines(
                     Ok(Some(rec.reference))
                 }
                 None => {
-                    // Not recorded: an image machined knows, or leftovers of ours.
-                    assembler.remove_leftovers(name).await?;
+                    // Not recorded: an image machined knows, or leftovers of ours. A name
+                    // with nothing at all behind it is a mistake worth hearing about.
+                    let mut found = assembler.remove_leftovers(name).await?;
                     if sd.list_images().await?.iter().any(|i| i.name == *name) {
                         sd.remove_image(name).await?;
+                        found = true;
                     }
-                    crate::install::take_off_boot(sd, name, report).await;
+                    found |= crate::install::take_off_boot(sd, name, report).await;
+                    if !found {
+                        bail!("no machine or image named {name}");
+                    }
                     Ok(None)
                 }
             }

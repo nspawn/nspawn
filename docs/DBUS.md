@@ -108,7 +108,7 @@ hundred that ended; older ones are gone with their objects).
 | `PushImage(s image, a{sv} options) -> o` | `push` | options to, registry, ca_cert; a job |
 | `BuildImage(s directory, s tag, a{sv} options) -> o` | `build` | options name, distribution, release, profile, backend, mode, force, keep_output, mkosi_args, registry, ca_cert; a job whose output includes mkosi's |
 | `RemoveMachines(as names, a{sv} options) -> o` | `rm` | `RemoveImages` with the option force, which stops a running machine first (SIGKILL) instead of refusing it |
-| `RemoveImages(as names) -> o` | `images rm` | a job: every name is tried, its result lists `removed`, and it fails at the end when one could not be removed |
+| `RemoveImages(as names) -> o` | `images rm` | a job: every name is tried, its result lists `removed`, and it fails at the end when one could not be removed; a name with nothing behind it fails with `no machine or image named NAME` |
 | `SearchImages(s term, s source, u limit, a{sv} options) -> (aa{sv}, as)` | `search` | source "", "hub" or "dockerhub"; the hits and the notes (a source that could not be reached); options registry, ca_cert |
 | `ListRepositories(s filter, b with_tags, a{sv} options) -> aa{sv}` | `hub ls` | options registry, ca_cert |
 | `ListTags(s repository, a{sv} options) -> as` | `hub tags` | options registry, ca_cert |
