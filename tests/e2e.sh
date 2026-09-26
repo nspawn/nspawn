@@ -73,7 +73,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot busybox-1.37 busybox-1.36; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side busybox-1.37 busybox-1.36; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -919,13 +919,23 @@ echo "$out" | grep_q "ignored SIGINT for 2 seconds" || fail "stop did not use --
 [ $(( $(date +%s) - stop_start )) -le 8 ] || fail "stop took longer than --stop-timeout allows"
 # USER:GROUP as docker takes it: the group is the primary one and the only one, a
 # number the image's group file does not list included; a name it lacks is refused.
+# The program comes after systemd-nspawn's getent runs, so its pid is waited for.
+program_pid() {
+  local p
+  for _ in $(seq 1 20); do
+    p=$(x 'for c in $(cat /proc/1/task/1/children); do [ "$(cat /proc/$c/comm 2>/dev/null)" = sleep ] && echo $c; done' | head -1)
+    [ -n "$p" ] && { echo "$p"; return 0; }
+    sleep 0.5
+  done
+  return 1
+}
 $NSPAWN start $app -u 1000:1000 -- /bin/sleep 300 >/dev/null || fail "start with -u UID:GID"
-pid=$(x 'cat /proc/1/task/1/children' | tr -d ' ')
+pid=$(program_pid) || fail "no program under the stub init after -u UID:GID: $(x 'ls /proc')"
 [ "$(x "awk '/^Uid:/ {print \$2} /^Gid:/ {print \$2}' /proc/$pid/status" | tr '\n' ' ')" = "1000 1000 " ] || fail "-u 1000:1000 not applied: $(x "grep -E '^(Uid|Gid|Groups):' /proc/$pid/status")"
 [ "$(x "awk '/^Groups:/ {print \$2}' /proc/$pid/status")" = 1000 ] || fail "-u UID:GID left other groups: $(x "grep ^Groups: /proc/$pid/status")"
 $NSPAWN stop $app >/dev/null || fail "stop after -u UID:GID"
 $NSPAWN start $app -u nobody:root -- /bin/sleep 300 >/dev/null || fail "start with -u NAME:GROUP"
-pid=$(x 'cat /proc/1/task/1/children' | tr -d ' ')
+pid=$(program_pid) || fail "no program under the stub init after -u NAME:GROUP: $(x 'ls /proc')"
 [ "$(x "awk '/^Uid:/ {print \$2} /^Gid:/ {print \$2}' /proc/$pid/status" | tr '\n' ' ')" = "65534 0 " ] || fail "-u nobody:root not applied: $(x "grep -E '^(Uid|Gid):' /proc/$pid/status")"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['user'] == 'nobody:root', d" || fail "inspect does not show the user with its group"
 $NSPAWN stop $app >/dev/null || fail "stop after -u NAME:GROUP"
@@ -1282,19 +1292,20 @@ ls /var/lib/nspawn/secrets/ | grep_q e2e-pw && fail "secret rm left files behind
 $NSPAWN events --since "-2min" --until now --filter type=secret | grep_q "secret create e2e-pw (size=7)" || fail "no event for the secret"
 $NSPAWN events --since "-2min" --until now --filter type=secret --filter event=remove | grep_q "secret remove e2e-pw (size=7)" || fail "secret remove carries no metadata: $($NSPAWN events --since -2min --until now --filter type=secret | tail -3)"
 
-step "everything at once: the features of 1.3.0 combined, on an app and on a booted machine"
+step "everything at once: the features of 1.3.0 and 1.4.0 combined, on an app, a sidecar and a booted machine"
 $NSPAWN network create e2e-nd --label tier=mix >/dev/null || fail "network create e2e-nd"
 $NSPAWN network create e2e-ne --internal >/dev/null || fail "network create e2e-ne"
 printf 'mix-secret' | $NSPAWN secret create e2e-pw >/dev/null || fail "secret create for the mix"
 mix_since=$(date +%s)
 mix_host_ip=$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i <= NF; i++) if ($i == "src") print $(i + 1); exit}')
 addr_on() { $NSPAWN inspect "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['addresses'].get('$2', ''))"; }
-# The app: two networks with aliases, a port on loopback, a healthcheck, a secret, a
-# read-only root with a tmpfs it writes, a user that binds port 80 through a sysctl, a
-# hostname, a stop signal and a restart policy, all on one machine.
+# The app: two networks with aliases, two ports on loopback (the second for the sidecar
+# below), a healthcheck, a secret, a read-only root with a tmpfs it writes, a user with a
+# group that binds port 80 through a sysctl, a hostname, a stop signal and a restart
+# policy, all on one machine.
 $NSPAWN create $app e2e-mix-app --network e2e-nd --network e2e-ne --network-alias mixweb --network-alias e2e-ne=inner \
-  -p 127.0.0.1:18095:80 --health-cmd "wget -qO- http://127.0.0.1/ >/dev/null" --health-interval 1s --health-retries 2 \
-  --secret e2e-pw:/run/secrets/token:0444 --read-only --tmpfs /www:size=8m,mode=1777 -u nobody \
+  -p 127.0.0.1:18095:80 -p 127.0.0.1:18097:8080 --health-cmd "wget -qO- http://127.0.0.1/ >/dev/null" --health-interval 1s --health-retries 2 \
+  --secret e2e-pw:/run/secrets/token:0444 --read-only --tmpfs /www:size=8m,mode=1777 -u nobody:root \
   --sysctl net.ipv4.ip_unprivileged_port_start=0 --hostname mix-$nonce --add-host peer:10.1.1.9 \
   --stop-signal SIGINT --stop-timeout 2 --restart on-failure -l role=mix \
   -- /bin/sh -c 'cat /run/secrets/token > /www/index.html; exec /bin/httpd -f -p 80 -h /www' >/dev/null || fail "create the mixed app"
@@ -1314,9 +1325,25 @@ $NSPAWN inspect e2e-mix-app | python3 -c "
 import json, sys
 d = json.load(sys.stdin)[0]
 assert d['networks'] == ['e2e-nd', 'e2e-ne'] and d['aliases'] == ['e2e-nd=mixweb', 'e2e-ne=inner'], (d['networks'], d['aliases'])
-assert d['ports'] == ['127.0.0.1:18095->80/tcp'] and d['secrets'] == ['e2e-pw:/run/secrets/token:0444:0:0'], (d['ports'], d['secrets'])
-assert d['user'] == 'nobody' and d['read_only'] and d['restart'] == 'on-failure' and d['labels']['role'] == 'mix', d
+assert d['ports'] == ['127.0.0.1:18095->80/tcp', '127.0.0.1:18097->8080/tcp'] and d['secrets'] == ['e2e-pw:/run/secrets/token:0444:0:0'], (d['ports'], d['secrets'])
+assert d['user'] == 'nobody:root' and d['read_only'] and d['restart'] == 'on-failure' and d['labels']['role'] == 'mix', d
 assert d['health'] == 'healthy' and d['healthcheck']['retries'] == 2, (d['health'], d['healthcheck'])" || fail "inspect of the mixed app"
+[ "$(mx 'p=$(pidof httpd); awk "/^Uid:/ {print \$2} /^Gid:/ {print \$2}" /proc/$p/status' | tr '\n' ' ')" = "65534 0 " ] || fail "-u nobody:root is not what httpd runs as: $(mx 'p=$(pidof httpd); grep -E "^(Uid|Gid):" /proc/$p/status')"
+# A sidecar in the app's network, with a user and group, a read-only root and a tmpfs:
+# its port comes out through the app's second published port, it reads the app's hosts
+# file, and it has nothing of its own on the host.
+$NSPAWN create $app e2e-mix-side --network container:e2e-mix-app -u 65534:65534 --read-only --tmpfs /www2:size=4m,mode=1777 -l role=mix \
+  -- /bin/sh -c "echo side-$nonce > /www2/index.html; exec /bin/httpd -f -p 8080 -h /www2" >/dev/null || fail "create the mixed sidecar"
+$NSPAWN start e2e-mix-side >/dev/null || fail "start the mixed sidecar"
+ms() { $NSPAWN exec e2e-mix-side -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
+retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18097/ | grep_q side-$nonce" || fail "the sidecar's port does not come out through the app's published port: $(curl -s -m 2 http://127.0.0.1:18097/)"
+[ "$(ms 'ip -4 -o addr show host0' | grep -c " $app_nd/")" = 1 ] || fail "the sidecar does not have the app's address: $(ms 'ip -4 -o addr show')"
+ms 'cat /etc/hosts' | grep_q "^10.1.1.9 peer$" || fail "the sidecar does not read the app's hosts file: $(ms 'cat /etc/hosts')"
+[ "$(ms 'p=$(pidof httpd); awk "/^Uid:/ {print \$2} /^Gid:/ {print \$2}" /proc/$p/status' | tr '\n' ' ')" = "65534 65534 " ] || fail "the sidecar's httpd does not run as 65534:65534: $(ms 'p=$(pidof httpd); grep -E "^(Uid|Gid):" /proc/$p/status')"
+[ "$(ms 'touch /x 2>/dev/null && echo RW || echo RO')" = RO ] || fail "the sidecar's root is writable"
+ip -o link show | grep_q "vb-e2e-mix-side" && fail "the sidecar got a veth of its own"
+[ "$(addr_on e2e-mix-side e2e-nd)" = "" ] || fail "the sidecar got an address of its own"
+$NSPAWN ps | grep "^ *e2e-mix-side " | grep_q " container:e2e-mix-app " || fail "ps does not show the sidecar's network: $($NSPAWN ps | grep e2e-mix-side)"
 # The booted machine: the same networks with an alias, a healthcheck on its systemd, the
 # secret, a hostname, a tmpfs and a capability dropped.
 $NSPAWN pull "$IMAGE" --name e2e-mix-boot --backend overlay --force >/dev/null || fail "pull e2e-mix-boot"
@@ -1335,6 +1362,7 @@ mb 'getent hosts mixweb' | grep_q "$app_nd" || fail "the booted machine does not
 mb 'getent hosts inner' | grep_q "$app_ne" || fail "the booted machine does not resolve the app's alias on e2e-ne: $(mb 'getent hosts inner')"
 $NSPAWN exec e2e-mix-boot -- bash -c 'exec 3<>/dev/tcp/mixweb/80; printf "GET / HTTP/1.0\r\n\r\n" >&3; cat <&3' </dev/null | tr -d '\r' | grep_q mix-secret || fail "the booted machine does not reach the app by its alias"
 $NSPAWN exec e2e-mix-boot -- bash -c 'exec 3<>/dev/tcp/inner/80; printf "GET / HTTP/1.0\r\n\r\n" >&3; cat <&3' </dev/null | tr -d '\r' | grep_q mix-secret || fail "the booted machine does not reach the app through the internal network"
+$NSPAWN exec e2e-mix-boot -- bash -c 'exec 3<>/dev/tcp/mixweb/8080; printf "GET / HTTP/1.0\r\n\r\n" >&3; cat <&3' </dev/null | tr -d '\r' | grep_q side-$nonce || fail "the booted machine does not reach the sidecar through the app's alias"
 mx 'cat /etc/hosts' | grep_q " mixboot" || fail "the app's hosts file misses the booted machine's alias: $(mx 'cat /etc/hosts')"
 retry 5 bash -c "$NSPAWN exec e2e-mix-app -- ping -c 1 -W 2 mixboot </dev/null >/dev/null 2>&1" || fail "the app does not reach the booted machine by its alias"
 # Operations on top of it all: pause, an update of the healthcheck, restart, top, exec
@@ -1349,6 +1377,11 @@ $NSPAWN restart e2e-mix-app -t 2 | grep_q "restarted e2e-mix-app" || fail "resta
 retry 10 bash -c "$NSPAWN ps | grep '^ *e2e-mix-app ' | grep_q '(healthy)'" || fail "the mixed app is not healthy after restart: $($NSPAWN ps | grep e2e-mix-app)"
 retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18095/ | grep_q mix-secret" || fail "the port does not answer after restart"
 [ "$(addr_on e2e-mix-app e2e-nd)" = "$app_nd" ] || fail "the address on e2e-nd changed across restart"
+# The sidecar kept the namespace the app left, as with docker: its port is silent until
+# it restarts too.
+curl -sf -m 2 http://127.0.0.1:18097/ >/dev/null 2>&1 && fail "the sidecar answered from the app's old namespace after the app's restart"
+$NSPAWN restart e2e-mix-side >/dev/null || fail "restart the sidecar after the app"
+retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18097/ | grep_q side-$nonce" || fail "the sidecar's port does not come back after its restart"
 $NSPAWN top e2e-mix-app | grep_q "httpd" || fail "top does not list httpd: $($NSPAWN top e2e-mix-app)"
 [ "$($NSPAWN exec e2e-mix-app -u nobody -w /www -T -- /bin/sh -c 'pwd; id -u' </dev/null | tr -d '\r' | tr '\n' ' ')" = "/www 65534 " ] || fail "exec -u -w -T in the mixed app: $($NSPAWN exec e2e-mix-app -u nobody -w /www -T -- /bin/sh -c 'pwd; id -u' </dev/null)"
 $NSPAWN logs e2e-mix-app e2e-mix-boot --until now > /tmp/e2e-mixlogs.txt 2>&1 || fail "logs of both mixed machines"
@@ -1368,6 +1401,11 @@ retry 30 bash -c "$NSPAWN ps | grep '^ *e2e-mix-boot ' | grep_q '(healthy)'" || 
 $NSPAWN events --since "@$mix_since" --until now --filter name=e2e-mix-app --filter event=health_status | grep_q "status=healthy" || fail "no health_status event for the mixed app"
 $NSPAWN stop e2e-mix-boot >/dev/null || fail "stop the mixed booted machine"
 out=$($NSPAWN secret rm e2e-pw 2>&1) && fail "the secret was removed while the mixed machines take it"
+out=$($NSPAWN rm e2e-mix-app 2>&1) && fail "the app was removed while the sidecar takes its network"
+echo "$out" | grep_q "network of e2e-mix-side" || fail "the refused rm of the app was not explained: $out"
+$NSPAWN stop e2e-mix-side >/dev/null || fail "stop the sidecar"
+ip netns list | grep_q -E "^nspawn-e2e-mix-side( |$)" && fail "the sidecar's namespace name was left behind"
+$NSPAWN rm e2e-mix-side >/dev/null || fail "rm the sidecar"
 $NSPAWN rm e2e-mix-app e2e-mix-boot >/dev/null || fail "rm the mixed machines"
 $NSPAWN secret rm e2e-pw >/dev/null || fail "secret rm once the mixed machines are gone"
 $NSPAWN network rm e2e-nd e2e-ne >/dev/null || fail "network rm of the mix networks"
