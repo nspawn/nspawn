@@ -146,6 +146,9 @@ if [ "$systemd_major" -ge 261 ] 2>/dev/null \
   mstack_supported=yes
 fi
 step "the default backend is overlay, whatever the host; mstack only by name"
+# As on a host that booted a moment ago: the module is not loaded (where it is a
+# module at all), and the service has to load it itself.
+rmmod overlay 2>/dev/null || true
 $NSPAWN pull "$IMAGE" --name e2e-auto --force > /tmp/e2e-auto.txt 2>&1 || { cat /tmp/e2e-auto.txt; fail "pull without --backend"; }
 $NSPAWN images ls | grep "^ *e2e-auto " | grep_q " overlay " || fail "auto did not choose overlay: $($NSPAWN images ls | grep e2e-auto)"
 grep -q "experimental" /tmp/e2e-auto.txt && fail "a pull without mstack was told mstack is experimental"

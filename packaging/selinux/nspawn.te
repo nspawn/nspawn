@@ -130,6 +130,11 @@ sysnet_dns_name_resolve(nspawn_t)
 sysnet_read_config(nspawn_t)
 miscfiles_read_generic_certs(nspawn_t)
 
+# The overlay module is loaded on demand: on a host that has not mounted one
+# since it booted, the choice of the default backend runs modprobe, in kmod's
+# own domain, which may load modules.
+modutils_domtrans_kmod(nspawn_t)
+
 # The bridge: ip, nft and iptables in their own domains, the forwarding
 # sysctls, the network namespaces prepared for apps.
 sysnet_domtrans_ifconfig(nspawn_t)

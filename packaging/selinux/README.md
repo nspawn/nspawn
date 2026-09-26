@@ -24,7 +24,7 @@ What the domain covers: the store and configuration (`nspawn_var_lib_t`,
 `nspawn_etc_t`), the machines' trees and units, the bus (its own name, the
 descriptors it hands over, systemd, machined, firewalld and polkit), registries
 over TLS, the bridge through ip, nft and iptables in their domains, the
-journal through journalctl, and the machines' namespaces. A command run inside
+overlay module through kmod, the journal through journalctl, and the machines' namespaces. A command run inside
 a machine takes the machine's own context (`unconfined_service_t` on Fedora,
 what systemd-nspawn@.service runs as), entered through the files of the
 machine's tree; mkosi runs unconfined, as it does from a shell. It was written
