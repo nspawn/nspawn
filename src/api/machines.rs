@@ -897,19 +897,22 @@ pub async fn processes(ctx: &Context, name: &str) -> Result<Vec<Process>> {
     let mut pids = Vec::new();
     // systemd-nspawn keeps itself in supervisor/ and the machine in payload/, which it
     // makes a moment after the machine registers: right after a restart the old tree may
-    // still be going while the new one is not there yet. Without that split (another
-    // supervisor), what is in the machine's PID namespace is its, and never what is in
-    // the host's.
+    // still be going while the new one is not there yet, and for a moment more payload/
+    // holds nspawn's own child, until it has become the machine's init. Without that
+    // split (another supervisor), what is in the machine's PID namespace is its, and
+    // never what is in the host's.
     let payload = unit_cgroup.join("payload");
     for _ in 0..20 {
         if payload.is_dir() {
-            break;
+            cgroup_pids(&payload, &mut pids);
+            pids.retain(|pid| comm(*pid).as_deref() != Some("systemd-nspawn"));
+            if !pids.is_empty() {
+                break;
+            }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    if payload.is_dir() {
-        cgroup_pids(&payload, &mut pids);
-    } else {
+    if !payload.is_dir() {
         let host = std::fs::read_link("/proc/self/ns/pid").ok();
         let inside = std::fs::read_link(format!("/proc/{leader}/ns/pid")).ok();
         cgroup_pids(&unit_cgroup, &mut pids);
@@ -926,6 +929,13 @@ pub async fn processes(ctx: &Context, name: &str) -> Result<Vec<Process>> {
         .into_iter()
         .filter_map(|pid| read_process(pid, shift))
         .collect())
+}
+
+/// The command name of a process, as /proc has it.
+fn comm(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|c| c.trim().to_string())
 }
 
 /// The PIDs of a cgroup and everything below it, where a booted machine's systemd

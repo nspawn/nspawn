@@ -1204,7 +1204,8 @@ $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0];
 $NSPAWN unpause $app || fail "unpause"
 [ "$(systemctl show -p FreezerState --value systemd-nspawn@$app.service)" = running ] || fail "the unit is still frozen after unpause"
 $NSPAWN ps | grep "^ *$app " | grep_q " running " || fail "ps does not show the machine running after unpause"
-$NSPAWN top $app | tee /tmp/e2e-top.txt | grep_q "/bin/sleep 300" || fail "top does not list the program: $(cat /tmp/e2e-top.txt)"
+# The program comes a moment after the machine's init, which top waits for.
+retry 10 bash -c "$NSPAWN top $app > /tmp/e2e-top.txt && grep -q '/bin/sleep 300' /tmp/e2e-top.txt" || fail "top does not list the program: $(cat /tmp/e2e-top.txt)"
 grep -q "systemd-nspawn" /tmp/e2e-top.txt && fail "top lists systemd-nspawn itself"
 grep -q "^ *PID " /tmp/e2e-top.txt || fail "top has no header"
 $NSPAWN pause $app >/dev/null && $NSPAWN stop $app -t 2 | grep_q "stopped $app" || fail "stop of a paused machine"
