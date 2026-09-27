@@ -43,7 +43,9 @@ allow nspawn_t self:capability { chown dac_override dac_read_search fowner fseti
 # The same inside a machine's user namespace, where the exec helper works. setpcap
 # narrows the command's bounding set to the machine's.
 allow nspawn_t self:cap_userns { chown dac_override dac_read_search fowner fsetid kill setgid setpcap setuid sys_admin sys_chroot sys_ptrace };
-allow nspawn_t self:process { fork getcap setcap setexec setrlimit setsched signal_perms };
+# setpgid: a command run in a machine gets a process group of its own, so that a
+# health probe past its timeout ends with what it forked.
+allow nspawn_t self:process { fork getcap setcap setexec setpgid setrlimit setsched signal_perms };
 allow nspawn_t self:fifo_file rw_fifo_file_perms;
 allow nspawn_t self:unix_stream_socket create_stream_socket_perms;
 allow nspawn_t self:unix_dgram_socket create_socket_perms;
@@ -187,6 +189,9 @@ domain_read_all_domains_state(nspawn_t)
 kernel_read_network_state(nspawn_t)
 domain_getattr_all_domains(nspawn_t)
 fs_read_nsfs_files(nspawn_t)
+# cp reads the kind of file system of every path it walks, to leave the kernel's
+# out.
+fs_getattr_all_fs(nspawn_t)
 fs_rw_cgroup_files(nspawn_t)
 kernel_read_system_state(nspawn_t)
 selinux_get_enforce_mode(nspawn_t)

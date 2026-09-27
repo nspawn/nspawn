@@ -72,9 +72,10 @@ the rpm, deb or Arch package), the suite leaves the package's service, bus and
 polkit files alone and tests them as shipped: a drop-in in
 `/etc/systemd/system/nspawn.service.d/` hands the service the configuration,
 and goes again at the end. That is the run that matters before a release, on
-every distribution of the matrix, and on Fedora `ausearch` has nothing to say
-about `nspawn_t` afterwards (read `/var/log/audit/audit.log` directly where
-`ausearch -ts` trips over the locale's date format).
+every distribution of the matrix. With SELinux enforcing, the suite reads
+`/var/log/audit/audit.log` at the end and fails on any denial of `nspawn_t`
+since it started, grouped by permission, process and target, so a policy that
+lags behind the code shows up as a FAIL line.
 
 The suite cleans up before and after itself and ends with `ALL OK` or a
 failure count. Every FAIL line names the check. It runs from wherever it sits,
