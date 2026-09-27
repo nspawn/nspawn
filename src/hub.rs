@@ -318,9 +318,21 @@ impl Hub {
             total,
             PROGRESS_INTERVAL,
         );
+        // The manifest, checked against its digest, says how large the layer is: a
+        // registry that keeps sending past that would fill the disk before the digest
+        // check ever ran.
+        let declared = u64::try_from(layer.size).unwrap_or(0);
+        let mut written = 0u64;
         let transfer = async {
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.with_context(|| format!("downloading layer {}", layer.digest))?;
+                written += chunk.len() as u64;
+                if declared > 0 && written > declared {
+                    bail!(
+                        "layer {} is larger than the {declared} bytes its manifest declares",
+                        layer.digest
+                    );
+                }
                 hasher.update(&chunk);
                 file.write_all(&chunk)
                     .await
@@ -416,10 +428,11 @@ pub fn part_path(dest: &Path) -> PathBuf {
     dest.with_file_name(format!(".part-{name}.{}", crate::store::unique_suffix()))
 }
 
-/// Whether another page must be asked for: a full page that moved the cursor. A registry
-/// that ignores `n` and `last` would otherwise be asked forever.
+/// Whether another page must be asked for: a page with something on it that moved the
+/// cursor. A registry that ignores `last` would otherwise be asked forever; one that
+/// caps its pages below what `n` asks is followed to its end.
 pub fn more_pages(page_len: usize, page_last: Option<&str>, previous: Option<&str>) -> bool {
-    page_len >= 100 && page_last.is_some() && page_last != previous
+    page_len > 0 && page_last.is_some() && page_last != previous
 }
 
 #[cfg(test)]
@@ -430,7 +443,11 @@ mod pagination_tests {
     fn pagination_stops_on_short_or_repeated_pages() {
         assert!(more_pages(100, Some("z"), None));
         assert!(more_pages(100, Some("z"), Some("m")));
-        assert!(!more_pages(99, Some("z"), None));
+        assert!(
+            more_pages(50, Some("z"), Some("m")),
+            "a registry with smaller pages than asked is followed"
+        );
+        assert!(!more_pages(0, None, Some("z")), "an empty page is the end");
         assert!(
             !more_pages(100, Some("z"), Some("z")),
             "the cursor did not move"
