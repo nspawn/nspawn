@@ -20,8 +20,8 @@ exit code, or 128 plus the signal it died of. Ctrl-C, SIGTERM, SIGHUP and SIGQUI
 the program; a third Ctrl-C within a second leaves it running and returns. `-i` gives the
 program this standard input, `-t` a terminal (`-it` for a shell), `--rm` removes the
 machine once it ends (named volumes stay; an image it had to pull is kept under its own
-name, as docker keeps images, and the machine gets a name of its own unless `--name`
-says one), and `-d` starts it in the background and
+name when that name is free, as docker keeps images, and the machine gets a name of its
+own unless `--name` says one), and `-d` starts it in the background and
 returns. A booted image shows its console until it powers off
 (Ctrl-C powers it off); `run -it` on one waits for its boot, opens a root shell and powers
 the machine off when the shell ends, with the shell's exit code. Closing the terminal of
@@ -120,8 +120,9 @@ and SYS_BOOT for an app on a bridge network, which runs without a user namespace
 systemd-nspawn's for a machine in one; `--cap-drop ALL --cap-add NET_BIND_SERVICE` keeps that one, as
 with docker) and `--privileged`,
 `--read-only`, `--tmpfs PATH[:OPTIONS]`, `--shm-size`, `--device
-HOST[:CONTAINER[:rwm]]`, `--dns` and `--dns-search`, `--add-host HOST:IP` (with
-`host-gateway`), `--ulimit NAME=SOFT[:HARD]`, `--oom-score-adj`, `--stop-signal` and
+HOST[:CONTAINER[:rwm]]` (a node, or a directory such as `/dev/dri`, whose nodes are
+allowed one by one), `--dns` and `--dns-search`, `--add-host HOST:IP` or `HOST=IP` (with
+`host-gateway`; the second form for IPv6 addresses), `--ulimit NAME=SOFT[:HARD]`, `--oom-score-adj`, `--stop-signal` and
 `--stop-timeout` (what `stop` uses unless `-t` says otherwise), `--init` (accepted; the
 stub init reaps anyway), `--sysctl` (`net.*` keys, set in an app machine's network
 namespace) and `--interface IFACE`, which has no docker counterpart: a network
@@ -162,7 +163,11 @@ there too, and so is what happened while nobody watched.
 
 `exec` enters the machine's namespaces for both kinds of machine, like docker exec: the
 exit code comes back, the image's environment applies and nothing is needed inside (no
-D-Bus, no PAM); `shell` opens machined's login session on booted machines and a plain
+D-Bus, no PAM). It attaches a terminal when standard input and output are one (`-t` and
+`-T` decide otherwise), so redirected output is byte-exact, and `-u USER[:GROUP]` takes
+names or numbers of the image's passwd and group files, with the home of the passwd
+entry and the user's supplementary groups unless a group is given, which is then the
+only one. `shell` opens machined's login session on booted machines and a plain
 shell on apps. `stop` sends the image's stop signal to the program of an app machine and
 SIGKILLs it after `--timeout` seconds, or asks a booted machine to power off; `--force`
 kills at once. `restart` is a stop and a start with the remembered options, `pause` and
