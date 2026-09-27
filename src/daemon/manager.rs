@@ -319,8 +319,8 @@ impl Manager {
     /// Local images, like `images ls`: name, kind, backend, origin, reference, size,
     /// read_only.
     async fn list_images(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Vec<Dict>> {
-        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
         let images = api::images::list(self.ctx()).await?;
         Ok(images.iter().map(values::image).collect())
     }
@@ -329,8 +329,8 @@ impl Manager {
     /// network, networks, address, addresses, aliases, ports, volumes, env, entrypoint,
     /// cmd, command, and the OCI config's image_env, working_dir, user and stop_signal.
     async fn get_image(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<Dict> {
-        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
         let record = self
             .ctx()
             .store
@@ -348,8 +348,8 @@ impl Manager {
         reference: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<OwnedObjectPath> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
         let request = api::pull::PullRequest {
@@ -402,8 +402,8 @@ impl Manager {
         name: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<OwnedObjectPath> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
         let request = api::create::CreateRequest {
@@ -459,8 +459,8 @@ impl Manager {
         image: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<OwnedObjectPath> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
         let request = api::push::PushRequest {
@@ -496,8 +496,8 @@ impl Manager {
         tag: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<OwnedObjectPath> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
         let request = api::build::BuildRequest {
@@ -553,8 +553,8 @@ impl Manager {
         #[zbus(header)] hdr: Header<'_>,
         names: Vec<String>,
     ) -> Result<OwnedObjectPath> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let state = self.state.clone();
         let target = names.join(" ");
         Ok(jobs::spawn(
@@ -590,8 +590,8 @@ impl Manager {
         names: Vec<String>,
         options: HashMap<String, OwnedValue>,
     ) -> Result<OwnedObjectPath> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let force = options.bool("force", false)?;
         options.finish()?;
@@ -634,8 +634,8 @@ impl Manager {
         path: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(zbus::zvariant::OwnedFd, OwnedObjectPath)> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         Options::new(&options).finish()?;
         let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
             .map_err(|e| Error::Failed(format!("creating a pipe: {e}")))?;
@@ -668,8 +668,8 @@ impl Manager {
         stream: zbus::zvariant::OwnedFd,
         options: HashMap<String, OwnedValue>,
     ) -> Result<OwnedObjectPath> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let contents = options.bool("contents", false)?;
         options.finish()?;
@@ -700,8 +700,8 @@ impl Manager {
     /// Like `volume ls`: every named volume with name, path, used_by (the machines whose
     /// records mount it) and created (unix seconds).
     async fn list_volumes(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Vec<Dict>> {
-        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
         let volumes = api::volumes::list(&self.ctx().store)?;
         Ok(volumes.iter().map(values::volume).collect())
     }
@@ -709,8 +709,8 @@ impl Manager {
     /// Like `volume create`: makes the volume's directory ahead of its first use and
     /// returns its path. One that exists already is not an error.
     async fn create_volume(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<String> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let path = api::volumes::create(self.ctx(), &name).await?;
         Ok(path.to_string_lossy().into_owned())
     }
@@ -723,8 +723,8 @@ impl Manager {
         #[zbus(header)] hdr: Header<'_>,
         names: Vec<String>,
     ) -> Result<OwnedObjectPath> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let target = names.join(" ");
         Ok(jobs::spawn(
             &self.state,
@@ -749,8 +749,8 @@ impl Manager {
     /// Like `volume prune`: a job removing every volume no machine uses; its result lists
     /// them.
     async fn prune_volumes(&self, #[zbus(header)] hdr: Header<'_>) -> Result<OwnedObjectPath> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         Ok(jobs::spawn(
             &self.state,
             owner,
@@ -768,16 +768,16 @@ impl Manager {
     /// Like `secret ls`: every secret with name, created (unix seconds), size (t, bytes
     /// of the plaintext), labels (a{ss}) and used_by (as); never the content.
     async fn list_secrets(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Vec<Dict>> {
-        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
         let secrets = api::secrets::list(&self.ctx().store)?;
         Ok(secrets.iter().map(values::secret).collect())
     }
 
     /// Like `secret inspect`: one secret as ListSecrets has it.
     async fn get_secret(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<Dict> {
-        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
         Ok(values::secret(&api::secrets::get(
             &self.ctx().store,
             &name,
@@ -793,8 +793,8 @@ impl Manager {
         content: Vec<u8>,
         options: HashMap<String, OwnedValue>,
     ) -> Result<()> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let labels = crate::volume::parse_labels(&options.strings("labels")?)?;
         options.finish()?;
@@ -808,8 +808,8 @@ impl Manager {
         #[zbus(header)] hdr: Header<'_>,
         names: Vec<String>,
     ) -> Result<OwnedObjectPath> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let target = names.join(" ");
         Ok(jobs::spawn(
             &self.state,
@@ -834,8 +834,8 @@ impl Manager {
     /// Like `network ls`: every network (the default one first) with name, interface,
     /// subnet, gateway, internal, created and machines (the ones whose records name it).
     async fn list_networks(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Vec<Dict>> {
-        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
         let networks = api::network::list_networks(self.ctx())?;
         Ok(networks.iter().map(values::network_summary).collect())
     }
@@ -847,8 +847,8 @@ impl Manager {
         #[zbus(header)] hdr: Header<'_>,
         name: String,
     ) -> Result<(Dict, Vec<Dict>)> {
-        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
         let (spec, entries) = api::network::inspect(self.ctx(), &name).await?;
         Ok((
             values::network(&spec),
@@ -866,8 +866,8 @@ impl Manager {
         name: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<Dict> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let subnet = options.string("subnet")?;
         let internal = options.bool("internal", false)?;
@@ -895,8 +895,8 @@ impl Manager {
         #[zbus(header)] hdr: Header<'_>,
         names: Vec<String>,
     ) -> Result<OwnedObjectPath> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let target = names.join(" ");
         Ok(jobs::spawn(
             &self.state,
@@ -921,8 +921,8 @@ impl Manager {
     /// Like `network prune`: a job removing every user-defined network no machine names;
     /// its result lists them.
     async fn prune_networks(&self, #[zbus(header)] hdr: Header<'_>) -> Result<OwnedObjectPath> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         Ok(jobs::spawn(
             &self.state,
             owner,
@@ -948,8 +948,8 @@ impl Manager {
         limit: u32,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(Vec<Dict>, Vec<String>)> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
         options.finish()?;
@@ -978,8 +978,8 @@ impl Manager {
         with_tags: bool,
         options: HashMap<String, OwnedValue>,
     ) -> Result<Vec<Dict>> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
         options.finish()?;
@@ -1010,8 +1010,8 @@ impl Manager {
         repository: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<Vec<String>> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
         options.finish()?;
@@ -1022,8 +1022,8 @@ impl Manager {
     /// leader, os and, when nspawn installed its image, the image's record and
     /// machine_path, its object in machined.
     async fn list_machines(&self, #[zbus(header)] hdr: Header<'_>, all: bool) -> Result<Vec<Dict>> {
-        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
         let machines = api::machines::list(self.ctx(), all).await?;
         Ok(machines.iter().map(values::machine).collect())
     }
@@ -1038,8 +1038,8 @@ impl Manager {
         #[zbus(header)] hdr: Header<'_>,
         names: Vec<String>,
     ) -> Result<Vec<Dict>> {
-        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
         let samples = api::stats::sample(self.ctx(), &names).await?;
         Ok(samples.iter().map(values::sample).collect())
     }
@@ -1047,8 +1047,8 @@ impl Manager {
     /// Like `inspect`: one machine as `ListMachines` has it (running or not), or the
     /// record of an image that is not running, with state "stopped".
     async fn get_machine(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<Dict> {
-        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
         let machine = api::machines::get(self.ctx(), &name).await?;
         Ok(values::machine(&machine))
     }
@@ -1065,8 +1065,8 @@ impl Manager {
         name: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(String, Vec<String>)> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let request = start_request(name, &mut options, true)?;
         options.finish()?;
@@ -1097,8 +1097,8 @@ impl Manager {
         OwnedObjectPath,
         Vec<String>,
     )> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let tty = options.bool("tty", false)?;
         let rows = options.u64("rows", 24)?.clamp(1, u16::MAX as u64) as u16;
@@ -1157,8 +1157,8 @@ impl Manager {
         name: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(String, Vec<String>)> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let request = api::machines::StopRequest {
             name,
@@ -1185,8 +1185,8 @@ impl Manager {
         name: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<bool> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let request = api::machines::UpdateRequest {
             name,
@@ -1213,8 +1213,8 @@ impl Manager {
         name: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<Vec<String>> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let request = api::machines::KillRequest {
             name,
@@ -1230,15 +1230,15 @@ impl Manager {
 
     /// docker pause: the machine's cgroup is frozen, every process in it with it.
     async fn pause_machine(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<()> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         Ok(api::machines::pause(self.ctx(), &name, true).await?)
     }
 
     /// docker unpause.
     async fn unpause_machine(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<()> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         Ok(api::machines::pause(self.ctx(), &name, false).await?)
     }
 
@@ -1249,8 +1249,8 @@ impl Manager {
         #[zbus(header)] hdr: Header<'_>,
         name: String,
     ) -> Result<Vec<Dict>> {
-        self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
         let processes = api::machines::processes(self.ctx(), &name).await?;
         Ok(processes.iter().map(values::process).collect())
     }
@@ -1266,8 +1266,8 @@ impl Manager {
         user: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(zbus::zvariant::OwnedFd, String)> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let mut env = options.strings("env")?;
         options.finish()?;
@@ -1294,8 +1294,8 @@ impl Manager {
         machine: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let request = api::machines::LogsRequest {
             machine,
@@ -1390,8 +1390,8 @@ impl Manager {
         #[zbus(header)] hdr: Header<'_>,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)> {
-        let owner = self.allow(&hdr, Action::Inspect).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Inspect).await?;
         let mut options = Options::new(&options);
         let since = options.string("since")?;
         let until = options.string("until")?;
@@ -1509,8 +1509,8 @@ impl Manager {
         user: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)> {
-        let owner = self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let detach = options.bool("detach", false)?;
         let tty = options.bool("tty", true)? && !detach;
@@ -1596,8 +1596,8 @@ impl Manager {
     /// names of the networks brought up under "networks", and the notes made on the way
     /// under "notes".
     async fn network_up(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Dict> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let notes = Notes::default();
         let (info, networks) = api::network::up(self.ctx(), &notes.report()).await?;
         let mut dict = values::bridge(&info);
@@ -1617,8 +1617,8 @@ impl Manager {
         password: String,
         options: HashMap<String, OwnedValue>,
     ) -> Result<Dict> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
         options.finish()?;
@@ -1637,8 +1637,8 @@ impl Manager {
 
     /// Like `logout`: true when credentials were stored for the registry.
     async fn logout(&self, #[zbus(header)] hdr: Header<'_>, registry: String) -> Result<bool> {
-        self.allow(&hdr, Action::Manage).await?;
         let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
         let registry = if registry.is_empty() {
             None
         } else {
