@@ -1300,7 +1300,10 @@ impl Manager {
         let request = api::machines::LogsRequest {
             machine,
             follow: options.bool("follow", false)?,
-            lines: Some(options.u64("lines", 0)?.min(u32::MAX as u64) as u32).filter(|n| *n > 0),
+            // 0 is a value: only what comes from now on, docker's --tail 0.
+            lines: options
+                .maybe_u64("lines")?
+                .map(|n| n.min(u32::MAX as u64) as u32),
             since: options.string("since")?,
             until: options.string("until")?,
             timestamps: options.bool("timestamps", false)?,
