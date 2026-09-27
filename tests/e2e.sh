@@ -654,7 +654,8 @@ for m in e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-def-cli e2e-nab e2e-non
 done
 $NSPAWN network create e2e-ne >/dev/null || fail "network create e2e-ne"
 $NSPAWN network prune -f >/dev/null || fail "network prune"
-$NSPAWN events --since "-10min" --until now --filter type=network --filter event=remove | grep_q "network remove e2e-ne (interface=nsbr-e2e-ne, internal=false, subnet=" || fail "network remove carries no metadata: $($NSPAWN events --since -10min --until now --filter type=network | tail -3)"
+# The event reaches the journal a moment after prune returns.
+retry 5 bash -c "$NSPAWN events --since -10min --until now --filter type=network --filter event=remove | grep -q 'network remove e2e-ne (interface=nsbr-e2e-ne, internal=false, subnet='" || fail "network remove carries no metadata: $($NSPAWN events --since -10min --until now --filter type=network | tail -3)"
 $NSPAWN network ls | grep_q "^ *e2e-n[a-e] " && fail "network prune left an unused network: $($NSPAWN network ls)"
 ip -o link show | grep_q nsbr-e2e && fail "a removed network left its bridge"
 nft list table ip nspawn | grep_q nsbr-e2e && fail "a removed network left rules in the nspawn table"
