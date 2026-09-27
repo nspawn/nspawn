@@ -923,7 +923,7 @@ grep -q "Bind=" /etc/systemd/nspawn/$app.nspawn && fail "-v none left volumes in
 $NSPAWN stop $app -t 2 || fail "stop app running its own cmd"
 
 step "docker's other flags: hostname, user, workdir, capabilities, read-only, tmpfs, devices, dns, hosts, ulimits, signals"
-$NSPAWN start $app --hostname h-$nonce -u nobody -w /tmp --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only --tmpfs /scratch:size=16m --device /dev/null:/dev/nullo:r --dns 10.99.0.1 --dns-search example.test --add-host peer:10.1.1.1 --add-host gw:host-gateway --ulimit nofile=64:128 --stop-signal SIGINT --stop-timeout 2 --oom-score-adj 100 --sysctl net.ipv4.icmp_echo_ignore_all=1 -p none -- /bin/sh -c 'trap "" INT; pwd; exec /bin/sleep 300' || fail "start with docker's other flags"
+$NSPAWN start $app --hostname h-$nonce -u nobody -w /tmp --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only --tmpfs /scratch:size=16m --device /dev/null:/dev/nullo:r --dns 10.99.0.1 --dns-search example.test --add-host peer:10.1.1.1 --add-host gw:host-gateway --add-host v6=fd00::1 --ulimit nofile=64:128 --ulimit core=unlimited --stop-signal SIGINT --stop-timeout 2 --oom-score-adj 100 --sysctl net.ipv4.icmp_echo_ignore_all=1 -p none -- /bin/sh -c 'trap "" INT; pwd; exec /bin/sleep 300' || fail "start with docker's other flags"
 x() { $NSPAWN exec $app -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
 [ "$(x hostname)" = "h-$nonce" ] || fail "--hostname not applied: $(x hostname)"
 # The program is the stub init's child: systemd-nspawn runs getent in the machine
@@ -964,6 +964,8 @@ x 'cat /proc/mounts' | grep_q " /scratch tmpfs" || fail "--tmpfs is not a tmpfs:
 x 'cat /etc/resolv.conf' | grep_q "^nameserver 10.99.0.1$" || fail "--dns not applied: $(x 'cat /etc/resolv.conf')"
 x 'cat /etc/resolv.conf' | grep_q "^search example.test$" || fail "--dns-search not applied"
 x 'cat /etc/hosts' | grep_q "^10.1.1.1 peer$" || fail "--add-host not applied: $(x 'cat /etc/hosts')"
+x 'cat /etc/hosts' | grep_q "^fd00::1 v6$" || fail "--add-host with an IPv6 address (HOST=IP) not applied: $(x 'cat /etc/hosts')"
+[ "$(x 'ulimit -c')" = unlimited ] || fail "--ulimit core=unlimited not applied: $(x 'ulimit -c')"
 x 'cat /etc/hosts' | grep_q "^10.99.0.1 gw$" || fail "--add-host host-gateway not applied: $(x 'cat /etc/hosts')"
 x "grep 'open files' /proc/$pid/limits" | grep_q "64 *128" || fail "--ulimit not applied: $(x "grep 'open files' /proc/$pid/limits")"
 [ "$(x "cat /proc/$pid/oom_score_adj")" = 100 ] || fail "--oom-score-adj not applied: $(x "cat /proc/$pid/oom_score_adj")"
@@ -974,9 +976,9 @@ import json, sys
 d = json.load(sys.stdin)[0]
 assert d['hostname'] == 'h-$nonce' and d['user'] == 'nobody' and d['working_dir'] == '/tmp', d
 assert d['cap_drop'] == ['ALL'] and d['cap_add'] == ['NET_BIND_SERVICE'] and d['read_only'] and d['tmpfs'] == ['/scratch:size=16m'], d
-assert d['devices'] == ['/dev/null:/dev/nullo:r'] and d['ulimits'] == {'nofile': '64:128'}, d
+assert d['devices'] == ['/dev/null:/dev/nullo:r'] and d['ulimits'] == {'core': '18446744073709551615:18446744073709551615', 'nofile': '64:128'}, d
 assert d['stop_signal'] == 'SIGINT' and d['stop_timeout'] == 2 and d['oom_score_adj'] == 100, d
-assert d['extra_hosts'] == ['peer:10.1.1.1', 'gw:host-gateway'] and d['sysctls'] == {'net.ipv4.icmp_echo_ignore_all': '1'}, d" || fail "inspect does not show the flags"
+assert d['extra_hosts'] == ['peer:10.1.1.1', 'gw:host-gateway', 'v6:fd00::1'] and d['sysctls'] == {'net.ipv4.icmp_echo_ignore_all': '1'}, d" || fail "inspect does not show the flags"
 stop_start=$(date +%s)
 out=$($NSPAWN stop $app 2>&1) || fail "stop with --stop-signal and --stop-timeout: $out"
 echo "$out" | grep_q "ignored SIGINT for 2 seconds" || fail "stop did not use --stop-signal and --stop-timeout: $out"

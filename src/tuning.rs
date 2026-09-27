@@ -135,7 +135,12 @@ impl Tuning {
                     .map(|c| c.to_string())
                     .collect()
             } else {
-                self.cap_drop.iter().map(|c| format!("CAP_{c}")).collect()
+                // docker applies the adds after the drops: a capability in both is kept.
+                self.cap_drop
+                    .iter()
+                    .filter(|c| !self.cap_add.contains(c))
+                    .map(|c| format!("CAP_{c}"))
+                    .collect()
             };
             // Without a user namespace, what systemd-nspawn retains beyond the app set
             // goes too, unless asked for: an interface given to the machine keeps
@@ -162,8 +167,21 @@ impl Tuning {
         if let Some(adj) = self.oom_score_adj {
             out.push(format!("OOMScoreAdjust={adj}"));
         }
+        // systemd's word for no limit; the number RLIM_INFINITY is would be refused.
+        let limit = |v: &u64| {
+            if *v == u64::MAX {
+                "infinity".to_string()
+            } else {
+                v.to_string()
+            }
+        };
         for (name, (soft, hard)) in &self.ulimits {
-            out.push(format!("Limit{}={soft}:{hard}", name.to_ascii_uppercase()));
+            out.push(format!(
+                "Limit{}={}:{}",
+                name.to_ascii_uppercase(),
+                limit(soft),
+                limit(hard)
+            ));
         }
         // Linking the journal makes a directory in the root, which a read-only one
         // refuses at every start.
@@ -192,12 +210,54 @@ impl Tuning {
         out
     }
 
-    /// DeviceAllow= for the unit, so that the machine's cgroup may open the nodes.
+    /// DeviceAllow= for the unit, so that the machine's cgroup may open the nodes: each
+    /// node under a directory given as a device (/dev/dri, /dev/snd), as docker allows
+    /// them, since DeviceAllow= takes a node and not a directory.
     pub fn unit_lines(&self) -> Vec<String> {
+        self.unit_lines_with(device_nodes)
+    }
+
+    /// `unit_lines`, with `nodes` saying what device nodes a host path stands for.
+    pub fn unit_lines_with(&self, nodes: impl Fn(&str) -> Vec<String>) -> Vec<String> {
         self.devices
             .iter()
-            .map(|d| format!("DeviceAllow={} {}", d.host, d.permissions))
+            .flat_map(|d| {
+                nodes(&d.host)
+                    .into_iter()
+                    .map(move |node| format!("DeviceAllow={node} {}", d.permissions))
+            })
             .collect()
+    }
+}
+
+/// The device nodes a --device path stands for: the node itself, or every character
+/// and block device below a directory.
+pub fn device_nodes(path: &str) -> Vec<String> {
+    use std::os::unix::fs::FileTypeExt;
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                walk(&entry.path(), out);
+            } else if kind.is_char_device() || kind.is_block_device() {
+                out.push(entry.path().to_string_lossy().into_owned());
+            }
+        }
+    }
+    let path = std::path::Path::new(path);
+    if path.is_dir() {
+        let mut out = Vec::new();
+        walk(path, &mut out);
+        out
+    } else {
+        vec![path.to_string_lossy().into_owned()]
     }
 }
 
@@ -596,9 +656,11 @@ fn device(text: &str) -> Result<Device> {
 
 /// --add-host HOST:IP (or HOST=IP); "host-gateway" stands for the machine's gateway.
 fn extra_host(text: &str) -> Result<ExtraHost> {
+    // HOST=IP first, the form docker has for IPv6 addresses, whose colons would split
+    // HOST:IP wrong; a hostname never carries an equals sign.
     let (host, ip) = text
-        .split_once(':')
-        .or_else(|| text.split_once('='))
+        .split_once('=')
+        .or_else(|| text.split_once(':'))
         .with_context(|| format!("--add-host {text}: HOST:IP"))?;
     validate_hostname(host)?;
     if ip != "host-gateway" {
@@ -696,7 +758,11 @@ mod tests {
             interfaces: vec!["wlan0".into(), "eth1".into(), "wlan0".into()],
             dns: vec!["10.0.0.53".into()],
             dns_search: vec!["example.org".into()],
-            extra_hosts: vec!["db:10.1.1.1".into(), "gw=host-gateway".into()],
+            extra_hosts: vec![
+                "db:10.1.1.1".into(),
+                "gw=host-gateway".into(),
+                "v6=fd00::1".into(),
+            ],
             ulimits: vec!["nofile=64:128".into(), "nproc=unlimited".into()],
             oom_score_adj: Some(-500),
             stop_signal: Some("SIGINT".into()),
@@ -725,7 +791,7 @@ mod tests {
                 &format!("DropCapability={dropped}"),
                 "OOMScoreAdjust=-500",
                 "LimitNOFILE=64:128",
-                "LimitNPROC=18446744073709551615:18446744073709551615",
+                "LimitNPROC=infinity:infinity",
                 "LinkJournal=no",
             ]
         );
@@ -740,12 +806,32 @@ mod tests {
                 "Bind=/dev/dri:/dev/dri",
             ]
         );
+        // A directory stands for the nodes below it, which DeviceAllow= takes one by one.
+        let nodes = |path: &str| match path {
+            "/dev/dri" => vec![
+                "/dev/dri/card0".to_string(),
+                "/dev/dri/renderD128".to_string(),
+            ],
+            other => vec![other.to_string()],
+        };
         assert_eq!(
-            t.unit_lines(),
-            ["DeviceAllow=/dev/null r", "DeviceAllow=/dev/dri rwm"]
+            t.unit_lines_with(nodes),
+            [
+                "DeviceAllow=/dev/null r",
+                "DeviceAllow=/dev/dri/card0 rwm",
+                "DeviceAllow=/dev/dri/renderD128 rwm"
+            ]
         );
+        assert_eq!(device_nodes("/dev/null"), ["/dev/null"]);
+        let empty = tempfile::tempdir().unwrap();
+        std::fs::write(empty.path().join("plain"), "").unwrap();
+        assert!(device_nodes(&empty.path().to_string_lossy()).is_empty());
         assert_eq!(t.interfaces, ["wlan0", "eth1"], "once each, in order");
         assert_eq!(t.extra_hosts[1].ip, "host-gateway");
+        assert_eq!(
+            (t.extra_hosts[2].host.as_str(), t.extra_hosts[2].ip.as_str()),
+            ("v6", "fd00::1")
+        );
         assert_eq!(t.sysctls["net.ipv4.ip_forward"], "1");
         assert_eq!((t.user.as_deref(), t.stop_timeout), (Some("1000"), Some(2)));
         assert_eq!(t.secrets[1].target, "/etc/key");
@@ -771,6 +857,19 @@ mod tests {
         assert!(t.interfaces.is_empty());
         assert_eq!(t.exec_lines(false)[0], "Capability=all");
         assert_eq!(t.tmpfs.len(), 2);
+        // A capability both added and dropped is kept, as docker applies the adds last.
+        let mut both = Tuning::default();
+        Overrides {
+            cap_add: vec!["NET_ADMIN".into()],
+            cap_drop: vec!["NET_ADMIN".into(), "MKNOD".into()],
+            ..Default::default()
+        }
+        .apply(&mut both)
+        .unwrap();
+        assert_eq!(
+            both.exec_lines(false),
+            ["Capability=CAP_NET_ADMIN", "DropCapability=CAP_MKNOD"]
+        );
         // ALL on both sides keeps every capability, as docker reads it.
         let mut caps = Tuning::default();
         Overrides {
