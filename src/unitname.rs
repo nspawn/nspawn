@@ -33,9 +33,13 @@ pub fn mount_unit_for(path: &str) -> String {
     format!("{}.mount", escape_path(path))
 }
 
-/// Name of the device unit udev keeps for a network interface of the host.
+/// Name of the device unit udev keeps for a network interface of the host: the escaped
+/// sysfs path, where a leading dot of the name is not the first byte.
 pub fn device_unit_for(interface: &str) -> String {
-    format!("sys-subsystem-net-devices-{}.device", escape(interface))
+    format!(
+        "{}.device",
+        escape_path(&format!("/sys/subsystem/net/devices/{interface}"))
+    )
 }
 
 #[cfg(test)]
@@ -68,6 +72,11 @@ mod tests {
         assert_eq!(
             device_unit_for("e2e-dummy0"),
             "sys-subsystem-net-devices-e2e\\x2ddummy0.device"
+        );
+        assert_eq!(
+            device_unit_for(".x"),
+            "sys-subsystem-net-devices-.x.device",
+            "a dot is escaped at the start of the whole path alone"
         );
         assert_eq!(escape("a.b_c:d"), "a.b_c:d");
         assert_eq!(escape(".x"), "\\x2ex");
