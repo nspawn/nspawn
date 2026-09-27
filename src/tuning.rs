@@ -618,7 +618,10 @@ fn capability(text: &str) -> Result<String> {
 /// --tmpfs PATH[:options]; the options go to the mount as they are.
 fn tmpfs(text: &str) -> Result<String> {
     let path = text.split_once(':').map_or(text, |(p, _)| p);
-    if !path.starts_with('/') || path == "/" || path.chars().any(char::is_whitespace) {
+    if !crate::volume::plain_inside_path(path)
+        || path == "/"
+        || path.chars().any(char::is_whitespace)
+    {
         bail!("--tmpfs {text}: an absolute path inside the machine, optionally :OPTIONS");
     }
     // The options become part of a settings line.
@@ -635,7 +638,7 @@ fn device(text: &str) -> Result<Device> {
         [host, container, permissions] => (host, container, permissions),
         _ => bail!("--device {text}: HOST[:CONTAINER[:PERMISSIONS]]"),
     };
-    if !host.starts_with("/dev/") || !container.starts_with('/') {
+    if !host.starts_with("/dev/") || !crate::volume::plain_inside_path(container) {
         bail!("--device {text}: a node under /dev, and an absolute path inside the machine");
     }
     if text.chars().any(char::is_whitespace) {
@@ -1019,6 +1022,8 @@ mod tests {
             ("workdir", "srv"),
             ("cap", "NET ADMIN"),
             ("tmpfs", "run"),
+            ("tmpfs", "/run/.."),
+            ("device", "/dev/null:/dev/../x"),
             ("tmpfs", "/x:size=1m\nBind=/:/host"),
             ("device", "/etc/passwd:/x"),
             ("device", "/dev/null:/x:q"),

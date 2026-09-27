@@ -934,6 +934,11 @@ $NSPAWN ps | grep "^ *$app " | grep_q " sh " || fail "--image-command did not re
 grep -q "Bind=" /etc/systemd/nspawn/$app.nspawn && fail "-v none left volumes in the settings"
 $NSPAWN stop $app -t 2 || fail "stop app running its own cmd"
 
+# A path inside the machine with a dot component would mount elsewhere, the root for one.
+out=$($NSPAWN start $app -v /tmp:/. -- /bin/sleep 1 2>&1) && fail "a volume target of /. was accepted"
+echo "$out" | grep_q "without . or .." || fail "the dot target was not explained: $out"
+out=$($NSPAWN start $app --tmpfs /x/.. -- /bin/sleep 1 2>&1) && fail "a tmpfs of /x/.. was accepted"
+
 step "docker's other flags: hostname, user, workdir, capabilities, read-only, tmpfs, devices, dns, hosts, ulimits, signals"
 $NSPAWN start $app --hostname h-$nonce -u nobody -w /tmp --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only --tmpfs /scratch:size=16m --device /dev/null:/dev/nullo:r --dns 10.99.0.1 --dns-search example.test --add-host peer:10.1.1.1 --add-host gw:host-gateway --add-host v6=fd00::1 --ulimit nofile=64:128 --ulimit core=unlimited --stop-signal SIGINT --stop-timeout 2 --oom-score-adj 100 --sysctl net.ipv4.icmp_echo_ignore_all=1 -p none -- /bin/sh -c 'trap "" INT; pwd; exec /bin/sleep 300' || fail "start with docker's other flags"
 x() { $NSPAWN exec $app -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }

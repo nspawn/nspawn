@@ -132,6 +132,9 @@ impl FromStr for Volume {
         if target.trim_end_matches('/').is_empty() {
             bail!("{text}: the machine's root cannot be a volume target");
         }
+        if !plain_inside_path(target) {
+            bail!("{text}: the target is a plain path inside the machine, without . or .. in it");
+        }
         reject_control_characters(text)?;
         Ok(Volume {
             source: source.to_string(),
@@ -153,6 +156,13 @@ impl fmt::Display for Volume {
 
 /// The names a managed volume may have: what `-v NAME:/path` accepts, which is also a
 /// safe single directory name under the volumes directory.
+/// An absolute path inside the machine with no `.` or `..` component: one of those
+/// would resolve to another place once systemd-nspawn mounts there, the root itself
+/// included.
+pub fn plain_inside_path(path: &str) -> bool {
+    path.starts_with('/') && path.split('/').all(|c| c != "." && c != "..")
+}
+
 pub fn validate_volume_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.starts_with('.')
@@ -399,6 +409,18 @@ mod tests {
         assert!("/srv://".parse::<Volume>().is_err());
         assert!("/srv:/data\n".parse::<Volume>().is_err());
         assert!("/srv:/data".parse::<Volume>().is_ok());
+        // A dot component would land the mount elsewhere, on the root for one.
+        for bad in [
+            "/srv:/.",
+            "/srv:/..",
+            "/srv:/a/..",
+            "/srv:/a/./b",
+            "/srv:/a/../b",
+        ] {
+            assert!(bad.parse::<Volume>().is_err(), "{bad}");
+        }
+        assert!(plain_inside_path("/a/b") && plain_inside_path("/a.b/..c"));
+        assert!(!plain_inside_path("a/b") && !plain_inside_path("/a/./b"));
     }
     #[test]
     fn a_new_volume_takes_what_the_image_has() {

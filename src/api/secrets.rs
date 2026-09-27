@@ -331,7 +331,7 @@ pub fn parse_ref(text: &str) -> Result<SecretRef> {
     validate_secret_name(name)?;
     let target = match target.filter(|t| !t.is_empty()) {
         Some(target) => {
-            if !target.starts_with('/')
+            if !crate::volume::plain_inside_path(target)
                 || target.ends_with('/')
                 || target.chars().any(char::is_whitespace)
             {
@@ -389,6 +389,7 @@ mod tests {
             "",
             ".hidden",
             "a:x",
+            "a:/x/../y",
             "a:/x:999",
             "a:/x:0400:root:root",
             "a:/x:0400:1",
