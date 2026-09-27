@@ -73,7 +73,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -769,7 +769,8 @@ out=$($NSPAWN run --rm docker.io/library/busybox:1.37 /bin/echo kept-$nonce 2>/d
 $NSPAWN images ls | grep_q "^ *busybox-1.37 " || fail "run --rm did not keep the image it pulled"
 $NSPAWN images ls | grep_q "^ *busybox-1.37-" && fail "run --rm left its machine behind"
 $NSPAWN images rm busybox-1.37 >/dev/null || fail "images rm of the image run kept"
-# A reboot asked from inside ends a --rm run (the machine is not restarted then).
+# A reboot asked from inside ends a --rm run (the machine is not restarted then): an app
+# keeps CAP_SYS_BOOT for it, which in its pid namespace can only signal its init.
 timeout 60 $NSPAWN run --rm $bb --name e2e-run -- /bin/reboot -f >/dev/null 2>&1; rc=$?
 [ "$rc" = 133 ] || fail "run --rm of a program that reboots did not end with 133: $rc"
 retry 15 bash -c "! $NSPAWN images ls | grep_q '^ *e2e-run '" || fail "run --rm left a machine that rebooted behind"
@@ -918,6 +919,26 @@ pid=$(x 'cat /proc/1/task/1/children' | tr -d ' ')
 retry 5 bash -c "$NSPAWN logs $app -n 5 | tr -d '\r' | grep -qx /tmp" || fail "--workdir not applied: $($NSPAWN logs $app -n 5)"
 # --cap-drop ALL --cap-add X keeps X, as with docker: bit 10 is CAP_NET_BIND_SERVICE.
 [ "$(x 'awk "/^CapBnd:/ {print \$2}" /proc/1/status')" = 0000000000000400 ] || fail "--cap-drop ALL --cap-add NET_BIND_SERVICE left other capabilities: $(x 'grep CapBnd /proc/1/status')"
+# An app without a user namespace keeps docker's default set and CAP_SYS_BOOT, no more:
+# the bounding set of a docker container (CapBnd 00000000a80425fb, docker 29) plus bit
+# 22, and /proc/sys cannot be remounted writable; --cap-add SYS_ADMIN gives that back,
+# a booted machine keeps systemd-nspawn's set in its own user namespace.
+$NSPAWN create $app e2e-caps -- /bin/sleep 300 >/dev/null || fail "create e2e-caps"
+$NSPAWN start e2e-caps >/dev/null || fail "start e2e-caps"
+c() { $NSPAWN exec e2e-caps -- /bin/sh -c "$1" </dev/null 2>&1 | tr -d '\r'; }
+[ "$(c 'awk "/^CapBnd:/ {print \$2}" /proc/1/status')" = 00000000a8c425fb ] || fail "an app on the bridge does not have docker's capabilities and CAP_SYS_BOOT: $(c 'grep CapBnd /proc/1/status')"
+grep -q "^SystemCallFilter=~kexec_load kexec_file_load" /etc/systemd/nspawn/e2e-caps.nspawn || fail "the kexec system calls are not filtered for an app: $(cat /etc/systemd/nspawn/e2e-caps.nspawn)"
+[ "$(c 'cat /proc/self/uid_map')" = "$(printf '         0          0 4294967295')" ] || fail "an app on the bridge is not in the initial user namespace: $(c 'cat /proc/self/uid_map')"
+c 'mount -o remount,rw /proc/sys' >/dev/null 2>&1 && fail "an app on the bridge remounted /proc/sys writable"
+c 'v=$(cat /proc/sys/kernel/core_pattern); printf %s "$v" > /proc/sys/kernel/core_pattern' >/dev/null 2>&1 && fail "an app on the bridge wrote a kernel sysctl"
+$NSPAWN stop e2e-caps >/dev/null || fail "stop e2e-caps"
+$NSPAWN start e2e-caps --cap-add SYS_ADMIN >/dev/null || fail "start e2e-caps with --cap-add SYS_ADMIN"
+[ $(( 0x$(c 'awk "/^CapBnd:/ {print \$2}" /proc/1/status') & 0x200000 )) != 0 ] || fail "--cap-add SYS_ADMIN did not give CAP_SYS_ADMIN back: $(c 'grep CapBnd /proc/1/status')"
+$NSPAWN stop e2e-caps >/dev/null || fail "stop e2e-caps"
+$NSPAWN start e2e-caps --cap-add none --network none >/dev/null || fail "start e2e-caps with --network none"
+[ "$(c 'cat /proc/self/uid_map')" != "$(printf '         0          0 4294967295')" ] || fail "an app with --network none is not in a user namespace of its own"
+[ $(( 0x$(c 'awk "/^CapBnd:/ {print \$2}" /proc/1/status') & 0x200000 )) != 0 ] || fail "an app in a user namespace lost systemd-nspawn's CAP_SYS_ADMIN: $(c 'grep CapBnd /proc/1/status')"
+$NSPAWN rm -f e2e-caps >/dev/null || fail "rm e2e-caps"
 [ "$(x 'touch /x 2>/dev/null && echo RW || echo RO')" = RO ] || fail "--read-only root is writable"
 [ "$(x 'touch /scratch/a && echo OK')" = OK ] || fail "--tmpfs is not writable"
 x 'cat /proc/mounts' | grep_q " /scratch tmpfs" || fail "--tmpfs is not a tmpfs: $(x 'cat /proc/mounts')"
@@ -989,6 +1010,9 @@ echo "$out" | grep_q "warning: e2e-dummy0 carries the host's default route" || f
 retry 10 bash -c "$NSPAWN logs $app | tr -d '\r' | grep -q 'e2e-dummy0: <'" || fail "the program did not find the interface inside from the start: $($NSPAWN logs $app 2>&1)"
 [ ! -e /sys/class/net/e2e-dummy0 ] || fail "the interface is still on the host while the machine runs"
 $NSPAWN exec $app -- ip -o link show e2e-dummy0 </dev/null | tr -d '\r' | grep_q "e2e-dummy0: <" || fail "the interface is not inside the running machine"
+# An interface given to an app keeps CAP_NET_ADMIN, so the app configures it.
+$NSPAWN exec $app -- ip link set e2e-dummy0 up </dev/null 2>&1 | tr -d '\r' | grep -v "^$" && fail "the app cannot bring its interface up"
+$NSPAWN exec $app -- ip -o link show e2e-dummy0 </dev/null | tr -d '\r' | grep_q ",UP" || fail "the interface did not come up inside the app: $($NSPAWN exec $app -- ip -o link show e2e-dummy0 </dev/null 2>&1)"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['interfaces'] == ['e2e-dummy0'], d" || fail "inspect does not show the interface"
 grep -q '^Wants=sys-subsystem-net-devices-e2e\\x2ddummy0.device' /etc/systemd/system/systemd-nspawn@$app.service.d/nspawn-hooks.conf || fail "the unit does not wait for the device: $(cat /etc/systemd/system/systemd-nspawn@$app.service.d/nspawn-hooks.conf)"
 grep -q "^Interface=" /etc/systemd/nspawn/$app.nspawn && fail "an app on the bridge got Interface= in its settings"

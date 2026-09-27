@@ -156,7 +156,15 @@ script bound over `/usr/bin/getent` that answers those two from the image's
 passwd and group files as docker reads them and hands anything else to the
 image's own getent, bound at `/run/nspawn/getent`. Apps on the bridge run with
 `PrivateUsers=no`, since a user namespace cannot join the network namespace
-prepared on the host; app images are assembled with overlay even where mstack
+prepared on the host, and with docker's default capabilities plus
+`CAP_SYS_BOOT` instead of systemd-nspawn's (`Tuning::exec_lines` spells the
+difference out as `DropCapability=`, `CAP_NET_ADMIN` kept with `--interface`,
+and `SystemCallFilter=~kexec_load kexec_file_load` beside it: in its own pid
+namespace reboot(2) only signals the machine's init, while kexec_load would
+load a kernel into the host): systemd-nspawn's
+set retains `CAP_SYS_ADMIN`, and its seccomp filter allows `@mount`, so root in
+such an app could remount `/proc/sys` writable and reach the host through
+`kernel.core_pattern`; app images are assembled with overlay even where mstack
 exists. The namespace is named with `NamespacePath=` in the settings file on
 systemd 259 or newer; before that the key does not exist, and the unit's
 `ExecStart=` gets `--network-namespace-path=` instead (minus the options that

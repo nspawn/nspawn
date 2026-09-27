@@ -100,8 +100,10 @@ impl Tuning {
 
     /// The [Exec] lines: Hostname=, Capability=, DropCapability=, OOMScoreAdjust=, the
     /// rlimits, LinkJournal=. User= and WorkingDirectory= are the caller's, image
-    /// defaults included.
-    pub fn exec_lines(&self) -> Vec<String> {
+    /// defaults included. `confined`: the machine runs without a user namespace (an app
+    /// on a bridge network), so it keeps docker's default capabilities instead of
+    /// systemd-nspawn's.
+    pub fn exec_lines(&self, confined: bool) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(hostname) = &self.hostname {
             out.push(format!("Hostname={hostname}"));
@@ -111,33 +113,51 @@ impl Tuning {
         } else if !self.cap_add.is_empty() {
             out.push(format!("Capability={}", capabilities(&self.cap_add)));
         }
-        if !self.cap_drop.is_empty() && !self.privileged {
+        if !self.privileged {
             // systemd-nspawn lets a drop win over an add, docker the other way round:
             // "--cap-drop ALL --cap-add X" keeps X, and "--cap-add ALL" keeps all but
             // the named drops, so those drops are spelled out.
             let add_all = self.cap_add.iter().any(|c| c == "ALL");
             let drop_all = self.cap_drop.iter().any(|c| c == "ALL");
-            let dropped = if add_all {
-                let named: Vec<String> = self
-                    .cap_drop
+            let added = |c: &str| self.cap_add.iter().any(|a| format!("CAP_{a}") == c);
+            let mut dropped: Vec<String> = if add_all {
+                self.cap_drop
                     .iter()
                     .filter(|c| *c != "ALL")
-                    .cloned()
-                    .collect();
-                capabilities(&named)
-            } else if drop_all && !self.cap_add.is_empty() {
+                    .map(|c| format!("CAP_{c}"))
+                    .collect()
+            } else if drop_all && self.cap_add.is_empty() {
+                vec!["all".to_string()]
+            } else if drop_all {
                 ALL_CAPABILITIES
                     .iter()
-                    .filter(|c| !self.cap_add.iter().any(|a| **c == format!("CAP_{a}")))
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .join(" ")
+                    .filter(|c| !added(c))
+                    .map(|c| c.to_string())
+                    .collect()
             } else {
-                capabilities(&self.cap_drop)
+                self.cap_drop.iter().map(|c| format!("CAP_{c}")).collect()
             };
-            if !dropped.is_empty() {
-                out.push(format!("DropCapability={dropped}"));
+            // Without a user namespace, what systemd-nspawn retains beyond the app set
+            // goes too, unless asked for: an interface given to the machine keeps
+            // CAP_NET_ADMIN, since it is there to be configured.
+            if confined && !add_all && !drop_all {
+                for cap in NSPAWN_CAPABILITIES {
+                    let kept =
+                        added(cap) || (cap == "CAP_NET_ADMIN" && !self.interfaces.is_empty());
+                    if !APP_CAPABILITIES.contains(&cap)
+                        && !kept
+                        && !dropped.iter().any(|d| d == cap)
+                    {
+                        dropped.push(cap.to_string());
+                    }
+                }
             }
+            if !dropped.is_empty() {
+                out.push(format!("DropCapability={}", dropped.join(" ")));
+            }
+        }
+        if confined && !self.privileged {
+            out.push(APP_SYSCALL_FILTER.to_string());
         }
         if let Some(adj) = self.oom_score_adj {
             out.push(format!("OOMScoreAdjust={adj}"));
@@ -180,6 +200,68 @@ impl Tuning {
             .collect()
     }
 }
+
+/// What an app without a user namespace keeps, instead of systemd-nspawn's set, whose
+/// CAP_SYS_ADMIN is root on the host outside a user namespace: /proc/sys is one remount
+/// away from writable, and kernel.core_pattern runs what it names as the host's root.
+/// docker's default set (moby, daemon/pkg/oci/caps/defaults.go) plus CAP_SYS_BOOT, so
+/// that a reboot asked from inside ends the machine as it does in a booted one: in a pid
+/// namespace of its own, reboot(2) can only signal the machine's init, and the kexec
+/// system calls the capability would also allow are filtered out (`APP_SYSCALL_FILTER`).
+pub const APP_CAPABILITIES: [&str; 15] = [
+    "CAP_AUDIT_WRITE",
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_FOWNER",
+    "CAP_FSETID",
+    "CAP_KILL",
+    "CAP_MKNOD",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_NET_RAW",
+    "CAP_SETFCAP",
+    "CAP_SETGID",
+    "CAP_SETPCAP",
+    "CAP_SETUID",
+    "CAP_SYS_BOOT",
+    "CAP_SYS_CHROOT",
+];
+
+/// Kept out of an app without a user namespace whatever its capabilities: with
+/// CAP_SYS_BOOT in the initial user namespace they would load a kernel into the host
+/// for its next kexec or crash, which docker's seccomp profile never allows either.
+pub const APP_SYSCALL_FILTER: &str = "SystemCallFilter=~kexec_load kexec_file_load";
+
+/// What systemd-nspawn retains by default (systemd-nspawn(1), --capability=), the
+/// CAP_NET_ADMIN of a private network included.
+const NSPAWN_CAPABILITIES: [&str; 27] = [
+    "CAP_AUDIT_CONTROL",
+    "CAP_AUDIT_WRITE",
+    "CAP_CHOWN",
+    "CAP_DAC_OVERRIDE",
+    "CAP_DAC_READ_SEARCH",
+    "CAP_FOWNER",
+    "CAP_FSETID",
+    "CAP_IPC_OWNER",
+    "CAP_KILL",
+    "CAP_LEASE",
+    "CAP_LINUX_IMMUTABLE",
+    "CAP_MKNOD",
+    "CAP_NET_ADMIN",
+    "CAP_NET_BIND_SERVICE",
+    "CAP_NET_BROADCAST",
+    "CAP_NET_RAW",
+    "CAP_SETFCAP",
+    "CAP_SETGID",
+    "CAP_SETPCAP",
+    "CAP_SETUID",
+    "CAP_SYS_ADMIN",
+    "CAP_SYS_BOOT",
+    "CAP_SYS_CHROOT",
+    "CAP_SYS_NICE",
+    "CAP_SYS_PTRACE",
+    "CAP_SYS_RESOURCE",
+    "CAP_SYS_TTY_CONFIG",
+];
 
 /// Every capability of the kernel, as systemd-nspawn names them.
 const ALL_CAPABILITIES: [&str; 41] = [
@@ -636,7 +718,7 @@ mod tests {
             .join(" ");
         assert_eq!(dropped.split(' ').count(), 39);
         assert_eq!(
-            t.exec_lines(),
+            t.exec_lines(false),
             [
                 "Hostname=web-1",
                 "Capability=CAP_NET_ADMIN CAP_SYS_PTRACE",
@@ -687,7 +769,7 @@ mod tests {
         cleared.apply(&mut t).unwrap();
         assert!(t.cap_add.is_empty() && t.hostname.is_none() && t.privileged);
         assert!(t.interfaces.is_empty());
-        assert_eq!(t.exec_lines()[0], "Capability=all");
+        assert_eq!(t.exec_lines(false)[0], "Capability=all");
         assert_eq!(t.tmpfs.len(), 2);
         // ALL on both sides keeps every capability, as docker reads it.
         let mut caps = Tuning::default();
@@ -697,14 +779,134 @@ mod tests {
         }
         .apply(&mut caps)
         .unwrap();
-        assert_eq!(caps.exec_lines(), ["DropCapability=all"]);
+        assert_eq!(caps.exec_lines(false), ["DropCapability=all"]);
         Overrides {
             cap_add: vec!["ALL".into()],
             ..Default::default()
         }
         .apply(&mut caps)
         .unwrap();
-        assert_eq!(caps.exec_lines(), ["Capability=all"]);
+        assert_eq!(caps.exec_lines(false), ["Capability=all"]);
+    }
+
+    #[test]
+    fn an_app_without_a_user_namespace_keeps_docker_s_capabilities() {
+        let beyond_docker = "CAP_AUDIT_CONTROL CAP_DAC_READ_SEARCH CAP_IPC_OWNER CAP_LEASE CAP_LINUX_IMMUTABLE CAP_NET_ADMIN CAP_NET_BROADCAST CAP_SYS_ADMIN CAP_SYS_NICE CAP_SYS_PTRACE CAP_SYS_RESOURCE CAP_SYS_TTY_CONFIG";
+        let plain = Tuning::default();
+        assert_eq!(
+            plain.exec_lines(true),
+            [
+                format!("DropCapability={beyond_docker}"),
+                APP_SYSCALL_FILTER.to_string()
+            ]
+        );
+        assert!(
+            APP_CAPABILITIES.contains(&"CAP_SYS_BOOT"),
+            "a reboot from inside ends the machine"
+        );
+        assert!(
+            plain.exec_lines(false).is_empty(),
+            "with a user namespace, systemd-nspawn's set stays"
+        );
+        for cap in NSPAWN_CAPABILITIES {
+            assert!(
+                APP_CAPABILITIES.contains(&cap) || beyond_docker.split(' ').any(|c| c == cap),
+                "{cap}"
+            );
+        }
+        // --cap-add keeps one of them, --cap-drop still drops one of docker's.
+        let mut t = Tuning::default();
+        Overrides {
+            cap_add: vec!["SYS_PTRACE".into()],
+            cap_drop: vec!["NET_RAW".into()],
+            ..Overrides::default()
+        }
+        .apply(&mut t)
+        .unwrap();
+        assert_eq!(
+            t.exec_lines(true),
+            [
+                "Capability=CAP_SYS_PTRACE".to_string(),
+                format!(
+                    "DropCapability=CAP_NET_RAW {}",
+                    beyond_docker.replace(" CAP_SYS_PTRACE", "")
+                ),
+                APP_SYSCALL_FILTER.to_string()
+            ]
+        );
+        // An interface given to the machine keeps CAP_NET_ADMIN, to be configured.
+        let mut t = Tuning::default();
+        Overrides {
+            interfaces: vec!["wlan0".into()],
+            ..Overrides::default()
+        }
+        .apply(&mut t)
+        .unwrap();
+        assert_eq!(
+            t.exec_lines(true),
+            [
+                format!(
+                    "DropCapability={}",
+                    beyond_docker.replace(" CAP_NET_ADMIN", "")
+                ),
+                APP_SYSCALL_FILTER.to_string()
+            ]
+        );
+        // --privileged, --cap-add ALL and --cap-drop ALL mean what they mean to docker.
+        for (add, drop, expected) in [
+            (
+                vec![],
+                vec!["ALL".into()],
+                vec![
+                    "DropCapability=all".to_string(),
+                    APP_SYSCALL_FILTER.to_string(),
+                ],
+            ),
+            (
+                vec!["ALL".into()],
+                vec!["SYS_ADMIN".into()],
+                vec![
+                    "Capability=all".to_string(),
+                    "DropCapability=CAP_SYS_ADMIN".to_string(),
+                    APP_SYSCALL_FILTER.to_string(),
+                ],
+            ),
+            (
+                vec!["NET_BIND_SERVICE".into()],
+                vec!["ALL".into()],
+                vec![
+                    "Capability=CAP_NET_BIND_SERVICE".to_string(),
+                    format!(
+                        "DropCapability={}",
+                        ALL_CAPABILITIES
+                            .iter()
+                            .filter(|c| **c != "CAP_NET_BIND_SERVICE")
+                            .copied()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ),
+                    APP_SYSCALL_FILTER.to_string(),
+                ],
+            ),
+        ] {
+            let mut t = Tuning::default();
+            Overrides {
+                cap_add: add,
+                cap_drop: drop,
+                ..Overrides::default()
+            }
+            .apply(&mut t)
+            .unwrap();
+            assert_eq!(t.exec_lines(true), expected);
+        }
+        let mut t = Tuning::default();
+        Overrides {
+            privileged: Some(true),
+            ..Overrides::default()
+        }
+        .apply(&mut t)
+        .unwrap();
+        assert_eq!(t.exec_lines(true), ["Capability=all"]);
     }
 
     #[test]

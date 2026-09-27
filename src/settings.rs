@@ -164,7 +164,8 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
             }
         }
     }
-    for line in s.tuning.exec_lines() {
+    // Without a user namespace the capabilities are docker's, not systemd-nspawn's.
+    for line in s.tuning.exec_lines(!private_users) {
         out.push_str(&line);
         out.push('\n');
     }

@@ -115,8 +115,10 @@ resolved from the image's passwd and group files by a stand-in for getent that n
 binds, since busybox has no getent, musl's answers no initgroups and neither takes a
 uid the passwd does not list, as docker does; a group, a name of the image's group
 file or a number, becomes the primary and only group, as with docker, and a name the
-image lacks is refused), `--cap-add`, `--cap-drop` (`--cap-drop
-ALL --cap-add NET_BIND_SERVICE` keeps that one, as with docker) and `--privileged`,
+image lacks is refused), `--cap-add`, `--cap-drop` (on top of the default set: docker's
+and SYS_BOOT for an app on a bridge network, which runs without a user namespace,
+systemd-nspawn's for a machine in one; `--cap-drop ALL --cap-add NET_BIND_SERVICE` keeps that one, as
+with docker) and `--privileged`,
 `--read-only`, `--tmpfs PATH[:OPTIONS]`, `--shm-size`, `--device
 HOST[:CONTAINER[:rwm]]`, `--dns` and `--dns-search`, `--add-host HOST:IP` (with
 `host-gateway`), `--ulimit NAME=SOFT[:HARD]`, `--oom-score-adj`, `--stop-signal` and
@@ -368,8 +370,17 @@ together with a generated `/etc/resolv.conf`. The process finds its network read
 the first instruction, as in docker, and the namespace goes away with `stop`. One
 consequence: a user namespace cannot join a network namespace that belongs to the host,
 so app machines on the bridge run without one (`PrivateUsers=no`), which is also docker's
-default; capabilities, seccomp and the other namespaces still apply. For the same reason
-app images are assembled with the overlay backend even where mstack is available.
+default; capabilities, seccomp and the other namespaces still apply. Such an app keeps
+docker's default capabilities (CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, MKNOD,
+NET_BIND_SERVICE, NET_RAW, SETFCAP, SETGID, SETPCAP, SETUID, SYS_CHROOT, AUDIT_WRITE)
+and SYS_BOOT, so that a reboot asked from inside ends the machine as it does in a
+booted one (in a pid namespace of its own it can only signal the machine's init, and
+the kexec system calls are filtered out), rather than systemd-nspawn's set, whose
+CAP_SYS_ADMIN is root on the host outside a user namespace: `/proc/sys` is one remount away from writable, and `kernel.core_pattern`
+runs what it names as the host's root. `--cap-add` puts one back (`NET_ADMIN` for a VPN
+client, and it is kept on its own with `--interface`), `--privileged` all of them. For
+the same reason app images are assembled with the overlay backend even where mstack is
+available.
 
 ### Published ports
 
