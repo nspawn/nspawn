@@ -62,17 +62,24 @@ pub async fn allows(connection: &Connection, sender: &str, action: Action) -> Re
     if caller_uid(connection, sender).await == Some(0) {
         return Ok(());
     }
-    let authority = AuthorityProxy::new(connection).await.map_err(|_| {
-        "polkit is not on this bus, so only root can be authorized; run the command as root"
-            .to_string()
-    })?;
+    let authority = AuthorityProxy::new(connection)
+        .await
+        .map_err(|e| format!("reaching polkit: {e}"))?;
     let mut name = HashMap::new();
     name.insert("name", Value::from(sender));
     let subject = ("system-bus-name", name);
     let (authorized, challenge, _) = authority
         .check_authorization(&subject, action.id(), HashMap::new(), 1, "")
         .await
-        .map_err(|e| format!("asking polkit about {}: {e}", action.id()))?;
+        .map_err(|e| {
+            // Building the proxy asks nothing of the bus: polkit's absence shows here.
+            if e.to_string().contains("ServiceUnknown") {
+                "polkit is not on this bus, so only root can be authorized; run the command as root"
+                    .to_string()
+            } else {
+                format!("asking polkit about {}: {e}", action.id())
+            }
+        })?;
     if authorized {
         return Ok(());
     }
