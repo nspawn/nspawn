@@ -301,14 +301,14 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
     let manager = &client.manager;
     // A pulled image is a machine, so --rm would remove the image too and the next run
     // would download it again: it is pulled under its own name and kept, and the machine
-    // is made from it, unless another image has that name.
+    // is made from it, when that name is free. A machine of that name, stopped or not,
+    // is somebody's: it is neither replaced (--pull always) nor given another mode.
     let base = image.local_name();
     let keep_image = args.rm
         && matches!(source, Source::Registry)
         && base != name
-        && images
-            .iter()
-            .all(|(n, r)| n != &base || r == &image.to_string());
+        && args.mode == ModeChoice::Auto
+        && images.iter().all(|(n, _)| n != &base);
     match source {
         Source::Local(source) => {
             client
@@ -325,14 +325,6 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
                 );
             }
             options.insert("name", Value::from(base.clone()));
-            // An older copy under that name is replaced (--pull always).
-            options.insert("force", Value::from(true));
-            if args.mode != ModeChoice::Auto {
-                options.insert(
-                    "mode",
-                    Value::from(format!("{:?}", args.mode).to_lowercase()),
-                );
-            }
             if args.no_verify {
                 options.insert("verify", Value::from(false));
             }
