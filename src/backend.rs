@@ -271,8 +271,8 @@ impl Assembler<'_> {
                     );
                 }
                 let unit_file = fs::remove_file(Path::new(UNIT_DIR).join(&unit)).is_ok();
-                let private =
-                    fs::remove_dir_all(self.store.machines_private_dir().join(name)).is_ok();
+                // An upper layer that cannot go is an error, not an orphan to leave behind.
+                let private = remove_dir_if_exists(&self.store.machines_private_dir().join(name))?;
                 remove_dir_if_exists(&mountpoint)? || unit_file || private
             }
             BackendChoice::Flat => remove_dir_if_exists(&self.machine_dir(name))?,
@@ -361,7 +361,15 @@ pub fn root_path(
                         .is_some_and(|n| n.starts_with("layer@"))
                 })
                 .collect();
-            layers.sort();
+            // By their number: layer@10 comes after layer@9, not between @1 and @2.
+            let number = |path: &PathBuf| {
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix("layer@"))
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .unwrap_or(0)
+            };
+            layers.sort_by_key(number);
             layers
                 .into_iter()
                 .rev()
@@ -842,14 +850,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
         let mstack = store.machines_dir.join("m.mstack");
-        for layer in ["layer@0", "layer@1"] {
+        for layer in ["layer@0", "layer@1", "layer@10", "layer@2"] {
             fs::create_dir_all(mstack.join(layer).join("bin")).unwrap();
             fs::write(mstack.join(layer).join("bin/sh"), layer).unwrap();
         }
         fs::create_dir_all(mstack.join("rw")).unwrap();
         assert_eq!(
             root_path(&store, "m", BackendChoice::Mstack, "bin/sh"),
-            Some(mstack.join("layer@1/bin/sh"))
+            Some(mstack.join("layer@10/bin/sh")),
+            "the layers are ordered by number, not by name"
         );
         assert_eq!(
             root_path(&store, "m", BackendChoice::Mstack, "bin/nope"),
