@@ -1009,6 +1009,10 @@ out=$($NSPAWN start $app -u nobody:nosuch 2>&1) && fail "an unknown group was ac
 echo "$out" | grep_q "unable to find group nosuch" || fail "the unknown group was not explained: $out"
 out=$($NSPAWN start $app -u nobody: 2>&1) && fail "an empty group was accepted"
 out=$($NSPAWN start $app --sysctl kernel.shmmax=1 2>&1) && fail "a sysctl beyond net.* was accepted"
+# A refused combination is not remembered: the next start without flags must work.
+out=$($NSPAWN start $app --network none --sysctl net.ipv4.ip_forward=1 -- /bin/sleep 300 2>&1) && fail "--sysctl was accepted with --network none"
+echo "$out" | grep_q "has none" || fail "the refused sysctl was not explained: $out"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['sysctls'] == {} and d['network'] != 'none', d" || fail "a refused start changed the record"
 # Everything back, and --privileged: the whole bounding set.
 $NSPAWN start $app --privileged --cap-drop none --cap-add none --read-only=false -u root -w / --tmpfs none --device none --dns none --dns-search none --add-host none --ulimit none --stop-signal "" --stop-timeout 10 --oom-score-adj 0 --sysctl none --hostname "" -- /bin/sleep 300 || fail "start with the flags taken back"
 [ "$(x hostname)" = "$app" ] || fail "--hostname \"\" did not restore the name: $(x hostname)"

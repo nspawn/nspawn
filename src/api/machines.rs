@@ -460,6 +460,12 @@ pub async fn prepare(
             "{name} is an app image, with nothing inside to configure a veth; use --network bridge or --network host"
         );
     }
+    if !record.tuning.sysctls.is_empty() && (record.mode != Mode::App || !bridged) {
+        bail!("--sysctl values are set in the network namespace nspawn makes for an app machine on a bridge network; {name} has none");
+    }
+    if record.backend == BackendChoice::Mstack && !record.tuning.secrets.is_empty() {
+        bail!("{name} runs under managed user namespaces (mstack), where secrets cannot be attached yet; pull it again with --backend overlay");
+    }
     check_interfaces(sd, store, config, name, &record, report).await?;
     let files = if bridged {
         let all = crate::api::network::all(store, config)?;
@@ -517,9 +523,6 @@ pub async fn prepare(
         store.record_image(&record)?;
         None
     };
-    if !record.tuning.sysctls.is_empty() && (record.mode != Mode::App || !bridged) {
-        bail!("--sysctl values are set in the network namespace nspawn makes for an app machine on a bridge network; {name} has none");
-    }
     // nspawn has no anonymous volumes: what the image expects a volume at lives in the
     // machine, and a recreate loses it.
     for path in &record.run.volumes {
@@ -604,9 +607,6 @@ pub async fn prepare(
         _ => None,
     };
     let managed_userns = record.backend == BackendChoice::Mstack;
-    if managed_userns && !record.tuning.secrets.is_empty() {
-        bail!("{name} runs under managed user namespaces (mstack), where secrets cannot be attached yet; pull it again with --backend overlay");
-    }
     binds.extend(crate::api::secrets::materialize(store, &record)?);
     if record.mode == Mode::App {
         binds.extend(crate::getent::shim(store, name, &record)?);
