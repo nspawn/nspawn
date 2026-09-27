@@ -236,6 +236,7 @@ pub fn put_tuning(options: &mut Options<'_>, t: crate::cli::TuningArgs) {
         ("cap_drop", t.cap_drop),
         ("tmpfs", t.tmpfs),
         ("devices", t.device),
+        ("interfaces", t.interface),
         ("dns", t.dns),
         ("dns_search", t.dns_search),
         ("extra_hosts", t.add_host),

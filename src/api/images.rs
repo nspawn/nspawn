@@ -182,6 +182,10 @@ pub async fn remove_machines(
                 Some(rec) => {
                     assembler.remove(name, rec.backend).await?;
                     store.remove_machine_files(name)?;
+                    crate::api::machines::return_interfaces(
+                        name,
+                        crate::api::machines::hook_interfaces(&rec),
+                    );
                     bridge::delete_netns(name);
                     store.remove_record(name)?;
                     crate::install::take_off_boot(sd, name, report).await;

@@ -457,6 +457,11 @@ pub struct TuningArgs {
     /// docker --device. Repeatable; "none" forgets them.
     #[arg(long, value_name = "HOST[:CONTAINER[:rwm]]")]
     pub device: Vec<String>,
+    /// A network interface of the host, moved into the machine while it runs and given
+    /// back when it stops: an ethernet one, or a wifi adapter with its whole phy; the
+    /// name is kept inside. Repeatable; "none" forgets them.
+    #[arg(long, value_name = "IFACE")]
+    pub interface: Vec<String>,
     /// DNS server for the machine, instead of the host's. Repeatable; "none" forgets
     /// them.
     #[arg(long, value_name = "IP")]
@@ -1044,6 +1049,20 @@ mod tests {
         assert_eq!(start.cpus, Some(0.5));
         assert_eq!(start.pids_limit, Some(100));
         assert_eq!(start.label, ["a=b"]);
+        let cli = Cli::try_parse_from([
+            "nspawn",
+            "start",
+            "kali",
+            "--interface",
+            "wlp11s0f3u2u3",
+            "--interface",
+            "eth1",
+        ])
+        .unwrap();
+        let Command::Start(start) = cli.command else {
+            panic!("not start");
+        };
+        assert_eq!(start.options.tuning.interface, ["wlp11s0f3u2u3", "eth1"]);
         for bad in [
             &["nspawn", "start", "web", "--restart", "bogus"][..],
             &["nspawn", "start", "web", "-m", "12q"][..],

@@ -178,6 +178,7 @@ pub fn record(r: &ImageRecord) -> Dict {
                     .collect::<Vec<_>>(),
             ),
         ),
+        ("interfaces".to_string(), strings(&r.tuning.interfaces)),
         (
             "dns".to_string(),
             strings(

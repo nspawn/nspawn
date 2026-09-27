@@ -727,6 +727,11 @@ pub fn withdraw_ports(record: &ImageRecord) -> Result<()> {
 }
 
 fn run(program: &str, args: &[&str]) -> Result<()> {
+    output(program, args).map(|_| ())
+}
+
+/// `run`, with what the program printed.
+fn output(program: &str, args: &[&str]) -> Result<String> {
     let output = Command::new(program)
         .args(args)
         .output()
@@ -738,7 +743,7 @@ fn run(program: &str, args: &[&str]) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn nft(script: &str) -> Result<()> {
@@ -983,6 +988,175 @@ pub fn delete_netns(name: &str) {
     if Path::new(&netns_path(name)).exists() {
         let _ = run("ip", &["netns", "del", &netns_name(name)]);
     }
+}
+
+/// Where the kernel lists the interfaces of the host's network namespace.
+pub const SYS_NET: &str = "/sys/class/net";
+
+/// The phy of a wireless interface, what a move between namespaces takes whole.
+pub fn wireless_phy(sys_net: &Path, iface: &str) -> Option<String> {
+    let name = fs::read_to_string(sys_net.join(iface).join("phy80211/name")).ok()?;
+    Some(name.trim().to_string())
+}
+
+/// Every interface of a phy, sorted.
+pub fn phy_interfaces(sys_net: &Path, phy: &str) -> Vec<String> {
+    let mut out: Vec<String> = fs::read_dir(sys_net)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            (wireless_phy(sys_net, &name)? == phy).then_some(name)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The bridge or bond the interface is a port of.
+pub fn master_of(sys_net: &Path, iface: &str) -> Option<String> {
+    let master = fs::read_link(sys_net.join(iface).join("master")).ok()?;
+    master.file_name()?.to_str().map(|s| s.to_string())
+}
+
+/// Whether the name is one of nspawn's own on the host: the bridge of a network
+/// (`bridge` is the default one's), or the host end of a machine's veth, systemd-nspawn's
+/// (ve-, vz-) included.
+pub fn nspawn_owned(iface: &str, bridge: &str) -> bool {
+    let veth_extra = iface
+        .strip_prefix("vb")
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    iface == bridge
+        || iface.starts_with("nsbr-")
+        || iface.starts_with("vb-")
+        || iface.starts_with("ve-")
+        || iface.starts_with("vz-")
+        || veth_extra
+}
+
+/// The interfaces of the host's IPv4 default routes, from /proc/net/route.
+pub fn default_route_interfaces(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 8 || fields[1] != "00000000" || fields[7] != "00000000" {
+            continue;
+        }
+        let up = u32::from_str_radix(fields[3], 16).is_ok_and(|flags| flags & 1 != 0);
+        if up && !out.iter().any(|i| i == fields[0]) {
+            out.push(fields[0].to_string());
+        }
+    }
+    out
+}
+
+/// The same for IPv6, from /proc/net/ipv6_route (the device last on each line; the
+/// unreachable default of a host without IPv6 sits on lo).
+pub fn default_route_interfaces_v6(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 10 || fields[1] != "00" || fields[0].bytes().any(|b| b != b'0') {
+            continue;
+        }
+        let dev = fields[9];
+        if dev != "lo" && !out.iter().any(|i| i == dev) {
+            out.push(dev.to_string());
+        }
+    }
+    out
+}
+
+/// Whether iw, which moves a phy between namespaces, is on the host.
+pub fn iw_available() -> bool {
+    Command::new("iw")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// The command that moves an interface, or the phy of a wireless one, into the
+/// namespace named after the machine.
+pub fn move_argv(iface: &str, phy: Option<&str>, name: &str) -> (&'static str, Vec<String>) {
+    let ns = netns_name(name);
+    match phy {
+        Some(phy) => (
+            "iw",
+            ["phy", phy, "set", "netns", "name", &ns]
+                .map(str::to_string)
+                .to_vec(),
+        ),
+        None => (
+            "ip",
+            ["link", "set", iface, "netns", &ns]
+                .map(str::to_string)
+                .to_vec(),
+        ),
+    }
+}
+
+/// The command that gives it back to the host's namespace, PID 1's, from inside the
+/// machine's, where the phy is only reachable.
+pub fn return_argv(iface: &str, phy: Option<&str>, name: &str) -> (&'static str, Vec<String>) {
+    let ns = netns_name(name);
+    match phy {
+        Some(phy) => (
+            "ip",
+            ["netns", "exec", &ns, "iw", "phy", phy, "set", "netns", "1"]
+                .map(str::to_string)
+                .to_vec(),
+        ),
+        None => (
+            "ip",
+            ["-n", &ns, "link", "set", iface, "netns", "1"]
+                .map(str::to_string)
+                .to_vec(),
+        ),
+    }
+}
+
+/// Moves a host interface into the machine's namespace, made by `create_netns`: with
+/// rtnetlink, or through nl80211 for a wireless one, whose phy goes whole. It comes
+/// down and unconfigured on the other side, as the kernel moves it.
+pub fn move_interface(iface: &str, name: &str) -> Result<()> {
+    let phy = wireless_phy(Path::new(SYS_NET), iface);
+    let (program, args) = move_argv(iface, phy.as_deref(), name);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(program, &args)
+        .map_err(|e| match &phy {
+            Some(phy) if format!("{e:#}").contains("not supported") => e.context(format!(
+                "the driver of {phy} cannot move it to another namespace"
+            )),
+            _ => e,
+        })
+        .with_context(|| format!("moving {iface} into the network namespace of {name}"))
+}
+
+/// Gives an interface back to the host from the machine's namespace: whether it was
+/// there to give back (the kernel returns what a namespace held when the namespace
+/// dies, and a device may have been unplugged).
+pub fn return_interface(iface: &str, name: &str) -> Result<bool> {
+    if !Path::new(&netns_path(name)).exists() || Path::new(SYS_NET).join(iface).exists() {
+        return Ok(false);
+    }
+    let ns = netns_name(name);
+    if run("ip", &["-n", &ns, "link", "show", iface]).is_err() {
+        return Ok(false);
+    }
+    // The phy's name is only readable from inside: sysfs shows the interfaces of the
+    // namespace it was mounted in, which ip netns exec does.
+    let phy_file = format!("{SYS_NET}/{iface}/phy80211/name");
+    let phy = output("ip", &["netns", "exec", &ns, "cat", &phy_file])
+        .ok()
+        .map(|text| text.trim().to_string());
+    let (program, args) = return_argv(iface, phy.as_deref(), name);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(program, &args).with_context(|| format!("giving {iface} back to the host from {name}"))?;
+    Ok(true)
 }
 
 pub fn resolv_conf(dns: &[IpAddr], search: &[String]) -> String {
@@ -1751,6 +1925,105 @@ mod tests {
         assert_eq!(
             resolv_conf(&["10.0.0.53".parse().unwrap(), "2001:db8::1".parse().unwrap()], &["lan".into()]),
             "# Generated by nspawn; do not edit.\nnameserver 10.0.0.53\nnameserver 2001:db8::1\nsearch lan\n"
+        );
+    }
+
+    #[test]
+    fn host_interfaces_are_read_from_sysfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sys_net = tmp.path();
+        for (iface, phy) in [
+            ("wlan0", Some("phy0")),
+            ("wlan1", Some("phy0")),
+            ("wlan2", Some("phy1")),
+            ("eth0", None),
+        ] {
+            let dir = sys_net.join(iface);
+            fs::create_dir_all(&dir).unwrap();
+            if let Some(phy) = phy {
+                fs::create_dir_all(dir.join("phy80211")).unwrap();
+                fs::write(dir.join("phy80211/name"), format!("{phy}\n")).unwrap();
+            }
+        }
+        std::os::unix::fs::symlink("../../br0", sys_net.join("eth0/master")).unwrap();
+        assert_eq!(wireless_phy(sys_net, "wlan0").as_deref(), Some("phy0"));
+        assert_eq!(wireless_phy(sys_net, "eth0"), None);
+        assert_eq!(wireless_phy(sys_net, "missing"), None);
+        assert_eq!(phy_interfaces(sys_net, "phy0"), ["wlan0", "wlan1"]);
+        assert_eq!(phy_interfaces(sys_net, "phy1"), ["wlan2"]);
+        assert!(phy_interfaces(sys_net, "phy2").is_empty());
+        assert_eq!(master_of(sys_net, "eth0").as_deref(), Some("br0"));
+        assert_eq!(master_of(sys_net, "wlan0"), None);
+    }
+
+    #[test]
+    fn nspawn_s_own_interfaces_are_known_by_name() {
+        for own in [
+            "nspawn0",
+            "nsbr-front",
+            "nsbr-a1b2c3",
+            "vb-web",
+            "vb1-web",
+            "vb12-web",
+            "ve-fedora",
+            "vz-zone",
+        ] {
+            assert!(nspawn_owned(own, "nspawn0"), "{own}");
+        }
+        for other in [
+            "eth0",
+            "wlan0",
+            "vbox0",
+            "vb",
+            "veth0",
+            "vzz",
+            "br-nspawn",
+            "nspawn1",
+        ] {
+            assert!(!nspawn_owned(other, "nspawn0"), "{other}");
+        }
+        assert!(nspawn_owned("br-nspawn", "br-nspawn"));
+    }
+
+    #[test]
+    fn default_routes_are_read_from_proc() {
+        let v4 =
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+wlp3s0\t00000000\t0102A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+eth0\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n\
+wlp3s0\t00000000\t0102A8C0\t0003\t0\t0\t700\t00000000\t0\t0\t0\n\
+nspawn0\t00630A0A\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n\
+eth0\t00000000\t0000000A\t0002\t0\t0\t0\t00000000\t0\t0\t0\n";
+        assert_eq!(default_route_interfaces(v4), ["wlp3s0", "eth0"]);
+        assert!(default_route_interfaces("Iface\tDestination\n").is_empty());
+        let v6 = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000258 00000001 00000000 00000003 wlp3s0\n\
+fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 wlp3s0\n\
+00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo\n\
+ff000000000000000000000000000000 08 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 eth0\n";
+        assert_eq!(default_route_interfaces_v6(v6), ["wlp3s0"]);
+    }
+
+    #[test]
+    fn an_interface_moves_by_its_name_and_a_phy_by_its_own() {
+        let strs = |(program, args): (&'static str, Vec<String>)| (program, args.join(" "));
+        assert_eq!(
+            strs(move_argv("eth1", None, "web")),
+            ("ip", "link set eth1 netns nspawn-web".to_string())
+        );
+        assert_eq!(
+            strs(move_argv("wlan0", Some("phy0"), "kali")),
+            ("iw", "phy phy0 set netns name nspawn-kali".to_string())
+        );
+        assert_eq!(
+            strs(return_argv("eth1", None, "web")),
+            ("ip", "-n nspawn-web link set eth1 netns 1".to_string())
+        );
+        assert_eq!(
+            strs(return_argv("wlan0", Some("phy0"), "kali")),
+            (
+                "ip",
+                "netns exec nspawn-kali iw phy phy0 set netns 1".to_string()
+            )
         );
     }
 

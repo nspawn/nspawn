@@ -27,7 +27,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `policy.rs` | restart policies and resource limits (`--restart`, `-m`, `--cpus`, `--pids-limit`), written into the hook drop-in |
 | `health.rs` | healthchecks: the image's or the flags', the probe runner (`health-run`, a transient unit bound to the machine's), its verdict under `/run/nspawn/health` |
 | `api/secrets.rs` | secrets: systemd-creds around them, their files under the state directory, decrypted into a root-only tmpfs for a running machine and bind-mounted read-only |
-| `tuning.rs` | docker's other per-container flags (hostname, user, capabilities, tmpfs, devices, dns, ulimits, signals, sysctls): parsing, and the settings and unit lines they become |
+| `tuning.rs` | docker's other per-container flags (hostname, user, capabilities, tmpfs, devices, dns, ulimits, signals, sysctls) and `--interface`: parsing, and the settings and unit lines they become |
 | `getent.rs` | the getent stand-in bound into an app that runs as a user |
 | `bridge.rs`, `hostnet.rs` | the nspawn0 bridge, ports, firewalls; veth mode |
 | `volume.rs`, `volmount.rs` | `-v` parsing; host-side mounts for mstack machines |
@@ -301,6 +301,28 @@ hands out a link-local address under a machine's name.
 
 `--network veth` keeps systemd-nspawn's own veth configured by systemd-networkd
 on the host; `--network host` shares the host's network.
+
+`--interface` (the record's `tuning.interfaces`) moves host interfaces into
+the machine. Where systemd-nspawn makes the namespace (booted machines, any
+`--network none` machine) they are `Interface=` lines of the settings file,
+next to `Bridge=` or `VirtualEthernet=yes` (any `[Network]` key replaces the
+template's command line, so the veth is asked for again), and systemd-nspawn
+moves them in and back at exit. An app on the bridge joins a namespace nspawn
+made (`NamespacePath=` takes no `Interface=` beside it), so the ExecStartPre
+hook moves them in itself as the last thing it does (`bridge::move_interface`:
+`ip link set` for ethernet, `iw phy set netns` for wireless, whose phy moves
+whole) and `release`, `stop`, `start`'s own pass and `images rm` give them back
+(`return_interface`, run inside the namespace with `ip -n` or `ip netns exec`,
+the only place a moved phy is reachable from) before the namespace is deleted;
+the in-process pass of `start` checks but does not move, so that the device
+units the unit wants (`Wants=`/`After=sys-subsystem-net-devices-*.device`, for
+a USB adapter at boot) are still active when its start job is queued. The
+checks (`machines::check_interfaces`) run in both passes before the record is
+written: another running machine naming the interface, the interface on the
+host (with a 3 s grace for one a dead namespace has not given back yet),
+nspawn's own bridges and veth ends, a port of a bridge or bond, the default
+route (a warning), `iw` for a wireless one through the hooks and systemd 256
+for one through `Interface=`.
 
 ## Volumes
 

@@ -452,9 +452,17 @@ pub async fn prepare(ctx: &Context, name: &str) -> Result<()> {
     let store = &ctx.store;
     let _lock = store.lock_for(Duration::from_secs(60)).await?;
     let record = store.load_image(name)?;
-    machines::prepare(sd, store, &ctx.config, name, record, &to_journal)
-        .await
-        .map(|_| ())
+    machines::prepare(
+        sd,
+        store,
+        &ctx.config,
+        name,
+        record,
+        machines::Pass::Hook,
+        &to_journal,
+    )
+    .await
+    .map(|_| ())
 }
 
 fn to_journal(event: Event) {

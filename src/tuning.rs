@@ -62,6 +62,9 @@ pub struct Tuning {
     pub shm_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<Device>,
+    /// Interfaces of the host moved into the machine while it runs, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dns: Vec<IpAddr>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -251,6 +254,7 @@ pub struct Overrides {
     pub tmpfs: Vec<String>,
     pub shm_size: Option<u64>,
     pub devices: Vec<String>,
+    pub interfaces: Vec<String>,
     pub dns: Vec<String>,
     pub dns_search: Vec<String>,
     pub extra_hosts: Vec<String>,
@@ -318,6 +322,13 @@ impl Overrides {
         }
         if !self.devices.is_empty() {
             t.devices = list(&self.devices, device)?;
+        }
+        if !self.interfaces.is_empty() {
+            let mut seen = std::collections::BTreeSet::new();
+            t.interfaces = list(&self.interfaces, interface_name)?
+                .into_iter()
+                .filter(|iface| seen.insert(iface.clone()))
+                .collect();
         }
         if !self.dns.is_empty() {
             t.dns = list(&self.dns, |s| {
@@ -409,6 +420,24 @@ fn reject_whitespace(flag: &str, text: &str) -> Result<()> {
         bail!("{flag} {text:?}: no whitespace");
     }
     Ok(())
+}
+
+/// An interface name as the kernel takes one: 1 to 15 bytes, no slash, colon or
+/// whitespace; not lo, which every machine has of its own.
+pub fn interface_name(text: &str) -> Result<String> {
+    if text.is_empty() || text.len() > 15 || text == "." || text == ".." {
+        bail!("--interface {text:?}: an interface name is 1 to 15 characters");
+    }
+    if text
+        .chars()
+        .any(|c| c == '/' || c == ':' || c.is_whitespace() || c.is_control())
+    {
+        bail!("--interface {text:?}: no slash, colon or whitespace in an interface name");
+    }
+    if text == "lo" {
+        bail!("--interface lo: every machine has a loopback of its own");
+    }
+    Ok(text.to_string())
 }
 
 /// A hostname (or a search domain) as the kernel takes it: labels of letters, digits and
@@ -582,6 +611,7 @@ mod tests {
             tmpfs: vec!["/run:size=64m".into(), "/tmp".into()],
             shm_size: Some(1 << 26),
             devices: vec!["/dev/null:/dev/nullo:r".into(), "/dev/dri".into()],
+            interfaces: vec!["wlan0".into(), "eth1".into(), "wlan0".into()],
             dns: vec!["10.0.0.53".into()],
             dns_search: vec!["example.org".into()],
             extra_hosts: vec!["db:10.1.1.1".into(), "gw=host-gateway".into()],
@@ -632,6 +662,7 @@ mod tests {
             t.unit_lines(),
             ["DeviceAllow=/dev/null r", "DeviceAllow=/dev/dri rwm"]
         );
+        assert_eq!(t.interfaces, ["wlan0", "eth1"], "once each, in order");
         assert_eq!(t.extra_hosts[1].ip, "host-gateway");
         assert_eq!(t.sysctls["net.ipv4.ip_forward"], "1");
         assert_eq!((t.user.as_deref(), t.stop_timeout), (Some("1000"), Some(2)));
@@ -648,12 +679,14 @@ mod tests {
         // "none" clears a list, a flag given empties an option, the rest stays.
         let cleared = Overrides {
             cap_add: vec!["none".into()],
+            interfaces: vec!["none".into()],
             hostname: Some(String::new()),
             privileged: Some(true),
             ..Overrides::default()
         };
         cleared.apply(&mut t).unwrap();
         assert!(t.cap_add.is_empty() && t.hostname.is_none() && t.privileged);
+        assert!(t.interfaces.is_empty());
         assert_eq!(t.exec_lines()[0], "Capability=all");
         assert_eq!(t.tmpfs.len(), 2);
         // ALL on both sides keeps every capability, as docker reads it.
@@ -688,6 +721,14 @@ mod tests {
             ("tmpfs", "/x:size=1m\nBind=/:/host"),
             ("device", "/etc/passwd:/x"),
             ("device", "/dev/null:/x:q"),
+            ("interface", "lo"),
+            ("interface", ""),
+            ("interface", "."),
+            ("interface", "sixteen-chars-xx"),
+            ("interface", "a/b"),
+            ("interface", "a:b"),
+            ("interface", "wl an"),
+            ("interface", "wl\nan"),
             ("dns", "10.0.0"),
             ("host", "db"),
             ("host", "db:10.0.0"),
@@ -706,6 +747,7 @@ mod tests {
                 "cap" => flags.cap_add = vec![value.into()],
                 "tmpfs" => flags.tmpfs = vec![value.into()],
                 "device" => flags.devices = vec![value.into()],
+                "interface" => flags.interfaces = vec![value.into()],
                 "dns" => flags.dns = vec![value.into()],
                 "host" => flags.extra_hosts = vec![value.into()],
                 "ulimit" => flags.ulimits = vec![value.into()],

@@ -230,10 +230,11 @@ fn health_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::health::
 }
 
 /// docker's other flags: hostname, user, working_dir, stop_signal (s), cap_add,
-/// cap_drop, tmpfs, devices (HOST:CONTAINER:PERMISSIONS), dns, dns_search, extra_hosts
-/// (HOST:IP), ulimits (NAME=SOFT:HARD), sysctls (KEY=VALUE), secrets
-/// (NAME[:TARGET[:MODE[:UID:GID]]]) (as, "none" clears), privileged, read_only, init (b),
-/// shm_size, stop_timeout (t), oom_score_adj (i).
+/// cap_drop, tmpfs, devices (HOST:CONTAINER:PERMISSIONS), interfaces (host interfaces
+/// moved into the machine), dns, dns_search, extra_hosts (HOST:IP), ulimits
+/// (NAME=SOFT:HARD), sysctls (KEY=VALUE), secrets (NAME[:TARGET[:MODE[:UID:GID]]]) (as,
+/// "none" clears), privileged, read_only, init (b), shm_size, stop_timeout (t),
+/// oom_score_adj (i).
 fn tuning_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::tuning::Overrides> {
     Ok(crate::tuning::Overrides {
         hostname: options.string("hostname")?,
@@ -246,6 +247,7 @@ fn tuning_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::tuning::
         tmpfs: options.strings("tmpfs")?,
         shm_size: options.maybe_u64("shm_size")?,
         devices: options.strings("devices")?,
+        interfaces: options.strings("interfaces")?,
         dns: options.strings("dns")?,
         dns_search: options.strings("dns_search")?,
         extra_hosts: options.strings("extra_hosts")?,

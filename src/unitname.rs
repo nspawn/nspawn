@@ -1,15 +1,11 @@
 //! systemd unit name escaping, the same rules as `systemd-escape --path`.
 
-/// Escapes a filesystem path into a unit name prefix: "/var/lib/machines/x-y" becomes
-/// "var-lib-machines-x\x2dy".
-pub fn escape_path(path: &str) -> String {
-    let trimmed: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-    if trimmed.is_empty() {
-        return "-".to_string();
-    }
-    let joined = trimmed.join("/");
-    let mut out = String::with_capacity(joined.len() * 2);
-    for (i, b) in joined.bytes().enumerate() {
+/// Escapes a string into a unit name part, as `systemd-escape` does: "/" becomes "-",
+/// letters, digits, ":" and "_" stay, so does "." after the first byte, the rest is
+/// "\xNN".
+pub fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() * 2);
+    for (i, b) in text.bytes().enumerate() {
         let c = b as char;
         if c == '/' {
             out.push('-');
@@ -22,9 +18,24 @@ pub fn escape_path(path: &str) -> String {
     out
 }
 
+/// Escapes a filesystem path into a unit name prefix: "/var/lib/machines/x-y" becomes
+/// "var-lib-machines-x\x2dy".
+pub fn escape_path(path: &str) -> String {
+    let trimmed: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    if trimmed.is_empty() {
+        return "-".to_string();
+    }
+    escape(&trimmed.join("/"))
+}
+
 /// Name of the mount unit that mounts `path`.
 pub fn mount_unit_for(path: &str) -> String {
     format!("{}.mount", escape_path(path))
+}
+
+/// Name of the device unit udev keeps for a network interface of the host.
+pub fn device_unit_for(interface: &str) -> String {
+    format!("sys-subsystem-net-devices-{}.device", escape(interface))
 }
 
 #[cfg(test)]
@@ -50,5 +61,15 @@ mod tests {
             mount_unit_for("/var/lib/machines/e2e"),
             "var-lib-machines-e2e.mount"
         );
+        assert_eq!(
+            device_unit_for("wlp11s0f3u2u3"),
+            "sys-subsystem-net-devices-wlp11s0f3u2u3.device"
+        );
+        assert_eq!(
+            device_unit_for("e2e-dummy0"),
+            "sys-subsystem-net-devices-e2e\\x2ddummy0.device"
+        );
+        assert_eq!(escape("a.b_c:d"), "a.b_c:d");
+        assert_eq!(escape(".x"), "\\x2ex");
     }
 }

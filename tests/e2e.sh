@@ -73,10 +73,13 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
+  # The interfaces the --interface step makes, back on the host by now.
+  ip link del e2e-dummy0 >/dev/null 2>&1 || true
+  rmmod mac80211_hwsim >/dev/null 2>&1 || true
   $NSPAWN network rm e2e-na e2e-nb e2e-nc e2e-nd e2e-ne >/dev/null 2>&1 || true
   $NSPAWN secret rm e2e-pw e2e-pw2 >/dev/null 2>&1 || true
   rm -f /var/lib/nspawn/secrets/e2e-pw.cred /var/lib/nspawn/secrets/e2e-pw.json /var/lib/nspawn/secrets/e2e-pw2.cred /var/lib/nspawn/secrets/e2e-pw2.json
@@ -975,6 +978,107 @@ $NSPAWN stop $app || fail "stop the privileged machine"
 $NSPAWN start $app --privileged=false -- /bin/sleep 300 >/dev/null || fail "start with --privileged=false"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert not d['privileged'], d" || fail "--privileged=false did not take it back"
 $NSPAWN stop $app || fail "stop"
+
+step "--interface: a host interface inside the machine while it runs, back on the host when it stops"
+ip link add e2e-dummy0 type dummy || fail "make a dummy interface"
+ip link set e2e-dummy0 up && ip route add default dev e2e-dummy0 metric 9999 || fail "route through the dummy interface"
+# An app on the bridge: the hooks move it into the namespace nspawn prepares, so the
+# program finds it from its first instruction; a default route through it is a warning.
+out=$($NSPAWN start $app --interface e2e-dummy0 -- /bin/sh -c 'ip -o link show e2e-dummy0; exec /bin/sleep 300' 2>&1) || fail "start with --interface: $out"
+echo "$out" | grep_q "warning: e2e-dummy0 carries the host's default route" || fail "the default route through the interface was not warned about: $out"
+retry 10 bash -c "$NSPAWN logs $app | tr -d '\r' | grep -q 'e2e-dummy0: <'" || fail "the program did not find the interface inside from the start: $($NSPAWN logs $app 2>&1)"
+[ ! -e /sys/class/net/e2e-dummy0 ] || fail "the interface is still on the host while the machine runs"
+$NSPAWN exec $app -- ip -o link show e2e-dummy0 </dev/null | tr -d '\r' | grep_q "e2e-dummy0: <" || fail "the interface is not inside the running machine"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['interfaces'] == ['e2e-dummy0'], d" || fail "inspect does not show the interface"
+grep -q '^Wants=sys-subsystem-net-devices-e2e\\x2ddummy0.device' /etc/systemd/system/systemd-nspawn@$app.service.d/nspawn-hooks.conf || fail "the unit does not wait for the device: $(cat /etc/systemd/system/systemd-nspawn@$app.service.d/nspawn-hooks.conf)"
+grep -q "^Interface=" /etc/systemd/nspawn/$app.nspawn && fail "an app on the bridge got Interface= in its settings"
+$NSPAWN create $app e2e-phys-b --interface e2e-dummy0 -- /bin/sleep 300 >/dev/null || fail "create a second machine naming the interface"
+out=$($NSPAWN start e2e-phys-b 2>&1) && fail "a second machine took the interface of a running one"
+echo "$out" | grep_q "is set for $app, which is running" || fail "the refused second machine was not explained: $out"
+$NSPAWN stop $app >/dev/null || fail "stop the machine with the interface"
+[ -e /sys/class/net/e2e-dummy0 ] || fail "the interface did not come back to the host with stop"
+ip netns list | grep_q -E "^nspawn-$app( |$)" && fail "the namespace was left behind"
+# Killed, the release hook still gives it back: the namespace name keeps the namespace
+# alive until the hook is done with it.
+$NSPAWN start $app >/dev/null || fail "start again with the remembered interface"
+[ ! -e /sys/class/net/e2e-dummy0 ] || fail "the remembered interface was not moved on the second start"
+$NSPAWN stop $app --force >/dev/null || fail "stop --force the app with the interface"
+[ -e /sys/class/net/e2e-dummy0 ] || fail "the release hook did not give the interface back after stop --force"
+$NSPAWN start e2e-phys-b >/dev/null || fail "start the second machine once the first stopped"
+[ ! -e /sys/class/net/e2e-dummy0 ] || fail "the second machine did not take the interface"
+$NSPAWN rm -f e2e-phys-b >/dev/null || fail "rm -f the machine holding the interface"
+retry 5 test -e /sys/class/net/e2e-dummy0 || fail "rm -f did not give the interface back"
+# --network none: systemd-nspawn moves it itself (Interface=) and gives it back at exit.
+$NSPAWN start $app --network none --interface e2e-dummy0 -- /bin/sh -c 'ip -o link show e2e-dummy0; exec /bin/sleep 300' >/dev/null || fail "start with --network none and --interface"
+grep -q "^Interface=e2e-dummy0" /etc/systemd/nspawn/$app.nspawn || fail "the settings file lacks Interface=: $(cat /etc/systemd/nspawn/$app.nspawn)"
+retry 10 bash -c "$NSPAWN logs $app | tr -d '\r' | grep -q 'e2e-dummy0: <'" || fail "with --network none the program did not find the interface: $($NSPAWN logs $app 2>&1)"
+[ ! -e /sys/class/net/e2e-dummy0 ] || fail "with --network none the interface stayed on the host"
+$NSPAWN stop $app >/dev/null || fail "stop the --network none machine"
+retry 5 test -e /sys/class/net/e2e-dummy0 || fail "systemd-nspawn did not give the interface back"
+# A booted machine on the bridge: Interface= beside Bridge=; its own user namespace owns
+# the network namespace, so its root configures the interface.
+$NSPAWN pull "$IMAGE" --name e2e-phys-boot --backend overlay --force >/dev/null || fail "pull e2e-phys-boot"
+$NSPAWN start e2e-phys-boot --interface e2e-dummy0 >/dev/null || fail "start a booted machine with --interface"
+grep -q "^Bridge=" /etc/systemd/nspawn/e2e-phys-boot.nspawn && grep -q "^Interface=e2e-dummy0" /etc/systemd/nspawn/e2e-phys-boot.nspawn || fail "the booted machine's settings lack Bridge= with Interface=: $(cat /etc/systemd/nspawn/e2e-phys-boot.nspawn)"
+[ ! -e /sys/class/net/e2e-dummy0 ] || fail "the booted machine did not take the interface"
+$NSPAWN exec e2e-phys-boot -- ip link set e2e-dummy0 up </dev/null || fail "the booted machine cannot bring the interface up"
+$NSPAWN exec e2e-phys-boot -- ip -o link show e2e-dummy0 </dev/null | tr -d '\r' | grep_q ",UP" || fail "the interface is not up inside the booted machine: $($NSPAWN exec e2e-phys-boot -- ip -o link show e2e-dummy0 </dev/null 2>&1)"
+retry 10 bash -c "$NSPAWN exec e2e-phys-boot -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep -q ' 10.99.0.'" || fail "the booted machine lost its bridge address to the interface: $($NSPAWN exec e2e-phys-boot -- ip -4 -o addr show </dev/null 2>&1)"
+$NSPAWN stop e2e-phys-boot >/dev/null || fail "stop the booted machine"
+retry 5 test -e /sys/class/net/e2e-dummy0 || fail "the booted machine did not give the interface back"
+$NSPAWN start e2e-phys-boot >/dev/null || fail "start the booted machine again (the interface is remembered)"
+[ ! -e /sys/class/net/e2e-dummy0 ] || fail "the remembered interface was not moved on the second start"
+# Not stop --force here: killed, systemd-nspawn gives nothing back, and the kernel
+# destroys a virtual interface like this one with the namespace (a physical one and a
+# wifi phy come back to the host).
+$NSPAWN stop e2e-phys-boot >/dev/null || fail "stop the booted machine again"
+retry 5 test -e /sys/class/net/e2e-dummy0 || fail "the booted machine did not give the remembered interface back"
+$NSPAWN rm e2e-phys-boot >/dev/null || fail "rm e2e-phys-boot"
+# What is refused: names the kernel takes not, nspawn's own interfaces, one that is not
+# there, and machines without a namespace of their own.
+for bad in lo a/b nspawn0 e2e-missing0; do
+  out=$($NSPAWN start $app --network bridge --interface $bad -- /bin/sleep 1 2>&1) && fail "--interface $bad was accepted"
+done
+echo "$out" | grep_q "is not on the host" || fail "a missing interface was not explained: $out"
+out=$($NSPAWN start $app --network host --interface e2e-dummy0 -- /bin/sleep 1 2>&1) && fail "--interface was accepted with --network host"
+echo "$out" | grep_q "shares the host's network" || fail "--network host was not explained: $out"
+$NSPAWN start $app --network bridge --interface none -- /bin/sleep 300 >/dev/null || fail "start with --interface none"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['interfaces'] == [], d" || fail "--interface none did not forget the interface"
+[ -e /sys/class/net/e2e-dummy0 ] || fail "--interface none still moved the interface"
+$NSPAWN create $app e2e-phys-b --network container:$app --interface e2e-dummy0 -- /bin/sleep 1 >/dev/null || fail "create with container: and --interface"
+out=$($NSPAWN start e2e-phys-b 2>&1) && fail "--interface was accepted with --network container:"
+echo "$out" | grep_q "give the interface to $app" || fail "--network container: was not explained: $out"
+$NSPAWN rm e2e-phys-b >/dev/null || fail "rm e2e-phys-b"
+$NSPAWN stop $app >/dev/null || fail "stop"
+ip link del e2e-dummy0 || fail "delete the dummy interface"
+# A wireless interface moves with its whole phy: iw on the host for an app on the
+# bridge, systemd-nspawn itself since 256 where it makes the namespace.
+if modprobe mac80211_hwsim radios=1 2>/dev/null; then
+  wl=$(ls /sys/devices/virtual/mac80211_hwsim/hwsim0/net/ | head -n 1)
+  phy=$(cat /sys/class/net/$wl/phy80211/name)
+  [ -n "$wl" ] && [ -n "$phy" ] || fail "no interface of the simulated radio: $wl $phy"
+  $NSPAWN start $app --interface $wl -- /bin/sh -c "cat /sys/class/net/$wl/phy80211/name; exec /bin/sleep 300" >/dev/null || fail "start with a wireless interface"
+  retry 10 bash -c "$NSPAWN logs $app | tr -d '\r' | grep -qx '$phy'" || fail "the phy is not inside the app: $($NSPAWN logs $app 2>&1)"
+  [ ! -e /sys/class/net/$wl ] || fail "the wireless interface stayed on the host"
+  $NSPAWN stop $app >/dev/null || fail "stop the app with the wireless interface"
+  retry 5 test -e /sys/class/net/$wl || fail "the wireless interface did not come back"
+  [ "$(cat /sys/class/net/$wl/phy80211/name)" = "$phy" ] || fail "the wireless interface came back on another phy: $(cat /sys/class/net/$wl/phy80211/name)"
+  if [ "$systemd_major" -ge 256 ]; then
+    $NSPAWN start $app --network none --interface $wl -- /bin/sh -c "cat /sys/class/net/$wl/phy80211/name; exec /bin/sleep 300" >/dev/null || fail "start with a wireless interface through Interface="
+    retry 10 bash -c "$NSPAWN logs $app | tr -d '\r' | grep -qx '$phy'" || fail "the phy is not inside through Interface=: $($NSPAWN logs $app 2>&1)"
+    [ ! -e /sys/class/net/$wl ] || fail "through Interface= the wireless interface stayed on the host"
+    $NSPAWN stop $app >/dev/null || fail "stop the --network none machine with the wireless interface"
+    retry 5 test -e /sys/class/net/$wl || fail "systemd-nspawn did not give the wireless interface back"
+  else
+    out=$($NSPAWN start $app --network none --interface $wl -- /bin/sleep 1 2>&1) && fail "a wireless interface through Interface= was accepted on systemd $systemd_major"
+    echo "$out" | grep_q "takes systemd 256 or newer" || fail "the systemd version was not explained: $out"
+  fi
+  $NSPAWN start $app --network bridge --interface none -- /bin/sleep 300 >/dev/null || fail "forget the wireless interface"
+  $NSPAWN stop $app >/dev/null || fail "stop"
+  rmmod mac80211_hwsim || fail "unload mac80211_hwsim"
+else
+  echo "mac80211_hwsim cannot be loaded here: the wireless part is skipped"
+fi
 
 hooks=/etc/systemd/system/systemd-nspawn@$app.service.d/nspawn-hooks.conf
 step "restart policy on-failure: a killed program comes back with its network, stop keeps it down"

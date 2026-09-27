@@ -42,7 +42,9 @@ the shells; `man nspawn` is the same reference the packages install.
   `--restart`, `-m`, `--cpus`, `--pids-limit`, the `--health-*` flags, `--secret`,
   `--label`, `--hostname`, `-u`, `-w`, `--cap-add`, `--cap-drop`, `--privileged`,
   `--read-only`, `--tmpfs`, `--device`, `--dns`, `--add-host`, `--ulimit`,
-  `--stop-signal` and the rest, remembered per machine; `update` changes the limits,
+  `--stop-signal` and the rest, remembered per machine, and `--interface` hands a
+  machine a network interface of the host, a wifi adapter with its phy included;
+  `update` changes the limits,
   the policy and the healthcheck of a machine, running or not; `exec`, `logs`,
   `events`, `cp`, `kill`, `pause`, `top`, `stats` and `inspect` behave as docker's.
   Named volumes are seeded from the image and outlive the machines that use them;
@@ -81,7 +83,9 @@ the bus interface, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) how it is bu
   `logs` and `cp` fail. A binary installed by hand needs the label as well, which
   `daemon --install` points out.
 - `ip` and `nft` on the host (iproute2 and nftables). `--network veth` needs
-  systemd-networkd; `shell` on a booted machine needs D-Bus inside it, `exec` nothing.
+  systemd-networkd; `--interface` with a wifi adapter needs `iw` for an app on the
+  bridge and systemd 256 for a booted machine; `shell` on a booted machine needs D-Bus
+  inside it, `exec` nothing.
 
 ## Development
 

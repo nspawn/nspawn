@@ -244,6 +244,165 @@ pub async fn unit_busy(sd: &Systemd, name: &str) -> Result<Option<String>> {
     })
 }
 
+/// Where the host interfaces of --interface go: into the settings file, for
+/// systemd-nspawn to move where it makes the machine's network namespace, or moved by
+/// the hooks into the namespace nspawn prepares for an app on the bridge, which
+/// NamespacePath= hands over with no room for Interface= beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterfaceRoute {
+    Settings,
+    Hooks,
+}
+
+pub fn interface_route(record: &ImageRecord) -> InterfaceRoute {
+    if record.mode == Mode::App && bridge::bridge_kind(record) {
+        InterfaceRoute::Hooks
+    } else {
+        InterfaceRoute::Settings
+    }
+}
+
+/// The interfaces the hooks move for a machine: none where systemd-nspawn moves them.
+pub fn hook_interfaces(record: &ImageRecord) -> &[String] {
+    match interface_route(record) {
+        InterfaceRoute::Hooks => &record.tuning.interfaces,
+        InterfaceRoute::Settings => &[],
+    }
+}
+
+/// Moves the machine's interfaces into its namespace; on a failure what was moved by
+/// then comes back.
+fn move_interfaces(name: &str, interfaces: &[String]) -> Result<()> {
+    for (i, iface) in interfaces.iter().enumerate() {
+        if let Err(e) = bridge::move_interface(iface, name) {
+            return_interfaces(name, &interfaces[..i]);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// Gives the machine's interfaces back to the host, best effort: one it holds no more
+/// is skipped, a failure is a warning, so that the rest of a release goes on.
+pub fn return_interfaces(name: &str, interfaces: &[String]) {
+    for iface in interfaces {
+        if let Err(e) = bridge::return_interface(iface, name) {
+            eprintln!("warning: {e:#}");
+        }
+    }
+}
+
+/// What --interface asks of the host, checked before anything is made: the machine has
+/// a network namespace of its own, each interface is on the host and nspawn's to give,
+/// no running machine names it, and the host can move it.
+async fn check_interfaces(
+    sd: &Systemd,
+    store: &Store,
+    config: &Config,
+    name: &str,
+    record: &ImageRecord,
+    report: Report<'_>,
+) -> Result<()> {
+    let interfaces = &record.tuning.interfaces;
+    let Some(first) = interfaces.first() else {
+        return Ok(());
+    };
+    if record.network == Network::Host {
+        bail!("{name} shares the host's network, where {first} is already; --interface is for a machine with a network namespace of its own");
+    }
+    if let Some(owner) = bridge::shares_network(record) {
+        bail!("{name} shares the network namespace of {owner}; give the interface to {owner} (nspawn start {owner} --interface {first})");
+    }
+    if record.backend == BackendChoice::Mstack {
+        bail!("{name} runs under managed user namespaces (mstack), where a host interface cannot be moved in; pull it again with --backend overlay");
+    }
+    let route = interface_route(record);
+    let sys_net = Path::new(bridge::SYS_NET);
+    let others = store.list_images()?;
+    for iface in interfaces {
+        for other in others
+            .iter()
+            .filter(|o| o.name != name && o.tuning.interfaces.contains(iface))
+        {
+            if store.is_starting(&other.name) || sd.machine_exists(&other.name).await? {
+                bail!(
+                    "{iface} is set for {}, which is running; stop it first, or start it with --interface none",
+                    other.name
+                );
+            }
+        }
+        // A namespace that just died gives its interfaces back a moment later.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !sys_net.join(iface).exists() {
+            if Instant::now() > deadline {
+                bail!("{iface} is not on the host (ip link lists what is); a machine that ended a moment ago may still have it");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if bridge::nspawn_owned(iface, &config.bridge) {
+            bail!("{iface} is a bridge or a veth end of nspawn's own; it stays on the host");
+        }
+        if let Some(master) = bridge::master_of(sys_net, iface) {
+            bail!("{iface} is a port of {master}; take it off it first (ip link set {iface} nomaster)");
+        }
+        let v4 = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
+        let v6 = std::fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default();
+        if bridge::default_route_interfaces(&v4).contains(iface)
+            || bridge::default_route_interfaces_v6(&v6).contains(iface)
+        {
+            note(
+                report,
+                format!("warning: {iface} carries the host's default route; the host loses it while {name} runs"),
+            );
+        }
+        if let Some(phy) = bridge::wireless_phy(sys_net, iface) {
+            match route {
+                InterfaceRoute::Hooks => {
+                    if !bridge::iw_available() {
+                        bail!("iw is needed to move a wireless interface ({iface} is one); install it");
+                    }
+                }
+                InterfaceRoute::Settings => {
+                    let version = sd.version().await?;
+                    if crate::backend::systemd_major(&version)
+                        .is_none_or(|major| major < settings::WIRELESS_INTERFACE_SINCE)
+                    {
+                        bail!(
+                            "moving a wireless interface into a booted machine, or one without a network, takes systemd {} or newer; this host runs {version}; an app machine on the bridge can take {iface} on any version",
+                            settings::WIRELESS_INTERFACE_SINCE
+                        );
+                    }
+                }
+            }
+            let others: Vec<String> = bridge::phy_interfaces(sys_net, &phy)
+                .into_iter()
+                .filter(|i| i != iface && !interfaces.contains(i))
+                .collect();
+            if !others.is_empty() {
+                note(
+                    report,
+                    format!(
+                        "note: {phy} carries {} too, which move with {iface}: a phy moves whole",
+                        others.join(", ")
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Who calls `prepare`: both passes do the same checks and write the same files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pass {
+    /// `start`, ahead of the unit, so that a refusal reaches the caller.
+    Ahead,
+    /// The unit's ExecStartPre, right before systemd-nspawn: the only pass that moves
+    /// host interfaces in, so that their device units are still active when the unit's
+    /// start job is queued (it waits for them), and so that they move once per start.
+    Hook,
+}
+
 /// Everything a machine needs before its unit starts. Shared by `start` and the
 /// ExecStartPre hook, so idempotent; the caller holds the store lock.
 pub async fn prepare(
@@ -252,6 +411,7 @@ pub async fn prepare(
     config: &Config,
     name: &str,
     record: Option<ImageRecord>,
+    pass: Pass,
     report: Report<'_>,
 ) -> Result<Network> {
     let Some(mut record) = record else {
@@ -262,6 +422,9 @@ pub async fn prepare(
     // A new run: the marks `kill` and `stop` left for the last one go.
     store.take_exit_on_next(name)?;
     store.forget_signal(name)?;
+    // A run that ended without its release hook may have left them in a namespace
+    // this pass makes anew.
+    return_interfaces(name, hook_interfaces(&record));
     let bridged = bridge::bridge_kind(&record);
     if bridged && record.mode == Mode::App && record.backend == BackendChoice::Mstack {
         bail!(
@@ -297,6 +460,7 @@ pub async fn prepare(
             "{name} is an app image, with nothing inside to configure a veth; use --network bridge or --network host"
         );
     }
+    check_interfaces(sd, store, config, name, &record, report).await?;
     let files = if bridged {
         let all = crate::api::network::all(store, config)?;
         let nets = crate::api::network::nets_of(store, config, &record)?;
@@ -546,6 +710,10 @@ pub async fn prepare(
     if record.network == Network::Veth {
         hostnet::ensure_networkd(sd, report).await?;
     }
+    // Last: nothing that could fail is left to leave an interface in the namespace.
+    if pass == Pass::Hook {
+        move_interfaces(name, hook_interfaces(&record))?;
+    }
     Ok(record.network)
 }
 
@@ -734,7 +902,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     }
     let booted = record.as_ref().is_none_or(|r| r.mode == Mode::Boot);
     let policy = record.as_ref().map(|r| r.restart);
-    let network = prepare(sd, store, config, &args.name, record, report).await?;
+    let network = prepare(sd, store, config, &args.name, record, Pass::Ahead, report).await?;
     // The unit's own hooks take the lock; it must be free while the unit starts.
     drop(lock);
     // always and unless-stopped enable the unit, as machinectl enable does. It is only
@@ -1007,8 +1175,14 @@ fn read_process(pid: u32, shift: u32) -> Option<Process> {
     })
 }
 
-/// The network namespace and published ports of a machine that ended. Safe to repeat.
+/// The host interfaces, network namespace and published ports of a machine that ended.
+/// Safe to repeat.
 pub fn release_machine(name: &str, record: Option<&ImageRecord>) -> Result<()> {
+    if let Some(record) = record {
+        // Before the namespace goes: the kernel would give them back on its own, a
+        // moment later and renamed when their names are taken by then.
+        return_interfaces(name, hook_interfaces(record));
+    }
     if record.map(|r| r.network) == Some(Network::Bridge) {
         bridge::delete_netns(name);
         record.map(bridge::withdraw_ports).transpose()?;
@@ -1742,6 +1916,38 @@ pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interfaces_go_through_the_hooks_for_an_app_on_the_bridge_alone() {
+        let record = |mode: &str, network: &str, no_network: bool, container: Option<&str>| {
+            let mut r: ImageRecord = serde_json::from_str(&format!(
+                r#"{{"name": "kali", "reference": "r", "manifest_digest": "d", "layers": [], "backend": "overlay", "created": 0, "mode": "{mode}", "network": "{network}", "no_network": {no_network}}}"#
+            ))
+            .unwrap();
+            r.network_container = container.map(str::to_string);
+            r.tuning.interfaces = vec!["wlan0".to_string()];
+            r
+        };
+        let app = record("app", "bridge", false, None);
+        assert_eq!(interface_route(&app), InterfaceRoute::Hooks);
+        assert_eq!(hook_interfaces(&app), ["wlan0"]);
+        for (mode, network, no_network, container) in [
+            ("boot", "bridge", false, None),
+            ("boot", "veth", false, None),
+            ("app", "bridge", true, None),
+            ("boot", "bridge", true, None),
+            ("app", "host", false, None),
+            ("app", "bridge", false, Some("vpn")),
+        ] {
+            let r = record(mode, network, no_network, container);
+            assert_eq!(
+                interface_route(&r),
+                InterfaceRoute::Settings,
+                "{mode} {network} {no_network} {container:?}"
+            );
+            assert!(hook_interfaces(&r).is_empty());
+        }
+    }
 
     #[test]
     fn processes_are_collected_below_the_unit_cgroup() {

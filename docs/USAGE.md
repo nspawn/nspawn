@@ -121,8 +121,10 @@ ALL --cap-add NET_BIND_SERVICE` keeps that one, as with docker) and `--privilege
 HOST[:CONTAINER[:rwm]]`, `--dns` and `--dns-search`, `--add-host HOST:IP` (with
 `host-gateway`), `--ulimit NAME=SOFT[:HARD]`, `--oom-score-adj`, `--stop-signal` and
 `--stop-timeout` (what `stop` uses unless `-t` says otherwise), `--init` (accepted; the
-stub init reaps anyway) and `--sysctl` (`net.*` keys, set in an app machine's network
-namespace). A `--tmpfs` that lands on `/run` (`/var/run` in most images) is left out
+stub init reaps anyway), `--sysctl` (`net.*` keys, set in an app machine's network
+namespace) and `--interface IFACE`, which has no docker counterpart: a network
+interface of the host moved into the machine while it runs (see "Physical
+interfaces" under Networking). A `--tmpfs` that lands on `/run` (`/var/run` in most images) is left out
 with a note: `/run` is a tmpfs of every machine already. `--hostname` reaches a booted
 machine as its `/etc/hostname`. Each becomes a line of the machine's settings file or of its unit; `inspect`
 shows them all. A path the image declares as a volume and nothing is mounted over gets a
@@ -400,3 +402,53 @@ systemd-nspawn setup: a virtual ethernet pair configured by systemd-networkd on 
 through `80-container-ve.network`. In that mode `start` activates systemd-networkd when
 the host has no `.network` files of its own and refuses with an explanation otherwise,
 and binds `ve-<name>` to firewalld's trusted zone while the machine runs.
+
+### Physical interfaces
+
+`--interface IFACE` on `run`, `create` and `start` gives a machine a network interface
+of the host, whole: a second ethernet port, or a wifi adapter for a machine doing
+wireless work, which `--device` cannot do (a network interface is not a node under
+`/dev`) and `--network host` cannot either (the machines run in a user namespace, which
+may not configure the host's interfaces). The interface is moved into the machine's
+network namespace before its program or init runs and is back on the host when the
+machine stops or is removed, with its name kept on both sides, as systemd-nspawn's
+`Interface=` and LXC's `phys` type do it. It arrives down and unconfigured, as the
+kernel moves it: the machine brings it up and configures it, with `ip` in an app or its
+systemd-networkd in a booted machine. `--interface` is repeatable and remembered like
+the other flags; `--interface none` forgets them; `inspect` lists them as
+`interfaces`.
+
+Where systemd-nspawn makes the machine's network namespace (a booted machine, on the
+bridge or with veth, and any machine with `--network none`) the interface goes into the
+machine's settings file as `Interface=` and systemd-nspawn moves it at start and back
+at exit. An app machine on a bridge network gets its namespace from nspawn itself
+(`NamespacePath=`, which allows no `Interface=` beside it), so the unit's hooks move the
+interface in with `ip` before systemd-nspawn runs and give it back after; such an app
+runs without a user namespace, so `iw reg set` and monitor mode work inside as on the
+host. Either way the unit wants and waits for the interface's device unit, so that a
+machine started at boot waits for a USB adapter udev has not seen yet.
+
+A wifi adapter cannot leave its phy, so the phy moves whole, every interface it carries
+with it (nspawn says which), and a driver without namespace support (`ath6kl`,
+`wilc1000`) refuses the move naming the phy. An app on the bridge takes a wireless
+interface on any systemd, through `iw`, which has to be installed; `Interface=` moves a
+phy since systemd 256, so on an older host a wireless interface is refused for a
+booted machine or one with `--network none`, with a message that says so. Regulatory
+domain (`iw reg set`) and rfkill are host-wide: they are set on the host, or from an
+app on the bridge; `--device /dev/rfkill` hands the switch to such an app.
+
+One machine at a time takes an interface: a second one naming it is refused while the
+first runs (`stop` it, or start it with `--interface none`). Refused as well: `lo`, the
+bridges and veth ends of nspawn's own, a port of a bridge or bond (take it off with
+`ip link set IFACE nomaster` first), a name that is not on the host (a machine that
+ended a moment ago may still hold it: the kernel gives interfaces back a little after
+their namespace dies), a machine with `--network host` (it is on the host's interfaces
+already), one with `--network container:NAME` (give the interface to NAME) and the
+mstack backend. The interface of the host's default route is allowed with a warning,
+since the host loses its route while the machine runs. When the interface comes back,
+NetworkManager or systemd-networkd manage it again as before, and a name taken on the
+host in the meantime makes the kernel rename it (`dev0`, `wlan0`). `stop --force` kills
+the machine: an app on the bridge still gets every interface back from its release
+hook, while a machine that took them through `Interface=` may not get to give them
+back, and the kernel then returns a physical interface or a wifi phy a moment later
+and destroys a virtual one (a VLAN, a macvlan, a dummy) with the namespace.
