@@ -35,7 +35,7 @@ pub const SCRIPT: &str = r#"#!/bin/sh
 group=''
 case "$1:$#" in
 passwd:2)
-    while IFS=: read -r name pw uid gid rest; do
+    while IFS=: read -r name pw uid gid rest || [ -n "$name" ]; do
         if [ "$name" = "$2" ] || [ "$uid" = "$2" ]; then
             printf '%s:%s:%s:%s:%s\n' "$name" "$pw" "$uid" "${group:-$gid}" "$rest"
             exit 0
@@ -52,14 +52,14 @@ initgroups:2)
         exit 0
     fi
     name=$2
-    while IFS=: read -r n pw uid gid rest; do
+    while IFS=: read -r n pw uid gid rest || [ -n "$n" ]; do
         if [ "$n" = "$2" ] || [ "$uid" = "$2" ]; then
             name=$n
             break
         fi
     done < /etc/passwd
     printf '%s' "$2"
-    while IFS=: read -r group pw gid members; do
+    while IFS=: read -r group pw gid members || [ -n "$group" ]; do
         case ",$members," in
         *",$name,"*) printf ' %s' "$gid" ;;
         esac
