@@ -1180,8 +1180,8 @@ fn read_process(pid: u32, shift: u32) -> Option<Process> {
     })
 }
 
-/// The host interfaces, network namespace and published ports of a machine that ended.
-/// Safe to repeat.
+/// The host interfaces, network namespace, published ports and decrypted secrets of a
+/// machine that ended. Safe to repeat.
 pub fn release_machine(name: &str, record: Option<&ImageRecord>) -> Result<()> {
     if let Some(record) = record {
         // Before the namespace goes: the kernel would give them back on its own, a
@@ -1192,6 +1192,8 @@ pub fn release_machine(name: &str, record: Option<&ImageRecord>) -> Result<()> {
         bridge::delete_netns(name);
         record.map(bridge::withdraw_ports).transpose()?;
     }
+    // A start that failed after decrypting them never ran the release hook.
+    crate::api::secrets::clear(name);
     Ok(())
 }
 
