@@ -271,6 +271,7 @@ pub async fn check(
             Ok(bundles) => bundles,
             Err(e) if policy.required => return Err(e),
             Err(e) => {
+                // The next subject may still carry one.
                 note(
                     report,
                     format!(
@@ -278,7 +279,7 @@ pub async fn check(
                         policy.registry
                     ),
                 );
-                return Ok(None);
+                continue;
             }
         };
         if !bundles.is_empty() {
@@ -420,8 +421,12 @@ fn verify_one(
                     &pk_policy,
                 ) {
                     Ok(result) => {
+                        // The key that verified, not the hint the bundle declares, which
+                        // nothing authenticates.
                         return Ok(Verified {
-                            signer: Signer::Key { hint: hint.clone() },
+                            signer: Signer::Key {
+                                hint: key.hint.clone(),
+                            },
                             time: result
                                 .integrated_time()
                                 .map(|t| t.as_second().max(0) as u64),
@@ -582,6 +587,21 @@ mod tests {
         let verified = verify_bundles(&identity_only, KALI_DIGEST, &candidates()).unwrap();
         assert_eq!(verified.len(), 1);
         assert!(matches!(verified[0].signer, Signer::Keyless { .. }));
+        // The hint a bundle declares is unauthenticated: what is recorded is the key
+        // that verified it.
+        let mut json: serde_json::Value = serde_json::from_str(KEY_BUNDLE).unwrap();
+        json["verificationMaterial"]["publicKey"]["hint"] = serde_json::Value::from("bogus");
+        let relabelled = vec![Candidate {
+            manifest_digest: candidates()[1].manifest_digest.clone(),
+            json: json.to_string(),
+        }];
+        let verified = verify_bundles(&keys_only, KALI_DIGEST, &relabelled).unwrap();
+        let expected = key_hint(&DerPublicKey::from_pem(HUB_KEY_PEM).unwrap());
+        assert!(
+            matches!(&verified[0].signer, Signer::Key { hint } if *hint == expected),
+            "{:?}",
+            verified[0].signer
+        );
     }
 
     #[test]
