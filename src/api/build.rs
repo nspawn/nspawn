@@ -233,9 +233,24 @@ async fn run_mkosi(mkosi: &Path, argv: &[String], report: Report<'_>) -> Result<
             .spawn()
             .with_context(|| format!("running {}", mkosi.display()))?
     };
-    let mut lines = BufReader::new(tokio::fs::File::from_std(fs::File::from(read))).lines();
-    while let Ok(Some(text)) = lines.next_line().await {
-        line(report, text);
+    // Byte by byte lines: one that is not UTF-8 (a package's scriptlet, a progress
+    // bar) must not end the reading, or mkosi blocks on the full pipe for ever.
+    let mut reader = BufReader::new(tokio::fs::File::from_std(fs::File::from(read)));
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&buf);
+                line(report, text.trim_end_matches(['\n', '\r']).to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                note(report, format!("warning: reading mkosi's output: {e}"));
+                break;
+            }
+        }
     }
     child.wait().await.context("waiting for mkosi")
 }
