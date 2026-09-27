@@ -164,7 +164,8 @@ there too, and so is what happened while nobody watched.
 `exec` enters the machine's namespaces for both kinds of machine, like docker exec: the
 exit code comes back, the image's environment applies and nothing is needed inside (no
 D-Bus, no PAM). The command runs with the machine's capabilities and resource limits,
-like its own processes. It attaches a terminal when standard input and output are one
+like its own processes; right after a start it waits, a few seconds at most, until
+systemd-nspawn has finished confining the machine. It attaches a terminal when standard input and output are one
 (`-t` and `-T` decide otherwise), so redirected output is byte-exact, and `-u USER[:GROUP]` takes
 names or numbers of the image's passwd and group files, with the home of the passwd
 entry and the user's supplementary groups unless a group is given, which is then the

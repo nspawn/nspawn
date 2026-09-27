@@ -964,14 +964,23 @@ pid=$(x 'cat /proc/1/task/1/children' | tr -d ' ')
 retry 5 bash -c "$NSPAWN logs $app -n 5 | tr -d '\r' | grep -qx /tmp" || fail "--workdir not applied: $($NSPAWN logs $app -n 5)"
 # --cap-drop ALL --cap-add X keeps X, as with docker: bit 10 is CAP_NET_BIND_SERVICE.
 [ "$(x 'awk "/^CapBnd:/ {print \$2}" /proc/1/status')" = 0000000000000400 ] || fail "--cap-drop ALL --cap-add NET_BIND_SERVICE left other capabilities: $(x 'grep CapBnd /proc/1/status')"
-# An app without a user namespace keeps the default set and CAP_SYS_BOOT, no more: the
-# bounding set of a docker container (CapBnd 00000000a80425fb, docker 29) plus bit 22,
-# and /proc/sys cannot be remounted writable; --cap-add SYS_ADMIN gives that back, a
-# booted machine keeps systemd-nspawn's set in its own user namespace.
+# An app without a user namespace keeps the default set and CAP_SYS_BOOT, no more
+# (CapBnd 00000000a84425fb), and /proc/sys cannot be remounted writable; --cap-add
+# SYS_ADMIN gives that back, a booted machine keeps systemd-nspawn's set in its own
+# user namespace.
 $NSPAWN create $app e2e-caps -- /bin/sleep 300 >/dev/null || fail "create e2e-caps"
 $NSPAWN start e2e-caps >/dev/null || fail "start e2e-caps"
 c() { $NSPAWN exec e2e-caps -- /bin/sh -c "$1" </dev/null 2>&1 | tr -d '\r'; }
-[ "$(c 'awk "/^CapBnd:/ {print \$2}" /proc/1/status')" = 00000000a84425fb ] || fail "an app on the bridge does not have the default set and CAP_SYS_BOOT: $(c 'grep CapBnd /proc/1/status')"
+out=$(c 'awk "/^CapBnd:/ {print \$2}" /proc/1/status')
+[ "$out" = 00000000a84425fb ] || fail "an app on the bridge does not have the default set and CAP_SYS_BOOT: $out"
+# systemd-nspawn reports a machine started before its child confines itself; exec waits
+# for that, so a command right after start has the machine's set every time.
+for i in 1 2 3 4 5; do
+  $NSPAWN stop e2e-caps >/dev/null || fail "stop e2e-caps ($i)"
+  $NSPAWN start e2e-caps >/dev/null || fail "start e2e-caps ($i)"
+  out=$(c 'awk "/^CapBnd:/ {print \$2}" /proc/self/status')
+  [ "$out" = 00000000a84425fb ] || fail "exec right after start ran with another bounding set ($i): $out"
+done
 grep -q "^SystemCallFilter=~kexec_load kexec_file_load" /etc/systemd/nspawn/e2e-caps.nspawn || fail "the kexec system calls are not filtered for an app: $(cat /etc/systemd/nspawn/e2e-caps.nspawn)"
 [ "$(c 'cat /proc/self/uid_map')" = "$(printf '         0          0 4294967295')" ] || fail "an app on the bridge is not in the initial user namespace: $(c 'cat /proc/self/uid_map')"
 c 'mount -o remount,rw /proc/sys' >/dev/null 2>&1 && fail "an app on the bridge remounted /proc/sys writable"

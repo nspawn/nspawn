@@ -1781,6 +1781,31 @@ fn payload_pid(leader: u32) -> Option<i32> {
     oldest.map(|(_, pid)| pid)
 }
 
+/// systemd-nspawn's child keeps the binary's name until it hands over to the stub init,
+/// which renames itself, or executes the machine's init: both come after it has dropped
+/// its capabilities and loaded its seccomp filter.
+fn in_nspawn_setup(comm: &str) -> bool {
+    comm.trim_end() == "systemd-nspawn"
+}
+
+/// systemd-nspawn reports a machine started once its child has mounted its file systems,
+/// before the child confines itself: a command entering the machine in between would take
+/// the child's capabilities instead of the machine's. Waits, within reason, for the rest.
+async fn wait_past_setup(machine: &str, leader: u32) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let comm = std::fs::read_to_string(format!("/proc/{leader}/comm"))
+            .with_context(|| format!("reading the name of the leader of {machine}"))?;
+        if !in_nspawn_setup(&comm) {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            bail!("{machine} is still being set up by systemd-nspawn; try again");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Parent PID and start time (field 22) of a /proc/PID/stat line, whose comm may hold
 /// spaces and parentheses.
 fn stat_ppid_and_start(stat: &str) -> Option<(u32, u64)> {
@@ -1821,6 +1846,7 @@ pub async fn spawn_in_namespaces(
     if sd.machine_leader(machine).await? != leader {
         bail!("machine {machine} changed while the command was being started; try again");
     }
+    wait_past_setup(machine, leader).await?;
     let user = if user == "root" || user.is_empty() {
         None
     } else {
@@ -1927,6 +1953,14 @@ pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nspawn_setup_by_the_leader_name() {
+        assert!(in_nspawn_setup("systemd-nspawn\n"));
+        assert!(!in_nspawn_setup("(sd-stubinit)\n"));
+        assert!(!in_nspawn_setup("systemd\n"));
+        assert!(!in_nspawn_setup("sh\n"));
+    }
 
     #[test]
     fn interfaces_go_through_the_hooks_for_an_app_on_the_bridge_alone() {
