@@ -86,6 +86,8 @@ files, and the machine units call nspawn back through drop-in hooks.
 /etc/nspawn/auth.json  registry credentials, 0600
 /run/nspawn/attach/NAME.sock  where an attached run waits for its machine's
                         systemd-nspawn (0700 directory)
+/run/nspawn/firewalld/NAME    the interfaces of a veth machine bound to
+                        firewalld's trusted zone, for the release hook to unbind
 ```
 
 Records are written through a temporary file and a rename. Garbage
@@ -306,7 +308,8 @@ machine's sysfs). `/etc/hosts` lists, for each network the machine joins, every
 member with its address there, its name and its aliases on that network (an
 alias several members share names the first of them by name), and
 `host.nspawn.internal`, the gateway of the machine's gateway network. With firewalld the
-bridges are bound to the trusted zone; with docker or ufw, accept rules go into
+bridges are bound to the trusted zone, and so is a veth machine's interface while it
+runs; with docker or ufw, accept rules go into
 DOCKER-USER or FORWARD. `network rm` undoes all of it for its bridge. The
 bridge is IPv4 only: it gets `addrgenmode none` and no `fe80::` address,
 host0 gets `LinkLocalAddressing=no` in its

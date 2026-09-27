@@ -122,7 +122,7 @@ with docker) and `--privileged`,
 `--read-only`, `--tmpfs PATH[:OPTIONS]`, `--shm-size`, `--device
 HOST[:CONTAINER[:rwm]]` (a node, or a directory such as `/dev/dri`, whose nodes are
 allowed one by one), `--dns` and `--dns-search`, `--add-host HOST:IP` or `HOST=IP` (with
-`host-gateway`; the second form for IPv6 addresses), `--ulimit NAME=SOFT[:HARD]`, `--oom-score-adj`, `--stop-signal` and
+`host-gateway`; the second form for IPv6 addresses), `--ulimit NAME=SOFT[:HARD]` (numbers or `unlimited`), `--oom-score-adj`, `--stop-signal` and
 `--stop-timeout` (what `stop` uses unless `-t` says otherwise), `--init` (accepted; the
 stub init reaps anyway), `--sysctl` (`net.*` keys, set in an app machine's network
 namespace) and `--interface IFACE`, which has no docker counterpart: a network
@@ -130,7 +130,9 @@ interface of the host moved into the machine while it runs (see "Physical
 interfaces" under Networking). A `--tmpfs` that lands on `/run` (`/var/run` in most images) is left out
 with a note: `/run` is a tmpfs of every machine already. `--hostname` reaches a booted
 machine as its `/etc/hostname`. Each becomes a line of the machine's settings file or of its unit; `inspect`
-shows them all. A path the image declares as a volume and nothing is mounted over gets a
+shows them all. A path inside the machine, the target of a volume or a secret, a
+`--tmpfs` or a `--device` path, must be plain: a `.` or `..` component is refused,
+since it would land elsewhere once mounted. A path the image declares as a volume and nothing is mounted over gets a
 note at start: nspawn has no anonymous volumes, so what is written there goes with the
 machine.
 
@@ -205,7 +207,8 @@ the name of the copy, and `DIR/.` copies the contents of DIR. What goes in belon
 root inside the machine, whatever user namespace it runs in; what comes out belongs to
 whoever ran `cp`, because the command line writes it. Paths inside the machine are
 resolved inside it, so a link there, absolute or not, never leads to the host; links
-are copied as links, and devices, sockets and fifos are left out. The service and the
+are copied as links, devices, sockets and fifos are left out, and so are the kernel's
+file systems mounted inside a running machine (`/proc`, `/sys` and the like). The service and the
 command line exchange a tar stream, as docker's API does. Where SELinux enforces, a host
 directory mounted with `-v` keeps its own label, which the service may not be allowed to
 write (docker needs `:z` for the same); named volumes are nspawn's and always work.
