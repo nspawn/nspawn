@@ -433,9 +433,8 @@ pub struct TuningArgs {
     /// Working directory of the program, instead of the image's.
     #[arg(long, short = 'w', value_name = "DIR")]
     pub workdir: Option<String>,
-    /// Capability to keep on top of the default set (NET_ADMIN, ALL): docker's and
-    /// SYS_BOOT for an app on a bridge network, systemd-nspawn's for a machine in a user
-    /// namespace.
+    /// Capability to keep on top of the default set (NET_ADMIN, ALL): the least an app
+    /// on a bridge network needs, systemd-nspawn's for a machine in a user namespace.
     /// Repeatable; "none" forgets them.
     #[arg(long, value_name = "CAP")]
     pub cap_add: Vec<String>,

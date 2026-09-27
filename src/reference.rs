@@ -67,8 +67,8 @@ impl ImageRef {
     }
 
     /// The reference as the registry client takes it, built from its parts: parsed from
-    /// its text, a registry without a dot or a port would pass for a repository of
-    /// Docker Hub.
+    /// its text, a registry without a dot or a port would pass for a repository of the
+    /// default registry of the client.
     pub fn to_oci(&self) -> Result<oci_client::Reference> {
         let reference = match (&self.digest, &self.tag) {
             (Some(digest), _) => oci_client::Reference::with_digest(

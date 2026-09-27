@@ -387,8 +387,8 @@ pub async fn run(ctx: &Context, name: &str) -> Result<()> {
         if !sd.machine_exists(name).await? {
             return Ok(());
         }
-        // Docker counts a probe by when it started: one that ends past the start period
-        // still belongs to it.
+        // A probe counts by when it started: one that ends past the start period still
+        // belongs to it.
         let in_start_period = started.elapsed() < hc.start_period();
         let probe = match probe(ctx, name, &argv, hc.timeout()).await {
             Ok(probe) => probe,

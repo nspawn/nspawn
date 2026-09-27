@@ -1300,7 +1300,7 @@ impl Manager {
         let request = api::machines::LogsRequest {
             machine,
             follow: options.bool("follow", false)?,
-            // 0 is a value: only what comes from now on, docker's --tail 0.
+            // 0 is a value: only what comes from now on.
             lines: options
                 .maybe_u64("lines")?
                 .map(|n| n.min(u32::MAX as u64) as u32),

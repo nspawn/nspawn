@@ -101,7 +101,7 @@ impl Tuning {
     /// The [Exec] lines: Hostname=, Capability=, DropCapability=, OOMScoreAdjust=, the
     /// rlimits, LinkJournal=. User= and WorkingDirectory= are the caller's, image
     /// defaults included. `confined`: the machine runs without a user namespace (an app
-    /// on a bridge network), so it keeps docker's default capabilities instead of
+    /// on a bridge network), so it keeps the default capabilities instead of
     /// systemd-nspawn's.
     pub fn exec_lines(&self, confined: bool) -> Vec<String> {
         let mut out = Vec::new();
@@ -135,7 +135,7 @@ impl Tuning {
                     .map(|c| c.to_string())
                     .collect()
             } else {
-                // docker applies the adds after the drops: a capability in both is kept.
+                // The adds win over the drops: a capability in both is kept.
                 self.cap_drop
                     .iter()
                     .filter(|c| !self.cap_add.contains(c))
@@ -149,7 +149,7 @@ impl Tuning {
                 for cap in NSPAWN_CAPABILITIES {
                     let kept =
                         added(cap) || (cap == "CAP_NET_ADMIN" && !self.interfaces.is_empty());
-                    if !APP_CAPABILITIES.contains(&cap)
+                    if !DEFAULT_CAPABILITIES.contains(&cap)
                         && !kept
                         && !dropped.iter().any(|d| d == cap)
                     {
@@ -162,7 +162,7 @@ impl Tuning {
             }
         }
         if confined && !self.privileged {
-            out.push(APP_SYSCALL_FILTER.to_string());
+            out.push(DEFAULT_SYSCALL_FILTER.to_string());
         }
         if let Some(adj) = self.oom_score_adj {
             out.push(format!("OOMScoreAdjust={adj}"));
@@ -211,8 +211,8 @@ impl Tuning {
     }
 
     /// DeviceAllow= for the unit, so that the machine's cgroup may open the nodes: each
-    /// node under a directory given as a device (/dev/dri, /dev/snd), as docker allows
-    /// them, since DeviceAllow= takes a node and not a directory.
+    /// node under a directory given as a device (/dev/dri, /dev/snd), since DeviceAllow=
+    /// takes a node and not a directory.
     pub fn unit_lines(&self) -> Vec<String> {
         self.unit_lines_with(device_nodes)
     }
@@ -264,11 +264,13 @@ pub fn device_nodes(path: &str) -> Vec<String> {
 /// What an app without a user namespace keeps, instead of systemd-nspawn's set, whose
 /// CAP_SYS_ADMIN is root on the host outside a user namespace: /proc/sys is one remount
 /// away from writable, and kernel.core_pattern runs what it names as the host's root.
-/// docker's default set (moby, daemon/pkg/oci/caps/defaults.go) plus CAP_SYS_BOOT, so
-/// that a reboot asked from inside ends the machine as it does in a booted one: in a pid
+/// The least that lets images run as written (files owned, users switched, ports below
+/// 1024 bound, raw sockets for ping, nodes made, chroots) plus CAP_SYS_BOOT, so that a
+/// reboot asked from inside ends the machine as it does in a booted one: in a pid
 /// namespace of its own, reboot(2) can only signal the machine's init, and the kexec
-/// system calls the capability would also allow are filtered out (`APP_SYSCALL_FILTER`).
-pub const APP_CAPABILITIES: [&str; 15] = [
+/// system calls the capability would also allow are filtered out
+/// (`DEFAULT_SYSCALL_FILTER`).
+pub const DEFAULT_CAPABILITIES: [&str; 15] = [
     "CAP_AUDIT_WRITE",
     "CAP_CHOWN",
     "CAP_DAC_OVERRIDE",
@@ -288,8 +290,8 @@ pub const APP_CAPABILITIES: [&str; 15] = [
 
 /// Kept out of an app without a user namespace whatever its capabilities: with
 /// CAP_SYS_BOOT in the initial user namespace they would load a kernel into the host
-/// for its next kexec or crash, which docker's seccomp profile never allows either.
-pub const APP_SYSCALL_FILTER: &str = "SystemCallFilter=~kexec_load kexec_file_load";
+/// for its next kexec or crash.
+pub const DEFAULT_SYSCALL_FILTER: &str = "SystemCallFilter=~kexec_load kexec_file_load";
 
 /// What systemd-nspawn retains by default (systemd-nspawn(1), --capability=), the
 /// CAP_NET_ADMIN of a private network included.
@@ -659,8 +661,8 @@ fn device(text: &str) -> Result<Device> {
 
 /// --add-host HOST:IP (or HOST=IP); "host-gateway" stands for the machine's gateway.
 fn extra_host(text: &str) -> Result<ExtraHost> {
-    // HOST=IP first, the form docker has for IPv6 addresses, whose colons would split
-    // HOST:IP wrong; a hostname never carries an equals sign.
+    // HOST=IP first, the form for IPv6 addresses, whose colons would split HOST:IP
+    // wrong; a hostname never carries an equals sign.
     let (host, ip) = text
         .split_once('=')
         .or_else(|| text.split_once(':'))
@@ -860,7 +862,7 @@ mod tests {
         assert!(t.interfaces.is_empty());
         assert_eq!(t.exec_lines(false)[0], "Capability=all");
         assert_eq!(t.tmpfs.len(), 2);
-        // A capability both added and dropped is kept, as docker applies the adds last.
+        // A capability both added and dropped is kept: the adds win.
         let mut both = Tuning::default();
         Overrides {
             cap_add: vec!["NET_ADMIN".into()],
@@ -892,18 +894,18 @@ mod tests {
     }
 
     #[test]
-    fn an_app_without_a_user_namespace_keeps_docker_s_capabilities() {
-        let beyond_docker = "CAP_AUDIT_CONTROL CAP_DAC_READ_SEARCH CAP_IPC_OWNER CAP_LEASE CAP_LINUX_IMMUTABLE CAP_NET_ADMIN CAP_NET_BROADCAST CAP_SYS_ADMIN CAP_SYS_NICE CAP_SYS_PTRACE CAP_SYS_RESOURCE CAP_SYS_TTY_CONFIG";
+    fn an_app_without_a_user_namespace_keeps_the_default_capabilities() {
+        let beyond_default = "CAP_AUDIT_CONTROL CAP_DAC_READ_SEARCH CAP_IPC_OWNER CAP_LEASE CAP_LINUX_IMMUTABLE CAP_NET_ADMIN CAP_NET_BROADCAST CAP_SYS_ADMIN CAP_SYS_NICE CAP_SYS_PTRACE CAP_SYS_RESOURCE CAP_SYS_TTY_CONFIG";
         let plain = Tuning::default();
         assert_eq!(
             plain.exec_lines(true),
             [
-                format!("DropCapability={beyond_docker}"),
-                APP_SYSCALL_FILTER.to_string()
+                format!("DropCapability={beyond_default}"),
+                DEFAULT_SYSCALL_FILTER.to_string()
             ]
         );
         assert!(
-            APP_CAPABILITIES.contains(&"CAP_SYS_BOOT"),
+            DEFAULT_CAPABILITIES.contains(&"CAP_SYS_BOOT"),
             "a reboot from inside ends the machine"
         );
         assert!(
@@ -912,11 +914,11 @@ mod tests {
         );
         for cap in NSPAWN_CAPABILITIES {
             assert!(
-                APP_CAPABILITIES.contains(&cap) || beyond_docker.split(' ').any(|c| c == cap),
+                DEFAULT_CAPABILITIES.contains(&cap) || beyond_default.split(' ').any(|c| c == cap),
                 "{cap}"
             );
         }
-        // --cap-add keeps one of them, --cap-drop still drops one of docker's.
+        // --cap-add keeps one of them, --cap-drop still drops one of the default set.
         let mut t = Tuning::default();
         Overrides {
             cap_add: vec!["SYS_PTRACE".into()],
@@ -931,9 +933,9 @@ mod tests {
                 "Capability=CAP_SYS_PTRACE".to_string(),
                 format!(
                     "DropCapability=CAP_NET_RAW {}",
-                    beyond_docker.replace(" CAP_SYS_PTRACE", "")
+                    beyond_default.replace(" CAP_SYS_PTRACE", "")
                 ),
-                APP_SYSCALL_FILTER.to_string()
+                DEFAULT_SYSCALL_FILTER.to_string()
             ]
         );
         // An interface given to the machine keeps CAP_NET_ADMIN, to be configured.
@@ -949,19 +951,20 @@ mod tests {
             [
                 format!(
                     "DropCapability={}",
-                    beyond_docker.replace(" CAP_NET_ADMIN", "")
+                    beyond_default.replace(" CAP_NET_ADMIN", "")
                 ),
-                APP_SYSCALL_FILTER.to_string()
+                DEFAULT_SYSCALL_FILTER.to_string()
             ]
         );
-        // --privileged, --cap-add ALL and --cap-drop ALL mean what they mean to docker.
+        // --privileged, --cap-add ALL and --cap-drop ALL: everything, everything but the
+        // named drops, nothing but the named adds.
         for (add, drop, expected) in [
             (
                 vec![],
                 vec!["ALL".into()],
                 vec![
                     "DropCapability=all".to_string(),
-                    APP_SYSCALL_FILTER.to_string(),
+                    DEFAULT_SYSCALL_FILTER.to_string(),
                 ],
             ),
             (
@@ -970,7 +973,7 @@ mod tests {
                 vec![
                     "Capability=all".to_string(),
                     "DropCapability=CAP_SYS_ADMIN".to_string(),
-                    APP_SYSCALL_FILTER.to_string(),
+                    DEFAULT_SYSCALL_FILTER.to_string(),
                 ],
             ),
             (
@@ -987,7 +990,7 @@ mod tests {
                             .collect::<Vec<_>>()
                             .join(" ")
                     ),
-                    APP_SYSCALL_FILTER.to_string(),
+                    DEFAULT_SYSCALL_FILTER.to_string(),
                 ],
             ),
         ] {

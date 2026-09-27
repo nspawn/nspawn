@@ -948,7 +948,7 @@ mod tests {
     fn users_are_resolved_by_name_or_number_with_their_groups() {
         let passwd = "root:x:0:0:root:/root:/bin/sh\nwww-data:x:33:33:www:/var/www:/usr/sbin/nologin\nalice:x:1000:1000::/home/alice:/bin/sh\n";
         let group =
-            "root:x:0:\nwww-data:x:33:\nvideo:x:44:alice,bob\ndocker:x:999:alice\nusers:x:100:\n";
+            "root:x:0:\nwww-data:x:33:\nvideo:x:44:alice,bob\nwheel:x:999:alice\nusers:x:100:\n";
         assert_eq!(
             resolve_in(passwd, group, "alice"),
             Some((1000, 1000, "/home/alice".to_string(), vec![44, 999]))

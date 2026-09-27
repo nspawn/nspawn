@@ -73,7 +73,7 @@ nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, Winsize);
 
 /// Pumps bytes between the local terminal and `pty` until the remote side closes it.
 /// The terminal is put into raw mode when standard input is a TTY. Without
-/// `interactive` nothing of standard input goes to the pty, as docker's -t alone.
+/// `interactive` nothing of standard input goes to the pty.
 pub fn run_session(pty: OwnedFd, interactive: bool) -> Result<()> {
     let stdin = io::stdin();
     let saved = if isatty(&stdin).unwrap_or(false) {
