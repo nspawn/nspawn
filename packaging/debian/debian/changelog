@@ -1,3 +1,12 @@
+nspawn (1.6.0-1) unstable; urgency=medium
+
+  * --interface moves a host interface, a wifi adapter with its phy included, into a machine.
+  * An app on the bridge gets its sysfs mounted inside its network namespace.
+  * update keeps the shared namespace of a --network container: machine.
+  * iw is recommended, for wifi adapters given to an app on the bridge.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Sun, 27 Sep 2026 03:46:48 -0500
+
 nspawn (1.5.2-1) unstable; urgency=medium
 
   * Offered under MIT or Apache-2.0 from this version on; the binary is 1.5.1's.

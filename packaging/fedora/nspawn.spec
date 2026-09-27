@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 1.5.2
+%global upstream_version 1.6.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -150,6 +150,12 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Sun Sep 27 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.6.0-1
+- --interface moves a host interface, a wifi adapter with its phy included, into a machine.
+- An app on the bridge gets its sysfs mounted inside its network namespace.
+- update keeps the shared namespace of a --network container: machine.
+- iw is recommended, for wifi adapters given to an app on the bridge.
+
 * Sat Sep 26 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.5.2-1
 - Offered under MIT or Apache-2.0 from this version on; the binary is 1.5.1's.
 
