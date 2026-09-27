@@ -35,7 +35,10 @@ work), overlayfs, `ip`, `nft`, `curl`, `python3`, `openssl` (the suite signs
 an image of its own with a key it makes), access to Docker Hub and to
 hub.nspawn.org (a signed image is pulled from it), a registry with the test
 image (`fedora:44` by default) that serves the OCI referrers API (zot does),
-and mkosi for the build step. The mstack pass runs only on systemd 261 with systemd-nsresourced and
+mkosi for the build step, and for the `--interface` step the `dummy` and
+`mac80211_hwsim` kernel modules (Fedora ships the latter in
+`kernel-modules-internal`, Ubuntu in `linux-modules-extra`; without it the
+wireless part is skipped and says so) and `iw`. The mstack pass runs only on systemd 261 with systemd-nsresourced and
 systemd-mountfsd installed; elsewhere it is skipped and says so, and so on
 the systemd 262 release, which cannot boot a managed user namespace until
 the fix for systemd/systemd#43899 lands in a later version. The

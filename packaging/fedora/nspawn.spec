@@ -34,6 +34,8 @@ Requires:       nftables
 Recommends:     (%{name}-selinux if selinux-policy-%{selinuxtype})
 # Without it only root can call the service.
 Recommends:     polkit
+# --interface with a wifi adapter on an app machine moves the phy with it.
+Recommends:     iw
 %{?systemd_requires}
 
 %description
