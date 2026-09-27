@@ -550,6 +550,12 @@ echo "$out"
 echo "$out" | grep_q "inside:$app" || fail "exec via namespaces did not run inside the machine"
 [ "$($NSPAWN exec $app -- id -u </dev/null | tr -d '\r')" = "0" ] || fail "exec does not run as the machine's root"
 [ "$($NSPAWN exec $app --user 65534 -- id -u </dev/null | tr -d '\r')" = "65534" ] || fail "exec --user ignored"
+# -u by names: the group named in /etc/group, the home the passwd entry has.
+grp=$($NSPAWN exec $app -- /bin/sh -c 'sed -n 1p /etc/group | cut -d: -f1' </dev/null | tr -d '\r')
+gid=$($NSPAWN exec $app -- /bin/sh -c 'sed -n 1p /etc/group | cut -d: -f3' </dev/null | tr -d '\r')
+home=$($NSPAWN exec $app -- /bin/sh -c 'grep ^nobody: /etc/passwd | cut -d: -f6' </dev/null | tr -d '\r')
+[ -n "$grp" ] && [ -n "$home" ] || fail "no group or nobody in the image: $grp $home"
+[ "$($NSPAWN exec $app --user nobody:$grp -- /bin/sh -c 'id -u; id -g; echo $HOME' </dev/null | tr -d '\r' | tr '\n' ' ')" = "65534 $gid $home " ] || fail "exec -u NAME:GROUP by names, with the passwd home: $($NSPAWN exec $app --user nobody:$grp -- /bin/sh -c 'id -u; id -g; echo $HOME' </dev/null 2>&1)"
 $NSPAWN exec $app -- /bin/sh -c 'exit 7' </dev/null; [ $? -eq 7 ] || fail "exec did not propagate the exit code"
 [ "$(printf 'a\nb' | $NSPAWN exec $app -- cat)" = "$(printf 'a\nb')" ] || fail "piped stdin/stdout through exec is not byte exact"
 echo "app-$nonce" > /tmp/e2e-cp-app

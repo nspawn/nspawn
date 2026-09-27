@@ -14,7 +14,7 @@
 
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::{BufRead, BufReader, IoSlice, IoSliceMut};
+use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -528,6 +528,7 @@ fn helper(
         // Best effort: cgroup v1 hosts or delegation quirks must not stop exec.
         let _ = std::fs::write(procs, std::process::id().to_string());
     }
+    let mut joined_user = false;
     for (name, flag, fd) in ns_fds {
         if let Err(e) = setns(fd, *flag) {
             // Joining the user namespace we are already in is refused with EINVAL; that is
@@ -542,6 +543,13 @@ fn helper(
             );
             return 126;
         }
+        joined_user |= *flag == CloneFlags::CLONE_NEWUSER;
+    }
+    // In the machine's user namespace our host uid is nobody: what is opened from here
+    // on, the terminal's slave first, belongs to the machine's root instead.
+    if joined_user {
+        let _ = setgid(Gid::from_raw(0));
+        let _ = setuid(Uid::from_raw(0));
     }
     let io = match io {
         ChildIo::Pty { rows, cols } => match open_terminal(rows, cols) {
@@ -688,11 +696,11 @@ fn grandchild(
     match user {
         None => env.push(CString::new("HOME=/root").expect("no NUL")),
         Some(user) => {
-            let Some((uid, gid, home)) = resolve_user(user) else {
+            let Some((uid, gid, home, groups)) = resolve_user(user) else {
                 complain(&format!("error: unknown user {user} inside the machine"));
                 return 126;
             };
-            if setgroups(&[]).is_err() || setgid(gid).is_err() || setuid(uid).is_err() {
+            if setgroups(&groups).is_err() || setgid(gid).is_err() || setuid(uid).is_err() {
                 complain(&format!(
                     "error: cannot switch to uid {} inside the machine",
                     uid
@@ -829,32 +837,88 @@ fn find_program(name: &CStr, env: &[CString]) -> Option<CString> {
     None
 }
 
-/// Looks a user up in the machine's /etc/passwd (we are inside its mount namespace):
-/// uid, gid and home. Accepts numeric "uid" or "uid:gid" as well.
-fn resolve_user(user: &str) -> Option<(Uid, Gid, String)> {
-    if let Some((u, g)) = user.split_once(':') {
+/// Looks a user up in the machine's /etc/passwd and /etc/group (we are inside its mount
+/// namespace): uid, gid, home and supplementary groups, for USER[:GROUP] by name or by
+/// number.
+fn resolve_user(user: &str) -> Option<(Uid, Gid, String, Vec<Gid>)> {
+    let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
+    let (uid, gid, home, groups) = resolve_in(&passwd, &group, user)?;
+    Some((
+        Uid::from_raw(uid),
+        Gid::from_raw(gid),
+        home,
+        groups.into_iter().map(Gid::from_raw).collect(),
+    ))
+}
+
+/// `resolve_user` on the files' text. A user the passwd file lacks is taken as a number
+/// with a group of the same number and no home; a group given explicitly is the only
+/// group, otherwise the passwd entry's own and every group of /etc/group that lists
+/// the user come along.
+fn resolve_in(passwd: &str, group: &str, user: &str) -> Option<(u32, u32, String, Vec<u32>)> {
+    let (who, explicit) = match user.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (user, None),
+    };
+    let (uid, gid, home, name) = match passwd_entry(passwd, who) {
+        Some(entry) => entry,
+        None => {
+            let uid: u32 = who.parse().ok()?;
+            (uid, uid, "/".to_string(), None)
+        }
+    };
+    let (gid, groups) = match explicit {
+        Some(g) => (group_gid(group, g).or_else(|| g.parse().ok())?, Vec::new()),
+        None => (
+            gid,
+            name.map(|n| supplementary_groups(group, &n))
+                .unwrap_or_default(),
+        ),
+    };
+    Some((uid, gid, home, groups))
+}
+
+/// The passwd entry of a name or a uid: uid, gid, home (/ when empty) and the name.
+fn passwd_entry(passwd: &str, who: &str) -> Option<(u32, u32, String, Option<String>)> {
+    for line in passwd.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() < 6 || (fields[0] != who && fields[2] != who) {
+            continue;
+        }
+        let home = if fields[5].is_empty() { "/" } else { fields[5] };
         return Some((
-            Uid::from_raw(u.parse().ok()?),
-            Gid::from_raw(g.parse().ok()?),
-            "/".to_string(),
+            fields[2].parse().ok()?,
+            fields[3].parse().ok()?,
+            home.to_string(),
+            Some(fields[0].to_string()),
         ));
     }
-    if let Ok(uid) = user.parse::<u32>() {
-        return Some((Uid::from_raw(uid), Gid::from_raw(uid), "/".to_string()));
-    }
-    let file = File::open("/etc/passwd").ok()?;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 6 && fields[0] == user {
-            let home = if fields[5].is_empty() { "/" } else { fields[5] };
-            return Some((
-                Uid::from_raw(fields[2].parse().ok()?),
-                Gid::from_raw(fields[3].parse().ok()?),
-                home.to_string(),
-            ));
-        }
-    }
     None
+}
+
+/// The gid of a group named, or numbered, in the group file.
+fn group_gid(group: &str, who: &str) -> Option<u32> {
+    group.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        (fields.len() >= 3 && (fields[0] == who || fields[2] == who))
+            .then(|| fields[2].parse().ok())
+            .flatten()
+    })
+}
+
+/// The gids of the groups whose member list names the user.
+fn supplementary_groups(group: &str, name: &str) -> Vec<u32> {
+    group
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            if fields.len() < 4 || !fields[3].split(',').any(|m| m == name) {
+                return None;
+            }
+            fields[2].parse().ok()
+        })
+        .collect()
 }
 
 /// Whether `/proc/<leader>/ns/<name>` is the namespace we are in already.
@@ -879,16 +943,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn users_are_resolved_by_name_or_number_with_their_groups() {
+        let passwd = "root:x:0:0:root:/root:/bin/sh\nwww-data:x:33:33:www:/var/www:/usr/sbin/nologin\nalice:x:1000:1000::/home/alice:/bin/sh\n";
+        let group =
+            "root:x:0:\nwww-data:x:33:\nvideo:x:44:alice,bob\ndocker:x:999:alice\nusers:x:100:\n";
+        assert_eq!(
+            resolve_in(passwd, group, "alice"),
+            Some((1000, 1000, "/home/alice".to_string(), vec![44, 999]))
+        );
+        assert_eq!(
+            resolve_in(passwd, group, "1000"),
+            Some((1000, 1000, "/home/alice".to_string(), vec![44, 999])),
+            "a uid the passwd lists is the same user"
+        );
+        assert_eq!(
+            resolve_in(passwd, group, "www-data:www-data"),
+            Some((33, 33, "/var/www".to_string(), Vec::new())),
+            "a group given is the only group"
+        );
+        assert_eq!(
+            resolve_in(passwd, group, "alice:users"),
+            Some((1000, 100, "/home/alice".to_string(), Vec::new()))
+        );
+        assert_eq!(
+            resolve_in(passwd, group, "alice:100"),
+            Some((1000, 100, "/home/alice".to_string(), Vec::new()))
+        );
+        assert_eq!(
+            resolve_in(passwd, group, "12345"),
+            Some((12345, 12345, "/".to_string(), Vec::new())),
+            "a number the passwd lacks"
+        );
+        assert_eq!(
+            resolve_in(passwd, group, "12345:4321"),
+            Some((12345, 4321, "/".to_string(), Vec::new()))
+        );
+        assert_eq!(resolve_in(passwd, group, "nobody"), None);
+        assert_eq!(resolve_in(passwd, group, "alice:nogroup"), None);
+    }
+
+    #[test]
     fn numeric_users_do_not_need_passwd() {
         assert_eq!(
-            resolve_user("1000:100"),
-            Some((Uid::from_raw(1000), Gid::from_raw(100), "/".to_string()))
+            resolve_in("", "", "1000:100"),
+            Some((1000, 100, "/".to_string(), Vec::new()))
         );
         assert_eq!(
-            resolve_user("65534"),
-            Some((Uid::from_raw(65534), Gid::from_raw(65534), "/".to_string()))
+            resolve_in("", "", "65534"),
+            Some((65534, 65534, "/".to_string(), Vec::new()))
         );
-        assert_eq!(resolve_user("1000:x"), None);
+        assert_eq!(resolve_in("", "", "1000:x"), None);
     }
 
     #[test]
