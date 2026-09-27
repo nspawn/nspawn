@@ -93,6 +93,12 @@ cleanup_machines() {
     $NSPAWN rm -f "$m" >/dev/null 2>&1 || true
   done
   $NSPAWN images rm busybox-1.37 >/dev/null 2>&1 || true
+  # The signature step keeps a dated hub image under the name pulling it gives; one cut
+  # short leaves it behind.
+  for m in $($NSPAWN images ls 2>/dev/null | awk '$5 ~ /^hub\.nspawn\.org\/fedora:/ { tag = substr($5, 23); if (tag ~ /-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]$/ && $1 == "fedora-" tag) print $1 }'); do
+    $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
+    $NSPAWN images rm "$m" >/dev/null 2>&1 || true
+  done
   $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || true
   rm -rf /tmp/e2e-cp /tmp/e2e-cp-* /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol /var/lib/nspawn/volumes/e2evol2 /var/lib/nspawn/volumes/e2evol-free /var/lib/nspawn/volumes/e2evol-home /var/lib/nspawn/volumes/e2evol-etc /var/lib/nspawn/volumes/e2evol-events /var/lib/nspawn/volumes/e2e-bootvol /var/lib/nspawn/volumes/.e2e-hidden
   kill "${listener_pid:-}" 2>/dev/null || true
