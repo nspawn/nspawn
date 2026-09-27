@@ -1162,6 +1162,13 @@ pub fn shares_network(record: &ImageRecord) -> Option<&str> {
     record.network_container.as_deref()
 }
 
+/// Whether nspawn names a network namespace after the machine, its own on bridge
+/// networks or another machine's with --network container:, which an app joins through
+/// NamespacePath= or --network-namespace-path=.
+pub fn namespaced(record: &ImageRecord) -> bool {
+    bridge_kind(record) || shares_network(record).is_some()
+}
+
 /// Whether the machine joins `network`, as its primary one or besides it.
 pub fn joins(record: &ImageRecord, network: &str) -> bool {
     bridge_kind(record) && networks_of(record).contains(&network)

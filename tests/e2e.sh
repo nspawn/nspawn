@@ -671,6 +671,13 @@ $NSPAWN exec e2e-side -- cat /etc/hosts </dev/null | tr -d '\r' | grep_q " host.
 $NSPAWN ps | grep "^ *e2e-side " | grep_q " container:e2e-side-net " || fail "ps does not show the shared network: $($NSPAWN ps)"
 $NSPAWN inspect e2e-side | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['network'] == 'container:e2e-side-net' and d['networks'] == [] and d['address'] == '', d" || fail "inspect of a machine in another one's network"
 $NSPAWN network inspect bridge | python3 -c "import json,sys; ms = [m['name'] for m in json.load(sys.stdin)[0]['machines']]; assert 'e2e-side-net' in ms and 'e2e-side' not in ms, ms" || fail "network inspect lists the sharing machine as a member"
+# update rewrites the unit's ExecStart: the shared namespace must stay on it.
+$NSPAWN update e2e-side -m 64m >/dev/null || fail "update of a machine in another one's network"
+if [ "$systemd_major" -lt 259 ]; then
+  grep -q -- "--network-namespace-path=/run/netns/nspawn-e2e-side" /etc/systemd/system/systemd-nspawn@e2e-side.service.d/nspawn-hooks.conf || fail "update dropped the shared namespace from ExecStart: $(cat /etc/systemd/system/systemd-nspawn@e2e-side.service.d/nspawn-hooks.conf)"
+fi
+$NSPAWN restart e2e-side >/dev/null || fail "restart the sharing machine after update"
+$NSPAWN exec e2e-side -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep_q " $owner_addr/" || fail "after update, the sharing machine lost the owner's address: $($NSPAWN exec e2e-side -- ip -4 -o addr show 2>&1 </dev/null)"
 out=$($NSPAWN start e2e-side --network-alias side 2>&1) && fail "an alias was accepted on a machine without a network of its own"
 out=$($NSPAWN create $app e2e-side-p --network container:e2e-side-net --network e2e-x -- /bin/sleep 1 2>&1) && fail "container: was combined with another network"
 echo "$out" | grep_q "stands alone" || fail "the combination was not explained: $out"

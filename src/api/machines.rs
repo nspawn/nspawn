@@ -499,7 +499,7 @@ pub async fn prepare(
         None
     };
     let route =
-        settings::namespace_route(sd, name, record.mode, bridged || shared.is_some()).await?;
+        settings::namespace_route(sd, name, record.mode, bridge::namespaced(&record)).await?;
     settings::write(
         &MachineSettings {
             name,
@@ -1386,8 +1386,7 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     }
     store.record_image(&record)?;
     let route =
-        settings::namespace_route(sd, &args.name, record.mode, bridge::bridge_kind(&record))
-            .await?;
+        settings::namespace_route(sd, &args.name, record.mode, bridge::namespaced(&record)).await?;
     let app_argv = settings::app_argv(sd, &args.name, record.mode, &route).await?;
     let reload = settings::write_hooks(
         &args.name,

@@ -742,9 +742,18 @@ mod tests {
         assert!(r.address.is_none() && r.extra_networks.is_empty() && r.aliases.is_empty());
         assert!(!bridge::bridge_kind(&r) && !bridge::joins(&r, "bridge"));
         assert_eq!(bridge::shares_network(&r), Some("vpn"));
+        assert!(
+            bridge::namespaced(&r),
+            "the shared namespace is joined the way a bridge one is"
+        );
         apply(&mut r, &choices(&["bridge".into()]).unwrap());
         assert!(r.network_container.is_none() && bridge::bridge_kind(&r));
         assert_eq!(bridge::shares_network(&r), None);
+        assert!(bridge::namespaced(&r));
+        apply(&mut r, &choices(&["none".into()]).unwrap());
+        assert!(!bridge::namespaced(&r));
+        apply(&mut r, &choices(&["host".into()]).unwrap());
+        assert!(!bridge::namespaced(&r));
     }
 
     #[test]
