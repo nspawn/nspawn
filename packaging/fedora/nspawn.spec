@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 1.6.0
+%global upstream_version 1.6.1
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -150,6 +150,13 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Sun Sep 27 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.6.1-1
+- Apps outside a user namespace keep a default capability set plus SYS_BOOT, not CAP_SYS_ADMIN.
+- cp leaves the kernel's file systems out; paths inside a machine must be plain.
+- Layer downloads are bound by the declared size; a registry without a dot or port stays one.
+- Fixes to ports, run/create/start flags, machines, images, the service, exec, health and cp.
+- nspawn-selinux lets the service set process groups and read file system kinds.
+
 * Sun Sep 27 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.6.0-1
 - --interface moves a host interface, a wifi adapter with its phy included, into a machine.
 - An app on the bridge gets its sysfs mounted inside its network namespace.

@@ -1,3 +1,13 @@
+nspawn (1.6.1-1) unstable; urgency=medium
+
+  * Apps outside a user namespace keep a default capability set plus SYS_BOOT, not CAP_SYS_ADMIN.
+  * cp leaves the kernel's file systems out; paths inside a machine must be plain.
+  * Layer downloads are bound by the declared size; a registry without a dot or port stays one.
+  * Fixes to ports, run/create/start flags, machines, images, the service, exec, health and cp.
+  * nspawn-selinux lets the service set process groups and read file system kinds.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Sun, 27 Sep 2026 14:21:28 -0500
+
 nspawn (1.6.0-1) unstable; urgency=medium
 
   * --interface moves a host interface, a wifi adapter with its phy included, into a machine.
