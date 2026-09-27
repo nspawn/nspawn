@@ -387,6 +387,9 @@ pub async fn run(ctx: &Context, name: &str) -> Result<()> {
         if !sd.machine_exists(name).await? {
             return Ok(());
         }
+        // Docker counts a probe by when it started: one that ends past the start period
+        // still belongs to it.
+        let in_start_period = started.elapsed() < hc.start_period();
         let probe = match probe(ctx, name, &argv, hc.timeout()).await {
             Ok(probe) => probe,
             Err(e) if !sd.machine_exists(name).await? => {
@@ -400,7 +403,6 @@ pub async fn run(ctx: &Context, name: &str) -> Result<()> {
                 output: format!("{e:#}"),
             },
         };
-        let in_start_period = started.elapsed() < hc.start_period();
         if let Some(status) = monitor.observe(probe, in_start_period) {
             crate::api::events::emit(
                 "machine",
@@ -410,6 +412,33 @@ pub async fn run(ctx: &Context, name: &str) -> Result<()> {
             );
         }
         write_status(name, &monitor.status)?;
+    }
+}
+
+/// SIGKILL to the command's process group, which the command leads: what it forked and
+/// left behind goes with it.
+fn kill_group(pid: u32) {
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(-(pid as i32)),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+}
+
+/// What a reader of the probe's output got. The pipes close once the command and
+/// whatever it forked are gone: a child that keeps them open past the command is
+/// killed after a moment, and the read given up on after another.
+async fn drained(mut reader: tokio::task::JoinHandle<String>, pid: u32) -> String {
+    let grace = Duration::from_secs(2);
+    if let Ok(read) = tokio::time::timeout(grace, &mut reader).await {
+        return read.unwrap_or_default();
+    }
+    kill_group(pid);
+    match tokio::time::timeout(grace, &mut reader).await {
+        Ok(read) => read.unwrap_or_default(),
+        Err(_) => {
+            reader.abort();
+            String::new()
+        }
     }
 }
 
@@ -428,6 +457,7 @@ async fn probe(ctx: &Context, name: &str, argv: &[String], timeout: Duration) ->
     .await?;
     let nsenter::Process {
         helper,
+        pid,
         pidfd,
         stdin,
         stdout,
@@ -441,13 +471,16 @@ async fn probe(ctx: &Context, name: &str, argv: &[String], timeout: Duration) ->
     let exit_code = match tokio::time::timeout(timeout, &mut waited).await {
         Ok(joined) => joined.context("waiting for the probe")??,
         Err(_) => {
+            // The command and what it forked: a child left holding the pipes would
+            // hold the probe's output, and the runner with it.
+            kill_group(pid);
             let _ = nsenter::pidfd_signal(&pidfd, nix::libc::SIGKILL);
             let _ = waited.await;
             -1
         }
     };
-    let mut output = out.await.context("reading the probe")?;
-    output.push_str(&err.await.context("reading the probe")?);
+    let mut output = drained(out, pid).await;
+    output.push_str(&drained(err, pid).await);
     if exit_code == -1 {
         output = format!(
             "Health check exceeded timeout ({})",

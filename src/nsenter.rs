@@ -32,8 +32,8 @@ use nix::sys::socket::{
 use nix::sys::stat::Mode;
 use nix::sys::wait::{waitpid, WaitStatus};
 use nix::unistd::{
-    chdir, dup2_stderr, dup2_stdin, dup2_stdout, execve, fork, pipe2, setgid, setgroups, setsid,
-    setuid, ForkResult, Gid, Pid, Uid,
+    chdir, dup2_stderr, dup2_stdin, dup2_stdout, execve, fork, pipe2, setgid, setgroups, setpgid,
+    setsid, setuid, ForkResult, Gid, Pid, Uid,
 };
 
 /// How the command's standard streams are set up.
@@ -658,6 +658,9 @@ fn grandchild(
             {
                 return 126;
             }
+            // A process group of its own, so that the command and what it forks can
+            // be ended together (a health probe past its timeout).
+            let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
         }
     }
     if let Err(e) = chdir(cwd.as_c_str()) {
