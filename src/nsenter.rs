@@ -701,15 +701,6 @@ fn grandchild(
     if let Some(bounding) = bounding {
         let _ = limit_bounding_set(bounding);
     }
-    // The resource limits of the machine's own processes (--ulimit among them), not the
-    // service's. Best effort, as above.
-    for (resource, soft, hard) in limits {
-        let limit = libc::rlimit {
-            rlim_cur: *soft,
-            rlim_max: *hard,
-        };
-        let _ = unsafe { libc::setrlimit(*resource as _, &limit) };
-    }
     let mut env: Vec<CString> = env.to_vec();
     match user {
         None => env.push(CString::new("HOME=/root").expect("no NUL")),
@@ -755,10 +746,9 @@ fn grandchild(
             return 127;
         }
     };
-    // Only the three streams go along. SIGPIPE goes back to its default: execve would
-    // pass on the service's SIG_IGN, and a command in a pipeline must die of a closed
-    // pipe.
-    close_from(3);
+    keep_streams_and_limit(limits);
+    // SIGPIPE goes back to its default: execve would pass on the service's SIG_IGN, and
+    // a command in a pipeline must die of a closed pipe.
     // SAFETY: only the default disposition is set, in a single-threaded child.
     let _ = unsafe {
         nix::sys::signal::signal(
@@ -781,6 +771,22 @@ fn grandchild(
                 126
             }
         }
+    }
+}
+
+/// Only the three streams go along, then the resource limits of the machine's own
+/// processes (--ulimit among them) replace the service's. Last, since with the service's
+/// descriptors still open a low open-files limit refuses the files opened on the way
+/// (the passwd file, SELinux's exec attribute). Best effort, as the bounding set.
+fn keep_streams_and_limit(limits: &[(i32, u64, u64)]) {
+    close_from(3);
+    for (resource, soft, hard) in limits {
+        let limit = libc::rlimit {
+            rlim_cur: *soft,
+            rlim_max: *hard,
+        };
+        // SAFETY: setrlimit(2) on this process with a valid struct.
+        let _ = unsafe { libc::setrlimit(*resource as _, &limit) };
     }
 }
 
@@ -1184,6 +1190,35 @@ mod tests {
             ForkResult::Child => {
                 // Keeping every capability is always allowed, whoever runs the test.
                 let code = if limit_bounding_set(u64::MAX).is_ok() {
+                    0
+                } else {
+                    1
+                };
+                unsafe { libc::_exit(code) }
+            }
+            ForkResult::Parent { child } => {
+                assert_eq!(exit_code(waitpid(child, None).unwrap()), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn the_machine_limits_come_with_the_streams_alone() {
+        // In a child, so that the test process keeps its own descriptors and limits.
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Child => {
+                for _ in 0..40 {
+                    // Left open on purpose, as the service's are when the helper forks.
+                    let _ = unsafe { libc::dup(2) };
+                }
+                keep_streams_and_limit(&[(libc::RLIMIT_NOFILE as i32, 8, 8)]);
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+                let opened = std::fs::File::open("/proc/self/status").is_ok();
+                let code = if opened && limit.rlim_cur == 8 && limit.rlim_max == 8 {
                     0
                 } else {
                     1

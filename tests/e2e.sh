@@ -1005,6 +1005,19 @@ x 'cat /etc/hosts' | grep_q "^fd00::1 v6$" || fail "--add-host with an IPv6 addr
 x "grep 'Max core' /proc/$pid/limits" | grep_q "unlimited *unlimited" || fail "--ulimit core=unlimited not applied to the program: $(x "grep 'Max core' /proc/$pid/limits")"
 x "grep 'Max open files' /proc/$pid/limits" | grep_q " 64 *128 " || fail "--ulimit nofile=64:128 not applied to the program: $(x "grep 'Max open files' /proc/$pid/limits")"
 x 'grep "Max open files" /proc/self/limits' | grep_q " 64 *128 " || fail "exec's command does not get the machine's limits: $(x 'grep "Max open files" /proc/self/limits')"
+# The command's limits come last: with the service holding many descriptors (log
+# followers here), a low open-files limit must not refuse what exec opens on the way,
+# the passwd file or SELinux's exec attribute.
+followers=()
+for _ in $(seq 1 40); do $NSPAWN logs -f $app >/dev/null 2>&1 & followers+=($!); done
+service_pid=$(systemctl show nspawn.service -p MainPID --value)
+for _ in $(seq 1 20); do [ "$(ls /proc/$service_pid/fd 2>/dev/null | wc -l)" -ge 80 ] && break; sleep 0.5; done
+out=$($NSPAWN exec $app -- /bin/sh -c 'echo ok' </dev/null 2>&1 | tr -d '\r')
+[ "$out" = ok ] || fail "exec failed while the service held many descriptors: $out"
+out=$($NSPAWN exec -u nobody $app -- /bin/sh -c 'echo ok' </dev/null 2>&1 | tr -d '\r')
+[ "$out" = ok ] || fail "exec -u failed while the service held many descriptors: $out"
+kill "${followers[@]}" 2>/dev/null
+wait "${followers[@]}" 2>/dev/null
 x 'cat /etc/hosts' | grep_q "^10.99.0.1 gw$" || fail "--add-host host-gateway not applied: $(x 'cat /etc/hosts')"
 x "grep 'open files' /proc/$pid/limits" | grep_q "64 *128" || fail "--ulimit not applied: $(x "grep 'open files' /proc/$pid/limits")"
 [ "$(x "cat /proc/$pid/oom_score_adj")" = 100 ] || fail "--oom-score-adj not applied: $(x "cat /proc/$pid/oom_score_adj")"
