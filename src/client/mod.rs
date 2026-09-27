@@ -540,15 +540,21 @@ pub fn version_warning(service: &str, client: &str) -> Option<String> {
 /// What the service's error reads like here: the message alone for the service's own
 /// errors, and a word of advice when the service is not there or refuses the caller.
 pub fn error(e: zbus::Error) -> anyhow::Error {
+    const NO_SERVICE: &str =
+        "the nspawn service is not on the system bus; run: sudo nspawn daemon --install";
+    const REFUSED: &str =
+        "the bus refused the call; see the policy in /usr/share/dbus-1/system.d/org.nspawn.conf";
     match &e {
         zbus::Error::MethodError(name, message, _) => match name.as_str() {
-            "org.freedesktop.DBus.Error.ServiceUnknown" => {
-                anyhow!("the nspawn service is not on the system bus; run: sudo nspawn daemon --install")
-            }
-            "org.freedesktop.DBus.Error.AccessDenied" => {
-                anyhow!("the bus refused the call; see the policy in /usr/share/dbus-1/system.d/org.nspawn.conf")
-            }
+            "org.freedesktop.DBus.Error.ServiceUnknown" => anyhow!(NO_SERVICE),
+            "org.freedesktop.DBus.Error.AccessDenied" => anyhow!(REFUSED),
             _ => anyhow!("{}", message.clone().unwrap_or_else(|| name.to_string())),
+        },
+        // A property read (the version, first thing every command does) fails this way.
+        zbus::Error::FDO(fdo) => match **fdo {
+            zbus::fdo::Error::ServiceUnknown(_) => anyhow!(NO_SERVICE),
+            zbus::fdo::Error::AccessDenied(_) => anyhow!(REFUSED),
+            _ => anyhow!("{e}"),
         },
         _ => anyhow!("{e}"),
     }
@@ -740,6 +746,17 @@ mod tests {
             Some("The name org.nspawn was not provided by any .service files"),
         ));
         assert!(missing.to_string().contains("nspawn daemon --install"));
+        // Reading a property, which every command does first, fails as an FDO error.
+        let property = error(zbus::Error::FDO(Box::new(
+            zbus::fdo::Error::ServiceUnknown(
+                "The name org.nspawn was not provided by any .service files".to_string(),
+            ),
+        )));
+        assert!(property.to_string().contains("nspawn daemon --install"));
+        let property = error(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
+            "no".to_string(),
+        ))));
+        assert!(property.to_string().contains("org.nspawn.conf"));
         let denied = error(method_error(
             "org.freedesktop.DBus.Error.AccessDenied",
             None,
