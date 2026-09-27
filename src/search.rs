@@ -36,7 +36,14 @@ pub async fn search_hub(hub: &Hub, registry: &str, term: &str, limit: usize) -> 
     let repos = filter_catalog(&hub.catalog(registry).await?, term);
     let mut hits = Vec::new();
     for repo in repos.into_iter().take(limit) {
-        let image = ImageRef::parse(&repo, registry)?;
+        // A name of the catalog, under the registry it came from: parsed as a
+        // reference, a first component with a dot would pass for another registry.
+        let image = ImageRef {
+            registry: registry.to_string(),
+            repository: repo.clone(),
+            tag: None,
+            digest: None,
+        };
         let tags = hub.tags(&image.to_oci()?).await.unwrap_or_default();
         hits.push(Hit {
             source: registry.to_string(),
