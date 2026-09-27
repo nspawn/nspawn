@@ -378,6 +378,23 @@ $NSPAWN stop e2e-c || fail "stop created machine"
 $NSPAWN images rm e2e-c | tee /tmp/e2e-rmc.txt || fail "rm created machine"
 grep -q "freed" /tmp/e2e-rmc.txt && fail "removing the created machine freed a layer still used by e2e-a and e2e-b"
 
+step "a port another machine took over is left alone when the first one is stopped again"
+# A stopped machine remembers its ports; a second one may publish the same port. Stopping
+# the first one again (or its unit failing to start) must not withdraw the second one's.
+$NSPAWN start e2e-a -p 18085:80 >/dev/null || fail "start e2e-a with a port"
+$NSPAWN stop e2e-a >/dev/null || fail "stop e2e-a"
+$NSPAWN start e2e-b -p 18085:80 >/dev/null || fail "start e2e-b on the port e2e-a remembers"
+nft list map ip nspawn ports | grep_q "tcp . 18085 : " || fail "the port of e2e-b is not mapped"
+$NSPAWN stop e2e-a >/dev/null || fail "stop e2e-a again while stopped"
+nft list map ip nspawn ports | grep_q "tcp . 18085 : " || fail "stopping e2e-a again withdrew the port of e2e-b"
+out=$($NSPAWN start e2e-a 2>&1) && fail "e2e-a started on a port e2e-b holds"
+echo "$out" | grep_q "already published by e2e-b" || fail "the conflict was not explained: $out"
+nft list map ip nspawn ports | grep_q "tcp . 18085 : " || fail "the refused start of e2e-a withdrew the port of e2e-b"
+$NSPAWN stop e2e-b >/dev/null || fail "stop e2e-b"
+nft list map ip nspawn ports | grep_q "tcp . 18085 : " && fail "the port of e2e-b stayed mapped after its stop"
+$NSPAWN start e2e-a -p none >/dev/null && $NSPAWN stop e2e-a >/dev/null || fail "forget the port of e2e-a"
+$NSPAWN start e2e-b -p none >/dev/null && $NSPAWN stop e2e-b >/dev/null || fail "forget the port of e2e-b"
+
 step "two machines on the bridge: names and published ports"
 $NSPAWN start e2e-a || fail "start e2e-a"
 $NSPAWN start e2e-b -p 18080:80 -p 127.0.0.1:18082:80 -p 18100-18101:80-81 || fail "start e2e-b with published ports"
