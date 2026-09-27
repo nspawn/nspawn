@@ -87,14 +87,38 @@ pub async fn machine_interfaces(sd: &Systemd, name: &str) -> Result<Vec<String>>
     Ok(indices.into_iter().filter_map(interface_name).collect())
 }
 
+/// Where the interfaces bound for a machine are noted, for the release of a machine
+/// machined no longer lists.
+const ADMITTED_DIR: &str = "/run/nspawn/firewalld";
+
+fn admitted_path(name: &str) -> std::path::PathBuf {
+    Path::new(ADMITTED_DIR).join(name)
+}
+
 /// Lets the machine's traffic through firewalld by binding its host-side interfaces to
-/// the trusted zone. Returns the names that were bound, for `release`.
+/// the trusted zone, and notes them for `release_machine`. Returns the names bound.
 pub async fn admit(sd: &Systemd, name: &str, report: Report<'_>) -> Result<Vec<String>> {
     let interfaces = machine_interfaces(sd, name).await?;
     for ifname in &interfaces {
         trust_interface(sd, ifname, report).await?;
     }
+    std::fs::create_dir_all(ADMITTED_DIR).with_context(|| format!("creating {ADMITTED_DIR}"))?;
+    let path = admitted_path(name);
+    std::fs::write(&path, interfaces.join("\n"))
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(interfaces)
+}
+
+/// Undoes `admit` for a machine, from what it noted: nothing when nothing was bound.
+/// Best effort, as `release`.
+pub async fn release_machine(sd: &Systemd, name: &str) {
+    let path = admitted_path(name);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let interfaces: Vec<String> = text.lines().map(str::to_string).collect();
+    release(sd, &interfaces).await;
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Binds one host interface to the trusted zone of firewalld (runtime configuration).

@@ -1278,6 +1278,7 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
             bail!("machine {} is not running", args.name);
         }
         sd.stop_unit_job(&unit).await?.wait().await?;
+        hostnet::release_machine(sd, &args.name).await;
         release_machine(&args.name, record.as_ref())?;
         sd.reset_failed(&unit).await?;
         return Ok(if state.busy() {
@@ -1286,13 +1287,6 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
             StopOutcome::WasNotRunning
         });
     }
-    let admitted = if hostnet::firewalld_running(sd).await {
-        hostnet::machine_interfaces(sd, &args.name)
-            .await
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
     let mode = record.as_ref().map(|r| r.mode);
     let latch = latch(policy, args.force, mode);
     let mut job = None;
@@ -1401,7 +1395,7 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
             None => sd.stop_unit(&unit).await?,
         }
         sd.reset_failed(&unit).await?;
-        hostnet::release(sd, &admitted).await;
+        hostnet::release_machine(sd, &args.name).await;
         let _lock = store.lock().await?;
         release_machine(&args.name, record.as_ref())?;
     }

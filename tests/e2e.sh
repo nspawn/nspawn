@@ -314,6 +314,12 @@ for backend in overlay flat mstack; do
     $NSPAWN stop "$name" || fail "stop veth machine"
     if firewall-cmd --state >/dev/null 2>&1; then
       firewall-cmd --zone=trusted --list-interfaces | grep_q -w "ve-$name" && fail "ve-$name still bound in firewalld after stop"
+      # A machine that ends on its own is released by its hook, not by stop.
+      $NSPAWN start "$name" --network veth >/dev/null || fail "start --network veth again"
+      [ "$(firewall-cmd --get-zone-of-interface="ve-$name")" = trusted ] || fail "ve-$name is not in the trusted zone on the second start"
+      machinectl poweroff "$name" >/dev/null 2>&1 || fail "machinectl poweroff of the veth machine"
+      retry 20 bash -c "! $NSPAWN machines ls | grep_q '^ *$name '" || fail "$name still running after poweroff"
+      retry 10 bash -c "! firewall-cmd --zone=trusted --list-interfaces | grep -qw ve-$name" || fail "ve-$name still bound in firewalld after the machine powered off on its own"
     fi
     $NSPAWN start "$name" --network bridge >/dev/null && $NSPAWN stop "$name" >/dev/null || fail "back to the bridge network"
     if [ "$networkd_was" != active ]; then
