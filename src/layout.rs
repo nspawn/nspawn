@@ -71,7 +71,12 @@ fn blob_path(dir: &Path, digest: &str) -> Result<PathBuf> {
     let (algo, hex) = digest
         .split_once(':')
         .with_context(|| format!("malformed digest {digest}"))?;
-    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+    // Both become path components below the layout.
+    if algo.is_empty()
+        || !algo.chars().all(|c| c.is_ascii_alphanumeric())
+        || hex.is_empty()
+        || !hex.chars().all(|c| c.is_ascii_hexdigit())
+    {
         bail!("malformed digest {digest}");
     }
     Ok(dir.join("blobs").join(algo).join(hex))
@@ -132,6 +137,26 @@ mod tests {
         )
         .unwrap();
         (manifest_digest, layer_digest)
+    }
+
+    #[test]
+    fn a_digest_names_a_blob_below_the_layout_alone() {
+        let dir = Path::new("/layout");
+        assert_eq!(
+            blob_path(dir, "sha256:ab12").unwrap(),
+            Path::new("/layout/blobs/sha256/ab12")
+        );
+        for bad in [
+            "sha256",
+            "..:ab",
+            "sha256:",
+            ":ab",
+            "a/b:ab",
+            "sha256:zz",
+            "sha256:../x",
+        ] {
+            assert!(blob_path(dir, bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
