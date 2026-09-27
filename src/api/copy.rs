@@ -231,6 +231,35 @@ pub fn kind_in(root: BorrowedFd<'_>, path: &Path) -> Result<Option<Kind>> {
     }
 }
 
+/// Whether the directory is on a file system the kernel makes up as it goes rather
+/// than one that holds files: procfs, sysfs, cgroups, devpts and their kind (the
+/// magics of linux/magic.h).
+fn kernel_filesystem(dir: &OwnedFd) -> bool {
+    const KERNEL_MAGICS: [u64; 17] = [
+        0x9fa0,     // proc
+        0x62656572, // sysfs
+        0x27e0eb,   // cgroup
+        0x63677270, // cgroup2
+        0x1cd1,     // devpts
+        0x19800202, // mqueue
+        0x42494e4d, // binfmt_misc
+        0x73636673, // securityfs
+        0x64626720, // debugfs
+        0x74726163, // tracefs
+        0xf97cff8c, // selinuxfs
+        0xcafe4a11, // bpf
+        0x6165676c, // pstore
+        0xde5e81e4, // efivarfs
+        0x65735543, // fusectl
+        0x62656570, // configfs
+        0x958458f6, // hugetlbfs
+    ];
+    let Ok(stat) = nix::sys::statfs::fstatfs(dir) else {
+        return false;
+    };
+    KERNEL_MAGICS.contains(&(stat.filesystem_type().0 as u64 & 0xffff_ffff))
+}
+
 fn is(mode: u32, kind: SFlag) -> bool {
     mode & SFlag::S_IFMT.bits() == kind.bits()
 }
@@ -306,12 +335,6 @@ fn pack_entry<W: Write>(
     header.set_uid(u64::from(ids.outward(st.st_uid)));
     header.set_gid(u64::from(ids.outward(st.st_gid)));
     if is(st.st_mode, SFlag::S_IFDIR) {
-        header.set_entry_type(tar::EntryType::Directory);
-        header.set_size(0);
-        builder
-            .append_data(&mut header, path, io::empty())
-            .with_context(|| format!("writing {}", path.display()))?;
-        stats.entries += 1;
         let dir = openat(
             dirfd,
             leaf,
@@ -319,6 +342,18 @@ fn pack_entry<W: Write>(
             Mode::empty(),
         )
         .map_err(|e| nix_error(e, path))?;
+        // The kernel's own file systems mounted in a running machine (/proc, /sys,
+        // cgroups) are not the machine's files: /proc/kcore alone reads as the whole
+        // of memory.
+        if kernel_filesystem(&dir) {
+            return Ok(());
+        }
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
+        builder
+            .append_data(&mut header, path, io::empty())
+            .with_context(|| format!("writing {}", path.display()))?;
+        stats.entries += 1;
         let listing = dir
             .try_clone()
             .context("duplicating a directory descriptor")?;
@@ -804,6 +839,22 @@ pub async fn copy_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_kernel_s_own_file_systems_are_told_apart() {
+        let open = |p: &str| {
+            nix::fcntl::open(
+                p,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap()
+        };
+        assert!(kernel_filesystem(&open("/proc")));
+        assert!(kernel_filesystem(&open("/sys")));
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!kernel_filesystem(&open(&tmp.path().to_string_lossy())));
+    }
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
