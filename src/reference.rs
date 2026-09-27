@@ -20,8 +20,13 @@ impl ImageRef {
         if input.is_empty() {
             bail!("empty image reference");
         }
+        // A first component that names a registry, or the default registry itself: a
+        // host without a dot or a port (a name on the local network) is one only when
+        // it is the configured one, and its references must read back as written.
         let (registry, rest) = match input.split_once('/') {
-            Some((first, rest)) if looks_like_registry(first) => (first.to_string(), rest),
+            Some((first, rest)) if looks_like_registry(first) || first == default_registry => {
+                (first.to_string(), rest)
+            }
             _ => (default_registry.to_string(), input),
         };
         let (rest, digest) = match rest.split_once('@') {
@@ -61,9 +66,31 @@ impl ImageRef {
         })
     }
 
+    /// The reference as the registry client takes it, built from its parts: parsed from
+    /// its text, a registry without a dot or a port would pass for a repository of
+    /// Docker Hub.
     pub fn to_oci(&self) -> Result<oci_client::Reference> {
-        oci_client::Reference::try_from(self.to_string())
-            .map_err(|e| anyhow!("invalid OCI reference {}: {e}", self))
+        let reference = match (&self.digest, &self.tag) {
+            (Some(digest), _) => oci_client::Reference::with_digest(
+                self.registry.clone(),
+                self.repository.clone(),
+                digest.clone(),
+            ),
+            (None, Some(tag)) => oci_client::Reference::with_tag(
+                self.registry.clone(),
+                self.repository.clone(),
+                tag.clone(),
+            ),
+            (None, None) => oci_client::Reference::with_tag(
+                self.registry.clone(),
+                self.repository.clone(),
+                "latest".to_string(),
+            ),
+        };
+        if reference.registry() != self.registry || reference.repository() != self.repository {
+            return Err(anyhow!("invalid OCI reference {}", self));
+        }
+        Ok(reference)
     }
 
     /// The machine image name used locally: `fedora:44` becomes `fedora-44`, `debian:latest`
@@ -238,6 +265,34 @@ mod tests {
         ] {
             assert!(validate_entry_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_registry_without_a_dot_is_kept_as_such() {
+        let r = ImageRef::parse("fedora:44", "zot").unwrap();
+        assert_eq!(
+            (r.registry.as_str(), r.repository.as_str()),
+            ("zot", "fedora")
+        );
+        let o = r.to_oci().unwrap();
+        assert_eq!(
+            (o.registry(), o.repository(), o.tag()),
+            ("zot", "fedora", Some("44"))
+        );
+        // What it prints reads back the same under that registry.
+        let again = ImageRef::parse(&r.to_string(), "zot").unwrap();
+        assert_eq!(again, r);
+        // Under another default, that first component is part of the repository.
+        let other = ImageRef::parse("zot/fedora:44", "docker.io").unwrap();
+        assert_eq!(other.repository, "zot/fedora");
+        let o = other.to_oci().unwrap();
+        assert_eq!((o.registry(), o.repository()), ("docker.io", "zot/fedora"));
+        let d = ImageRef::parse(
+            "fedora@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            "zot",
+        )
+        .unwrap();
+        assert_eq!(d.to_oci().unwrap().digest().map(|d| d.len()), Some(71));
     }
 
     #[test]
