@@ -550,20 +550,18 @@ pub async fn prepare(
             }
             std::fs::create_dir_all(&source)
                 .with_context(|| format!("creating volume {}", source.display()))?;
-            // What the image has there, owner included, as docker seeds a volume: from
-            // the layers, which earlier runs have not touched, or the tree itself
-            // where there are none.
+            // What the image has there, owner included: from its layers, which earlier
+            // runs have not touched, merged as the image shows them, or from the tree
+            // itself where there are no layers.
             let target = volume.target.trim_start_matches('/');
-            let image_path =
-                crate::backend::image_path(store, &record.layers, record.backend, target).or_else(
-                    || {
-                        (record.backend == BackendChoice::Flat)
-                            .then(|| crate::backend::root_path(store, name, record.backend, target))
-                            .flatten()
-                    },
-                );
-            if let Some(image_path) = image_path {
-                crate::volume::seed(&image_path, &source)?;
+            let layers = crate::backend::layer_dirs(store, &record.layers, record.backend);
+            if !layers.is_empty() {
+                crate::volume::seed_from_layers(&layers, target, &source)?;
+            } else if let Some(path) = (record.backend == BackendChoice::Flat)
+                .then(|| crate::backend::root_path(store, name, record.backend, target))
+                .flatten()
+            {
+                crate::volume::seed(&path, &source)?;
             }
             crate::api::events::emit(
                 "volume",

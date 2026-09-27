@@ -53,6 +53,133 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Fills a named volume with what an image of several layers has at `relative`, layer by
+/// layer from the bottom, as the assembled image would show it: a higher layer adds and
+/// replaces entries, its whiteouts (overlayfs character devices 0:0) remove what a lower
+/// one had, and an opaque directory hides everything below it. Whether a directory was
+/// found; owner and mode are the topmost layer's, as with `seed`.
+pub fn seed_from_layers(layers: &[PathBuf], relative: &str, to: &Path) -> Result<bool> {
+    let relative = Path::new(relative);
+    let mut top: Option<fs::Metadata> = None;
+    for layer in layers {
+        // A whiteout or an opaque directory on the way hides what lower layers had.
+        let mut hidden = false;
+        let mut prefix = PathBuf::new();
+        for component in relative.iter() {
+            prefix.push(component);
+            let Some(path) = crate::backend::chase(layer, &prefix) else {
+                break;
+            };
+            match path.symlink_metadata() {
+                Err(_) => break,
+                Ok(meta) if is_whiteout(&meta) => {
+                    hidden = true;
+                    break;
+                }
+                Ok(meta) if meta.is_dir() && is_opaque(&path) => hidden = true,
+                Ok(_) => {}
+            }
+        }
+        if hidden {
+            clear_dir(to)?;
+            top = None;
+        }
+        let Some(path) = crate::backend::chase(layer, relative) else {
+            continue;
+        };
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        if is_whiteout(&meta) || !meta.is_dir() {
+            continue;
+        }
+        merge_tree(&path, to)?;
+        top = Some(meta);
+    }
+    match top {
+        Some(meta) => take_over(&meta, to).map(|()| true),
+        None => Ok(false),
+    }
+}
+
+/// A higher layer's directory over what the copy holds so far.
+fn merge_tree(from: &Path, to: &Path) -> Result<()> {
+    for entry in fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
+        let entry = entry.with_context(|| format!("reading {}", from.display()))?;
+        let source = entry.path();
+        let target = to.join(entry.file_name());
+        let meta = source
+            .symlink_metadata()
+            .with_context(|| format!("looking at {}", source.display()))?;
+        let kind = meta.file_type();
+        if is_whiteout(&meta) {
+            remove_entry(&target)?;
+            continue;
+        }
+        if kind.is_dir() {
+            if is_opaque(&source) {
+                clear_dir(&target)?;
+            }
+            if target.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
+                remove_entry(&target)?;
+            }
+            if !target.is_dir() {
+                fs::create_dir(&target)
+                    .with_context(|| format!("creating {}", target.display()))?;
+            }
+            merge_tree(&source, &target)?;
+        } else if kind.is_symlink() {
+            remove_entry(&target)?;
+            let link = fs::read_link(&source)
+                .with_context(|| format!("reading the link {}", source.display()))?;
+            std::os::unix::fs::symlink(&link, &target)
+                .with_context(|| format!("creating the link {}", target.display()))?;
+        } else if kind.is_file() {
+            remove_entry(&target)?;
+            fs::copy(&source, &target).with_context(|| format!("copying {}", source.display()))?;
+        } else {
+            continue;
+        }
+        take_over(&meta, &target)?;
+    }
+    Ok(())
+}
+
+/// An overlayfs whiteout: a character device 0:0.
+fn is_whiteout(meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    meta.file_type().is_char_device() && meta.rdev() == 0
+}
+
+/// An overlayfs opaque directory: nothing below it in lower layers shows.
+fn is_opaque(dir: &Path) -> bool {
+    ["trusted.overlay.opaque", "user.overlay.opaque"]
+        .iter()
+        .any(|name| xattr::get(dir, name).ok().flatten().as_deref() == Some(b"y"))
+}
+
+fn remove_entry(path: &Path) -> Result<()> {
+    match path.symlink_metadata() {
+        Ok(meta) if meta.is_dir() => {
+            fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))
+        }
+        Ok(_) => fs::remove_file(path).with_context(|| format!("removing {}", path.display())),
+        Err(_) => Ok(()),
+    }
+}
+
+/// Empties a directory, keeping the directory itself.
+fn clear_dir(dir: &Path) -> Result<()> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        remove_entry(&entry.path())?;
+    }
+    Ok(())
+}
+
 /// The owner, mode and times of the image's entry, on the copy.
 fn take_over(meta: &fs::Metadata, target: &Path) -> Result<()> {
     std::os::unix::fs::lchown(target, Some(meta.uid()), Some(meta.gid()))
@@ -422,6 +549,47 @@ mod tests {
         assert!(plain_inside_path("/a/b") && plain_inside_path("/a.b/..c"));
         assert!(!plain_inside_path("a/b") && !plain_inside_path("/a/./b"));
     }
+    #[test]
+    fn a_volume_is_seeded_from_every_layer_of_the_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let top = tmp.path().join("top");
+        fs::create_dir_all(base.join("data/sub")).unwrap();
+        fs::write(base.join("data/a"), "base").unwrap();
+        fs::write(base.join("data/sub/b"), "b").unwrap();
+        fs::write(base.join("data/gone"), "gone").unwrap();
+        fs::create_dir_all(top.join("data/sub")).unwrap();
+        fs::write(top.join("data/a"), "top").unwrap();
+        fs::write(top.join("data/c"), "c").unwrap();
+        fs::set_permissions(top.join("data"), fs::Permissions::from_mode(0o750)).unwrap();
+        let volume = tmp.path().join("volume");
+        fs::create_dir(&volume).unwrap();
+        let layers = vec![base.clone(), top.clone()];
+        assert!(seed_from_layers(&layers, "data", &volume).unwrap());
+        // The top layer's files replace, the base's stay, the top's mode wins.
+        assert_eq!(fs::read_to_string(volume.join("a")).unwrap(), "top");
+        assert_eq!(fs::read_to_string(volume.join("sub/b")).unwrap(), "b");
+        assert_eq!(fs::read_to_string(volume.join("c")).unwrap(), "c");
+        assert_eq!(fs::read_to_string(volume.join("gone")).unwrap(), "gone");
+        assert_eq!(fs::metadata(&volume).unwrap().mode() & 0o7777, 0o750);
+        // A path only the base has is seeded from the base alone.
+        let other = tmp.path().join("other");
+        fs::create_dir(&other).unwrap();
+        fs::create_dir_all(base.join("only")).unwrap();
+        fs::write(base.join("only/x"), "x").unwrap();
+        assert!(seed_from_layers(&layers, "only", &other).unwrap());
+        assert_eq!(fs::read_to_string(other.join("x")).unwrap(), "x");
+        // Nothing anywhere: nothing seeded, the directory untouched.
+        assert!(!seed_from_layers(&layers, "nowhere", &other).unwrap());
+        // An opaque directory in the top layer hides the base's content.
+        if xattr::set(top.join("data"), "user.overlay.opaque", b"y").is_ok() {
+            let opaque = tmp.path().join("opaque");
+            fs::create_dir(&opaque).unwrap();
+            assert!(seed_from_layers(&layers, "data", &opaque).unwrap());
+            assert!(opaque.join("c").is_file() && !opaque.join("gone").exists());
+        }
+    }
+
     #[test]
     fn a_new_volume_takes_what_the_image_has() {
         let tmp = tempfile::tempdir().unwrap();
