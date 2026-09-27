@@ -67,10 +67,10 @@ pub fn mount_into_machine(leader: u32, source: &Path, target: &str, read_only: b
     if r < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
         // A filesystem (or a submount) without idmapped mounts: docker mounts it plainly,
         // so does nspawn, with a note, since root inside then appears as nobody there.
-        eprintln!(
+        crate::nsenter::complain(&format!(
             "note: {} cannot be idmapped (unsupported filesystem); attached with the host's ownership",
             source.display()
-        );
+        ));
         attr.attr_set &= !libc::MOUNT_ATTR_IDMAP;
         attr.userns_fd = 0;
         r = unsafe {
@@ -127,22 +127,27 @@ fn run_helper(work: impl FnOnce() -> i32, what: &str) -> Result<()> {
 
 fn make_mount_point(userns: &File, mntns: &File, target: &CStr) -> i32 {
     if let Err(e) = setns(userns, CloneFlags::CLONE_NEWUSER) {
-        eprintln!("error: joining the machine's user namespace: {e}");
+        crate::nsenter::complain(&format!("error: joining the machine's user namespace: {e}"));
         return 1;
     }
     if let Err(e) = setns(mntns, CloneFlags::CLONE_NEWNS) {
-        eprintln!("error: joining the machine's mount namespace: {e}");
+        crate::nsenter::complain(&format!(
+            "error: joining the machine's mount namespace: {e}"
+        ));
         return 1;
     }
     if nix::unistd::setgid(nix::unistd::Gid::from_raw(0)).is_err()
         || nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).is_err()
     {
-        eprintln!("error: cannot become root inside the machine");
+        crate::nsenter::complain("error: cannot become root inside the machine");
         return 1;
     }
     let path = Path::new(std::ffi::OsStr::from_bytes(target.to_bytes()));
     if let Err(e) = std::fs::create_dir_all(path) {
-        eprintln!("error: creating {} inside the machine: {e}", path.display());
+        crate::nsenter::complain(&format!(
+            "error: creating {} inside the machine: {e}",
+            path.display()
+        ));
         return 1;
     }
     0
@@ -150,7 +155,9 @@ fn make_mount_point(userns: &File, mntns: &File, target: &CStr) -> i32 {
 
 fn attach(mntns: &File, tree: &OwnedFd, target: &CStr) -> i32 {
     if let Err(e) = setns(mntns, CloneFlags::CLONE_NEWNS) {
-        eprintln!("error: joining the machine's mount namespace: {e}");
+        crate::nsenter::complain(&format!(
+            "error: joining the machine's mount namespace: {e}"
+        ));
         return 1;
     }
     let r = unsafe {
@@ -164,11 +171,11 @@ fn attach(mntns: &File, tree: &OwnedFd, target: &CStr) -> i32 {
         )
     };
     if r < 0 {
-        eprintln!(
+        crate::nsenter::complain(&format!(
             "error: attaching the volume at {}: {}",
             target.to_string_lossy(),
             io::Error::last_os_error()
-        );
+        ));
         return 1;
     }
     0

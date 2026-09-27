@@ -455,7 +455,9 @@ pub fn host_pty(rows: u16, cols: u16) -> Result<(OwnedFd, OwnedFd)> {
 
 /// Writes a line to standard error with write(2): Rust's stderr lock may be held by a
 /// thread of the parent that did not come along with the fork.
-fn complain(text: &str) {
+/// Writes a line to standard error with a plain write(2): safe in a child of a
+/// multithreaded process, where the locks of the standard streams may be held.
+pub(crate) fn complain(text: &str) {
     let mut bytes = text.as_bytes().to_vec();
     bytes.push(b'\n');
     let _ = unsafe { libc::write(2, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
