@@ -368,6 +368,16 @@ $NSPAWN create e2e-a e2e-bad -v "bad volume" >/dev/null 2>&1 && fail "create acc
 
 step "create: another machine from a local image, without the registry"
 env NSPAWN_REGISTRY=127.0.0.1:9 $NSPAWN create e2e-a e2e-c || fail "create from a local image"
+# A flag refused by create --force is refused before the old machine goes.
+$NSPAWN start e2e-c -l keep=me >/dev/null && $NSPAWN stop e2e-c >/dev/null || fail "label e2e-c"
+out=$($NSPAWN create e2e-a e2e-c --force --hostname 'bad host' 2>&1) && fail "create --force accepted a bad hostname"
+$NSPAWN inspect e2e-c | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['labels'].get('keep') == 'me', d" || fail "a refused create --force replaced the machine: $out"
+# --network none is a kind of network, inherited like the bridge.
+$NSPAWN start e2e-c --network none >/dev/null && $NSPAWN stop e2e-c >/dev/null || fail "e2e-c on no network"
+$NSPAWN create e2e-c e2e-cshort >/dev/null || fail "create from a machine on no network"
+$NSPAWN inspect e2e-cshort | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['network'] == 'none', d" || fail "create did not inherit --network none"
+$NSPAWN rm e2e-cshort >/dev/null || fail "rm e2e-cshort"
+$NSPAWN start e2e-c --network bridge >/dev/null && $NSPAWN stop e2e-c >/dev/null || fail "e2e-c back on the bridge"
 $NSPAWN images ls | grep "^ *e2e-c " | grep_q "create" || fail "created machine not listed with origin create"
 # An image pulled under its own name is found by its short reference too, and not
 # pulled again under that name.

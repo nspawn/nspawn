@@ -1,6 +1,8 @@
 //! docker create: another machine from an image that is already local. No registry
 //! involved, layers shared, and a writable layer, address and settings of its own.
 
+use std::collections::BTreeMap;
+
 use anyhow::{bail, Context as _, Result};
 use oci_client::manifest::OciImageManifest;
 
@@ -11,7 +13,7 @@ use crate::hub::short_digest;
 use crate::install::{ensure_replaceable, install, remove_existing, Install};
 use crate::oci::Mode;
 use crate::reference::validate_machine_name;
-use crate::store::validate_digest;
+use crate::store::{validate_digest, ImageRecord};
 use crate::volume;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +149,64 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     if backend == Backend::Mstack {
         note(report, crate::backend::MSTACK_EXPERIMENTAL);
     }
+    // The rest of the flags, applied to a draft of the record before the old machine
+    // goes: a flag refused after that would leave a machine with none of them. The
+    // network kind is inherited (none included); ports are not (two machines cannot
+    // publish the same one), nor a user-defined network or another machine's
+    // namespace, which a machine joins only when told to.
+    let mut draft = ImageRecord {
+        network_name: None,
+        address: None,
+        extra_networks: Vec::new(),
+        aliases: BTreeMap::new(),
+        network_container: None,
+        healthcheck: None,
+        tuning: Default::default(),
+        ..source.clone()
+    };
+    match &network {
+        Some(choice) => crate::api::network::apply(&mut draft, choice),
+        None => draft.network_name = None,
+    }
+    if !request.aliases.is_empty() {
+        if !bridge::bridge_kind(&draft) {
+            bail!(
+                "aliases are names on a bridge network; {} joins none",
+                request.name
+            );
+        }
+        draft.aliases =
+            crate::api::network::parse_aliases(&request.aliases, &bridge::networks_of(&draft))?;
+    }
+    if let Some(entrypoint) = &request.entrypoint {
+        volume::reject_control_characters(entrypoint)?;
+        draft.entrypoint = Some(if entrypoint.is_empty() {
+            Vec::new()
+        } else {
+            vec![entrypoint.clone()]
+        });
+    } else {
+        draft.entrypoint = None;
+    }
+    draft.cmd = None;
+    if !request.command.is_empty() {
+        for arg in &request.command {
+            volume::reject_control_characters(arg)?;
+        }
+        draft.cmd = Some(request.command.clone());
+    }
+    draft.env = env;
+    draft.volumes = volumes;
+    draft.labels = labels;
+    draft.restart = request.restart.unwrap_or_default();
+    draft.limits = limits;
+    draft.ports = ports;
+    draft.remove_on_exit = false;
+    if !request.health.is_empty() {
+        let hc = request.health.apply(draft.effective_healthcheck())?;
+        draft.healthcheck = Some(hc);
+    }
+    request.tuning.apply(&mut draft.tuning)?;
     remove_existing(store, sd, &request.name, report).await?;
     line(
         report,
@@ -177,54 +237,24 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         report,
     )
     .await?;
-    // The network kind is inherited; ports are not (two machines cannot publish the same
-    // one), nor a user-defined network, which a machine joins only when told to, as with
-    // docker.
-    let mut record = store
+    // What install wrote, with the draft's choices on top.
+    let installed = store
         .load_image(&request.name)?
         .context("the record of the new machine is missing")?;
-    match &network {
-        Some(choice) => crate::api::network::apply(&mut record, choice),
-        None => {
-            record.network = source.network;
-            record.network_name = None;
-        }
-    }
-    if !request.aliases.is_empty() {
-        if !bridge::bridge_kind(&record) {
-            bail!(
-                "aliases are names on a bridge network; {} joins none",
-                request.name
-            );
-        }
-        record.aliases =
-            crate::api::network::parse_aliases(&request.aliases, &bridge::networks_of(&record))?;
-    }
-    record.ports = ports;
-    if let Some(entrypoint) = &request.entrypoint {
-        volume::reject_control_characters(entrypoint)?;
-        record.entrypoint = Some(if entrypoint.is_empty() {
-            Vec::new()
-        } else {
-            vec![entrypoint.clone()]
-        });
-    }
-    if !request.command.is_empty() {
-        for arg in &request.command {
-            volume::reject_control_characters(arg)?;
-        }
-        record.cmd = Some(request.command.clone());
-    }
-    record.env = env;
-    record.volumes = volumes;
-    record.labels = labels;
-    record.restart = request.restart.unwrap_or_default();
-    record.limits = limits;
-    if !request.health.is_empty() {
-        let hc = request.health.apply(record.effective_healthcheck())?;
-        record.healthcheck = Some(hc);
-    }
-    request.tuning.apply(&mut record.tuning)?;
+    let record = ImageRecord {
+        name: installed.name,
+        reference: installed.reference,
+        manifest_digest: installed.manifest_digest,
+        layers: installed.layers,
+        backend: installed.backend,
+        created: installed.created,
+        origin: installed.origin,
+        mode: installed.mode,
+        run: installed.run,
+        signed_by: installed.signed_by,
+        signed_at: installed.signed_at,
+        ..draft
+    };
     store.record_image(&record)?;
     crate::api::events::emit(
         "machine",
