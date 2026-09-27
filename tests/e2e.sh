@@ -540,6 +540,10 @@ echo "$app_addr" | grep_q "^10\.99\.0\." || fail "no bridge address for the app"
 ipv4_only "$app" "$app_addr"
 $NSPAWN exec $app -- ip -4 -o addr show host0 </dev/null | tr -d '\r' | grep_q "$app_addr/24" || fail "host0 not configured inside the app"
 $NSPAWN exec $app -- cat /etc/hosts </dev/null | tr -d '\r' | grep_q "host.nspawn.internal" || fail "generated /etc/hosts missing in the app"
+# sysfs is mounted inside the namespace: the app's interfaces, not the host's.
+sys_net=$($NSPAWN exec $app -- ls /sys/class/net </dev/null | tr -d '\r' | tr '\n' ' ')
+echo "$sys_net" | grep_q "host0" || fail "/sys/class/net in the app lacks host0: $sys_net"
+echo "$sys_net" | grep_q "nspawn0" && fail "/sys/class/net in the app shows the host's interfaces: $sys_net"
 # The service ignores SIGPIPE; what exec runs must not inherit that.
 ignored=$($NSPAWN exec $app -- cat /proc/self/status </dev/null | tr -d '\r' | awk '/^SigIgn:/ {print $2}')
 [ $(( 16#${ignored:-0} & 0x1000 )) = 0 ] || fail "a command run by exec ignores SIGPIPE (SigIgn $ignored)"

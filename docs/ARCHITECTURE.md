@@ -160,7 +160,10 @@ prepared on the host; app images are assembled with overlay even where mstack
 exists. The namespace is named with `NamespacePath=` in the settings file on
 systemd 259 or newer; before that the key does not exist, and the unit's
 `ExecStart=` gets `--network-namespace-path=` instead (minus the options that
-conflict). An app's `ExecStart=` is rewritten in the hooks drop-in on every
+conflict). `Private=yes` (`--private-network`) goes with it: a namespace path
+alone does not count as a private network to systemd-nspawn, which then mounts
+the machine's `/sys` before joining the namespace, so that `/sys/class/net`
+lists the host's interfaces; with it, sysfs is mounted inside the namespace. An app's `ExecStart=` is rewritten in the hooks drop-in on every
 systemd version anyway: the argv systemd has loaded runs behind `nspawn
 attach-exec NAME --` (`src/attach.rs`), which execs it as it is unless an
 attached `run` waits for the machine on `/run/nspawn/attach/NAME.sock`; then it

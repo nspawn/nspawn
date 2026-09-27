@@ -192,9 +192,13 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
                         files.push(format!("BindReadOnly={dir}/hosts:/etc/hosts"));
                     }
                     Mode::App => {
+                        // Private=yes as well: a namespace path alone does not count as
+                        // a private network to systemd-nspawn, which then mounts the
+                        // machine's /sys before joining the namespace, so that
+                        // /sys/class/net shows the host's interfaces.
                         if *route == NamespaceRoute::Settings {
                             out.push_str(&format!(
-                                "\n[Network]\nNamespacePath={}\n",
+                                "\n[Network]\nPrivate=yes\nNamespacePath={}\n",
                                 crate::bridge::netns_path(s.name)
                             ));
                         }
@@ -401,9 +405,11 @@ pub fn render_hooks(
 /// An app machine's ExecStart=: the loaded argv behind `nspawn attach-exec` (src/attach.rs),
 /// without the override of ours it may carry and without --console, which only a run
 /// chooses.
-/// With `namespace` it carries --network-namespace-path= instead of the options that
-/// conflict with it (in their `--option=value` form). Applied to its own output it gives
-/// the same lines.
+/// With `namespace` it carries --private-network and --network-namespace-path= instead
+/// of the options that conflict with them (in their `--option=value` form); the first
+/// makes systemd-nspawn mount the machine's /sys inside the namespace, which the path
+/// alone does not. Without it both go, the settings file saying what the network is.
+/// Applied to its own output it gives the same lines.
 pub fn exec_start_override(command: &str, argv: &[String], name: &str, namespace: bool) -> String {
     const CONFLICTING: &[&str] = &[
         "--network-veth",
@@ -420,11 +426,16 @@ pub fn exec_start_override(command: &str, argv: &[String], name: &str, namespace
     let argv = unwrapped(argv);
     let mut kept: Vec<String> = argv
         .iter()
-        .filter(|arg| !is(arg, "--console") && !is(arg, "--network-namespace-path"))
+        .filter(|arg| {
+            !is(arg, "--console")
+                && !is(arg, "--network-namespace-path")
+                && !is(arg, "--private-network")
+        })
         .filter(|arg| !namespace || !CONFLICTING.iter().any(|option| is(arg, option)))
         .map(|arg| unit_quote(arg))
         .collect();
     if namespace {
+        kept.push("--private-network".to_string());
         kept.push(format!(
             "--network-namespace-path={}",
             unit_quote(&crate::bridge::netns_path(name))
@@ -662,7 +673,7 @@ mod tests {
         let text = exec_start_override(command, &argv, "web", true);
         assert_eq!(
             text,
-            "ExecStart=\nExecStart=/usr/bin/nspawn attach-exec web -- systemd-nspawn --quiet --keep-unit --boot --link-journal=try-guest -U --settings=override --machine=web --network-namespace-path=/run/netns/nspawn-web\n"
+            "ExecStart=\nExecStart=/usr/bin/nspawn attach-exec web -- systemd-nspawn --quiet --keep-unit --boot --link-journal=try-guest -U --settings=override --machine=web --private-network --network-namespace-path=/run/netns/nspawn-web\n"
         );
         // What systemd loads from that drop-in gives the same drop-in again.
         let loaded: Vec<String> = text.lines().nth(1).unwrap()["ExecStart=".len()..]
@@ -697,7 +708,7 @@ mod tests {
         .collect();
         assert_eq!(
             exec_start_override(command, &bridged, "a", true),
-            "ExecStart=\nExecStart=/usr/bin/nspawn attach-exec a -- systemd-nspawn \"--machine=%%i\" --network-namespace-path=/run/netns/nspawn-a\n"
+            "ExecStart=\nExecStart=/usr/bin/nspawn attach-exec a -- systemd-nspawn \"--machine=%%i\" --private-network --network-namespace-path=/run/netns/nspawn-a\n"
         );
         assert_eq!(unit_quote("plain-arg=1"), "plain-arg=1");
         assert_eq!(unit_quote("with space"), "\"with space\"");
@@ -862,7 +873,9 @@ mod tests {
         });
         assert!(app_bridged.contains("[Exec]\nPrivateUsers=no\nBoot=no\n"));
         assert!(app_bridged.contains("KillSignal=SIGRTMIN+4\nResolvConf=off\n"));
-        assert!(app_bridged.contains("[Network]\nNamespacePath=/run/netns/nspawn-web\n"));
+        assert!(
+            app_bridged.contains("[Network]\nPrivate=yes\nNamespacePath=/run/netns/nspawn-web\n")
+        );
         assert!(!app_bridged.contains("Bridge="));
         // Before systemd 259 the namespace goes on the command line and the file has no
         // [Network] section, so the template's network options stay in force there.
