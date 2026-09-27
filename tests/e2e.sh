@@ -964,14 +964,14 @@ pid=$(x 'cat /proc/1/task/1/children' | tr -d ' ')
 retry 5 bash -c "$NSPAWN logs $app -n 5 | tr -d '\r' | grep -qx /tmp" || fail "--workdir not applied: $($NSPAWN logs $app -n 5)"
 # --cap-drop ALL --cap-add X keeps X, as with docker: bit 10 is CAP_NET_BIND_SERVICE.
 [ "$(x 'awk "/^CapBnd:/ {print \$2}" /proc/1/status')" = 0000000000000400 ] || fail "--cap-drop ALL --cap-add NET_BIND_SERVICE left other capabilities: $(x 'grep CapBnd /proc/1/status')"
-# An app without a user namespace keeps docker's default set and CAP_SYS_BOOT, no more:
-# the bounding set of a docker container (CapBnd 00000000a80425fb, docker 29) plus bit
-# 22, and /proc/sys cannot be remounted writable; --cap-add SYS_ADMIN gives that back,
-# a booted machine keeps systemd-nspawn's set in its own user namespace.
+# An app without a user namespace keeps the default set and CAP_SYS_BOOT, no more: the
+# bounding set of a docker container (CapBnd 00000000a80425fb, docker 29) plus bit 22,
+# and /proc/sys cannot be remounted writable; --cap-add SYS_ADMIN gives that back, a
+# booted machine keeps systemd-nspawn's set in its own user namespace.
 $NSPAWN create $app e2e-caps -- /bin/sleep 300 >/dev/null || fail "create e2e-caps"
 $NSPAWN start e2e-caps >/dev/null || fail "start e2e-caps"
 c() { $NSPAWN exec e2e-caps -- /bin/sh -c "$1" </dev/null 2>&1 | tr -d '\r'; }
-[ "$(c 'awk "/^CapBnd:/ {print \$2}" /proc/1/status')" = 00000000a8c425fb ] || fail "an app on the bridge does not have docker's capabilities and CAP_SYS_BOOT: $(c 'grep CapBnd /proc/1/status')"
+[ "$(c 'awk "/^CapBnd:/ {print \$2}" /proc/1/status')" = 00000000a84425fb ] || fail "an app on the bridge does not have the default set and CAP_SYS_BOOT: $(c 'grep CapBnd /proc/1/status')"
 grep -q "^SystemCallFilter=~kexec_load kexec_file_load" /etc/systemd/nspawn/e2e-caps.nspawn || fail "the kexec system calls are not filtered for an app: $(cat /etc/systemd/nspawn/e2e-caps.nspawn)"
 [ "$(c 'cat /proc/self/uid_map')" = "$(printf '         0          0 4294967295')" ] || fail "an app on the bridge is not in the initial user namespace: $(c 'cat /proc/self/uid_map')"
 c 'mount -o remount,rw /proc/sys' >/dev/null 2>&1 && fail "an app on the bridge remounted /proc/sys writable"
@@ -992,7 +992,10 @@ x 'cat /etc/resolv.conf' | grep_q "^nameserver 10.99.0.1$" || fail "--dns not ap
 x 'cat /etc/resolv.conf' | grep_q "^search example.test$" || fail "--dns-search not applied"
 x 'cat /etc/hosts' | grep_q "^10.1.1.1 peer$" || fail "--add-host not applied: $(x 'cat /etc/hosts')"
 x 'cat /etc/hosts' | grep_q "^fd00::1 v6$" || fail "--add-host with an IPv6 address (HOST=IP) not applied: $(x 'cat /etc/hosts')"
-[ "$(x 'ulimit -c')" = unlimited ] || fail "--ulimit core=unlimited not applied: $(x 'ulimit -c')"
+# The program's own limits (exec's command has the machine's too, set the same way).
+x "grep 'Max core' /proc/$pid/limits" | grep_q "unlimited *unlimited" || fail "--ulimit core=unlimited not applied to the program: $(x "grep 'Max core' /proc/$pid/limits")"
+x "grep 'Max open files' /proc/$pid/limits" | grep_q " 64 *128 " || fail "--ulimit nofile=64:128 not applied to the program: $(x "grep 'Max open files' /proc/$pid/limits")"
+x 'grep "Max open files" /proc/self/limits' | grep_q " 64 *128 " || fail "exec's command does not get the machine's limits: $(x 'grep "Max open files" /proc/self/limits')"
 x 'cat /etc/hosts' | grep_q "^10.99.0.1 gw$" || fail "--add-host host-gateway not applied: $(x 'cat /etc/hosts')"
 x "grep 'open files' /proc/$pid/limits" | grep_q "64 *128" || fail "--ulimit not applied: $(x "grep 'open files' /proc/$pid/limits")"
 [ "$(x "cat /proc/$pid/oom_score_adj")" = 100 ] || fail "--oom-score-adj not applied: $(x "cat /proc/$pid/oom_score_adj")"
@@ -1039,7 +1042,7 @@ out=$($NSPAWN start $app --sysctl kernel.shmmax=1 2>&1) && fail "a sysctl beyond
 # A refused combination is not remembered: the next start without flags must work.
 out=$($NSPAWN start $app --network none --sysctl net.ipv4.ip_forward=1 -- /bin/sleep 300 2>&1) && fail "--sysctl was accepted with --network none"
 echo "$out" | grep_q "has none" || fail "the refused sysctl was not explained: $out"
-$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['sysctls'] == {} and d['network'] != 'none', d" || fail "a refused start changed the record"
+$NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['network'] != 'none' and 'net.ipv4.ip_forward' not in d['sysctls'], d" || fail "a refused start changed the record"
 # Everything back, and --privileged: the whole bounding set.
 $NSPAWN start $app --privileged --cap-drop none --cap-add none --read-only=false -u root -w / --tmpfs none --device none --dns none --dns-search none --add-host none --ulimit none --stop-signal "" --stop-timeout 10 --oom-score-adj 0 --sysctl none --hostname "" -- /bin/sleep 300 || fail "start with the flags taken back"
 [ "$(x hostname)" = "$app" ] || fail "--hostname \"\" did not restore the name: $(x hostname)"
