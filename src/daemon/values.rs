@@ -475,6 +475,8 @@ impl<'a> Options<'a> {
                 Value::U8(n) => Ok(i64::from(*n)),
                 Value::U16(n) => Ok(i64::from(*n)),
                 Value::U32(n) => Ok(i64::from(*n)),
+                Value::U64(n) => i64::try_from(*n)
+                    .map_err(|_| anyhow::anyhow!("option {key} is too large for an integer")),
                 _ => Err(anyhow::anyhow!("option {key} must be an integer (i)")),
             })
             .transpose()
@@ -591,6 +593,13 @@ mod tests {
         let mut numbers = Options::new(&narrow);
         assert_eq!(numbers.u64("rows", 24).unwrap(), 40, "u will do for t");
         assert_eq!(numbers.u64("cols", 80).unwrap(), 120, "so will q");
+        let wide: HashMap<String, OwnedValue> =
+            HashMap::from([("oom_score_adj".to_string(), v(100u64))]);
+        assert_eq!(
+            Options::new(&wide).i64("oom_score_adj").unwrap(),
+            Some(100),
+            "t will do for an integer, as the documentation says"
+        );
         assert!(numbers
             .u64("lines", 0)
             .unwrap_err()
