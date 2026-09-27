@@ -936,6 +936,11 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             }
             match state.active.as_str() {
                 "active" | "activating" | "reloading" | "deactivating" => {}
+                // The program ran and failed: an ending, with its code for whoever
+                // attached; a unit that failed before it ran is the start's error.
+                "failed" if sd.exec_main_exit(&unit).await?.is_some() => {
+                    return Ok(StartOutcome::Ended)
+                }
                 "failed" => bail!(
                     "{} ended right after starting with an error; see journalctl -u {unit}",
                     args.name
