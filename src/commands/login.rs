@@ -2,8 +2,7 @@
 
 use std::io::{self, BufRead, Write};
 
-use anyhow::{Context as _, Result};
-use nix::sys::signal::{self, SigHandler, Signal};
+use anyhow::{bail, Context as _, Result};
 use nix::sys::termios::{self, LocalFlags, SetArg};
 use nix::unistd::isatty;
 
@@ -13,6 +12,9 @@ use crate::client::{self, Client};
 use crate::config::Config;
 
 pub async fn login(args: LoginArgs, client: &Client, config: &Config) -> Result<()> {
+    if args.password_stdin && args.username.is_none() {
+        bail!("--password-stdin takes the username from --username");
+    }
     let username = match args.username {
         Some(u) => u,
         None => prompt("Username: ", false)?,
@@ -75,19 +77,17 @@ fn prompt(label: &str, hidden: bool) -> Result<String> {
         let mut quiet = original.clone();
         quiet.local_flags.remove(LocalFlags::ECHO);
         termios::tcsetattr(&stdin, SetArg::TCSANOW, &quiet)?;
-        // Ctrl-C would kill us with the echo still off; ignore it while it is.
-        let previous = unsafe { signal::signal(Signal::SIGINT, SigHandler::SigIgn) }.ok();
-        Some((original, previous))
+        // Ctrl-C would kill us with the echo still off: the echo comes back first.
+        let guard = crate::pty::guard_terminal(&original);
+        Some((original, guard))
     } else {
         None
     };
     let mut text = String::new();
     let read = stdin.lock().read_line(&mut text);
-    if let Some((original, previous)) = saved {
+    if let Some((original, guard)) = saved {
+        drop(guard);
         let _ = termios::tcsetattr(&stdin, SetArg::TCSANOW, &original);
-        if let Some(previous) = previous {
-            let _ = unsafe { signal::signal(Signal::SIGINT, previous) };
-        }
         println!();
     }
     read.context("reading from the terminal")?;
