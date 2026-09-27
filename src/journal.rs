@@ -22,7 +22,7 @@ pub async fn last_main_exit(unit: &str) -> Option<(i32, i32)> {
             "--no-pager",
             "--quiet",
             "--output=json",
-            "--lines=1",
+            "--lines=10",
             "--reverse",
         ])
         .arg(format!("--unit={unit}"))
@@ -32,13 +32,23 @@ pub async fn last_main_exit(unit: &str) -> Option<(i32, i32)> {
         .output()
         .await
         .ok()?;
-    parse_main_exit(std::str::from_utf8(&output.stdout).ok()?)
+    main_exit_in(std::str::from_utf8(&output.stdout).ok()?)
+}
+
+/// The latest ending of the main process among the entries, newest first: the hooks
+/// systemd reaps are logged the same way, and a hook that failed is not the machine's
+/// program ending.
+fn main_exit_in(entries: &str) -> Option<(i32, i32)> {
+    entries.lines().find_map(parse_main_exit)
 }
 
 fn parse_main_exit(line: &str) -> Option<(i32, i32)> {
     let entry: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     if entry["MESSAGE_ID"].as_str() == Some(UNIT_SUCCESS) {
         return Some((1, 0));
+    }
+    if entry["COMMAND"].as_str() != Some("ExecStart") {
+        return None;
     }
     let code = match entry["EXIT_CODE"].as_str()? {
         "exited" => 1,
@@ -91,6 +101,11 @@ mod tests {
         assert_eq!(parse_main_exit(r#"{"EXIT_CODE": "exited"}"#), None);
         let success = r#"{"UNIT": "systemd-nspawn@web.service", "MESSAGE_ID": "7ad2d189f7e94e70a38c781354912448", "MESSAGE": "systemd-nspawn@web.service: Deactivated successfully."}"#;
         assert_eq!(parse_main_exit(success), Some((1, 0)));
+        // A hook that failed is logged the same way, and is not the program's ending.
+        let hook = exited.replace("\"ExecStart\"", "\"ExecStartPre\"");
+        assert_eq!(parse_main_exit(&hook), None);
+        assert_eq!(main_exit_in(&format!("{hook}\n{exited}\n")), Some((1, 3)));
+        assert_eq!(main_exit_in(&format!("{hook}\n")), None);
     }
 
     #[test]
