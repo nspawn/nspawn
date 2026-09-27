@@ -114,23 +114,43 @@ fn receive(name: &str) -> Result<Option<(Mode, OwnedFd, UnixStream)>> {
 pub struct Listener {
     name: String,
     path: PathBuf,
+    /// The inode bound, so that only this socket is removed: another run of the same
+    /// name may have replaced it meanwhile.
+    ino: u64,
     listener: tokio::net::UnixListener,
 }
 
 impl Listener {
+    /// Binds the run's socket. One a run still waits on is left alone and refused; one
+    /// left behind by a run that went (nothing answers) is replaced.
     pub fn bind(name: &str) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
         let dir = PathBuf::from(DIR);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("restricting {}", dir.display()))?;
         let path = socket_path(name);
-        let _ = std::fs::remove_file(&path);
-        let listener = tokio::net::UnixListener::bind(&path)
-            .with_context(|| format!("listening on {}", path.display()))?;
+        let listener = match tokio::net::UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                if UnixStream::connect(&path).is_ok() {
+                    bail!("a run of {name} is waiting to hand its terminal or input over already");
+                }
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("removing {}", path.display()))?;
+                tokio::net::UnixListener::bind(&path)
+                    .with_context(|| format!("listening on {}", path.display()))?
+            }
+            Err(e) => return Err(e).with_context(|| format!("listening on {}", path.display())),
+        };
+        let ino = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("looking at {}", path.display()))?
+            .ino();
         Ok(Listener {
             name: name.to_string(),
             path,
+            ino,
             listener,
         })
     }
@@ -171,7 +191,13 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::symlink_metadata(&self.path)
+            .map(|m| m.ino() == self.ino)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
