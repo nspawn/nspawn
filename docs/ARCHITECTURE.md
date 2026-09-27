@@ -141,7 +141,13 @@ systemd-nspawn and the whole machine: `cpu.stat`, `memory.current` and
 interfaces through `/proc/LEADER/net/dev`; the service returns counters with a
 monotonic time and the client makes rates of two samples. `exec` joins the leader's namespaces (user
 first, mount last), joins its cgroup, becomes the machine's root and then the
-requested user, so capabilities are dropped.
+requested user, so capabilities are dropped. It first waits until the leader is
+past systemd-nspawn's setup, which reports the machine started as soon as the
+leader exists (the leader keeps the name `systemd-nspawn` until the stub init
+renames itself or the machine's init runs), then takes the leader's bounding
+set and resource limits; the limits come last, once only the three streams are
+left, so that a low open-files limit does not refuse the passwd file or
+SELinux's exec attribute on the way.
 
 ## Machines and apps
 
