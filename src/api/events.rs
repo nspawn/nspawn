@@ -1,4 +1,4 @@
-//! docker events, from the journal: systemd's entries about the machines' units (so
+//! events, from the journal: systemd's entries about the machines' units (so
 //! machines started by machinectl, at boot or by a restart policy count too) and
 //! nspawn's own entries for what it does. The service keeps no history.
 
@@ -220,7 +220,7 @@ impl Mapper {
     }
 }
 
-/// docker's --filter: the same key twice matches either value; different keys must all
+/// --filter: the same key twice matches either value; different keys must all
 /// match.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Filters {
@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn filters_like_docker() {
+    fn filters_match_any_value_of_a_key_and_every_key() {
         let mut e = Mapper::default().map(&entry(STARTED)).unwrap();
         e.labels.insert("caddy".into(), "web.example".into());
         let f = |list: &[&str]| {

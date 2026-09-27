@@ -1,4 +1,4 @@
-//! docker login and logout: credentials for a registry, checked against it and kept for
+//! login and logout: credentials for a registry, checked against it and kept for
 //! pull, push and search.
 
 use anyhow::{bail, Result};

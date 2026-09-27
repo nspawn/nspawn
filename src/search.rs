@@ -1,4 +1,4 @@
-//! docker search across the sources nspawn knows: the configured hub (its catalog, with
+//! search across the sources nspawn knows: the configured hub (its catalog, with
 //! the tags of every match) and Docker Hub (its search API). Every hit names its source
 //! and the reference `pull` takes.
 

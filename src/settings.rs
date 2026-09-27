@@ -122,7 +122,7 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
     } else if s.mode == Mode::App && s.network == Network::Bridge && s.bridge.is_some() {
         // A user namespace cannot join the network namespace prepared on the host
         // (EPERM: it belongs to the initial user namespace), so app machines on the
-        // bridge run without one, as docker does.
+        // bridge run without one.
         out.push_str("PrivateUsers=no\n");
         private_users = false;
     }
@@ -147,7 +147,7 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
                 out.push_str(&format!("WorkingDirectory={dir}\n"));
             }
             // nspawn's User= takes a name or a uid and asks getent inside for the rest;
-            // the group of docker's USER:GROUP form is what nspawn's stand-in answers.
+            // the group of the USER:GROUP form is what nspawn's stand-in answers.
             if let Some(user) = s.tuning.user.as_deref().or(s.run.user.as_deref()) {
                 let user = user.split_once(':').map(|(u, _)| u).unwrap_or(user);
                 if !user.is_empty() {
@@ -253,7 +253,7 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
     }
     for bind in rendered_binds {
         // With private users the host's uid 0 is nobody inside; idmap makes root inside
-        // the owner of what it writes, as docker users expect.
+        // the owner of what it writes.
         let options = if private_users { ":idmap" } else { "" };
         files.push(format!(
             "{}={}:{}{options}",
@@ -386,7 +386,7 @@ pub fn render_hooks(
     let restart_setting = restart.unit_setting();
     let mut unit = Vec::new();
     if restart_setting.is_some() {
-        // Restarted as long as it keeps failing, with a growing delay, as docker does it.
+        // Restarted as long as it keeps failing, with a growing delay.
         unit.push("StartLimitIntervalSec=0".to_string());
     }
     // A unit started at boot waits for the interfaces it moves in, a USB adapter
@@ -418,7 +418,7 @@ pub fn render_hooks(
         text.push_str("RestartForceExitStatus=\n");
     }
     if limits.memory > 0 {
-        // As much swap again, docker's default; without it swap would be unbounded.
+        // As much swap again as memory; without a bound swap would be unlimited.
         text.push_str(&format!(
             "MemoryMax={0}\nMemorySwapMax={0}\n",
             limits.memory

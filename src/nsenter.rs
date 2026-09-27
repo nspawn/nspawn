@@ -1,4 +1,4 @@
-//! docker exec for machines that have no D-Bus inside: enter the namespaces of the
+//! exec for machines that have no D-Bus inside: enter the namespaces of the
 //! machine's leader process and run a command there, on a pseudo terminal or on pipes.
 //!
 //! setns() into a mount namespace is refused for multithreaded processes, and children
@@ -263,7 +263,7 @@ pub fn spawn(
         )?);
     }
     // The caller says what terminal it has (the service's own environment has none);
-    // docker's default stands in otherwise.
+    // xterm stands in otherwise.
     if matches!(stdio, Stdio::Pty { .. }) && !image_env.iter().any(|v| v.starts_with("TERM=")) {
         env.push(CString::new("TERM=xterm")?);
     }
@@ -694,7 +694,7 @@ fn grandchild(
         complain("error: cannot become root inside the machine");
         return 126;
     }
-    // The capabilities of the machine's own processes and no more, as docker exec gives:
+    // The capabilities of the machine's own processes and no more:
     // the service's bounding set is the host's whole one, and the command is theirs to
     // trace once it runs. Best effort: a security module that refuses (an SELinux
     // policy without the rule) must not stop the command.
@@ -720,7 +720,7 @@ fn grandchild(
         }
     }
     // With SELinux the command belongs to the machine's domain, not to the domain of
-    // whoever runs it here (the confined service, say), as with docker exec.
+    // whoever runs it here (the confined service, say).
     if let Some(context) = exec_context {
         // Opened for writing only: creating or truncating is not a thing there.
         let written = std::fs::OpenOptions::new()
@@ -763,7 +763,7 @@ fn grandchild(
                 "error: cannot execute {}: {e}",
                 program.to_string_lossy()
             ));
-            // As the shells and docker have it: 127 for a program that is not there,
+            // As the shells have it: 127 for a program that is not there,
             // 126 for one that cannot be run.
             if e == Errno::ENOENT {
                 127

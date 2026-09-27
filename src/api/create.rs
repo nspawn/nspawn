@@ -1,4 +1,4 @@
-//! docker create: another machine from an image that is already local. No registry
+//! create: another machine from an image that is already local. No registry
 //! involved, layers shared, and a writable layer, address and settings of its own.
 
 use std::collections::BTreeMap;
@@ -34,13 +34,13 @@ pub struct CreateRequest {
     pub force: bool,
     /// Replaces the image's entrypoint; an empty string runs the arguments alone.
     pub entrypoint: Option<String>,
-    /// VAR=value or VAR (copied from the environment), like docker -e.
+    /// VAR=value or VAR (copied from the environment).
     pub env: Vec<String>,
-    /// SOURCE:TARGET[:ro], like docker -v.
+    /// SOURCE:TARGET[:ro].
     pub volume: Vec<String>,
-    /// KEY=VALUE labels on top of the image's, like docker --label.
+    /// KEY=VALUE labels on top of the image's.
     pub label: Vec<String>,
-    /// docker's --restart; None is no.
+    /// --restart; None is no.
     pub restart: Option<crate::policy::Restart>,
     /// Bytes; None or 0 for no limit.
     pub memory: Option<u64>,

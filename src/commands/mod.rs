@@ -225,7 +225,7 @@ fn put_opt(options: &mut Options<'_>, key: &'static str, value: Option<String>) 
     }
 }
 
-/// docker's other flags as the service takes them.
+/// The per-machine settings as the service takes them.
 pub fn put_tuning(options: &mut Options<'_>, t: crate::cli::TuningArgs) {
     put_opt(options, "hostname", t.hostname);
     put_opt(options, "user", t.user);
@@ -781,7 +781,7 @@ fn shorten(text: &str, max: usize) -> String {
 }
 
 /// Whether the answer to a [y/N] question is a yes.
-/// Like docker: the answer is read from standard input whatever it is, and anything but
+/// The answer is read from standard input whatever it is, and anything but
 /// a yes is a no, the end of a script's input too.
 fn ask(question: &str, without_asking: &str) -> Result<bool> {
     eprint!("{question} [y/N] ");

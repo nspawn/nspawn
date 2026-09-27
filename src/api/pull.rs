@@ -1,4 +1,4 @@
-//! docker pull: resolve the reference on the registry, fetch the blobs the store lacks,
+//! pull: resolve the reference on the registry, fetch the blobs the store lacks,
 //! assemble the image with a backend and record it.
 
 use anyhow::Result;
@@ -13,7 +13,7 @@ use crate::oci::Mode;
 use crate::reference::{validate_machine_name, ImageRef};
 use crate::store::validate_digest;
 
-/// Blobs fetched at once, docker's default for a pull.
+/// Blobs fetched at once.
 const CONCURRENT_DOWNLOADS: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,7 +150,7 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
             format!("blob {}: already present", short_digest(digest)),
         );
     }
-    // Several at a time, as docker fetches layers; each transfer reports under its own
+    // Several at a time; each transfer reports under its own
     // digest, so their bars keep apart. The first failure ends the others, whose part
     // files go with them.
     let (hub, oci) = (&hub, &oci);

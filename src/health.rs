@@ -1,4 +1,4 @@
-//! docker's healthchecks: a probe run inside the machine at an interval by a transient
+//! Healthchecks: a probe run inside the machine at an interval by a transient
 //! unit bound to the machine's, its verdict in /run/nspawn/health/NAME.json for ps and
 //! inspect, and a journal event on every change.
 
@@ -18,7 +18,7 @@ use crate::systemd::Systemd;
 
 pub const STATUS_DIR: &str = "/run/nspawn/health";
 
-/// docker's defaults, in microseconds.
+/// The defaults of HEALTHCHECK, in microseconds.
 pub const DEFAULT_INTERVAL: u64 = 30_000_000;
 pub const DEFAULT_TIMEOUT: u64 = 30_000_000;
 pub const DEFAULT_START_INTERVAL: u64 = 5_000_000;
@@ -28,7 +28,7 @@ const OUTPUT_LIMIT: usize = 4096;
 /// How many probes `inspect` shows.
 const LOG_LIMIT: usize = 5;
 
-/// An image's or a machine's healthcheck, as docker's HEALTHCHECK has it.
+/// An image's or a machine's healthcheck, with the fields of HEALTHCHECK.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Healthcheck {
     /// ["CMD", argv...], ["CMD-SHELL", "line"] or ["NONE"].
@@ -129,7 +129,7 @@ fn usec(value: u64) -> Duration {
 /// has (its own, or the image's).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Overrides {
-    /// --health-cmd: a shell line, as docker takes it.
+    /// --health-cmd: a shell line.
     pub cmd: Option<String>,
     pub interval: Option<u64>,
     pub timeout: Option<u64>,
@@ -186,7 +186,7 @@ impl Overrides {
     }
 }
 
-/// A duration as docker takes it: 10s, 1m30s, 500ms, 1.5h (units ns, us, ms, s, m, h);
+/// A duration: 10s, 1m30s, 500ms, 1.5h (units ns, us, ms, s, m, h);
 /// microseconds, at least a millisecond unless 0.
 pub fn parse_duration(text: &str) -> Result<u64> {
     let bad = || anyhow::anyhow!("{text}: expected a duration such as 10s, 1m30s or 500ms");
@@ -226,7 +226,7 @@ pub fn parse_duration(text: &str) -> Result<u64> {
     Ok(total)
 }
 
-/// A duration as docker prints it: 1m30s, 500ms.
+/// A duration as parse_duration reads it: 1m30s, 500ms.
 pub fn format_duration(usec: u64) -> String {
     if usec == 0 {
         return "0s".to_string();
@@ -270,7 +270,7 @@ pub struct Status {
     pub log: Vec<Probe>,
 }
 
-/// docker's rule: a success makes the machine healthy; a failure counts towards
+/// A success makes the machine healthy; a failure counts towards
 /// `retries`, at which it is unhealthy, unless it comes during the start period of a
 /// machine that was never healthy.
 pub struct Monitor {
@@ -501,8 +501,8 @@ async fn probe(ctx: &Context, name: &str, argv: &[String], timeout: Duration) ->
     })
 }
 
-/// The first OUTPUT_LIMIT bytes of a stream; the rest is read and dropped, as docker
-/// does, so that a probe which says more never dies of SIGPIPE on a pipe closed early.
+/// The first OUTPUT_LIMIT bytes of a stream; the rest is read and dropped, so
+/// that a probe which says more never dies of SIGPIPE on a pipe closed early.
 fn read_capped(fd: Option<OwnedFd>) -> String {
     let Some(fd) = fd else {
         return String::new();
@@ -529,7 +529,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn durations_as_docker_takes_them() {
+    fn durations_are_read_with_their_units() {
         assert_eq!(parse_duration("10s").unwrap(), 10_000_000);
         assert_eq!(parse_duration("1m30s").unwrap(), 90_000_000);
         assert_eq!(parse_duration("500ms").unwrap(), 500_000);
@@ -647,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn the_verdict_follows_docker() {
+    fn the_verdict_follows_the_failing_streak() {
         let probe = |code: i32| Probe {
             start: 1,
             end: 2,

@@ -72,7 +72,7 @@ pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// The state, and the healthcheck's verdict next to it as docker ps shows it.
+/// The state, and the healthcheck's verdict next to it.
 fn state_column(machine: &Dict) -> String {
     let state = client::string(machine, "state");
     match client::string(machine, "health").as_str() {
@@ -246,7 +246,7 @@ fn run_source(
 }
 
 /// The name of a machine of run --rm without --name: the image's local name and a random
-/// part, as docker names its containers when not told.
+/// part.
 fn run_name(base: &str) -> Result<String> {
     let mut bytes = [0u8; 4];
     File::open("/dev/urandom")
@@ -256,7 +256,7 @@ fn run_name(base: &str) -> Result<String> {
     Ok(format!("{base}-{}", hex::encode(bytes)))
 }
 
-/// docker run: a machine from a local image or from the registry, started with the
+/// run: a machine from a local image or from the registry, started with the
 /// options given, which it keeps as after start.
 pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> {
     if !args.detach && !args.options.wait {
@@ -269,7 +269,7 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
     let image = ImageRef::parse(&args.reference, &registry)?;
     let name = match &args.name {
         Some(name) => name.clone(),
-        // run --rm keeps the image, as docker does (see below): the machine it removes
+        // run --rm keeps the image (see below): the machine it removes
         // gets a name of its own.
         None if args.rm => run_name(&image.local_name())?,
         None => image.local_name(),
@@ -365,7 +365,7 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
     let code = match started {
         Ok(code) => code,
         Err(e) => {
-            // docker run --rm leaves nothing behind when the start fails.
+            // run --rm leaves nothing behind when the start fails.
             if args.rm {
                 let mut options = Options::new();
                 options.insert("force", Value::from(true));
@@ -410,7 +410,7 @@ async fn run_attached(
     }
 }
 
-/// docker run without -d: the machine's output (or its terminal) until it ends, and its
+/// run without -d: the machine's output (or its terminal) until it ends, and its
 /// exit code. Ctrl-C and the like go to its program; a third Ctrl-C within a second
 /// leaves it running and returns.
 async fn attached(
@@ -517,7 +517,7 @@ impl Forwarded {
     }
 }
 
-/// docker run -it of a booted image: a shell once the machine is up, and the machine
+/// run -it of a booted image: a shell once the machine is up, and the machine
 /// powered off when the shell ends, whose exit code is the run's.
 async fn booted_shell(client: &Client, name: &str, options: Options<'_>) -> Result<i32> {
     let (_, notes) = client
@@ -606,7 +606,7 @@ async fn stop_one(
     Ok(outcome != "was-not-running")
 }
 
-/// docker restart: a stop and a start with the remembered options, each name in turn.
+/// restart: a stop and a start with the remembered options, each name in turn.
 pub async fn restart(args: RestartArgs, client: &Client) -> Result<()> {
     let mut failed = 0;
     for name in &args.names {
@@ -642,7 +642,6 @@ pub async fn restart(args: RestartArgs, client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// docker pause and unpause, each name in turn.
 pub async fn pause(args: NamesArgs, client: &Client, on: bool) -> Result<()> {
     let mut failed = 0;
     for name in &args.names {
@@ -669,7 +668,6 @@ pub async fn pause(args: NamesArgs, client: &Client, on: bool) -> Result<()> {
     Ok(())
 }
 
-/// docker top: the machine's processes.
 pub async fn top(args: TopArgs, client: &Client) -> Result<()> {
     let processes = client
         .manager
@@ -691,7 +689,7 @@ pub async fn top(args: TopArgs, client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// docker kill: every name gets the signal, each one printed once it did; a name that
+/// kill: every name gets the signal, each one printed once it did; a name that
 /// could not be signalled is reported and makes the command fail at the end.
 pub async fn kill(args: KillArgs, client: &Client) -> Result<()> {
     let mut failed = 0;
@@ -720,7 +718,7 @@ pub async fn kill(args: KillArgs, client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// docker update: every name gets the same changes, each one printed once it has them.
+/// update: every name gets the same changes, each one printed once it has them.
 pub async fn update(args: UpdateArgs, client: &Client) -> Result<()> {
     let mut failed = 0;
     for name in &args.names {
@@ -755,7 +753,7 @@ pub async fn update(args: UpdateArgs, client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// docker exec: the service runs the command inside the machine and hands its streams
+/// exec: the service runs the command inside the machine and hands its streams
 /// over, a pseudo terminal when this is one, pipes otherwise; the exit status comes
 /// back through the process object.
 pub async fn exec(args: ExecArgs, client: &Client) -> Result<()> {
@@ -876,7 +874,7 @@ async fn run_command(
         tokio::task::block_in_place(|| pump_pipes(stdin, stdout, stderr))?;
     }
     // The streams end when the command (and whatever it left behind) closes them; the
-    // exit status may take its time after that, as with docker.
+    // exit status may take its time after that.
     ended.status().await
 }
 
@@ -934,7 +932,7 @@ fn copy(mut from: File, mut to: impl Write) -> Result<()> {
     }
 }
 
-/// docker events: the service reads the journal and sends one JSON object per event.
+/// events: the service reads the journal and sends one JSON object per event.
 pub async fn events(args: EventsArgs, client: &Client) -> Result<()> {
     // A bad filter is said before anything is asked.
     crate::api::events::Filters::parse(&args.filters)?;
@@ -982,7 +980,7 @@ pub async fn events(args: EventsArgs, client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// An event as docker events prints it: time, type, action, name, then its attributes
+/// An event as one line: time, type, action, name, then its attributes
 /// and labels.
 fn event_line(event: &serde_json::Value) -> String {
     let text = |key: &str| event.get(key).and_then(|v| v.as_str()).unwrap_or("");
@@ -1007,7 +1005,7 @@ fn event_line(event: &serde_json::Value) -> String {
     line
 }
 
-/// docker logs: journalctl's output comes through pipes from the service, and its exit
+/// logs: journalctl's output comes through pipes from the service, and its exit
 /// status through the process object.
 pub async fn logs(args: LogsArgs, client: &Client) -> Result<()> {
     let mut streams = Vec::new();
@@ -1066,7 +1064,7 @@ pub async fn logs(args: LogsArgs, client: &Client) -> Result<()> {
 }
 
 /// Several machines' output on this process's streams, every line behind its machine's
-/// name, the way docker compose shows them. Lines are printed whole, so they never mix.
+/// name. Lines are printed whole, so they never mix.
 fn pump_prefixed(streams: Vec<(String, OwnedFd, OwnedFd)>) -> Result<()> {
     let width = streams.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
     let mut threads = Vec::new();
@@ -1115,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn events_read_like_docker_events() {
+    fn events_are_printed_one_per_line() {
         let event = serde_json::json!({
             "time": "2026-09-24T10:00:00.000001Z",
             "type": "machine",

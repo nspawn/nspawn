@@ -1,4 +1,4 @@
-//! docker's per-container knobs beyond the network, volumes, limits and healthcheck:
+//! Per-machine settings beyond the network, volumes, limits and healthcheck:
 //! hostname, user, capabilities, mounts, devices, DNS, ulimits, signals. Remembered with
 //! the machine, most of them one line of its settings file.
 
@@ -8,7 +8,7 @@ use std::net::IpAddr;
 use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-/// A device node handed to the machine, as docker's --device.
+/// A device node handed to the machine (--device).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
     pub host: String,
@@ -17,7 +17,7 @@ pub struct Device {
     pub permissions: String,
 }
 
-/// A secret handed to the machine, as docker's long --secret form has it.
+/// A secret handed to the machine, with the fields of the long --secret form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretRef {
     pub name: String,
@@ -114,7 +114,7 @@ impl Tuning {
             out.push(format!("Capability={}", capabilities(&self.cap_add)));
         }
         if !self.privileged {
-            // systemd-nspawn lets a drop win over an add, docker the other way round:
+            // systemd-nspawn lets a drop win over an add, the flags the other way round:
             // "--cap-drop ALL --cap-add X" keeps X, and "--cap-add ALL" keeps all but
             // the named drops, so those drops are spelled out.
             let add_all = self.cap_add.iter().any(|c| c == "ALL");
@@ -543,7 +543,7 @@ impl Overrides {
     }
 }
 
-/// docker's USER[:GROUP]: neither side empty when the colon is there.
+/// USER[:GROUP]: neither side empty when the colon is there.
 fn validate_user(text: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
@@ -599,7 +599,7 @@ pub fn validate_hostname(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// A capability as docker spells it (NET_ADMIN, CAP_NET_ADMIN, all), kept without the
+/// A capability with or without its prefix (NET_ADMIN, CAP_NET_ADMIN, all), kept without the
 /// prefix in upper case.
 fn capability(text: &str) -> Result<String> {
     let upper = text.to_ascii_uppercase();
@@ -631,7 +631,7 @@ fn tmpfs(text: &str) -> Result<String> {
     Ok(text.to_string())
 }
 
-/// --device HOST[:CONTAINER[:PERMISSIONS]], as docker takes it.
+/// --device HOST[:CONTAINER[:PERMISSIONS]].
 fn device(text: &str) -> Result<Device> {
     let fields: Vec<&str> = text.split(':').collect();
     let (host, container, permissions) = match fields[..] {
@@ -678,7 +678,7 @@ fn extra_host(text: &str) -> Result<ExtraHost> {
     })
 }
 
-/// --ulimit NAME=SOFT[:HARD], docker's names (nofile, nproc, core, ...).
+/// --ulimit NAME=SOFT[:HARD], NAME one of nofile, nproc, core, ...
 fn ulimit(text: &str) -> Result<(String, (u64, u64))> {
     let (name, values) = text
         .split_once('=')
@@ -875,7 +875,7 @@ mod tests {
             both.exec_lines(false),
             ["Capability=CAP_NET_ADMIN", "DropCapability=CAP_MKNOD"]
         );
-        // ALL on both sides keeps every capability, as docker reads it.
+        // ALL on both sides keeps every capability.
         let mut caps = Tuning::default();
         Overrides {
             cap_drop: vec!["ALL".into()],

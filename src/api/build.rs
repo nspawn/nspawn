@@ -1,4 +1,4 @@
-//! docker build, with mkosi: an OCI layout built into a private directory, its blobs
+//! build, with mkosi: an OCI layout built into a private directory, its blobs
 //! copied into the store, the image assembled and recorded, ready to push.
 
 use std::fs;

@@ -229,7 +229,7 @@ fn health_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::health::
     })
 }
 
-/// docker's other flags: hostname, user, working_dir, stop_signal (s), cap_add,
+/// The per-machine settings: hostname, user, working_dir, stop_signal (s), cap_add,
 /// cap_drop, tmpfs, devices (HOST:CONTAINER:PERMISSIONS), interfaces (host interfaces
 /// moved into the machine), dns, dns_search, extra_hosts (HOST:IP), ulimits
 /// (NAME=SOFT:HARD), sysctls (KEY=VALUE), secrets (NAME[:TARGET[:MODE[:UID:GID]]]) (as,
@@ -658,7 +658,7 @@ impl Manager {
     }
 
     /// Like `cp ... NAME:PATH`: the tar stream read from `stream` unpacked at `path` of
-    /// the machine by docker cp's rules, everything owned by root inside. Options:
+    /// the machine by cp's rules, everything owned by root inside. Options:
     /// contents (b), the source was written DIR/. and its contents go into `path`. A job.
     async fn copy_to(
         &self,
@@ -1084,7 +1084,7 @@ impl Manager {
     /// without tty). With tty an app's program gets a pseudo terminal whose master comes
     /// back under "tty"; otherwise the output comes back under "stdout", a line at a
     /// time. The process object's Signal reaches the program (a booted machine is
-    /// powered off), and its exit status is docker run's. Also returns the start's
+    /// powered off), and its exit status is the one run exits with. Also returns the start's
     /// notes.
     async fn run_machine(
         &self,
@@ -1175,7 +1175,7 @@ impl Manager {
         Ok((outcome.to_string(), notes.into_lines()))
     }
 
-    /// docker update: options restart (s), memory (t, bytes), cpus (d), pids_limit (t),
+    /// Like `update`: options restart (s), memory (t, bytes), cpus (d), pids_limit (t),
     /// 0 removing a limit, absent keeping it, and the flags of `health_overrides`. A
     /// running machine gets the limits at once (the restart policy applies to its next
     /// ending anyway) and its probes start over. Returns whether it was running.
@@ -1203,7 +1203,7 @@ impl Manager {
         Ok(api::machines::update(self.ctx(), &request).await?)
     }
 
-    /// docker kill: option signal (s, a name like KILL or SIGHUP, or a number; SIGKILL
+    /// Like `kill`: option signal (s, a name like KILL or SIGHUP, or a number; SIGKILL
     /// when absent). SIGKILL stops the machine for good, like StopMachine with force;
     /// other signals go to an app's program or a booted machine's init. Returns the
     /// notes made on the way.
@@ -1228,21 +1228,21 @@ impl Manager {
         Ok(notes.into_lines())
     }
 
-    /// docker pause: the machine's cgroup is frozen, every process in it with it.
+    /// Like `pause`: the machine's cgroup is frozen, every process in it with it.
     async fn pause_machine(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<()> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Manage).await?;
         Ok(api::machines::pause(self.ctx(), &name, true).await?)
     }
 
-    /// docker unpause.
+    /// Like `unpause`.
     async fn unpause_machine(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<()> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Manage).await?;
         Ok(api::machines::pause(self.ctx(), &name, false).await?)
     }
 
-    /// docker top: the processes of a running machine: pid (u), user (s, the uid as the
+    /// Like `top`: the processes of a running machine: pid (u), user (s, the uid as the
     /// machine sees it), time (s, CPU time), command (s).
     async fn machine_processes(
         &self,
@@ -1572,8 +1572,8 @@ impl Manager {
             };
         let mut fds = HashMap::new();
         if detach {
-            // Nobody reads the command: its output is drained here, as docker exec -d
-            // discards it, so that it never blocks on a full pipe. On threads of their
+            // Nobody reads the command: its output is drained here and discarded, so
+            // that it never blocks on a full pipe. On threads of their
             // own: a child of the command that keeps the pipe open outlives the command,
             // and a blocking task of the runtime would keep the service from exiting.
             drop(stdin);

@@ -5,8 +5,7 @@
 //! stock 80-container-ve.network; without networkd the interface stays down and `host0`
 //! inside the machine never sees a carrier. On hosts running firewalld the new interface
 //! lands in the default zone, which drops the machine's DHCP requests, so it is bound to
-//! the trusted zone while the machine runs (runtime configuration only, like docker does
-//! with its own zone).
+//! the trusted zone while the machine runs (runtime configuration only).
 
 use std::path::Path;
 

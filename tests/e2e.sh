@@ -275,8 +275,8 @@ for backend in overlay flat mstack; do
     $NSPAWN exec "$name" -- /usr/bin/systemctl is-active nspawn-volumes.service </dev/null | tr -d '\r' | grep_q -x active || fail "nspawn-volumes.service not active inside $name"
     # Volumes are idmapped binds: a copy into one has to be made as the machine's root,
     # and lands as root on the host. A named volume is nspawn's own directory; a host
-    # directory keeps its SELinux label, which the service may not write to (as with
-    # docker without :z), so that one is only tried where SELinux does not enforce.
+    # directory keeps its SELinux label, which the service may not write to, so
+    # that one is only tried where SELinux does not enforce.
     $NSPAWN cp /tmp/e2e-cp/src/a.txt "$name:/srv/named/" || fail "cp into the named volume of $name"
     [ "$(stat -c %u /var/lib/nspawn/volumes/e2e-bootvol/a.txt 2>/dev/null)" = 0 ] || fail "a file copied into the named volume of $name is not root's on the host"
     [ "$($NSPAWN exec "$name" -- stat -c %u /srv/named/a.txt </dev/null | tr -d '\r')" = 0 ] || fail "a file copied into the named volume of $name is not root's inside"
@@ -507,7 +507,7 @@ else
 fi
 [ -e /etc/systemd/system/machines.target.wants/systemd-nspawn@e2e-b.service ] && fail "images rm left e2e-b enabled at boot"
 
-step "build, push and pull round trip (docker-like flow)"
+step "build, push and pull round trip"
 if command -v mkosi >/dev/null 2>&1; then
   # The fixture next to this script, or one the caller names with a definition of
   # its own (NSPAWN_BUILD_CONTEXT).
@@ -543,7 +543,7 @@ else
   echo "mkosi not installed: skipping the build round trip"
 fi
 
-step "app images without an init system (docker-style)"
+step "app images without an init system"
 app=e2e-busybox
 $NSPAWN pull docker.io/library/busybox:latest --name $app --backend overlay --force > /tmp/e2e-app.txt 2>&1 || fail "pull busybox from Docker Hub"
 cat /tmp/e2e-app.txt
@@ -717,7 +717,7 @@ if firewall-cmd --state >/dev/null 2>&1; then
 fi
 $NSPAWN network ls | grep_q "^ *bridge " || fail "the default network is not listed"
 
-step "--network container: a machine in another one's network namespace, like docker's"
+step "--network container: a machine in another one's network namespace"
 $NSPAWN create $app e2e-side-net -p 18095:8080 -- /bin/sleep 300 >/dev/null || fail "create the owner of the shared network"
 $NSPAWN start e2e-side-net >/dev/null || fail "start the owner of the shared network"
 $NSPAWN create $app e2e-side --network container:e2e-side-net -- /bin/sh -c "mkdir -p /www && echo side-$nonce > /www/index.html && exec /bin/httpd -f -p 8080 -h /www" >/dev/null || fail "create a machine in another one's network"
@@ -761,7 +761,7 @@ retry 10 bash -c "$NSPAWN logs e2e-side | tr -d '\r' | grep -q ' $boot_addr/'" |
 $NSPAWN rm -f e2e-side >/dev/null || fail "rm e2e-side"
 $NSPAWN rm -f e2e-side-boot e2e-side-net >/dev/null || fail "rm the owners"
 
-step "run -d: a machine from an image and started in one step, like docker run -d"
+step "run -d: a machine from an image and started in one step"
 # busybox is here as $app: run makes another machine of it without the registry.
 $NSPAWN run -d docker.io/library/busybox:latest --name e2e-run -p 18082:80 -- /bin/sh -c "mkdir -p /www; echo run-$nonce > /www/index.html; exec /bin/httpd -f -p 80 -h /www" > /tmp/e2e-run.txt 2>&1 || { cat /tmp/e2e-run.txt; fail "run from a local image"; }
 cat /tmp/e2e-run.txt
@@ -789,7 +789,7 @@ timeout 20 $NSPAWN logs e2e-run -f --until now >/dev/null 2>&1 || fail "logs -f 
 $NSPAWN rm -f e2e-run >/dev/null || fail "rm -f e2e-run"
 systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit left in failed state after stop"
 
-step "run attached, like docker run: output, input, terminal, signals, exit code, --rm"
+step "run attached: output, input, terminal, signals, exit code, --rm"
 bb=docker.io/library/busybox:latest
 out=$($NSPAWN run --rm $bb --name e2e-run -- /bin/sh -c 'echo out-$0; echo err-$0 >&2; exit 3' $nonce 2>/tmp/e2e-run.err); rc=$?
 [ "$rc" = 3 ] || fail "run did not exit with the program's code: $rc"
@@ -813,7 +813,7 @@ $NSPAWN kill e2e-run >/dev/null || fail "kill of an attached run"
 wait $run_pid; rc=$?
 [ "$rc" = 137 ] || fail "run killed with SIGKILL did not exit with 137: $rc"
 retry 15 bash -c "! $NSPAWN images ls | grep_q '^ *e2e-run '" || fail "run --rm left a killed machine behind"
-# docker keeps the image of a --rm run: what run pulled stays, the machine goes.
+# run --rm keeps the image: what run pulled stays, the machine goes.
 # (A tag of its own, so that no image of the host is replaced.)
 out=$($NSPAWN run --rm docker.io/library/busybox:1.37 /bin/echo kept-$nonce 2>/dev/null) || fail "run --rm of an image not here yet"
 [ "$out" = "kept-$nonce" ] || fail "run --rm of an image not here yet did not show the output: $out"
@@ -914,7 +914,7 @@ out=$($NSPAWN start $app -p 18099:80 2>&1); echo "$out" | grep_q "in use by a se
 $NSPAWN ps -a | grep "^ *$app " | grep_q "18099->80" && fail "a refused port was remembered"
 kill "$listener_pid" 2>/dev/null; listener_pid=
 
-step "entrypoint, environment and volumes, docker style"
+step "entrypoint, environment and volumes"
 rm -rf /tmp/e2e-bind /var/lib/nspawn/volumes/e2evol; mkdir -p /tmp/e2e-bind; echo from-host > /tmp/e2e-bind/hello
 export E2E_HOST_VAR=fromhost
 # The unit's journal keeps the lines of earlier runs, so every line carries the nonce.
@@ -960,8 +960,8 @@ out=$($NSPAWN start $app -v /tmp:/. -- /bin/sleep 1 2>&1) && fail "a volume targ
 echo "$out" | grep_q "without . or .." || fail "the dot target was not explained: $out"
 out=$($NSPAWN start $app --tmpfs /x/.. -- /bin/sleep 1 2>&1) && fail "a tmpfs of /x/.. was accepted"
 
-step "docker's other flags: hostname, user, workdir, capabilities, read-only, tmpfs, devices, dns, hosts, ulimits, signals"
-$NSPAWN start $app --hostname h-$nonce -u nobody -w /tmp --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only --tmpfs /scratch:size=16m --device /dev/null:/dev/nullo:r --dns 10.99.0.1 --dns-search example.test --add-host peer:10.1.1.1 --add-host gw:host-gateway --add-host v6=fd00::1 --ulimit nofile=64:128 --ulimit core=unlimited --stop-signal SIGINT --stop-timeout 2 --oom-score-adj 100 --sysctl net.ipv4.icmp_echo_ignore_all=1 -p none -- /bin/sh -c 'trap "" INT; pwd; exec /bin/sleep 300' || fail "start with docker's other flags"
+step "per-machine settings: hostname, user, workdir, capabilities, read-only, tmpfs, devices, dns, hosts, ulimits, signals"
+$NSPAWN start $app --hostname h-$nonce -u nobody -w /tmp --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only --tmpfs /scratch:size=16m --device /dev/null:/dev/nullo:r --dns 10.99.0.1 --dns-search example.test --add-host peer:10.1.1.1 --add-host gw:host-gateway --add-host v6=fd00::1 --ulimit nofile=64:128 --ulimit core=unlimited --stop-signal SIGINT --stop-timeout 2 --oom-score-adj 100 --sysctl net.ipv4.icmp_echo_ignore_all=1 -p none -- /bin/sh -c 'trap "" INT; pwd; exec /bin/sleep 300' || fail "start with the per-machine settings"
 x() { $NSPAWN exec $app -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
 [ "$(x hostname)" = "h-$nonce" ] || fail "--hostname not applied: $(x hostname)"
 # The program is the stub init's child: systemd-nspawn runs getent in the machine
@@ -973,7 +973,7 @@ pid=$(x 'cat /proc/1/task/1/children' | tr -d ' ')
 # The program prints its directory: exec runs with the machine's capabilities, and
 # without CAP_SYS_PTRACE root cannot read the cwd link of nobody's process.
 retry 5 bash -c "$NSPAWN logs $app -n 5 | tr -d '\r' | grep -qx /tmp" || fail "--workdir not applied: $($NSPAWN logs $app -n 5)"
-# --cap-drop ALL --cap-add X keeps X, as with docker: bit 10 is CAP_NET_BIND_SERVICE.
+# --cap-drop ALL --cap-add X keeps X: bit 10 is CAP_NET_BIND_SERVICE.
 [ "$(x 'awk "/^CapBnd:/ {print \$2}" /proc/1/status')" = 0000000000000400 ] || fail "--cap-drop ALL --cap-add NET_BIND_SERVICE left other capabilities: $(x 'grep CapBnd /proc/1/status')"
 # An app without a user namespace keeps the default set and CAP_SYS_BOOT, no more
 # (CapBnd 00000000a84425fb), and /proc/sys cannot be remounted writable; --cap-add
@@ -1046,7 +1046,7 @@ stop_start=$(date +%s)
 out=$($NSPAWN stop $app 2>&1) || fail "stop with --stop-signal and --stop-timeout: $out"
 echo "$out" | grep_q "ignored SIGINT for 2 seconds" || fail "stop did not use --stop-signal and --stop-timeout: $out"
 [ $(( $(date +%s) - stop_start )) -le 8 ] || fail "stop took longer than --stop-timeout allows"
-# USER:GROUP as docker takes it: the group is the primary one and the only one, a
+# USER:GROUP: the group is the primary one and the only one, a
 # number the image's group file does not list included; a name it lacks is refused.
 # The program comes after systemd-nspawn's getent runs, so its pid is waited for.
 program_pid() {
@@ -1284,7 +1284,7 @@ restarts=$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)
 $NSPAWN kill -s USR1 $app >/dev/null || fail "kill -s USR1"
 retry 15 bash -c "[ \"\$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)\" -gt $restarts ]" || fail "a program ended by kill -s USR1 was not restarted by its policy"
 retry 15 bash -c "$NSPAWN ps | grep_q '^ *$app '" || fail "the app did not come back after SIGUSR1"
-# docker's rule: the stop signal sent by kill ends the machine for good.
+# The stop signal sent by kill ends the machine for good.
 $NSPAWN kill -s TERM $app >/dev/null || fail "kill with the stop signal"
 sleep 5
 # The program died of the signal, so the unit may end failed; it must not come back.
@@ -1439,7 +1439,7 @@ systemctl is-active nspawn-health-$app.service >/dev/null 2>&1 && fail "a runner
 $NSPAWN ps | grep "^ *$app " | grep_q "health" && fail "ps shows a health for a machine without healthcheck"
 $NSPAWN stop $app || fail "stop"
 
-step "restart, pause, unpause and top, like docker's"
+step "restart, pause, unpause and top"
 $NSPAWN start $app -- /bin/sleep 300 >/dev/null || fail "start for restart"
 pid_before=$(machinectl show $app -p Leader --value)
 $NSPAWN restart $app -t 2 | grep_q "restarted $app" || fail "restart"
@@ -1498,8 +1498,8 @@ $NSPAWN volume rm e2evol2 e2e-no-such-volume > /tmp/e2e-volrm.txt 2>&1 && fail "
 grep -q "removed e2evol2" /tmp/e2e-volrm.txt || fail "volume rm stopped at the missing volume: $(cat /tmp/e2e-volrm.txt)"
 grep -q "no volume named e2e-no-such-volume" /tmp/e2e-volrm.txt || fail "a missing volume was not explained: $(cat /tmp/e2e-volrm.txt)"
 $NSPAWN volume rm ../images >/dev/null 2>&1 && fail "volume rm reached outside the volumes directory"
-# A volume made on first use takes what the image has at its path, owner included, as
-# docker seeds it: busybox's /home belongs to nobody, its /etc has files.
+# A volume made on first use takes what the image has at its path, owner included:
+# busybox's /home belongs to nobody, its /etc has files.
 $NSPAWN start $app -v e2evol-home:/home -v e2evol-etc:/etc -- /bin/sleep 300 >/dev/null || fail "start with volumes over image directories"
 [ "$(stat -c %u /var/lib/nspawn/volumes/e2evol-home)" = 65534 ] || fail "the volume over /home did not take nobody's ownership: $(stat -c '%u %a' /var/lib/nspawn/volumes/e2evol-home)"
 [ -f /var/lib/nspawn/volumes/e2evol-etc/passwd ] || fail "the volume over /etc was not seeded with the image's files"
@@ -1626,7 +1626,7 @@ $NSPAWN restart e2e-mix-app -t 2 | grep_q "restarted e2e-mix-app" || fail "resta
 retry 10 bash -c "$NSPAWN ps | grep '^ *e2e-mix-app ' | grep_q '(healthy)'" || fail "the mixed app is not healthy after restart: $($NSPAWN ps | grep e2e-mix-app)"
 retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18095/ | grep_q mix-secret" || fail "the port does not answer after restart"
 [ "$(addr_on e2e-mix-app e2e-nd)" = "$app_nd" ] || fail "the address on e2e-nd changed across restart"
-# The sidecar kept the namespace the app left, as with docker: its port is silent until
+# The sidecar kept the namespace the app left: its port is silent until
 # it restarts too.
 curl -sf -m 2 http://127.0.0.1:18097/ >/dev/null 2>&1 && fail "the sidecar answered from the app's old namespace after the app's restart"
 $NSPAWN restart e2e-mix-side >/dev/null || fail "restart the sidecar after the app"

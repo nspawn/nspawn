@@ -1,4 +1,4 @@
-//! docker push: the blobs the registry lacks, then the manifest.
+//! push: the blobs the registry lacks, then the manifest.
 
 use anyhow::{bail, Context as _, Result};
 use oci_client::manifest::OciImageManifest;

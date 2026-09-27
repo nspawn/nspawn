@@ -128,8 +128,8 @@ async fn copy_in(client: &Client, source: &str, name: &str, path: &str) -> Resul
     let (source, contents) = split_source(source);
     let source = PathBuf::from(source);
     fs::symlink_metadata(&source).with_context(|| format!("{}", source.display()))?;
-    // The parent is opened and the last component read from it without following it,
-    // like docker; "." and "/" are named by what they are.
+    // The parent is opened and the last component read from it without following it;
+    // "." and "/" are named by what they are.
     let (parent, leaf, top): (PathBuf, OsString, OsString) = match source.file_name() {
         Some(leaf)
             if source

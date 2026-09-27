@@ -466,7 +466,7 @@ impl Systemd {
 
     /// Clears the "failed" state a signal leaves on a unit, so that a stopped app machine
     /// is not listed by systemctl --failed.
-    /// Freezes the unit's cgroup (docker pause).
+    /// Freezes the unit's cgroup (pause).
     pub async fn freeze_unit(&self, unit: &str) -> Result<()> {
         self.manager
             .freeze_unit(unit.to_string())

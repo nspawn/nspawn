@@ -1,4 +1,4 @@
-//! docker stats: rates from two samples a second apart, the table redrawn at each.
+//! stats: rates from two samples a second apart, the table redrawn at each.
 
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -41,7 +41,7 @@ impl Counters {
 #[derive(Debug, Clone, PartialEq)]
 struct Row {
     name: String,
-    /// 100 per busy CPU, as docker counts it.
+    /// 100 per busy CPU.
     cpu_percent: Option<f64>,
     memory: Option<u64>,
     memory_limit: Option<u64>,

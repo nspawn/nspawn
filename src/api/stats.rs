@@ -1,4 +1,4 @@
-//! docker stats: counters from the cgroup of each machine's unit (systemd-nspawn and the
+//! stats: counters from the cgroup of each machine's unit (systemd-nspawn and the
 //! whole machine) and from its interfaces as the machine sees them. Rates are the
 //! caller's, from two samples.
 
@@ -20,7 +20,7 @@ pub struct Sample {
     /// CLOCK_MONOTONIC when it was taken, in microseconds.
     pub time_usec: u64,
     pub cpu_usec: Option<u64>,
-    /// Without the reclaimable page cache, as docker counts it.
+    /// Without the reclaimable page cache.
     pub memory: Option<u64>,
     /// The limit, or the host's memory without one.
     pub memory_limit: Option<u64>,
@@ -115,7 +115,7 @@ fn cpu_usec(cpu_stat: &str) -> Option<u64> {
     field(cpu_stat, "usage_usec")
 }
 
-/// memory.current less inactive_file, as docker shows it on cgroup v2.
+/// memory.current less inactive_file.
 fn memory_used(current: &str, stat: &str) -> Option<u64> {
     let current: u64 = current.trim().parse().ok()?;
     Some(current.saturating_sub(field(stat, "inactive_file").unwrap_or(0)))
@@ -181,7 +181,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cgroup_files_are_read_as_docker_counts_them() {
+    fn cgroup_files_are_read_into_counters() {
         assert_eq!(
             cpu_usec("usage_usec 123456\nuser_usec 100000\nsystem_usec 23456\n"),
             Some(123456)

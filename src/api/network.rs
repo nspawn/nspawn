@@ -298,7 +298,7 @@ pub async fn inspect(ctx: &Context, name: &str) -> Result<(NetSpec, Vec<NetworkE
     Ok((spec, entries(ctx, name).await?))
 }
 
-/// docker network create: a bridge and a subnet of its own (the next free /24 of
+/// network create: a bridge and a subnet of its own (the next free /24 of
 /// network_pool unless given), brought up at once.
 pub async fn create(
     ctx: &Context,
@@ -367,7 +367,7 @@ pub async fn create(
     Ok(spec)
 }
 
-/// docker network rm, bridge and rules included. A network in use, unknown or the default
+/// network rm, bridge and rules included. A network in use, unknown or the default
 /// is refused without stopping the others.
 pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Result<Removal> {
     require_root("network rm")?;

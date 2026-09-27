@@ -1,4 +1,4 @@
-//! What a machine's unit carries besides the hooks: docker's restart policies and the
+//! What a machine's unit carries besides the hooks: the restart policies and the
 //! resource limits of `-m`, `--cpus` and `--pids-limit`, both remembered in the record
 //! and written into the unit's drop-in.
 
@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::oci::Mode;
 
-/// docker's restart policies. `always` and `unless-stopped` also start the machine at
+/// Restart policies. `always` and `unless-stopped` also start the machine at
 /// boot; `nspawn stop` of an `unless-stopped` machine takes that back until the next
 /// `start`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -108,13 +108,13 @@ impl Limits {
         })
     }
 
-    /// The CPU limit as docker's --cpus writes it (0.5, 2).
+    /// The CPU limit as --cpus writes it (0.5, 2).
     pub fn cpus(&self) -> f64 {
         self.milli_cpus as f64 / 1000.0
     }
 }
 
-/// docker's --memory: a size of at least 4m, or 0 for none.
+/// --memory: a size of at least 4m, or 0 for none.
 pub fn parse_memory(text: &str) -> Result<u64> {
     let bytes = parse_size(text)?;
     if bytes > 0 && bytes < MIN_MEMORY {
@@ -123,7 +123,7 @@ pub fn parse_memory(text: &str) -> Result<u64> {
     Ok(bytes)
 }
 
-/// A size as docker takes it: a number of bytes, or one with b, k, m, g or t
+/// A size: a number of bytes, or one with b, k, m, g or t
 /// (1024-based, case-insensitive, an optional trailing b or ib); decimals allowed.
 pub fn parse_size(text: &str) -> Result<u64> {
     let lower = text.trim().to_ascii_lowercase();
@@ -152,7 +152,7 @@ pub fn parse_size(text: &str) -> Result<u64> {
     Ok(bytes as u64)
 }
 
-/// docker's --cpus (0.5, 2) as thousandths of a CPU; 0 for none.
+/// --cpus (0.5, 2) as thousandths of a CPU; 0 for none.
 pub fn milli_cpus_from(cpus: f64) -> Result<u64> {
     if !cpus.is_finite() || cpus < 0.0 {
         bail!("--cpus {cpus}: expected a number of CPUs like 0.5 or 2");
@@ -182,7 +182,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn restart_policies_are_spelled_like_docker_everywhere() {
+    fn restart_policies_are_spelled_the_same_everywhere() {
         for (policy, name, setting, boot) in [
             (Restart::No, "no", None, false),
             (Restart::OnFailure, "on-failure", Some("on-failure"), false),
@@ -210,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_sizes_read_like_docker() {
+    fn memory_sizes_are_read_with_their_units() {
         assert_eq!(parse_memory("64m").unwrap(), 64 << 20);
         assert_eq!(parse_memory("64M").unwrap(), 64 << 20);
         assert_eq!(parse_memory("64mb").unwrap(), 64 << 20);

@@ -3,7 +3,7 @@
 //! systemd-nspawn resolves the user an app runs as (`User=`) by running `getent passwd`
 //! and `getent initgroups` inside the machine. busybox and static images have no
 //! getent, musl's (alpine) has no `initgroups`, and neither takes a uid the image's
-//! passwd does not list, which docker allows, nor the group of docker's USER:GROUP.
+//! passwd does not list, which --user allows, nor the group of USER:GROUP.
 //! So nspawn binds a shell script over the path systemd-nspawn looks at that answers
 //! those two from `/etc/passwd` and `/etc/group`, with the group asked for as the
 //! primary and only one, and hands anything else to the image's own getent, bound at
@@ -23,13 +23,13 @@ use crate::store::{ImageRecord, Store};
 pub const REAL: &str = "/run/nspawn/getent";
 
 /// Answers `passwd KEY` and `initgroups KEY` by name or by uid; a uid the file does not
-/// list runs all the same, with gid 0 and no home, as docker has it, and a group asked
+/// list runs all the same, with gid 0 and no home, and a group asked
 /// for (`group=`, filled in by `script`) is the primary one and the only one. Nothing
 /// but shell builtins: systemd-nspawn runs it with an empty environment.
 pub const SCRIPT: &str = r#"#!/bin/sh
 # Written by nspawn: systemd-nspawn resolves the user an app runs as with getent, and
 # this answers passwd and initgroups from /etc/passwd and /etc/group, by name or by
-# uid, as docker reads them. Anything else goes to the image's own getent.
+# uid. Anything else goes to the image's own getent.
 # The gid of --user USER:GROUP; empty for the passwd entry's own group and the ones
 # /etc/group adds.
 group=''
@@ -135,7 +135,7 @@ fn switches_to(user: Option<&str>) -> Option<&str> {
     Some(user)
 }
 
-/// The group of docker's USER:GROUP, when given.
+/// The group of USER:GROUP, when given.
 fn group_of(user: Option<&str>) -> Option<&str> {
     user?
         .split_once(':')
@@ -144,7 +144,7 @@ fn group_of(user: Option<&str>) -> Option<&str> {
 }
 
 /// The gid `group` stands for: itself when numeric, else the image's /etc/group entry
-/// of that name, refused as docker refuses it when there is none.
+/// of that name, refused when there is none.
 fn resolve_group(store: &Store, name: &str, backend: BackendChoice, group: &str) -> Result<u32> {
     if let Ok(gid) = group.parse::<u32>() {
         return Ok(gid);

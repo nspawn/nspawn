@@ -85,15 +85,15 @@ impl Removal {
     }
 }
 
-/// Removes every name it can, like docker rmi: one that cannot be removed does not stop
+/// Removes every name it can: one that cannot be removed does not stop
 /// the others, and is reported in the result.
 pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Result<Removal> {
     require_root("images rm")?;
     remove_machines(ctx, names, false, report).await
 }
 
-/// `remove`, and with `force` a running machine is stopped first (SIGKILL, like docker
-/// rm -f) instead of refused.
+/// `remove`, and with `force` a running machine is stopped first (SIGKILL) instead of
+/// refused.
 pub async fn remove_machines(
     ctx: &Context,
     names: &[String],
@@ -185,7 +185,7 @@ pub async fn remove_machines(
                     crate::api::machines::release_machine(name, Some(&rec))?;
                     store.remove_record(name)?;
                     crate::install::take_off_boot(sd, name, report).await;
-                    // Like docker: named volumes outlive the machine.
+                    // Named volumes outlive the machine.
                     for volume in rec.volumes.iter().filter(|v| v.is_named()) {
                         note(
                             report,

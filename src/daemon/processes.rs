@@ -41,8 +41,8 @@ pub struct ProcessState {
 /// Where the Signal method of an attached run goes, and what it remembers.
 #[derive(Default)]
 pub struct Signals {
-    /// A booted machine: any signal asks it to power off, as Ctrl-C of docker run
-    /// stops a container.
+    /// A booted machine: any signal asks it to power off, as Ctrl-C of an attached run
+    /// stops it.
     pub poweroff: Option<String>,
     /// An app machine: signals go to its program, whichever process it is by then.
     pub program: Option<String>,

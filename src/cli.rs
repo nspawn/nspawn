@@ -1024,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_and_limits_read_like_docker() {
+    fn restart_and_limits_are_parsed() {
         let cli = Cli::try_parse_from([
             "nspawn",
             "start",
@@ -1119,7 +1119,7 @@ mod tests {
             };
             assert!(skipped, "{args:?}");
         }
-        // docker's order: options, the image, then its command and arguments as they are.
+        // Options, the image, then its command and arguments as they are.
         let cli = Cli::try_parse_from([
             "nspawn",
             "run",

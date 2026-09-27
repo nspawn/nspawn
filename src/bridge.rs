@@ -4,8 +4,7 @@
 //! A bridge carries the first address of its subnet; each machine gets a fixed address,
 //! handed to its systemd-networkd through a mounted .network file, and a generated
 //! /etc/hosts. The nftables table `ip nspawn` masquerades, DNATs published ports and keeps
-//! the networks apart; loopback access to published ports goes through route_localnet,
-//! as docker does without its userland proxy.
+//! the networks apart; loopback access to published ports goes through route_localnet.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -27,7 +26,7 @@ use crate::store::{ImageRecord, Store};
 use crate::systemd::Systemd;
 
 pub const TABLE: &str = "nspawn";
-/// Name the machines can use for the host, like host.docker.internal.
+/// Name the machines can use for the host.
 pub const HOST_NAME: &str = "host.nspawn.internal";
 const FALLBACK_DNS: [IpAddr; 2] = [
     IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
@@ -139,7 +138,7 @@ pub struct NetSpec {
     /// Unix seconds; 0 for the default network.
     #[serde(default)]
     pub created: u64,
-    /// KEY=VALUE, as docker network create --label.
+    /// KEY=VALUE, from network create --label.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
 }
@@ -266,7 +265,7 @@ impl Protocol {
     }
 }
 
-/// docker's -p: [IP:]HOST:CONTAINER[/udp].
+/// A published port, -p [IP:]HOST:CONTAINER[/udp].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortMap {
     /// One address of the host, or every address (0.0.0.0).
@@ -343,7 +342,7 @@ impl fmt::Display for PortMap {
 }
 
 /// One -p value, ranges expanded: HOST-HOST:CONTAINER-CONTAINER of equal lengths gives one
-/// mapping per port, as docker's inspect shows them.
+/// mapping per port, as inspect shows them.
 fn expand_ports(text: &str) -> Result<Vec<PortMap>> {
     let (ports, suffix) = match text.rsplit_once('/') {
         Some((ports, proto)) => (ports, format!("/{proto}")),
@@ -524,7 +523,7 @@ fn allow_forwarding_past_iptables(bridge: &str, report: Report<'_>) -> Result<()
     Ok(())
 }
 
-/// Out of the bridge anything; in, only published ports and replies, as docker does.
+/// Out of the bridge anything; in, only published ports and replies.
 fn forwarding_rules(bridge: &str) -> [Vec<&str>; 2] {
     [
         vec!["-i", bridge, "-j", "ACCEPT"],
@@ -847,7 +846,7 @@ pub fn host_end_name(name: &str) -> String {
 
 /// The host end of the machine's veth on its `index`th network: vb-NAME for the first,
 /// vb1-NAME, vb2-NAME.. for the others.
-/// The MAC of an app's interface, from its address as docker derives it: a restart
+/// The MAC of an app's interface, derived from its address: a restart
 /// keeps it, so what the host's neighbour cache knows of the address stays right
 /// instead of pointing at the interface that went, unreachable until it is probed.
 pub fn mac_of(addr: Ipv4Addr) -> String {

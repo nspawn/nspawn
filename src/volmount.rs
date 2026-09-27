@@ -65,8 +65,8 @@ pub fn mount_into_machine(leader: u32, source: &Path, target: &str, read_only: b
         )
     };
     if r < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
-        // A filesystem (or a submount) without idmapped mounts: docker mounts it plainly,
-        // so does nspawn, with a note, since root inside then appears as nobody there.
+        // A filesystem (or a submount) without idmapped mounts is mounted plainly,
+        // with a note, since root inside then appears as nobody there.
         crate::nsenter::complain(&format!(
             "note: {} cannot be idmapped (unsupported filesystem); attached with the host's ownership",
             source.display()

@@ -1,5 +1,5 @@
 //! What an OCI image config says about running the image, and whether the image boots an
-//! init system (a "machine") or runs a single program (an "app", the docker case).
+//! init system (a "machine") or runs a single program (an "app").
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};

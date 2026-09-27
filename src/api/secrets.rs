@@ -1,4 +1,4 @@
-//! docker secret, on systemd-creds: a secret is kept encrypted under the state directory
+//! Secrets, on systemd-creds: a secret is kept encrypted under the state directory
 //! (bound to the host's TPM2 where there is one, to its credential key otherwise) and
 //! decrypted for a machine into a tmpfs of root's alone while it runs, where the file is
 //! bind-mounted read-only at its target.
@@ -21,7 +21,7 @@ use crate::tuning::SecretRef;
 
 /// Where a machine's secrets are decrypted while it runs.
 pub const RUN_DIR: &str = "/run/nspawn/secrets";
-/// What a secret may weigh, as docker limits it.
+/// What a secret may weigh.
 pub const MAX_SIZE: usize = 500 * 1024;
 
 /// What is kept next to the encrypted blob.
@@ -139,8 +139,8 @@ pub fn get(store: &Store, name: &str) -> Result<SecretInfo> {
         .with_context(|| format!("no secret named {name}"))
 }
 
-/// docker secret create: the content, encrypted for this host, under the state directory.
-/// A name in use is refused, as docker does.
+/// secret create: the content, encrypted for this host, under the state directory.
+/// A name in use is refused.
 pub async fn create(
     ctx: &Context,
     name: &str,
@@ -180,7 +180,7 @@ pub async fn create(
     Ok(())
 }
 
-/// docker secret rm: one a machine names, or unknown, is refused without stopping the
+/// secret rm: one a machine names, or unknown, is refused without stopping the
 /// others.
 pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Result<Removal> {
     require_root("secret rm")?;
@@ -317,7 +317,7 @@ fn systemd_creds(args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-/// `--secret NAME[:TARGET[:MODE[:UID:GID]]]`: docker's fields, /run/secrets/NAME, 0444
+/// `--secret NAME[:TARGET[:MODE[:UID:GID]]]`: /run/secrets/NAME, 0444
 /// and root by default.
 pub fn parse_ref(text: &str) -> Result<SecretRef> {
     let fields: Vec<&str> = text.split(':').collect();
@@ -373,7 +373,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn secret_references_read_like_docker() {
+    fn secret_references_take_a_target_mode_and_owner() {
         let plain = parse_ref("db-password").unwrap();
         assert_eq!(
             (plain.target.as_str(), plain.mode, plain.uid, plain.gid),

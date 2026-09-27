@@ -1,4 +1,4 @@
-//! Volumes as docker knows them: `-v /host/dir:/inside[:ro]` binds a host path, and
+//! Volumes: `-v /host/dir:/inside[:ro]` binds a host path, and
 //! `-v name:/inside` a directory nspawn keeps under its own volumes directory. Both end up
 //! as bind mounts in the machine's settings.
 
@@ -12,7 +12,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Fills a named volume made on first use with what the image has at its mount point,
-/// owner and mode included, as docker does: a program that runs as a user finds its
+/// owner and mode included: a program that runs as a user finds its
 /// data directory its own, and a volume over a directory with files starts with them.
 /// Devices, sockets and fifos are left out.
 pub fn seed(from: &Path, to: &Path) -> Result<()> {

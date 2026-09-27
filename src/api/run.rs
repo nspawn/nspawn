@@ -1,4 +1,4 @@
-//! docker run, attached: a machine's output, end and exit code, and a terminal or an
+//! run, attached: a machine's output, end and exit code, and a terminal or an
 //! input for an app's program (src/attach.rs). The end comes from the unit's
 //! PropertiesChanged, which carries the exit status as it was (a later read can race a
 //! restart); the output comes from the journal, so `logs` has it too.
@@ -33,7 +33,7 @@ const CLD_DUMPED: i32 = 3;
 /// What systemd-nspawn exits with when the machine asked for a reboot.
 const REBOOT: i32 = 133;
 
-/// docker's exit code: the program's, or 128 plus the signal it died of. systemd-nspawn
+/// The exit code: the program's, or 128 plus the signal it died of. systemd-nspawn
 /// reports 255 for any signal that killed an app's program, and 1 after a SIGKILL of
 /// the whole machine on 259 and newer, so the signal nspawn itself sent decides.
 pub fn exit_code(ending: &Ending, sent: Option<i32>, app: bool) -> i32 {
@@ -298,7 +298,7 @@ impl Follower {
     }
 }
 
-/// The terminal an attached run gives the program of an app, like docker run -t.
+/// The terminal an attached run gives the program of an app (run -t).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Terminal {
     pub rows: u16,
@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn exit_codes_as_docker_gives_them() {
+    fn exit_codes_follow_the_program_or_its_signal() {
         assert_eq!(
             exit_code(&ending(CLD_EXITED, 3, "exit-code"), None, true),
             3

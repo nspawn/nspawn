@@ -1,4 +1,4 @@
-//! cp: files between the host and a machine, as a tar stream like docker's API. The
+//! cp: files between the host and a machine, as a tar stream. The
 //! service packs or unpacks on the machine's side, the command line on the host's, so
 //! what lands on the host belongs to whoever ran `cp`, and what lands in a machine to
 //! its root.
@@ -36,7 +36,7 @@ pub enum Endpoint {
 
 impl Endpoint {
     /// `NAME:PATH` is a machine's path (relative ones start at its root), anything else
-    /// a local path; a local path with a colon is written `./a:b`, as with docker.
+    /// a local path; a local path with a colon is written `./a:b`.
     pub fn parse(arg: &str) -> Result<Endpoint> {
         if arg == "-" {
             bail!("cp does not read or write tar streams on - yet; give a path");
@@ -812,7 +812,7 @@ pub async fn copy_from(
     Ok(stats)
 }
 
-/// CopyTo: a stream from `input` unpacked at `path` of the machine, by docker's rules.
+/// CopyTo: a stream from `input` unpacked at `path` of the machine, by the rules of `plan`.
 pub async fn copy_to(
     ctx: &Context,
     name: &str,
@@ -893,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoints_read_like_docker() {
+    fn endpoints_are_machine_or_local_paths() {
         let machine = |name: &str, path: &str| Endpoint::Machine {
             name: name.to_string(),
             path: path.to_string(),
@@ -929,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn destinations_follow_docker_cp() {
+    fn destinations_follow_the_cp_rules() {
         let p = |dir: &str, top: Option<&str>| Plan {
             dir: PathBuf::from(dir),
             top: top.map(OsString::from),

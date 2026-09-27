@@ -68,10 +68,10 @@ pub struct ImageRecord {
     /// The --health-* flags, on top of the image's healthcheck (run.healthcheck).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<Healthcheck>,
-    /// docker's other per-container flags (hostname, user, capabilities, ...).
+    /// The other per-machine settings (hostname, user, capabilities, ...).
     #[serde(default, skip_serializing_if = "Tuning::is_default")]
     pub tuning: Tuning,
-    /// Ports published on the host, like docker -p (bridge network only).
+    /// Ports published on the host with -p (bridge network only).
     #[serde(default)]
     pub ports: Vec<PortMap>,
     /// Entrypoint override (--entrypoint); None keeps the image's. An empty list runs
@@ -91,7 +91,7 @@ pub struct ImageRecord {
     /// Labels given with --label, on top of the image's own (run.labels).
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
-    /// docker's --restart.
+    /// The restart policy (--restart).
     #[serde(default)]
     pub restart: crate::policy::Restart,
     /// --memory, --cpus and --pids-limit.
@@ -425,7 +425,7 @@ impl Store {
     }
 
     /// Remembers that the machine's current run was sent its stop signal: when it ends,
-    /// it is not restarted (docker's rule for `docker kill` with the stop signal).
+    /// it is not restarted, since a kill with the stop signal is a stop.
     pub fn mark_exit_on_next(&self, name: &str) -> Result<()> {
         crate::reference::validate_entry_name(name)?;
         let path = self.exit_on_next_path(name);
@@ -1168,7 +1168,7 @@ fn entry_xattrs<R: Read>(entry: &mut tar::Entry<'_, R>) -> Result<Vec<(String, V
     Ok(xattrs)
 }
 
-/// Sets the attributes on an unpacked entry. As with docker, a file system that does not
+/// Sets the attributes on an unpacked entry. A file system that does not
 /// take one (ENOTSUP, or EPERM for user.* on a symlink) is not an error.
 fn apply_xattrs(path: &Path, xattrs: &[(String, Vec<u8>)]) -> Result<()> {
     for (name, value) in xattrs {

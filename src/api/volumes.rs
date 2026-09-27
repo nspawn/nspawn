@@ -85,7 +85,7 @@ pub fn list(store: &Store) -> Result<Vec<VolumeInfo>> {
 }
 
 /// Makes a named volume ahead of its first use, the way `start` would: a directory
-/// owned by root, mode 0755. One that exists already is fine, like docker volume create.
+/// owned by root, mode 0755. One that exists already is fine.
 pub async fn create(ctx: &Context, name: &str) -> Result<PathBuf> {
     require_root("volume create")?;
     let store = &ctx.store;
@@ -128,7 +128,7 @@ fn create_in(store: &Store, name: &str) -> Result<PathBuf> {
 }
 
 /// Removes volumes nobody uses. One in use, unknown or not made by nspawn is refused and
-/// does not stop the others, like docker volume rm.
+/// does not stop the others.
 pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Result<Removal> {
     require_root("volume rm")?;
     let store = &ctx.store;

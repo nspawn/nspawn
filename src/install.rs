@@ -130,7 +130,7 @@ pub async fn install(
         backend = Backend::Overlay;
         assembler.assemble(backend, spec.name, &layers).await?;
     }
-    // Both kinds join the bridge, like docker; --network host is one flag away.
+    // Both kinds join the bridge; --network host is one flag away.
     let network = Network::Bridge;
     let route = settings::namespace_route(sd, spec.name, mode, true).await?;
     settings::write(

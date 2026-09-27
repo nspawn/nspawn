@@ -37,7 +37,7 @@ pub struct MachineSummary {
     pub os: Option<String>,
     /// The verdict of its healthcheck, while it runs and has one.
     pub health: Option<crate::health::Status>,
-    /// How its last run ended, for a stopped machine: docker's exit code.
+    /// How its last run ended, for a stopped machine: its exit code as `run` reports it.
     pub exit_code: Option<i32>,
 }
 
@@ -167,7 +167,7 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
         });
     }
     // Records machined does not list. Those between two runs of a restart policy show
-    // without -a, as in docker ps; starting, closing and stopped ones only with -a.
+    // without -a; starting, closing and stopped ones only with -a.
     let running: std::collections::HashSet<&str> =
         machines.iter().map(|m| m.name.as_str()).collect();
     let mut others: Vec<&ImageRecord> = records
@@ -577,7 +577,7 @@ pub async fn prepare(
         });
     }
     // /run is a tmpfs of every machine already, and one over it would hide what
-    // systemd-nspawn keeps there; --tmpfs /var/run, docker's habit for a read-only
+    // systemd-nspawn keeps there; --tmpfs /var/run, common for a read-only
     // nginx, lands on it through the image's symlink.
     let mut tuning = record.tuning.clone();
     tuning.tmpfs.retain(|mount| {
@@ -592,7 +592,7 @@ pub async fn prepare(
         true
     });
     // A booted machine's systemd sets the hostname from /etc/hostname, over the one
-    // systemd-nspawn set: --hostname goes in as that file, as docker writes it.
+    // systemd-nspawn set: --hostname goes in as that file.
     let hostname_file = match (&record.tuning.hostname, record.mode) {
         (Some(hostname), Mode::Boot) => {
             let dir = store.machine_files_dir(name);
@@ -1012,7 +1012,7 @@ async fn wait_for_init(sd: &Systemd, name: &str) -> Result<StartOutcome> {
     }
 }
 
-/// docker pause: the machine's cgroup is frozen, every process in it with it.
+/// The machine's cgroup frozen, every process in it with it, or thawed.
 pub async fn pause(ctx: &Context, name: &str, on: bool) -> Result<()> {
     validate_entry_name(name)?;
     let sd = ctx.sd().await?;
@@ -1040,7 +1040,7 @@ pub async fn pause(ctx: &Context, name: &str, on: bool) -> Result<()> {
     Ok(())
 }
 
-/// A process of a running machine, as docker top shows it.
+/// A process of a running machine, as top shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Process {
     pub pid: u32,
@@ -1051,7 +1051,7 @@ pub struct Process {
     pub command: String,
 }
 
-/// docker top: the processes in the machine's PID namespace, from its cgroup.
+/// The processes in the machine's PID namespace, from its cgroup.
 pub async fn processes(ctx: &Context, name: &str) -> Result<Vec<Process>> {
     validate_entry_name(name)?;
     let sd = ctx.sd().await?;
@@ -1310,7 +1310,7 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         }
     } else {
         match mode {
-            // docker stop: the image's stop signal, then SIGKILL after the timeout.
+            // The image's stop signal, then SIGKILL after the timeout.
             Some(Mode::App) => {
                 let signal = record
                     .as_ref()
@@ -1420,9 +1420,9 @@ pub struct KillRequest {
     pub signal: String,
 }
 
-/// docker kill. SIGKILL is `stop --force`. Other signals go to an app's program or a
+/// kill. SIGKILL is `stop --force`. Other signals go to an app's program or a
 /// booted machine's init, and a machine they end is restarted by its policy, unless it
-/// was its stop signal (docker's rule, through the mark the release hook reads).
+/// was its stop signal (through the mark the release hook reads).
 pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Result<()> {
     validate_entry_name(&args.name)?;
     let signal = signal_number(&args.signal)?;
@@ -1516,7 +1516,7 @@ pub struct UpdateRequest {
     pub health: crate::health::Overrides,
 }
 
-/// docker update, through the record and the drop-in: at the reload systemd applies a
+/// update, through the record and the drop-in: at the reload systemd applies a
 /// running unit's new limits to its cgroup, and reads Restart= again. Returns whether it
 /// was running.
 pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
@@ -1913,7 +1913,7 @@ pub struct LogsRequest {
 
 const FOLLOW_TAIL: u32 = 10;
 
-/// journalctl's arguments for docker logs: the console output is in the unit's journal,
+/// journalctl's arguments for logs: the console output is in the unit's journal,
 /// earlier runs included; a booted machine also has a journal of its own.
 pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
     // --all: a line with colours or a CR would read "[N B blob data]" otherwise.

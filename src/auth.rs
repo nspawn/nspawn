@@ -206,7 +206,7 @@ pub fn forget_in(path: &Path, registry: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Checks credentials against the registry the way docker login does: GET /v2/, and on a
+/// Checks credentials against the registry: GET /v2/, and on a
 /// challenge either basic authentication or a token request at the announced realm.
 /// Ok(false) means the registry never asked for credentials.
 pub async fn verify(
