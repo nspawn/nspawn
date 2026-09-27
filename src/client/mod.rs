@@ -563,6 +563,8 @@ pub fn registry_options(config: &Config) -> Options<'_> {
         options.insert("registry", Value::from(config.registry.as_str()));
     }
     if let Some(ca) = &config.ca_cert {
+        // The service reads it from its own working directory: an absolute path.
+        let ca = std::fs::canonicalize(ca).unwrap_or_else(|_| ca.clone());
         options.insert("ca_cert", Value::from(ca.to_string_lossy().into_owned()));
     }
     options
