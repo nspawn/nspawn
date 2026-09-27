@@ -240,6 +240,9 @@ pub fn spawn(
     let bounding = std::fs::read_to_string(format!("/proc/{leader}/status"))
         .ok()
         .and_then(|status| capability_bounding_set(&status));
+    let limits = std::fs::read_to_string(format!("/proc/{leader}/limits"))
+        .map(|text| resource_limits(&text))
+        .unwrap_or_default();
     // Read through /proc/<leader> above: a process that is still alive now is the one
     // they came from.
     if pidfd_signal(leader_fd, 0).is_err() {
@@ -345,6 +348,7 @@ pub fn spawn(
                 user.as_deref(),
                 exec_context.as_deref(),
                 bounding,
+                &limits,
             );
             unsafe { libc::_exit(code) }
         }
@@ -513,6 +517,7 @@ fn helper(
     user: Option<&str>,
     exec_context: Option<&str>,
     bounding: Option<u64>,
+    limits: &[(i32, u64, u64)],
 ) -> i32 {
     // Not dumpable from here on: the command's process is in the machine's PID namespace
     // before it becomes the machine's root and execs, and until then it holds what the
@@ -613,12 +618,13 @@ fn helper(
         }
         Ok(ForkResult::Child) => {
             drop(socket);
-            let code = grandchild(io, argv, env, cwd, user, exec_context, bounding);
+            let code = grandchild(io, argv, env, cwd, user, exec_context, bounding, limits);
             unsafe { libc::_exit(code) }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn grandchild(
     io: CommandIo,
     argv: &[CString],
@@ -627,6 +633,7 @@ fn grandchild(
     user: Option<&str>,
     exec_context: Option<&str>,
     bounding: Option<u64>,
+    limits: &[(i32, u64, u64)],
 ) -> i32 {
     // The streams first: from here on, complaints reach whoever runs the command.
     match io {
@@ -693,6 +700,15 @@ fn grandchild(
     // policy without the rule) must not stop the command.
     if let Some(bounding) = bounding {
         let _ = limit_bounding_set(bounding);
+    }
+    // The resource limits of the machine's own processes (--ulimit among them), not the
+    // service's. Best effort, as above.
+    for (resource, soft, hard) in limits {
+        let limit = libc::rlimit {
+            rlim_cur: *soft,
+            rlim_max: *hard,
+        };
+        let _ = unsafe { libc::setrlimit(*resource as _, &limit) };
     }
     let mut env: Vec<CString> = env.to_vec();
     match user {
@@ -766,6 +782,44 @@ fn grandchild(
             }
         }
     }
+}
+
+/// The resource limits of a /proc/PID/limits, as (resource, soft, hard).
+fn resource_limits(text: &str) -> Vec<(i32, u64, u64)> {
+    const RESOURCES: [(&str, i32); 16] = [
+        ("Max cpu time", libc::RLIMIT_CPU as i32),
+        ("Max file size", libc::RLIMIT_FSIZE as i32),
+        ("Max data size", libc::RLIMIT_DATA as i32),
+        ("Max stack size", libc::RLIMIT_STACK as i32),
+        ("Max core file size", libc::RLIMIT_CORE as i32),
+        ("Max resident set", libc::RLIMIT_RSS as i32),
+        ("Max processes", libc::RLIMIT_NPROC as i32),
+        ("Max open files", libc::RLIMIT_NOFILE as i32),
+        ("Max locked memory", libc::RLIMIT_MEMLOCK as i32),
+        ("Max address space", libc::RLIMIT_AS as i32),
+        ("Max file locks", libc::RLIMIT_LOCKS as i32),
+        ("Max pending signals", libc::RLIMIT_SIGPENDING as i32),
+        ("Max msgqueue size", libc::RLIMIT_MSGQUEUE as i32),
+        ("Max nice priority", libc::RLIMIT_NICE as i32),
+        ("Max realtime priority", libc::RLIMIT_RTPRIO as i32),
+        ("Max realtime timeout", libc::RLIMIT_RTTIME as i32),
+    ];
+    let value = |word: &str| -> Option<u64> {
+        if word == "unlimited" {
+            Some(libc::RLIM_INFINITY)
+        } else {
+            word.parse().ok()
+        }
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (name, resource) = RESOURCES.iter().find(|(name, _)| line.starts_with(name))?;
+            let mut words = line[name.len()..].split_whitespace();
+            let soft = value(words.next()?)?;
+            let hard = value(words.next()?)?;
+            Some((*resource, soft, hard))
+        })
+        .collect()
 }
 
 /// The CapBnd of a /proc/PID/status.
@@ -943,6 +997,25 @@ fn exit_code(status: WaitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_limits_of_a_process_are_read_from_proc() {
+        let text = "Limit                     Soft Limit           Hard Limit           Units     \nMax cpu time              unlimited            unlimited            seconds   \nMax open files            64                   128                  files     \nMax core file size        0                    unlimited            bytes     \nMax bogus                 1                    2                    things    \n";
+        let limits = resource_limits(text);
+        assert_eq!(
+            limits,
+            [
+                (
+                    libc::RLIMIT_CPU as i32,
+                    libc::RLIM_INFINITY,
+                    libc::RLIM_INFINITY
+                ),
+                (libc::RLIMIT_NOFILE as i32, 64, 128),
+                (libc::RLIMIT_CORE as i32, 0, libc::RLIM_INFINITY),
+            ]
+        );
+        assert!(resource_limits("").is_empty());
+    }
 
     #[test]
     fn users_are_resolved_by_name_or_number_with_their_groups() {
