@@ -184,6 +184,7 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
     // the unit hooks. The name is checked again, the old image goes only at this point.
     let _lock = store.lock().await?;
     ensure_replaceable(store, sd, &name, request.force).await?;
+    crate::install::stage_layers(store, backend, &manifest, request.mode, &name).await?;
     remove_existing(store, sd, &name, report).await?;
     let mode = install(
         store,

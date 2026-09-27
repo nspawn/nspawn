@@ -207,6 +207,8 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         draft.healthcheck = Some(hc);
     }
     request.tuning.apply(&mut draft.tuning)?;
+    crate::install::stage_layers(store, backend, &manifest, Some(source.mode), &request.name)
+        .await?;
     remove_existing(store, sd, &request.name, report).await?;
     line(
         report,

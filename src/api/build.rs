@@ -162,6 +162,7 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
                 backend.name()
             ),
         );
+        crate::install::stage_layers(store, backend, &manifest, request.mode, &name).await?;
         remove_existing(store, sd, &name, report).await?;
         install(
             store,

@@ -30,6 +30,63 @@ pub struct Install<'a> {
     pub signed_at: Option<u64>,
 }
 
+/// The backend an image of `manifest` is assembled with: `backend`, unless it is mstack
+/// and the image's command says it runs a program rather than an init system, in which
+/// case overlay, since mstack machines cannot join the bridge network.
+fn assembled_with(
+    store: &Store,
+    backend: Backend,
+    manifest: &OciImageManifest,
+    mode: Option<Mode>,
+    report: Report<'_>,
+    name: &str,
+) -> Result<(Backend, RunSpec)> {
+    let config_path = store.blob_path(&manifest.config.digest);
+    let config_blob =
+        fs::read(&config_path).with_context(|| format!("reading {}", config_path.display()))?;
+    let run = RunSpec::from_config(&config_blob)?;
+    let surely_app =
+        mode == Some(Mode::App) || (mode.is_none() && detect_mode(true, &run.argv()) == Mode::App);
+    if backend == Backend::Mstack && surely_app {
+        note(report, format!("note: {name} runs a program rather than an init system; assembling it as overlay, since mstack machines cannot join the bridge network"));
+        return Ok((Backend::Overlay, run));
+    }
+    Ok((backend, run))
+}
+
+/// Extracts the layers of `manifest` into the store ahead of `install`, where the same
+/// extraction then finds them done: what can fail in it (a media type nobody knows, a
+/// hostile archive, a full disk) fails before the machine being replaced is removed. A
+/// flat machine extracts into its own directory and is not covered.
+pub async fn stage_layers(
+    store: &Store,
+    backend: Backend,
+    manifest: &OciImageManifest,
+    mode: Option<Mode>,
+    name: &str,
+) -> Result<()> {
+    // install says its notes; this pass keeps quiet.
+    let (backend, _) = assembled_with(store, backend, manifest, mode, &|_| {}, name)?;
+    if backend == Backend::Flat {
+        return Ok(());
+    }
+    for layer in &manifest.layers {
+        let store = store.clone();
+        let (digest, media_type, blob, ownership) = (
+            layer.digest.clone(),
+            layer.media_type.clone(),
+            store.blob_path(&layer.digest),
+            backend.ownership(),
+        );
+        tokio::task::spawn_blocking(move || {
+            store.import_layer(&digest, &media_type, &blob, ownership)
+        })
+        .await
+        .context("extracting a layer")??;
+    }
+    Ok(())
+}
+
 /// All blobs named in the manifest (layers and config) must already be in the store.
 pub async fn install(
     store: &Store,
@@ -49,21 +106,11 @@ pub async fn install(
             blob: store.blob_path(&d.digest),
         })
         .collect();
-    let config_path = store.blob_path(&spec.manifest.config.digest);
-    let config_blob =
-        fs::read(&config_path).with_context(|| format!("reading {}", config_path.display()))?;
-    let run = RunSpec::from_config(&config_blob)?;
     // An mstack image runs with managed user namespaces, which cannot join the network
     // namespace prepared for app machines on the bridge; apps get overlay instead. Whether
     // the image is an app is known before extraction when its command says so.
-    let surely_app = spec.mode == Some(Mode::App)
-        || (spec.mode.is_none() && detect_mode(true, &run.argv()) == Mode::App);
-    let backend = if backend == Backend::Mstack && surely_app {
-        note(report, format!("note: {} runs a program rather than an init system; assembling it as overlay, since mstack machines cannot join the bridge network", spec.name));
-        Backend::Overlay
-    } else {
-        backend
-    };
+    let (backend, run) =
+        assembled_with(store, backend, spec.manifest, spec.mode, report, spec.name)?;
     let assembler = Assembler { store, sd };
     let mut backend = backend;
     let trees = assembler.assemble(backend, spec.name, &layers).await?;
