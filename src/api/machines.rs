@@ -1466,19 +1466,31 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
     if record.is_some() {
         ctx.store.mark_signal(&args.name, signal)?;
     }
-    if mode == Some(Mode::App) {
-        let (leader, payload) = wait_for_payload(sd, &args.name).await?;
-        let payload = payload.with_context(|| {
-            format!(
-                "{} has no program running under its init (leader PID {leader})",
-                args.name
-            )
-        })?;
-        send_signal(payload, signal).with_context(|| {
-            format!("sending {} to PID {payload} of {}", args.signal, args.name)
-        })?;
-    } else {
-        sd.kill_machine(&args.name, "leader", signal).await?;
+    let delivered: Result<()> = async {
+        if mode == Some(Mode::App) {
+            let (leader, payload) = wait_for_payload(sd, &args.name).await?;
+            let payload = payload.with_context(|| {
+                format!(
+                    "{} has no program running under its init (leader PID {leader})",
+                    args.name
+                )
+            })?;
+            send_signal(payload, signal).with_context(|| {
+                format!("sending {} to PID {payload} of {}", args.signal, args.name)
+            })
+        } else {
+            sd.kill_machine(&args.name, "leader", signal).await
+        }
+    }
+    .await;
+    if let Err(e) = delivered {
+        // The marks were set ahead of the signal, so that a release right after it finds
+        // them; a signal that never went must not end the machine's next run instead.
+        if record.is_some() {
+            ctx.store.take_exit_on_next(&args.name)?;
+            ctx.store.forget_signal(&args.name)?;
+        }
+        return Err(e);
     }
     let image = record.as_ref().map(|r| r.reference.as_str()).unwrap_or("");
     crate::api::events::emit(
