@@ -591,13 +591,22 @@ impl Store {
             for layer in &record.layers {
                 set.insert(layer_dir_name(layer));
             }
-            if let Ok(bytes) = self.load_manifest(&record.name) {
-                if let Ok(manifest) =
-                    serde_json::from_slice::<oci_client::manifest::OciImageManifest>(&bytes)
-                {
-                    set.insert(layer_dir_name(&manifest.config.digest));
-                }
-            }
+            // The config blob is named by the manifest alone: one that cannot be read
+            // would have its blob taken for unreferenced.
+            let bytes = self.load_manifest(&record.name).with_context(|| {
+                format!(
+                    "the manifest of {} cannot be read; fix or remove the image first",
+                    record.name
+                )
+            })?;
+            let manifest = serde_json::from_slice::<oci_client::manifest::OciImageManifest>(&bytes)
+                .with_context(|| {
+                    format!(
+                        "the manifest of {} cannot be read; fix or remove the image first",
+                        record.name
+                    )
+                })?;
+            set.insert(layer_dir_name(&manifest.config.digest));
         }
         Ok(set)
     }
@@ -709,7 +718,8 @@ impl Store {
         let entries = match fs::read_dir(self.images_dir()) {
             Ok(entries) => entries,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            // A listing may go without the records; what collects garbage may not.
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !strict => {
                 eprintln!("note: run as root to see the backend and source of each image");
                 return Ok(out);
             }
@@ -1992,6 +2002,13 @@ mod tests {
             .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))
             .unwrap();
         fs::write(store.blob_path("sha256:m"), b"manifest?").unwrap();
+        // Every recorded image has its manifest, which names its config blob.
+        let manifest = r#"{"schemaVersion": 2, "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": "sha256:m", "size": 9}, "layers": []}"#;
+        for image in store.list_images_strict().unwrap() {
+            store
+                .save_manifest(&image.name, manifest.as_bytes())
+                .unwrap();
+        }
         store.gc_blobs().unwrap();
         assert!(fresh.exists(), "a download in flight is left alone");
         assert!(!old.exists(), "an abandoned one goes");
@@ -2020,6 +2037,30 @@ mod tests {
         assert!(store.gc_blobs().is_err());
         assert!(store.layer_dir("sha256:live", Ownership::Root).is_dir());
         assert!(store.blob_path("sha256:live").is_file());
+        // A record whose manifest is gone names its config blob nowhere: blobs are not
+        // collected, layers (named by the record) still are.
+        fs::remove_file(store.images_dir().join("future.json")).unwrap();
+        let record: ImageRecord = serde_json::from_str(
+            r#"{"name": "live", "reference": "r", "manifest_digest": "d", "layers": ["sha256:live"], "backend": "overlay", "created": 0}"#,
+        )
+        .unwrap();
+        store.record_image(&record).unwrap();
+        let e = store.gc_blobs().unwrap_err().to_string();
+        assert!(e.contains("manifest of live cannot be read"), "{e}");
+        assert!(store.blob_path("sha256:live").is_file());
+        assert!(store.gc_layers().is_ok());
+        // Records that cannot be listed at all are no listing either for the collector.
+        if !nix::unistd::geteuid().is_root() {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(store.images_dir(), fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(
+                store.list_images().unwrap().is_empty(),
+                "the lenient listing goes on"
+            );
+            assert!(store.list_images_strict().is_err());
+            assert!(store.gc_layers().is_err());
+            fs::set_permissions(store.images_dir(), fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     #[test]
