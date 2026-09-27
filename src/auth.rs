@@ -44,6 +44,8 @@ pub fn canonical(registry: &str) -> String {
         .trim_start_matches("https://")
         .trim_start_matches("http://");
     let host = host.split('/').next().unwrap_or(host).to_ascii_lowercase();
+    // The port https implies names the same registry.
+    let host = host.strip_suffix(":443").unwrap_or(&host).to_string();
     match host.as_str() {
         "docker.io" | "index.docker.io" | "registry-1.docker.io" | "registry.hub.docker.com" => {
             "docker.io".to_string()
@@ -88,12 +90,38 @@ pub fn lookup(registry: &str) -> Option<Credentials> {
 
 pub fn lookup_in(path: &Path, registry: &str) -> Option<Credentials> {
     let key = canonical(registry);
-    let text = fs::read_to_string(path).ok()?;
-    let file = serde_json::from_str::<AuthFile>(&text).ok()?;
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!(
+                "warning: {} cannot be read ({e}); going on without credentials",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let file = match serde_json::from_str::<AuthFile>(&text) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!(
+                "warning: {} is not the JSON of a credentials file ({e}); going on without credentials",
+                path.display()
+            );
+            return None;
+        }
+    };
+    // The name a login stores under first: an alias of the registry written by hand or
+    // by another tool must not outrank a fresher login.
     file.auths
-        .iter()
-        .find(|(stored, _)| canonical(stored) == key)
-        .and_then(|(_, entry)| entry_credentials(entry))
+        .get(&key)
+        .or_else(|| {
+            file.auths
+                .iter()
+                .find(|(stored, _)| canonical(stored) == key)
+                .map(|(_, entry)| entry)
+        })
+        .and_then(entry_credentials)
 }
 
 fn read_store(path: &Path) -> Result<AuthFile> {
@@ -267,6 +295,11 @@ mod tests {
             canonical("https://hub.nspawn.test:8443/"),
             "hub.nspawn.test:8443"
         );
+        assert_eq!(
+            canonical("hub.nspawn.org:443"),
+            "hub.nspawn.org",
+            "the port https implies is the same registry"
+        );
         assert_eq!(api_base("docker.io"), "https://registry-1.docker.io");
         assert_eq!(
             api_base("hub.nspawn.test:8443"),
@@ -318,6 +351,22 @@ mod tests {
         store_in(&path, "ghcr.io", &creds).unwrap();
         assert_eq!(lookup_in(&path, "https://ghcr.io/v2/").unwrap(), creds);
         assert!(lookup_in(&path, "docker.io").is_none());
+        // An alias written by hand sorts before the name a login stores under; the
+        // login still wins.
+        let mut file: AuthFile = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let stale = base64::engine::general_purpose::STANDARD.encode("old:secret");
+        file.auths.insert(
+            "GHCR.IO".to_string(),
+            AuthEntry {
+                auth: Some(stale),
+                ..AuthEntry::default()
+            },
+        );
+        write_store(&path, &file).unwrap();
+        assert_eq!(lookup_in(&path, "ghcr.io").unwrap(), creds);
+        // A file that is not JSON gives no credentials, and says so.
+        fs::write(&path, "{not json").unwrap();
+        assert!(lookup_in(&path, "ghcr.io").is_none());
     }
 
     #[test]
