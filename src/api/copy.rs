@@ -530,10 +530,15 @@ pub fn unpack<R: Read>(
                 }
             }
             tar::EntryType::Regular | tar::EntryType::Continuous => {
-                replace_leaf(&parent, &leaf, &shown)?;
+                if is_dir_at(&parent, &leaf) {
+                    bail!("{} is a directory; not replacing it", shown.display());
+                }
+                // Written beside its name and renamed over it once complete, so that a
+                // copy cut short leaves the file that was there, not half of the new one.
+                let staged = staged_leaf(&leaf);
                 let file = openat(
                     &parent,
-                    leaf.as_os_str(),
+                    staged.as_os_str(),
                     OFlag::O_WRONLY
                         | OFlag::O_CREAT
                         | OFlag::O_EXCL
@@ -543,16 +548,27 @@ pub fn unpack<R: Read>(
                 )
                 .map_err(|e| nix_error(e, &shown))?;
                 let mut file = File::from(file);
-                let bytes = io::copy(&mut entry, &mut file)
-                    .with_context(|| format!("writing {}", shown.display()))?;
-                if let Some((uid, gid)) = owner {
-                    fchown(&file, Some(uid), Some(gid)).map_err(|e| nix_error(e, &shown))?;
+                let written: Result<u64> = (|| {
+                    let bytes = io::copy(&mut entry, &mut file)
+                        .with_context(|| format!("writing {}", shown.display()))?;
+                    if let Some((uid, gid)) = owner {
+                        fchown(&file, Some(uid), Some(gid)).map_err(|e| nix_error(e, &shown))?;
+                    }
+                    // After the chown, which clears setuid and setgid.
+                    fchmod(&file, mode).map_err(|e| nix_error(e, &shown))?;
+                    futimens(&file, &timespec(mtime), &timespec(mtime))
+                        .map_err(|e| nix_error(e, &shown))?;
+                    nix::fcntl::renameat(&parent, staged.as_os_str(), &parent, leaf.as_os_str())
+                        .map_err(|e| nix_error(e, &shown))?;
+                    Ok(bytes)
+                })();
+                match written {
+                    Ok(bytes) => stats.bytes += bytes,
+                    Err(e) => {
+                        let _ = unlinkat(&parent, staged.as_os_str(), UnlinkatFlags::NoRemoveDir);
+                        return Err(e);
+                    }
                 }
-                // After the chown, which clears setuid and setgid.
-                fchmod(&file, mode).map_err(|e| nix_error(e, &shown))?;
-                futimens(&file, &timespec(mtime), &timespec(mtime))
-                    .map_err(|e| nix_error(e, &shown))?;
-                stats.bytes += bytes;
             }
             tar::EntryType::Symlink => {
                 let link = entry
@@ -596,7 +612,16 @@ pub fn unpack<R: Read>(
     Ok(stats)
 }
 
-/// Makes room for a file or a link: what is there goes, unless it is a directory.
+/// The name a file is written under until it is complete: beside its own, never the
+/// name of anything the archive carries.
+fn staged_leaf(leaf: &OsStr) -> OsString {
+    let mut name = OsString::from(".");
+    name.push(leaf);
+    name.push(format!(".nspawn-cp-{}", crate::store::unique_suffix()));
+    name
+}
+
+/// Makes room for a link: what is there goes, unless it is a directory.
 fn replace_leaf(parent: &OwnedFd, leaf: &OsStr, shown: &Path) -> Result<()> {
     match unlinkat(parent, leaf, UnlinkatFlags::NoRemoveDir) {
         Ok(()) | Err(Errno::ENOENT) => Ok(()),
