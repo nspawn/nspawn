@@ -442,7 +442,7 @@ async fn attached(
     }
     let ended = Ended::watch(&client.connection, process).await?;
     if let Some(master) = handed.remove("tty") {
-        tokio::task::block_in_place(|| pty::run_session(OwnedFd::from(master)))?;
+        tokio::task::block_in_place(|| pty::run_session(OwnedFd::from(master), interactive))?;
         return ended.status().await;
     }
     let Some(output) = handed.remove("stdout") else {
@@ -810,7 +810,7 @@ pub async fn shell(args: ShellArgs, client: &Client) -> Result<()> {
         .shell(&args.machine, &args.user, options)
         .await
         .map_err(client::error)?;
-    tokio::task::block_in_place(|| pty::run_session(OwnedFd::from(fd)))
+    tokio::task::block_in_place(|| pty::run_session(OwnedFd::from(fd), true))
 }
 
 /// TERM as this terminal has it, for the machine's side of a pseudo terminal.
@@ -828,10 +828,13 @@ async fn run_command(
     user: &str,
     spec: ExecSpec,
 ) -> Result<i32> {
+    // A terminal when both ends are one: with the output redirected to a file, a pty
+    // would turn every newline into CRLF and tell the command it has a terminal.
     let tty = !spec.detach
-        && spec
-            .tty
-            .unwrap_or_else(|| nix::unistd::isatty(io::stdin()).unwrap_or(false));
+        && spec.tty.unwrap_or_else(|| {
+            nix::unistd::isatty(io::stdin()).unwrap_or(false)
+                && nix::unistd::isatty(io::stdout()).unwrap_or(false)
+        });
     let (rows, cols) = pty::window_size().unwrap_or((24, 80));
     let mut options = Options::new();
     options.insert("tty", Value::from(tty));
@@ -863,7 +866,7 @@ async fn run_command(
     let ended = Ended::watch(&client.connection, process).await?;
     let mut take = |name: &str| fds.remove(name).map(OwnedFd::from);
     if let Some(master) = take("tty") {
-        tokio::task::block_in_place(|| pty::run_session(master))?;
+        tokio::task::block_in_place(|| pty::run_session(master, true))?;
     } else {
         let (Some(stdin), Some(stdout), Some(stderr)) =
             (take("stdin"), take("stdout"), take("stderr"))
