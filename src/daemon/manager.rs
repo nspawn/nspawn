@@ -1570,10 +1570,12 @@ impl Manager {
         let mut fds = HashMap::new();
         if detach {
             // Nobody reads the command: its output is drained here, as docker exec -d
-            // discards it, so that it never blocks on a full pipe.
+            // discards it, so that it never blocks on a full pipe. On threads of their
+            // own: a child of the command that keeps the pipe open outlives the command,
+            // and a blocking task of the runtime would keep the service from exiting.
             drop(stdin);
             for fd in [stdout, stderr].into_iter().flatten() {
-                tokio::task::spawn_blocking(move || {
+                std::thread::spawn(move || {
                     let _ = std::io::copy(&mut std::fs::File::from(fd), &mut std::io::sink());
                 });
             }
