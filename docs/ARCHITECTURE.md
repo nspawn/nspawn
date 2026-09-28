@@ -27,7 +27,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `policy.rs` | restart policies and resource limits (`--restart`, `-m`, `--cpus`, `--pids-limit`), written into the hook drop-in |
 | `health.rs` | healthchecks: the image's or the flags', the probe runner (`health-run`, a transient unit bound to the machine's), its verdict under `/run/nspawn/health` |
 | `api/secrets.rs` | secrets: systemd-creds around them, their files under the state directory, decrypted into a root-only tmpfs for a running machine and bind-mounted read-only |
-| `tuning.rs` | docker's other per-container flags (hostname, user, capabilities, tmpfs, devices, dns, ulimits, signals, sysctls) and `--interface`: parsing, and the settings and unit lines they become |
+| `tuning.rs` | docker's other per-container flags (hostname, user, capabilities, tmpfs, devices, dns, ulimits, signals, sysctls, timezone) and `--interface`: parsing, and the settings and unit lines they become |
 | `getent.rs` | the getent stand-in bound into an app that runs as a user |
 | `bridge.rs`, `hostnet.rs` | the nspawn0 bridge, ports, firewalls; veth mode |
 | `volume.rs`, `volmount.rs` | `-v` parsing; host-side mounts for mstack machines |
