@@ -1,3 +1,9 @@
+nspawn (1.7.2-1) unstable; urgency=medium
+
+  * The tests pass when the package is built inside a systemd-nspawn machine.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Mon, 28 Sep 2026 18:22:21 -0500
+
 nspawn (1.7.1-1) unstable; urgency=medium
 
   * cp tries a lookup again when openat2 answers EAGAIN, which failed copies on a busy host.

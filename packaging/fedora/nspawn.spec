@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 1.7.1
+%global upstream_version 1.7.2
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -150,6 +150,9 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Mon Sep 28 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.7.2-1
+- The tests pass when the package is built inside a systemd-nspawn machine.
+
 * Mon Sep 28 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.7.1-1
 - cp tries a lookup again when openat2 answers EAGAIN, which failed copies on a busy host.
 
