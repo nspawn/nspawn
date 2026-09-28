@@ -191,6 +191,10 @@ fn nix_error(e: Errno, what: &Path) -> anyhow::Error {
         ),
         Errno::ENOENT => anyhow!("{}: no such file or directory", what.display()),
         Errno::ENOTDIR => anyhow!("{}: not a directory", what.display()),
+        Errno::EAGAIN => anyhow!(
+            "{}: its lookup kept crossing renames or mounts on the host; try again",
+            what.display()
+        ),
         other => anyhow!("{}: {}", what.display(), other.desc()),
     }
 }
@@ -201,13 +205,31 @@ fn scoped_raw(root: BorrowedFd<'_>, path: &Path, flags: OFlag) -> nix::Result<Ow
     } else {
         path
     };
-    openat2(
-        root,
-        lookup,
-        OpenHow::new()
-            .flags(flags | OFlag::O_CLOEXEC)
-            .resolve(ResolveFlag::RESOLVE_IN_ROOT | ResolveFlag::RESOLVE_NO_MAGICLINKS),
-    )
+    retry_on_eagain(|| {
+        openat2(
+            root,
+            lookup,
+            OpenHow::new()
+                .flags(flags | OFlag::O_CLOEXEC)
+                .resolve(ResolveFlag::RESOLVE_IN_ROOT | ResolveFlag::RESOLVE_NO_MAGICLINKS),
+        )
+    })
+}
+
+/// How often a lookup is tried before its EAGAIN is the answer.
+const LOOKUP_ATTEMPTS: usize = 32;
+
+/// openat2 answers EAGAIN when a `..` on the way crossed a rename or a mount anywhere on
+/// the system, since it cannot then vouch that the lookup stayed below the root, and its
+/// manual leaves the retry to the caller.
+fn retry_on_eagain<T>(mut attempt: impl FnMut() -> nix::Result<T>) -> nix::Result<T> {
+    for _ in 1..LOOKUP_ATTEMPTS {
+        match attempt() {
+            Err(Errno::EAGAIN) => continue,
+            other => return other,
+        }
+    }
+    attempt()
 }
 
 /// Opens `path` beneath `root`, which it can never leave.
@@ -1161,6 +1183,34 @@ mod tests {
             assert!(result.is_err(), "{path}");
         }
         assert!(!tmp.path().join("escape").exists());
+    }
+
+    #[test]
+    fn a_lookup_that_crossed_a_rename_is_tried_again() {
+        let mut calls = 0;
+        let answer = retry_on_eagain(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(Errno::EAGAIN)
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(answer, Ok(3));
+        calls = 0;
+        let answer: nix::Result<()> = retry_on_eagain(|| {
+            calls += 1;
+            Err(Errno::EAGAIN)
+        });
+        assert_eq!(answer, Err(Errno::EAGAIN));
+        assert_eq!(calls, LOOKUP_ATTEMPTS);
+        calls = 0;
+        let answer: nix::Result<()> = retry_on_eagain(|| {
+            calls += 1;
+            Err(Errno::ENOENT)
+        });
+        assert_eq!(answer, Err(Errno::ENOENT));
+        assert_eq!(calls, 1, "only EAGAIN is tried again");
     }
 
     #[test]
