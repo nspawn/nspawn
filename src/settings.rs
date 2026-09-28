@@ -418,11 +418,10 @@ pub fn render_hooks(
         text.push_str("RestartForceExitStatus=\n");
     }
     if limits.memory > 0 {
-        // As much swap again as memory; without a bound swap would be unlimited.
-        text.push_str(&format!(
-            "MemoryMax={0}\nMemorySwapMax={0}\n",
-            limits.memory
-        ));
+        text.push_str(&format!("MemoryMax={}\n", limits.memory));
+    }
+    if let Some(swap) = limits.swap_max() {
+        text.push_str(&format!("MemorySwapMax={swap}\n"));
     }
     if let Some(quota) = limits.cpu_quota() {
         text.push_str(&format!("CPUQuota={quota}\n"));
@@ -1252,6 +1251,7 @@ mod tests {
                     memory: 64 << 20,
                     milli_cpus: 500,
                     pids: 100,
+                    ..Limits::default()
                 },
                 remove_on_exit: false,
                 tuning: &Tuning::default(),
@@ -1268,9 +1268,8 @@ mod tests {
             &HookSpec {
                 restart: Restart::No,
                 limits: &Limits {
-                    memory: 0,
                     milli_cpus: 333,
-                    pids: 0,
+                    ..Limits::default()
                 },
                 remove_on_exit: false,
                 tuning: &Tuning::default(),

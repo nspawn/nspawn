@@ -146,6 +146,7 @@ pub fn record(r: &ImageRecord) -> Dict {
         ("labels".to_string(), map(&r.effective_labels())),
         ("restart".to_string(), v(r.restart.name())),
         ("memory".to_string(), v(r.limits.memory)),
+        ("memory_swap".to_string(), v(r.limits.memory_swap)),
         ("cpus".to_string(), v(r.limits.cpus())),
         ("pids_limit".to_string(), v(r.limits.pids)),
         ("image_labels".to_string(), map(&r.run.labels)),

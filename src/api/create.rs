@@ -44,6 +44,9 @@ pub struct CreateRequest {
     pub restart: Option<crate::policy::Restart>,
     /// Bytes; None or 0 for no limit.
     pub memory: Option<u64>,
+    /// Memory and swap together in bytes, -1 for no bound on swap; None or 0 for as much
+    /// swap again as memory.
+    pub memory_swap: Option<i64>,
     /// CPUs (0.5); None or 0 for no limit.
     pub cpus: Option<f64>,
     /// Processes; None or 0 for no limit.
@@ -117,6 +120,9 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     let mut limits = crate::policy::Limits::default();
     if let Some(memory) = request.memory {
         limits.memory = memory;
+    }
+    if let Some(memory_swap) = request.memory_swap {
+        limits.memory_swap = memory_swap;
     }
     if let Some(cpus) = request.cpus {
         limits.milli_cpus = crate::policy::milli_cpus_from(cpus)?;

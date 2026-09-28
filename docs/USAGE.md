@@ -88,7 +88,9 @@ should it end the machine the policy decides, unless it was the machine's stop s
 which counts as a stop. `-m/--memory`, `--cpus` and `--pids-limit`
 bound the whole machine (its unit's MemoryMax=, CPUQuota= and TasksMax=), which is why
 they cannot be seen from inside; as with docker, `--memory` also lets the machine use as
-much swap again (MemorySwapMax=), and no more. Both are remembered like the ports and apply at the
+much swap again (MemorySwapMax=), and no more, unless `--memory-swap` gives memory and
+swap together: equal to `--memory` for no swap, larger for more, `-1` for swap without a
+bound (it needs `--memory`, and `0` goes back to the default). They are remembered like the ports and apply at the
 next start; `--restart no` and a limit of 0 remove them. `update` changes them without a
 start, like docker update: a running machine gets the new limits in its cgroup at once.
 `stats` shows what each running machine uses against them, its unit's cgroup read every

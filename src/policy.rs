@@ -74,6 +74,16 @@ pub struct Limits {
     /// Processes and threads (TasksMax=).
     #[serde(default)]
     pub pids: u64,
+    /// Memory and swap together (--memory-swap): 0 for as much swap again as memory,
+    /// -1 for no bound on swap.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub memory_swap: i64,
+}
+
+// serde's skip_serializing_if hands the field over by reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(n: &i64) -> bool {
+    *n == 0
 }
 
 /// Below this systemd would kill the supervisor before the program had a chance.
@@ -86,6 +96,15 @@ impl Limits {
     pub fn check(&self, mode: Mode) -> Result<()> {
         if self.memory > 0 && self.memory < MIN_MEMORY {
             bail!("--memory must be at least 4m (or 0 for no limit)");
+        }
+        if self.memory_swap < -1 {
+            bail!("--memory-swap is a size, 0 or -1");
+        }
+        if self.memory_swap > 0 && self.memory == 0 {
+            bail!("--memory-swap bounds memory and swap together, so it needs --memory too");
+        }
+        if self.memory_swap > 0 && (self.memory_swap as u64) < self.memory {
+            bail!("--memory-swap is memory and swap together: it cannot be below --memory");
         }
         if mode == Mode::Boot && self.pids > 0 && self.pids < MIN_BOOT_PIDS {
             bail!("--pids-limit must be at least {MIN_BOOT_PIDS} for a booted machine (or 0 for no limit)");
@@ -112,6 +131,30 @@ impl Limits {
     pub fn cpus(&self) -> f64 {
         self.milli_cpus as f64 / 1000.0
     }
+
+    /// MemorySwapMax= beside a memory limit: as much swap again by default, none when
+    /// --memory-swap equals --memory, what is left of it otherwise; without a memory
+    /// limit swap has no bound of its own.
+    pub fn swap_max(&self) -> Option<String> {
+        if self.memory == 0 {
+            return None;
+        }
+        Some(match self.memory_swap {
+            -1 => "infinity".to_string(),
+            0 => self.memory.to_string(),
+            total => (total as u64).saturating_sub(self.memory).to_string(),
+        })
+    }
+}
+
+/// --memory-swap: memory and swap together as a size, 0 for the default (as much swap
+/// again as memory) or -1 for no bound on swap.
+pub fn parse_memory_swap(text: &str) -> Result<i64> {
+    if text.trim() == "-1" {
+        return Ok(-1);
+    }
+    let bytes = parse_size(text)?;
+    i64::try_from(bytes).map_err(|_| anyhow::anyhow!("{text}: too large for --memory-swap"))
 }
 
 /// --memory: a size of at least 4m, or 0 for none.
@@ -240,9 +283,8 @@ mod tests {
     #[test]
     fn limits_render_and_check() {
         let limits = |milli_cpus| Limits {
-            memory: 0,
             milli_cpus,
-            pids: 0,
+            ..Limits::default()
         };
         assert_eq!(limits(500).cpu_quota().as_deref(), Some("50%"));
         assert_eq!(limits(1250).cpu_quota().as_deref(), Some("125%"));
@@ -262,5 +304,34 @@ mod tests {
         assert!(few_pids.check(Mode::App).is_ok());
         let old: Limits = serde_json::from_str("{}").unwrap();
         assert_eq!(old, Limits::default());
+    }
+
+    #[test]
+    fn memory_swap_reads_and_bounds_swap_like_docker() {
+        assert_eq!(parse_memory_swap("-1").unwrap(), -1);
+        assert_eq!(parse_memory_swap("0").unwrap(), 0);
+        assert_eq!(parse_memory_swap("1g").unwrap(), 1 << 30);
+        assert!(parse_memory_swap("-2").is_err());
+        let limits = |memory: u64, memory_swap: i64| Limits {
+            memory,
+            memory_swap,
+            ..Limits::default()
+        };
+        let m = 512 << 20;
+        assert_eq!(limits(m, 0).swap_max().as_deref(), Some("536870912"));
+        assert_eq!(limits(m, -1).swap_max().as_deref(), Some("infinity"));
+        assert_eq!(limits(m, m as i64).swap_max().as_deref(), Some("0"));
+        assert_eq!(
+            limits(m, 3 * m as i64).swap_max().as_deref(),
+            Some("1073741824")
+        );
+        assert_eq!(limits(0, -1).swap_max(), None);
+        assert!(limits(0, -1).check(Mode::App).is_ok());
+        assert!(limits(0, 1 << 30).check(Mode::App).is_err());
+        assert!(limits(m, (m / 2) as i64).check(Mode::App).is_err());
+        assert!(limits(m, -3).check(Mode::App).is_err());
+        assert!(limits(m, m as i64).check(Mode::App).is_ok());
+        let json = serde_json::to_string(&limits(m, 0)).unwrap();
+        assert!(!json.contains("memory_swap"), "{json}");
     }
 }

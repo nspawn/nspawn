@@ -173,6 +173,9 @@ fn start_options(args: StartOptions, command: Vec<String>) -> Result<Options<'st
     if let Some(memory) = args.memory {
         options.insert("memory", Value::from(memory));
     }
+    if let Some(memory_swap) = args.memory_swap {
+        options.insert("memory_swap", Value::from(memory_swap));
+    }
     if let Some(cpus) = args.cpus {
         options.insert("cpus", Value::from(cpus));
     }
@@ -728,6 +731,9 @@ pub async fn update(args: UpdateArgs, client: &Client) -> Result<()> {
         }
         if let Some(memory) = args.memory {
             options.insert("memory", Value::from(memory));
+        }
+        if let Some(memory_swap) = args.memory_swap {
+            options.insert("memory_swap", Value::from(memory_swap));
         }
         if let Some(cpus) = args.cpus {
             options.insert("cpus", Value::from(cpus));

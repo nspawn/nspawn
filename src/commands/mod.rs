@@ -468,6 +468,9 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             if let Some(memory) = a.memory {
                 put(&mut options, "memory", memory);
             }
+            if let Some(memory_swap) = a.memory_swap {
+                put(&mut options, "memory_swap", memory_swap);
+            }
             if let Some(cpus) = a.cpus {
                 put(&mut options, "cpus", cpus);
             }

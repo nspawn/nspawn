@@ -398,9 +398,15 @@ pub struct CreateArgs {
     #[arg(long, value_enum, value_name = "POLICY")]
     pub restart: Option<crate::policy::Restart>,
     /// Memory limit of the whole machine, like docker -m: 512m, 2g, and as much swap
-    /// again; 0 removes it. Remembered; applied at the next start.
+    /// again unless --memory-swap says otherwise; 0 removes it. Remembered; applied at the
+    /// next start.
     #[arg(long, short = 'm', value_name = "SIZE", value_parser = crate::policy::parse_memory)]
     pub memory: Option<u64>,
+    /// Memory and swap together, like docker --memory-swap: a size of at least --memory
+    /// (equal to it, no swap), or -1 for swap without a bound; 0 goes back to as much swap
+    /// again as memory. Remembered; applied at the next start.
+    #[arg(long, value_name = "SIZE", allow_hyphen_values = true, value_parser = crate::policy::parse_memory_swap)]
+    pub memory_swap: Option<i64>,
     /// CPU limit of the whole machine, like docker --cpus: 0.5, 2; 0 removes it.
     /// Remembered; applied at the next start.
     #[arg(long, value_name = "N", value_parser = crate::policy::parse_cpus)]
@@ -633,9 +639,14 @@ pub struct UpdateArgs {
     /// Restart policy: no, on-failure, always (also starts it at boot) or unless-stopped.
     #[arg(long, value_enum, value_name = "POLICY")]
     pub restart: Option<crate::policy::Restart>,
-    /// Memory limit of the whole machine: 512m, 2g, and as much swap again; 0 removes it.
+    /// Memory limit of the whole machine: 512m, 2g, and as much swap again unless
+    /// --memory-swap says otherwise; 0 removes it.
     #[arg(long, short = 'm', value_name = "SIZE", value_parser = crate::policy::parse_memory)]
     pub memory: Option<u64>,
+    /// Memory and swap together: a size of at least --memory (equal to it, no swap), or -1
+    /// for swap without a bound; 0 goes back to as much swap again as memory.
+    #[arg(long, value_name = "SIZE", allow_hyphen_values = true, value_parser = crate::policy::parse_memory_swap)]
+    pub memory_swap: Option<i64>,
     /// CPU limit of the whole machine: 0.5, 2; 0 removes it.
     #[arg(long, value_name = "N", value_parser = crate::policy::parse_cpus)]
     pub cpus: Option<f64>,
@@ -848,9 +859,15 @@ pub struct StartOptions {
     #[arg(long, value_enum, value_name = "POLICY")]
     pub restart: Option<crate::policy::Restart>,
     /// Memory limit of the whole machine, like docker -m: 512m, 2g, and as much swap
-    /// again; 0 removes it. Remembered; applied at the next start.
+    /// again unless --memory-swap says otherwise; 0 removes it. Remembered; applied at the
+    /// next start.
     #[arg(long, short = 'm', value_name = "SIZE", value_parser = crate::policy::parse_memory)]
     pub memory: Option<u64>,
+    /// Memory and swap together, like docker --memory-swap: a size of at least --memory
+    /// (equal to it, no swap), or -1 for swap without a bound; 0 goes back to as much swap
+    /// again as memory. Remembered; applied at the next start.
+    #[arg(long, value_name = "SIZE", allow_hyphen_values = true, value_parser = crate::policy::parse_memory_swap)]
+    pub memory_swap: Option<i64>,
     /// CPU limit of the whole machine, like docker --cpus: 0.5, 2; 0 removes it.
     /// Remembered; applied at the next start.
     #[arg(long, value_name = "N", value_parser = crate::policy::parse_cpus)]
@@ -1064,11 +1081,30 @@ mod tests {
             panic!("not start");
         };
         assert_eq!(start.options.tuning.interface, ["wlp11s0f3u2u3", "eth1"]);
+        let cli =
+            Cli::try_parse_from(["nspawn", "start", "web", "-m", "1g", "--memory-swap", "-1"])
+                .unwrap();
+        let Command::Start(start) = cli.command else {
+            panic!("not start");
+        };
+        assert_eq!(start.options.memory_swap, Some(-1));
+        let cli = Cli::try_parse_from(["nspawn", "update", "web", "--memory-swap", "2g"]).unwrap();
+        let Command::Update(update) = cli.command else {
+            panic!("not update");
+        };
+        assert_eq!(update.memory_swap, Some(2 << 30));
+        let cli =
+            Cli::try_parse_from(["nspawn", "create", "img", "web", "--memory-swap=512m"]).unwrap();
+        let Command::Create(create) = cli.command else {
+            panic!("not create");
+        };
+        assert_eq!(create.memory_swap, Some(512 << 20));
         for bad in [
             &["nspawn", "start", "web", "--restart", "bogus"][..],
             &["nspawn", "start", "web", "-m", "12q"][..],
             &["nspawn", "start", "web", "--cpus", "-1"][..],
             &["nspawn", "create", "img", "web", "-m", "1k"][..],
+            &["nspawn", "start", "web", "--memory-swap", "-2"][..],
         ] {
             assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
         }

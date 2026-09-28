@@ -177,8 +177,8 @@ async fn caller_gone(connection: zbus::Connection, name: Option<String>) {
 
 /// What StartMachine and RunMachine are asked: wait (b, default `wait`), network (s) or
 /// networks (as), aliases (as), publish (as), entrypoint (s), env (as), volume (as),
-/// label (as), restart (s), memory (t), cpus (d), pids_limit (t), image_command (b),
-/// command (as), remove (b), and the flags of `health_overrides` and `tuning_overrides`.
+/// label (as), restart (s), memory (t), memory_swap (x), cpus (d), pids_limit (t),
+/// image_command (b), command (as), remove (b), and the flags of `health_overrides` and `tuning_overrides`.
 fn start_request(
     name: String,
     options: &mut Options<'_>,
@@ -199,6 +199,7 @@ fn start_request(
             .map(|r| crate::policy::Restart::parse(&r))
             .transpose()?,
         memory: options.maybe_u64("memory")?,
+        memory_swap: options.i64("memory_swap")?,
         cpus: options.f64("cpus")?,
         pids_limit: options.maybe_u64("pids_limit")?,
         image_command: options.bool("image_command", false)?,
@@ -393,8 +394,9 @@ impl Manager {
 
     /// Like `create`. Options: backend (s), network (s) or networks (as), aliases (as),
     /// publish (as), force (b), entrypoint (s), env (as), volume (as), label (as),
-    /// restart (s), memory (t, bytes), cpus (d), pids_limit (t), command (as), the flags
-    /// of `health_overrides` and `tuning_overrides`, registry (s), ca_cert (s).
+    /// restart (s), memory (t, bytes), memory_swap (x, bytes of memory and swap, -1 for
+    /// no bound on swap), cpus (d), pids_limit (t), command (as), the flags of
+    /// `health_overrides` and `tuning_overrides`, registry (s), ca_cert (s).
     async fn create_machine(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -423,6 +425,7 @@ impl Manager {
                 .map(|r| crate::policy::Restart::parse(&r))
                 .transpose()?,
             memory: options.maybe_u64("memory")?,
+            memory_swap: options.i64("memory_swap")?,
             cpus: options.f64("cpus")?,
             pids_limit: options.maybe_u64("pids_limit")?,
             command: options.strings("command")?,
@@ -1055,7 +1058,7 @@ impl Manager {
 
     /// Like `start`. Options: wait (b, default true), network (s), publish (as),
     /// entrypoint (s), env (as), volume (as), label (as), restart (s), memory (t,
-    /// bytes), cpus (d), pids_limit (t), image_command (b), command (as). Returns
+    /// bytes), memory_swap (x), cpus (d), pids_limit (t), image_command (b), command (as). Returns
     /// "started", "ended" when the program returned before the machine registered, or
     /// "restarting" when it ended and its restart policy brings it back, and the notes
     /// made on the way.
@@ -1175,8 +1178,9 @@ impl Manager {
         Ok((outcome.to_string(), notes.into_lines()))
     }
 
-    /// Like `update`: options restart (s), memory (t, bytes), cpus (d), pids_limit (t),
-    /// 0 removing a limit, absent keeping it, and the flags of `health_overrides`. A
+    /// Like `update`: options restart (s), memory (t, bytes), memory_swap (x, bytes of
+    /// memory and swap, -1 for no bound on swap), cpus (d), pids_limit (t), 0 removing a
+    /// limit, absent keeping it, and the flags of `health_overrides`. A
     /// running machine gets the limits at once (the restart policy applies to its next
     /// ending anyway) and its probes start over. Returns whether it was running.
     async fn update_machine(
@@ -1195,6 +1199,7 @@ impl Manager {
                 .map(|r| crate::policy::Restart::parse(&r))
                 .transpose()?,
             memory: options.maybe_u64("memory")?,
+            memory_swap: options.i64("memory_swap")?,
             cpus: options.f64("cpus")?,
             pids_limit: options.maybe_u64("pids_limit")?,
             health: health_overrides(&mut options)?,

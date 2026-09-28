@@ -740,6 +740,9 @@ pub struct StartRequest {
     pub restart: Option<Restart>,
     /// Bytes, 0 for none; None keeps the remembered limit.
     pub memory: Option<u64>,
+    /// Memory and swap together in bytes, -1 for no bound on swap, 0 for as much swap
+    /// again as memory; None keeps the remembered one.
+    pub memory_swap: Option<i64>,
     /// CPUs (0.5), 0 for none; None keeps the remembered limit.
     pub cpus: Option<f64>,
     /// Processes, 0 for none; None keeps the remembered limit.
@@ -847,7 +850,13 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             if let Some(restart) = args.restart {
                 r.restart = restart;
             }
-            apply_limits(&mut r.limits, args.memory, args.cpus, args.pids_limit)?;
+            apply_limits(
+                &mut r.limits,
+                args.memory,
+                args.memory_swap,
+                args.cpus,
+                args.pids_limit,
+            )?;
             r.limits.check(r.mode)?;
             if !args.health.is_empty() {
                 let hc = args.health.apply(r.effective_healthcheck())?;
@@ -878,6 +887,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             || !args.label.is_empty()
             || args.restart.is_some()
             || args.memory.is_some()
+            || args.memory_swap.is_some()
             || args.cpus.is_some()
             || args.pids_limit.is_some()
             || !args.health.is_empty()
@@ -967,15 +977,23 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     Ok(StartOutcome::Started)
 }
 
-/// 0 removes a limit; None keeps it.
+/// 0 removes a limit; None keeps it. Removing the memory limit takes a total of memory
+/// and swap with it, which means nothing without one.
 fn apply_limits(
     limits: &mut Limits,
     memory: Option<u64>,
+    memory_swap: Option<i64>,
     cpus: Option<f64>,
     pids: Option<u64>,
 ) -> Result<()> {
     if let Some(memory) = memory {
         limits.memory = memory;
+        if memory == 0 && memory_swap.is_none() && limits.memory_swap > 0 {
+            limits.memory_swap = 0;
+        }
+    }
+    if let Some(memory_swap) = memory_swap {
+        limits.memory_swap = memory_swap;
     }
     if let Some(cpus) = cpus {
         limits.milli_cpus = crate::policy::milli_cpus_from(cpus)?;
@@ -1508,6 +1526,8 @@ pub struct UpdateRequest {
     pub restart: Option<Restart>,
     /// Bytes, 0 for none.
     pub memory: Option<u64>,
+    /// Memory and swap together in bytes, -1 for no bound on swap, 0 for the default.
+    pub memory_swap: Option<i64>,
     /// CPUs (0.5), 0 for none.
     pub cpus: Option<f64>,
     /// Processes, 0 for none.
@@ -1523,12 +1543,13 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     validate_entry_name(&args.name)?;
     if args.restart.is_none()
         && args.memory.is_none()
+        && args.memory_swap.is_none()
         && args.cpus.is_none()
         && args.pids_limit.is_none()
         && args.health.is_empty()
     {
         bail!(
-            "nothing to update; give --memory, --cpus, --pids-limit, --restart or a --health flag"
+            "nothing to update; give --memory, --memory-swap, --cpus, --pids-limit, --restart or a --health flag"
         );
     }
     let sd = ctx.sd().await?;
@@ -1563,7 +1584,13 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
         }
         record.restart = restart;
     }
-    apply_limits(&mut record.limits, args.memory, args.cpus, args.pids_limit)?;
+    apply_limits(
+        &mut record.limits,
+        args.memory,
+        args.memory_swap,
+        args.cpus,
+        args.pids_limit,
+    )?;
     record.limits.check(record.mode)?;
     if !args.health.is_empty() {
         let hc = args.health.apply(record.effective_healthcheck())?;
@@ -2096,19 +2123,25 @@ mod tests {
             memory: 64 << 20,
             milli_cpus: 500,
             pids: 100,
+            memory_swap: 128 << 20,
         };
-        apply_limits(&mut limits, None, Some(2.0), Some(0)).unwrap();
+        apply_limits(&mut limits, None, None, Some(2.0), Some(0)).unwrap();
         assert_eq!(
             limits,
             Limits {
                 memory: 64 << 20,
                 milli_cpus: 2000,
                 pids: 0,
+                memory_swap: 128 << 20,
             }
         );
-        apply_limits(&mut limits, Some(0), None, None).unwrap();
+        apply_limits(&mut limits, Some(0), None, None, None).unwrap();
         assert_eq!(limits.memory, 0);
-        assert!(apply_limits(&mut limits, None, Some(-1.0), None).is_err());
+        assert_eq!(limits.memory_swap, 0, "a total goes with the memory limit");
+        apply_limits(&mut limits, None, Some(-1), None, None).unwrap();
+        apply_limits(&mut limits, Some(0), None, None, None).unwrap();
+        assert_eq!(limits.memory_swap, -1, "no bound on swap stays");
+        assert!(apply_limits(&mut limits, None, None, Some(-1.0), None).is_err());
     }
 
     #[test]

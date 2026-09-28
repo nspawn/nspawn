@@ -2201,6 +2201,7 @@ mod tests {
             memory: 64 << 20,
             milli_cpus: 500,
             pids: 100,
+            memory_swap: -1,
         };
         store.record_image(&labelled).unwrap();
         let back = store.load_image("old").unwrap().unwrap();
