@@ -1,3 +1,9 @@
+nspawn (1.7.1-1) unstable; urgency=medium
+
+  * cp tries a lookup again when openat2 answers EAGAIN, which failed copies on a busy host.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Mon, 28 Sep 2026 17:11:22 -0500
+
 nspawn (1.7.0-1) unstable; urgency=medium
 
   * --memory-swap sets memory and swap together, as docker takes it.
