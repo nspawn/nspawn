@@ -897,10 +897,53 @@ mod tests {
             )
             .unwrap()
         };
-        assert!(kernel_filesystem(&open("/proc")));
-        assert!(kernel_filesystem(&open("/sys")));
+        // Where the kernel's file systems sit depends on where the tests run: the root
+        // of /sys is a tmpfs in a systemd-nspawn machine with a network of its own, with
+        // sysfs mounted below it. The mount table says where they are.
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        for kind in ["proc", "sysfs"] {
+            match mounted_at(&mountinfo, kind) {
+                Some(point) => assert!(kernel_filesystem(&open(&point)), "{kind} at {point}"),
+                None => eprintln!("no {kind} mounted here: not checked"),
+            }
+        }
         let tmp = tempfile::tempdir().unwrap();
         assert!(!kernel_filesystem(&open(&tmp.path().to_string_lossy())));
+    }
+
+    /// The last mount point of a file system type in a /proc/PID/mountinfo, the one on top
+    /// when several share a point; points with escaped characters are left out.
+    fn mounted_at(mountinfo: &str, kind: &str) -> Option<String> {
+        let mut top: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+        for line in mountinfo.lines() {
+            let fields: Vec<&str> = line.split(' ').collect();
+            let (Some(point), Some(dash)) = (fields.get(4), fields.iter().position(|f| *f == "-"))
+            else {
+                continue;
+            };
+            if let Some(fstype) = fields.get(dash + 1) {
+                top.insert(point, fstype);
+            }
+        }
+        top.into_iter()
+            .find(|(point, fstype)| *fstype == kind && !point.contains('\\'))
+            .map(|(point, _)| point.to_string())
+    }
+
+    #[test]
+    fn mount_points_are_read_from_the_mount_table() {
+        let table = "\
+22 1 0:21 / /proc rw,nosuid shared:5 - proc proc rw
+23 1 0:20 / /sys rw shared:6 - tmpfs tmpfs rw,mode=555
+24 23 0:22 /kernel /sys/kernel rw - sysfs sysfs rw
+25 1 0:23 / /mnt/a\\040b rw - sysfs sysfs rw
+26 1 0:24 / /data rw - sysfs sysfs rw
+27 1 0:25 / /data rw - ext4 /dev/vda rw
+";
+        assert_eq!(mounted_at(table, "proc").as_deref(), Some("/proc"));
+        assert_eq!(mounted_at(table, "sysfs").as_deref(), Some("/sys/kernel"));
+        assert_eq!(mounted_at(table, "tmpfs").as_deref(), Some("/sys"));
+        assert_eq!(mounted_at(table, "cgroup2"), None);
     }
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};

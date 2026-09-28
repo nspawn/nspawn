@@ -1467,7 +1467,13 @@ mod tests {
         assert!(msg.contains("rmdir /var/lib/machines && btrfs subvolume create /var/lib/machines"));
         assert!(explain_unwritable(Path::new("/x"), 300)
             .starts_with("cannot create directories below /x"));
-        assert!(check_writable(Path::new("/proc")).is_err());
+        // Only procfs refuses a directory there; an empty /proc of a chroot would not.
+        let procfs = nix::sys::statfs::statfs("/proc")
+            .map(|s| s.filesystem_type() == nix::sys::statfs::PROC_SUPER_MAGIC)
+            .unwrap_or(false);
+        if procfs {
+            assert!(check_writable(Path::new("/proc")).is_err());
+        }
     }
 
     #[test]

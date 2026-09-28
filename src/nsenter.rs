@@ -1182,7 +1182,12 @@ mod tests {
 
     #[test]
     fn a_terminal_is_allocated_unlocked_and_sized() {
-        // /dev/pts/ptmx is open to everyone; this runs where the tests run.
+        // /dev/pts/ptmx is open to everyone where devpts is mounted, which a bare chroot
+        // may lack.
+        if !Path::new("/dev/ptmx").exists() {
+            eprintln!("no /dev/ptmx here: not checked");
+            return;
+        }
         let master = open_terminal(31, 111).unwrap();
         let slave = open_slave(&master).unwrap();
         assert!(nix::unistd::isatty(&slave).unwrap());
