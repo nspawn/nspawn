@@ -147,7 +147,9 @@ requested user, so capabilities are dropped. It first waits until the leader is
 past systemd-nspawn's setup, which reports the machine started as soon as the
 leader exists (the leader keeps the name `systemd-nspawn` until the stub init
 renames itself or the machine's init runs), then takes the leader's bounding
-set and resource limits; the limits come last, once only the three streams are
+set and resource limits, the set less `CAP_SYS_BOOT` when the machine shares the
+host's user namespace and is not privileged, since the command enters without the
+machine's seccomp filter and its kexec rule; the limits come last, once only the three streams are
 left, so that a low open-files limit does not refuse the passwd file or
 SELinux's exec attribute on the way.
 

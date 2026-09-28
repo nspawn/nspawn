@@ -209,6 +209,9 @@ pub fn raise_file_capabilities() -> nix::Result<()> {
 /// `leader_fd` is a pidfd of the leader, taken while the machine named it: the
 /// namespaces are only used once it shows that the PID was not given to another
 /// process meanwhile.
+/// `privileged`: the machine runs with every capability and without the kexec filter,
+/// so the command keeps CAP_SYS_BOOT whatever its user namespace.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     leader: u32,
     leader_fd: &OwnedFd,
@@ -217,6 +220,7 @@ pub fn spawn(
     working_dir: Option<&str>,
     image_env: &[String],
     stdio: Stdio,
+    privileged: bool,
 ) -> Result<Process> {
     if argv.is_empty() {
         bail!("no command given");
@@ -237,9 +241,11 @@ pub fn spawn(
         ns_fds.push((name, flag, fd));
     }
     let exec_context = selinux_context_of(leader);
+    let host_user_namespace = !privileged && same_namespace(leader, "user")?;
     let bounding = std::fs::read_to_string(format!("/proc/{leader}/status"))
         .ok()
-        .and_then(|status| capability_bounding_set(&status));
+        .and_then(|status| capability_bounding_set(&status))
+        .map(|set| exec_bounding_set(set, host_user_namespace));
     let limits = std::fs::read_to_string(format!("/proc/{leader}/limits"))
         .map(|text| resource_limits(&text))
         .unwrap_or_default();
@@ -828,6 +834,22 @@ fn resource_limits(text: &str) -> Vec<(i32, u64, u64)> {
         .collect()
 }
 
+/// CAP_SYS_BOOT, capability(7)'s number 22.
+const CAP_SYS_BOOT: u32 = 22;
+
+/// The bounding set a command entering a machine gets: the leader's, less CAP_SYS_BOOT
+/// when the machine shares the host's user namespace. There the capability is the
+/// host's, and the machine's own processes keep it only beside systemd-nspawn's seccomp
+/// filter, which keeps the kexec system calls out and which a command entering the
+/// machine does not carry.
+fn exec_bounding_set(leader: u64, host_user_namespace: bool) -> u64 {
+    if host_user_namespace {
+        leader & !(1 << CAP_SYS_BOOT)
+    } else {
+        leader
+    }
+}
+
 /// The CapBnd of a /proc/PID/status.
 fn capability_bounding_set(status: &str) -> Option<u64> {
     status
@@ -1182,6 +1204,15 @@ mod tests {
         assert_eq!(capability_bounding_set("Name:\tsh\n"), None);
         let ours = std::fs::read_to_string("/proc/self/status").unwrap();
         assert!(capability_bounding_set(&ours).is_some());
+    }
+
+    #[test]
+    fn a_command_in_the_host_user_namespace_goes_without_cap_sys_boot() {
+        let app = 0x0000_0000_a844_25fb;
+        assert_eq!(exec_bounding_set(app, true), 0x0000_0000_a804_25fb);
+        assert_eq!(exec_bounding_set(app, false), app);
+        let without = 0x0000_0000_a804_25fb;
+        assert_eq!(exec_bounding_set(without, true), without);
     }
 
     #[test]

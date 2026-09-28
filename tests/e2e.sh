@@ -936,9 +936,12 @@ $NSPAWN ps | grep "^ *$app " | grep_q "/bin/sh -c" || fail "ps does not show the
 [ "$($NSPAWN exec -e X=1 -e E2E_HOST_VAR -w /tmp $app -- /bin/sh -c 'echo $X $E2E_HOST_VAR $(pwd)' </dev/null | tr -d '\r')" = "1 fromhost /tmp" ] || fail "exec -e or -w not applied"
 $NSPAWN exec -d $app -- /bin/sleep 7 </dev/null || fail "exec -d"
 $NSPAWN exec $app -- /bin/sh -c 'ps -o args | grep -q "^/bin/sleep 7$"' </dev/null || fail "exec -d did not leave the command running"
-# exec's command gets the machine's capabilities and nothing of the service's descriptors.
-leader_bnd=$(grep CapBnd "/proc/$(machinectl show $app -p Leader --value)/status")
-[ "$($NSPAWN exec $app -- /bin/grep CapBnd /proc/self/status </dev/null | tr -d '\r')" = "$leader_bnd" ] || fail "exec's command has other capabilities than the machine ($leader_bnd)"
+# exec's command gets the machine's capabilities and nothing of the service's descriptors;
+# an app on the bridge shares the host's user namespace, so CAP_SYS_BOOT (bit 22) stays
+# with the machine's own processes, which carry the kexec filter.
+leader_bnd=$(awk '/^CapBnd:/ {print $2}' "/proc/$(machinectl show $app -p Leader --value)/status")
+exec_bnd=$($NSPAWN exec $app -- /bin/sh -c 'awk "/^CapBnd:/ {print \$2}" /proc/self/status' </dev/null | tr -d '\r')
+[ "$(( 0x$exec_bnd ))" = "$(( 0x$leader_bnd & ~0x400000 ))" ] || fail "exec's command has other capabilities than the machine less CAP_SYS_BOOT: $exec_bnd, the machine $leader_bnd"
 [ "$($NSPAWN exec $app -- /bin/sh -c 'ls /proc/$$/fd; true' </dev/null | tr -d '\r' | tr '\n' ' ')" = "0 1 2 " ] || fail "exec's command has descriptors beyond its streams"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['labels'].get('caddy') == 'app.example' and d['labels'].get('tier') == 'web', d" || fail "--label not recorded"
 $NSPAWN ps --json | python3 -c "import json,sys; d = [m for m in json.load(sys.stdin) if m['name'] == '$app']; assert d and d[0]['labels'].get('caddy') == 'app.example', d" || fail "labels not listed by ps --json"
@@ -985,12 +988,13 @@ c() { $NSPAWN exec e2e-caps -- /bin/sh -c "$1" </dev/null 2>&1 | tr -d '\r'; }
 out=$(c 'awk "/^CapBnd:/ {print \$2}" /proc/1/status')
 [ "$out" = 00000000a84425fb ] || fail "an app on the bridge does not have the default set and CAP_SYS_BOOT: $out"
 # systemd-nspawn reports a machine started before its child confines itself; exec waits
-# for that, so a command right after start has the machine's set every time.
+# for that, so a command right after start has the machine's set every time, less
+# CAP_SYS_BOOT: the command does not carry the seccomp filter that keeps kexec out.
 for i in 1 2 3 4 5; do
   $NSPAWN stop e2e-caps >/dev/null || fail "stop e2e-caps ($i)"
   $NSPAWN start e2e-caps >/dev/null || fail "start e2e-caps ($i)"
   out=$(c 'awk "/^CapBnd:/ {print \$2}" /proc/self/status')
-  [ "$out" = 00000000a84425fb ] || fail "exec right after start ran with another bounding set ($i): $out"
+  [ "$out" = 00000000a80425fb ] || fail "exec right after start ran with another bounding set ($i): $out"
 done
 grep -q "^SystemCallFilter=~kexec_load kexec_file_load" /etc/systemd/nspawn/e2e-caps.nspawn || fail "the kexec system calls are not filtered for an app: $(cat /etc/systemd/nspawn/e2e-caps.nspawn)"
 [ "$(c 'cat /proc/self/uid_map')" = "$(printf '         0          0 4294967295')" ] || fail "an app on the bridge is not in the initial user namespace: $(c 'cat /proc/self/uid_map')"
@@ -1003,6 +1007,7 @@ $NSPAWN stop e2e-caps >/dev/null || fail "stop e2e-caps"
 $NSPAWN start e2e-caps --cap-add none --network none >/dev/null || fail "start e2e-caps with --network none"
 [ "$(c 'cat /proc/self/uid_map')" != "$(printf '         0          0 4294967295')" ] || fail "an app with --network none is not in a user namespace of its own"
 [ $(( 0x$(c 'awk "/^CapBnd:/ {print \$2}" /proc/1/status') & 0x200000 )) != 0 ] || fail "an app in a user namespace lost systemd-nspawn's CAP_SYS_ADMIN: $(c 'grep CapBnd /proc/1/status')"
+[ $(( 0x$(c 'awk "/^CapBnd:/ {print \$2}" /proc/self/status') & 0x400000 )) != 0 ] || fail "a command in a machine with a user namespace of its own lost CAP_SYS_BOOT: $(c 'grep CapBnd /proc/self/status')"
 $NSPAWN rm -f e2e-caps >/dev/null || fail "rm e2e-caps"
 [ "$(x 'touch /x 2>/dev/null && echo RW || echo RO')" = RO ] || fail "--read-only root is writable"
 [ "$(x 'touch /scratch/a && echo OK')" = OK ] || fail "--tmpfs is not writable"
@@ -1080,6 +1085,7 @@ $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0];
 $NSPAWN start $app --privileged --cap-drop none --cap-add none --read-only=false -u root -w / --tmpfs none --device none --dns none --dns-search none --add-host none --ulimit none --stop-signal "" --stop-timeout 10 --oom-score-adj 0 --sysctl none --hostname "" -- /bin/sleep 300 || fail "start with the flags taken back"
 [ "$(x hostname)" = "$app" ] || fail "--hostname \"\" did not restore the name: $(x hostname)"
 [ "$(x 'awk "/^CapBnd:/ {print \$2}" /proc/1/status')" != 0000000000000000 ] || fail "--privileged left no capabilities"
+[ $(( 0x$(x 'awk "/^CapBnd:/ {print \$2}" /proc/self/status') & 0x400000 )) != 0 ] || fail "a command in a privileged machine lost CAP_SYS_BOOT: $(x 'grep CapBnd /proc/self/status')"
 [ "$(x 'touch /x 2>/dev/null && echo RW || echo RO')" = RW ] || fail "--read-only=false left the root read-only"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['privileged'] and not d['read_only'] and d['cap_drop'] == [] and d['cap_add'] == [] and d['hostname'] == '' and d['stop_signal'] == '', d" || fail "inspect after taking the flags back"
 $NSPAWN stop $app || fail "stop the privileged machine"

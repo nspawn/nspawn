@@ -1884,8 +1884,18 @@ pub async fn spawn_in_namespaces(
         .map(|r| volume::merge_env(&r.run.env, &r.env))
         .unwrap_or_default();
     let env = volume::merge_env(&env, extra_env);
+    let privileged = record.is_some_and(|r| r.tuning.privileged);
     tokio::task::block_in_place(|| {
-        nsenter::spawn(leader, &leader_fd, command, user, working_dir, &env, stdio)
+        nsenter::spawn(
+            leader,
+            &leader_fd,
+            command,
+            user,
+            working_dir,
+            &env,
+            stdio,
+            privileged,
+        )
     })
     .with_context(|| format!("running a command inside {machine}"))
 }
