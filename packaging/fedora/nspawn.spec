@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 1.6.1
+%global upstream_version 1.7.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -150,6 +150,11 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Mon Sep 28 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.7.0-1
+- --memory-swap sets memory and swap together, as docker takes it.
+- --timezone hands systemd-nspawn's Timezone= modes over; off keeps a zone set inside.
+- A command entered with exec in an app on the bridge goes without CAP_SYS_BOOT.
+
 * Sun Sep 27 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.6.1-1
 - Apps outside a user namespace keep a default capability set plus SYS_BOOT, not CAP_SYS_ADMIN.
 - cp leaves the kernel's file systems out; paths inside a machine must be plain.

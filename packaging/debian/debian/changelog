@@ -1,3 +1,11 @@
+nspawn (1.7.0-1) unstable; urgency=medium
+
+  * --memory-swap sets memory and swap together, as docker takes it.
+  * --timezone hands systemd-nspawn's Timezone= modes over; off keeps a zone set inside.
+  * A command entered with exec in an app on the bridge goes without CAP_SYS_BOOT.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Mon, 28 Sep 2026 15:08:21 -0500
+
 nspawn (1.6.1-1) unstable; urgency=medium
 
   * Apps outside a user namespace keep a default capability set plus SYS_BOOT, not CAP_SYS_ADMIN.
