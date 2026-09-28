@@ -493,6 +493,11 @@ pub struct TuningArgs {
     /// Seconds `stop` waits after the signal before SIGKILL, unless -t says otherwise.
     #[arg(long, value_name = "SECONDS")]
     pub stop_timeout: Option<u64>,
+    /// How systemd-nspawn sets the machine's /etc/localtime at each start: auto (its
+    /// default, the host's zone), off (left alone, so a zone set inside stays), copy,
+    /// bind, symlink or delete. Remembered.
+    #[arg(long, value_name = "MODE", value_parser = ["auto", "off", "copy", "bind", "symlink", "delete"])]
+    pub timezone: Option<String>,
     /// Accepted for docker's sake: nspawn's stub init reaps orphans anyway.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     pub init: Option<bool>,
@@ -1081,6 +1086,11 @@ mod tests {
             panic!("not start");
         };
         assert_eq!(start.options.tuning.interface, ["wlp11s0f3u2u3", "eth1"]);
+        let cli = Cli::try_parse_from(["nspawn", "start", "kali", "--timezone", "off"]).unwrap();
+        let Command::Start(start) = cli.command else {
+            panic!("not start");
+        };
+        assert_eq!(start.options.tuning.timezone.as_deref(), Some("off"));
         let cli =
             Cli::try_parse_from(["nspawn", "start", "web", "-m", "1g", "--memory-swap", "-1"])
                 .unwrap();
@@ -1105,6 +1115,7 @@ mod tests {
             &["nspawn", "start", "web", "--cpus", "-1"][..],
             &["nspawn", "create", "img", "web", "-m", "1k"][..],
             &["nspawn", "start", "web", "--memory-swap", "-2"][..],
+            &["nspawn", "start", "web", "--timezone", "utc"][..],
         ] {
             assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
         }

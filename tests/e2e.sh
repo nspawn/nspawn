@@ -78,7 +78,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -1086,6 +1086,33 @@ $NSPAWN stop $app || fail "stop the privileged machine"
 $NSPAWN start $app --privileged=false -- /bin/sleep 300 >/dev/null || fail "start with --privileged=false"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert not d['privileged'], d" || fail "--privileged=false did not take it back"
 $NSPAWN stop $app || fail "stop"
+
+step "--timezone: how systemd-nspawn sets the machine's /etc/localtime"
+$NSPAWN create $app e2e-tz -- /bin/sleep 300 >/dev/null || fail "create e2e-tz"
+$NSPAWN start e2e-tz --timezone off >/dev/null || fail "start e2e-tz with --timezone off"
+grep -qx "Timezone=off" /etc/systemd/nspawn/e2e-tz.nspawn || fail "--timezone off is not in the settings: $(cat /etc/systemd/nspawn/e2e-tz.nspawn)"
+tz() { $NSPAWN exec e2e-tz -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
+# off: a zone set inside survives a restart, and nothing is mounted over it.
+tz 'ln -sf /usr/share/zoneinfo/Asia/Tokyo /etc/localtime'
+$NSPAWN stop e2e-tz >/dev/null || fail "stop e2e-tz"
+$NSPAWN start e2e-tz >/dev/null || fail "start e2e-tz again"
+[ "$(tz 'readlink /etc/localtime')" = /usr/share/zoneinfo/Asia/Tokyo ] || fail "--timezone off did not keep the zone set inside: $(tz 'ls -l /etc/localtime')"
+tz 'cat /proc/self/mountinfo' | grep_q " /etc/localtime " && fail "--timezone off still mounted /etc/localtime"
+$NSPAWN inspect e2e-tz | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['timezone'] == 'off', d" || fail "inspect does not show --timezone"
+# copy: the host's zone as a file of the machine's own, which a package may replace.
+if [ -e /etc/localtime ]; then
+  $NSPAWN stop e2e-tz >/dev/null || fail "stop e2e-tz before copy"
+  $NSPAWN start e2e-tz --timezone copy >/dev/null || fail "start e2e-tz with --timezone copy"
+  [ "$(tz 'test -f /etc/localtime && ! test -L /etc/localtime && md5sum < /etc/localtime')" = "$(md5sum < /etc/localtime)" ] || fail "--timezone copy did not copy the host's zone: $(tz 'ls -l /etc/localtime')"
+  tz 'cat /proc/self/mountinfo' | grep_q " /etc/localtime " && fail "--timezone copy mounted /etc/localtime"
+else
+  echo "this host has no /etc/localtime: --timezone copy not checked"
+fi
+$NSPAWN stop e2e-tz >/dev/null || fail "stop e2e-tz before auto"
+$NSPAWN start e2e-tz --timezone auto >/dev/null || fail "start e2e-tz with --timezone auto"
+grep -q "^Timezone=" /etc/systemd/nspawn/e2e-tz.nspawn && fail "--timezone auto left a Timezone= line: $(cat /etc/systemd/nspawn/e2e-tz.nspawn)"
+$NSPAWN start e2e-tz --timezone utc 2>/dev/null && fail "an unknown --timezone mode was accepted"
+$NSPAWN rm -f e2e-tz >/dev/null || fail "rm e2e-tz"
 
 step "--interface: a host interface inside the machine while it runs, back on the host when it stops"
 ip link add e2e-dummy0 type dummy || fail "make a dummy interface"

@@ -125,7 +125,10 @@ with docker) and `--privileged`,
 HOST[:CONTAINER[:rwm]]` (a node, or a directory such as `/dev/dri`, whose nodes are
 allowed one by one), `--dns` and `--dns-search`, `--add-host HOST:IP` or `HOST=IP` (with
 `host-gateway`; the second form for IPv6 addresses), `--ulimit NAME=SOFT[:HARD]` (numbers or `unlimited`), `--oom-score-adj`, `--stop-signal` and
-`--stop-timeout` (what `stop` uses unless `-t` says otherwise), `--init` (accepted; the
+`--stop-timeout` (what `stop` uses unless `-t` says otherwise), `--timezone MODE`
+(systemd-nspawn's `Timezone=`: its default, `auto`, points `/etc/localtime` at the host's
+zone at every start, and `off` leaves the machine's own, so a zone set inside with
+`timedatectl` survives a restart; an app also takes `-e TZ=`), `--init` (accepted; the
 stub init reaps anyway), `--sysctl` (`net.*` keys, set in an app machine's network
 namespace) and `--interface IFACE`, which has no docker counterpart: a network
 interface of the host moved into the machine while it runs (see "Physical

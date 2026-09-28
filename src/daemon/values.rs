@@ -163,6 +163,10 @@ pub fn record(r: &ImageRecord) -> Dict {
             "hostname".to_string(),
             opt_string(r.tuning.hostname.as_deref()),
         ),
+        (
+            "timezone".to_string(),
+            opt_string(r.tuning.timezone.as_deref()),
+        ),
         ("cap_add".to_string(), strings(&r.tuning.cap_add)),
         ("cap_drop".to_string(), strings(&r.tuning.cap_drop)),
         ("privileged".to_string(), v(r.tuning.privileged)),

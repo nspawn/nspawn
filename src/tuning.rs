@@ -91,7 +91,14 @@ pub struct Tuning {
     /// --secret: decrypted for the machine while it runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<SecretRef>,
+    /// systemd-nspawn's Timezone= mode for /etc/localtime; None is its own default, auto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
 }
+
+/// The modes of systemd-nspawn's Timezone= besides auto, its default: off leaves the
+/// machine's /etc/localtime alone, so a zone set inside survives a restart.
+pub const TIMEZONE_MODES: [&str; 5] = ["off", "copy", "bind", "symlink", "delete"];
 
 impl Tuning {
     pub fn is_default(&self) -> bool {
@@ -166,6 +173,9 @@ impl Tuning {
         }
         if let Some(adj) = self.oom_score_adj {
             out.push(format!("OOMScoreAdjust={adj}"));
+        }
+        if let Some(mode) = &self.timezone {
+            out.push(format!("Timezone={mode}"));
         }
         // systemd's word for no limit; the number RLIM_INFINITY is would be refused.
         let limit = |v: &u64| {
@@ -409,6 +419,7 @@ pub struct Overrides {
     pub init: Option<bool>,
     pub sysctls: Vec<String>,
     pub secrets: Vec<String>,
+    pub timezone: Option<String>,
 }
 
 fn cleared(values: &[String]) -> bool {
@@ -510,6 +521,16 @@ impl Overrides {
                 crate::api::machines::signal_number(signal)?;
             }
             t.stop_signal = some_unless_empty(signal);
+        }
+        if let Some(mode) = &self.timezone {
+            t.timezone = match mode.as_str() {
+                "" | "auto" => None,
+                m if TIMEZONE_MODES.contains(&m) => Some(m.to_string()),
+                other => bail!(
+                    "--timezone {other:?}: one of auto, {}",
+                    TIMEZONE_MODES.join(", ")
+                ),
+            };
         }
         if let Some(timeout) = self.stop_timeout {
             if timeout > 86_400 {
@@ -776,6 +797,7 @@ mod tests {
             sysctls: vec!["net.ipv4.ip_forward=1".into()],
             secrets: vec!["pw".into(), "tls:/etc/key:0400:1000:1000".into()],
             privileged: None,
+            timezone: Some("off".into()),
         };
         let mut t = Tuning::default();
         flags.apply(&mut t).unwrap();
@@ -795,6 +817,7 @@ mod tests {
                 "Capability=CAP_NET_ADMIN CAP_SYS_PTRACE",
                 &format!("DropCapability={dropped}"),
                 "OOMScoreAdjust=-500",
+                "Timezone=off",
                 "LimitNOFILE=64:128",
                 "LimitNPROC=infinity:infinity",
                 "LinkJournal=no",
@@ -1045,6 +1068,7 @@ mod tests {
             ("ulimit", "bogus=1"),
             ("oom", "5000"),
             ("signal", "SIGBOGUS"),
+            ("timezone", "utc"),
             ("sysctl", "kernel.shmmax=1"),
             ("sysctl", "net.ipv4.ip_forward"),
         ] {
@@ -1062,6 +1086,7 @@ mod tests {
                 "ulimit" => flags.ulimits = vec![value.into()],
                 "oom" => flags.oom_score_adj = Some(5000),
                 "signal" => flags.stop_signal = Some(value.into()),
+                "timezone" => flags.timezone = Some(value.into()),
                 _ => flags.sysctls = vec![value.into()],
             }
             assert!(
@@ -1069,5 +1094,28 @@ mod tests {
                 "{field} {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn timezone_takes_the_modes_of_systemd_nspawn_and_auto_forgets() {
+        let mut t = Tuning::default();
+        for mode in TIMEZONE_MODES {
+            let flags = Overrides {
+                timezone: Some(mode.into()),
+                ..Overrides::default()
+            };
+            flags.apply(&mut t).unwrap();
+            assert!(t.exec_lines(false).contains(&format!("Timezone={mode}")));
+        }
+        let auto = Overrides {
+            timezone: Some("auto".into()),
+            ..Overrides::default()
+        };
+        auto.apply(&mut t).unwrap();
+        assert_eq!(t.timezone, None);
+        assert!(!t
+            .exec_lines(false)
+            .iter()
+            .any(|l| l.starts_with("Timezone=")));
     }
 }
