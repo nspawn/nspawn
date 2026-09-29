@@ -1,3 +1,11 @@
+nspawn (1.8.0-1) unstable; urgency=medium
+
+  * --log-driver local|journal|none, as docker takes it; local, the default, keeps a machine's output in journald's nspawn namespace, capped at 1 GiB.
+  * Booted machines start behind nspawn attach-exec, which connects their console to that namespace.
+  * nspawn-selinux lets the service connect to journald's stream socket.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Mon, 28 Sep 2026 19:38:38 -0500
+
 nspawn (1.7.2-1) unstable; urgency=medium
 
   * The tests pass when the package is built inside a systemd-nspawn machine.
