@@ -158,9 +158,12 @@ impl UnitWatch {
 }
 
 /// The journal's current cursor, for a follower to start after; None without a journal.
-pub async fn journal_cursor() -> Option<String> {
+pub async fn journal_cursor(namespace: Option<&str>) -> Option<String> {
+    let mut argv = vec!["--lines=0", "--show-cursor", "--quiet", "--no-pager"];
+    let namespace = namespace.map(|ns| format!("--namespace={ns}"));
+    argv.extend(namespace.as_deref());
     let output = tokio::process::Command::new("journalctl")
-        .args(["--lines=0", "--show-cursor", "--quiet", "--no-pager"])
+        .args(argv)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -172,14 +175,22 @@ pub async fn journal_cursor() -> Option<String> {
         .map(|c| c.trim().to_string())
 }
 
-/// journalctl's arguments for what a unit's processes write, from `cursor` on.
-pub fn follower_arguments(unit: &str, cursor: Option<&str>) -> Vec<String> {
+/// journalctl's arguments for what a unit's processes write, from `cursor` on, in the
+/// system's journal or in `namespace`.
+pub fn follower_arguments(
+    unit: &str,
+    cursor: Option<&str>,
+    namespace: Option<&str>,
+) -> Vec<String> {
     let mut argv = vec![
         "--no-pager".to_string(),
         "--quiet".to_string(),
         "--output=json".to_string(),
         "--follow".to_string(),
     ];
+    if let Some(namespace) = namespace {
+        argv.push(format!("--namespace={namespace}"));
+    }
     match cursor {
         Some(cursor) => argv.push(format!("--after-cursor={cursor}")),
         None => argv.push("--lines=0".to_string()),
@@ -231,11 +242,19 @@ impl Drop for Follower {
 }
 
 impl Follower {
-    pub fn start(unit: &str, cursor: Option<&str>, out: OwnedFd) -> Result<Self> {
+    /// In a journal `namespace` only the machine writes: the hooks' messages stay in the
+    /// system's journal.
+    pub fn start(
+        unit: &str,
+        cursor: Option<&str>,
+        namespace: Option<&str>,
+        out: OwnedFd,
+    ) -> Result<Self> {
+        let everything = namespace.is_some();
         let mut out = tokio::net::unix::pipe::Sender::from_owned_fd(out)
             .context("preparing the output's pipe")?;
         let mut child = tokio::process::Command::new("journalctl")
-            .args(follower_arguments(unit, cursor))
+            .args(follower_arguments(unit, cursor, namespace))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -262,7 +281,7 @@ impl Follower {
                         let Ok(Some(line)) = line else { break };
                         last_line = tokio::time::Instant::now();
                         let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
-                        if !from_machine(&entry) {
+                        if !everything && !from_machine(&entry) {
                             continue;
                         }
                         let Some(mut bytes) = message_bytes(&entry) else { continue };
@@ -297,6 +316,14 @@ impl Follower {
             let _ = task.await;
         }
     }
+}
+
+/// Starts journald's `namespace`, so that its files are there to be read or followed
+/// before a machine first writes to it.
+pub async fn ensure_journal_namespace(sd: &Systemd, namespace: &str) -> Result<()> {
+    sd.start_unit(&format!("systemd-journald@{namespace}.service"))
+        .await
+        .with_context(|| format!("starting journald's {namespace} namespace"))
 }
 
 /// The terminal an attached run gives the program of an app (run -t).
@@ -415,10 +442,14 @@ pub async fn attach(
     let (output, follower) = if let Some(read) = straight {
         (Some(read), None)
     } else if terminal.is_none() {
-        let cursor = journal_cursor().await;
+        let namespace = tuning.journal_namespace();
+        if let Some(namespace) = namespace {
+            ensure_journal_namespace(sd, namespace).await?;
+        }
+        let cursor = journal_cursor(namespace).await;
         let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
             .context("creating the output's pipe")?;
-        let follower = Follower::start(&unit, cursor.as_deref(), write)?;
+        let follower = Follower::start(&unit, cursor.as_deref(), namespace, write)?;
         (Some(read), Some(follower))
     } else {
         (None, None)
@@ -610,10 +641,12 @@ mod tests {
 
     #[test]
     fn the_follower_reads_the_unit_after_the_cursor() {
-        let argv = follower_arguments("systemd-nspawn@web.service", Some("s=1;i=2"));
+        let argv = follower_arguments("systemd-nspawn@web.service", Some("s=1;i=2"), None);
         assert!(argv.contains(&"--after-cursor=s=1;i=2".to_string()));
         assert!(argv.contains(&"_SYSTEMD_UNIT=systemd-nspawn@web.service".to_string()));
         assert!(argv.contains(&"--follow".to_string()));
-        assert!(follower_arguments("u", None).contains(&"--lines=0".to_string()));
+        assert!(follower_arguments("u", None, None).contains(&"--lines=0".to_string()));
+        assert!(follower_arguments("u", None, Some("nspawn"))
+            .contains(&"--namespace=nspawn".to_string()));
     }
 }

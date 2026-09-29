@@ -15,8 +15,8 @@ the registry every time and `--pull never` never. A name that is taken is refuse
 command, as with docker (`nspawn run -it alpine sh`; after `--` as well). Like `docker
 run` it stays attached: the
 machine's output follows until it ends (stdout and stderr together, a line at a time,
-from the journal, so that `logs` shows it later too; with `--log-driver none` straight
-from the program, and nothing is kept), and `run` exits with the program's
+from nspawn's journal, so that `logs` shows it later too; with `--log-driver none`
+straight from the program, and nothing is kept), and `run` exits with the program's
 exit code, or 128 plus the signal it died of. Ctrl-C, SIGTERM, SIGHUP and SIGQUIT go to
 the program; a third Ctrl-C within a second leaves it running and returns. `-i` gives the
 program this standard input, `-t` a terminal (`-it` for a shell), `--rm` removes the
@@ -130,10 +130,7 @@ allowed one by one), `--dns` and `--dns-search`, `--add-host HOST:IP` or `HOST=I
 (systemd-nspawn's `Timezone=`: its default, `auto`, points `/etc/localtime` at the host's
 zone at every start, and `off` leaves the machine's own, so a zone set inside with
 `timedatectl` survives a restart; an app also takes `-e TZ=`), `--log-driver DRIVER`
-(`journal`, the default, keeps the program's output in the unit's journal, where `logs`
-and an attached `run` read it; `none` drops it, for a program that writes a lot: `logs`
-refuses such a machine, an attached run of an app still shows the output, straight from
-the program, and a booted machine's console goes nowhere, so it runs with `-d`), `--init` (accepted; the
+(see "Where the output goes" below), `--init` (accepted; the
 stub init reaps anyway), `--sysctl` (`net.*` keys, set in an app machine's network
 namespace) and `--interface IFACE`, which has no docker counterpart: a network
 interface of the host moved into the machine while it runs (see "Physical
@@ -170,6 +167,23 @@ labels while it has a record), `subnet=`, `interface=` and `internal=` on a netw
 `path=` on a volume's, `size=` on a secret's. It reads
 the journal, so machines started by `machinectl`, at boot or by a restart policy are
 there too, and so is what happened while nobody watched.
+
+### Where the output goes
+
+What a machine prints goes, by default (`--log-driver local`), to a journal of
+nspawn's own: journald's `nspawn` namespace, kept apart from the system's journal, so a
+program that writes a lot never floods the host's logs. `logs` and an attached `run`
+read it, with `-f`, `-n`, `--since` and timestamps as before, and
+`journalctl --namespace=nspawn` shows it all. The namespace holds 1 GiB at most, the
+oldest lines going first (`/usr/lib/systemd/journald@nspawn.conf`, which
+`/etc/systemd/journald@nspawn.conf` or a drop-in overrides); the limit is the
+namespace's, shared by every machine, and a removed machine's lines stay until they age
+out. Machines of earlier versions write there from their next start, and `logs` still
+shows what they wrote to the system's journal before. `--log-driver journal` keeps a
+machine in the system's journal as before, and `--log-driver none` drops the output:
+`logs` refuses such a machine, an attached `run` of an app still shows the output,
+straight from the program, and a booted machine's console goes nowhere, so it runs
+with `-d`. Like docker's, the driver is a per-machine setting, remembered.
 
 ### exec, shell, stop and the rest
 

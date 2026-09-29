@@ -1120,30 +1120,48 @@ grep -q "^Timezone=" /etc/systemd/nspawn/e2e-tz.nspawn && fail "--timezone auto 
 $NSPAWN start e2e-tz --timezone utc 2>/dev/null && fail "an unknown --timezone mode was accepted"
 $NSPAWN rm -f e2e-tz >/dev/null || fail "rm e2e-tz"
 
-step "--log-driver none: the program's output kept out of the journal"
+step "--log-driver: nspawn's own journal by default, the system's on request, or nothing"
 bb=docker.io/library/busybox:latest
 hooks_of() { echo /etc/systemd/system/systemd-nspawn@$1.service.d/nspawn-hooks.conf; }
-# Attached: the output comes straight from the program, stdout and stderr merged, with
-# the program's exit code, and nothing of it reaches the journal.
+in_system_journal() { journalctl -u systemd-nspawn@$1.service --output=cat --no-pager 2>/dev/null | grep_q "$2"; }
+in_nspawn_journal() { journalctl --namespace=nspawn -u systemd-nspawn@$1.service --output=cat --no-pager 2>/dev/null | grep_q "$2"; }
+# local, the default: the output goes to journald's nspawn namespace, which logs and an
+# attached run read, and never to the system's journal.
+out=$($NSPAWN run --rm $bb --name e2e-quiet -- /bin/sh -c 'echo local-$0' attached$nonce 2>/dev/null) || fail "run with the default log driver"
+[ "$out" = "local-attached$nonce" ] || fail "an attached run did not show the output of a local machine: $out"
+in_system_journal e2e-quiet "local-attached$nonce" && fail "the default log driver wrote to the system's journal"
+retry 5 in_nspawn_journal e2e-quiet "local-attached$nonce" || fail "the default log driver did not write to nspawn's journal namespace"
+$NSPAWN create $app e2e-quiet -- /bin/sh -c "echo detached-$nonce; exec sleep 300" >/dev/null || fail "create e2e-quiet"
+$NSPAWN start e2e-quiet >/dev/null || fail "start e2e-quiet"
+grep -qx "Wants=systemd-journald@nspawn.socket" "$(hooks_of e2e-quiet)" || fail "a local machine does not want journald's namespace: $(cat "$(hooks_of e2e-quiet)")"
+grep -q "attach-exec e2e-quiet --journal-namespace nspawn -- " "$(hooks_of e2e-quiet)" || fail "a local machine's output is not sent to the namespace: $(cat "$(hooks_of e2e-quiet)")"
+retry 10 bash -c "$NSPAWN logs e2e-quiet 2>/dev/null | tr -d '\r' | grep_q '^detached-$nonce\$'" || fail "logs of a local machine: $($NSPAWN logs e2e-quiet 2>&1)"
+in_system_journal e2e-quiet "detached-$nonce" && fail "a detached local machine wrote to the system's journal"
+$NSPAWN inspect e2e-quiet | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['log_driver'] == 'local', d" || fail "inspect does not show the default log driver"
+# journal: the system's journal, as before local existed.
+$NSPAWN stop e2e-quiet >/dev/null || fail "stop e2e-quiet"
+$NSPAWN start e2e-quiet --log-driver journal >/dev/null || fail "start e2e-quiet with --log-driver journal"
+grep -q "journald@nspawn\|--journal-namespace" "$(hooks_of e2e-quiet)" && fail "--log-driver journal still sends the output to the namespace"
+retry 10 in_system_journal e2e-quiet "detached-$nonce" || fail "--log-driver journal did not write to the system's journal"
+retry 10 bash -c "$NSPAWN logs e2e-quiet 2>/dev/null | tr -d '\r' | grep_q '^detached-$nonce\$'" || fail "logs of a machine in the system's journal: $($NSPAWN logs e2e-quiet 2>&1)"
+# none: the unit drops the output, logs says so, and an attached run still shows it.
+$NSPAWN rm -f e2e-quiet >/dev/null || fail "rm e2e-quiet"
 out=$($NSPAWN run --rm --log-driver none $bb --name e2e-quiet -- /bin/sh -c 'echo out-$0; echo err-$0 >&2; exit 3' quiet$nonce 2>/dev/null); rc=$?
 [ "$rc" = 3 ] || fail "run --log-driver none did not exit with the program's code: $rc"
 [ "$out" = "$(printf 'out-quiet%s\nerr-quiet%s' $nonce $nonce)" ] || fail "run --log-driver none did not show the program's output: $out"
-journalctl -u systemd-nspawn@e2e-quiet.service --output=cat --no-pager 2>/dev/null | grep_q "quiet$nonce" && fail "--log-driver none left the output in the journal"
+in_system_journal e2e-quiet "quiet$nonce" && fail "--log-driver none wrote to the system's journal"
+in_nspawn_journal e2e-quiet "quiet$nonce" && fail "--log-driver none wrote to nspawn's journal"
 [ "$(echo abc | $NSPAWN run -i --rm --log-driver none $bb --name e2e-quiet -- wc -c 2>/dev/null)" = 4 ] || fail "run -i --log-driver none did not give the program its input"
-# Detached: the unit drops the output, logs says so, and journal brings it back.
-$NSPAWN create $app e2e-quiet -- /bin/sh -c "echo detached-$nonce; exec sleep 300" >/dev/null || fail "create e2e-quiet"
+$NSPAWN create $app e2e-quiet -- /bin/sh -c "echo dropped-$nonce; exec sleep 300" >/dev/null || fail "create e2e-quiet again"
 $NSPAWN start e2e-quiet --log-driver none >/dev/null || fail "start e2e-quiet with --log-driver none"
 grep -qx "StandardOutput=null" "$(hooks_of e2e-quiet)" || fail "--log-driver none is not in the unit: $(cat "$(hooks_of e2e-quiet)")"
 grep -qx "StandardError=journal" "$(hooks_of e2e-quiet)" || fail "--log-driver none took systemd-nspawn's messages too: $(cat "$(hooks_of e2e-quiet)")"
 sleep 2
-journalctl -u systemd-nspawn@e2e-quiet.service --output=cat --no-pager 2>/dev/null | grep_q "detached-$nonce" && fail "a detached machine with --log-driver none wrote to the journal"
+in_system_journal e2e-quiet "dropped-$nonce" && fail "a detached machine with --log-driver none wrote to the system's journal"
+in_nspawn_journal e2e-quiet "dropped-$nonce" && fail "a detached machine with --log-driver none wrote to nspawn's journal"
 out=$($NSPAWN logs e2e-quiet 2>&1) && fail "logs of a machine that drops its output succeeded: $out"
 echo "$out" | grep_q "keeps no output" || fail "logs of a machine that drops its output did not say so: $out"
-$NSPAWN inspect e2e-quiet | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['log_driver'] == 'none', d" || fail "inspect does not show the log driver"
-$NSPAWN stop e2e-quiet >/dev/null || fail "stop e2e-quiet"
-$NSPAWN start e2e-quiet --log-driver journal >/dev/null || fail "start e2e-quiet with --log-driver journal"
-grep -q "^StandardOutput=" "$(hooks_of e2e-quiet)" && fail "--log-driver journal left StandardOutput= in the unit"
-retry 10 bash -c "$NSPAWN logs e2e-quiet 2>/dev/null | tr -d '\r' | grep_q '^detached-$nonce\$'" || fail "--log-driver journal did not bring the output back: $($NSPAWN logs e2e-quiet 2>&1)"
+$NSPAWN inspect e2e-quiet | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['log_driver'] == 'none', d" || fail "inspect does not show the log driver none"
 $NSPAWN rm -f e2e-quiet >/dev/null || fail "rm e2e-quiet"
 # The caller of an attached run goes: the machine goes on, what it writes read and
 # dropped by the service, which stays up for it past its idle time.

@@ -94,14 +94,21 @@ pub struct Tuning {
     /// systemd-nspawn's Timezone= mode for /etc/localtime; None is its own default, auto.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
-    /// Where the program's output goes: None for the journal, "none" to drop it.
+    /// Where the program's output goes: None for nspawn's own journal namespace (local),
+    /// "journal" for the system's journal, "none" to drop it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_driver: Option<String>,
 }
 
-/// --log-driver: journal (the default: the unit's journal, what `logs` and an attached
-/// `run` read) or none (dropped; an attached run gets it straight from the program).
-pub const LOG_DRIVERS: [&str; 2] = ["journal", "none"];
+/// --log-driver: local (the default: a journal namespace of nspawn's own, kept apart
+/// from the system's journal, which `logs` and an attached `run` read), journal (the
+/// system's journal) or none (dropped; an attached run gets it straight from the
+/// program).
+pub const LOG_DRIVERS: [&str; 3] = ["local", "journal", "none"];
+
+/// The journald namespace the output of local machines goes to, with limits of its own
+/// (journald@nspawn.conf).
+pub const JOURNAL_NAMESPACE: &str = "nspawn";
 
 /// The modes of systemd-nspawn's Timezone= besides auto, its default: off leaves the
 /// machine's /etc/localtime alone, so a zone set inside survives a restart.
@@ -115,6 +122,17 @@ impl Tuning {
     /// Whether the program's output is dropped instead of kept in the journal.
     pub fn drops_output(&self) -> bool {
         self.log_driver.as_deref() == Some("none")
+    }
+
+    /// The journald namespace the program's output goes to: nspawn's own unless the log
+    /// driver says the system's journal or nothing.
+    pub fn journal_namespace(&self) -> Option<&'static str> {
+        self.log_driver.is_none().then_some(JOURNAL_NAMESPACE)
+    }
+
+    /// The log driver's name, the default spelled out.
+    pub fn log_driver_name(&self) -> &str {
+        self.log_driver.as_deref().unwrap_or("local")
     }
 
     /// The [Exec] lines: Hostname=, Capability=, DropCapability=, OOMScoreAdjust=, the
@@ -547,8 +565,8 @@ impl Overrides {
         }
         if let Some(driver) = &self.log_driver {
             t.log_driver = match driver.as_str() {
-                "" | "journal" => None,
-                "none" => Some("none".to_string()),
+                "" | "local" => None,
+                "journal" | "none" => Some(driver.clone()),
                 other => bail!("--log-driver {other:?}: {}", LOG_DRIVERS.join(" or ")),
             };
         }
@@ -1143,21 +1161,23 @@ mod tests {
     }
 
     #[test]
-    fn the_log_driver_is_journal_unless_none() {
+    fn the_log_driver_is_local_unless_told_otherwise() {
+        let driver = |name: &str| Overrides {
+            log_driver: Some(name.into()),
+            ..Overrides::default()
+        };
         let mut t = Tuning::default();
+        assert_eq!(t.log_driver_name(), "local");
+        assert_eq!(t.journal_namespace(), Some(JOURNAL_NAMESPACE));
         assert!(!t.drops_output());
-        let none = Overrides {
-            log_driver: Some("none".into()),
-            ..Overrides::default()
-        };
-        none.apply(&mut t).unwrap();
+        driver("none").apply(&mut t).unwrap();
         assert!(t.drops_output());
-        let journal = Overrides {
-            log_driver: Some("journal".into()),
-            ..Overrides::default()
-        };
-        journal.apply(&mut t).unwrap();
-        assert_eq!(t.log_driver, None, "journal is the default, not remembered");
+        assert_eq!(t.journal_namespace(), None);
+        driver("journal").apply(&mut t).unwrap();
+        assert_eq!(t.log_driver_name(), "journal");
+        assert_eq!(t.journal_namespace(), None, "the system's journal");
         assert!(!t.drops_output());
+        driver("local").apply(&mut t).unwrap();
+        assert_eq!(t.log_driver, None, "local is the default, not remembered");
     }
 }

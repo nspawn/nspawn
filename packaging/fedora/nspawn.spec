@@ -84,6 +84,7 @@ bzip2 -9 packaging/selinux/%{name}.pp
 %install
 install -D -m 0755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
 install -D -m 0644 packaging/systemd/%{name}.service %{buildroot}%{_unitdir}/%{name}.service
+install -D -m 0644 packaging/systemd/journald@%{name}.conf %{buildroot}%{_prefix}/lib/systemd/journald@%{name}.conf
 install -D -m 0644 packaging/dbus/org.nspawn.service %{buildroot}%{_datadir}/dbus-1/system-services/org.nspawn.service
 install -D -m 0644 packaging/dbus/org.nspawn.conf %{buildroot}%{_datadir}/dbus-1/system.d/org.nspawn.conf
 install -D -m 0644 packaging/polkit/org.nspawn.policy %{buildroot}%{_datadir}/polkit-1/actions/org.nspawn.policy
@@ -135,6 +136,7 @@ fi
 %doc README.md docs/USAGE.md docs/ARCHITECTURE.md docs/DBUS.md packaging/polkit/nspawn-wheel.rules
 %{_bindir}/%{name}
 %{_unitdir}/%{name}.service
+%{_prefix}/lib/systemd/journald@%{name}.conf
 %{_datadir}/dbus-1/system-services/org.nspawn.service
 %{_datadir}/dbus-1/system.d/org.nspawn.conf
 %{_datadir}/polkit-1/actions/org.nspawn.policy

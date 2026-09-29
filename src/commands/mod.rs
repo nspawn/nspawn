@@ -26,8 +26,13 @@ use crate::search::SearchSource;
 
 pub async fn run(cli: Cli) -> Result<()> {
     // Before anything else: the machine starts whatever the configuration says.
-    if let Command::AttachExec { name, argv } = &cli.command {
-        match crate::attach::exec(name, argv)? {}
+    if let Command::AttachExec {
+        name,
+        journal_namespace,
+        argv,
+    } = &cli.command
+    {
+        match crate::attach::exec(name, journal_namespace.as_deref(), argv)? {}
     }
     let config = Config::load(
         cli.config.as_deref(),

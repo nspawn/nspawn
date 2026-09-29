@@ -684,7 +684,7 @@ pub async fn prepare(
         },
         &route,
     )?;
-    let app_argv = settings::app_argv(sd, name, record.mode, &route).await?;
+    let app_argv = settings::wrapped_argv(sd, name, record.mode, &route, &record.tuning).await?;
     if settings::write_hooks(
         name,
         config,
@@ -1599,7 +1599,8 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     store.record_image(&record)?;
     let route =
         settings::namespace_route(sd, &args.name, record.mode, bridge::namespaced(&record)).await?;
-    let app_argv = settings::app_argv(sd, &args.name, record.mode, &route).await?;
+    let app_argv =
+        settings::wrapped_argv(sd, &args.name, record.mode, &route, &record.tuning).await?;
     let reload = settings::write_hooks(
         &args.name,
         &ctx.config,
@@ -1946,6 +1947,9 @@ pub struct LogsRequest {
     pub all: bool,
     /// Booted machines: the machine's own journal instead of its console output.
     pub inside: bool,
+    /// The journald namespace the machine writes to (--log-driver local), read together
+    /// with the system's journal, which holds what it wrote before and systemd's lines.
+    pub namespace: Option<String>,
 }
 
 const FOLLOW_TAIL: u32 = 10;
@@ -1981,6 +1985,9 @@ pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
         argv.push(format!("--machine={}", args.machine));
         argv.push(format!("--output={output}"));
     } else {
+        if let Some(namespace) = &args.namespace {
+            argv.push(format!("--namespace=+{namespace}"));
+        }
         argv.push(format!("--unit=systemd-nspawn@{}.service", args.machine));
         argv.push(format!("--output={output}"));
         if !args.all {
@@ -2260,6 +2267,7 @@ mod tests {
             timestamps: true,
             all: true,
             inside: false,
+            namespace: None,
         };
         assert_eq!(
             journalctl_arguments(&full),
@@ -2287,6 +2295,24 @@ mod tests {
                 "--all",
                 "--machine=fedora-44",
                 "--output=cat"
+            ]
+        );
+        // A local machine: its namespace and the system's journal, interleaved.
+        let local = LogsRequest {
+            machine: "web".into(),
+            namespace: Some("nspawn".into()),
+            ..LogsRequest::default()
+        };
+        assert_eq!(
+            journalctl_arguments(&local),
+            vec![
+                "--no-pager",
+                "--quiet",
+                "--all",
+                "--namespace=+nspawn",
+                "--unit=systemd-nspawn@web.service",
+                "--output=cat",
+                "_TRANSPORT=stdout"
             ]
         );
     }

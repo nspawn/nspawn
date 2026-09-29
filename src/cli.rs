@@ -105,6 +105,9 @@ pub enum Command {
     #[command(hide = true)]
     AttachExec {
         name: String,
+        /// The journald namespace the output goes to (--log-driver local).
+        #[arg(long)]
+        journal_namespace: Option<String>,
         #[arg(last = true, required = true)]
         argv: Vec<std::ffi::OsString>,
     },
@@ -498,10 +501,11 @@ pub struct TuningArgs {
     /// bind, symlink or delete. Remembered.
     #[arg(long, value_name = "MODE", value_parser = ["auto", "off", "copy", "bind", "symlink", "delete"])]
     pub timezone: Option<String>,
-    /// Where the program's output goes, like docker --log-driver: journal (the default,
-    /// what logs and an attached run read) or none (dropped; an attached run still shows
+    /// Where the program's output goes, like docker --log-driver: local (the default, a
+    /// journal of nspawn's own, apart from the system's, which logs and an attached run
+    /// read), journal (the system's journal) or none (dropped; an attached run still shows
     /// it, straight from the program, and logs has nothing). Remembered.
-    #[arg(long, value_name = "DRIVER", value_parser = ["journal", "none"])]
+    #[arg(long, value_name = "DRIVER", value_parser = ["local", "journal", "none"])]
     pub log_driver: Option<String>,
     /// Accepted for docker's sake: nspawn's stub init reaps orphans anyway.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]

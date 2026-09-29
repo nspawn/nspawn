@@ -153,7 +153,7 @@ pub async fn install(
     )?;
     // The unit hooks exist from now on, so that machinectl start or an enabled unit gets
     // the same preparation as nspawn start.
-    let app_argv = settings::app_argv(sd, spec.name, mode, &route).await?;
+    let app_argv = settings::wrapped_argv(sd, spec.name, mode, &route, &Default::default()).await?;
     if settings::write_hooks(
         spec.name,
         config,

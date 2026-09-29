@@ -349,15 +349,17 @@ pub fn hook_argv(config: &crate::config::Config) -> Result<Vec<String>> {
     Ok(argv)
 }
 
-/// The argv systemd has loaded for an app machine's ExecStart=, which the drop-in
-/// rewrites (`exec_start_override`). None for a booted machine.
-pub async fn app_argv(
+/// The argv systemd has loaded for the ExecStart= the drop-in rewrites behind
+/// `nspawn attach-exec` (`exec_start_override`): an app machine's always, a booted
+/// machine's when its output goes to nspawn's journal namespace. None otherwise.
+pub async fn wrapped_argv(
     sd: &Systemd,
     name: &str,
     mode: Mode,
     route: &NamespaceRoute,
+    tuning: &Tuning,
 ) -> Result<Option<Vec<String>>> {
-    if mode != Mode::App {
+    if mode != Mode::App && tuning.journal_namespace().is_none() {
         return Ok(None);
     }
     Ok(Some(match route {
@@ -396,6 +398,11 @@ pub fn render_hooks(
         let device = crate::unitname::device_unit_for(iface);
         unit.push(format!("Wants={device}"));
         unit.push(format!("After={device}"));
+    }
+    // --log-driver local: the output goes to journald's namespace, listening by then.
+    if let Some(namespace) = tuning.journal_namespace() {
+        unit.push(format!("Wants=systemd-journald@{namespace}.socket"));
+        unit.push(format!("After=systemd-journald@{namespace}.socket"));
     }
     if !unit.is_empty() {
         text.push_str("[Unit]\n");
@@ -438,27 +445,34 @@ pub fn render_hooks(
         text.push_str(&line);
         text.push('\n');
     }
+    let journal = tuning.journal_namespace();
     match (route, app_argv) {
         (NamespaceRoute::CommandLine(argv), _) => {
-            text.push_str(&exec_start_override(command, argv, name, true));
+            text.push_str(&exec_start_override(command, argv, name, true, journal));
         }
         (NamespaceRoute::Settings, Some(argv)) => {
-            text.push_str(&exec_start_override(command, argv, name, false));
+            text.push_str(&exec_start_override(command, argv, name, false, journal));
         }
         (NamespaceRoute::Settings, None) => {}
     }
     text
 }
 
-/// An app machine's ExecStart=: the loaded argv behind `nspawn attach-exec` (src/attach.rs),
+/// A machine's ExecStart=: the loaded argv behind `nspawn attach-exec` (src/attach.rs),
 /// without the override of ours it may carry and without --console, which only a run
-/// chooses.
+/// chooses; `journal` is the journald namespace attach-exec connects the output to.
 /// With `namespace` it carries --private-network and --network-namespace-path= instead
 /// of the options that conflict with them (in their `--option=value` form); the first
 /// makes systemd-nspawn mount the machine's /sys inside the namespace, which the path
 /// alone does not. Without it both go, the settings file saying what the network is.
 /// Applied to its own output it gives the same lines.
-pub fn exec_start_override(command: &str, argv: &[String], name: &str, namespace: bool) -> String {
+pub fn exec_start_override(
+    command: &str,
+    argv: &[String],
+    name: &str,
+    namespace: bool,
+    journal: Option<&str>,
+) -> String {
     const CONFLICTING: &[&str] = &[
         "--network-veth",
         "-n",
@@ -489,8 +503,11 @@ pub fn exec_start_override(command: &str, argv: &[String], name: &str, namespace
             unit_quote(&crate::bridge::netns_path(name))
         ));
     }
+    let journal = journal
+        .map(|ns| format!(" --journal-namespace {}", unit_quote(ns)))
+        .unwrap_or_default();
     format!(
-        "ExecStart=\nExecStart={command} attach-exec {} -- {}\n",
+        "ExecStart=\nExecStart={command} attach-exec {}{journal} -- {}\n",
         unit_quote(name),
         kept.join(" ")
     )
@@ -721,7 +738,7 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let text = exec_start_override(command, &argv, "web", true);
+        let text = exec_start_override(command, &argv, "web", true, None);
         assert_eq!(
             text,
             "ExecStart=\nExecStart=/usr/bin/nspawn attach-exec web -- systemd-nspawn --quiet --keep-unit --boot --link-journal=try-guest -U --settings=override --machine=web --private-network --network-namespace-path=/run/netns/nspawn-web\n"
@@ -731,18 +748,21 @@ mod tests {
             .split(' ')
             .map(|s| s.to_string())
             .collect();
-        assert_eq!(exec_start_override(command, &loaded, "web", true), text);
+        assert_eq!(
+            exec_start_override(command, &loaded, "web", true, None),
+            text
+        );
         // Without the namespace on the command line (systemd 259 and newer, or a network
         // other than the bridge), the path a loaded drop-in added goes, and so does a
         // --console of whatever origin: only a run chooses that.
         let mut console = loaded;
         console.push("--console=interactive".into());
         assert_eq!(
-            exec_start_override(command, &console, "web", false),
+            exec_start_override(command, &console, "web", false, None),
             "ExecStart=\nExecStart=/usr/bin/nspawn attach-exec web -- systemd-nspawn --quiet --keep-unit --boot --link-journal=try-guest -U --settings=override --machine=web\n"
         );
         assert_eq!(
-            exec_start_override(command, &argv, "web", false),
+            exec_start_override(command, &argv, "web", false, None),
             "ExecStart=\nExecStart=/usr/bin/nspawn attach-exec web -- systemd-nspawn --quiet --keep-unit --boot --link-journal=try-guest --network-veth -U --settings=override --machine=web\n"
         );
         // Every option that cannot go with a namespace path is dropped, whatever its value.
@@ -758,7 +778,7 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert_eq!(
-            exec_start_override(command, &bridged, "a", true),
+            exec_start_override(command, &bridged, "a", true, None),
             "ExecStart=\nExecStart=/usr/bin/nspawn attach-exec a -- systemd-nspawn \"--machine=%%i\" --private-network --network-namespace-path=/run/netns/nspawn-a\n"
         );
         assert_eq!(unit_quote("plain-arg=1"), "plain-arg=1");
@@ -881,7 +901,7 @@ mod tests {
             },
         );
         assert!(hooks.starts_with(
-            "# Generated by nspawn; do not edit.\n[Unit]\nStartLimitIntervalSec=0\nWants=sys-subsystem-net-devices-e2e\\x2ddummy0.device\nAfter=sys-subsystem-net-devices-e2e\\x2ddummy0.device\n[Service]\n"
+            "# Generated by nspawn; do not edit.\n[Unit]\nStartLimitIntervalSec=0\nWants=sys-subsystem-net-devices-e2e\\x2ddummy0.device\nAfter=sys-subsystem-net-devices-e2e\\x2ddummy0.device\nWants=systemd-journald@nspawn.socket\nAfter=systemd-journald@nspawn.socket\n[Service]\n"
         ), "{hooks}");
         let bad = MachineSettings {
             tuning: &Tuning {
@@ -1195,6 +1215,10 @@ mod tests {
     #[test]
     fn the_hooks_drop_in_carries_the_policy_and_the_limits() {
         let command = "/usr/bin/nspawn";
+        let journal = Tuning {
+            log_driver: Some("journal".into()),
+            ..Tuning::default()
+        };
         let plain = render_hooks(
             command,
             "web",
@@ -1204,14 +1228,34 @@ mod tests {
                 restart: Restart::No,
                 limits: &Limits::default(),
                 remove_on_exit: false,
-                tuning: &Tuning::default(),
+                tuning: &journal,
             },
         );
         assert_eq!(
             plain,
             "# Generated by nspawn; do not edit.\n[Service]\nExecStartPre=/usr/bin/nspawn network prepare %i\nExecStartPost=/usr/bin/nspawn network publish %i\nExecStopPost=-/usr/bin/nspawn network release %i\nLogRateLimitIntervalSec=0\n",
-            "a booted machine without a policy or limits: the hooks alone"
+            "a booted machine without a policy or limits, writing to the system's journal: the hooks alone"
         );
+        // The default, local: journald's namespace listens first, and the machine's
+        // ExecStart= runs behind attach-exec, which connects its output there.
+        let argv: Vec<String> = ["systemd-nspawn", "--quiet", "--boot", "--machine=web"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let local = render_hooks(
+            command,
+            "web",
+            &NamespaceRoute::Settings,
+            Some(&argv),
+            &HookSpec {
+                restart: Restart::No,
+                limits: &Limits::default(),
+                remove_on_exit: false,
+                tuning: &Tuning::default(),
+            },
+        );
+        assert!(local.starts_with("# Generated by nspawn; do not edit.\n[Unit]\nWants=systemd-journald@nspawn.socket\nAfter=systemd-journald@nspawn.socket\n[Service]\n"), "{local}");
+        assert!(local.ends_with("ExecStart=\nExecStart=/usr/bin/nspawn attach-exec web --journal-namespace nspawn -- systemd-nspawn --quiet --boot --machine=web\n"), "{local}");
         let quiet = render_hooks(
             command,
             "web",
@@ -1242,7 +1286,7 @@ mod tests {
                 restart: Restart::OnFailure,
                 limits: &Limits::default(),
                 remove_on_exit: false,
-                tuning: &Tuning::default(),
+                tuning: &journal,
             },
         );
         assert!(on_failure.starts_with(
@@ -1261,7 +1305,7 @@ mod tests {
                     restart: policy,
                     limits: &Limits::default(),
                     remove_on_exit: false,
-                    tuning: &Tuning::default(),
+                    tuning: &journal,
                 },
             );
             assert!(text.contains("\nRestart=always\n"));
@@ -1280,7 +1324,7 @@ mod tests {
                     ..Limits::default()
                 },
                 remove_on_exit: false,
-                tuning: &Tuning::default(),
+                tuning: &journal,
             },
         );
         assert!(!limited.contains("[Unit]"));
@@ -1298,7 +1342,7 @@ mod tests {
                     ..Limits::default()
                 },
                 remove_on_exit: false,
-                tuning: &Tuning::default(),
+                tuning: &journal,
             },
         );
         assert!(
@@ -1322,10 +1366,10 @@ mod tests {
                 restart: Restart::Always,
                 limits: &Limits::default(),
                 remove_on_exit: false,
-                tuning: &Tuning::default(),
+                tuning: &journal,
             },
         );
-        assert!(old_systemd.ends_with(&exec_start_override(command, &argv, "web", true)));
+        assert!(old_systemd.ends_with(&exec_start_override(command, &argv, "web", true, None)));
         assert!(old_systemd.contains("RestartMaxDelaySec=30s\nExecStart="));
         let app = render_hooks(
             command,
@@ -1336,9 +1380,9 @@ mod tests {
                 restart: Restart::No,
                 limits: &Limits::default(),
                 remove_on_exit: false,
-                tuning: &Tuning::default(),
+                tuning: &journal,
             },
         );
-        assert!(app.ends_with(&exec_start_override(command, &argv, "web", false)));
+        assert!(app.ends_with(&exec_start_override(command, &argv, "web", false, None)));
     }
 }

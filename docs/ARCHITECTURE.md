@@ -187,7 +187,16 @@ attach-exec NAME --` (`src/attach.rs`), which execs it as it is unless an
 attached `run` waits for the machine on `/run/nspawn/attach/NAME.sock`; then it
 receives the run's terminal or input there and adds `--console=interactive` or
 `--console=pipe`, the console mode being something systemd-nspawn only takes
-on its command line. A machine with `--log-driver none` has `StandardOutput=null`
+on its command line. With `--log-driver local`, the default, the drop-in rewrites a
+booted machine's `ExecStart=` the same way, adds `--journal-namespace nspawn` to
+attach-exec, and makes the unit want `systemd-journald@nspawn.socket`: attach-exec
+opens a stream to `/run/systemd/journal.nspawn/stdout` with journald's stream header,
+as `sd_journal_stream_fd_with_namespace()` does, and makes it the stdout of
+systemd-nspawn, whose relay carries the machine's output; journald files the lines
+under the unit from the stream's cgroup. Its stderr stays the unit's, in the system's
+journal, with the hooks' messages. `logs` reads the namespace and the system's journal
+interleaved (`--namespace=+nspawn`); an attached run follows the namespace. A machine
+with `--log-driver none` has `StandardOutput=null`
 (and `StandardError=journal`, for systemd-nspawn's and the hooks' messages) in the
 drop-in; an attached run of it hands a pipe over instead, which becomes the
 program's stdout and stderr, and should the caller go the service reads and drops

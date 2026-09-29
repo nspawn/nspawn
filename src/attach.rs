@@ -81,14 +81,19 @@ impl Mode {
     }
 }
 
-/// The ExecStart of an app machine.
-pub fn exec(name: &str, argv: &[OsString]) -> Result<Infallible> {
+/// The ExecStart of a machine. With `journal`, the output systemd-nspawn relays goes to
+/// that journald namespace instead of the unit's own stdout, unless a run takes it.
+pub fn exec(name: &str, journal: Option<&str>, argv: &[OsString]) -> Result<Infallible> {
     let Some((program, rest)) = argv.split_first() else {
         bail!("attach-exec: nothing to run");
     };
     let mut command = std::process::Command::new(program);
+    let mut taken = false;
+    let mut stdin_handed = false;
     match receive(name) {
         Ok(Some((mode, fds, mut stream))) => {
+            taken = !matches!(mode, Mode::Stdin);
+            stdin_handed = matches!(mode, Mode::Stdin);
             let fd = &fds[0];
             match &mode {
                 Mode::Tty { term } => {
@@ -120,8 +125,47 @@ pub fn exec(name: &str, argv: &[OsString]) -> Result<Infallible> {
         // The run notices that nothing arrived; the machine starts anyway.
         Err(e) => eprintln!("attach-exec: {e:#}"),
     }
+    // A terminal or a pipe of a run carries the output itself.
+    if let (Some(namespace), false) = (journal, taken) {
+        match journal_stream(namespace, name) {
+            Ok(stream) => {
+                nix::unistd::dup2_stdout(&stream).context("attaching the journal")?;
+                // With --console=pipe the program writes to systemd-nspawn's stderr too.
+                if stdin_handed {
+                    nix::unistd::dup2_stderr(&stream).context("attaching the journal")?;
+                }
+            }
+            // Better the system's journal than no machine.
+            Err(e) => eprintln!("attach-exec: {e:#}; the output goes to the system's journal"),
+        }
+    }
     let error = command.args(rest).exec();
     bail!("running {}: {error}", program.to_string_lossy())
+}
+
+/// A stream into journald's `namespace`, as sd_journal_stream_fd_with_namespace() opens
+/// it: the header names the identifier, priority info, level prefixes parsed as a
+/// service's are, and nothing forwarded. journald files the lines under this process's
+/// unit, the machine's.
+fn journal_stream(namespace: &str, identifier: &str) -> Result<OwnedFd> {
+    let path = journal_stream_path(namespace);
+    let stream =
+        UnixStream::connect(&path).with_context(|| format!("connecting to {}", path.display()))?;
+    stream
+        .shutdown(std::net::Shutdown::Read)
+        .context("closing the journal stream's reading side")?;
+    (&stream)
+        .write_all(journal_stream_header(identifier).as_bytes())
+        .with_context(|| format!("writing to {}", path.display()))?;
+    Ok(stream.into())
+}
+
+fn journal_stream_path(namespace: &str) -> PathBuf {
+    PathBuf::from(format!("/run/systemd/journal.{namespace}/stdout"))
+}
+
+fn journal_stream_header(identifier: &str) -> String {
+    format!("{identifier}\n\n6\n1\n0\n0\n0\n")
 }
 
 fn receive(name: &str) -> Result<Option<(Mode, Vec<OwnedFd>, UnixStream)>> {
@@ -288,6 +332,16 @@ mod tests {
         assert_eq!(Mode::decode(b"output\nstderr\n"), None);
         assert_eq!(Mode::decode(b"tty\n\n"), None, "a terminal needs its TERM");
         assert_eq!(Mode::decode(b"shell\n"), None);
+    }
+
+    #[test]
+    fn the_journal_stream_is_opened_as_systemd_does() {
+        assert_eq!(
+            journal_stream_path("nspawn"),
+            PathBuf::from("/run/systemd/journal.nspawn/stdout")
+        );
+        // Identifier, unit (none), priority 6, level prefix, no syslog, kmsg or console.
+        assert_eq!(journal_stream_header("web"), "web\n\n6\n1\n0\n0\n0\n");
     }
 
     #[test]

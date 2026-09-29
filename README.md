@@ -42,7 +42,9 @@ the shells; `man nspawn` is the same reference the packages install.
   `--restart`, `-m`, `--cpus`, `--pids-limit`, the `--health-*` flags, `--secret`,
   `--label`, `--hostname`, `-u`, `-w`, `--cap-add`, `--cap-drop`, `--privileged`,
   `--read-only`, `--tmpfs`, `--device`, `--dns`, `--add-host`, `--ulimit`,
-  `--stop-signal` and the rest, remembered per machine, and `--interface` hands a
+  `--stop-signal`, `--log-driver` and the rest, remembered per machine; what a machine
+  prints goes to a journal of nspawn's own, apart from the system's, which `logs`
+  reads. `--interface` hands a
   machine a network interface of the host, a wifi adapter with its phy included;
   `update` changes the limits,
   the policy and the healthcheck of a machine, running or not; `exec`, `logs`,

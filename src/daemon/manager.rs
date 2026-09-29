@@ -1317,6 +1317,7 @@ impl Manager {
             timestamps: options.bool("timestamps", false)?,
             all: options.bool("all", false)?,
             inside: options.bool("inside", false)?,
+            namespace: None,
         };
         options.finish()?;
         crate::reference::validate_entry_name(&request.machine)?;
@@ -1330,9 +1331,17 @@ impl Manager {
                 )));
             }
         }
+        let mut request = request;
         if let Ok(Some(record)) = self.ctx().store.load_image(&request.machine) {
             api::machines::check_logs_kept(&record, request.inside)
                 .map_err(|e| Error::Failed(format!("{e:#}")))?;
+            if let Some(namespace) = record.tuning.journal_namespace() {
+                if let Ok(sd) = self.ctx().sd().await {
+                    // Its files must exist for journalctl to read them.
+                    let _ = api::run::ensure_journal_namespace(sd, namespace).await;
+                }
+                request.namespace = Some(namespace.to_string());
+            }
         }
         let argv = api::machines::journalctl_arguments(&request);
         let pipe = || {
