@@ -94,7 +94,14 @@ pub struct Tuning {
     /// systemd-nspawn's Timezone= mode for /etc/localtime; None is its own default, auto.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+    /// Where the program's output goes: None for the journal, "none" to drop it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_driver: Option<String>,
 }
+
+/// --log-driver: journal (the default: the unit's journal, what `logs` and an attached
+/// `run` read) or none (dropped; an attached run gets it straight from the program).
+pub const LOG_DRIVERS: [&str; 2] = ["journal", "none"];
 
 /// The modes of systemd-nspawn's Timezone= besides auto, its default: off leaves the
 /// machine's /etc/localtime alone, so a zone set inside survives a restart.
@@ -103,6 +110,11 @@ pub const TIMEZONE_MODES: [&str; 5] = ["off", "copy", "bind", "symlink", "delete
 impl Tuning {
     pub fn is_default(&self) -> bool {
         *self == Tuning::default()
+    }
+
+    /// Whether the program's output is dropped instead of kept in the journal.
+    pub fn drops_output(&self) -> bool {
+        self.log_driver.as_deref() == Some("none")
     }
 
     /// The [Exec] lines: Hostname=, Capability=, DropCapability=, OOMScoreAdjust=, the
@@ -420,6 +432,7 @@ pub struct Overrides {
     pub sysctls: Vec<String>,
     pub secrets: Vec<String>,
     pub timezone: Option<String>,
+    pub log_driver: Option<String>,
 }
 
 fn cleared(values: &[String]) -> bool {
@@ -530,6 +543,13 @@ impl Overrides {
                     "--timezone {other:?}: one of auto, {}",
                     TIMEZONE_MODES.join(", ")
                 ),
+            };
+        }
+        if let Some(driver) = &self.log_driver {
+            t.log_driver = match driver.as_str() {
+                "" | "journal" => None,
+                "none" => Some("none".to_string()),
+                other => bail!("--log-driver {other:?}: {}", LOG_DRIVERS.join(" or ")),
             };
         }
         if let Some(timeout) = self.stop_timeout {
@@ -798,6 +818,7 @@ mod tests {
             secrets: vec!["pw".into(), "tls:/etc/key:0400:1000:1000".into()],
             privileged: None,
             timezone: Some("off".into()),
+            log_driver: None,
         };
         let mut t = Tuning::default();
         flags.apply(&mut t).unwrap();
@@ -1069,6 +1090,7 @@ mod tests {
             ("oom", "5000"),
             ("signal", "SIGBOGUS"),
             ("timezone", "utc"),
+            ("log", "json-file"),
             ("sysctl", "kernel.shmmax=1"),
             ("sysctl", "net.ipv4.ip_forward"),
         ] {
@@ -1087,6 +1109,7 @@ mod tests {
                 "oom" => flags.oom_score_adj = Some(5000),
                 "signal" => flags.stop_signal = Some(value.into()),
                 "timezone" => flags.timezone = Some(value.into()),
+                "log" => flags.log_driver = Some(value.into()),
                 _ => flags.sysctls = vec![value.into()],
             }
             assert!(
@@ -1117,5 +1140,24 @@ mod tests {
             .exec_lines(false)
             .iter()
             .any(|l| l.starts_with("Timezone=")));
+    }
+
+    #[test]
+    fn the_log_driver_is_journal_unless_none() {
+        let mut t = Tuning::default();
+        assert!(!t.drops_output());
+        let none = Overrides {
+            log_driver: Some("none".into()),
+            ..Overrides::default()
+        };
+        none.apply(&mut t).unwrap();
+        assert!(t.drops_output());
+        let journal = Overrides {
+            log_driver: Some("journal".into()),
+            ..Overrides::default()
+        };
+        journal.apply(&mut t).unwrap();
+        assert_eq!(t.log_driver, None, "journal is the default, not remembered");
+        assert!(!t.drops_output());
     }
 }

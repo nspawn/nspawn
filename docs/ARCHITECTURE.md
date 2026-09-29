@@ -187,7 +187,11 @@ attach-exec NAME --` (`src/attach.rs`), which execs it as it is unless an
 attached `run` waits for the machine on `/run/nspawn/attach/NAME.sock`; then it
 receives the run's terminal or input there and adds `--console=interactive` or
 `--console=pipe`, the console mode being something systemd-nspawn only takes
-on its command line. The exec keeps the PID, so `Type=notify`, signals and the
+on its command line. A machine with `--log-driver none` has `StandardOutput=null`
+(and `StandardError=journal`, for systemd-nspawn's and the hooks' messages) in the
+drop-in; an attached run of it hands a pipe over instead, which becomes the
+program's stdout and stderr, and should the caller go the service reads and drops
+what comes until the machine ends, so that the program never blocks on it. The exec keeps the PID, so `Type=notify`, signals and the
 exit status are systemd-nspawn's; and since `nspawn_t` executes `bin_t`
 programs as `unconfined_service_t`, systemd-nspawn runs in the domain it had.
 

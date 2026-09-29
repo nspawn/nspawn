@@ -1,7 +1,8 @@
 //! run, attached: a machine's output, end and exit code, and a terminal or an
 //! input for an app's program (src/attach.rs). The end comes from the unit's
 //! PropertiesChanged, which carries the exit status as it was (a later read can race a
-//! restart); the output comes from the journal, so `logs` has it too.
+//! restart); the output comes from the journal, so `logs` has it too, unless the
+//! machine's log driver is none: then it comes straight from the program.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -325,6 +326,9 @@ pub struct Attached {
     /// Where the caller reads the output (without -t).
     pub output: Option<OwnedFd>,
     follower: Option<Follower>,
+    /// The service's copy of the read end of an output that bypasses the journal, read
+    /// and dropped once the caller goes, or the program would block on a full pipe.
+    drain: Option<OwnedFd>,
     watch: UnitWatch,
     /// The main process, as the process object's PID.
     pub main_pid: u32,
@@ -347,12 +351,20 @@ pub async fn attach(
     if !app && (request.terminal.is_some() || request.stdin.is_some()) {
         bail!("{name} boots an init system; its console is shown without -i and -t, and a shell comes with -it");
     }
+    // The log driver the start is about to set, the one given here among them.
+    let mut tuning = record.tuning.clone();
+    request.start.tuning.apply(&mut tuning)?;
+    let drops = tuning.drops_output();
+    if !app && drops {
+        bail!("{name} drops its console with --log-driver none, so an attached run would show nothing; run it with -d, or give it --log-driver journal");
+    }
     let sd = ctx.sd().await?;
     let unit = format!("systemd-nspawn@{name}.service");
     // Refused before binding: the socket would replace the one an earlier run waits on.
     if ctx.store.is_starting(&name) || sd.machine_exists(&name).await? {
         bail!("machine {name} is already running");
     }
+    let mut straight = None;
     let (mode, handed, keep, terminal) = match (&request.terminal, request.stdin) {
         (Some(t), _) => {
             let (master, slave) = crate::nsenter::host_pty(t.rows, t.cols)?;
@@ -363,26 +375,46 @@ pub async fn attach(
                 Some(crate::attach::Mode::Tty {
                     term: t.term.clone(),
                 }),
-                Some(slave),
+                vec![slave],
                 Some(keep),
                 Some(master),
             )
         }
-        (None, Some(stdin)) => (Some(crate::attach::Mode::Stdin), Some(stdin), None, None),
-        (None, None) => (None, None, None, None),
+        (None, stdin) if drops => {
+            let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+                .context("creating the output's pipe")?;
+            straight = Some(read);
+            let mode = crate::attach::Mode::Output {
+                stdin: stdin.is_some(),
+            };
+            (
+                Some(mode),
+                [Some(write), stdin].into_iter().flatten().collect(),
+                None,
+                None,
+            )
+        }
+        (None, Some(stdin)) => (Some(crate::attach::Mode::Stdin), vec![stdin], None, None),
+        (None, None) => (None, Vec::new(), None, None),
     };
-    let handover = match (mode, handed) {
-        (Some(mode), Some(fd)) => {
+    let handover = match mode {
+        Some(mode) => {
             let listener = crate::attach::Listener::bind(&name)?;
             Some(tokio::spawn(async move {
                 listener
-                    .hand_over(&mode, &fd, Duration::from_secs(120))
+                    .hand_over(&mode, &handed, Duration::from_secs(120))
                     .await
             }))
         }
-        _ => None,
+        None => None,
     };
-    let (output, follower) = if terminal.is_none() {
+    let drain = match &straight {
+        Some(read) => Some(read.try_clone().context("keeping the output's pipe")?),
+        None => None,
+    };
+    let (output, follower) = if let Some(read) = straight {
+        (Some(read), None)
+    } else if terminal.is_none() {
         let cursor = journal_cursor().await;
         let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
             .context("creating the output's pipe")?;
@@ -424,6 +456,7 @@ pub async fn attach(
         keep,
         output,
         follower,
+        drain,
         watch,
         main_pid,
     })
@@ -441,6 +474,17 @@ impl Attached {
         let ending = tokio::select! {
             ending = self.watch.ended() => ending,
             _ = caller_gone => {
+                if let Some(drain) = self.drain.take() {
+                    // The machine goes on alone; what it writes is read and dropped until
+                    // it ends, which keeps the service up meanwhile.
+                    std::thread::spawn(move || {
+                        let mut file = std::fs::File::from(drain);
+                        let mut buf = [0u8; 4096];
+                        while matches!(std::io::Read::read(&mut file, &mut buf), Ok(n) if n > 0) {}
+                    });
+                    let _ = self.watch.ended().await;
+                    return 0;
+                }
                 let Some(keep) = self.keep.take() else {
                     if let Some(follower) = self.follower.take() {
                         follower.finish().await;

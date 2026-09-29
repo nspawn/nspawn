@@ -232,6 +232,7 @@ pub fn put_tuning(options: &mut Options<'_>, t: crate::cli::TuningArgs) {
     put_opt(options, "working_dir", t.workdir);
     put_opt(options, "stop_signal", t.stop_signal);
     put_opt(options, "timezone", t.timezone);
+    put_opt(options, "log_driver", t.log_driver);
     for (key, values) in [
         ("cap_add", t.cap_add),
         ("cap_drop", t.cap_drop),

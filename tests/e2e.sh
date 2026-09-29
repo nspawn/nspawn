@@ -78,7 +78,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -1119,6 +1119,45 @@ $NSPAWN start e2e-tz --timezone auto >/dev/null || fail "start e2e-tz with --tim
 grep -q "^Timezone=" /etc/systemd/nspawn/e2e-tz.nspawn && fail "--timezone auto left a Timezone= line: $(cat /etc/systemd/nspawn/e2e-tz.nspawn)"
 $NSPAWN start e2e-tz --timezone utc 2>/dev/null && fail "an unknown --timezone mode was accepted"
 $NSPAWN rm -f e2e-tz >/dev/null || fail "rm e2e-tz"
+
+step "--log-driver none: the program's output kept out of the journal"
+bb=docker.io/library/busybox:latest
+hooks_of() { echo /etc/systemd/system/systemd-nspawn@$1.service.d/nspawn-hooks.conf; }
+# Attached: the output comes straight from the program, stdout and stderr merged, with
+# the program's exit code, and nothing of it reaches the journal.
+out=$($NSPAWN run --rm --log-driver none $bb --name e2e-quiet -- /bin/sh -c 'echo out-$0; echo err-$0 >&2; exit 3' quiet$nonce 2>/dev/null); rc=$?
+[ "$rc" = 3 ] || fail "run --log-driver none did not exit with the program's code: $rc"
+[ "$out" = "$(printf 'out-quiet%s\nerr-quiet%s' $nonce $nonce)" ] || fail "run --log-driver none did not show the program's output: $out"
+journalctl -u systemd-nspawn@e2e-quiet.service --output=cat --no-pager 2>/dev/null | grep_q "quiet$nonce" && fail "--log-driver none left the output in the journal"
+[ "$(echo abc | $NSPAWN run -i --rm --log-driver none $bb --name e2e-quiet -- wc -c 2>/dev/null)" = 4 ] || fail "run -i --log-driver none did not give the program its input"
+# Detached: the unit drops the output, logs says so, and journal brings it back.
+$NSPAWN create $app e2e-quiet -- /bin/sh -c "echo detached-$nonce; exec sleep 300" >/dev/null || fail "create e2e-quiet"
+$NSPAWN start e2e-quiet --log-driver none >/dev/null || fail "start e2e-quiet with --log-driver none"
+grep -qx "StandardOutput=null" "$(hooks_of e2e-quiet)" || fail "--log-driver none is not in the unit: $(cat "$(hooks_of e2e-quiet)")"
+grep -qx "StandardError=journal" "$(hooks_of e2e-quiet)" || fail "--log-driver none took systemd-nspawn's messages too: $(cat "$(hooks_of e2e-quiet)")"
+sleep 2
+journalctl -u systemd-nspawn@e2e-quiet.service --output=cat --no-pager 2>/dev/null | grep_q "detached-$nonce" && fail "a detached machine with --log-driver none wrote to the journal"
+out=$($NSPAWN logs e2e-quiet 2>&1) && fail "logs of a machine that drops its output succeeded: $out"
+echo "$out" | grep_q "keeps no output" || fail "logs of a machine that drops its output did not say so: $out"
+$NSPAWN inspect e2e-quiet | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['log_driver'] == 'none', d" || fail "inspect does not show the log driver"
+$NSPAWN stop e2e-quiet >/dev/null || fail "stop e2e-quiet"
+$NSPAWN start e2e-quiet --log-driver journal >/dev/null || fail "start e2e-quiet with --log-driver journal"
+grep -q "^StandardOutput=" "$(hooks_of e2e-quiet)" && fail "--log-driver journal left StandardOutput= in the unit"
+retry 10 bash -c "$NSPAWN logs e2e-quiet 2>/dev/null | tr -d '\r' | grep_q '^detached-$nonce\$'" || fail "--log-driver journal did not bring the output back: $($NSPAWN logs e2e-quiet 2>&1)"
+$NSPAWN rm -f e2e-quiet >/dev/null || fail "rm e2e-quiet"
+# The caller of an attached run goes: the machine goes on, what it writes read and
+# dropped by the service, which stays up for it past its idle time.
+$NSPAWN run --log-driver none --name e2e-drain $bb -- /bin/sh -c 'i=0; while true; do i=$((i+1)); echo line-$i-0123456789012345678901234567890123456789; echo $i > /tmp/c.new; mv /tmp/c.new /tmp/count; done' >/dev/null 2>&1 &
+run_pid=$!
+retry 10 bash -c "$NSPAWN ps | grep_q '^ *e2e-drain '" || fail "the attached run of e2e-drain did not start"
+sleep 2
+kill -9 $run_pid
+wait $run_pid 2>/dev/null
+sleep 70
+count() { $NSPAWN exec e2e-drain -- cat /tmp/count </dev/null 2>/dev/null | tr -d '\r'; }
+c1=$(count); sleep 2; c2=$(count)
+[ -n "$c1" ] && [ -n "$c2" ] && [ "$c2" -gt "$c1" ] || fail "the program stalled once the caller of its attached run went: $c1 then $c2"
+$NSPAWN rm -f e2e-drain >/dev/null || fail "rm e2e-drain"
 
 step "--interface: a host interface inside the machine while it runs, back on the host when it stops"
 ip link add e2e-dummy0 type dummy || fail "make a dummy interface"

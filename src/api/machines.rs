@@ -1952,6 +1952,23 @@ const FOLLOW_TAIL: u32 = 10;
 
 /// journalctl's arguments for logs: the console output is in the unit's journal,
 /// earlier runs included; a booted machine also has a journal of its own.
+/// Refuses logs of a machine whose output was dropped (--log-driver none), as docker
+/// does, rather than showing nothing; a booted machine's own journal is still there.
+pub fn check_logs_kept(record: &ImageRecord, inside: bool) -> Result<()> {
+    if inside || !record.tuning.drops_output() {
+        return Ok(());
+    }
+    let hint = if record.mode == Mode::Boot {
+        "; --inside reads its own journal"
+    } else {
+        ""
+    };
+    bail!(
+        "{} keeps no output: its log driver is none (start it with --log-driver journal to keep it){hint}",
+        record.name
+    )
+}
+
 pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
     // --all: a line with colours or a CR would read "[N B blob data]" otherwise.
     let mut argv = vec![
@@ -2272,5 +2289,24 @@ mod tests {
                 "--output=cat"
             ]
         );
+    }
+
+    #[test]
+    fn logs_of_a_machine_that_drops_its_output_are_refused() {
+        let record = |mode: &str, driver: Option<&str>| {
+            let mut r: ImageRecord = serde_json::from_str(&format!(
+                r#"{{"name": "quiet", "reference": "r", "manifest_digest": "d", "layers": [], "backend": "overlay", "created": 0, "mode": "{mode}"}}"#
+            ))
+            .unwrap();
+            r.tuning.log_driver = driver.map(str::to_string);
+            r
+        };
+        assert!(check_logs_kept(&record("app", None), false).is_ok());
+        let app = check_logs_kept(&record("app", Some("none")), false).unwrap_err();
+        assert!(app.to_string().contains("keeps no output"), "{app}");
+        assert!(!app.to_string().contains("--inside"));
+        let boot = check_logs_kept(&record("boot", Some("none")), false).unwrap_err();
+        assert!(boot.to_string().contains("--inside"), "{boot}");
+        assert!(check_logs_kept(&record("boot", Some("none")), true).is_ok());
     }
 }

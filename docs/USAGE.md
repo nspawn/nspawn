@@ -15,7 +15,8 @@ the registry every time and `--pull never` never. A name that is taken is refuse
 command, as with docker (`nspawn run -it alpine sh`; after `--` as well). Like `docker
 run` it stays attached: the
 machine's output follows until it ends (stdout and stderr together, a line at a time,
-from the journal, so that `logs` shows it later too), and `run` exits with the program's
+from the journal, so that `logs` shows it later too; with `--log-driver none` straight
+from the program, and nothing is kept), and `run` exits with the program's
 exit code, or 128 plus the signal it died of. Ctrl-C, SIGTERM, SIGHUP and SIGQUIT go to
 the program; a third Ctrl-C within a second leaves it running and returns. `-i` gives the
 program this standard input, `-t` a terminal (`-it` for a shell), `--rm` removes the
@@ -128,7 +129,11 @@ allowed one by one), `--dns` and `--dns-search`, `--add-host HOST:IP` or `HOST=I
 `--stop-timeout` (what `stop` uses unless `-t` says otherwise), `--timezone MODE`
 (systemd-nspawn's `Timezone=`: its default, `auto`, points `/etc/localtime` at the host's
 zone at every start, and `off` leaves the machine's own, so a zone set inside with
-`timedatectl` survives a restart; an app also takes `-e TZ=`), `--init` (accepted; the
+`timedatectl` survives a restart; an app also takes `-e TZ=`), `--log-driver DRIVER`
+(`journal`, the default, keeps the program's output in the unit's journal, where `logs`
+and an attached `run` read it; `none` drops it, for a program that writes a lot: `logs`
+refuses such a machine, an attached run of an app still shows the output, straight from
+the program, and a booted machine's console goes nowhere, so it runs with `-d`), `--init` (accepted; the
 stub init reaps anyway), `--sysctl` (`net.*` keys, set in an app machine's network
 namespace) and `--interface IFACE`, which has no docker counterpart: a network
 interface of the host moved into the machine while it runs (see "Physical

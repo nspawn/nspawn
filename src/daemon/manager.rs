@@ -230,7 +230,8 @@ fn health_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::health::
     })
 }
 
-/// The per-machine settings: hostname, user, working_dir, stop_signal, timezone (s), cap_add,
+/// The per-machine settings: hostname, user, working_dir, stop_signal, timezone,
+/// log_driver (s), cap_add,
 /// cap_drop, tmpfs, devices (HOST:CONTAINER:PERMISSIONS), interfaces (host interfaces
 /// moved into the machine), dns, dns_search, extra_hosts (HOST:IP), ulimits
 /// (NAME=SOFT:HARD), sysctls (KEY=VALUE), secrets (NAME[:TARGET[:MODE[:UID:GID]]]) (as,
@@ -262,6 +263,7 @@ fn tuning_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::tuning::
             .transpose()?,
         stop_signal: options.string("stop_signal")?,
         timezone: options.string("timezone")?,
+        log_driver: options.string("log_driver")?,
         stop_timeout: options.maybe_u64("stop_timeout")?,
         init: options.maybe_bool("init")?,
         sysctls: options.strings("sysctls")?,
@@ -1327,6 +1329,10 @@ impl Manager {
                     request.machine
                 )));
             }
+        }
+        if let Ok(Some(record)) = self.ctx().store.load_image(&request.machine) {
+            api::machines::check_logs_kept(&record, request.inside)
+                .map_err(|e| Error::Failed(format!("{e:#}")))?;
         }
         let argv = api::machines::journalctl_arguments(&request);
         let pipe = || {

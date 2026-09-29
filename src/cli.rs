@@ -498,6 +498,11 @@ pub struct TuningArgs {
     /// bind, symlink or delete. Remembered.
     #[arg(long, value_name = "MODE", value_parser = ["auto", "off", "copy", "bind", "symlink", "delete"])]
     pub timezone: Option<String>,
+    /// Where the program's output goes, like docker --log-driver: journal (the default,
+    /// what logs and an attached run read) or none (dropped; an attached run still shows
+    /// it, straight from the program, and logs has nothing). Remembered.
+    #[arg(long, value_name = "DRIVER", value_parser = ["journal", "none"])]
+    pub log_driver: Option<String>,
     /// Accepted for docker's sake: nspawn's stub init reaps orphans anyway.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     pub init: Option<bool>,
@@ -1092,6 +1097,12 @@ mod tests {
         };
         assert_eq!(start.options.tuning.timezone.as_deref(), Some("off"));
         let cli =
+            Cli::try_parse_from(["nspawn", "run", "-d", "--log-driver", "none", "img"]).unwrap();
+        let Command::Run(run) = cli.command else {
+            panic!("not run");
+        };
+        assert_eq!(run.options.tuning.log_driver.as_deref(), Some("none"));
+        let cli =
             Cli::try_parse_from(["nspawn", "start", "web", "-m", "1g", "--memory-swap", "-1"])
                 .unwrap();
         let Command::Start(start) = cli.command else {
@@ -1116,6 +1127,7 @@ mod tests {
             &["nspawn", "create", "img", "web", "-m", "1k"][..],
             &["nspawn", "start", "web", "--memory-swap", "-2"][..],
             &["nspawn", "start", "web", "--timezone", "utc"][..],
+            &["nspawn", "start", "web", "--log-driver", "json-file"][..],
         ] {
             assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
         }

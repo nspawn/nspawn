@@ -1,4 +1,5 @@
-//! A terminal or an input for an app's program (run -i, -t). systemd-nspawn takes its
+//! A terminal, an input or an output for an app's program (run -t, -i, and a run of a
+//! machine whose log driver is none). systemd-nspawn takes its
 //! console mode only on its command line, and the unit's stdio is fixed in its files, so
 //! an app machine's ExecStart is `nspawn attach-exec NAME -- ARGV`: when a run waits on
 //! the service's socket for that machine, it receives the descriptors there and execs
@@ -32,6 +33,9 @@ pub enum Mode {
     Tty { term: String },
     /// The caller's stdin; the output stays in the journal.
     Stdin,
+    /// A pipe for stdout and stderr, and the caller's stdin when `stdin`: the output of a
+    /// machine that keeps none in the journal.
+    Output { stdin: bool },
 }
 
 impl Mode {
@@ -39,6 +43,16 @@ impl Mode {
         match self {
             Mode::Tty { term } => format!("tty\n{term}\n").into_bytes(),
             Mode::Stdin => b"stdin\n".to_vec(),
+            Mode::Output { stdin: false } => b"output\n".to_vec(),
+            Mode::Output { stdin: true } => b"output\nstdin\n".to_vec(),
+        }
+    }
+
+    /// How many descriptors come with the mode.
+    fn descriptors(&self) -> usize {
+        match self {
+            Mode::Output { stdin: true } => 2,
+            _ => 1,
         }
     }
 
@@ -50,6 +64,11 @@ impl Mode {
                 term: lines.next().filter(|t| !t.is_empty())?.to_string(),
             }),
             "stdin" => Some(Mode::Stdin),
+            "output" => match lines.next() {
+                None => Some(Mode::Output { stdin: false }),
+                Some("stdin") => Some(Mode::Output { stdin: true }),
+                Some(_) => None,
+            },
             _ => None,
         }
     }
@@ -57,7 +76,7 @@ impl Mode {
     fn console(&self) -> &'static str {
         match self {
             Mode::Tty { .. } => "--console=interactive",
-            Mode::Stdin => "--console=pipe",
+            Mode::Stdin | Mode::Output { .. } => "--console=pipe",
         }
     }
 }
@@ -69,17 +88,30 @@ pub fn exec(name: &str, argv: &[OsString]) -> Result<Infallible> {
     };
     let mut command = std::process::Command::new(program);
     match receive(name) {
-        Ok(Some((mode, fd, mut stream))) => {
-            nix::unistd::dup2_stdin(&fd).context("attaching standard input")?;
-            if let Mode::Tty { term } = &mode {
-                nix::unistd::dup2_stdout(&fd).context("attaching standard output")?;
-                // As the controlling terminal of the session systemd made, resizes reach
-                // systemd-nspawn as SIGWINCH.
-                let _ = nix::unistd::setsid();
-                if let Err(e) = nsenter::take_controlling_terminal(&fd) {
-                    eprintln!("attach-exec: the terminal cannot be the controlling one: {e}");
+        Ok(Some((mode, fds, mut stream))) => {
+            let fd = &fds[0];
+            match &mode {
+                Mode::Tty { term } => {
+                    nix::unistd::dup2_stdin(fd).context("attaching standard input")?;
+                    nix::unistd::dup2_stdout(fd).context("attaching standard output")?;
+                    // As the controlling terminal of the session systemd made, resizes
+                    // reach systemd-nspawn as SIGWINCH.
+                    let _ = nix::unistd::setsid();
+                    if let Err(e) = nsenter::take_controlling_terminal(fd) {
+                        eprintln!("attach-exec: the terminal cannot be the controlling one: {e}");
+                    }
+                    command.env("TERM", term);
                 }
-                command.env("TERM", term);
+                Mode::Stdin => {
+                    nix::unistd::dup2_stdin(fd).context("attaching standard input")?;
+                }
+                Mode::Output { stdin } => {
+                    nix::unistd::dup2_stdout(fd).context("attaching standard output")?;
+                    nix::unistd::dup2_stderr(fd).context("attaching standard error")?;
+                    if *stdin {
+                        nix::unistd::dup2_stdin(&fds[1]).context("attaching standard input")?;
+                    }
+                }
             }
             command.arg(mode.console());
             stream.write_all(b"ok").context("answering the run")?;
@@ -92,7 +124,7 @@ pub fn exec(name: &str, argv: &[OsString]) -> Result<Infallible> {
     bail!("running {}: {error}", program.to_string_lossy())
 }
 
-fn receive(name: &str) -> Result<Option<(Mode, OwnedFd, UnixStream)>> {
+fn receive(name: &str) -> Result<Option<(Mode, Vec<OwnedFd>, UnixStream)>> {
     let path = socket_path(name);
     if !path.exists() {
         return Ok(None);
@@ -104,10 +136,16 @@ fn receive(name: &str) -> Result<Option<(Mode, OwnedFd, UnixStream)>> {
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .context("setting a timeout on the run's socket")?;
-    let (bytes, mut fds) = nsenter::receive_fds(&stream)?;
+    let (bytes, fds) = nsenter::receive_fds(&stream)?;
     let mode = Mode::decode(&bytes).context("the run sent something unexpected")?;
-    let fd = fds.pop().context("the run sent no descriptor")?;
-    Ok(Some((mode, fd, stream)))
+    if fds.len() != mode.descriptors() {
+        bail!(
+            "the run sent {} descriptors instead of {}",
+            fds.len(),
+            mode.descriptors()
+        );
+    }
+    Ok(Some((mode, fds, stream)))
 }
 
 /// The service's end of one run's socket, removed when dropped.
@@ -155,9 +193,17 @@ impl Listener {
         })
     }
 
-    /// Hands `fd` over when the machine's ExecStart asks, and waits for it to take it.
+    /// Hands `fds` over when the machine's ExecStart asks, and waits for it to take them.
     /// Only a root process in the machine's own unit is answered.
-    pub async fn hand_over(&self, mode: &Mode, fd: &OwnedFd, timeout: Duration) -> Result<()> {
+    pub async fn hand_over(&self, mode: &Mode, fds: &[OwnedFd], timeout: Duration) -> Result<()> {
+        if fds.len() != mode.descriptors() {
+            bail!(
+                "{} descriptors for a mode that takes {}",
+                fds.len(),
+                mode.descriptors()
+            );
+        }
+        let fds: Vec<&OwnedFd> = fds.iter().collect();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let (mut stream, _) = tokio::time::timeout_at(deadline, self.listener.accept())
@@ -174,7 +220,7 @@ impl Listener {
             if credentials.uid() != 0 || !in_unit {
                 continue;
             }
-            nsenter::send_fds(&stream, &mode.encode(), &[fd])?;
+            nsenter::send_fds(&stream, &mode.encode(), &fds)?;
             let mut answer = [0u8; 2];
             use tokio::io::AsyncReadExt;
             tokio::time::timeout_at(deadline, stream.read_exact(&mut answer))
@@ -232,9 +278,14 @@ mod tests {
                 term: "xterm-256color".into(),
             },
             Mode::Stdin,
+            Mode::Output { stdin: false },
+            Mode::Output { stdin: true },
         ] {
             assert_eq!(Mode::decode(&mode.encode()), Some(mode));
         }
+        assert_eq!(Mode::Output { stdin: true }.descriptors(), 2);
+        assert_eq!(Mode::Output { stdin: false }.descriptors(), 1);
+        assert_eq!(Mode::decode(b"output\nstderr\n"), None);
         assert_eq!(Mode::decode(b"tty\n\n"), None, "a terminal needs its TERM");
         assert_eq!(Mode::decode(b"shell\n"), None);
     }
