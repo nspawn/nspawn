@@ -154,9 +154,11 @@ fn keep_own_messages_in_journal(command: &mut std::process::Command) {
 }
 
 /// A stream into journald's `namespace`, as sd_journal_stream_fd_with_namespace() opens
-/// it: the header names the identifier, priority info, level prefixes parsed as a
-/// service's are, and nothing forwarded. journald files the lines under this process's
-/// unit, the machine's.
+/// it: the header names the identifier, the machine's unit, priority info, level
+/// prefixes parsed as a service's are, and nothing forwarded. journald files a line under
+/// the unit of the process that wrote it; with --console=pipe that is the program, and
+/// when it is gone by then (a short `wc -c`) the unit named here, which journald takes
+/// from root, is what the line gets.
 fn journal_stream(namespace: &str, identifier: &str) -> Result<OwnedFd> {
     let path = journal_stream_path(namespace);
     let stream =
@@ -165,7 +167,7 @@ fn journal_stream(namespace: &str, identifier: &str) -> Result<OwnedFd> {
         .shutdown(std::net::Shutdown::Read)
         .context("closing the journal stream's reading side")?;
     (&stream)
-        .write_all(journal_stream_header(identifier).as_bytes())
+        .write_all(journal_stream_header(identifier, &machine_unit(identifier)).as_bytes())
         .with_context(|| format!("writing to {}", path.display()))?;
     Ok(stream.into())
 }
@@ -174,8 +176,12 @@ fn journal_stream_path(namespace: &str) -> PathBuf {
     PathBuf::from(format!("/run/systemd/journal.{namespace}/stdout"))
 }
 
-fn journal_stream_header(identifier: &str) -> String {
-    format!("{identifier}\n\n6\n1\n0\n0\n0\n")
+fn journal_stream_header(identifier: &str, unit: &str) -> String {
+    format!("{identifier}\n{unit}\n6\n1\n0\n0\n0\n")
+}
+
+fn machine_unit(name: &str) -> String {
+    format!("systemd-nspawn@{name}.service")
 }
 
 fn receive(name: &str) -> Result<Option<(Mode, Vec<OwnedFd>, UnixStream)>> {
@@ -350,8 +356,11 @@ mod tests {
             journal_stream_path("nspawn"),
             PathBuf::from("/run/systemd/journal.nspawn/stdout")
         );
-        // Identifier, unit (none), priority 6, level prefix, no syslog, kmsg or console.
-        assert_eq!(journal_stream_header("web"), "web\n\n6\n1\n0\n0\n0\n");
+        // Identifier, unit, priority 6, level prefix, no syslog, kmsg or console.
+        assert_eq!(
+            journal_stream_header("web", &machine_unit("web")),
+            "web\nsystemd-nspawn@web.service\n6\n1\n0\n0\n0\n"
+        );
     }
 
     #[test]
