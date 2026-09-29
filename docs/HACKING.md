@@ -84,8 +84,10 @@ it at another mkosi definition.
 
 ## Debugging a machine
 
-- `journalctl -u systemd-nspawn@NAME.service` shows nspawn, the hooks and the
-  machine's console; `nspawn logs NAME --all` is the same without the noise.
+- `journalctl -u systemd-nspawn@NAME.service` shows systemd-nspawn and the hooks;
+  the machine's console is in `journalctl --namespace=nspawn -u
+  systemd-nspawn@NAME.service` (`--log-driver local`, the default), and
+  `nspawn logs NAME --all` shows the two together.
 - `/etc/systemd/nspawn/NAME.nspawn` is what the machine was started with; it is
   regenerated on every start from `/var/lib/nspawn/images/NAME.json`.
 - `nft list table ip nspawn` shows the DNAT map and NAT rules;
