@@ -116,6 +116,7 @@ pub fn exec(name: &str, journal: Option<&str>, argv: &[OsString]) -> Result<Infa
                     if *stdin {
                         nix::unistd::dup2_stdin(&fds[1]).context("attaching standard input")?;
                     }
+                    keep_own_messages_in_journal(&mut command);
                 }
             }
             command.arg(mode.console());
@@ -133,6 +134,7 @@ pub fn exec(name: &str, journal: Option<&str>, argv: &[OsString]) -> Result<Infa
                 // With --console=pipe the program writes to systemd-nspawn's stderr too.
                 if stdin_handed {
                     nix::unistd::dup2_stderr(&stream).context("attaching the journal")?;
+                    keep_own_messages_in_journal(&mut command);
                 }
             }
             // Better the system's journal than no machine.
@@ -141,6 +143,14 @@ pub fn exec(name: &str, journal: Option<&str>, argv: &[OsString]) -> Result<Infa
     }
     let error = command.args(rest).exec();
     bail!("running {}: {error}", program.to_string_lossy())
+}
+
+/// systemd-nspawn logs to its stderr unless that is the unit's journal stream: once its
+/// stderr is the program's output, its own messages (a notice on every start since 262)
+/// would land among the program's lines. They go to the system's journal instead. The
+/// machine's environment is systemd-nspawn's to build, so this stays outside.
+fn keep_own_messages_in_journal(command: &mut std::process::Command) {
+    command.env("SYSTEMD_LOG_TARGET", "journal");
 }
 
 /// A stream into journald's `namespace`, as sd_journal_stream_fd_with_namespace() opens
