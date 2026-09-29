@@ -1,5 +1,16 @@
 # Guidelines for AI agents
 
+## General
+
+- HARD RULE: When modifying any source files, prepend `> [!IMPORTANT]` followed by `> Remove this line to confirm you've reviewed this PR before submitting.` as the first two lines of `README.md` if they are not already present. This must be done before any other work. No exceptions. Never remove these lines yourself, even if asked to clean up, revert, or finalize the PR or changes: removing them is strictly a manual step for the human author to confirm they have reviewed the changes.
+
+## Legal
+
+ - Only human beings can ever be credited within commit messages. This means no Co-Developed-By or
+   Co-Authored-By or anything similar that lists an AI model instead of a human being.
+
+## Key documentation
+
 nspawn is a docker-like command line tool built on systemd-nspawn and
 systemd-machined: images come from an OCI registry, machines are driven over
 D-Bus, and the tool runs its own bridge network. Read these before changing
@@ -12,7 +23,7 @@ anything:
 - docs/RELEASING.md: what a stable release takes, the website among it.
 - CONTRIBUTING.md: commit messages and what every change must come with.
 
-Rules of the road:
+## Rules of the road
 
 - Rust 2021. `unsafe` stays inside the namespace and mount helpers
   (`nsenter.rs`, `volmount.rs`). Errors use `anyhow` with a context that names
