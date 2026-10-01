@@ -11,10 +11,15 @@ version and the documentation; the AUR packages are the maintainer's.
    pass on every commit, and `tests/e2e.sh` passes on every host of the matrix
    (see [HACKING](HACKING.md)): the oldest supported systemd, a host with
    SELinux enforcing, and one with the mstack backend. It runs against the
-   packages of the release commit, each built on its distribution (the rpm with
-   `nspawn-selinux`, the deb, the Arch package) and installed there, with
+   packages of the last commit that changed what the binary or the packages
+   do (the code, the tests, the unit, bus, polkit and SELinux files, the
+   recipes beyond their version), each built on its distribution (the rpm
+   with `nspawn-selinux`, the deb, the Arch package) and installed there, with
    `NSPAWN=/usr/bin/nspawn`, and against a registry of our own: the suite logs
-   in and pushes, which a public registry is not for.
+   in and pushes, which a public registry is not for. A commit that only
+   touches documentation, or only the version and the changelogs, as the
+   release commit does, is covered by that run and does not need one of its
+   own.
 2. The documentation in this repository says what the code does. The pages that
    go stale first are the ones that quote paths, flags or defaults: README.md,
    docs/USAGE.md, docs/ARCHITECTURE.md, docs/DBUS.md and the `--help` texts in
