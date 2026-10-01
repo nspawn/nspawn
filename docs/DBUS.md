@@ -42,7 +42,8 @@ only read (`ListImages`, `GetImage`, `ListMachines`, `GetMachine`,
 administrators by default, so `sudo nspawn ...` works and a
 desktop or `pkttyagent` session is asked for a password. Root is allowed
 without asking, which is also how the service keeps working where polkit is
-not installed: there, nobody else can call it.
+not installed: there, nobody else can call it. The one exception is
+`org.nspawn.Names`, which hands out names alone and asks nothing (see below).
 
 An administrator hands either action to a group with a rule of their own,
 which is how to drive nspawn without a password. The packages ship one as an
@@ -207,6 +208,24 @@ record, and empty otherwise.
 from one and for pipes otherwise, pumps them, and takes the exit status from
 the process object. The terminal is allocated inside the machine, on its own
 devpts, so `tty` and everything that opens its terminal by name work there.
+
+## org.nspawn.Names at /org/nspawn
+
+The names of what is there and nothing else about it, for any user and
+without polkit, as machined lists the names of its machines and images: what
+shell completion offers after `nspawn stop`, `start`, `run` and the rest. A
+completion runs as its user, under `sudo` too, and cannot answer a password
+prompt. Secrets are left out: their names are an administrator's.
+
+| Method | Returns |
+|---|---|
+| `Machines(b all) -> as` | the machines that run, as `ps` lists them; with `all`, every machine nspawn keeps a record of too, as `ps -a` |
+| `Images() -> as` | the images, as `images ls` lists them: what `start` takes |
+| `References() -> as` | the references of the local images: what `run` makes a machine from without a pull |
+| `Networks() -> as` | the networks, `bridge` among them |
+| `Volumes() -> as` | the named volumes |
+
+Each list is sorted, every name once.
 
 ## org.nspawn.Process at /org/nspawn/process/N
 

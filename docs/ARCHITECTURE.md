@@ -14,7 +14,8 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `api/` | the library: typed operations on images, machines and the network; nothing here prints, progress goes through a `Report` and results come back as values |
 | `cli.rs`, `commands/` | clap definitions and the terminal side: argument conversion into calls on the service, tables, prompts, the commands that own the terminal (exec, shell, logs) and the host's end of cp |
 | `client/` | the proxies for `org.nspawn`, how its errors read, how a job is followed |
-| `daemon/` | the D-Bus service `org.nspawn`: the Manager interface, jobs, processes, dictionaries, the files that make the bus start it |
+| `daemon/` | the D-Bus service `org.nspawn`: the Manager interface, the Names interface (names alone, for every user), jobs, processes, dictionaries, the files that make the bus start it |
+| `completion.rs` | shell completion: the script a shell sources calls `nspawn` back with `NSPAWN_COMPLETE` set, and the names of machines, images, networks and volumes come from `org.nspawn.Names` at each TAB (`api/names.rs`) |
 | `packaging/` | the unit, bus and SELinux policy files the packages ship, and the Fedora spec |
 | `config.rs` | `/etc/nspawn/nspawn.toml` (the signature policies per registry among it), environment and flags |
 | `reference.rs` | image references, local names, machine name rules |

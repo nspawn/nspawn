@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::completion::{candidates, Kind};
+
 pub use crate::backend::BackendChoice;
 pub use crate::oci::ModeChoice;
 pub use crate::search::SearchSource;
@@ -173,14 +175,14 @@ pub enum NetworkCommand {
     /// The networks with their machines, addresses and published ports, as JSON.
     Inspect {
         /// Network names ("bridge" for the default one).
-        #[arg(required = true)]
+        #[arg(required = true, add = candidates(Kind::Network))]
         names: Vec<String>,
     },
     /// Remove networks no machine uses, with their bridges and rules.
     #[command(alias = "remove")]
     Rm {
         /// Network names.
-        #[arg(required = true)]
+        #[arg(required = true, add = candidates(Kind::Network))]
         names: Vec<String>,
     },
     /// Remove every network no machine uses.
@@ -219,7 +221,7 @@ pub enum VolumeCommand {
     /// Remove named volumes no machine uses.
     Rm {
         /// Volume names.
-        #[arg(required = true)]
+        #[arg(required = true, add = candidates(Kind::Volume))]
         names: Vec<String>,
     },
     /// Remove every named volume no machine uses, once a yes comes on standard input.
@@ -356,6 +358,7 @@ pub struct PullArgs {
 pub struct CreateArgs {
     /// Image to start from: a local one by its name or reference, or a reference to pull
     /// first (kept under its own name, as run does).
+    #[arg(add = candidates(Kind::Image))]
     pub source: String,
     /// Name of the new machine.
     pub name: String,
@@ -366,7 +369,7 @@ pub struct CreateArgs {
     /// machine's network, as docker's) or a network made with network create;
     /// repeatable to join several bridge networks, the first one primary (default: the
     /// source's kind; a network made with network create is not inherited).
-    #[arg(long, value_name = "NETWORK")]
+    #[arg(long, value_name = "NETWORK", add = candidates(Kind::NetworkChoice))]
     pub network: Vec<String>,
     /// Another name for the machine on a network, like docker --network-alias: NAME on
     /// its primary network, or NETWORK=NAME. Repeatable.
@@ -389,7 +392,7 @@ pub struct CreateArgs {
     #[arg(long, short = 'e', value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
     /// Mount a host directory or a named volume, SOURCE:TARGET[:ro], like docker -v.
-    #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]")]
+    #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]", value_hint = clap::ValueHint::AnyPath)]
     pub volume: Vec<String>,
     /// Label the machine, KEY=VALUE, like docker --label; the image's own labels stay
     /// underneath. Repeatable and remembered; "none" forgets them.
@@ -465,7 +468,7 @@ pub struct TuningArgs {
     pub shm_size: Option<u64>,
     /// A device node of the host for the machine, HOST[:CONTAINER[:PERMISSIONS]], like
     /// docker --device. Repeatable; "none" forgets them.
-    #[arg(long, value_name = "HOST[:CONTAINER[:rwm]]")]
+    #[arg(long, value_name = "HOST[:CONTAINER[:rwm]]", value_hint = clap::ValueHint::AnyPath)]
     pub device: Vec<String>,
     /// A network interface of the host, moved into the machine while it runs and given
     /// back when it stops: an ethernet one, or a wifi adapter with its whole phy; the
@@ -589,6 +592,7 @@ pub struct BuildArgs {
 #[derive(Args, Debug)]
 pub struct PushArgs {
     /// Local image name, or the reference it was pulled from or built as.
+    #[arg(add = candidates(Kind::Image))]
     pub image: String,
     /// Push under a different reference than the one recorded for the image.
     #[arg(long)]
@@ -614,18 +618,18 @@ pub enum ImagesCommand {
 pub struct CpArgs {
     /// What to copy: a local path, or MACHINE:PATH (a local path with a colon is
     /// written ./a:b). DIR/. copies the contents of DIR.
-    #[arg(value_name = "SOURCE")]
+    #[arg(value_name = "SOURCE", value_hint = clap::ValueHint::AnyPath)]
     pub source: String,
     /// Where to: MACHINE:PATH, or a local path. An existing directory receives the source
     /// under its own name; otherwise the copy takes this name.
-    #[arg(value_name = "DESTINATION")]
+    #[arg(value_name = "DESTINATION", value_hint = clap::ValueHint::AnyPath)]
     pub destination: String,
 }
 
 #[derive(Args, Debug)]
 pub struct RmArgs {
     /// Machine names.
-    #[arg(required = true)]
+    #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
     /// Stop a running machine first (SIGKILL, like docker rm -f) instead of refusing.
     #[arg(long, short = 'f')]
@@ -635,7 +639,7 @@ pub struct RmArgs {
 #[derive(Args, Debug)]
 pub struct KillArgs {
     /// Machine names.
-    #[arg(required = true)]
+    #[arg(required = true, add = candidates(Kind::Running))]
     pub names: Vec<String>,
     /// Signal to send: a name (KILL, SIGHUP, RTMIN+3) or a number. SIGKILL stops the
     /// machine like stop --force; other signals go to an app's program or a booted
@@ -648,7 +652,7 @@ pub struct KillArgs {
 #[derive(Args, Debug)]
 pub struct UpdateArgs {
     /// Machine names.
-    #[arg(required = true)]
+    #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
     /// Restart policy: no, on-failure, always (also starts it at boot) or unless-stopped.
     #[arg(long, value_enum, value_name = "POLICY")]
@@ -674,6 +678,7 @@ pub struct UpdateArgs {
 #[derive(Args, Debug)]
 pub struct StatsArgs {
     /// Machine names (every running machine when none is given).
+    #[arg(add = candidates(Kind::Running))]
     pub names: Vec<String>,
     /// Print one table and return instead of drawing a new one every second.
     #[arg(long)]
@@ -710,7 +715,7 @@ pub struct EventsArgs {
 #[derive(Args, Debug)]
 pub struct ImagesRmArgs {
     /// Image names.
-    #[arg(required = true)]
+    #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
 }
 
@@ -747,13 +752,14 @@ pub struct OutputArgs {
 #[derive(Args, Debug)]
 pub struct InspectArgs {
     /// Machine or image names.
-    #[arg(required = true)]
+    #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct StartArgs {
     /// Image name.
+    #[arg(add = candidates(Kind::Startable))]
     pub name: String,
     #[command(flatten)]
     pub options: StartOptions,
@@ -780,6 +786,7 @@ pub enum PullPolicy {
 #[derive(Args, Debug)]
 pub struct RunArgs {
     /// Image reference: [registry/]repository[:tag|@digest], for example nginx:1.27.
+    #[arg(add = candidates(Kind::Reference))]
     pub reference: String,
     /// Name of the machine (default: derived from the reference, e.g. nginx-1.27).
     #[arg(long, short = 'n')]
@@ -839,7 +846,7 @@ pub struct StartOptions {
     /// network), none (no network), container:NAME (the network of that running
     /// machine, as docker's --network container:) or the name of a network made with
     /// network create; repeatable to join several bridge networks, the first one primary.
-    #[arg(long, value_name = "NETWORK")]
+    #[arg(long, value_name = "NETWORK", add = candidates(Kind::NetworkChoice))]
     pub network: Vec<String>,
     /// Another name for the machine on a network, like docker --network-alias: NAME on
     /// its primary network, or NETWORK=NAME. Repeatable and remembered; "none" forgets
@@ -861,7 +868,7 @@ pub struct StartOptions {
     pub env: Vec<String>,
     /// Mount a host directory or a named volume, SOURCE:TARGET[:ro], like docker -v.
     /// Repeatable and remembered; "none" forgets them.
-    #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]")]
+    #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]", value_hint = clap::ValueHint::AnyPath)]
     pub volume: Vec<String>,
     /// Label the machine, KEY=VALUE, like docker --label; the image's own labels stay
     /// underneath. Repeatable and remembered; "none" forgets them.
@@ -899,7 +906,7 @@ pub struct StartOptions {
 #[derive(Args, Debug)]
 pub struct StopArgs {
     /// Machine names.
-    #[arg(required = true)]
+    #[arg(required = true, add = candidates(Kind::Running))]
     pub names: Vec<String>,
     /// Kill the machine immediately instead of asking it to power off.
     #[arg(long, short = 'f')]
@@ -917,7 +924,7 @@ pub struct StopArgs {
 #[derive(Args, Debug)]
 pub struct RestartArgs {
     /// Machine names.
-    #[arg(required = true)]
+    #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
     /// App images: seconds to wait after the stop signal before terminating the machine
     /// (default: the machine's --stop-timeout, else 10).
@@ -928,19 +935,21 @@ pub struct RestartArgs {
 #[derive(Args, Debug)]
 pub struct NamesArgs {
     /// Machine names.
-    #[arg(required = true)]
+    #[arg(required = true, add = candidates(Kind::Running))]
     pub names: Vec<String>,
 }
 
 #[derive(Args, Debug)]
 pub struct TopArgs {
     /// Machine name.
+    #[arg(add = candidates(Kind::Running))]
     pub machine: String,
 }
 
 #[derive(Args, Debug)]
 pub struct ExecArgs {
     /// Machine name.
+    #[arg(add = candidates(Kind::Running))]
     pub machine: String,
     /// User inside the machine.
     #[arg(long, short = 'u', default_value = "root")]
@@ -975,6 +984,7 @@ pub struct ExecArgs {
 #[derive(Args, Debug)]
 pub struct ShellArgs {
     /// Machine name.
+    #[arg(add = candidates(Kind::Running))]
     pub machine: String,
     /// User inside the machine.
     #[arg(long, short = 'u', default_value = "root")]
@@ -984,7 +994,7 @@ pub struct ShellArgs {
 #[derive(Args, Debug, Default)]
 pub struct LogsArgs {
     /// Machine names; with several, every line carries its machine's name.
-    #[arg(required = true)]
+    #[arg(required = true, add = candidates(Kind::Any))]
     pub machines: Vec<String>,
     /// Keep printing new output (starts from the last 10 lines unless --lines says otherwise).
     #[arg(long, short = 'f')]
@@ -1019,26 +1029,38 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    /// The completions and the manual page are written from this very definition, so a
-    /// command or a flag cannot be in one and missing from the other.
+    /// The completions and the manual page come from this definition, so a command
+    /// or a flag cannot be in one and missing from the other.
     #[test]
     fn what_shells_and_man_are_given_comes_from_here() {
-        for shell in [
-            clap_complete::Shell::Bash,
-            clap_complete::Shell::Zsh,
-            clap_complete::Shell::Fish,
+        let complete = |words: &[&str]| -> Vec<String> {
+            let words: Vec<std::ffi::OsString> = words.iter().map(Into::into).collect();
+            let index = words.len() - 1;
+            clap_complete::engine::complete(&mut Cli::command(), words, index, None)
+                .expect("completing")
+                .iter()
+                .map(|c| c.get_value().to_string_lossy().into_owned())
+                .collect()
+        };
+        let commands = complete(&["nspawn", ""]);
+        for word in [
+            "images", "machines", "network", "volume", "inspect", "rm", "restart", "run",
         ] {
-            let mut out = Vec::new();
-            let mut command = Cli::command();
-            let name = command.get_name().to_string();
-            clap_complete::generate(shell, &mut command, name, &mut out);
-            let text = String::from_utf8(out).expect("the generators write text");
-            for word in [
-                "nspawn", "images", "machines", "network", "volume", "inspect", "rm", "restart",
-                "run",
-            ] {
-                assert!(text.contains(word), "{shell} completions miss {word}");
-            }
+            assert!(
+                commands.iter().any(|c| c == word),
+                "completions miss {word}"
+            );
+        }
+        assert!(
+            !commands.iter().any(|c| c == "attach-exec"),
+            "a hidden command completes"
+        );
+        let flags = complete(&["nspawn", "run", "--"]);
+        for flag in ["--log-driver", "--network", "--restart"] {
+            assert!(
+                flags.iter().any(|f| f == flag),
+                "completions miss run {flag}"
+            );
         }
         let mut man = Vec::new();
         clap_mangen::Man::new(Cli::command())

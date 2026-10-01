@@ -259,7 +259,14 @@ ends up the same way but resolves the manifest through the registry first.
 
 Completions for bash, zsh and fish come with the packages; from a build of your own,
 `nspawn completions bash > ~/.local/share/bash-completion/completions/nspawn` (or the
-equivalent for your shell). `man nspawn` is the same reference the packages install.
+equivalent for your shell). Besides commands and flags, TAB completes names, asked
+from the service as it goes: the running machines after `stop`, `exec`, `kill`,
+`pause`, `top`, `shell` and `stats`, the images that do not run after `start`, every
+machine and image after `rm`, `inspect`, `logs`, `restart`, `update` and `images rm`,
+the local images after `create` and `push`, their references after `run`, the
+networks after `--network`, `network rm` and `network inspect`, and the volumes after
+`volume rm`. The names are all the service hands out without asking polkit, so this
+works for any user and under `sudo` without a password; secrets are not completed.
 
 `ps`, `machines ls`, `images ls`, `network ls` and `volume ls` take `--json` and print what the
 service answered instead of a table, and `nspawn inspect NAME...` prints the whole

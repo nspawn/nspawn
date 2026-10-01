@@ -5,6 +5,7 @@
 pub mod install;
 pub mod jobs;
 pub mod manager;
+pub mod names;
 pub mod polkit;
 pub mod processes;
 pub mod values;
@@ -118,6 +119,7 @@ pub async fn run(config: Config, idle_exit: Option<Duration>) -> Result<()> {
     }
     let connection = zbus::connection::Builder::system()?
         .serve_at(MANAGER_PATH, Manager::new(state.clone()))?
+        .serve_at(MANAGER_PATH, names::Names::new(state.clone()))?
         .build()
         .await
         .context("connecting to the system bus")?;

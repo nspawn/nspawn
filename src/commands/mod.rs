@@ -43,10 +43,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         // What a shell and man(1) need, written from the command line's own definition
         // so that they cannot drift from it. The packages generate them at build time.
         Command::Completions(a) => {
-            let mut command = Cli::command();
-            let name = command.get_name().to_string();
-            clap_complete::generate(a.shell, &mut command, name, &mut std::io::stdout());
-            Ok(())
+            let script = crate::completion::registration(a.shell)
+                .with_context(|| format!("writing the {} completions", a.shell))?;
+            std::io::Write::write_all(&mut std::io::stdout(), &script)
+                .context("writing the completions")
         }
         Command::Manpage => clap_mangen::Man::new(Cli::command())
             .render(&mut std::io::stdout())

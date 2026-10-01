@@ -2046,6 +2046,35 @@ if command -v busctl >/dev/null 2>&1; then
   grep -q '"state" s "running"' /tmp/e2e-lm.txt || fail "ListMachines: not running"
   $B call $M GetMachine s e2e-dbus | grep_q '"state" s "running"' || fail "GetMachine of a running machine"
   $B call $M GetNetwork s bridge | grep_q '"name" s "e2e-dbus"' || fail "GetNetwork misses the machine"
+  # Names for shell completion: every user gets them, polkit is not asked; nothing else
+  # answers such a caller.
+  N="org.nspawn /org/nspawn org.nspawn.Names"
+  $B introspect $N > /tmp/e2e-names.txt || fail "org.nspawn.Names not reachable"
+  for m in Machines Images References Networks Volumes; do
+    grep -q "^\.$m  *method" /tmp/e2e-names.txt || fail "method $m missing from org.nspawn.Names"
+  done
+  out=$(runuser -u nobody -- busctl --system call $N Machines b false 2>&1) || fail "Names.Machines refused an unprivileged caller: $out"
+  echo "$out" | grep_q '"e2e-dbus"' || fail "Names.Machines misses the running machine: $out"
+  runuser -u nobody -- busctl --system call $N Images | grep_q '"e2e-dbus"' || fail "Names.Images misses the image"
+  runuser -u nobody -- busctl --system call $N Networks | grep_q '"bridge"' || fail "Names.Networks misses bridge"
+  out=$(runuser -u nobody -- busctl --system call $M ListMachines b false 2>&1) && fail "ListMachines answered an unprivileged caller: $out"
+  bin=$(readlink -f "$NSPAWN")
+  if runuser -u nobody -- test -x "$bin"; then
+    tab() { runuser -u nobody -- env NSPAWN_COMPLETE=fish "$bin" -- nspawn "$@" | cut -f1; }
+    tab stop "" | grep_q -x e2e-dbus || fail "TAB after stop does not offer the running machine to an unprivileged user: $(tab stop "")"
+    tab start "" | grep_q -x e2e-dbus && fail "TAB after start offers a running machine: $(tab start "")"
+    tab rm e2e-d | grep_q -x e2e-dbus || fail "TAB after rm e2e-d does not offer e2e-dbus: $(tab rm e2e-d)"
+    tab network rm "" | grep_q -x bridge || fail "TAB after network rm misses bridge: $(tab network rm "")"
+    tab secret rm "" | grep_q -v '^-' && fail "TAB after secret rm offers names: $(tab secret rm "")"
+  fi
+  for shell in bash zsh fish; do
+    $NSPAWN completions $shell | grep_q NSPAWN_COMPLETE || fail "the $shell completions do not call nspawn back"
+  done
+  # The script a package installed, sourced by a user's bash as a TAB would run it.
+  if [ "$packaged" = yes ]; then
+    out=$(runuser -u nobody -- bash -c 'source /usr/share/bash-completion/completions/nspawn; COMP_WORDS=(nspawn stop ""); COMP_CWORD=2; COMP_TYPE=9; _clap_complete_nspawn nspawn "" stop; printf "%s\n" "${COMPREPLY[@]}"' 2>&1)
+    echo "$out" | grep_q -x e2e-dbus || fail "the installed bash completion does not offer the running machine: $out"
+  fi
   # Every exec of this run went through Exec; each left a process object behind.
   out=$($NSPAWN exec e2e-dbus -- /bin/sh -c "echo via-bus-$nonce; exit 7" </dev/null); code=$?
   [ "$code" = 7 ] || fail "exec did not propagate the exit code (got $code)"

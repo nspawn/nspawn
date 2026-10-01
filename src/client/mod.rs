@@ -186,6 +186,20 @@ pub trait Process {
     fn exited(&self, status: i32) -> zbus::Result<()>;
 }
 
+#[zbus::proxy(
+    interface = "org.nspawn.Names",
+    default_service = "org.nspawn",
+    default_path = "/org/nspawn",
+    gen_blocking = false
+)]
+pub trait Names {
+    fn machines(&self, all: bool) -> zbus::Result<Vec<String>>;
+    fn images(&self) -> zbus::Result<Vec<String>>;
+    fn references(&self) -> zbus::Result<Vec<String>>;
+    fn networks(&self) -> zbus::Result<Vec<String>>;
+    fn volumes(&self) -> zbus::Result<Vec<String>>;
+}
+
 /// A process the service started for us, watched for its end from before its streams
 /// are pumped, so that a quick exit is never missed.
 pub struct Ended {

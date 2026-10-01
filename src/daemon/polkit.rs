@@ -2,6 +2,7 @@
 //! caller, as machined does: the actions are org.nspawn.inspect for the read-only
 //! methods and org.nspawn.manage for the rest, both admin-only by default, so an
 //! administrator can hand either of them to a group with a rule of their own.
+//! org.nspawn.Names asks for neither: it hands out names alone (see `names.rs`).
 
 use std::collections::HashMap;
 

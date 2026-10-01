@@ -112,7 +112,11 @@ from a source tarball plus a `cargo vendor` tarball.
 The shell completions and the manual page are generated from the command line
 itself, by `nspawn completions bash|zsh|fish` and `nspawn manpage`; the three
 recipes run them at build time, so a new command or flag reaches them without
-anyone writing it twice.
+anyone writing it twice. The completion scripts are only a hook: at each TAB
+the shell runs `NSPAWN_COMPLETE=bash nspawn -- WORDS`, and the binary answers
+from its own definition and from `org.nspawn.Names` (`src/completion.rs`, whose
+tests complete whole command lines against made-up names). clap_complete keeps
+that call behind its `unstable-dynamic` feature.
 
 `daemon --install` writes some of the same paths, which belong to the
 packages: `/usr/share/dbus-1/system-services/org.nspawn.service` and

@@ -11,6 +11,7 @@ pub mod hub;
 pub mod images;
 pub mod login;
 pub mod machines;
+pub mod names;
 pub mod network;
 pub mod pull;
 pub mod push;

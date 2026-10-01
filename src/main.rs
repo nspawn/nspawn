@@ -12,6 +12,7 @@ mod bridge;
 mod cli;
 mod client;
 mod commands;
+mod completion;
 mod config;
 mod daemon;
 mod getent;
@@ -37,10 +38,9 @@ mod verify;
 mod volmount;
 mod volume;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
-#[tokio::main]
-async fn main() {
+fn main() {
     // Behave like a normal Unix tool in pipelines: die quietly on a closed pipe instead of
     // panicking in println!.
     unsafe {
@@ -49,6 +49,16 @@ async fn main() {
             nix::sys::signal::SigHandler::SigDfl,
         );
     }
+    // A shell asking for completions (NSPAWN_COMPLETE=bash nspawn -- WORDS) gets them and
+    // nothing else; the names come from the service, through a runtime of their own.
+    clap_complete::CompleteEnv::with_factory(cli::Cli::command)
+        .var(completion::VARIABLE)
+        .complete();
+    run();
+}
+
+#[tokio::main]
+async fn run() {
     let args = cli::Cli::parse();
     // The service writes into its clients' pipes (events, attached runs): a client that
     // leaves must cost it a write error, not its life.

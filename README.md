@@ -30,7 +30,8 @@ nspawn push team/app:1              # upload it to the hub, layers already there
 
 `nspawn --help` lists the rest: `login`, `hub ls`, `inspect`, `update`, `stats`, `top`,
 `cp`, `kill`, `restart`, `pause`, `volume`, `secret`, `network`, and `completions` for
-the shells; `man nspawn` is the same reference the packages install.
+the shells, which complete the names of machines, images, networks and volumes too;
+`man nspawn` is the same reference the packages install.
 
 ## What it does
 
