@@ -1,3 +1,10 @@
+nspawn (1.9.0-1) unstable; urgency=medium
+
+  * Name completion in bash, zsh and fish: machines, images, references, networks and volumes, asked from the service at each TAB.
+  * org.nspawn.Names hands out those names to any user without polkit.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Thu, 01 Oct 2026 18:34:02 -0500
+
 nspawn (1.8.0-1) unstable; urgency=medium
 
   * --log-driver local|journal|none, as docker takes it; local, the default, keeps a machine's output in journald's nspawn namespace, capped at 1 GiB.
