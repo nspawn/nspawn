@@ -33,6 +33,22 @@ nspawn push team/app:1              # upload it to the hub, layers already there
 the shells, which complete the names of machines, images, networks and volumes too;
 `man nspawn` is the same reference the packages install.
 
+## Installation
+
+Every [release](https://github.com/nspawn/nspawn/releases) carries packages for the
+distributions, which install the binary, the service on the system bus, the polkit
+actions, the completions and the manual page:
+
+| Distribution | Package |
+| --- | --- |
+| Fedora 44 | `nspawn-VERSION-1.fc44.x86_64.rpm`, with `nspawn-selinux-VERSION-1.fc44.noarch.rpm` for SELinux enforcing |
+| Ubuntu 24.04, and later Ubuntu and Debian releases | `nspawn_VERSION-1_amd64.deb` |
+| Arch Linux | `nspawn-VERSION-1-x86_64.pkg.tar.zst`, or the AUR's [nspawn](https://aur.archlinux.org/packages/nspawn) and [nspawn-git](https://aur.archlinux.org/packages/nspawn-git) |
+
+The release also has the plain binary in a tarball and a `SHA256SUMS` over everything.
+[Getting started](https://nspawn.org/docs/getting-started/) on nspawn.org covers the
+requirements, building from source and usage examples.
+
 ## What it does
 
 - **Two kinds of machine.** An image that ships systemd boots like `machinectl start`

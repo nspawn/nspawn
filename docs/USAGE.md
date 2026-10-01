@@ -6,6 +6,15 @@ network, and where credentials live. `nspawn COMMAND --help` and `man nspawn` li
 every flag; [DBUS.md](DBUS.md) has the bus interface the commands call, and
 [ARCHITECTURE.md](ARCHITECTURE.md) how it is all built.
 
+The documentation on [nspawn.org](https://nspawn.org/docs/) covers the same ground as
+guides: [getting started](https://nspawn.org/docs/getting-started/),
+[images](https://nspawn.org/docs/images/), [machines](https://nspawn.org/docs/machines/),
+[networking](https://nspawn.org/docs/networking/),
+[configuration](https://nspawn.org/docs/configuration/),
+[building images](https://nspawn.org/docs/building/), the
+[command reference](https://nspawn.org/docs/reference/) and a
+[FAQ](https://nspawn.org/docs/faq/).
+
 ## run and build
 
 `run` is `pull` (or `create` from a local image with the same reference, as docker's
