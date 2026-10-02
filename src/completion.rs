@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use clap::CommandFactory;
 use clap_complete::engine::{ArgValueCandidates, CompletionCandidate};
 
 use crate::client::NamesProxy;
@@ -109,6 +110,29 @@ pub fn candidates(kind: Kind) -> ArgValueCandidates {
     })
 }
 
+/// The command line as completion sees it: every flag hidden. clap's engine leaves the
+/// hidden candidates out when a visible one fits the word, so TAB on an empty word
+/// offers names and subcommands alone, and the flags come once the word starts with
+/// `-`, or when nothing else fits.
+pub fn command() -> clap::Command {
+    let mut command = crate::cli::Cli::command();
+    // Built first, so that the help and version flags clap adds are hidden too.
+    command.build();
+    hide_flags(command)
+}
+
+fn hide_flags(command: clap::Command) -> clap::Command {
+    command
+        .mut_args(|arg| {
+            if arg.is_positional() {
+                arg
+            } else {
+                arg.hide(true)
+            }
+        })
+        .mut_subcommands(hide_flags)
+}
+
 /// The script that hooks `nspawn` into `shell`: a function that calls the binary found
 /// on PATH, never the one that wrote it, since the packages write it at build time.
 pub fn registration(shell: clap_complete::Shell) -> std::io::Result<Vec<u8>> {
@@ -170,7 +194,6 @@ fn from_service(queries: &[Query]) -> anyhow::Result<Answers> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
 
     fn answering(f: impl FnOnce()) {
         let answers = Answers::from([
@@ -195,16 +218,14 @@ mod tests {
         ANSWERS.with(|a| *a.borrow_mut() = None);
     }
 
-    /// The names TAB offers at the end of `line` (a trailing space starts a new word),
-    /// without the flags that come along on an empty word.
+    /// What TAB offers at the end of `line`; a trailing space starts a new word.
     fn complete(line: &str) -> Vec<String> {
         let words: Vec<std::ffi::OsString> = line.split(' ').map(Into::into).collect();
         let index = words.len() - 1;
-        clap_complete::engine::complete(&mut crate::cli::Cli::command(), words, index, None)
+        clap_complete::engine::complete(&mut command(), words, index, None)
             .unwrap()
             .iter()
             .map(|c| c.get_value().to_string_lossy().into_owned())
-            .filter(|value| !value.starts_with('-'))
             .collect()
     }
 
@@ -257,16 +278,57 @@ mod tests {
     }
 
     #[test]
-    fn secrets_and_new_names_get_no_candidates() {
+    fn flags_come_with_a_dash() {
+        answering(|| {
+            // One dash brings the short form of a flag that has one, two the long ones.
+            for (line, expected) in [
+                ("nspawn stop -", ["-f", "-t", "--no-wait", "-h"]),
+                (
+                    "nspawn stop --",
+                    ["--force", "--timeout", "--no-wait", "--help"],
+                ),
+            ] {
+                let flags = complete(line);
+                for flag in expected {
+                    assert!(
+                        flags.iter().any(|f| f == flag),
+                        "{line:?}: {flag} missing: {flags:?}"
+                    );
+                }
+                assert!(
+                    flags.iter().all(|f| f.starts_with('-')),
+                    "{line:?}: {flags:?}"
+                );
+            }
+            assert_eq!(complete("nspawn stop --f"), ["--force"]);
+            assert_eq!(
+                complete("nspawn run nginx --net"),
+                ["--network", "--network-alias"]
+            );
+        });
+    }
+
+    #[test]
+    fn subcommands_come_without_the_global_flags() {
+        let commands = complete("nspawn ");
+        assert!(commands.iter().any(|c| c == "stop"), "{commands:?}");
+        assert!(!commands.iter().any(|c| c.starts_with('-')), "{commands:?}");
+        assert!(complete("nspawn --reg").contains(&"--registry".to_string()));
+    }
+
+    #[test]
+    fn without_names_the_flags_come() {
         answering(|| {
             for line in [
                 "nspawn secret rm ",
-                "nspawn secret inspect ",
                 "nspawn network create ",
-                "nspawn volume create ",
                 "nspawn create fedora-44 ",
             ] {
-                assert_eq!(complete(line), Vec::<String>::new(), "{line:?}");
+                let offered = complete(line);
+                assert!(
+                    !offered.is_empty() && offered.iter().all(|o| o.starts_with('-')),
+                    "{line:?}: {offered:?}"
+                );
             }
         });
     }

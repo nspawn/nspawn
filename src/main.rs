@@ -38,7 +38,7 @@ mod verify;
 mod volmount;
 mod volume;
 
-use clap::{CommandFactory, Parser};
+use clap::Parser;
 
 fn main() {
     // Behave like a normal Unix tool in pipelines: die quietly on a closed pipe instead of
@@ -51,7 +51,7 @@ fn main() {
     }
     // A shell asking for completions (NSPAWN_COMPLETE=bash nspawn -- WORDS) gets them and
     // nothing else; the names come from the service, through a runtime of their own.
-    clap_complete::CompleteEnv::with_factory(cli::Cli::command)
+    clap_complete::CompleteEnv::with_factory(completion::command)
         .var(completion::VARIABLE)
         .complete();
     run();

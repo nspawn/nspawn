@@ -2062,6 +2062,8 @@ if command -v busctl >/dev/null 2>&1; then
   if runuser -u nobody -- test -x "$bin"; then
     tab() { runuser -u nobody -- env NSPAWN_COMPLETE=fish "$bin" -- nspawn "$@" | cut -f1; }
     tab stop "" | grep_q -x e2e-dbus || fail "TAB after stop does not offer the running machine to an unprivileged user: $(tab stop "")"
+    tab stop "" | grep_q '^-' && fail "TAB after stop offers flags among the names: $(tab stop "")"
+    tab stop -- | grep_q -x -- --force || fail "TAB after stop -- does not offer the flags: $(tab stop --)"
     tab start "" | grep_q -x e2e-dbus && fail "TAB after start offers a running machine: $(tab start "")"
     tab rm e2e-d | grep_q -x e2e-dbus || fail "TAB after rm e2e-d does not offer e2e-dbus: $(tab rm e2e-d)"
     tab network rm "" | grep_q -x bridge || fail "TAB after network rm misses bridge: $(tab network rm "")"

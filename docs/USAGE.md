@@ -276,6 +276,7 @@ the local images after `create` and `push`, their references after `run`, the
 networks after `--network`, `network rm` and `network inspect`, and the volumes after
 `volume rm`. The names are all the service hands out without asking polkit, so this
 works for any user and under `sudo` without a password; secrets are not completed.
+Flags come once the word starts with `-`, or where there is no name to offer.
 
 `ps`, `machines ls`, `images ls`, `network ls` and `volume ls` take `--json` and print what the
 service answered instead of a table, and `nspawn inspect NAME...` prints the whole
