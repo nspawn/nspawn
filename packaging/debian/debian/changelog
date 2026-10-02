@@ -1,3 +1,9 @@
+nspawn (1.9.1-1) unstable; urgency=medium
+
+  * TAB offers names and subcommands alone on an empty word; the flags come once the word starts with a dash, or where there is no name to offer.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Thu, 01 Oct 2026 21:33:28 -0500
+
 nspawn (1.9.0-1) unstable; urgency=medium
 
   * Name completion in bash, zsh and fish: machines, images, references, networks and volumes, asked from the service at each TAB.
