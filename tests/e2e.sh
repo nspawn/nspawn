@@ -40,10 +40,10 @@ pyrun() { python3 -c 'import os, pty, sys; sys.exit(os.waitstatus_to_exitcode(pt
 addr_of() { $NSPAWN inspect "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)[0].get('address') or '')"; }
 nonce=$$
 # With SELinux enforcing, the service's domain must cover everything the suite makes it
-# do: its denials from here on fail the run (checked at the end).
-audit_log=/var/log/audit/audit.log
-audit_start=0
-[ -r "$audit_log" ] && audit_start=$(wc -l < "$audit_log")
+# do: its denials from here on fail the run (checked at the end, by the time of each
+# record, since the log may rotate meanwhile).
+audit_dir=/var/log/audit
+audit_start=$(date +%s)
 # The command line is a client of the org.nspawn service: it goes on the bus first,
 # with a configuration file that names the registry and its CA for the service's own
 # use (the command line passes them on every call anyway). A binary a package installed
@@ -2237,10 +2237,10 @@ out=$($NSPAWN --registry 127.0.0.1:9 search --source hub e2e-$nonce 2>&1 >/dev/n
 [ $rc -eq 0 ] || fail "search with an unreachable hub failed instead of warning: $out"
 echo "$out" | grep_q "warning: 127.0.0.1:9" || fail "search did not warn about the unreachable hub: $out"
 
-if [ "$(getenforce 2>/dev/null)" = Enforcing ] && [ -r "$audit_log" ]; then
-  # A rotated log starts over: read it whole then.
-  [ "$(wc -l < "$audit_log")" -ge "$audit_start" ] || audit_start=0
-  denials=$(tail -n +$((audit_start + 1)) "$audit_log" | grep "type=AVC" | grep "scontext=system_u:system_r:nspawn_t:" \
+if [ "$(getenforce 2>/dev/null)" = Enforcing ] && [ -r "$audit_dir/audit.log" ]; then
+  # The current log and those it rotated into, from the start of the run on.
+  denials=$(cat "$audit_dir"/audit.log* | awk -v since="$audit_start" '/type=AVC/ && substr($0, index($0, "audit(") + 6) + 0 >= since' \
+    | grep "scontext=system_u:system_r:nspawn_t:" \
     | grep -o 'denied  { [^}]*} for  pid=[0-9]* comm="[^"]*"\|tcontext=[^ ]*\|tclass=[^ ]*' | paste - - - | sed 's/pid=[0-9]* //' | sort | uniq -c)
   [ -z "$denials" ] || fail "SELinux denied the service:
 $denials"
