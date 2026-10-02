@@ -1,5 +1,6 @@
 //! org.nspawn.Manager at /org/nspawn: everything the command line does, as methods.
 //! Dictionaries (a{sv}) carry the results; the long operations come back as jobs.
+//! `Like` in the functions descriptions are references to Docker commands.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

@@ -1311,8 +1311,8 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
     }
     if args.force {
         // systemd 255 answers "Invalid argument" when some process of the unit cannot be
-        // signalled although the machine got its SIGKILL, so the answer decides nothing:
-        // the stop job goes in either way, and what counts is that the machine goes.
+        // signalled although the machine got its SIGKILL. To workaround this, the stop job
+        // goes in either way, and what counts is that the machine goes off.
         if record.is_some() {
             store.mark_signal(&args.name, libc::SIGKILL)?;
         }
@@ -1819,6 +1819,7 @@ fn in_nspawn_setup(comm: &str) -> bool {
 /// systemd-nspawn reports a machine started once its child has mounted its file systems,
 /// before the child confines itself: a command entering the machine in between would take
 /// the child's capabilities instead of the machine's. Waits, within reason, for the rest.
+/// https://github.com/systemd/systemd/issues/43976
 async fn wait_past_setup(machine: &str, leader: u32) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
