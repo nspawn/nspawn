@@ -38,7 +38,9 @@ export -f grep_q
 pyrun() { python3 -c 'import os, pty, sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"; }
 # A machine's address on its network, as inspect has it.
 addr_of() { $NSPAWN inspect "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)[0].get('address') or '')"; }
-nonce=$$
+# Unique across runs, since the journals keep what earlier runs wrote: the PID is not,
+# as a VM that has just booted gives the script the same one every time.
+nonce=$(date +%s)
 # With SELinux enforcing, the service's domain must cover everything the suite makes it
 # do: its denials from here on fail the run (checked at the end, by the time of each
 # record, since the log may rotate meanwhile).
@@ -763,7 +765,7 @@ $NSPAWN rm -f e2e-side-boot e2e-side-net >/dev/null || fail "rm the owners"
 
 step "run -d: a machine from an image and started in one step"
 # busybox is here as $app: run makes another machine of it without the registry.
-$NSPAWN run -d docker.io/library/busybox:latest --name e2e-run -p 18082:80 -- /bin/sh -c "mkdir -p /www; echo run-$nonce > /www/index.html; exec /bin/httpd -f -p 80 -h /www" > /tmp/e2e-run.txt 2>&1 || { cat /tmp/e2e-run.txt; fail "run from a local image"; }
+$NSPAWN run -d docker.io/library/busybox:latest --name e2e-run -p 18082:80 -- /bin/sh -c "mkdir -p /www; echo run-$nonce > /www/index.html; echo serving-$nonce; exec /bin/httpd -f -p 80 -h /www" > /tmp/e2e-run.txt 2>&1 || { cat /tmp/e2e-run.txt; fail "run from a local image"; }
 cat /tmp/e2e-run.txt
 grep_q "started e2e-run" /tmp/e2e-run.txt || fail "run did not say it started e2e-run"
 grep_q "downloading" /tmp/e2e-run.txt && fail "run downloaded an image that is here already"
@@ -782,8 +784,10 @@ $NSPAWN create docker.io/library/busybox:1.36 e2e-cpull --force > /tmp/e2e-cpull
 grep -q "downloading" /tmp/e2e-cpull.txt && fail "create pulled an image that is here already"
 $NSPAWN rm e2e-cpull >/dev/null && $NSPAWN images rm busybox-1.36 >/dev/null || fail "rm the created machine and its image"
 # Several machines at once: every line carries its machine's name; --until ends a follow.
+# The line looked for is this run's: the journal keeps what earlier machines of the name
+# printed, and a fresh host has none of it.
 $NSPAWN logs $app e2e-run --until now > /tmp/e2e-logs2.txt 2>&1 || fail "logs of two machines"
-grep -q "^e2e-run  *| " /tmp/e2e-logs2.txt || fail "logs of two machines carry no names: $(head -3 /tmp/e2e-logs2.txt)"
+retry 5 bash -c "$NSPAWN logs $app e2e-run --until now > /tmp/e2e-logs2.txt 2>&1; grep -q '^e2e-run  *| serving-$nonce' /tmp/e2e-logs2.txt" || fail "logs of two machines carry no names: $(head -3 /tmp/e2e-logs2.txt)"
 grep -q "^$app | " /tmp/e2e-logs2.txt || fail "logs of two machines miss $app"
 timeout 20 $NSPAWN logs e2e-run -f --until now >/dev/null 2>&1 || fail "logs -f --until did not end by itself"
 $NSPAWN rm -f e2e-run >/dev/null || fail "rm -f e2e-run"
