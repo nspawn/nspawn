@@ -285,6 +285,23 @@ failed install) is refused with `no machine or image named NAME`; the other name
 the same command are still tried. `pull` with `--name`
 ends up the same way but resolves the manifest through the registry first.
 
+### The same machines on another host
+
+`nspawn generate [NAME...]` prints the commands that make machines again, on another
+host or on this one after a reinstall: a shell script with `network create` for the
+networks they join, then `run -d` for each machine with every flag it keeps (networks
+and aliases, ports, entrypoint and command, environment, volumes, labels, restart
+policy, limits, healthcheck, docker's other flags and `--depends-on`), each after the
+machines it depends on or takes its network from, which come along when they are not
+named; an image without flags of its own is pulled again instead. Without names it
+covers every machine nspawn has. Run on the other host, the script starts the machines
+as they were brought up here. What a flag cannot carry is said in comments at the top:
+a secret is encrypted for this host, so `nspawn secret create` it there first; a host
+directory a machine mounts has to exist there; an image built here has to be pushed
+first. The contents of named volumes and of a machine's writable layer, and its
+address on a network, stay behind: volumes are seeded again from the image, and the
+addresses are handed out anew.
+
 ### Completions, the man page and JSON
 
 Completions for bash, zsh and fish come with the packages; from a build of your own,

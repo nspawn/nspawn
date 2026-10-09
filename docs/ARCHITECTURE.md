@@ -29,6 +29,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `health.rs` | healthchecks: the image's or the flags', the probe runner (`health-run`, a transient unit bound to the machine's), its verdict under `/run/nspawn/health` |
 | `api/secrets.rs` | secrets: systemd-creds around them, their files under the state directory, decrypted into a root-only tmpfs for a running machine and bind-mounted read-only |
 | `tuning.rs` | docker's other per-container flags (hostname, user, capabilities, tmpfs, devices, dns, ulimits, signals, sysctls, timezone), `--interface` and `--depends-on`: parsing, and the settings and unit lines they become |
+| `api/generate.rs` | `generate`: the `network create` and `run -d` commands that make machines again from their records, in the order of their dependencies, quoted for a shell |
 | `api/dependencies.rs` | `--depends-on`: the checks (machines of nspawn's, no cycle), the hook that waits for each condition (`await-dependencies`), the verdict on a dependency as its unit and healthcheck show it |
 | `getent.rs` | the getent stand-in bound into an app that runs as a user |
 | `bridge.rs`, `hostnet.rs` | the nspawn0 bridge, ports, firewalls; veth mode |

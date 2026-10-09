@@ -710,6 +710,14 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             MachinesCommand::Ls(a) => machines::ls(a, client).await,
         },
         Command::Ps(args) => machines::ls(args, client).await,
+        Command::Generate(args) => {
+            let script = manager
+                .generate(&args.names, Options::new())
+                .await
+                .map_err(client::error)?;
+            print!("{script}");
+            Ok(())
+        }
         Command::Inspect(args) => {
             let mut out = Vec::new();
             for name in &args.names {

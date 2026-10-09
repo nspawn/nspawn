@@ -8,6 +8,7 @@ pub mod copy;
 pub mod create;
 pub mod dependencies;
 pub mod events;
+pub mod generate;
 pub mod hub;
 pub mod images;
 pub mod login;

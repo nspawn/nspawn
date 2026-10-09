@@ -180,7 +180,7 @@ async fn caller_gone(connection: zbus::Connection, name: Option<String>) {
 /// networks (as), aliases (as), publish (as), entrypoint (s), env (as), volume (as),
 /// label (as), restart (s), memory (t), memory_swap (x), cpus (d), pids_limit (t),
 /// image_command (b), command (as), remove (b), and the flags of `health_overrides` and `tuning_overrides`.
-fn start_request(
+pub(crate) fn start_request(
     name: String,
     options: &mut Options<'_>,
     wait: bool,
@@ -343,6 +343,21 @@ impl Manager {
             .load_image(&name)?
             .ok_or_else(|| Error::Failed(format!("no image named {name}")))?;
         Ok(values::record(&record))
+    }
+
+    /// Like `generate`: the nspawn commands that make the named machines again, every
+    /// machine of nspawn's when none is named, with the networks they join and the
+    /// machines they depend on, as a shell script. No options yet.
+    async fn generate(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        names: Vec<String>,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<String> {
+        let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
+        Options::new(&options).finish()?;
+        Ok(api::generate::generate(self.ctx(), &names)?.render())
     }
 
     /// Like `pull`. Options: name (s), backend (s), mode (s), force (b), verify (b, default

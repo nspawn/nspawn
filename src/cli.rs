@@ -57,6 +57,10 @@ pub enum Command {
     Ps(PsArgs),
     /// Everything nspawn knows about machines or images, as JSON, like docker inspect.
     Inspect(InspectArgs),
+    /// Print the nspawn commands that make machines again, on another host or this one:
+    /// run -d with every flag a machine keeps, after the networks it joins and the
+    /// machines it depends on.
+    Generate(GenerateArgs),
     /// Boot an image as a machine.
     Start(StartArgs),
     /// Power off running machines.
@@ -763,6 +767,14 @@ pub struct OutputArgs {
 pub struct InspectArgs {
     /// Machine or image names.
     #[arg(required = true, add = candidates(Kind::Any))]
+    pub names: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct GenerateArgs {
+    /// Machine names (every machine of nspawn's when none is given); the machines they
+    /// depend on or take their network from come too.
+    #[arg(add = candidates(Kind::Any))]
     pub names: Vec<String>,
 }
 

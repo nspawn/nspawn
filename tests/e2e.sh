@@ -80,15 +80,15 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
   # The interfaces the --interface step makes, back on the host by now.
   ip link del e2e-dummy0 >/dev/null 2>&1 || true
   rmmod mac80211_hwsim >/dev/null 2>&1 || true
-  $NSPAWN network rm e2e-na e2e-nb e2e-nc e2e-nd e2e-ne >/dev/null 2>&1 || true
-  $NSPAWN secret rm e2e-pw e2e-pw2 >/dev/null 2>&1 || true
+  $NSPAWN network rm e2e-na e2e-nb e2e-nc e2e-nd e2e-ne e2e-gn >/dev/null 2>&1 || true
+  $NSPAWN secret rm e2e-pw e2e-pw2 e2e-gen-pw >/dev/null 2>&1 || true
   rm -f /var/lib/nspawn/secrets/e2e-pw.cred /var/lib/nspawn/secrets/e2e-pw.json /var/lib/nspawn/secrets/e2e-pw2.cred /var/lib/nspawn/secrets/e2e-pw2.json
   # Machines of run --rm have names of their own.
   for m in $($NSPAWN images ls 2>/dev/null | awk '$1 ~ /^busybox-1\.37-/ {print $1}'); do
@@ -102,7 +102,7 @@ cleanup_machines() {
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
   $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || true
-  rm -rf /tmp/e2e-cp /tmp/e2e-cp-* /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol /var/lib/nspawn/volumes/e2evol2 /var/lib/nspawn/volumes/e2evol-free /var/lib/nspawn/volumes/e2evol-home /var/lib/nspawn/volumes/e2evol-etc /var/lib/nspawn/volumes/e2evol-events /var/lib/nspawn/volumes/e2e-bootvol /var/lib/nspawn/volumes/.e2e-hidden
+  rm -rf /tmp/e2e-cp /tmp/e2e-cp-* /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol /var/lib/nspawn/volumes/e2evol2 /var/lib/nspawn/volumes/e2evol-free /var/lib/nspawn/volumes/e2evol-home /var/lib/nspawn/volumes/e2evol-etc /var/lib/nspawn/volumes/e2evol-events /var/lib/nspawn/volumes/e2evol-gen /var/lib/nspawn/volumes/e2e-bootvol /var/lib/nspawn/volumes/.e2e-hidden
   kill "${listener_pid:-}" 2>/dev/null || true
   if [ "$networkd_was" != active ]; then
     systemctl stop systemd-networkd.service systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-resolve-hook.socket >/dev/null 2>&1 || true
@@ -1624,6 +1624,46 @@ $NSPAWN start e2e-dep-web --depends-on none >/dev/null || fail "start with --dep
 grep -q "await-dependencies\|e2e-dep-db" $dropin && fail "--depends-on none left the dependencies in the drop-in: $(cat $dropin)"
 $NSPAWN rm -f e2e-dep-db e2e-dep-web e2e-dep-job >/dev/null || fail "rm the machines of the dependencies step"
 
+step "generate: the commands that make machines again, run back to the same machines"
+$NSPAWN network create e2e-gn --subnet 10.98.9.0/24 --label team=e2e >/dev/null || fail "network create for generate"
+printf 'gen-secret' | $NSPAWN secret create e2e-gen-pw >/dev/null || fail "secret create for generate"
+$NSPAWN create $app e2e-gen-db --network e2e-gn --health-cmd true --health-interval 1s -- /bin/sleep 300 >/dev/null || fail "create the machine generate brings along"
+$NSPAWN create $app e2e-gen-web --network e2e-gn --network-alias www -p 18097:8080 -e "GREETING=hello there" -e EMPTY= -v e2evol-gen:/data -l "tier=front end" --restart on-failure -m 64m --cpus 0.5 --pids-limit 200 --health-cmd "test -d /data" --health-interval 2s --hostname gen-web --cap-add NET_ADMIN --tmpfs /scratch:size=8m --add-host peer:10.1.1.1 --ulimit nofile=64:128 --stop-signal SIGINT --stop-timeout 4 --secret e2e-gen-pw --depends-on e2e-gen-db:healthy --entrypoint /bin/sh -- -c "echo 'gen ok'; exec /bin/sleep 300" >/dev/null || fail "create a machine with many flags"
+gen_keys() {
+  $NSPAWN inspect "$1" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)[0]
+# What a new machine of the same flags gets anew, or what only runs have.
+for k in ['created', 'address', 'addresses', 'state', 'started', 'leader', 'os', 'health', 'health_failing_streak', 'health_log', 'exit_code', 'machine_path', 'origin']:
+    d.pop(k, None)
+print(json.dumps(d, sort_keys=True, indent=1))"
+}
+gen_keys e2e-gen-web > /tmp/e2e-gen-web.before; gen_keys e2e-gen-db > /tmp/e2e-gen-db.before
+$NSPAWN generate e2e-gen-web > /tmp/e2e-gen.sh || fail "generate"
+cat /tmp/e2e-gen.sh
+grep_q "^# secret e2e-gen-pw is encrypted for this host" /tmp/e2e-gen.sh || fail "generate does not say the secret stays behind"
+grep_q "^nspawn network create e2e-gn --subnet 10.98.9.0/24" /tmp/e2e-gen.sh || fail "generate does not make the network"
+[ "$(grep -n '^nspawn run -d --name e2e-gen-db ' /tmp/e2e-gen.sh | cut -d: -f1)" -lt "$(grep -n '^nspawn run -d --name e2e-gen-web ' /tmp/e2e-gen.sh | cut -d: -f1)" ] || fail "generate does not make the dependency first"
+$NSPAWN generate > /tmp/e2e-gen-all.sh || fail "generate of every machine"
+grep_q "^nspawn run -d --name e2e-gen-web " /tmp/e2e-gen-all.sh || fail "generate without names left a machine out"
+out=$($NSPAWN generate e2e-nonexistent 2>&1) && fail "generate of a machine nspawn does not have"
+echo "$out" | grep_q "is not a machine of nspawn's" || fail "the missing machine was not explained: $out"
+# The machines and their network go, the script brings them back.
+$NSPAWN rm -f e2e-gen-web e2e-gen-db >/dev/null || fail "rm the machines generate described"
+$NSPAWN network rm e2e-gn >/dev/null || fail "network rm e2e-gn"
+sed "s#^nspawn #$NSPAWN #" /tmp/e2e-gen.sh | bash > /tmp/e2e-gen-run.txt 2>&1 || fail "the generated script failed: $(cat /tmp/e2e-gen-run.txt)"
+$NSPAWN network inspect e2e-gn | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['subnet'] == '10.98.9.0/24' and d['labels'] == {'team': 'e2e'}, d" || fail "the network came back otherwise"
+for m in e2e-gen-web e2e-gen-db; do
+  gen_keys $m > /tmp/$m.after
+  diff /tmp/$m.before /tmp/$m.after > /tmp/$m.diff || fail "$m came back otherwise: $(cat /tmp/$m.diff)"
+done
+$NSPAWN ps | grep_q "^ *e2e-gen-web .* running" || fail "the machine generate made again does not run"
+retry 5 bash -c "$NSPAWN logs e2e-gen-web | grep -q 'gen ok'" || fail "the command of the machine made again did not run"
+$NSPAWN rm -f e2e-gen-web e2e-gen-db >/dev/null || fail "rm the machines made again"
+$NSPAWN network rm e2e-gn >/dev/null || fail "network rm e2e-gn"
+$NSPAWN secret rm e2e-gen-pw >/dev/null || fail "secret rm e2e-gen-pw"
+$NSPAWN volume rm e2evol-gen >/dev/null || fail "volume rm e2evol-gen"
+
 step "restart, pause, unpause and top"
 $NSPAWN start $app -- /bin/sleep 300 >/dev/null || fail "start for restart"
 pid_before=$(machinectl show $app -p Leader --value)
@@ -2086,7 +2126,7 @@ if command -v busctl >/dev/null 2>&1; then
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
   $NSPAWN ps 2>&1 >/dev/null | grep_q "warning: the nspawn service runs" && fail "the command and the service disagree on their version: $($NSPAWN ps 2>&1 >/dev/null)"
-  for m in ListImages GetImage PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine PauseMachine UnpauseMachine MachineProcesses UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
+  for m in ListImages GetImage Generate PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine PauseMachine UnpauseMachine MachineProcesses UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do

@@ -26,6 +26,7 @@ pub trait Manager {
 
     fn list_images(&self) -> zbus::Result<Vec<Dict>>;
     fn get_image(&self, name: &str) -> zbus::Result<Dict>;
+    fn generate(&self, names: &[String], options: Options<'_>) -> zbus::Result<String>;
     fn pull_image(&self, reference: &str, options: Options<'_>) -> zbus::Result<OwnedObjectPath>;
     fn create_machine(
         &self,

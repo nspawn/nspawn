@@ -1104,6 +1104,152 @@ fn pump_prefixed(streams: Vec<(String, OwnedFd, OwnedFd)>) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A machine with every flag `generate` knows, and the same machine before any.
+    fn generated_pair() -> (crate::store::ImageRecord, crate::store::ImageRecord) {
+        let mut fresh: crate::store::ImageRecord = serde_json::from_value(serde_json::json!({
+            "name": "web",
+            "reference": "docker.io/library/nginx:1.27",
+            "manifest_digest": "sha256:00",
+            "layers": [],
+            "backend": "overlay",
+            "created": 0,
+        }))
+        .unwrap();
+        fresh.mode = crate::oci::Mode::App;
+        fresh.run.entrypoint = vec!["/docker-entrypoint.sh".into()];
+        fresh.run.cmd = vec!["nginx".into(), "-g".into(), "daemon off;".into()];
+        fresh.run.healthcheck = Some(crate::health::Healthcheck {
+            test: vec![
+                "CMD".into(),
+                "curl".into(),
+                "-f".into(),
+                "http://localhost/".into(),
+            ],
+            interval: 30_000_000,
+            timeout: 5_000_000,
+            retries: 3,
+            ..Default::default()
+        });
+        let mut r = fresh.clone();
+        crate::api::network::apply(
+            &mut r,
+            &crate::api::network::choices(&["backend".into(), "front".into()]).unwrap(),
+        );
+        r.aliases = crate::api::network::parse_aliases(
+            &["www".into(), "front=web-front".into()],
+            &["backend", "front"],
+        )
+        .unwrap();
+        r.ports = crate::bridge::parse_publish(&["127.0.0.1:8080:80".into(), "5353:53/udp".into()])
+            .unwrap();
+        r.entrypoint = Some(vec!["/bin/sh".into()]);
+        r.cmd = Some(vec!["-c".into(), "echo 'hi there'; exec nginx".into()]);
+        r.env = vec!["A=1".into(), "B=two words".into()];
+        r.volumes =
+            crate::volume::parse_volumes(&["data:/var/lib/data".into(), "/srv/x:/x:ro".into()])
+                .unwrap();
+        r.labels = [("tier".to_string(), "front end".to_string())].into();
+        r.restart = crate::policy::Restart::Always;
+        r.limits.memory = 512 << 20;
+        r.limits.memory_swap = -1;
+        r.limits.milli_cpus = 500;
+        r.limits.pids = 100;
+        r.healthcheck = Some(
+            crate::health::Overrides {
+                cmd: Some("test -f /ok".into()),
+                interval: Some(1_000_000),
+                retries: Some(2),
+                ..Default::default()
+            }
+            .apply(r.run.healthcheck.as_ref())
+            .unwrap(),
+        );
+        crate::tuning::Overrides {
+            hostname: Some("w1".into()),
+            user: Some("1000:1000".into()),
+            working_dir: Some("/srv".into()),
+            cap_add: vec!["NET_ADMIN".into()],
+            cap_drop: vec!["MKNOD".into()],
+            privileged: None,
+            read_only: Some(true),
+            tmpfs: vec!["/tmp:size=64m".into()],
+            shm_size: Some(64 << 20),
+            devices: vec!["/dev/null:/dev/nullo:r".into()],
+            interfaces: vec!["eth9".into()],
+            dns: vec!["10.0.0.53".into()],
+            dns_search: vec!["example.org".into()],
+            extra_hosts: vec![
+                "db:10.1.1.1".into(),
+                "v6=fd00::1".into(),
+                "gw:host-gateway".into(),
+            ],
+            ulimits: vec!["nofile=64:128".into(), "core=unlimited".into()],
+            oom_score_adj: Some(-500),
+            stop_signal: Some("SIGQUIT".into()),
+            stop_timeout: Some(3),
+            init: Some(true),
+            sysctls: vec!["net.ipv4.ip_forward=1".into()],
+            secrets: vec!["pw:/etc/pw:0400:1000:1000".into()],
+            timezone: Some("off".into()),
+            log_driver: Some("journal".into()),
+            depends_on: vec!["db:healthy".into(), "cache:optional".into()],
+        }
+        .apply(&mut r.tuning)
+        .unwrap();
+        (r, fresh)
+    }
+
+    #[test]
+    fn what_generate_prints_makes_the_same_machine_again() {
+        let (r, mut again) = generated_pair();
+        let command = crate::api::generate::machine_command(&r, "hub.example", false);
+        assert_eq!(
+            command[0],
+            ["run", "-d", "--name", "web", "docker.io/library/nginx:1.27"]
+        );
+        assert_eq!(
+            command.last().unwrap(),
+            &["--", "-c", "echo 'hi there'; exec nginx"]
+        );
+        let mut argv = vec!["nspawn".to_string()];
+        argv.extend(command.concat());
+        let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(&argv).unwrap();
+        let crate::cli::Command::Run(run) = cli.command else {
+            panic!("not run");
+        };
+        assert!(run.detach && !run.rm && !run.no_verify);
+        assert_eq!(run.name.as_deref(), Some("web"));
+        assert_eq!(run.reference, r.reference);
+        // What run sends the service, read back as the service reads it.
+        let options = start_options(run.options, run.command).unwrap();
+        let dict: HashMap<String, zbus::zvariant::OwnedValue> = options
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.try_into().unwrap()))
+            .collect();
+        let mut read = crate::daemon::values::Options::new(&dict);
+        let request = crate::daemon::manager::start_request("web".into(), &mut read, true).unwrap();
+        read.finish().unwrap();
+        crate::api::machines::apply_flags(&mut again, &request).unwrap();
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::to_value(&r).unwrap()
+        );
+        // And as a script a shell reads.
+        let script = crate::api::generate::Script {
+            notes: vec![],
+            commands: vec![command],
+        }
+        .render();
+        assert!(script.starts_with(
+            "nspawn run -d --name web docker.io/library/nginx:1.27 \\\n  --network backend \\\n  --network front \\\n"
+        ), "{script}");
+        assert!(script.contains("\\\n  -e 'B=two words' \\\n"), "{script}");
+        assert!(
+            script.ends_with("\\\n  -- -c 'echo '\\''hi there'\\''; exec nginx'\n"),
+            "{script}"
+        );
+    }
+
     #[test]
     fn machines_of_run_rm_get_names_of_their_own() {
         let a = run_name("alpine-3").unwrap();

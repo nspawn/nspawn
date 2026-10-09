@@ -800,87 +800,8 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     let previous_policy = record.as_ref().map(|r| r.restart).unwrap_or_default();
     match record.as_mut() {
         Some(r) => {
-            if !args.network.is_empty() {
-                crate::api::network::apply(r, &crate::api::network::choices(&args.network)?);
-            }
-            if !args.aliases.is_empty() {
-                if !bridge::bridge_kind(r) {
-                    bail!(
-                        "aliases are names on a bridge network; {} joins none",
-                        args.name
-                    );
-                }
-                r.aliases =
-                    crate::api::network::parse_aliases(&args.aliases, &bridge::networks_of(r))?;
-            }
-            if !args.publish.is_empty() {
-                r.ports = bridge::parse_publish(&args.publish)?;
-            }
-            if args.image_command {
-                r.entrypoint = None;
-                r.cmd = None;
-            }
-            if r.mode == Mode::Boot
-                && (!args.command.is_empty() || args.entrypoint.is_some() || !args.env.is_empty())
-            {
-                bail!(
-                    "{} boots an init system; a command, an entrypoint and variables only apply to the program of an app image",
-                    args.name
-                );
-            }
-            if let Some(entrypoint) = &args.entrypoint {
-                volume::reject_control_characters(entrypoint)?;
-                r.entrypoint = Some(if entrypoint.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![entrypoint.clone()]
-                });
-            }
-            if !args.command.is_empty() {
-                for arg in &args.command {
-                    volume::reject_control_characters(arg)?;
-                }
-                r.cmd = Some(args.command.clone());
-            }
-            if !args.env.is_empty() {
-                r.env = volume::parse_env(&args.env)?;
-            }
-            if !args.volume.is_empty() {
-                r.volumes = volume::parse_volumes(&args.volume)?;
-            }
-            if !args.label.is_empty() {
-                r.labels = volume::parse_labels(&args.label)?;
-            }
-            if let Some(restart) = args.restart {
-                r.restart = restart;
-            }
-            apply_limits(
-                &mut r.limits,
-                args.memory,
-                args.memory_swap,
-                args.cpus,
-                args.pids_limit,
-            )?;
-            r.limits.check(r.mode)?;
-            if !args.health.is_empty() {
-                let hc = args.health.apply(r.effective_healthcheck())?;
-                r.healthcheck = Some(hc);
-            }
-            args.tuning.apply(&mut r.tuning)?;
+            apply_flags(r, args)?;
             crate::api::dependencies::check(store, &args.name, &r.tuning.depends_on)?;
-            if r.mode == Mode::Boot
-                && (r.tuning.user.is_some() || r.tuning.working_dir.is_some() || r.tuning.init)
-            {
-                bail!(
-                    "{} boots an init system; --user, --workdir and --init only apply to the program of an app image",
-                    args.name
-                );
-            }
-            // Set on every start, so that a start without --rm keeps the machine.
-            if args.remove && r.restart != Restart::No {
-                bail!("--rm and a restart policy exclude each other: a machine removed when it ends cannot be restarted (--restart no)");
-            }
-            r.remove_on_exit = args.remove;
         }
         None if !args.command.is_empty()
             || !args.network.is_empty()
@@ -1018,6 +939,91 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
         return wait_for_init(sd, &args.name).await;
     }
     Ok(StartOutcome::Started)
+}
+
+/// What a start's flags make of the machine's record: each one given replaces what the
+/// machine had. Shared with the round trip of `generate`.
+pub fn apply_flags(r: &mut ImageRecord, args: &StartRequest) -> Result<()> {
+    if !args.network.is_empty() {
+        crate::api::network::apply(r, &crate::api::network::choices(&args.network)?);
+    }
+    if !args.aliases.is_empty() {
+        if !bridge::bridge_kind(r) {
+            bail!(
+                "aliases are names on a bridge network; {} joins none",
+                args.name
+            );
+        }
+        r.aliases = crate::api::network::parse_aliases(&args.aliases, &bridge::networks_of(r))?;
+    }
+    if !args.publish.is_empty() {
+        r.ports = bridge::parse_publish(&args.publish)?;
+    }
+    if args.image_command {
+        r.entrypoint = None;
+        r.cmd = None;
+    }
+    if r.mode == Mode::Boot
+        && (!args.command.is_empty() || args.entrypoint.is_some() || !args.env.is_empty())
+    {
+        bail!(
+            "{} boots an init system; a command, an entrypoint and variables only apply to the program of an app image",
+            args.name
+        );
+    }
+    if let Some(entrypoint) = &args.entrypoint {
+        volume::reject_control_characters(entrypoint)?;
+        r.entrypoint = Some(if entrypoint.is_empty() {
+            Vec::new()
+        } else {
+            vec![entrypoint.clone()]
+        });
+    }
+    if !args.command.is_empty() {
+        for arg in &args.command {
+            volume::reject_control_characters(arg)?;
+        }
+        r.cmd = Some(args.command.clone());
+    }
+    if !args.env.is_empty() {
+        r.env = volume::parse_env(&args.env)?;
+    }
+    if !args.volume.is_empty() {
+        r.volumes = volume::parse_volumes(&args.volume)?;
+    }
+    if !args.label.is_empty() {
+        r.labels = volume::parse_labels(&args.label)?;
+    }
+    if let Some(restart) = args.restart {
+        r.restart = restart;
+    }
+    apply_limits(
+        &mut r.limits,
+        args.memory,
+        args.memory_swap,
+        args.cpus,
+        args.pids_limit,
+    )?;
+    r.limits.check(r.mode)?;
+    if !args.health.is_empty() {
+        let hc = args.health.apply(r.effective_healthcheck())?;
+        r.healthcheck = Some(hc);
+    }
+    args.tuning.apply(&mut r.tuning)?;
+    if r.mode == Mode::Boot
+        && (r.tuning.user.is_some() || r.tuning.working_dir.is_some() || r.tuning.init)
+    {
+        bail!(
+            "{} boots an init system; --user, --workdir and --init only apply to the program of an app image",
+            args.name
+        );
+    }
+    // Set on every start, so that a start without --rm keeps the machine.
+    if args.remove && r.restart != Restart::No {
+        bail!("--rm and a restart policy exclude each other: a machine removed when it ends cannot be restarted (--restart no)");
+    }
+    r.remove_on_exit = args.remove;
+    Ok(())
 }
 
 /// Why the machine's start failed because of one it depends on, if that is why.

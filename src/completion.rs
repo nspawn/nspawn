@@ -244,6 +244,7 @@ mod tests {
                 ("nspawn start ", &["fedora-44", "old"]),
                 ("nspawn rm ", &["db", "fedora-44", "old", "web"]),
                 ("nspawn inspect ", &["db", "fedora-44", "old", "web"]),
+                ("nspawn generate ", &["db", "fedora-44", "old", "web"]),
                 ("nspawn logs ", &["db", "fedora-44", "old", "web"]),
                 ("nspawn restart ", &["db", "fedora-44", "old", "web"]),
                 ("nspawn update ", &["db", "fedora-44", "old", "web"]),

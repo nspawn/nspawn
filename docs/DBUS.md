@@ -35,7 +35,7 @@ from the `[registries."host"]` tables of its file (the hub's is built in):
 a client chooses the registry, never the policy.
 
 Every user may call; who may do what is polkit's answer. The methods that
-only read (`ListImages`, `GetImage`, `ListMachines`, `GetMachine`,
+only read (`ListImages`, `GetImage`, `Generate`, `ListMachines`, `GetMachine`,
 `MachineStats`, `MachineProcesses`, `Events`, `ListNetworks`, `GetNetwork`,
 `ListVolumes`, `ListSecrets`, `GetSecret`) ask for
 `org.nspawn.inspect`, the rest for `org.nspawn.manage`, and both are for
@@ -127,6 +127,7 @@ hundred that ended; older ones are gone with their objects).
 | `UpdateMachine(s name, a{sv} options) -> b` | `update` | options restart, memory, memory_swap, cpus, pids_limit and the health_* ones as for StartMachine (0 removes a limit, absent keeps it); a running machine gets the limits at once and its probes start over; true when it was running |
 | `PauseMachine(s name)`, `UnpauseMachine(s name)` | `pause`, `unpause` | the machine's cgroup frozen and thawed (docker pause); fail for a machine that is not running |
 | `MachineProcesses(s name) -> aa{sv}` | `top` | the processes in the machine's PID namespace, from its cgroup: pid (u), user (s, the uid as the machine sees it, root for 0), time (s, CPU time HH:MM:SS), command (s) |
+| `Generate(as names, a{sv} options) -> s` | `generate` | a shell script that makes the named machines again, every machine of nspawn's when none is named: `network create` for the networks they join, then `run -d` with every flag a machine keeps (`pull` for an image without flags of its own), each after the machines it depends on or takes its network from, which come along; what the flags cannot carry (secrets, host directories, images built on this host) as comments at the top; no options yet |
 | `KillMachine(s name, a{sv} options) -> as` | `kill` | option signal (a name such as KILL, SIGHUP or RTMIN+3, or a number; SIGKILL by default): SIGKILL is StopMachine with force, other signals go to an app's program or a booted machine's init; the machine's own stop signal keeps a restart policy from bringing it back, other signals leave that to the policy; fails for a machine that is not running; the notes |
 | `Exec(s machine, as argv, s user, a{sv} options) -> (a{sh}, o)` | `exec` | user "" for root; options tty (default true), rows, cols, env (the caller's `TERM=` among them; xterm otherwise on a terminal), workdir (s, instead of the machine's), detach (b: no streams come back, the output is discarded and the command runs on); returns the streams ("tty", or "stdin", "stdout", "stderr") and a process object |
 | `Shell(s machine, s user, a{sv} options) -> (h, s)` | `shell` | the login session machined offers for a booted machine: its pseudo terminal and the terminal's path; options env, as for `Exec`; apps get `Exec` of a shell with a tty instead |
