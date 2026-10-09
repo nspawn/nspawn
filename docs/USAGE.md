@@ -119,6 +119,27 @@ probes with their output, and `events` a `health_status` on every change. The pr
 from a unit of their own (`nspawn-health-NAME.service`) bound to the machine's, so they
 go with it.
 
+### Dependencies
+
+`--depends-on NAME[:CONDITION][:optional]` on `run`, `create` and `start` is compose's
+`depends_on` for one machine: the other machine is started first, and this one waits for
+what the condition asks of it. `started`, the default, asks that its start went through;
+`healthy` that its healthcheck says healthy (it needs one, and an unhealthy verdict fails
+the start); `completed` that its program ended with 0, for a machine that prepares
+something and exits, such as a migration, which then runs again at every start of the
+machines that depend on it, as with `docker compose up`. With `:optional` a failure of
+the other machine is a warning and this one starts anyway. The flag is repeatable and
+remembered, `--depends-on none` forgets them; the machines named must be nspawn's, and a
+cycle is refused.
+
+systemd does the work: the machine's unit wants the other one's and is ordered after it,
+and its first hook waits for the condition, so `machinectl start`, a start at boot and a
+restart policy follow the same order as `nspawn start`, which says which machines it
+started first. A start that waits for `healthy` or `completed` has no time limit, since
+it lasts as long as the other machine takes; `nspawn stop` ends it. Stopping a machine
+leaves the ones that depend on it running, as compose does, and `rm` refuses a machine
+others depend on unless they go in the same command.
+
 ### The other flags of docker run
 
 The other flags of `docker run` are there too, remembered like the rest: `--hostname`,

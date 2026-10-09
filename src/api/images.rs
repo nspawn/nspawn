@@ -137,6 +137,28 @@ pub async fn remove_machines(
         ));
         skip.insert(name);
     }
+    // Nor one another machine depends on, unless that one goes too: systemd would start
+    // a machine that is not there before it.
+    for name in names
+        .iter()
+        .filter(|n| !skip.contains(*n))
+        .cloned()
+        .collect::<Vec<_>>()
+    {
+        let dependents = crate::api::dependencies::dependents(&records, &name, names);
+        if !dependents.is_empty() {
+            let (verb, them) = if dependents.len() == 1 {
+                ("depends", "it")
+            } else {
+                ("depend", "them")
+            };
+            removal.failed.push((
+                name.clone(),
+                format!("{} {verb} on {name} (--depends-on); remove {them} too, or start {them} with --depends-on none first", dependents.join(", ")),
+            ));
+            skip.insert(name);
+        }
+    }
     if force {
         let valid: Vec<&String> = names.iter().filter(|n| !skip.contains(*n)).collect();
         for name in valid {

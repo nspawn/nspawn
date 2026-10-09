@@ -102,6 +102,10 @@ pub enum Command {
     /// From a transient unit: runs a machine's health probes until it is gone.
     #[command(hide = true)]
     HealthRun { name: String },
+    /// ExecStartPre of a machine with --depends-on: waits until the other machines are
+    /// what it asks of them.
+    #[command(hide = true)]
+    AwaitDependencies { name: String },
     /// ExecStart of an app machine: runs systemd-nspawn with the terminal or input an
     /// attached run hands over, or as it is.
     #[command(hide = true)]
@@ -522,6 +526,12 @@ pub struct TuningArgs {
     /// Repeatable; "none" forgets them.
     #[arg(long, value_name = "NAME[:TARGET[:MODE[:UID:GID]]]")]
     pub secret: Vec<String>,
+    /// Another machine to start first, like compose's depends_on: started (the default),
+    /// healthy (its healthcheck passes) or completed (its program ended with 0); with
+    /// :optional a failure of it is a warning. systemd follows it at boot as well.
+    /// Repeatable; "none" forgets them.
+    #[arg(long, value_name = "NAME[:CONDITION][:optional]", add = candidates(Kind::Any))]
+    pub depends_on: Vec<String>,
 }
 
 /// docker's --health-* flags, on top of the image's HEALTHCHECK; remembered.
@@ -1128,6 +1138,30 @@ mod tests {
             panic!("not run");
         };
         assert_eq!(run.options.tuning.log_driver.as_deref(), Some("none"));
+        let cli = Cli::try_parse_from([
+            "nspawn",
+            "run",
+            "-d",
+            "--depends-on",
+            "db:healthy",
+            "--depends-on",
+            "migrate:completed",
+            "img",
+        ])
+        .unwrap();
+        let Command::Run(run) = cli.command else {
+            panic!("not run");
+        };
+        assert_eq!(
+            run.options.tuning.depends_on,
+            ["db:healthy", "migrate:completed"]
+        );
+        let cli =
+            Cli::try_parse_from(["nspawn", "create", "img", "web", "--depends-on", "db"]).unwrap();
+        let Command::Create(create) = cli.command else {
+            panic!("not create");
+        };
+        assert_eq!(create.tuning.depends_on, ["db"]);
         let cli =
             Cli::try_parse_from(["nspawn", "start", "web", "-m", "1g", "--memory-swap", "-1"])
                 .unwrap();

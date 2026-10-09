@@ -36,6 +36,64 @@ pub struct ExtraHost {
     pub ip: String,
 }
 
+/// What a machine waits for of another one it depends on, as compose's depends_on
+/// conditions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Condition {
+    /// Its start went through.
+    Started,
+    /// Its healthcheck says healthy.
+    Healthy,
+    /// Its program ended with 0.
+    Completed,
+}
+
+impl Condition {
+    pub fn name(self) -> &'static str {
+        match self {
+            Condition::Started => "started",
+            Condition::Healthy => "healthy",
+            Condition::Completed => "completed",
+        }
+    }
+
+    /// What is waited for, after the machine's name.
+    pub fn awaited(self) -> &'static str {
+        match self {
+            Condition::Started => "to start",
+            Condition::Healthy => "to be healthy",
+            Condition::Completed => "to complete",
+        }
+    }
+
+    /// Whether the condition can take longer than a start: the unit's start then has no
+    /// time limit.
+    pub fn waits(self) -> bool {
+        self != Condition::Started
+    }
+}
+
+/// An entry of --depends-on: another machine started before this one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dependency {
+    pub name: String,
+    pub condition: Condition,
+    /// A failure of the other machine is a warning instead of failing this one's start.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
+}
+
+impl std::fmt::Display for Dependency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.name, self.condition.name())?;
+        if self.optional {
+            f.write_str(":optional")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tuning {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,6 +156,9 @@ pub struct Tuning {
     /// "journal" for the system's journal, "none" to drop it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_driver: Option<String>,
+    /// --depends-on: machines started first, each with what is waited for of it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<Dependency>,
 }
 
 /// --log-driver: local (the default: a journal namespace of nspawn's own, kept apart
@@ -451,6 +512,7 @@ pub struct Overrides {
     pub secrets: Vec<String>,
     pub timezone: Option<String>,
     pub log_driver: Option<String>,
+    pub depends_on: Vec<String>,
 }
 
 fn cleared(values: &[String]) -> bool {
@@ -598,8 +660,44 @@ impl Overrides {
                 }
             }
         }
+        if !self.depends_on.is_empty() {
+            t.depends_on = list(&self.depends_on, dependency)?;
+            let mut names = std::collections::BTreeSet::new();
+            for dep in &t.depends_on {
+                if !names.insert(&dep.name) {
+                    bail!("--depends-on: {} is named twice", dep.name);
+                }
+            }
+        }
         Ok(())
     }
+}
+
+/// --depends-on NAME[:CONDITION][:optional], the condition started unless given.
+pub fn dependency(text: &str) -> Result<Dependency> {
+    let mut fields = text.split(':');
+    let name = fields.next().unwrap_or_default();
+    crate::reference::validate_machine_name(name)
+        .with_context(|| format!("--depends-on {text}"))?;
+    let mut dep = Dependency {
+        name: name.to_string(),
+        condition: Condition::Started,
+        optional: false,
+    };
+    let mut condition = None;
+    for field in fields {
+        match field {
+            "optional" if !dep.optional => dep.optional = true,
+            "started" if condition.is_none() => condition = Some(Condition::Started),
+            "healthy" if condition.is_none() => condition = Some(Condition::Healthy),
+            "completed" if condition.is_none() => condition = Some(Condition::Completed),
+            _ => bail!(
+                "--depends-on {text}: NAME[:CONDITION][:optional], the condition started, healthy or completed"
+            ),
+        }
+    }
+    dep.condition = condition.unwrap_or(Condition::Started);
+    Ok(dep)
 }
 
 /// USER[:GROUP]: neither side empty when the colon is there.
@@ -837,6 +935,7 @@ mod tests {
             privileged: None,
             timezone: Some("off".into()),
             log_driver: None,
+            depends_on: Vec::new(),
         };
         let mut t = Tuning::default();
         flags.apply(&mut t).unwrap();
@@ -1179,5 +1278,67 @@ mod tests {
         assert!(!t.drops_output());
         driver("local").apply(&mut t).unwrap();
         assert_eq!(t.log_driver, None, "local is the default, not remembered");
+    }
+
+    #[test]
+    fn dependencies_are_parsed_with_their_condition() {
+        let parsed = |text: &str| dependency(text).map(|d| d.to_string());
+        assert_eq!(parsed("db").unwrap(), "db:started");
+        assert_eq!(parsed("db:healthy").unwrap(), "db:healthy");
+        assert_eq!(
+            parsed("db:completed:optional").unwrap(),
+            "db:completed:optional"
+        );
+        assert_eq!(parsed("db:optional").unwrap(), "db:started:optional");
+        assert_eq!(
+            parsed("db:optional:healthy").unwrap(),
+            "db:healthy:optional"
+        );
+        for bad in [
+            "",
+            ":healthy",
+            "db:",
+            "db:ready",
+            "db:healthy:started",
+            "db:optional:optional",
+            "a/b",
+            "db:healthy:optional:x",
+        ] {
+            assert!(dependency(bad).is_err(), "{bad:?}");
+        }
+        assert!(Condition::Healthy.waits() && Condition::Completed.waits());
+        assert!(!Condition::Started.waits());
+        let mut t = Tuning::default();
+        Overrides {
+            depends_on: vec![
+                "db:healthy".into(),
+                "migrate:completed".into(),
+                "cache:optional".into(),
+            ],
+            ..Overrides::default()
+        }
+        .apply(&mut t)
+        .unwrap();
+        let text = serde_json::to_string(&t).unwrap();
+        assert_eq!(
+            text,
+            r#"{"depends_on":[{"name":"db","condition":"healthy"},{"name":"migrate","condition":"completed"},{"name":"cache","condition":"started","optional":true}]}"#
+        );
+        assert_eq!(serde_json::from_str::<Tuning>(&text).unwrap(), t);
+        let twice = Overrides {
+            depends_on: vec!["db".into(), "db:healthy".into()],
+            ..Overrides::default()
+        };
+        assert_eq!(
+            twice.apply(&mut Tuning::default()).unwrap_err().to_string(),
+            "--depends-on: db is named twice"
+        );
+        Overrides {
+            depends_on: vec!["none".into()],
+            ..Overrides::default()
+        }
+        .apply(&mut t)
+        .unwrap();
+        assert!(t.depends_on.is_empty() && t.is_default());
     }
 }

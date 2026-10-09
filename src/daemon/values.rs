@@ -235,6 +235,16 @@ pub fn record(r: &ImageRecord) -> Dict {
                     .collect::<Vec<_>>(),
             ),
         ),
+        (
+            "depends_on".to_string(),
+            strings(
+                &r.tuning
+                    .depends_on
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>(),
+            ),
+        ),
         ("image_volumes".to_string(), strings(&r.run.volumes)),
         (
             "healthcheck".to_string(),

@@ -59,7 +59,9 @@ requirements, building from source and usage examples.
   `--restart`, `-m`, `--cpus`, `--pids-limit`, the `--health-*` flags, `--secret`,
   `--label`, `--hostname`, `-u`, `-w`, `--cap-add`, `--cap-drop`, `--privileged`,
   `--read-only`, `--tmpfs`, `--device`, `--dns`, `--add-host`, `--ulimit`,
-  `--stop-signal`, `--log-driver` and the rest, remembered per machine; what a machine
+  `--stop-signal`, `--log-driver`, `--depends-on` and the rest, remembered per machine;
+  `--depends-on` starts other machines first and waits for them to be started, healthy
+  or completed, at boot as well, since systemd keeps the order; what a machine
   prints goes to a journal of nspawn's own, apart from the system's, which `logs`
   reads. `--interface` hands a
   machine a network interface of the host, a wifi adapter with its phy included;

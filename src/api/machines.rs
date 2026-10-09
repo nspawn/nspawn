@@ -42,7 +42,11 @@ pub struct MachineSummary {
 }
 
 /// The exit code of the machine's last run, as an attached run would have given it.
-async fn last_exit_code(sd: &Systemd, store: &Store, record: &ImageRecord) -> Option<i32> {
+pub(crate) async fn last_exit_code(
+    sd: &Systemd,
+    store: &Store,
+    record: &ImageRecord,
+) -> Option<i32> {
     let unit = format!("systemd-nspawn@{}.service", record.name);
     // The unit's own ExecMainCode= goes with it when it is unloaded; the journal keeps
     // what systemd logged when it reaped the process.
@@ -863,6 +867,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
                 r.healthcheck = Some(hc);
             }
             args.tuning.apply(&mut r.tuning)?;
+            crate::api::dependencies::check(store, &args.name, &r.tuning.depends_on)?;
             if r.mode == Mode::Boot
                 && (r.tuning.user.is_some() || r.tuning.working_dir.is_some() || r.tuning.init)
             {
@@ -910,6 +915,10 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     }
     let booted = record.as_ref().is_none_or(|r| r.mode == Mode::Boot);
     let policy = record.as_ref().map(|r| r.restart);
+    let deps = record
+        .as_ref()
+        .map(|r| r.tuning.depends_on.clone())
+        .unwrap_or_default();
     let network = prepare(sd, store, config, &args.name, record, Pass::Ahead, report).await?;
     // The unit's own hooks take the lock; it must be free while the unit starts.
     drop(lock);
@@ -931,7 +940,41 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     // firewalld only knows a veth once the machine is registered, and published ports
     // need it registered too.
     let firewalld = network == Network::Veth && hostnet::firewalld_running(sd).await;
-    if sd.start_machine(&args.name).await? {
+    // systemd starts the machines this one depends on, the ones down now said afterwards.
+    let mut down = Vec::new();
+    for dep in &deps {
+        let unit = format!("systemd-nspawn@{}.service", dep.name);
+        if !sd.unit_status(&unit).await?.busy() {
+            down.push(dep);
+        }
+    }
+    let patient = deps.iter().any(|d| d.condition.waits());
+    let restarting = match sd.start_machine(&args.name, patient).await {
+        Ok(restarting) => restarting,
+        // The hook's reason, which the job's result does not carry.
+        Err(e) => match dependency_failure(store, sd, &args.name).await {
+            Some(why) => bail!("{} did not start: {why}", args.name),
+            None => return Err(e),
+        },
+    };
+    for dep in down {
+        let unit = format!("systemd-nspawn@{}.service", dep.name);
+        if sd.unit_status(&unit).await?.active != "failed" {
+            note(
+                report,
+                format!("{} started first: {} depends on it", dep.name, args.name),
+            );
+        } else if dep.optional {
+            note(
+                report,
+                format!("warning: {} failed to start; it is optional, so {} started anyway (journalctl -u {unit} says why)", dep.name, args.name),
+            );
+        }
+    }
+    if restarting {
+        if let Some(why) = dependency_failure(store, sd, &args.name).await {
+            note(report, format!("warning: {why}"));
+        }
         return Ok(StartOutcome::Restarting);
     }
     if args.wait || firewalld || network == Network::Bridge {
@@ -975,6 +1018,12 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
         return wait_for_init(sd, &args.name).await;
     }
     Ok(StartOutcome::Started)
+}
+
+/// Why the machine's start failed because of one it depends on, if that is why.
+async fn dependency_failure(store: &Store, sd: &Systemd, name: &str) -> Option<String> {
+    let record = store.load_image(name).ok()??;
+    crate::api::dependencies::failure(sd, store, &record).await
 }
 
 /// 0 removes a limit; None keeps it. Removing the memory limit takes a total of memory
@@ -1282,8 +1331,13 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         sd.reload().await?;
     }
     if !sd.machine_exists(&args.name).await? {
-        // A start is preparing it: its network must not be released under it.
-        if store.is_starting(&args.name) {
+        // A start is preparing it: its network must not be released under it. One that
+        // waits in its unit for the machines it depends on is systemd's to stop.
+        let waiting = record
+            .as_ref()
+            .is_some_and(|r| r.tuning.depends_on.iter().any(|d| d.condition.waits()))
+            && sd.unit_status(&unit).await?.busy();
+        if store.is_starting(&args.name) && !waiting {
             bail!("machine {} is starting; stop it once it runs", args.name);
         }
         // Ended, or between two runs of a restart policy (nspawn's or an administrator's):

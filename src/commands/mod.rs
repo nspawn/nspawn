@@ -69,6 +69,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             api::network::remove_after_exit(&Context::new(config), &name, &invocation).await
         }
         Command::HealthRun { name } => crate::health::run(&Context::new(config), &name).await,
+        Command::AwaitDependencies { name } => {
+            api::dependencies::await_all(&Context::new(config), &name).await
+        }
         // The unit hooks must not depend on the service: a machine starts on its own.
         Command::Network(args) => match args.command {
             NetworkCommand::Prepare { name } => {
@@ -250,6 +253,7 @@ pub fn put_tuning(options: &mut Options<'_>, t: crate::cli::TuningArgs) {
         ("ulimits", t.ulimit),
         ("sysctls", t.sysctl),
         ("secrets", t.secret),
+        ("depends_on", t.depends_on),
     ] {
         put_all(options, key, values);
     }
@@ -736,6 +740,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         | Command::Manpage
         | Command::RemoveAfterExit { .. }
         | Command::HealthRun { .. }
+        | Command::AwaitDependencies { .. }
         | Command::AttachExec { .. } => {
             unreachable!("handled before")
         }

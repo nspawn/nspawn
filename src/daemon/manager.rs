@@ -269,6 +269,7 @@ fn tuning_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::tuning::
         init: options.maybe_bool("init")?,
         sysctls: options.strings("sysctls")?,
         secrets: options.strings("secrets")?,
+        depends_on: options.strings("depends_on")?,
     })
 }
 

@@ -262,6 +262,10 @@ mod tests {
                     "nspawn run docker.io/library/nginx:1.27 --network ",
                     &["backend", "bridge", "host", "none", "veth"],
                 ),
+                (
+                    "nspawn create old web --depends-on ",
+                    &["db", "fedora-44", "old", "web"],
+                ),
             ] {
                 assert_eq!(complete(line), expected, "{line:?}");
             }

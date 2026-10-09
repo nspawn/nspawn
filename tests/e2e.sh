@@ -80,7 +80,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -1552,6 +1552,77 @@ sleep 1
 systemctl is-active nspawn-health-$app.service >/dev/null 2>&1 && fail "a runner started for a disabled healthcheck"
 $NSPAWN ps | grep "^ *$app " | grep_q "health" && fail "ps shows a health for a machine without healthcheck"
 $NSPAWN stop $app || fail "stop"
+
+step "--depends-on: other machines started first and waited for, by nspawn start and by systemd alike"
+dep_since=$(date +%s)
+dropin=/etc/systemd/system/systemd-nspawn@e2e-dep-web.service.d/nspawn-hooks.conf
+$NSPAWN create $app e2e-dep-db --health-cmd "test -f /ok" --health-interval 1s --health-retries 100 -- /bin/sleep 300 >/dev/null || fail "create the machine depended on"
+$NSPAWN create $app e2e-dep-job -- /bin/sh -c "echo job-ran-$nonce" >/dev/null || fail "create the machine that completes"
+$NSPAWN create $app e2e-dep-web --depends-on e2e-dep-db:healthy --depends-on e2e-dep-job:completed -- /bin/sleep 300 >/dev/null || fail "create a machine with dependencies"
+$NSPAWN inspect e2e-dep-web | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['depends_on'] == ['e2e-dep-db:healthy', 'e2e-dep-job:completed'], d['depends_on']" || fail "inspect does not show the dependencies"
+# The start goes on as long as e2e-dep-db is not healthy, both started by systemd.
+$NSPAWN start e2e-dep-web > /tmp/e2e-dep-start.txt 2>&1 &
+dep_start=$!
+retry 10 bash -c "journalctl -u systemd-nspawn@e2e-dep-web.service --since @$dep_since | grep -q 'e2e-dep-web waits for e2e-dep-db to be healthy'" || fail "the hook does not say what it waits for: $(journalctl -u systemd-nspawn@e2e-dep-web.service --since @$dep_since | tail -5)"
+$NSPAWN ps | grep_q "^ *e2e-dep-db .* running" || fail "the machine depended on was not started: $($NSPAWN ps)"
+sleep 2
+[ "$(systemctl show -p ActiveState --value systemd-nspawn@e2e-dep-web.service)" = activating ] || fail "the machine did not wait for its dependency: $(systemctl show -p ActiveState --value systemd-nspawn@e2e-dep-web.service)"
+machinectl show e2e-dep-web >/dev/null 2>&1 && fail "the machine ran before its dependency was healthy"
+$NSPAWN exec e2e-dep-db -- touch /ok </dev/null || fail "touch /ok in the machine depended on"
+wait $dep_start || fail "start of a machine with dependencies: $(cat /tmp/e2e-dep-start.txt)"
+cat /tmp/e2e-dep-start.txt
+grep_q "e2e-dep-db started first: e2e-dep-web depends on it" /tmp/e2e-dep-start.txt || fail "start does not say it started e2e-dep-db first"
+grep_q "e2e-dep-job started first" /tmp/e2e-dep-start.txt || fail "start does not say it ran e2e-dep-job first"
+$NSPAWN ps | grep_q "^ *e2e-dep-web .* running" || fail "the machine with dependencies is not running"
+retry 5 bash -c "$NSPAWN logs e2e-dep-job | grep -q job-ran-$nonce" || fail "the machine that completes did not run"
+grep -q "^Wants=systemd-nspawn@e2e-dep-db.service$" $dropin && grep -q "^After=systemd-nspawn@e2e-dep-job.service$" $dropin && grep -q "await-dependencies %i$" $dropin && grep -q "^TimeoutStartSec=infinity$" $dropin || fail "the drop-in lacks the dependencies: $(cat $dropin)"
+# Stopping a dependency leaves the machine alone; removing it is refused.
+$NSPAWN stop e2e-dep-db >/dev/null || fail "stop the machine depended on"
+$NSPAWN ps | grep_q "^ *e2e-dep-web .* running" || fail "stopping a dependency stopped the machine that depends on it"
+out=$($NSPAWN rm -f e2e-dep-db 2>&1) && fail "a machine another one depends on was removed"
+echo "$out" | grep_q "e2e-dep-web depends on e2e-dep-db" || fail "the refused removal was not explained: $out"
+# What is refused before anything changes.
+out=$($NSPAWN start e2e-dep-db --depends-on e2e-dep-web 2>&1) && fail "a cycle of dependencies was accepted"
+echo "$out" | grep_q "cycle, e2e-dep-db -> e2e-dep-web -> e2e-dep-db" || fail "the cycle was not explained: $out"
+out=$($NSPAWN create $app e2e-dep-x --depends-on e2e-dep-x -- /bin/true 2>&1) && fail "a machine depending on itself was created"
+echo "$out" | grep_q "cannot depend on itself" || fail "the self dependency was not explained: $out"
+out=$($NSPAWN create $app e2e-dep-x --depends-on e2e-nowhere -- /bin/true 2>&1) && fail "a dependency on no machine was accepted"
+echo "$out" | grep_q "no machine of nspawn's" || fail "the missing dependency was not explained: $out"
+out=$($NSPAWN create $app e2e-dep-x --depends-on e2e-dep-db:ready -- /bin/true 2>&1) && fail "an unknown condition was accepted"
+echo "$out" | grep_q "started, healthy or completed" || fail "the unknown condition was not explained: $out"
+$NSPAWN images ls | grep_q "^ *e2e-dep-x " && fail "a refused create left a machine"
+# A dependency that does not complete fails the start with its exit code, unless optional.
+$NSPAWN stop e2e-dep-web >/dev/null || fail "stop the machine with dependencies"
+$NSPAWN start e2e-dep-job -- /bin/sh -c "exit 3" >/dev/null 2>&1
+out=$($NSPAWN start e2e-dep-web 2>&1) && fail "a machine started although a dependency failed"
+echo "$out" | grep_q "e2e-dep-web did not start: e2e-dep-job, which e2e-dep-web waits for to complete, exited with 3" || fail "the failed dependency was not explained: $out"
+$NSPAWN start e2e-dep-web --depends-on e2e-dep-db:healthy --depends-on e2e-dep-job:completed:optional > /tmp/e2e-dep-start.txt 2>&1 || fail "start with a failing optional dependency: $(cat /tmp/e2e-dep-start.txt)"
+grep_q "warning: e2e-dep-job failed to start; it is optional" /tmp/e2e-dep-start.txt || fail "the failed optional dependency was not reported: $(cat /tmp/e2e-dep-start.txt)"
+journalctl -u systemd-nspawn@e2e-dep-web.service --since @$dep_since | grep_q "it is optional, so e2e-dep-web starts anyway" || fail "the hook did not warn of the optional dependency"
+# systemd alone, as at boot: the unit pulls in what it depends on.
+$NSPAWN stop e2e-dep-web e2e-dep-db >/dev/null || fail "stop both"
+timeout 120 systemctl start systemd-nspawn@e2e-dep-web.service || fail "systemctl start of a machine with dependencies"
+$NSPAWN ps | grep_q "^ *e2e-dep-db .* running" || fail "systemd did not start the dependency first"
+$NSPAWN ps | grep "^ *e2e-dep-db " | grep_q "(healthy)" || fail "systemd started the machine before its dependency was healthy: $($NSPAWN ps)"
+retry 5 bash -c "$NSPAWN ps | grep -q '^ *e2e-dep-web .* running'" || fail "the machine started by systemd does not run"
+# A start that waits can be stopped: its unit is systemd's by then.
+$NSPAWN stop e2e-dep-web >/dev/null || fail "stop the machine started by systemd"
+$NSPAWN exec e2e-dep-db -- rm /ok </dev/null || fail "rm /ok"
+$NSPAWN restart e2e-dep-db >/dev/null || fail "restart the machine depended on"
+retry 5 bash -c "$NSPAWN ps | grep '^ *e2e-dep-db ' | grep -q 'health: starting'" || fail "e2e-dep-db did not start over its healthcheck: $($NSPAWN ps)"
+$NSPAWN start e2e-dep-web > /tmp/e2e-dep-start.txt 2>&1 &
+dep_start=$!
+retry 10 bash -c "[ \"\$(systemctl show -p ActiveState --value systemd-nspawn@e2e-dep-web.service)\" = activating ]" || fail "the machine is not waiting"
+$NSPAWN stop e2e-dep-web >/dev/null || fail "stop a machine waiting for its dependencies"
+wait $dep_start && fail "a start whose machine was stopped succeeded"
+[ "$(systemctl show -p ActiveState --value systemd-nspawn@e2e-dep-web.service)" = activating ] && fail "the waiting start is still there"
+# started alone asks for no wait, and none forgets them.
+$NSPAWN start e2e-dep-web --depends-on e2e-dep-db >/dev/null || fail "start with a started dependency"
+grep -q "^TimeoutStartSec=" $dropin && fail "a started dependency took the time limit off the start"
+$NSPAWN stop e2e-dep-web >/dev/null || fail "stop"
+$NSPAWN start e2e-dep-web --depends-on none >/dev/null || fail "start with --depends-on none"
+grep -q "await-dependencies\|e2e-dep-db" $dropin && fail "--depends-on none left the dependencies in the drop-in: $(cat $dropin)"
+$NSPAWN rm -f e2e-dep-db e2e-dep-web e2e-dep-job >/dev/null || fail "rm the machines of the dependencies step"
 
 step "restart, pause, unpause and top"
 $NSPAWN start $app -- /bin/sleep 300 >/dev/null || fail "start for restart"

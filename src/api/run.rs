@@ -424,13 +424,18 @@ pub async fn attach(
         (None, Some(stdin)) => (Some(crate::attach::Mode::Stdin), vec![stdin], None, None),
         (None, None) => (None, Vec::new(), None, None),
     };
+    // The program asks once the unit runs it, after the machines it depends on are
+    // ready, for as long as that takes: the start's own end bounds the wait then.
+    let ask_within = if tuning.depends_on.iter().any(|d| d.condition.waits()) {
+        Duration::from_secs(86_400)
+    } else {
+        Duration::from_secs(120)
+    };
     let handover = match mode {
         Some(mode) => {
             let listener = crate::attach::Listener::bind(&name)?;
             Some(tokio::spawn(async move {
-                listener
-                    .hand_over(&mode, &handed, Duration::from_secs(120))
-                    .await
+                listener.hand_over(&mode, &handed, ask_within).await
             }))
         }
         None => None,

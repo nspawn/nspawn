@@ -329,15 +329,16 @@ impl Systemd {
 
     /// Starts a machine's unit. Returns true when its program ended during the start
     /// and the unit is waiting to start it again (Restart=): systemd keeps the start job
-    /// open across restarts, so it is not waited for then.
-    pub async fn start_machine(&self, name: &str) -> Result<bool> {
+    /// open across restarts, so it is not waited for then. `patient`: the start waits for
+    /// other machines, as long as they take, so the job has no time limit.
+    pub async fn start_machine(&self, name: &str, patient: bool) -> Result<bool> {
         let unit = format!("systemd-nspawn@{name}.service");
-        self.start_unit_or_restart(&unit)
+        self.start_unit_or_restart(&unit, patient)
             .await
             .with_context(|| format!("machine {name} failed to start; see journalctl -u {unit}"))
     }
 
-    async fn start_unit_or_restart(&self, unit: &str) -> Result<bool> {
+    async fn start_unit_or_restart(&self, unit: &str, patient: bool) -> Result<bool> {
         let mut jobs = self
             .manager
             .receive_job_removed()
@@ -349,6 +350,13 @@ impl Systemd {
             .await
             .with_context(|| format!("starting {unit}"))?;
         let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
+        let expired = async {
+            if patient {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep_until(deadline).await;
+        };
+        tokio::pin!(expired);
         let mut poll = tokio::time::interval(std::time::Duration::from_millis(250));
         loop {
             tokio::select! {
@@ -367,7 +375,7 @@ impl Systemd {
                         return Ok(true);
                     }
                 }
-                _ = tokio::time::sleep_until(deadline) => bail!("timed out while starting {unit}"),
+                _ = &mut expired => bail!("timed out while starting {unit}"),
             }
         }
     }

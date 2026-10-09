@@ -28,7 +28,8 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `policy.rs` | restart policies and resource limits (`--restart`, `-m`, `--cpus`, `--pids-limit`), written into the hook drop-in |
 | `health.rs` | healthchecks: the image's or the flags', the probe runner (`health-run`, a transient unit bound to the machine's), its verdict under `/run/nspawn/health` |
 | `api/secrets.rs` | secrets: systemd-creds around them, their files under the state directory, decrypted into a root-only tmpfs for a running machine and bind-mounted read-only |
-| `tuning.rs` | docker's other per-container flags (hostname, user, capabilities, tmpfs, devices, dns, ulimits, signals, sysctls, timezone) and `--interface`: parsing, and the settings and unit lines they become |
+| `tuning.rs` | docker's other per-container flags (hostname, user, capabilities, tmpfs, devices, dns, ulimits, signals, sysctls, timezone), `--interface` and `--depends-on`: parsing, and the settings and unit lines they become |
+| `api/dependencies.rs` | `--depends-on`: the checks (machines of nspawn's, no cycle), the hook that waits for each condition (`await-dependencies`), the verdict on a dependency as its unit and healthcheck show it |
 | `getent.rs` | the getent stand-in bound into an app that runs as a user |
 | `bridge.rs`, `hostnet.rs` | the nspawn0 bridge, ports, firewalls; veth mode |
 | `volume.rs`, `volmount.rs` | `-v` parsing; host-side mounts for mstack machines |
@@ -81,7 +82,8 @@ files, and the machine units call nspawn back through drop-in hooks.
   nspawn-hooks.conf     ExecStartPre/Post, ExecStopPost calling nspawn,
                         LogRateLimitIntervalSec=0, Restart= and
                         MemoryMax=/MemorySwapMax=/CPUQuota=/TasksMax= when set,
-                        for an app ExecStart= behind `nspawn attach-exec`
+                        for an app ExecStart= behind `nspawn attach-exec`,
+                        Wants=/After= the units of --depends-on
 /etc/systemd/system/machines.target.wants/systemd-nspawn@NAME.service
                         --restart always or unless-stopped: started at boot
 /etc/nspawn/auth.json  registry credentials, 0600
@@ -112,6 +114,20 @@ during the start period of a machine never healthy do not count), the verdict
 and the last five probes in `/run/nspawn/health/NAME.json`, which `ps` and
 `inspect` read, and a `health_status` event on every change; `network release`
 removes the file, the unit goes with the machine's.
+
+A machine with `--depends-on` has its order kept by systemd: its drop-in
+wants each other machine's unit and is ordered after it (`Wants=`, so that
+stopping one leaves it alone), and its first ExecStartPre,
+`nspawn await-dependencies NAME`, comes before `network prepare` and its lock
+and waits in turn for each condition: a start that went through, a healthy
+verdict in `/run/nspawn/health`, or a program that ended with 0, read from the
+unit's state and ExecMainStatus. It fails the start when a dependency fails, or
+writes a warning for an optional one. Conditions that wait (`healthy`,
+`completed`) also set `TimeoutStartSec=infinity`, and `start` then waits for
+the job without its time limit; when the job fails, `start` gives the
+dependency's failure as the reason. The checks at `create` and `start`
+refuse a machine that is not nspawn's, the machine itself and a cycle; `rm`
+refuses a machine others depend on unless they go with it.
 
 `stop` sends the image's stop signal to the program of an app machine and
 SIGKILLs the cgroup after `--timeout`; a booted machine gets SIGRTMIN+4
