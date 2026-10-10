@@ -1,3 +1,11 @@
+nspawn (1.10.0-1) unstable; urgency=medium
+
+  * --depends-on NAME[:started|healthy|completed][:optional] on run, create and start: the other machines start first, by systemd too, and the machine waits for the condition.
+  * nspawn generate [NAME...] prints the commands that make machines again: network create, then run -d with every flag each machine keeps.
+  * rm removes a machine together with the machines on its network named in the same command.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Sat, 10 Oct 2026 13:46:25 -0500
+
 nspawn (1.9.1-1) unstable; urgency=medium
 
   * TAB offers names and subcommands alone on an empty word; the flags come once the word starts with a dash, or where there is no name to offer.

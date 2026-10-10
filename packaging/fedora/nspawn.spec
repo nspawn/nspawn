@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 1.9.1
+%global upstream_version 1.10.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -152,6 +152,11 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Sat Oct 10 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.10.0-1
+- --depends-on NAME[:started|healthy|completed][:optional] on run, create and start: the other machines start first, by systemd too, and the machine waits for the condition.
+- nspawn generate [NAME...] prints the commands that make machines again: network create, then run -d with every flag each machine keeps.
+- rm removes a machine together with the machines on its network named in the same command.
+
 * Thu Oct 01 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.9.1-1
 - TAB offers names and subcommands alone on an empty word; the flags come once the word starts with a dash, or where there is no name to offer.
 
