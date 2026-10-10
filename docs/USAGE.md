@@ -135,10 +135,13 @@ cycle is refused.
 systemd does the work: the machine's unit wants the other one's and is ordered after it,
 and its first hook waits for the condition, so `machinectl start`, a start at boot and a
 restart policy follow the same order as `nspawn start`, which says which machines it
-started first. A start that waits for `healthy` or `completed` has no time limit, since
-it lasts as long as the other machine takes; `nspawn stop` ends it. Stopping a machine
-leaves the ones that depend on it running, as compose does, and `rm` refuses a machine
-others depend on unless they go in the same command.
+started first. A start that waits for `healthy` or `completed`, directly or through the
+machines its dependencies depend on, has no time limit, since it lasts as long as the
+other machine takes; `nspawn stop` ends it. A machine on another one's network
+(`--network container:NAME`) that also depends on it gets it started first, at boot as
+by `nspawn start`. Stopping a machine leaves the ones that depend on it running, as
+compose does, and `rm` refuses a machine others depend on unless they go in the same
+command, and then only once they are gone.
 
 ### The other flags of docker run
 
@@ -293,8 +296,11 @@ networks they join, then `run -d` for each machine with every flag it keeps (net
 and aliases, ports, entrypoint and command, environment, volumes, labels, restart
 policy, limits, healthcheck, docker's other flags and `--depends-on`), each after the
 machines it depends on or takes its network from, which come along when they are not
-named; an image without flags of its own is pulled again instead. Without names it
-covers every machine nspawn has. Run on the other host, the script starts the machines
+named; an image without flags of its own is pulled again instead, unless another
+machine takes its network, which needs it running. Each `run -d` pulls its machine on
+its own (`--pull always`, blobs already there are not downloaded again), so that a
+machine never takes the network kind, mode or backend of another one made from the
+same image. Without names it covers every machine nspawn has. Run on the other host, the script starts the machines
 as they were brought up here. What a flag cannot carry is said in comments at the top:
 a secret is encrypted for this host, so `nspawn secret create` it there first; a host
 directory a machine mounts has to exist there; an image built here has to be pushed
@@ -444,8 +450,9 @@ rules included; `network create --label KEY=VALUE` tags one.
 `--network container:NAME` puts an app machine in the network namespace of NAME, as
 docker's `--network container:` does: the same interfaces and address, NAME's hosts
 and resolv.conf files, nothing of its own, and a port its program serves is published
-with `-p` on NAME. NAME has to be running on a bridge network when the machine starts,
-and cannot be removed while a machine names it; when NAME stops or restarts, the
+with `-p` on NAME. NAME has to be running on a bridge network when the machine starts
+(`--depends-on NAME` has it started first), and cannot be removed while a machine
+names it, unless that machine goes in the same `rm`; when NAME stops or restarts, the
 machine keeps the namespace it joined and has to be restarted to join the new one, as
 with docker. `-p`, `--network-alias`, `--dns`, `--dns-search`, `--add-host` and
 `--sysctl` are refused on such a machine, since they shape a network of its own, and

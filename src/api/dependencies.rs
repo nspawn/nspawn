@@ -15,9 +15,10 @@ use crate::systemd::{Systemd, UnitState};
 use crate::tuning::{Condition, Dependency};
 
 /// Each machine named is one of nspawn's, other than this one, and none of them leads
-/// back to it.
-pub fn check(store: &Store, name: &str, deps: &[Dependency]) -> Result<()> {
-    if deps.is_empty() {
+/// back to it, through dependencies or the network of another machine (`owner`, its
+/// --network container:): a machine waits for both.
+pub fn check(store: &Store, name: &str, deps: &[Dependency], owner: Option<&str>) -> Result<()> {
+    if deps.is_empty() && owner.is_none() {
         return Ok(());
     }
     let records = store.list_images()?;
@@ -38,7 +39,10 @@ pub fn check(store: &Store, name: &str, deps: &[Dependency]) -> Result<()> {
     let mut graph = graph(&records);
     graph.insert(
         name.to_string(),
-        deps.iter().map(|d| d.name.clone()).collect(),
+        deps.iter()
+            .map(|d| d.name.clone())
+            .chain(owner.map(str::to_string))
+            .collect(),
     );
     if let Some(cycle) = cycle(name, &graph) {
         bail!(
@@ -49,17 +53,86 @@ pub fn check(store: &Store, name: &str, deps: &[Dependency]) -> Result<()> {
     Ok(())
 }
 
-/// Every machine's dependencies, by name.
+/// What every machine waits for, by name: its dependencies and the machine whose
+/// network it takes.
 fn graph(records: &[ImageRecord]) -> BTreeMap<String, Vec<String>> {
     records
         .iter()
         .map(|r| {
             (
                 r.name.clone(),
-                r.tuning.depends_on.iter().map(|d| d.name.clone()).collect(),
+                r.tuning
+                    .depends_on
+                    .iter()
+                    .map(|d| d.name.clone())
+                    .chain(r.network_container.clone())
+                    .collect(),
             )
         })
         .collect()
+}
+
+/// Whether a start of `name` can wait as long as another machine takes: a machine it
+/// depends on, directly or through others, has a condition that waits, and systemd
+/// holds each start in the queue until the one before it is through.
+pub fn waits(records: &[ImageRecord], name: &str) -> bool {
+    let by_name: BTreeMap<&str, &ImageRecord> =
+        records.iter().map(|r| (r.name.as_str(), r)).collect();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut next = vec![name];
+    while let Some(at) = next.pop() {
+        if !seen.insert(at) {
+            continue;
+        }
+        for dep in by_name
+            .get(at)
+            .map(|r| r.tuning.depends_on.as_slice())
+            .unwrap_or_default()
+        {
+            if dep.condition.waits() {
+                return true;
+            }
+            next.push(dep.name.as_str());
+        }
+    }
+    false
+}
+
+/// `names` in the order to remove them: each machine before the ones it depends on or
+/// takes its network from, so that those go only once it has; otherwise as given.
+pub fn removal_order(records: &[ImageRecord], names: &[String]) -> Vec<String> {
+    fn visit<'a>(
+        name: &'a str,
+        names: &[String],
+        records: &'a [ImageRecord],
+        seen: &mut std::collections::BTreeSet<&'a str>,
+        out: &mut Vec<String>,
+    ) {
+        if !seen.insert(name) {
+            return;
+        }
+        if let Some(r) = records.iter().find(|r| r.name == name) {
+            let held = r
+                .tuning
+                .depends_on
+                .iter()
+                .map(|d| d.name.as_str())
+                .chain(r.network_container.as_deref());
+            for other in held {
+                if names.iter().any(|n| n == other) {
+                    visit(other, names, records, seen, out);
+                }
+            }
+        }
+        out.push(name.to_string());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for name in names.iter().rev() {
+        visit(name.as_str(), names, records, &mut seen, &mut out);
+    }
+    out.reverse();
+    out
 }
 
 /// A path from `name` back to itself through the dependencies, both ends included.
@@ -88,6 +161,20 @@ fn cycle(name: &str, graph: &BTreeMap<String, Vec<String>>) -> Option<Vec<String
     walk(name, name, graph, &mut path, &mut seen).then_some(path)
 }
 
+/// The machines among `records` that need `name` to stay, by depending on it or taking
+/// its network, leaving out those in `gone`.
+pub fn holders<'a>(records: &'a [ImageRecord], name: &str, gone: &[String]) -> Vec<&'a str> {
+    records
+        .iter()
+        .filter(|r| !gone.contains(&r.name))
+        .filter(|r| {
+            r.network_container.as_deref() == Some(name)
+                || r.tuning.depends_on.iter().any(|d| d.name == name)
+        })
+        .map(|r| r.name.as_str())
+        .collect()
+}
+
 /// The machines among `records` that depend on `name`, leaving out those in `going`.
 pub fn dependents<'a>(records: &'a [ImageRecord], name: &str, going: &[String]) -> Vec<&'a str> {
     records
@@ -108,6 +195,8 @@ pub struct Observed {
     health: Option<String>,
     /// How its program ended, once it has.
     exit_code: Option<i32>,
+    /// systemd's Result= of its last run, once it ended: "success" or why not.
+    result: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,17 +240,17 @@ pub fn verdict(name: &str, dep: &Dependency, seen: &Observed) -> Verdict {
             )),
             _ => Verdict::Waiting,
         },
+        // systemd's verdict on the run, which a failure before the program started
+        // shares; the exit code may be an earlier run's then, so it only explains.
         Condition::Completed => {
             let ended = unit.restarting() || matches!(unit.active.as_str(), "inactive" | "failed");
             match seen.exit_code {
                 _ if !ended => Verdict::Waiting,
-                Some(0) => Verdict::Met,
-                // systemd took it as a success (the exit status of a reboot, 133).
-                _ if unit.active == "inactive" => Verdict::Met,
-                Some(code) => Verdict::Failed(format!(
+                _ if seen.result == "success" => Verdict::Met,
+                Some(code) if code != 0 => Verdict::Failed(format!(
                     "{other}, which {name} waits for to complete, exited with {code}; nspawn logs {other} shows why"
                 )),
-                None => failed(),
+                _ => failed(),
             }
         }
     }
@@ -174,11 +263,13 @@ pub async fn observe(sd: &Systemd, store: &Store, dep: &Dependency) -> Result<Ob
         .unit_status(&format!("systemd-nspawn@{}.service", dep.name))
         .await?;
     let ended = unit.restarting() || matches!(unit.active.as_str(), "inactive" | "failed");
-    let exit_code = match &record {
-        Some(r) if ended && dep.condition == Condition::Completed => {
-            crate::api::machines::last_exit_code(sd, store, r).await
-        }
-        _ => None,
+    let (exit_code, result) = match &record {
+        Some(r) if ended && dep.condition == Condition::Completed => (
+            crate::api::machines::last_exit_code(sd, store, r).await,
+            sd.unit_result(&format!("systemd-nspawn@{}.service", dep.name))
+                .await?,
+        ),
+        _ => (None, String::new()),
     };
     Ok(Observed {
         healthcheck: record
@@ -187,6 +278,7 @@ pub async fn observe(sd: &Systemd, store: &Store, dep: &Dependency) -> Result<Ob
         unit,
         health: crate::health::read_status(&dep.name).map(|s| s.status),
         exit_code,
+        result,
     })
 }
 
@@ -255,6 +347,7 @@ mod tests {
             unit: unit(active, sub),
             health: None,
             exit_code: None,
+            result: String::new(),
         }
     }
 
@@ -379,8 +472,9 @@ mod tests {
     #[test]
     fn completed_waits_for_the_end_and_its_exit_code() {
         let d = dep("migrate:completed");
-        let ended = |active: &str, sub: &str, code: Option<i32>| Observed {
+        let ended = |active: &str, sub: &str, code: Option<i32>, result: &str| Observed {
             exit_code: code,
+            result: result.to_string(),
             ..seen(active, sub)
         };
         assert_eq!(
@@ -392,29 +486,142 @@ mod tests {
             Verdict::Waiting
         );
         assert_eq!(
-            verdict("web", &d, &ended("inactive", "dead", Some(0))),
+            verdict("web", &d, &ended("inactive", "dead", Some(0), "success")),
             Verdict::Met
         );
         assert_eq!(
-            verdict("web", &d, &ended("inactive", "dead", None)),
+            verdict("web", &d, &ended("inactive", "dead", None, "success")),
             Verdict::Met
         );
         assert_eq!(
-            failed_with(verdict("web", &d, &ended("failed", "failed", Some(3)))),
+            failed_with(verdict("web", &d, &ended("failed", "failed", Some(3), "exit-code"))),
             "migrate, which web waits for to complete, exited with 3; nspawn logs migrate shows why"
         );
-        assert!(
-            failed_with(verdict("web", &d, &ended("failed", "failed", None)))
-                .starts_with("migrate, which web depends on, failed")
-        );
+        assert!(failed_with(verdict(
+            "web",
+            &d,
+            &ended("failed", "failed", None, "exit-code")
+        ))
+        .starts_with("migrate, which web depends on, failed"));
+        // A run that failed before its program started keeps the exit code of the one
+        // before, a success: systemd's verdict on this run decides.
+        assert!(failed_with(verdict(
+            "web",
+            &d,
+            &ended("failed", "failed", Some(0), "exit-code")
+        ))
+        .starts_with("migrate, which web depends on, failed"));
         assert_eq!(
-            verdict("web", &d, &ended("activating", "auto-restart", Some(0))),
+            verdict(
+                "web",
+                &d,
+                &ended("activating", "auto-restart", Some(0), "success")
+            ),
             Verdict::Met,
             "restart always brings back a program that completed"
         );
         assert!(matches!(
-            verdict("web", &d, &ended("activating", "auto-restart", Some(1))),
+            verdict(
+                "web",
+                &d,
+                &ended("activating", "auto-restart", Some(1), "exit-code")
+            ),
             Verdict::Failed(_)
         ));
+    }
+
+    #[test]
+    fn a_wait_further_down_the_chain_counts() {
+        let record = |name: &str, deps: &[&str]| {
+            let mut r: ImageRecord = serde_json::from_value(serde_json::json!({
+                "name": name, "reference": "r", "manifest_digest": "d", "layers": [],
+                "backend": "overlay", "created": 0,
+            }))
+            .unwrap();
+            r.tuning.depends_on = deps.iter().map(|d| dep(d)).collect();
+            r
+        };
+        let records = [
+            record("web", &["api"]),
+            record("api", &["migrate:completed", "cache"]),
+            record("migrate", &[]),
+            record("cache", &[]),
+            record("loop-a", &["loop-b"]),
+            record("loop-b", &["loop-a"]),
+        ];
+        assert!(waits(&records, "web"), "through api");
+        assert!(waits(&records, "api"));
+        assert!(!waits(&records, "cache"));
+        assert!(!waits(&records, "loop-a"), "a cycle ends the walk");
+        let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            removal_order(&records, &names(&["migrate", "cache", "web", "api"])),
+            names(&["web", "api", "cache", "migrate"])
+        );
+        assert_eq!(
+            removal_order(&records, &names(&["cache", "migrate"])),
+            names(&["cache", "migrate"]),
+            "unrelated machines keep their order"
+        );
+    }
+
+    #[test]
+    fn a_network_owner_goes_after_the_machines_on_its_network() {
+        let mut side: ImageRecord = serde_json::from_value(serde_json::json!({
+            "name": "side", "reference": "r", "manifest_digest": "d", "layers": [],
+            "backend": "overlay", "created": 0,
+        }))
+        .unwrap();
+        side.network_container = Some("own".into());
+        let mut own = side.clone();
+        own.name = "own".into();
+        own.network_container = None;
+        let records = [side, own];
+        let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            removal_order(&records, &names(&["own", "side"])),
+            names(&["side", "own"])
+        );
+        assert_eq!(holders(&records, "own", &[]), ["side"]);
+        assert!(holders(&records, "own", &names(&["side"])).is_empty());
+    }
+
+    #[test]
+    fn a_cycle_through_a_shared_network_is_found() {
+        let mut side: ImageRecord = serde_json::from_value(serde_json::json!({
+            "name": "side", "reference": "r", "manifest_digest": "d", "layers": [],
+            "backend": "overlay", "created": 0,
+        }))
+        .unwrap();
+        side.network_container = Some("web".into());
+        let mut graph = graph(&[side]);
+        graph.insert("web".into(), vec!["side".into()]);
+        assert_eq!(cycle("web", &graph).unwrap(), ["web", "side", "web"]);
+    }
+
+    #[test]
+    fn check_counts_the_network_owner_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        store.init().unwrap();
+        let record = |name: &str, deps: &[&str]| {
+            let mut r: ImageRecord = serde_json::from_value(serde_json::json!({
+                "name": name, "reference": "r", "manifest_digest": "d", "layers": [],
+                "backend": "overlay", "created": 0,
+            }))
+            .unwrap();
+            r.tuning.depends_on = deps.iter().map(|d| dep(d)).collect();
+            r
+        };
+        store.record_image(&record("web", &["side"])).unwrap();
+        store.record_image(&record("side", &[])).unwrap();
+        let e = check(&store, "side", &[], Some("web")).unwrap_err();
+        assert!(e.to_string().contains("cycle, side -> web -> side"), "{e}");
+        check(&store, "side", &[], None).unwrap();
+        assert!(check(&store, "side", &[dep("web")], None).is_err());
+        assert!(check(&store, "web", &[dep("nowhere")], None)
+            .unwrap_err()
+            .to_string()
+            .contains("no machine of nspawn's"));
     }
 }

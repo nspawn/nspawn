@@ -426,7 +426,13 @@ pub async fn attach(
     };
     // The program asks once the unit runs it, after the machines it depends on are
     // ready, for as long as that takes: the start's own end bounds the wait then.
-    let ask_within = if tuning.depends_on.iter().any(|d| d.condition.waits()) {
+    // Records read without the lock: one that goes meanwhile only shortens the wait.
+    let records = ctx.store.list_images().unwrap_or_default();
+    let ask_within = if tuning
+        .depends_on
+        .iter()
+        .any(|d| d.condition.waits() || crate::api::dependencies::waits(&records, &d.name))
+    {
         Duration::from_secs(86_400)
     } else {
         Duration::from_secs(120)

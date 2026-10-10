@@ -232,9 +232,15 @@ pub fn unit_word(state: &UnitState) -> &'static str {
 /// Why a machine machined does not list cannot be removed or replaced yet: its unit is up
 /// or restarting, and would go on restarting with nothing to start.
 pub async fn unit_busy(sd: &Systemd, name: &str) -> Result<Option<String>> {
-    let state = sd
-        .unit_status(&format!("systemd-nspawn@{name}.service"))
-        .await?;
+    let unit = format!("systemd-nspawn@{name}.service");
+    let state = sd.unit_status(&unit).await?;
+    // A start held in systemd's queue behind the machines it depends on runs later
+    // from what is loaded now, files gone or not.
+    if !state.busy() && sd.unit_queued(&unit).await? {
+        return Ok(Some(format!(
+            "machine {name} is about to start, once the machines it depends on are; stop it first"
+        )));
+    }
     Ok(if !state.busy() {
         None
     } else if state.restarting() {
@@ -509,14 +515,23 @@ pub async fn prepare(
         if !bridge::bridge_kind(&owner_record) {
             bail!("{name} shares the network of {owner}, which has no network of its own to share");
         }
-        if !sd.machine_exists(owner).await? {
+        // A machine it depends on is started by systemd before its unit's hooks run,
+        // the second pass of a start, which attaches the namespace then.
+        let later =
+            pass == Pass::Ahead && record.tuning.depends_on.iter().any(|d| d.name == *owner);
+        if !sd.machine_exists(owner).await? && !later {
+            if record.tuning.depends_on.iter().any(|d| d.name == *owner) {
+                bail!("{name} shares the network of {owner}, which is not running; see journalctl -u systemd-nspawn@{owner}.service");
+            }
             bail!(
-                "{name} shares the network of {owner}, which is not running; start {owner} first"
+                "{name} shares the network of {owner}, which is not running; start {owner} first, or give {name} --depends-on {owner}"
             );
         }
         let nets = crate::api::network::nets_of(store, config, &owner_record)?;
-        let leader = sd.machine_leader(owner).await?;
-        bridge::attach_netns(name, leader)?;
+        if sd.machine_exists(owner).await? {
+            let leader = sd.machine_leader(owner).await?;
+            bridge::attach_netns(name, leader)?;
+        }
         store.record_image(&record)?;
         Some((
             store.machine_files_dir(owner),
@@ -801,7 +816,12 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     match record.as_mut() {
         Some(r) => {
             apply_flags(r, args)?;
-            crate::api::dependencies::check(store, &args.name, &r.tuning.depends_on)?;
+            crate::api::dependencies::check(
+                store,
+                &args.name,
+                &r.tuning.depends_on,
+                r.network_container.as_deref(),
+            )?;
         }
         None if !args.command.is_empty()
             || !args.network.is_empty()
@@ -841,6 +861,8 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
         .map(|r| r.tuning.depends_on.clone())
         .unwrap_or_default();
     let network = prepare(sd, store, config, &args.name, record, Pass::Ahead, report).await?;
+    // Read with the records under the lock, prepare's included.
+    let patient = crate::api::dependencies::waits(&store.list_images()?, &args.name);
     // The unit's own hooks take the lock; it must be free while the unit starts.
     drop(lock);
     // always and unless-stopped enable the unit, as machinectl enable does. It is only
@@ -869,7 +891,6 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             down.push(dep);
         }
     }
-    let patient = deps.iter().any(|d| d.condition.waits());
     let restarting = match sd.start_machine(&args.name, patient).await {
         Ok(restarting) => restarting,
         // The hook's reason, which the job's result does not carry.
@@ -1338,11 +1359,13 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
     }
     if !sd.machine_exists(&args.name).await? {
         // A start is preparing it: its network must not be released under it. One that
-        // waits in its unit for the machines it depends on is systemd's to stop.
-        let waiting = record
-            .as_ref()
-            .is_some_and(|r| r.tuning.depends_on.iter().any(|d| d.condition.waits()))
-            && sd.unit_status(&unit).await?.busy();
+        // waits for the machines it depends on, in its unit or in systemd's queue, is
+        // systemd's to stop.
+        let queued = sd.unit_queued(&unit).await?;
+        // Records read without the lock: one that goes meanwhile only means no wait.
+        let records = store.list_images().unwrap_or_default();
+        let waiting = crate::api::dependencies::waits(&records, &args.name)
+            && (sd.unit_status(&unit).await?.busy() || queued);
         if store.is_starting(&args.name) && !waiting {
             bail!("machine {} is starting; stop it once it runs", args.name);
         }
@@ -1357,7 +1380,8 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         hostnet::release_machine(sd, &args.name).await;
         release_machine(&args.name, record.as_ref())?;
         sd.reset_failed(&unit).await?;
-        return Ok(if state.busy() {
+        // A start held in systemd's queue was going to run it: it stopped.
+        return Ok(if state.busy() || queued {
             StopOutcome::Stopped
         } else {
             StopOutcome::WasNotRunning
@@ -1727,6 +1751,11 @@ async fn wait_for_previous(sd: &Systemd, name: &str, unit: &str, mode: Option<Mo
         }
         let active = state.active;
         let registered = sd.machine_exists(name).await?;
+        // Its unit runs the hooks of a start already, which may wait for the machines it
+        // depends on for as long as they take.
+        if active == "activating" && state.sub == "start-pre" && !registered {
+            bail!("machine {name} is already starting; see journalctl -u {unit}");
+        }
         match active.as_str() {
             "active" | "activating" if registered && machine_alive(sd, name, mode).await => {
                 if active == "activating" {

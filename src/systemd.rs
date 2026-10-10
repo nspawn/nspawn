@@ -627,6 +627,28 @@ impl Systemd {
             .with_context(|| format!("connecting to {unit}"))
     }
 
+    /// How the unit's last run ended, systemd's Result= ("success", "exit-code", ...):
+    /// unlike ExecMainStatus, it is that of the run even when the run failed before its
+    /// main process started.
+    pub async fn unit_result(&self, unit: &str) -> Result<String> {
+        self.service(unit)
+            .await?
+            .result()
+            .await
+            .with_context(|| format!("reading how {unit} ended"))
+    }
+
+    /// Whether a job of the unit waits in systemd's queue, as a start ordered after
+    /// another unit's does while that one starts.
+    pub async fn unit_queued(&self, unit: &str) -> Result<bool> {
+        let listed = self
+            .manager
+            .list_units_by_names(vec![unit.to_string()])
+            .await
+            .with_context(|| format!("querying the jobs of {unit}"))?;
+        Ok(listed.iter().any(|u| u.7 != 0))
+    }
+
     /// The PID of the main process of the unit's current or last run (0 before any).
     pub async fn exec_main_pid(&self, unit: &str) -> Result<u32> {
         self.service(unit)

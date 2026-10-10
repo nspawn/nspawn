@@ -213,7 +213,12 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         draft.healthcheck = Some(hc);
     }
     request.tuning.apply(&mut draft.tuning)?;
-    crate::api::dependencies::check(store, &request.name, &draft.tuning.depends_on)?;
+    crate::api::dependencies::check(
+        store,
+        &request.name,
+        &draft.tuning.depends_on,
+        draft.network_container.as_deref(),
+    )?;
     crate::install::stage_layers(store, backend, &manifest, Some(source.mode), &request.name)
         .await?;
     remove_existing(store, sd, &request.name, report).await?;

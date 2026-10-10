@@ -89,7 +89,21 @@ pub fn generate(ctx: &Context, names: &[String]) -> Result<Script> {
         let spec = crate::api::network::find(&ctx.store, &ctx.config, network)?;
         script.commands.push(network_command(&spec));
     }
+    // A machine another one takes its network from has to run before that one starts.
+    let owners: BTreeSet<&str> = machines
+        .iter()
+        .filter_map(|r| r.network_container.as_deref())
+        .collect();
+    // An image built here, which another host can only pull once it is pushed: its
+    // record says build, the records of the machines made from it create.
+    let built: BTreeSet<&str> = records
+        .iter()
+        .filter(|r| r.origin == "build")
+        .map(|r| r.reference.as_str())
+        .collect();
     let mut secrets = BTreeSet::new();
+    let mut pushed = BTreeSet::new();
+    let mut runs = Vec::new();
     for r in &machines {
         let registry = ImageRef::parse(&r.reference, &ctx.config.registry)
             .map(|i| i.registry)
@@ -99,15 +113,23 @@ pub fn generate(ctx: &Context, names: &[String]) -> Result<Script> {
             .ok()
             .flatten()
             .is_some_and(|p| p.required);
-        script.commands.push(machine_command(
+        let command = machine_command(
             r,
             &ctx.config.registry,
             required && r.signed_by.is_none(),
-        ));
-        if r.origin == "build" {
+            owners.contains(r.name.as_str()),
+        );
+        // The pulls first: a run --rm keeps the image it pulls under the image's own
+        // name, which a pull of that name later would find taken.
+        if command[0][0] == "pull" {
+            script.commands.push(command);
+        } else {
+            runs.push(command);
+        }
+        if built.contains(r.reference.as_str()) && pushed.insert(r.reference.as_str()) {
             script.notes.push(format!(
-                "{} runs {}, built on this host: push it (nspawn push {}) before this script runs elsewhere",
-                r.name, r.reference, r.name
+                "{} was built on this host: push it (nspawn push {}) before this script runs elsewhere",
+                r.reference, r.name
             ));
         }
         for volume in r.volumes.iter().filter(|v| v.source.starts_with('/')) {
@@ -125,6 +147,7 @@ pub fn generate(ctx: &Context, names: &[String]) -> Result<Script> {
             }
         }
     }
+    script.commands.extend(runs);
     Ok(script)
 }
 
@@ -170,14 +193,19 @@ pub fn network_command(spec: &NetSpec) -> Command {
     }
     let mut command = vec![head];
     for (key, value) in &spec.labels {
-        command.push(words(&["--label", &format!("{key}={value}")]));
+        command.push(option("--label", &format!("{key}={value}")));
     }
     command
 }
 
-/// `run -d` with every flag the machine keeps, or `pull` for an image with none.
-/// `no_verify`: the image was pulled without the signature its registry requires.
-pub fn machine_command(r: &ImageRecord, registry: &str, no_verify: bool) -> Command {
+/// `run -d` with every flag the machine keeps, or `pull` for an image with none that
+/// need not run. `no_verify`: the image was pulled without the signature its registry
+/// requires. `run`: another machine takes its network, so it has to run, flags or not.
+///
+/// `run` pulls each machine on its own (`--pull always`): made from a local image of the
+/// same reference instead, it would take that image's network kind, mode and backend
+/// wherever its own flags leave them out. Blobs already there are not downloaded again.
+pub fn machine_command(r: &ImageRecord, registry: &str, no_verify: bool, run: bool) -> Command {
     let mut pull_flags = Vec::new();
     match r.backend {
         BackendChoice::Flat => pull_flags.extend(words(&["--backend", "flat"])),
@@ -195,7 +223,7 @@ pub fn machine_command(r: &ImageRecord, registry: &str, no_verify: bool) -> Comm
         pull_flags.push("--no-verify".to_string());
     }
     let (flags, tail) = flags(r);
-    if flags.is_empty() && tail.is_empty() && !r.remove_on_exit {
+    if flags.is_empty() && tail.is_empty() && !r.remove_on_exit && !run {
         let mut head = words(&["pull", &r.reference]);
         let own_name = ImageRef::parse(&r.reference, registry).map(|i| i.local_name());
         if own_name.ok().as_deref() != Some(r.name.as_str()) {
@@ -204,7 +232,7 @@ pub fn machine_command(r: &ImageRecord, registry: &str, no_verify: bool) -> Comm
         head.extend(pull_flags);
         return vec![head];
     }
-    let mut head = words(&["run", "-d", "--name", &r.name]);
+    let mut head = words(&["run", "-d", "--name", &r.name, "--pull", "always"]);
     head.extend(pull_flags);
     if r.remove_on_exit {
         head.push("--rm".to_string());
@@ -224,12 +252,21 @@ fn words(list: &[&str]) -> Vec<String> {
     list.iter().map(|w| w.to_string()).collect()
 }
 
+/// A long option and its value, in one word when the value starts with a dash, which
+/// clap would read as another option otherwise.
+fn option(name: &str, value: &str) -> Vec<String> {
+    if value.starts_with('-') {
+        vec![format!("{name}={value}")]
+    } else {
+        words(&[name, value])
+    }
+}
+
 /// The flags of start and run that make `r` what it is, a group each, and the command
 /// that follows `--`.
 fn flags(r: &ImageRecord) -> (Vec<Vec<String>>, Vec<String>) {
     let mut out: Vec<Vec<String>> = Vec::new();
-    let flag =
-        |out: &mut Vec<Vec<String>>, name: &str, value: &str| out.push(words(&[name, value]));
+    let flag = |out: &mut Vec<Vec<String>>, name: &str, value: &str| out.push(option(name, value));
     if r.no_network {
         flag(&mut out, "--network", "none");
     } else if let Some(owner) = &r.network_container {
@@ -248,13 +285,15 @@ fn flags(r: &ImageRecord) -> (Vec<Vec<String>>, Vec<String>) {
             }
         }
     }
-    for (network, aliases) in &r.aliases {
+    // Aliases stay in the record of a machine that left the bridge, where they mean
+    // nothing and start refuses them.
+    for (network, aliases) in r.aliases.iter().filter(|_| bridge::bridge_kind(r)) {
         for alias in aliases {
             flag(&mut out, "--network-alias", &format!("{network}={alias}"));
         }
     }
     for port in &r.ports {
-        flag(&mut out, "-p", &publish_text(port));
+        flag(&mut out, "--publish", &publish_text(port));
     }
     // An entrypoint of more than one word: the rest goes before the arguments, which
     // the image's own then stand for.
@@ -276,20 +315,20 @@ fn flags(r: &ImageRecord) -> (Vec<Vec<String>>, Vec<String>) {
         tail.extend(cmd.iter().cloned());
     }
     for var in &r.env {
-        flag(&mut out, "-e", var);
+        flag(&mut out, "--env", var);
     }
     for volume in &r.volumes {
-        flag(&mut out, "-v", &volume.to_string());
+        flag(&mut out, "--volume", &volume.to_string());
     }
     for (key, value) in &r.labels {
-        flag(&mut out, "-l", &format!("{key}={value}"));
+        flag(&mut out, "--label", &format!("{key}={value}"));
     }
     if r.restart != Restart::No {
         flag(&mut out, "--restart", r.restart.name());
     }
     let limits = &r.limits;
     if limits.memory > 0 {
-        flag(&mut out, "-m", &size_text(limits.memory));
+        flag(&mut out, "--memory", &size_text(limits.memory));
     }
     if limits.memory_swap == -1 {
         flag(&mut out, "--memory-swap", "-1");
@@ -327,7 +366,7 @@ fn health_flags(r: &ImageRecord) -> Vec<Vec<String>> {
             [_, argv @ ..] => argv.iter().map(|w| quote(w)).collect::<Vec<_>>().join(" "),
             [] => String::new(),
         };
-        out.push(words(&["--health-cmd", &line]));
+        out.push(option("--health-cmd", &line));
     }
     for (name, value, image) in [
         ("--health-interval", hc.interval, base.interval),
@@ -352,8 +391,7 @@ fn health_flags(r: &ImageRecord) -> Vec<Vec<String>> {
 /// docker's other flags, as the machine keeps them.
 fn tuning_flags(t: &crate::tuning::Tuning) -> Vec<Vec<String>> {
     let mut out: Vec<Vec<String>> = Vec::new();
-    let flag =
-        |out: &mut Vec<Vec<String>>, name: &str, value: &str| out.push(words(&[name, value]));
+    let flag = |out: &mut Vec<Vec<String>>, name: &str, value: &str| out.push(option(name, value));
     if let Some(hostname) = &t.hostname {
         flag(&mut out, "--hostname", hostname);
     }
@@ -516,13 +554,13 @@ mod tests {
     fn an_image_without_flags_is_pulled_again() {
         let plain = record("fedora-44", "hub.example/fedora:44");
         assert_eq!(
-            machine_command(&plain, "hub.example", false),
+            machine_command(&plain, "hub.example", false, false),
             [["pull", "hub.example/fedora:44"]]
         );
         let mut named = record("base", "hub.example/fedora:44");
         named.backend = BackendChoice::Flat;
         assert_eq!(
-            machine_command(&named, "hub.example", true),
+            machine_command(&named, "hub.example", true, false),
             [[
                 "pull",
                 "hub.example/fedora:44",
@@ -537,20 +575,36 @@ mod tests {
         let mut app = record("fedora-44", "hub.example/fedora:44");
         app.mode = Mode::App;
         assert_eq!(
-            machine_command(&app, "hub.example", false)[0][2..],
+            machine_command(&app, "hub.example", false, false)[0][2..],
             ["--mode", "app"]
         );
         let mut once = record("job", "hub.example/fedora:44");
         once.remove_on_exit = true;
         assert_eq!(
-            machine_command(&once, "hub.example", false),
+            machine_command(&once, "hub.example", false, false),
             [[
                 "run",
                 "-d",
                 "--name",
                 "job",
+                "--pull",
+                "always",
                 "--rm",
                 "hub.example/fedora:44"
+            ]]
+        );
+        // A machine another one takes its network from runs, flags or not.
+        let owner = record("redis", "docker.io/library/redis:7");
+        assert_eq!(
+            machine_command(&owner, "hub.example", false, true),
+            [[
+                "run",
+                "-d",
+                "--name",
+                "redis",
+                "--pull",
+                "always",
+                "docker.io/library/redis:7"
             ]]
         );
     }
@@ -573,6 +627,9 @@ mod tests {
             script.render(),
             "# secret pw is encrypted for this host\nnspawn network create backend --subnet 10.99.7.0/24 --internal \\\n  --label 'team=a b'\n"
         );
+        let mut dashed = spec.clone();
+        dashed.labels = [("-k".to_string(), "v".to_string())].into();
+        assert_eq!(network_command(&dashed)[1], ["--label=-k=v"]);
     }
 
     #[test]
@@ -599,5 +656,31 @@ mod tests {
             names(order(&["other", "web", "db"], &by_name)),
             ["other", "disk", "db", "web"]
         );
+    }
+
+    #[test]
+    fn values_that_look_like_options_and_stale_aliases() {
+        let mut r = record("web", "hub.example/app:1");
+        r.mode = Mode::App;
+        r.env = vec!["-x=1".into()];
+        r.labels = [("-k".to_string(), "v".to_string())].into();
+        r.tuning.user = Some("-1".into());
+        r.network = Network::Host;
+        r.aliases = [("bridge".to_string(), vec!["www".to_string()])].into();
+        let command = machine_command(&r, "hub.example", false, false);
+        let flat = command.concat();
+        assert!(flat.contains(&"--env=-x=1".to_string()), "{flat:?}");
+        assert!(flat.contains(&"--label=-k=v".to_string()), "{flat:?}");
+        assert!(flat.contains(&"--user=-1".to_string()), "{flat:?}");
+        assert!(!flat.iter().any(|w| w == "--network-alias"), "{flat:?}");
+        let mut argv = vec!["nspawn".to_string()];
+        argv.extend(flat);
+        let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(&argv).unwrap();
+        let crate::cli::Command::Run(run) = cli.command else {
+            panic!("not run");
+        };
+        assert_eq!(run.options.env, ["-x=1"]);
+        assert_eq!(run.options.tuning.user.as_deref(), Some("-1"));
+        assert_eq!(run.options.network, ["host"]);
     }
 }

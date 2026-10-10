@@ -114,8 +114,8 @@ pub async fn remove_machines(
             skip.insert(name.clone());
         }
     }
-    // A machine another one takes its network from stays, running or not: the other
-    // could not start again without it.
+    // A machine another one takes its network from stays, running or not, unless that
+    // one goes too: the other could not start again without it.
     let records = store.list_images()?;
     let shared: Vec<(String, String)> = names
         .iter()
@@ -124,6 +124,7 @@ pub async fn remove_machines(
             let sharing: Vec<&str> = records
                 .iter()
                 .filter(|r| r.network_container.as_deref() == Some(name.as_str()))
+                .filter(|r| !names.contains(&r.name))
                 .map(|r| r.name.as_str())
                 .collect();
             (name.clone(), sharing.join(", "))
@@ -147,22 +148,39 @@ pub async fn remove_machines(
     {
         let dependents = crate::api::dependencies::dependents(&records, &name, names);
         if !dependents.is_empty() {
-            let (verb, them) = if dependents.len() == 1 {
-                ("depends", "it")
+            let (verb, them, their) = if dependents.len() == 1 {
+                ("depends", "it", "its")
             } else {
-                ("depend", "them")
+                ("depend", "them", "their")
             };
             removal.failed.push((
                 name.clone(),
-                format!("{} {verb} on {name} (--depends-on); remove {them} too, or start {them} with --depends-on none first", dependents.join(", ")),
+                format!("{} {verb} on {name} (--depends-on); remove {them} too, or drop the dependency with --depends-on none at {their} next start", dependents.join(", ")),
             ));
             skip.insert(name);
         }
     }
     if force {
-        let valid: Vec<&String> = names.iter().filter(|n| !skip.contains(*n)).collect();
-        for name in valid {
+        // Each machine before the ones it depends on: one that a refused machine depends
+        // on stays, and is not killed for nothing.
+        let order = crate::api::dependencies::removal_order(&records, names);
+        let mut starting = std::collections::HashSet::new();
+        for name in order
+            .iter()
+            .filter(|n| !skip.contains(*n))
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            let name = &name;
+            if crate::api::dependencies::holders(&records, name, &[])
+                .iter()
+                .any(|d| skip.contains(*d) || starting.contains(*d))
+            {
+                continue;
+            }
+            // Refused below, and what it needs stays with it.
             if store.is_starting(name) {
+                starting.insert(name.clone());
                 continue;
             }
             // Running, or its unit restarting it: the stop's job ends that too.
@@ -189,8 +207,23 @@ pub async fn remove_machines(
     } else {
         ", or use nspawn rm --force"
     };
-    for name in names.iter().filter(|n| !skip.contains(*n)) {
+    // A machine before the ones it depends on, which go only once it has: one that
+    // stays keeps them.
+    let order = crate::api::dependencies::removal_order(&records, names);
+    for name in order.iter().filter(|n| !skip.contains(*n)) {
         let outcome: Result<Option<String>> = async {
+            let staying = crate::api::dependencies::holders(&records, name, &removal.removed);
+            if !staying.is_empty() {
+                let (stays, needs) = if staying.len() == 1 {
+                    ("stays", "needs")
+                } else {
+                    ("stay", "need")
+                };
+                bail!(
+                    "{} {stays} and {needs} {name} (--depends-on or --network container:); {name} stays with it",
+                    staying.join(", ")
+                );
+            }
             if store.is_starting(name) {
                 bail!("machine {name} is starting; wait for it or stop it first");
             }

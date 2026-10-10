@@ -1202,10 +1202,18 @@ mod tests {
     #[test]
     fn what_generate_prints_makes_the_same_machine_again() {
         let (r, mut again) = generated_pair();
-        let command = crate::api::generate::machine_command(&r, "hub.example", false);
+        let command = crate::api::generate::machine_command(&r, "hub.example", false, false);
         assert_eq!(
             command[0],
-            ["run", "-d", "--name", "web", "docker.io/library/nginx:1.27"]
+            [
+                "run",
+                "-d",
+                "--name",
+                "web",
+                "--pull",
+                "always",
+                "docker.io/library/nginx:1.27"
+            ]
         );
         assert_eq!(
             command.last().unwrap(),
@@ -1241,9 +1249,12 @@ mod tests {
         }
         .render();
         assert!(script.starts_with(
-            "nspawn run -d --name web docker.io/library/nginx:1.27 \\\n  --network backend \\\n  --network front \\\n"
+            "nspawn run -d --name web --pull always docker.io/library/nginx:1.27 \\\n  --network backend \\\n  --network front \\\n"
         ), "{script}");
-        assert!(script.contains("\\\n  -e 'B=two words' \\\n"), "{script}");
+        assert!(
+            script.contains("\\\n  --env 'B=two words' \\\n"),
+            "{script}"
+        );
         assert!(
             script.ends_with("\\\n  -- -c 'echo '\\''hi there'\\''; exec nginx'\n"),
             "{script}"

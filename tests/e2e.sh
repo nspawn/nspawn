@@ -38,6 +38,17 @@ export -f grep_q
 pyrun() { python3 -c 'import os, pty, sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"; }
 # A machine's address on its network, as inspect has it.
 addr_of() { $NSPAWN inspect "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)[0].get('address') or '')"; }
+# What inspect says of a machine that generate's script must give again: not what a new
+# machine of the same flags gets anew, or what only runs have; the script pulls the tag
+# again, which may have moved meanwhile.
+gen_keys() {
+  $NSPAWN inspect "$1" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)[0]
+for k in ['created', 'address', 'addresses', 'state', 'started', 'leader', 'os', 'health', 'health_failing_streak', 'health_log', 'exit_code', 'machine_path', 'origin', 'digest']:
+    d.pop(k, None)
+print(json.dumps(d, sort_keys=True, indent=1))"
+}
 # Unique across runs, since the journals keep what earlier runs wrote: the PID is not,
 # as a VM that has just booted gives the script the same one every time.
 nonce=$(date +%s)
@@ -80,7 +91,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -1581,6 +1592,11 @@ $NSPAWN stop e2e-dep-db >/dev/null || fail "stop the machine depended on"
 $NSPAWN ps | grep_q "^ *e2e-dep-web .* running" || fail "stopping a dependency stopped the machine that depends on it"
 out=$($NSPAWN rm -f e2e-dep-db 2>&1) && fail "a machine another one depends on was removed"
 echo "$out" | grep_q "e2e-dep-web depends on e2e-dep-db" || fail "the refused removal was not explained: $out"
+# Named together, a dependency goes only once what depends on it has: e2e-dep-web runs,
+# so rm without -f keeps it, and e2e-dep-db with it.
+out=$($NSPAWN rm e2e-dep-db e2e-dep-web 2>&1) && fail "rm of a running machine and its dependency succeeded"
+echo "$out" | grep_q "e2e-dep-web stays and needs e2e-dep-db" || fail "the kept dependency was not explained: $out"
+$NSPAWN images ls | grep_q "^ *e2e-dep-db " || fail "rm removed the dependency of a machine it kept"
 # What is refused before anything changes.
 out=$($NSPAWN start e2e-dep-db --depends-on e2e-dep-web 2>&1) && fail "a cycle of dependencies was accepted"
 echo "$out" | grep_q "cycle, e2e-dep-db -> e2e-dep-web -> e2e-dep-db" || fail "the cycle was not explained: $out"
@@ -1613,6 +1629,8 @@ retry 5 bash -c "$NSPAWN ps | grep '^ *e2e-dep-db ' | grep -q 'health: starting'
 $NSPAWN start e2e-dep-web > /tmp/e2e-dep-start.txt 2>&1 &
 dep_start=$!
 retry 10 bash -c "[ \"\$(systemctl show -p ActiveState --value systemd-nspawn@e2e-dep-web.service)\" = activating ]" || fail "the machine is not waiting"
+out=$(timeout 20 $NSPAWN start e2e-dep-web 2>&1) && fail "a second start of a waiting machine succeeded"
+echo "$out" | grep_q "already starting" || fail "the second start was not explained: $out"
 $NSPAWN stop e2e-dep-web >/dev/null || fail "stop a machine waiting for its dependencies"
 wait $dep_start && fail "a start whose machine was stopped succeeded"
 [ "$(systemctl show -p ActiveState --value systemd-nspawn@e2e-dep-web.service)" = activating ] && fail "the waiting start is still there"
@@ -1629,15 +1647,6 @@ $NSPAWN network create e2e-gn --subnet 10.98.9.0/24 --label team=e2e >/dev/null 
 printf 'gen-secret' | $NSPAWN secret create e2e-gen-pw >/dev/null || fail "secret create for generate"
 $NSPAWN create $app e2e-gen-db --network e2e-gn --health-cmd true --health-interval 1s -- /bin/sleep 300 >/dev/null || fail "create the machine generate brings along"
 $NSPAWN create $app e2e-gen-web --network e2e-gn --network-alias www -p 18097:8080 -e "GREETING=hello there" -e EMPTY= -v e2evol-gen:/data -l "tier=front end" --restart on-failure -m 64m --cpus 0.5 --pids-limit 200 --health-cmd "test -d /data" --health-interval 2s --hostname gen-web --cap-add NET_ADMIN --tmpfs /scratch:size=8m --add-host peer:10.1.1.1 --ulimit nofile=64:128 --stop-signal SIGINT --stop-timeout 4 --secret e2e-gen-pw --depends-on e2e-gen-db:healthy --entrypoint /bin/sh -- -c "echo 'gen ok'; exec /bin/sleep 300" >/dev/null || fail "create a machine with many flags"
-gen_keys() {
-  $NSPAWN inspect "$1" | python3 -c "
-import json, sys
-d = json.load(sys.stdin)[0]
-# What a new machine of the same flags gets anew, or what only runs have.
-for k in ['created', 'address', 'addresses', 'state', 'started', 'leader', 'os', 'health', 'health_failing_streak', 'health_log', 'exit_code', 'machine_path', 'origin']:
-    d.pop(k, None)
-print(json.dumps(d, sort_keys=True, indent=1))"
-}
 gen_keys e2e-gen-web > /tmp/e2e-gen-web.before; gen_keys e2e-gen-db > /tmp/e2e-gen-db.before
 $NSPAWN generate e2e-gen-web > /tmp/e2e-gen.sh || fail "generate"
 cat /tmp/e2e-gen.sh
@@ -1663,6 +1672,20 @@ $NSPAWN rm -f e2e-gen-web e2e-gen-db >/dev/null || fail "rm the machines made ag
 $NSPAWN network rm e2e-gn >/dev/null || fail "network rm e2e-gn"
 $NSPAWN secret rm e2e-gen-pw >/dev/null || fail "secret rm e2e-gen-pw"
 $NSPAWN volume rm e2evol-gen >/dev/null || fail "volume rm e2evol-gen"
+# A machine another one takes its network from runs, flags of its own or not; one that
+# depends on it as well gets it started first.
+$NSPAWN pull "$IMAGE" --name e2e-gen-own --backend overlay --force >/dev/null || fail "pull the owner of a shared network"
+$NSPAWN create $app e2e-gen-side --network container:e2e-gen-own --depends-on e2e-gen-own -- /bin/sleep 300 >/dev/null || fail "create a machine in the owner's network"
+$NSPAWN start e2e-gen-side > /tmp/e2e-gen-side.txt 2>&1 || fail "start a machine whose stopped owner it depends on: $(cat /tmp/e2e-gen-side.txt)"
+grep_q "e2e-gen-own started first" /tmp/e2e-gen-side.txt || fail "start does not say it started the owner first: $(cat /tmp/e2e-gen-side.txt)"
+$NSPAWN ps | grep_q "^ *e2e-gen-own .* running" || fail "the owner was not started first"
+$NSPAWN generate e2e-gen-side > /tmp/e2e-gen-side.sh || fail "generate of a machine in another one's network"
+cat /tmp/e2e-gen-side.sh
+grep_q "^nspawn run -d --name e2e-gen-own " /tmp/e2e-gen-side.sh || fail "the owner without flags of its own is not run"
+$NSPAWN rm -f e2e-gen-side e2e-gen-own >/dev/null || fail "rm the machine in a shared network and its owner"
+sed "s#^nspawn #$NSPAWN #" /tmp/e2e-gen-side.sh | bash > /tmp/e2e-gen-run.txt 2>&1 || fail "the script of the shared network failed: $(cat /tmp/e2e-gen-run.txt)"
+retry 10 bash -c "$NSPAWN ps | grep -q '^ *e2e-gen-side .* running'" || fail "the machine in the shared network does not run again"
+$NSPAWN rm -f e2e-gen-side e2e-gen-own >/dev/null || fail "rm the machines of the shared network"
 
 step "restart, pause, unpause and top"
 $NSPAWN start $app -- /bin/sleep 300 >/dev/null || fail "start for restart"
@@ -1766,7 +1789,7 @@ ls /var/lib/nspawn/secrets/ | grep_q e2e-pw && fail "secret rm left files behind
 $NSPAWN events --since "-2min" --until now --filter type=secret | grep_q "secret create e2e-pw (size=7)" || fail "no event for the secret"
 $NSPAWN events --since "-2min" --until now --filter type=secret --filter event=remove | grep_q "secret remove e2e-pw (size=7)" || fail "secret remove carries no metadata: $($NSPAWN events --since -2min --until now --filter type=secret | tail -3)"
 
-step "everything at once: the features of 1.3.0 and 1.4.0 combined, on an app, a sidecar and a booted machine"
+step "everything at once: the features of 1.3.0, 1.4.0 and 1.10.0 combined, on an app, a sidecar and a booted machine"
 $NSPAWN network create e2e-nd --label tier=mix >/dev/null || fail "network create e2e-nd"
 $NSPAWN network create e2e-ne --internal >/dev/null || fail "network create e2e-ne"
 printf 'mix-secret' | $NSPAWN secret create e2e-pw >/dev/null || fail "secret create for the mix"
@@ -1803,10 +1826,10 @@ assert d['ports'] == ['127.0.0.1:18095->80/tcp', '127.0.0.1:18097->8080/tcp'] an
 assert d['user'] == 'nobody:root' and d['read_only'] and d['restart'] == 'on-failure' and d['labels']['role'] == 'mix', d
 assert d['health'] == 'healthy' and d['healthcheck']['retries'] == 2, (d['health'], d['healthcheck'])" || fail "inspect of the mixed app"
 [ "$(mx 'p=$(pidof httpd); awk "/^Uid:/ {print \$2} /^Gid:/ {print \$2}" /proc/$p/status' | tr '\n' ' ')" = "65534 0 " ] || fail "-u nobody:root is not what httpd runs as: $(mx 'p=$(pidof httpd); grep -E "^(Uid|Gid):" /proc/$p/status')"
-# A sidecar in the app's network, with a user and group, a read-only root and a tmpfs:
-# its port comes out through the app's second published port, it reads the app's hosts
-# file, and it has nothing of its own on the host.
-$NSPAWN create $app e2e-mix-side --network container:e2e-mix-app -u 65534:65534 --read-only --tmpfs /www2:size=4m,mode=1777 -l role=mix \
+# A sidecar in the app's network, with a user and group, a read-only root and a tmpfs,
+# that waits for the app to be healthy: its port comes out through the app's second
+# published port, it reads the app's hosts file, and it has nothing of its own on the host.
+$NSPAWN create $app e2e-mix-side --network container:e2e-mix-app --depends-on e2e-mix-app:healthy -u 65534:65534 --read-only --tmpfs /www2:size=4m,mode=1777 -l role=mix \
   -- /bin/sh -c "echo side-$nonce > /www2/index.html; exec /bin/httpd -f -p 8080 -h /www2" >/dev/null || fail "create the mixed sidecar"
 $NSPAWN start e2e-mix-side >/dev/null || fail "start the mixed sidecar"
 ms() { $NSPAWN exec e2e-mix-side -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
@@ -1819,9 +1842,9 @@ ip -o link show | grep_q "vb-e2e-mix-side" && fail "the sidecar got a veth of it
 [ "$(addr_on e2e-mix-side e2e-nd)" = "" ] || fail "the sidecar got an address of its own"
 $NSPAWN ps | grep "^ *e2e-mix-side " | grep_q " container:e2e-mix-app " || fail "ps does not show the sidecar's network: $($NSPAWN ps | grep e2e-mix-side)"
 # The booted machine: the same networks with an alias, a healthcheck on its systemd, the
-# secret, a hostname, a tmpfs and a capability dropped.
+# secret, a hostname, a tmpfs, a capability dropped, and the sidecar it depends on.
 $NSPAWN pull "$IMAGE" --name e2e-mix-boot --backend overlay --force >/dev/null || fail "pull e2e-mix-boot"
-$NSPAWN start e2e-mix-boot --network e2e-nd --network e2e-ne --network-alias mixboot \
+$NSPAWN start e2e-mix-boot --network e2e-nd --network e2e-ne --network-alias mixboot --depends-on e2e-mix-side \
   --health-cmd "systemctl is-system-running --wait | grep -Eq '^(running|degraded)\$'" --health-interval 2s --health-timeout 30s --health-retries 3 --health-start-period 40s \
   --secret e2e-pw --hostname mixboot-$nonce --tmpfs /var/tmp:size=16m --cap-drop SYS_MODULE --add-host peer:10.1.1.9 >/dev/null || fail "start the mixed booted machine"
 mb() { $NSPAWN exec e2e-mix-boot -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
@@ -1877,10 +1900,41 @@ $NSPAWN stop e2e-mix-boot >/dev/null || fail "stop the mixed booted machine"
 out=$($NSPAWN secret rm e2e-pw 2>&1) && fail "the secret was removed while the mixed machines take it"
 out=$($NSPAWN rm e2e-mix-app 2>&1) && fail "the app was removed while the sidecar takes its network"
 echo "$out" | grep_q "network of e2e-mix-side" || fail "the refused rm of the app was not explained: $out"
+out=$($NSPAWN rm e2e-mix-side 2>&1) && fail "the sidecar was removed while the booted machine depends on it"
+echo "$out" | grep_q "e2e-mix-boot depends on e2e-mix-side" || fail "the refused rm of the sidecar was not explained: $out"
 $NSPAWN stop e2e-mix-side >/dev/null || fail "stop the sidecar"
 ip netns list | grep_q -E "^nspawn-e2e-mix-side( |$)" && fail "the sidecar's namespace name was left behind"
-$NSPAWN rm e2e-mix-side >/dev/null || fail "rm the sidecar"
-$NSPAWN rm e2e-mix-app e2e-mix-boot >/dev/null || fail "rm the mixed machines"
+# The three down, a start of the booted machine brings up the other two as systemd does
+# at boot: the app first, healthy before the sidecar joins its new namespace.
+$NSPAWN start e2e-mix-boot > /tmp/e2e-mix-start.txt 2>&1 || fail "start the booted machine with the rest of the mix down: $(cat /tmp/e2e-mix-start.txt)"
+grep_q "e2e-mix-side started first: e2e-mix-boot depends on it" /tmp/e2e-mix-start.txt || fail "start does not say it started the sidecar first: $(cat /tmp/e2e-mix-start.txt)"
+$NSPAWN ps | grep "^ *e2e-mix-app " | grep_q "(healthy)" || fail "the sidecar started before the app was healthy: $($NSPAWN ps | grep e2e-mix-)"
+retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18097/ | grep_q side-$nonce" || fail "the sidecar started by systemd does not answer through the app's port"
+retry 30 bash -c "$NSPAWN ps | grep '^ *e2e-mix-boot ' | grep_q '(healthy)'" || fail "the booted machine is not healthy after the start of the three: $($NSPAWN ps | grep e2e-mix-boot)"
+$NSPAWN exec e2e-mix-boot -- bash -c 'exec 3<>/dev/tcp/mixweb/8080; printf "GET / HTTP/1.0\r\n\r\n" >&3; cat <&3' </dev/null | tr -d '\r' | grep_q side-$nonce || fail "the booted machine does not reach the sidecar after the start of the three"
+# generate of the booted machine brings along the two it needs, in the order they start;
+# with the three and their networks gone, the script makes them again.
+for m in e2e-mix-app e2e-mix-side e2e-mix-boot; do gen_keys $m > /tmp/$m.before; done
+$NSPAWN generate e2e-mix-boot > /tmp/e2e-mix-gen.sh || fail "generate of the mixed machines"
+cat /tmp/e2e-mix-gen.sh
+grep_q "^# secret e2e-pw is encrypted for this host" /tmp/e2e-mix-gen.sh || fail "generate does not say the secret of the mix stays behind"
+grep_q "^nspawn network create e2e-ne --subnet [0-9./]* --internal$" /tmp/e2e-mix-gen.sh || fail "generate does not make the internal network"
+grep_q "^nspawn network create e2e-nd " /tmp/e2e-mix-gen.sh && grep_q "^  --label tier=mix$" /tmp/e2e-mix-gen.sh || fail "generate does not make the labelled network"
+mix_line() { grep -n "^nspawn run -d --name $1 " /tmp/e2e-mix-gen.sh | cut -d: -f1; }
+[ -n "$(mix_line e2e-mix-app)" ] && [ "$(mix_line e2e-mix-app)" -lt "$(mix_line e2e-mix-side)" ] && [ "$(mix_line e2e-mix-side)" -lt "$(mix_line e2e-mix-boot)" ] || fail "generate does not make the app, the sidecar and the booted machine in that order"
+# One rm of the three, the app named first: it goes once the two that need it have.
+$NSPAWN rm -f e2e-mix-app e2e-mix-side e2e-mix-boot >/dev/null || fail "rm -f of the three mixed machines"
+$NSPAWN network rm e2e-nd e2e-ne >/dev/null || fail "network rm of the mix networks"
+sed "s#^nspawn #$NSPAWN #" /tmp/e2e-mix-gen.sh | bash > /tmp/e2e-mix-gen-run.txt 2>&1 || fail "the script of the mixed machines failed: $(cat /tmp/e2e-mix-gen-run.txt)"
+for m in e2e-mix-app e2e-mix-side e2e-mix-boot; do
+  gen_keys $m > /tmp/$m.after
+  diff /tmp/$m.before /tmp/$m.after > /tmp/$m.diff || fail "$m came back otherwise: $(cat /tmp/$m.diff)"
+done
+retry 10 bash -c "curl -sf -m 2 http://127.0.0.1:18095/ | grep_q mix-secret" || fail "the app made again does not serve the secret on its port"
+retry 10 bash -c "curl -sf -m 2 http://127.0.0.1:18097/ | grep_q side-$nonce" || fail "the sidecar made again does not answer through the app's port"
+retry 30 bash -c "$NSPAWN ps | grep '^ *e2e-mix-boot ' | grep_q '(healthy)'" || fail "the booted machine made again is not healthy: $($NSPAWN ps | grep e2e-mix-boot)"
+$NSPAWN exec e2e-mix-boot -- bash -c 'exec 3<>/dev/tcp/inner/80; printf "GET / HTTP/1.0\r\n\r\n" >&3; cat <&3' </dev/null | tr -d '\r' | grep_q mix-secret || fail "the booted machine made again does not reach the app through the internal network"
+$NSPAWN rm -f e2e-mix-app e2e-mix-side e2e-mix-boot >/dev/null || fail "rm -f of the mixed machines made again"
 $NSPAWN secret rm e2e-pw >/dev/null || fail "secret rm once the mixed machines are gone"
 $NSPAWN network rm e2e-nd e2e-ne >/dev/null || fail "network rm of the mix networks"
 ip -o link show | grep_q "nsbr-e2e-n[de]" && fail "a mix network left its bridge"

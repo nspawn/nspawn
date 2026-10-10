@@ -123,12 +123,19 @@ stopping one leaves it alone), and its first ExecStartPre,
 and waits in turn for each condition: a start that went through, a healthy
 verdict in `/run/nspawn/health`, or a program that ended with 0, read from the
 unit's state and ExecMainStatus. It fails the start when a dependency fails, or
-writes a warning for an optional one. Conditions that wait (`healthy`,
-`completed`) also set `TimeoutStartSec=infinity`, and `start` then waits for
-the job without its time limit; when the job fails, `start` gives the
-dependency's failure as the reason. The checks at `create` and `start`
-refuse a machine that is not nspawn's, the machine itself and a cycle; `rm`
-refuses a machine others depend on unless they go with it.
+writes a warning for an optional one. `completed` reads systemd's `Result=` of
+the run, since ExecMainStatus keeps an earlier run's when this one failed
+before its program started. Conditions that wait (`healthy`, `completed`) also
+set `TimeoutStartSec=infinity`, and `start` waits for the job without its time
+limit when one of them is anywhere down the chain, since systemd holds each
+start in its queue until the one before it is through; when the job fails,
+`start` gives the dependency's failure as the reason. A machine on the network
+of one it depends on skips attaching that network in the pass before its unit
+starts, and its hook attaches it once systemd has started the owner. The checks
+at `create` and `start` refuse a machine that is not nspawn's, the machine
+itself and a cycle, `--network container:` counting as a dependency; `rm`
+removes a machine before the ones it depends on and keeps a dependency whose
+dependents stay.
 
 `stop` sends the image's stop signal to the program of an app machine and
 SIGKILLs the cgroup after `--timeout`; a booted machine gets SIGRTMIN+4

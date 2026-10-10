@@ -232,7 +232,12 @@ pub fn format_duration(usec: u64) -> String {
         return "0s".to_string();
     }
     if !usec.is_multiple_of(1_000_000) {
-        return format!("{}ms", usec / 1000);
+        // What parse_duration reads back to the same microseconds.
+        return if usec.is_multiple_of(1000) {
+            format!("{}ms", usec / 1000)
+        } else {
+            format!("{usec}us")
+        };
     }
     let seconds = usec / 1_000_000;
     let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
@@ -543,6 +548,8 @@ mod tests {
         assert_eq!(format_duration(500_000), "500ms");
         assert_eq!(format_duration(3_600_000_000), "1h");
         assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(1500), "1500us");
+        assert_eq!(parse_duration(&format_duration(1500)).unwrap(), 1500);
     }
 
     #[test]
