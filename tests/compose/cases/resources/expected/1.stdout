@@ -1,0 +1,41 @@
+name: myproject
+services:
+  app:
+    image: alpine
+    networks:
+      ext: {}
+      frontnet:
+        ipv4_address: 172.28.0.10
+    volumes:
+      - type: volume
+        source: shared
+        target: /shared
+        volume: {}
+      - type: volume
+        source: extvol
+        target: /ext
+        volume: {}
+networks:
+  ext:
+    name: preexisting
+    external: true
+  frontnet:
+    name: myproject_frontnet
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
+    labels:
+      team: web
+volumes:
+  extvol:
+    name: extvol
+    external: true
+  shared:
+    name: myproject_shared
+    driver: local
+    driver_opts:
+      device: /compose/resources/shared
+      o: bind
+      type: none

@@ -1,0 +1,11 @@
+name: env-envfilelatin1
+services:
+  web:
+    environment:
+      A: "1"
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: env-envfilelatin1_default

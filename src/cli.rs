@@ -98,6 +98,8 @@ pub enum Command {
     Volume(VolumeArgs),
     /// Manage secrets (--secret NAME), like docker secret: kept encrypted for this host.
     Secret(SecretArgs),
+    /// Run docker compose files on nspawn machines, with docker compose's commands.
+    Compose(crate::compose::cli::ComposeArgs),
     /// Serve org.nspawn on the system bus (started by the bus; see --install).
     Daemon(DaemonArgs),
     /// run --rm: removes a machine once its unit is down after that run.

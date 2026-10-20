@@ -1,0 +1,13 @@
+name: yaml-mergescalar
+services:
+  web:
+    command:
+      - echo
+      - b
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: yaml-mergescalar_default
+x-c: keep

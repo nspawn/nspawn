@@ -1,0 +1,28 @@
+name: env-castok
+services:
+  web:
+    scale: 2
+    cpu_percent: 5
+    cpus: 10
+    cpu_shares: 7
+    image: x
+    init: true
+    networks:
+      default: null
+    oom_score_adj: -1000
+    privileged: true
+    ulimits:
+      nofile:
+        soft: 10
+        hard: 20
+      nproc: 65535
+    healthcheck:
+      retries: 3
+    ports:
+      - mode: ingress
+        target: 8
+        protocol: tcp
+    tty: true
+networks:
+  default:
+    name: env-castok_default

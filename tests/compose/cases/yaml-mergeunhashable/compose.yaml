@@ -1,0 +1,7 @@
+services:
+  web:
+    image: nginx
+x-b:
+  <<:
+    ? [k]
+    : v

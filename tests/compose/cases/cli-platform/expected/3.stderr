@@ -1,0 +1,1 @@
+service.build.platforms MUST include service.platform "linux/amd64": invalid compose project

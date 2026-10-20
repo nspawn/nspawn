@@ -51,6 +51,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::Manpage => clap_mangen::Man::new(Cli::command())
             .render(&mut std::io::stdout())
             .context("writing the manual page"),
+        // main hands nspawn compose its arguments before clap reads them: clap's
+        // definition of it is for the help, the manual page and the completions.
+        Command::Compose(_) => unreachable!("nspawn compose is read in main"),
         Command::Daemon(a) => {
             if a.install {
                 for line in crate::daemon::install::install(config.config_path.as_deref()).await? {
@@ -743,6 +746,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         Command::Logs(args) => machines::logs(args, client).await,
         Command::Cp(args) => copy::cp(args, client).await,
         Command::Daemon(_)
+        | Command::Compose(_)
         | Command::Network(_)
         | Command::Completions(_)
         | Command::Manpage

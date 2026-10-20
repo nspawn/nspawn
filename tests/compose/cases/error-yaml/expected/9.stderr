@@ -1,0 +1,1 @@
+failed to parse /compose/error-yaml/duplicate.yaml: yaml: construct errors: line 1: line 4: mapping key "image" already defined at line 3

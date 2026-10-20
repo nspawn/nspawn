@@ -1,0 +1,10 @@
+services:
+  web:
+    image: nginx
+  debug:
+    image: busybox
+    profiles: [debug, tools]
+  worker:
+    image: busybox
+    profiles: [jobs]
+    depends_on: [web]

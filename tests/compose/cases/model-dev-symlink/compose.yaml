@@ -1,0 +1,10 @@
+services:
+  web:
+    image: alpine
+    develop:
+      watch:
+        - path: ./link
+          action: sync
+          target: /app
+        - path: ./link/sub
+          action: rebuild

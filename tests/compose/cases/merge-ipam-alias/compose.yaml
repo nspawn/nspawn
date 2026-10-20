@@ -1,0 +1,9 @@
+services:
+  web:
+    image: alpine
+    networks: [n]
+networks:
+  n:
+    ipam:
+      config:
+        - subnet: 10.1.0.0/24

@@ -1,0 +1,4 @@
+x: &s foo
+y:
+  <<: *s
+services: {web: {image: x}}

@@ -1,0 +1,10 @@
+name: yaml-memunicode
+services:
+  web:
+    image: nginx
+    mem_limit: "10"
+    networks:
+      default: null
+networks:
+  default:
+    name: yaml-memunicode_default

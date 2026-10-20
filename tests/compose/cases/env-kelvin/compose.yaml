@@ -1,0 +1,6 @@
+services:
+  web:
+    image: x
+    environment:
+      A: "a$Kb"
+      B: "c${ſ}d"

@@ -1,0 +1,7 @@
+config
+-f sub config
+-p x -f sub config
+-f missing.yaml config
+-p x -f missing.yaml config
+-f ext.yaml config
+-f ext2.yaml config

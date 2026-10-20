@@ -1,0 +1,7 @@
+services:
+  web:
+    image: nginx
+    command: [echo, <<, b]
+x-a: <<
+x-b: !!merge foo
+x-c: keep

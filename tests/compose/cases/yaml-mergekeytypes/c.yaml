@@ -1,0 +1,5 @@
+services:
+  web:
+    image: nginx
+x-b:
+  <<: {~: a, k: v}

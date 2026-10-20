@@ -1,0 +1,5 @@
+services:
+  web:
+    image: x
+    pids_limit: "99999999999999999999x"
+    scale: "99999999999999999999x"

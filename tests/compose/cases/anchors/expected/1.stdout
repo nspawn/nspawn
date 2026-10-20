@@ -1,0 +1,35 @@
+name: anchors
+services:
+  a:
+    restart: always
+    environment:
+      NAME: a
+      TZ: UTC
+    image: alpine
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+    networks:
+      default: null
+  b:
+    restart: 'no'
+    image: alpine
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+    networks:
+      default: null
+    x-custom: value
+networks:
+  default:
+    name: anchors_default
+x-defaults:
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+  restart: always
+x-env:
+  TZ: UTC

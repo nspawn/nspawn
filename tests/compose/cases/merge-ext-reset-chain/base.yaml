@@ -1,0 +1,8 @@
+services:
+  root:
+    image: alpine
+    ports: ["80:80"]
+    environment: [A=1]
+  mid:
+    extends: root
+    ports: !reset []

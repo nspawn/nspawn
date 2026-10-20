@@ -1,0 +1,9 @@
+name: fromstdin
+services:
+  web:
+    image: nginx:1
+    networks:
+      default: null
+networks:
+  default:
+    name: fromstdin_default

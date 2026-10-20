@@ -1,0 +1,13 @@
+name: env-envfiles2
+services:
+  web:
+    environment:
+      A: two
+      B: b1
+      C: b1-two
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: env-envfiles2_default

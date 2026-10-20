@@ -1,0 +1,9 @@
+name: merged
+services:
+  web:
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: merged_default

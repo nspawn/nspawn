@@ -1,0 +1,4 @@
+services:
+  web:
+    image: alpine
+    ports: ["[::1]:8080:80", "80/UDP", "[]:81:81"]

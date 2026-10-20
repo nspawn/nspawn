@@ -1,0 +1,1 @@
+failed to parse /compose/yaml-aliaskeydup/b.yaml: yaml: construct errors: line 1: line 5: mapping key "k" already defined at line 4

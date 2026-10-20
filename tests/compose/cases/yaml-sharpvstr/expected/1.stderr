@@ -1,0 +1,1 @@
+failed to parse /compose/yaml-sharpvstr/compose.yaml: yaml: construct errors: line 1: go-yaml load error in constructor at L5.C5: cannot use '[]interface {}{"a\a"}' as a map key; try decoding into yaml.Node

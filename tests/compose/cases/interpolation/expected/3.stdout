@@ -1,0 +1,11 @@
+NAME                REQUIRED            DEFAULT VALUE       ALTERNATE VALUE
+PG_VERSION          false               16                  
+FALLBACK            false               deep                
+DB_PASSWORD         true                                    
+PRIV                false               yes                 
+PORT                false               5432                
+SET_VAR             false                                   set
+UNSET_VAR           false                                   unset
+MISSING             false               ${FALLBACK:-deep}   
+DB_USER             false                                   
+RO                  false               false               

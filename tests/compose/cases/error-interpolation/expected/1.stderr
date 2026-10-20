@@ -1,0 +1,4 @@
+error while interpolating services.web.command: required variable REQ is missing a value: must be set
+invalid interpolation format for services.web.image.
+You may need to escape any $ with another $.
+${

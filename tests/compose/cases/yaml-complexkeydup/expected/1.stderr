@@ -1,0 +1,1 @@
+failed to parse /compose/yaml-complexkeydup/compose.yaml: yaml: construct errors: line 5: mapping key "a" already defined at line 5

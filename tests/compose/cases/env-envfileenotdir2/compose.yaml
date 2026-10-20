@@ -1,0 +1,6 @@
+services:
+  web:
+    image: x
+    env_file:
+      - path: compose.yaml/x
+        required: false

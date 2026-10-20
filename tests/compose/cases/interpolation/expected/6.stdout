@@ -1,0 +1,19 @@
+name: interpolation
+networks:
+  default:
+    name: interpolation_default
+services:
+  db:
+    environment:
+      ALT: ${SET_VAR:+set} ${UNSET_VAR:+unset}
+      LITERAL: $$NOT_A_VAR
+      NESTED: ${MISSING:-${FALLBACK:-deep}}
+      POSTGRES_PASSWORD: ${DB_PASSWORD?the password is needed}
+      POSTGRES_USER: ${DB_USER}
+    image: postgres:${PG_VERSION:-16}
+    networks:
+      default: null
+    ports:
+      - ${PORT:-5432}:5432
+    privileged: ${PRIV:-yes}
+    read_only: ${RO:-false}

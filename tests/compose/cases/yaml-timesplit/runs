@@ -1,0 +1,6 @@
+-f a.yaml config
+-f b.yaml config
+-f c.yaml config
+-f d.yaml config
+-f e.yaml config
+-f a.yaml config --format json

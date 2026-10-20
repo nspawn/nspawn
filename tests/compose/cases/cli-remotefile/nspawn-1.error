@@ -1,0 +1,1 @@
+--file oci://example.invalid/app:1: files on this host: a git or oci:// address is refused

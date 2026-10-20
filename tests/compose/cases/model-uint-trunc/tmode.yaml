@@ -1,0 +1,8 @@
+services:
+  web:
+    image: alpine
+    volumes:
+      - type: tmpfs
+        target: /t
+        tmpfs:
+          mode: "0755"

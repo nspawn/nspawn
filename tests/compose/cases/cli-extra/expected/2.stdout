@@ -1,0 +1,5 @@
+NAME                REQUIRED            DEFAULT VALUE       ALTERNATE VALUE
+ZVAR                false                                   
+BVAR                true                                    
+AVAR                false                                   alt
+TAG                 false               latest              

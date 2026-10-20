@@ -1,0 +1,10 @@
+name: yaml-memlimit
+services:
+  web:
+    image: nginx
+    mem_limit: "16"
+    networks:
+      default: null
+networks:
+  default:
+    name: yaml-memlimit_default

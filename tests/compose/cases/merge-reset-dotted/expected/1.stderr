@@ -1,0 +1,1 @@
+failed to parse /compose/merge-reset-dotted/b.yaml: yaml: construct errors: line 1: internal error: path "services.my.svc.ports" is not a sub-path of "services.my👻svc"

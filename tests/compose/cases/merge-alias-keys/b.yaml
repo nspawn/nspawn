@@ -1,0 +1,7 @@
+x-k1: &k1 foo
+services:
+  web:
+    image: alpine
+    labels:
+      *k1 : one
+      k1: two

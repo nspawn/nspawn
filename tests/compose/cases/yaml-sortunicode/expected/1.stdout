@@ -1,0 +1,14 @@
+name: yaml-sortunicode
+services:
+  web:
+    image: nginx
+    labels:
+      aⅫ: d
+      aZ: c
+      x2: a
+      x٣: b
+    networks:
+      default: null
+networks:
+  default:
+    name: yaml-sortunicode_default

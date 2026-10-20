@@ -1,0 +1,4 @@
+name: fromstdin
+services:
+  web:
+    image: nginx:${TAG:-1}

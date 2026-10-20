@@ -1,0 +1,7 @@
+services:
+  web:
+    image: x
+    environment:
+      - HOME
+      - COMPOSE_PROJECT_NAME
+      - FROMDOTENV

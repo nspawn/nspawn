@@ -1,0 +1,12 @@
+name: env-kelvin
+services:
+  web:
+    environment:
+      A: a
+      B: cd
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: env-kelvin_default

@@ -1,0 +1,9 @@
+version: "3"
+services:
+  web:
+    image: alpine
+---
+version: "3"
+services:
+  db:
+    image: alpine

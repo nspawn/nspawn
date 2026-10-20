@@ -1,0 +1,8 @@
+services:
+  web:
+    image: nginx
+x-a:
+  ? !!timestamp "2001-12-14T20:00:00+20:00"
+  : a
+  ? !!timestamp "2001-12-14T20:00:00+20:00"
+  : b

@@ -1,0 +1,9 @@
+name: profiles
+services:
+  web:
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: profiles_default

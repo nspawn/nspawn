@@ -1,0 +1,16 @@
+name: profiles
+services:
+  debug:
+    profiles:
+      - debug
+      - tools
+    image: busybox
+    networks:
+      default: null
+  web:
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: profiles_default

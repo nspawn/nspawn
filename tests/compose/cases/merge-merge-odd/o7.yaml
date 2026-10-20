@@ -1,0 +1,3 @@
+services:
+  web:
+    ports: {a: 1}

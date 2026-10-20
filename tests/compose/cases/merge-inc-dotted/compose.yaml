@@ -1,0 +1,9 @@
+include:
+  - sub.yaml
+services:
+  my.svc:
+    command: [b]
+    environment: [A=2]
+  plain:
+    command: [b]
+    environment: [A=2]

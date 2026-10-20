@@ -1,0 +1,4 @@
+services:
+  web:
+    image: nginx
+    shm_size: 1kx

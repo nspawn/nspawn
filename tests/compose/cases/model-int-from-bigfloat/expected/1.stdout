@@ -1,0 +1,11 @@
+name: model-int-from-bigfloat
+services:
+  web:
+    cpu_count: -9223372036854775808
+    cpu_shares: -9223372036854775808
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: model-int-from-bigfloat_default

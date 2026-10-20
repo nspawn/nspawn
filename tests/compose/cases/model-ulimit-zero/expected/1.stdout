@@ -1,0 +1,17 @@
+name: model-ulimit-zero
+services:
+  web:
+    image: alpine
+    networks:
+      default: null
+    ulimits:
+      core: 5
+      nofile:
+        soft: 0
+        hard: 0
+      nproc:
+        soft: 0
+        hard: 0
+networks:
+  default:
+    name: model-ulimit-zero_default

@@ -1,0 +1,4 @@
+services:
+  web:
+    image: x
+    cpus: "1e400"

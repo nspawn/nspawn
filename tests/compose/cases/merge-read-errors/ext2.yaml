@@ -1,0 +1,5 @@
+services:
+  web:
+    extends:
+      file: missing.yaml
+      service: other

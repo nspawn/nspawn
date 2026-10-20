@@ -1,0 +1,17 @@
+name: merge-inc-nested-envfile
+services:
+  inner:
+    image: alpine:fromenvfile
+    networks:
+      default: null
+  mid:
+    image: alpine
+    networks:
+      default: null
+  web:
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-inc-nested-envfile_default

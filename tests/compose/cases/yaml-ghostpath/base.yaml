@@ -1,0 +1,8 @@
+services:
+  web:
+    image: nginx
+x-a:
+  b:
+    c: 1
+  b.c:
+    d: 2

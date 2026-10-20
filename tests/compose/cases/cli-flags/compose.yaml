@@ -1,0 +1,5 @@
+services:
+  web:
+    image: nginx
+    environment:
+      FOO: ${FOO:-x}

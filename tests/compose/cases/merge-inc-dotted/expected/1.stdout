@@ -1,0 +1,22 @@
+name: merge-inc-dotted
+services:
+  my.svc:
+    command:
+      - a
+      - b
+    environment:
+      A: "2"
+    image: alpine
+    networks:
+      default: null
+  plain:
+    command:
+      - b
+    environment:
+      A: "2"
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-inc-dotted_default

@@ -1,0 +1,6 @@
+include:
+  - sub/compose.yaml
+services:
+  main:
+    image: alpine
+    depends_on: [included]

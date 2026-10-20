@@ -1,0 +1,20 @@
+name: model-uint-trunc
+services:
+  web:
+    blkio_config:
+      weight: 1
+    image: alpine
+    networks:
+      default: null
+    volumes:
+      - type: tmpfs
+        target: /t
+        tmpfs:
+          mode: 1
+    ports:
+      - mode: ingress
+        target: 80
+        protocol: tcp
+networks:
+  default:
+    name: model-uint-trunc_default

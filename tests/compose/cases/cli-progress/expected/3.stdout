@@ -1,0 +1,9 @@
+name: cli-progress
+services:
+  web:
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: cli-progress_default

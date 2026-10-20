@@ -1,0 +1,4 @@
+services:
+  web:
+    image: alpine
+    extra_hosts: ["=1.2.3.4"]

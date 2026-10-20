@@ -1,0 +1,20 @@
+name: env-nopathresolution
+services:
+  job:
+    image: busybox
+    networks:
+      default: null
+  web:
+    environment:
+      A: "1"
+      B: two
+    image: nginx
+    labels:
+      com.example.tier: front
+    label_file:
+      - /compose/env-nopathresolution/labels/web.labels
+    networks:
+      default: null
+networks:
+  default:
+    name: env-nopathresolution_default

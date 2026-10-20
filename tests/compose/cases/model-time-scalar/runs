@@ -1,0 +1,3 @@
+-f image.yaml config
+-f cmd.yaml config
+-f env.yaml config

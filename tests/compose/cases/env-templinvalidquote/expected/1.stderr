@@ -1,0 +1,1 @@
+failed to read /compose/env-templinvalidquote/.env: Invalid template: "\x01${"

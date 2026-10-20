@@ -1,0 +1,4 @@
+name: ${EMPTYNAME}
+services:
+  web:
+    image: x

@@ -1,0 +1,13 @@
+services:
+  plain:
+    image: x
+  pa:
+    image: x
+    profiles: [a]
+  pb:
+    image: x
+    profiles: [b]
+  pc:
+    image: x
+    profiles: [c, d]
+    depends_on: [pa]

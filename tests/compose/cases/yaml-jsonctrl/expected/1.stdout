@@ -1,0 +1,22 @@
+{
+  "name": "yaml-jsonctrl",
+  "networks": {
+    "default": {
+      "name": "yaml-jsonctrl_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "web": {
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "A": "a\bb\fc"
+      },
+      "image": "nginx",
+      "networks": {
+        "default": null
+      }
+    }
+  }
+}

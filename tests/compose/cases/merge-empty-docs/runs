@@ -1,0 +1,4 @@
+-f trailing.yaml config
+-f leading.yaml config
+-f compose.yaml -f empty.yaml config
+-f empty.yaml config

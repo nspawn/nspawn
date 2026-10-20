@@ -1,0 +1,8 @@
+services:
+  common:
+    image: debian
+    env_file: common.env
+    volumes:
+      - ./data:/data
+    labels:
+      origin: common

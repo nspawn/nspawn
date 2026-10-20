@@ -1,0 +1,13 @@
+name: merge-inc-nulls
+services:
+  other:
+    image: alpine:3.20
+    networks:
+      default: null
+  web:
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-inc-nulls_default

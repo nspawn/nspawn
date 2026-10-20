@@ -1,0 +1,8 @@
+services:
+  web:
+    image: nginx
+    labels:
+      x2: a
+      "x٣": b
+      aZ: c
+      "aⅫ": d

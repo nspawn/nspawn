@@ -1,0 +1,16 @@
+name: model-dev-symlink
+services:
+  web:
+    develop:
+      watch:
+        - path: /compose/model-dev-symlink/real
+          action: sync
+          target: /app
+        - path: /compose/model-dev-symlink/real/sub
+          action: rebuild
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: model-dev-symlink_default

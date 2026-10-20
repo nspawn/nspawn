@@ -1,0 +1,5 @@
+config
+--profile debug config
+config --profiles
+--profile * config --services
+config worker

@@ -1,0 +1,18 @@
+services:
+  web:
+    image: busybox
+    command: ["sleep", "1"]
+    environment:
+      A: "1"
+      B: "2"
+    ports: ["80:80"]
+    labels: [a=1]
+    depends_on:
+      cache:
+        condition: service_healthy
+    dns: 8.8.8.8
+  cache:
+    image: redis
+    volumes: [data:/data]
+volumes:
+  data: {}

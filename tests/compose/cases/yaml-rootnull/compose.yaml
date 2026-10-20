@@ -1,0 +1,4 @@
+--- !!null
+services:
+  web:
+    image: nginx

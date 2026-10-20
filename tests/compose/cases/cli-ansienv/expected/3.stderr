@@ -1,0 +1,2 @@
+option '--no-ansi' is DEPRECATED ! Please use '--ansi' instead.
+can't use --progress tty while ANSI support is disabled

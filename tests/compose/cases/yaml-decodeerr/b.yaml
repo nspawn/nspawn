@@ -1,0 +1,4 @@
+services:
+  web:
+    image: nginx
+    stop_grace_period: 3y

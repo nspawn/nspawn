@@ -1,0 +1,7 @@
+-f duration.yaml config
+-f published.yaml config
+-f cpus.yaml config
+-f mem.yaml config
+-f bool.yaml config
+-f hosts.yaml config
+-f hosts2.yaml config

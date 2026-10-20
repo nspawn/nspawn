@@ -1,0 +1,1 @@
+failed to parse /compose/merge-dupkey/c.yaml: yaml: construct errors: line 1: line 6: mapping key "a\"b" already defined at line 5

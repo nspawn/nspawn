@@ -1,0 +1,1 @@
+validating /compose/yaml-tz24/compose.yaml: json: error calling MarshalJSON for type time.Time: Time.MarshalJSON: timezone hour outside of range [0,23]

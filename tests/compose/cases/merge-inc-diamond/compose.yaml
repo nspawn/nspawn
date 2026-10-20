@@ -1,0 +1,6 @@
+include:
+  - b.yaml
+  - c.yaml
+services:
+  web:
+    image: alpine

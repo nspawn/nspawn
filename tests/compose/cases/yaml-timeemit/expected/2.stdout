@@ -1,0 +1,25 @@
+{
+  "name": "yaml-timeemit",
+  "networks": {
+    "default": {
+      "name": "yaml-timeemit_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "web": {
+      "command": null,
+      "entrypoint": null,
+      "image": "nginx",
+      "networks": {
+        "default": null
+      }
+    }
+  },
+  "x-a": "2001-12-14T21:59:43Z",
+  "x-b": "2001-12-14T00:00:00Z",
+  "x-c": [
+    "2001-12-14T21:59:43.5Z"
+  ],
+  "x-d": "2001-12-14T21:59:43-05:00"
+}

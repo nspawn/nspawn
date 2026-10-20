@@ -1,0 +1,1 @@
+failed to parse /compose/yaml-mergekeytypes/b.yaml: yaml: construct errors: line 5: cannot construct !!timestamp `2001-12-14` into string

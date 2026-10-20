@@ -1,0 +1,3 @@
+-f compose.yaml -f b.yaml config
+-f compose.yaml -f c.yaml config
+-f d.yaml -f e.yaml config

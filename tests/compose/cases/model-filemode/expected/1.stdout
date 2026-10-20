@@ -1,0 +1,23 @@
+name: model-filemode
+services:
+  web:
+    image: alpine
+    networks:
+      default: null
+    secrets:
+      - source: s
+        target: /run/secrets/s
+        mode: 0-1
+      - source: t
+        target: /run/secrets/t
+        mode: 0-10
+networks:
+  default:
+    name: model-filemode_default
+secrets:
+  s:
+    name: model-filemode_s
+    file: /compose/model-filemode/s
+  t:
+    name: model-filemode_t
+    file: /compose/model-filemode/t

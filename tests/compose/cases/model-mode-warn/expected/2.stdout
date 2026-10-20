@@ -1,0 +1,17 @@
+name: model-mode-warn
+services:
+  web:
+    image: alpine
+    networks:
+      default: null
+    secrets:
+      - source: s
+        target: /run/secrets/s
+        mode: 0-1
+networks:
+  default:
+    name: model-mode-warn_default
+secrets:
+  s:
+    name: model-mode-warn_s
+    file: /compose/model-mode-warn/s

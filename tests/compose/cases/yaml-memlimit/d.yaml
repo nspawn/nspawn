@@ -1,0 +1,4 @@
+services:
+  web:
+    image: nginx
+    mem_limit: 0x1p4

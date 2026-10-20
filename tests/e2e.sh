@@ -2406,6 +2406,9 @@ out=$($NSPAWN --registry 127.0.0.1:9 search --source hub e2e-$nonce 2>&1 >/dev/n
 [ $rc -eq 0 ] || fail "search with an unreachable hub failed instead of warning: $out"
 echo "$out" | grep_q "warning: 127.0.0.1:9" || fail "search did not warn about the unreachable hub: $out"
 
+step "compose config: the binary prints what docker compose printed for the cases"
+python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"
+
 if [ "$(getenforce 2>/dev/null)" = Enforcing ] && [ -r "$audit_dir/audit.log" ]; then
   # The current log and those it rotated into, from the start of the run on.
   denials=$(cat "$audit_dir"/audit.log* | awk -v since="$audit_start" '/type=AVC/ && substr($0, index($0, "audit(") + 6) + 0 >= since' \

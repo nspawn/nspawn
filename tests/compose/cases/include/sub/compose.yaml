@@ -1,0 +1,5 @@
+services:
+  included:
+    image: nginx:${TAG}
+    volumes:
+      - ./www:/www

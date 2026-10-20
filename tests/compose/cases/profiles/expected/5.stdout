@@ -1,0 +1,19 @@
+name: profiles
+services:
+  web:
+    image: nginx
+    networks:
+      default: null
+  worker:
+    profiles:
+      - jobs
+    image: busybox
+    networks:
+      default: null
+    depends_on:
+      web:
+        condition: service_started
+        required: true
+networks:
+  default:
+    name: profiles_default

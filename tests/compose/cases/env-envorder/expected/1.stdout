@@ -1,0 +1,7 @@
+COMPOSE_PROJECT_NAME=env-envorder
+FOO.X=3
+FOO1=2
+FOO=1
+HOME=/home/user
+PATH=/usr/local/bin:/usr/bin:/bin
+PWD=/compose/env-envorder

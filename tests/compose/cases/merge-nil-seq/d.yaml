@@ -1,0 +1,6 @@
+services:
+  web:
+    image: alpine
+    build:
+      context: .
+      extra_hosts: {}

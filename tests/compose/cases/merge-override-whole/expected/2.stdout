@@ -1,0 +1,14 @@
+name: merge-override-whole
+services:
+  web:
+    command:
+      - echo
+      - sub
+    environment:
+      B: "2"
+    image: busybox
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-override-whole_default

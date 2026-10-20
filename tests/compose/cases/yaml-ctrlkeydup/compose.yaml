@@ -1,0 +1,6 @@
+services:
+  web:
+    image: nginx
+    labels:
+      "a\x07": 1
+      "a\x07": 2

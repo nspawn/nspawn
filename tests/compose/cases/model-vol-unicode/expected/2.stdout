@@ -1,0 +1,13 @@
+name: model-vol-unicode
+services:
+  web:
+    image: alpine
+    networks:
+      default: null
+    volumes:
+      - type: volume
+        target: /b
+        volume: {}
+networks:
+  default:
+    name: model-vol-unicode_default

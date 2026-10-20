@@ -1,0 +1,4 @@
+-f missing.yaml config
+-f colons.yaml config
+-f unexpected.yaml config
+-f ok.yaml config

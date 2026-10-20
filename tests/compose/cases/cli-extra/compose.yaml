@@ -1,0 +1,7 @@
+services:
+  web:
+    image: nginx:${TAG:-latest}
+    environment:
+      B: ${BVAR:?need b}
+      A: ${AVAR+alt}
+      Z: "${ZVAR}"

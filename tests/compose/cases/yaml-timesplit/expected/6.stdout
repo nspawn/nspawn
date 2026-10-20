@@ -1,0 +1,20 @@
+{
+  "name": "yaml-timesplit",
+  "networks": {
+    "default": {
+      "name": "yaml-timesplit_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "web": {
+      "command": null,
+      "entrypoint": null,
+      "image": "nginx",
+      "networks": {
+        "default": null
+      }
+    }
+  },
+  "x-a": "2001-12-14T21:59:43.5Z"
+}

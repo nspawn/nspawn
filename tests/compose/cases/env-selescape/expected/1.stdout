@@ -1,0 +1,9 @@
+name: env-selescape
+services:
+  web:
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: env-selescape_default

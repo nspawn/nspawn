@@ -1,0 +1,14 @@
+name: merge-alias-keys
+services:
+  web:
+    image: alpine
+    labels:
+      bar: two
+      foo: one
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-alias-keys_default
+x-k1: foo
+x-k2: bar

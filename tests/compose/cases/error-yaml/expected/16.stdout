@@ -1,0 +1,9 @@
+name: error-yaml
+services:
+  web:
+    image: 'y'
+    networks:
+      default: null
+networks:
+  default:
+    name: error-yaml_default

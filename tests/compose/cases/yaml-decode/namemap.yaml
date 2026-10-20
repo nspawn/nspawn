@@ -1,0 +1,2 @@
+name: {a: b}
+services: {web: {image: x}}

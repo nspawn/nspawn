@@ -1,0 +1,4 @@
+time="2026-10-15T19:25:20Z" level=warning msg="service \"web\": secrets.s.mode: mode is not supported outside Swarm mode and will be ignored"
+decoding failed due to the following error(s):
+
+'services[web].secrets[0].mode' strconv.ParseInt: parsing "7\u00a0": invalid syntax

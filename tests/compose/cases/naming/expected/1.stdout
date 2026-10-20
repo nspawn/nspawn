@@ -1,0 +1,10 @@
+name: mixedcase_name
+services:
+  app:
+    container_name: fixed-name
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: mixedcase_name_default

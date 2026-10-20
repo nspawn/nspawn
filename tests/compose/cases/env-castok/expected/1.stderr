@@ -1,0 +1,5 @@
+time="2026-10-15T19:23:56Z" level=warning msg="\"On\" for boolean is not supported by YAML 1.2, please use `true`"
+time="2026-10-15T19:23:56Z" level=warning msg="\"No\" for boolean is not supported by YAML 1.2, please use `false`"
+time="2026-10-15T19:23:56Z" level=warning msg="\"y\" for boolean is not supported by YAML 1.2, please use `true`"
+time="2026-10-15T19:23:56Z" level=warning msg="\"N\" for boolean is not supported by YAML 1.2, please use `false`"
+time="2026-10-15T19:23:56Z" level=warning msg="\"OFF\" for boolean is not supported by YAML 1.2, please use `false`"

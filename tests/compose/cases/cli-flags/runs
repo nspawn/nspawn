@@ -1,0 +1,22 @@
+config -f compose.yaml
+config -p x
+convert
+config --services=false
+config --format json --format yaml
+-p a -p b config
+--parallel -1 config
+config --hash=
+config --output=
+config --hash w?b
+config --hash web,*
+--progress bogus config
+--workdir . --project-directory . config
+--no-ansi --ansi always config
+config -q --environment
+config -q --variables --format yaml
+config --variables --format YAML
+config --variables --format {{json.}}
+--progress tty --ansi never config
+config --quiet=true
+--env-file= config
+config --services --services

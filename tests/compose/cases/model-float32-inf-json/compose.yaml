@@ -1,0 +1,9 @@
+services:
+  web:
+    image: alpine
+    deploy:
+      update_config:
+        max_failure_ratio: "1e39"
+      resources:
+        limits:
+          cpus: "1e39"

@@ -1,0 +1,2 @@
+error while interpolating services.web.pids_limit: failed to cast to expected type: strconv.ParseInt: parsing "99999999999999999999x": value out of range
+error while interpolating services.web.scale: failed to cast to expected type: strconv.Atoi: parsing "99999999999999999999x": value out of range

@@ -1,0 +1,1 @@
+failed to parse /compose/yaml-overridedup/compose.yaml: yaml: construct errors: line 6: mapping key "b" already defined at line 5

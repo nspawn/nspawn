@@ -1,0 +1,13 @@
+name: env-nointerpenv
+networks:
+  default:
+    name: env-nointerpenv_default
+services:
+  web:
+    environment:
+      - HOME
+      - COMPOSE_PROJECT_NAME=env-nointerpenv
+      - FROMDOTENV
+    image: x
+    networks:
+      default: null

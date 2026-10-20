@@ -1,0 +1,9 @@
+name: fromroot
+services:
+  web:
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: fromroot_default

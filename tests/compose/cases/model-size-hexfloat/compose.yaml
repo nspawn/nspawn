@@ -1,0 +1,5 @@
+services:
+  web:
+    image: alpine
+    mem_limit: "0x1p4"
+    shm_size: "0x1.8p1k"

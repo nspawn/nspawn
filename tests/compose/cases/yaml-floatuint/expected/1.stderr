@@ -1,0 +1,1 @@
+failed to parse /compose/yaml-floatuint/compose.yaml: yaml: construct errors: line 1: go-yaml load error in resolver at <unknown position>: cannot construct !!int `18446744073709551615` as a !!float

@@ -1,0 +1,49 @@
+name: env-templtorture
+services:
+  web:
+    environment:
+      T01: val
+      T02: val-x
+      T03: val
+      T04: ab}c}
+      T05: valb}c}
+      T06: '{}'
+      T07: '{a}x'
+      T08: $$SET $$val $$$$
+      T09: altval
+      T10: '|alt||'
+      T11: d||d
+      T12: val||val
+      T13: $$ $$1 $$} $$- val$$
+      T14: ""
+      T15: val
+      T16: x:-y
+      T17: $$
+      T18: $$
+      T19: val
+      T20: ab}
+      T22: val}
+      T23: x}}
+      T24: val
+      T25: ""
+      T26: __
+      T27: ""
+      T28: val
+      T31: a-b
+      T32: ""
+      T33: ""
+      T34: x
+      T35: '}'
+      T36: a:?b
+      T37: val
+      T38: val
+      T39: val{val}
+      T40: deep}}
+      T41: avalbcval
+      T42: x}
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: env-templtorture_default

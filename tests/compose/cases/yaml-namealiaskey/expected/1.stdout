@@ -1,0 +1,10 @@
+name: realname
+services:
+  web:
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: realname_default
+x-n: name

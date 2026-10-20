@@ -1,0 +1,2 @@
+-f - config
+-f - config --format json

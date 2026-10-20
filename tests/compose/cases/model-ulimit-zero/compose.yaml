@@ -1,0 +1,9 @@
+services:
+  web:
+    image: alpine
+    ulimits:
+      nofile: 0
+      nproc:
+        soft: 0
+        hard: 0
+      core: 5

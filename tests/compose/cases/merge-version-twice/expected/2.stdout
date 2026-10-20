@@ -1,0 +1,13 @@
+name: merge-version-twice
+services:
+  db:
+    image: alpine
+    networks:
+      default: null
+  web:
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-version-twice_default

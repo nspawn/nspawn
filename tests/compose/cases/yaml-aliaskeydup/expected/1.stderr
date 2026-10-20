@@ -1,0 +1,1 @@
+failed to parse /compose/yaml-aliaskeydup/a.yaml: yaml: construct errors: line 1: line 5: mapping key "image" already defined at line 4

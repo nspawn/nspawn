@@ -1,0 +1,1 @@
+failed to read /compose/env-dotenvctl/.env: line 1: unexpected character "\x01" in variable name "A\x01B=1"

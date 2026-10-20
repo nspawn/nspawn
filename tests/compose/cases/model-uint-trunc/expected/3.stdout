@@ -1,0 +1,13 @@
+name: model-uint-trunc
+networks:
+  default:
+    name: model-uint-trunc_default
+services:
+  web:
+    image: alpine
+    networks:
+      default: null
+    ports:
+      - mode: ingress
+        protocol: tcp
+        target: "80"

@@ -1,0 +1,4 @@
+config --variables --format yaml
+config --variables --format table
+--profile= config --profiles
+config --format yml

@@ -1,0 +1,4 @@
+services:
+  web:
+    image: "${"
+    command: ${REQ:?must be set}

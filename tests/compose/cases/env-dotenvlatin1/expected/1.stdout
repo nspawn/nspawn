@@ -1,0 +1,5 @@
+A=1
+COMPOSE_PROJECT_NAME=env-dotenvlatin1
+HOME=/home/user
+PATH=/usr/local/bin:/usr/bin:/bin
+PWD=/compose/env-dotenvlatin1

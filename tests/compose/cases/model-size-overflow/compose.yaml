@@ -1,0 +1,7 @@
+services:
+  web:
+    image: alpine
+    mem_limit: "100000000p"
+    mem_reservation: "1e30"
+    shm_size: "NaN "
+    memswap_limit: "Inf "

@@ -1,0 +1,4 @@
+include: {a: 1, b: [x, 2]}
+services:
+  web:
+    image: alpine

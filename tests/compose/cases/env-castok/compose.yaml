@@ -1,0 +1,28 @@
+services:
+  web:
+    image: x
+    cpus: "1E1"
+    cpu_percent: "5."
+    cpu_shares: "+7"
+    cpu_count: "-0"
+    oom_score_adj: "-1000"
+    init: "TRUE"
+    tty: "On"
+    stdin_open: "N"
+    read_only: "False"
+    privileged: "y"
+    healthcheck:
+      retries: "+3"
+      disable: "No"
+    ulimits:
+      nofile:
+        soft: "+10"
+        hard: "20"
+      nproc: "65535"
+    scale: "+2"
+    ports:
+      - target: "08"
+networks:
+  n:
+    external: "OFF"
+    name: n

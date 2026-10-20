@@ -1,0 +1,5 @@
+config
+config --format json
+-f str.yaml config --no-interpolate
+-f weight.yaml config
+-f tmode.yaml config

@@ -1,0 +1,1 @@
+services.web.depends_on: cannot use map[string]interface {} as a mapping key

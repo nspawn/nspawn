@@ -1,0 +1,3 @@
+config
+-f compose.yaml -f compose.override.yaml -f extra.yaml config
+-f compose.yaml -f extra.yaml --profile tools config --services

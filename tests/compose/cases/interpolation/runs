@@ -1,0 +1,6 @@
+config
+config --format json
+config --variables
+config --variables --format json
+config --environment
+config --no-interpolate

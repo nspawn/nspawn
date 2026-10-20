@@ -1,0 +1,12 @@
+name: merge-reset-dotted-label
+services:
+  web:
+    image: alpine
+    labels:
+      a.<<b: "1"
+      other: x
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-reset-dotted-label_default

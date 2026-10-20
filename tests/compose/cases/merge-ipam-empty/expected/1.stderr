@@ -1,0 +1,1 @@
+validating /compose/merge-ipam-empty/b.yaml: networks.n.ipam.config must be a array

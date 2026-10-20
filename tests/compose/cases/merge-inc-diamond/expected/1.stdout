@@ -1,0 +1,21 @@
+name: merge-inc-diamond
+services:
+  b:
+    image: alpine
+    networks:
+      default: null
+  c:
+    image: alpine
+    networks:
+      default: null
+  d:
+    image: 'alpine:'
+    networks:
+      default: null
+  web:
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-inc-diamond_default

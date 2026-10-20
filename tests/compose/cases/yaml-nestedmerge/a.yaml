@@ -1,0 +1,8 @@
+services:
+  web:
+    image: nginx
+x-m3: &m3 {k: from-m3}
+x-m1: &m1 {<<: *m3, a: 1}
+x-m2: &m2 {k: from-m2}
+x-p:
+  <<: [*m1, *m2]

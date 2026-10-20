@@ -1,0 +1,3 @@
+-f latin.yaml config
+-f ideo.yaml config
+-f nbsp.yaml config

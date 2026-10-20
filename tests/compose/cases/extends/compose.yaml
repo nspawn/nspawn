@@ -1,0 +1,16 @@
+services:
+  base:
+    image: alpine
+    environment:
+      FROM: base
+    volumes:
+      - ./base:/base
+  child:
+    extends: base
+    environment:
+      CHILD: "yes"
+  other:
+    extends:
+      file: common/common.yaml
+      service: common
+    command: run

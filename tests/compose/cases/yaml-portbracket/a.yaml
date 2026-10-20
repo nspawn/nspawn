@@ -1,0 +1,5 @@
+services:
+  web:
+    image: nginx
+    ports:
+      - "[::1:8080:80"

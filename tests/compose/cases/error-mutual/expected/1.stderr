@@ -1,0 +1,1 @@
+service web declares mutually exclusive `network_mode` and `networks`: invalid compose project

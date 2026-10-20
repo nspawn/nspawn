@@ -1,0 +1,1 @@
+services.web.logging: cannot merge logging: expected a mapping, got []interface {}

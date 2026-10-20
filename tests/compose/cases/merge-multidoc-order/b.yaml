@@ -1,0 +1,7 @@
+services:
+  web:
+    image: alpine
+---
+services:
+  web:
+    image: [

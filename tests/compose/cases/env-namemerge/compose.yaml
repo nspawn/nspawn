@@ -1,0 +1,6 @@
+x-base: &b
+  name: merged
+<<: *b
+services:
+  web:
+    image: x

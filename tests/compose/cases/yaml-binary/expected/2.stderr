@@ -1,0 +1,1 @@
+failed to parse /compose/yaml-binary/b.yaml: yaml: construct errors: line 1: go-yaml load error in constructor at L4.C6: !!binary value contains invalid base64 data

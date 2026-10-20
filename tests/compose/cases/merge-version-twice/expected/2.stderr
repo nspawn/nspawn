@@ -1,0 +1,1 @@
+time="2026-10-15T19:25:12Z" level=warning msg="/compose/merge-version-twice/multi.yaml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"

@@ -1,0 +1,35 @@
+{
+  "name": "interpolation",
+  "networks": {
+    "default": {
+      "name": "interpolation_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "db": {
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "ALT": "set ",
+        "LITERAL": "$$NOT_A_VAR",
+        "NESTED": "from .env",
+        "POSTGRES_PASSWORD": "secret",
+        "POSTGRES_USER": ""
+      },
+      "image": "postgres:16",
+      "networks": {
+        "default": null
+      },
+      "privileged": true,
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 5432,
+          "published": "5432",
+          "protocol": "tcp"
+        }
+      ]
+    }
+  }
+}

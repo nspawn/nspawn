@@ -21,6 +21,43 @@ Unit tests need no root and touch nothing outside temporary directories. The
 `[lints.clippy]` table of Cargo.toml turns on a few lints about clones and
 allocations beyond clippy's default set; they are part of the same check.
 
+## nspawn compose against docker compose
+
+`nspawn compose` is checked against the docker compose release that
+`src/compose/support` names, run for real. Docker is all it needs on the host:
+Go runs in a container.
+
+- `tests/compose/cases/*` hold compose files, a `runs` file with the arguments
+  of each run (an `env` file with the environment and a `stdin` file with the
+  standard input, where they need one), and what docker compose printed for
+  every run under `expected/`.
+  `cargo test` makes the runs in process and compares output, errors and
+  warnings. `tests/compose/oracle.sh build` builds that docker compose from its
+  source, and `tests/compose/oracle.sh record` records the cases again; a case
+  added needs its record. `nspawn-N.error` next to `expected/` holds the error
+  nspawn gives on purpose for a run docker compose takes. The end-to-end suite
+  makes the same runs with the binary, through `tests/compose/binary.py`, which
+  covers what the test in process does not: the environment, directory and stdin
+  it starts with, how warnings and errors reach stderr, the exit status.
+- `NSPAWN_COMPOSE_CORPUS=DIR cargo test corpus -- --ignored` does the same with
+  cases kept outside the repository, recorded with `oracle.sh record DIR`.
+- The YAML parser and emitter, `src/compose/libyaml.rs` and
+  `src/compose/emitter.rs`, are ports of those of go-yaml, the release docker
+  compose builds with. `tests/compose/go-yaml.sh events DIR` writes what
+  go-yaml's parser makes of every file under DIR (events, marks, errors) and
+  `NSPAWN_YAML_EVENTS=DIR cargo test parser_matches -- --ignored` compares;
+  `go-yaml.sh emit DIR` and `NSPAWN_YAML_EMIT=DIR cargo test emitter_matches --
+  --ignored` do the same with the YAML written of the JSON files under DIR. Any
+  inputs serve: compose files, the YAML test suite, files cut or changed at
+  random.
+- `src/compose/unicode.rs` holds what Go's packages decide character by
+  character (which characters `%q` escapes, which are letters, digits and spaces,
+  lower case) and the texts of system errors, as the Go release docker compose
+  builds with has them; `tests/compose/go-tables.sh` writes it again.
+
+Their containers get 2 GiB of memory at most: docker compose sets no limit on
+what aliases expand to, and a file that expands without end takes what it gets.
+
 ## End-to-end suite
 
 `tests/e2e.sh` exercises the whole thing against a real registry and
@@ -79,8 +116,8 @@ lags behind the code shows up as a FAIL line.
 
 The suite cleans up before and after itself and ends with `ALL OK` or a
 failure count. Every FAIL line names the check. It runs from wherever it sits,
-as long as `tests/build-context` sits next to it; `NSPAWN_BUILD_CONTEXT` points
-it at another mkosi definition.
+as long as `tests/build-context` and `tests/compose` sit next to it;
+`NSPAWN_BUILD_CONTEXT` points it at another mkosi definition.
 
 ## Debugging a machine
 

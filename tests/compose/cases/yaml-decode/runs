@@ -1,0 +1,32 @@
+-f scalar.yaml config
+-f seq.yaml config
+-f nameseq.yaml config
+-f namemap.yaml config
+-f nameint.yaml config
+-f namebool.yaml config
+-f namenull.yaml config
+-f namefloat.yaml config
+-f namedate.yaml config
+-f namebin.yaml config
+-f nameinttag.yaml config
+-f topdup.yaml config
+-f aliasname.yaml config
+-f mergebad.yaml config
+-f mergetop.yaml config
+-f selfalias.yaml config
+-f doc2err.yaml config
+-f doc2name.yaml config
+-f seqkey.yaml config
+-f mapkey.yaml config
+-f intkey.yaml config
+-f tagstr.yaml config
+-f binbad.yaml config
+-f commentfirst.yaml config
+-f empty.yaml config
+-f onlycomment.yaml config
+-f emptydoc.yaml config
+-p xx -f nameseq.yaml config
+-p xx -f doc2err.yaml config
+-p xx -f scalar.yaml config
+-f scalar.yaml -f nameint.yaml config
+-f nameint.yaml -f token.yaml config

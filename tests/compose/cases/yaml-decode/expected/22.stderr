@@ -1,0 +1,1 @@
+failed to parse /compose/yaml-decode/tagstr.yaml: yaml: construct errors: line 1: go-yaml load error in resolver at <unknown position>: cannot construct !!str `abc` as a !!int

@@ -1,0 +1,1 @@
+failed to parse /compose/yaml-ghostpath/over.yaml: yaml: construct errors: line 1: internal error: path "x-a.b.c" is not a sub-path of "x-a.b👻c"

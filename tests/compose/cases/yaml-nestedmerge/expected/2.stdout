@@ -1,0 +1,15 @@
+name: fromm3
+services:
+  web:
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: fromm3_default
+x-m1:
+  name: fromm3
+x-m2:
+  name: fromm2
+x-m3:
+  name: fromm3

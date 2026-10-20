@@ -1,0 +1,6 @@
+services:
+  web:
+    image: nginx
+x-a:
+  ? {true: a, 1.5: b, -1: c, 18446744073709551615: d, s: e, ~: f, .nan: g, !!timestamp 2001-12-14: h, !!timestamp "2000-01-01T00:00:00.5Z": i, 3: j, -.inf: k, false: l}
+  : x

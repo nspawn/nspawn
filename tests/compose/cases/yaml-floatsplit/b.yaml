@@ -1,0 +1,4 @@
+services:
+  web:
+    image: nginx
+x-d: .5_

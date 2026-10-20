@@ -1,0 +1,11 @@
+name: yaml-floatsplit
+services:
+  web:
+    environment:
+      A: 1e400
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: yaml-floatsplit_default

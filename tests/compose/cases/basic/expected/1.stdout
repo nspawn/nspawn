@@ -1,0 +1,119 @@
+name: basic
+services:
+  app:
+    cap_add:
+      - NET_ADMIN
+    entrypoint:
+      - python
+      - -m
+      - http.server
+    environment:
+      COUNT: "3"
+      DEBUG: "false"
+      MODE: production
+    extra_hosts:
+      - host.local=10.0.0.1
+      - other=10.0.0.2
+    image: python:3.12-slim
+    init: true
+    networks:
+      back: null
+    shm_size: "134217728"
+    stop_grace_period: 20s
+    tmpfs:
+      - /tmp
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
+      nproc: 512
+    user: 1000:1000
+    working_dir: /srv
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "print(1)"
+  web:
+    deploy:
+      resources:
+        limits:
+          cpus: 0.5
+          memory: "268435456"
+    restart: unless-stopped
+    command:
+      - nginx
+      - -g
+      - daemon off;
+    environment:
+      BARE: null
+      EMPTY: ""
+      TZ: UTC
+    image: nginx:1.27
+    labels:
+      com.example.role: frontend
+      com.example.tier: "1"
+    networks:
+      back: {}
+      front:
+        aliases:
+          - www
+    volumes:
+      - type: bind
+        source: /compose/basic/html
+        target: /usr/share/nginx/html
+        read_only: true
+        bind: {}
+      - type: volume
+        source: logs
+        target: /var/log/nginx
+        volume: {}
+      - type: tmpfs
+        target: /cache
+        tmpfs:
+          size: "67108864"
+    depends_on:
+      app:
+        condition: service_healthy
+        required: true
+    healthcheck:
+      test:
+        - CMD
+        - curl
+        - -f
+        - http://localhost
+      timeout: 5s
+      interval: 30s
+      retries: 3
+      start_period: 1m30s
+    ports:
+      - mode: ingress
+        target: 80
+        published: "8080"
+        protocol: tcp
+      - mode: ingress
+        host_ip: 127.0.0.1
+        target: 443
+        published: "8443"
+        protocol: tcp
+      - mode: ingress
+        target: 9000
+        published: "9000"
+        protocol: udp
+      - mode: ingress
+        target: 9001
+        published: "9001"
+        protocol: udp
+      - mode: ingress
+        host_ip: 0.0.0.0
+        target: 5000
+        published: "5001"
+        protocol: tcp
+networks:
+  back:
+    name: basic_back
+    internal: true
+  front:
+    name: basic_front
+volumes:
+  logs:
+    name: basic_logs

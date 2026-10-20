@@ -1,0 +1,39 @@
+services:
+  web:
+    image: nginx:1.27
+    command: nginx -g "daemon off;"
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+      - 9000-9001:9000-9001/udp
+    volumes:
+      - logs:/var/log/nginx
+      - type: tmpfs
+        target: /cache
+        tmpfs:
+          size: 64m
+    environment: [TZ=UTC, EMPTY=, BARE]
+    labels:
+      com.example.role: frontend
+    depends_on: [db]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 30s
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+    profiles: [web]
+    pull_policy: always
+  db:
+    image: postgres:16
+    ulimits:
+      nofile: {soft: 1, hard: 2}
+    secrets: [s]
+secrets:
+  s:
+    environment: S
+volumes:
+  logs: {}

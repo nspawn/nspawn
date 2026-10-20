@@ -1,0 +1,8 @@
+services:
+  base:
+    image: alpine
+    command: ["echo", "hi"]
+  web:
+    extends:
+      service: base
+      file:

@@ -1,0 +1,3 @@
+-f neg.yaml config
+-f neg.yaml config --format json
+-f big.yaml config

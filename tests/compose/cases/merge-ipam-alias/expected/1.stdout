@@ -1,0 +1,15 @@
+name: merge-ipam-alias
+services:
+  web:
+    image: alpine
+    networks:
+      'n': null
+networks:
+  'n':
+    name: merge-ipam-alias_n
+    ipam:
+      config:
+        - subnet: 10.2.0.0/24
+          gateway: 10.1.0.1
+          ip_range: 10.2.0.0/25
+        - subnet: 10.2.0.0/24

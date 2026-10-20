@@ -1,0 +1,2 @@
+--profile * config --hash *
+--profile * config --hash db

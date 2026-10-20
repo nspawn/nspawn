@@ -1,0 +1,7 @@
+services:
+  app:
+    image: myimg
+    platform: linux/amd64
+    build:
+      context: .
+      platforms: [linux/arm64]

@@ -1,0 +1,19 @@
+{
+  "name": "fromstdin",
+  "networks": {
+    "default": {
+      "name": "fromstdin_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "web": {
+      "command": null,
+      "entrypoint": null,
+      "image": "nginx:1",
+      "networks": {
+        "default": null
+      }
+    }
+  }
+}

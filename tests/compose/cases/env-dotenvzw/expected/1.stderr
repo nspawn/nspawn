@@ -1,0 +1,1 @@
+failed to read /compose/env-dotenvzw/.env: line 1: unexpected character "\u200b" in variable name "A\u200bB=1"

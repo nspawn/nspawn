@@ -1,0 +1,3 @@
+services:
+  web:
+    environment: [X=1]

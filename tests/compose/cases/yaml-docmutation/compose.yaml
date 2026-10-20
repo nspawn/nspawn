@@ -1,0 +1,10 @@
+services:
+  web:
+    image: nginx
+x-b:
+  k: keep
+x-a: &a
+  k: !reset 1
+  j: 2
+---
+x-b: *a

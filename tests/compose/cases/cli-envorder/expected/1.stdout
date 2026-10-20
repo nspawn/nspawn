@@ -1,0 +1,6 @@
+COMPOSE_PROJECT_NAME=cli-envorder
+HOME=/home/user
+PATH=/usr/local/bin:/usr/bin:/bin
+PWD=/compose/cli-envorder
+VAR1=b
+VAR=a

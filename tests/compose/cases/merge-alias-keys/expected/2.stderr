@@ -1,0 +1,1 @@
+failed to parse /compose/merge-alias-keys/b.yaml: yaml: construct errors: line 1: line 7: mapping key "k1" already defined at line 6

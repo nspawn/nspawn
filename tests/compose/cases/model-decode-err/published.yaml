@@ -1,0 +1,6 @@
+services:
+  web:
+    image: alpine
+    ports:
+      - target: 80
+        published: 8080.0

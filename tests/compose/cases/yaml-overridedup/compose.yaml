@@ -1,0 +1,6 @@
+services:
+  web:
+    image: nginx
+x-a: !override
+  b: 1
+  b: 2

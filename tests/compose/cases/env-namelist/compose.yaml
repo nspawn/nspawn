@@ -1,0 +1,4 @@
+name: [a]
+services:
+  web:
+    image: x

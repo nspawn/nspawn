@@ -1,0 +1,12 @@
+name: yaml-mergequotedkey
+services:
+  web:
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: yaml-mergequotedkey_default
+x-b:
+  '<<': 1
+  a: 2

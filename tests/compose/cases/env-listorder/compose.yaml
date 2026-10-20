@@ -1,0 +1,8 @@
+services:
+  web:
+    image: x
+    ports:
+      - target: "${A:?a}"
+        published: "80"
+      - target: "81"
+        published: "${B:?b}"

@@ -1,0 +1,4 @@
+services:
+  web:
+    labels:
+      "a.<<b": !reset ""

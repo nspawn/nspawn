@@ -1,0 +1,71 @@
+{
+  "name": "model-vol-bindopt-volume",
+  "networks": {
+    "default": {
+      "name": "model-vol-bindopt-volume_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "web": {
+      "command": null,
+      "entrypoint": null,
+      "image": "alpine",
+      "networks": {
+        "default": null
+      },
+      "volumes": [
+        {
+          "type": "volume",
+          "source": "data",
+          "target": "/data",
+          "bind": {
+            "selinux": "z"
+          },
+          "volume": {}
+        },
+        {
+          "type": "volume",
+          "source": "data",
+          "target": "/data2",
+          "bind": {
+            "propagation": "rshared"
+          },
+          "volume": {}
+        },
+        {
+          "type": "volume",
+          "source": "data",
+          "target": "/data3",
+          "read_only": true,
+          "volume": {
+            "nocopy": true
+          }
+        },
+        {
+          "type": "bind",
+          "source": "/compose/model-vol-bindopt-volume/h",
+          "target": "/h",
+          "bind": {},
+          "volume": {
+            "nocopy": true
+          }
+        },
+        {
+          "type": "bind",
+          "source": "/compose/model-vol-bindopt-volume/h2",
+          "target": "/h2",
+          "bind": {
+            "selinux": "Z",
+            "propagation": "rslave"
+          }
+        }
+      ]
+    }
+  },
+  "volumes": {
+    "data": {
+      "name": "model-vol-bindopt-volume_data"
+    }
+  }
+}

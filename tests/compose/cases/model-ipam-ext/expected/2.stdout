@@ -1,0 +1,29 @@
+{
+  "name": "model-ipam-ext",
+  "networks": {
+    "n": {
+      "name": "model-ipam-ext_n",
+      "ipam": {
+        "driver": "default",
+        "config": [
+          {
+            "subnet": "10.0.0.0/24",
+            "aux_addresses": {
+              "host1": "10.0.0.5"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "services": {
+    "web": {
+      "command": null,
+      "entrypoint": null,
+      "image": "alpine",
+      "networks": {
+        "n": null
+      }
+    }
+  }
+}

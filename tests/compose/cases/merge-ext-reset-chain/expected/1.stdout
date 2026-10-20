@@ -1,0 +1,11 @@
+name: merge-ext-reset-chain
+services:
+  web:
+    environment:
+      B: "2"
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-ext-reset-chain_default

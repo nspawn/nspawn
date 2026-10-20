@@ -1,0 +1,11 @@
+name: yaml-mergekeytypes
+services:
+  web:
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: yaml-mergekeytypes_default
+x-b:
+  k: v

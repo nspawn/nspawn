@@ -1,0 +1,6 @@
+include:
+  - path: a.yaml
+    project_directory: 1
+services:
+  web:
+    image: alpine

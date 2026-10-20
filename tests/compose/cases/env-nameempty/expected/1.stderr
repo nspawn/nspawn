@@ -1,0 +1,3 @@
+time="2026-10-15T19:24:10Z" level=warning msg="The \"EMPTYNAME\" variable is not set. Defaulting to a blank string."
+time="2026-10-15T19:24:10Z" level=warning msg="The \"EMPTYNAME\" variable is not set. Defaulting to a blank string."
+project name must not be empty

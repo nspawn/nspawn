@@ -1,0 +1,40 @@
+name: override
+services:
+  cache:
+    image: redis
+    networks:
+      default: null
+    volumes:
+      - type: volume
+        source: other
+        target: /data
+        volume: {}
+  web:
+    command:
+      - echo
+      - override
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    environment:
+      A: "1"
+      B: "3"
+      C: "4"
+    image: busybox
+    networks:
+      default: null
+    depends_on:
+      cache:
+        condition: service_started
+        required: true
+    ports:
+      - mode: ingress
+        target: 80
+        published: "81"
+        protocol: tcp
+networks:
+  default:
+    name: override_default
+volumes:
+  other:
+    name: override_other

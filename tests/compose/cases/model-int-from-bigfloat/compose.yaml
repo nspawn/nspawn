@@ -1,0 +1,5 @@
+services:
+  web:
+    image: alpine
+    cpu_count: 1e30
+    cpu_shares: 1.0e19

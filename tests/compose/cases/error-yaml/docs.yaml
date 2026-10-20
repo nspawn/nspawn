@@ -1,0 +1,7 @@
+services:
+  web:
+    image: x
+---
+services:
+  web:
+    image: y

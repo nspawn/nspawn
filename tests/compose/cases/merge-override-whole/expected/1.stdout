@@ -1,0 +1,21 @@
+name: merge-override-whole
+services:
+  base:
+    command:
+      - echo
+      - hi
+    image: alpine
+    networks:
+      default: null
+  web:
+    command:
+      - echo
+      - hi
+    environment:
+      A: "1"
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-override-whole_default

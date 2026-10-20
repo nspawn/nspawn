@@ -1,0 +1,4 @@
+version: "3"
+services:
+  d:
+    image: alpine:${UNSET_TAG}

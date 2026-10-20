@@ -1,0 +1,3 @@
+--ansi always --progress plain config -q
+--ansi never --progress tty config -q
+--no-ansi --progress tty config -q

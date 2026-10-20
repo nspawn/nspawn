@@ -1,0 +1,1 @@
+validating /compose/merge-nil-seq/c.yaml: services.web.extra_hosts must be a mapping

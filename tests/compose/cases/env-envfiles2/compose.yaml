@@ -1,0 +1,7 @@
+services:
+  web:
+    image: x
+    environment:
+      A: ${A}
+      B: ${B}
+      C: ${C}

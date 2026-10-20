@@ -1,0 +1,10 @@
+name: yaml-timesplit
+services:
+  web:
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: yaml-timesplit_default
+x-a: 2001-12-14T21:59:43+05:61

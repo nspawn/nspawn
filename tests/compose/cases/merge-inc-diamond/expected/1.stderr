@@ -1,0 +1,2 @@
+time="2026-10-15T19:24:49Z" level=warning msg="The \"UNSET_TAG\" variable is not set. Defaulting to a blank string."
+time="2026-10-15T19:24:49Z" level=warning msg="/compose/merge-inc-diamond/d.yaml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"

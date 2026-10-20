@@ -1,0 +1,6 @@
+x-base: &base
+  ports: !reset []
+services:
+  my.svc:
+    <<: *base
+    image: alpine

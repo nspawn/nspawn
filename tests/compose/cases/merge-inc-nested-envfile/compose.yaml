@@ -1,0 +1,5 @@
+include:
+  - tests/compose.yaml
+services:
+  web:
+    image: alpine

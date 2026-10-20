@@ -1,0 +1,2 @@
+time="2026-10-15T19:25:19Z" level=warning msg="service \"web\": deploy.update_config: deploy.update_config only applies to rolling updates in Swarm mode"
+json: unsupported value: +Inf

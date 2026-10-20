@@ -1,0 +1,14 @@
+name: yaml-docmutation
+services:
+  web:
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: yaml-docmutation_default
+x-a:
+  j: 2
+x-b:
+  j: 2
+  k: keep

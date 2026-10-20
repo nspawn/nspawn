@@ -1,0 +1,13 @@
+services:
+  web:
+    image: alpine
+    secrets:
+      - source: s
+        mode: -1
+      - source: t
+        mode: "-10"
+secrets:
+  s:
+    file: ./s
+  t:
+    file: ./t

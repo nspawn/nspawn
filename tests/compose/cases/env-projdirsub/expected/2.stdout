@@ -1,0 +1,9 @@
+name: env-projdirsub
+services:
+  web:
+    image: x:root
+    networks:
+      default: null
+networks:
+  default:
+    name: env-projdirsub_default

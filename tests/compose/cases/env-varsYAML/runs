@@ -1,0 +1,3 @@
+config --variables --format YAML
+config --variables --format JSON
+config --variables --format TABLE

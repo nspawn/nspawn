@@ -1,0 +1,4 @@
+services:
+  app:
+    image: myimg
+    build: .

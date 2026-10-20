@@ -1,0 +1,10 @@
+name: env-hexfloat
+services:
+  web:
+    cpus: 0.25
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: env-hexfloat_default

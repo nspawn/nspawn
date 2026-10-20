@@ -1,0 +1,6 @@
+services:
+  web:
+    image: alpine
+    build:
+      context: .
+      ssh: ["k\u00a0"]

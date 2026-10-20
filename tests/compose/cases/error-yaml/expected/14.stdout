@@ -1,0 +1,14 @@
+name: error-yaml
+services:
+  web:
+    command:
+      - a
+      - b
+    entrypoint:
+      - a
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: error-yaml_default

@@ -1,0 +1,14 @@
+services:
+  web:
+    image: alpine
+    networks: [n]
+networks:
+  n:
+    ipam:
+      driver: default
+      x-ipam: 1
+      config:
+        - subnet: 10.0.0.0/24
+          x-pool: bar
+          aux_addresses:
+            host1: 10.0.0.5

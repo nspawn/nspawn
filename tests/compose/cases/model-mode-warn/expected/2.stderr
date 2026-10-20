@@ -1,0 +1,1 @@
+time="2026-10-15T19:25:23Z" level=warning msg="service \"web\": secrets.s.mode: mode is not supported outside Swarm mode and will be ignored"

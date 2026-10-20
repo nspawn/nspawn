@@ -1,0 +1,4 @@
+name: {a: 1, a: 2}
+services:
+  web:
+    image: nginx

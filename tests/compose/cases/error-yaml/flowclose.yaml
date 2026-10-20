@@ -1,0 +1,10 @@
+services:
+  web:
+    image: x
+    command: [
+      a,
+      b
+    ]
+    entrypoint: [
+      a
+]

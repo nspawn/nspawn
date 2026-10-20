@@ -1,0 +1,1 @@
+validating /compose/model-schema-quote/cname.yaml: services.web.container_name '\a' does not match pattern '[a-zA-Z0-9][a-zA-Z0-9_.-]+'

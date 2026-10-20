@@ -1,0 +1,37 @@
+{
+  "name": "env-nopathresolution",
+  "networks": {
+    "default": {
+      "name": "env-nopathresolution_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "job": {
+      "command": null,
+      "entrypoint": null,
+      "image": "busybox",
+      "networks": {
+        "default": null
+      }
+    },
+    "web": {
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "A": "1",
+        "B": "two"
+      },
+      "image": "nginx",
+      "labels": {
+        "com.example.tier": "front"
+      },
+      "label_file": [
+        "./labels/web.labels"
+      ],
+      "networks": {
+        "default": null
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+name: model-size-hexfloat
+services:
+  web:
+    image: alpine
+    mem_limit: "16"
+    networks:
+      default: null
+    shm_size: "3072"
+networks:
+  default:
+    name: model-size-hexfloat_default

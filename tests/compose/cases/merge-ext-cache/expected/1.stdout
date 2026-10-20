@@ -1,0 +1,13 @@
+name: merge-ext-cache
+services:
+  a:
+    image: 'alpine:'
+    networks:
+      default: null
+  b:
+    image: 'alpine:'
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-ext-cache_default

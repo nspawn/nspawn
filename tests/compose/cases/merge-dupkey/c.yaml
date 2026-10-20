@@ -1,0 +1,6 @@
+services:
+  web:
+    image: alpine
+x-a:
+  "a\"b": 1
+  "a\"b": 2

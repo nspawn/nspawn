@@ -1,0 +1,24 @@
+{
+  "name": "model-ulimit-zero",
+  "networks": {
+    "default": {
+      "name": "model-ulimit-zero_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "web": {
+      "command": null,
+      "entrypoint": null,
+      "image": "alpine",
+      "networks": {
+        "default": null
+      },
+      "ulimits": {
+        "core": 5,
+        "nofile": {},
+        "nproc": {}
+      }
+    }
+  }
+}

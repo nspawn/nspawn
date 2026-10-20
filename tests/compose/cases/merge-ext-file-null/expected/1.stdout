@@ -1,0 +1,19 @@
+name: merge-ext-file-null
+services:
+  base:
+    command:
+      - echo
+      - hi
+    image: alpine
+    networks:
+      default: null
+  web:
+    command:
+      - echo
+      - hi
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-ext-file-null_default

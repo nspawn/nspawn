@@ -1,0 +1,1 @@
+validating /compose/error-schema/compose.yaml: services.web.foo false schema

@@ -1,0 +1,9 @@
+services:
+  my.svc:
+    image: alpine
+    command: [a]
+    environment: [A=1]
+  plain:
+    image: alpine
+    command: [a]
+    environment: [A=1]

@@ -1,0 +1,57 @@
+{
+  "name": "anchors",
+  "networks": {
+    "default": {
+      "name": "anchors_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "a": {
+      "restart": "always",
+      "command": null,
+      "entrypoint": null,
+      "environment": {
+        "NAME": "a",
+        "TZ": "UTC"
+      },
+      "image": "alpine",
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "10m"
+        }
+      },
+      "networks": {
+        "default": null
+      }
+    },
+    "b": {
+      "restart": "no",
+      "command": null,
+      "entrypoint": null,
+      "image": "alpine",
+      "logging": {
+        "driver": "json-file",
+        "options": {
+          "max-size": "10m"
+        }
+      },
+      "networks": {
+        "default": null
+      }
+    }
+  },
+  "x-defaults": {
+    "logging": {
+      "driver": "json-file",
+      "options": {
+        "max-size": "10m"
+      }
+    },
+    "restart": "always"
+  },
+  "x-env": {
+    "TZ": "UTC"
+  }
+}

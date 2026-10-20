@@ -1,0 +1,6 @@
+include:
+  - path: inner.yaml
+    env_file: compose/oracle.sh
+services:
+  mid:
+    image: alpine

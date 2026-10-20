@@ -1,0 +1,3 @@
+services:
+  web:
+    image: x:${TAG:-1}

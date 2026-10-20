@@ -1,0 +1,5 @@
+services:
+  web:
+    image: alpine
+    blkio_config:
+      weight: "10"

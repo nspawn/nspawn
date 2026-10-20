@@ -1,0 +1,11 @@
+name: env-rawbom2
+services:
+  web:
+    environment:
+      "\uFEFF\x41": "1"
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: env-rawbom2_default

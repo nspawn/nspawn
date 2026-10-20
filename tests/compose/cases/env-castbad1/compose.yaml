@@ -1,0 +1,4 @@
+services:
+  web:
+    image: x
+    cpu_percent: "1_0"

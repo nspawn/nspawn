@@ -1,0 +1,6 @@
+services:
+  web:
+    extends:
+      file: base.yaml
+      service: mid
+    environment: !override [B=2]

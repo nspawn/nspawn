@@ -1,0 +1,6 @@
+services:
+  web:
+    image: x
+    env_file:
+      - path: raw.env
+        format: raw

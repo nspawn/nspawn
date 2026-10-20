@@ -1,0 +1,7 @@
+config
+config --format json
+config --services
+config --volumes
+config --networks
+config --images
+config -q

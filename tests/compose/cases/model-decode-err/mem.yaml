@@ -1,0 +1,4 @@
+services:
+  web:
+    image: alpine
+    mem_limit: 12xyz

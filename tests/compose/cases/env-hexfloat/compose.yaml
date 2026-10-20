@@ -1,0 +1,4 @@
+services:
+  web:
+    image: x
+    cpus: "0x1p-2"

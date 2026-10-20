@@ -1,0 +1,12 @@
+services:
+  web:
+    image: alpine
+    ports:
+      - target: 4294967376
+    volumes:
+      - type: tmpfs
+        target: /t
+        tmpfs:
+          mode: 4294967297
+    blkio_config:
+      weight: 65537

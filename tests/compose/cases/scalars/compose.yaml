@@ -1,0 +1,18 @@
+services:
+  app:
+    image: alpine
+    labels:
+      octal: 0755
+      date: 2001-12-14
+      float: 1.5e3
+      bool: true
+      yes_word: yes
+      colon: "a: b"
+      sexagesimal: "1:30"
+      number_string: "8080"
+      empty: ""
+      tilde: ~
+      multiline: |
+        line one
+        line two
+    command: ["echo", "it's", "<html>&"]

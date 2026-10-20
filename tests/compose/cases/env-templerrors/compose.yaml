@@ -1,0 +1,15 @@
+services:
+  web:
+    image: x
+    environment:
+      E1: 'a ${UNSET:-${} b'
+      E2: '${SET:-x} then ${'
+      E3: '${UNSET:-a}${'
+      E4: '${UNSET:-a}b${}c}'
+      E5: '${UNSET:?msg ${SET}}'
+      E6: '${UNSET:?${'
+      E7: '${UNSET:+${}'
+      E8: '${SET:+${}'
+      E9: '${SET:?${}'
+      EA: '${UNSET?a${}'
+    command: ['${', 'ok', '${UNSET:?inlist}']

@@ -1,0 +1,3 @@
+decoding failed due to the following error(s):
+
+'services[web].volumes[0].tmpfs.mode' expected type 'uint32', got unconvertible type 'string'

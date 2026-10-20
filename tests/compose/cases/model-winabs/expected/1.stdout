@@ -1,0 +1,27 @@
+name: model-winabs
+services:
+  web:
+    image: alpine
+    networks:
+      default: null
+    secrets:
+      - source: s
+        target: /run/secrets/s
+    volumes:
+      - type: bind
+        source: \\server\share\dir
+        target: /a
+      - type: bind
+        source: 1:/x
+        target: /b
+      - type: bind
+        source: \\server\share2
+        target: /c
+        bind: {}
+networks:
+  default:
+    name: model-winabs_default
+secrets:
+  s:
+    name: model-winabs_s
+    file: \\srv\sec

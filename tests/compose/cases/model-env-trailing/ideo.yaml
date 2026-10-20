@@ -1,0 +1,4 @@
+services:
+  web:
+    image: alpine
+    environment: ["FOO　=1"]

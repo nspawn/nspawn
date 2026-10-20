@@ -1,0 +1,6 @@
+services:
+  web:
+    image: alpine
+    labels:
+      "a.<<b": "1"
+      other: x

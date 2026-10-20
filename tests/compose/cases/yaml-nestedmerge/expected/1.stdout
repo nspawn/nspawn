@@ -1,0 +1,19 @@
+name: yaml-nestedmerge
+services:
+  web:
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: yaml-nestedmerge_default
+x-m1:
+  a: 1
+  k: from-m3
+x-m2:
+  k: from-m2
+x-m3:
+  k: from-m3
+x-p:
+  a: 1
+  k: from-m3

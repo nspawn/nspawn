@@ -1,0 +1,4 @@
+services:
+  my.svc:
+    image: alpine
+    ports: ["80:80"]

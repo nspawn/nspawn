@@ -1,0 +1,11 @@
+services:
+  app:
+    image: alpine
+    env_file:
+      - app.env
+      - path: optional.env
+        required: false
+      - path: raw.env
+        format: raw
+    environment:
+      OVERRIDE: from-compose

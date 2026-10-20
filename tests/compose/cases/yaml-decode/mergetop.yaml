@@ -1,0 +1,2 @@
+<<: {name: merged}
+services: {web: {image: x}}

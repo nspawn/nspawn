@@ -1,0 +1,1 @@
+failed to parse /compose/yaml-decode/doc2err.yaml: go-yaml load error in parser (while parsing a flow node) at L4.C1: did not find expected node content

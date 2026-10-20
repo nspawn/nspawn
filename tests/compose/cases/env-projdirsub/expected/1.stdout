@@ -1,0 +1,9 @@
+name: sub
+services:
+  web:
+    image: x:sub
+    networks:
+      default: null
+networks:
+  default:
+    name: sub_default

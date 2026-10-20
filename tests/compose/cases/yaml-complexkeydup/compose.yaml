@@ -1,0 +1,6 @@
+services:
+  web:
+    image: nginx
+x-a:
+  ? {a: 1, a: 2}
+  : x

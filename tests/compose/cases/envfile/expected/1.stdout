@@ -1,0 +1,15 @@
+name: envfile
+services:
+  app:
+    environment:
+      A: "1"
+      B: two words
+      C: 1-x
+      OVERRIDE: from-compose
+      RAW: keep $${A} as is
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: envfile_default

@@ -1,0 +1,33 @@
+name: merge-merge-odd
+services:
+  db:
+    image: alpine
+    networks:
+      default: null
+  web:
+    image: alpine
+    logging:
+      driver: local
+    networks:
+      'n': null
+    ulimits:
+      nofile: 5
+    build:
+      context: /compose/merge-merge-odd
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_started
+        required: true
+    ports:
+      - mode: ingress
+        target: 80
+        protocol: tcp
+networks:
+  default:
+    name: merge-merge-odd_default
+  'n':
+    name: merge-merge-odd_n
+    ipam:
+      config:
+        - subnet: 10.0.0.0/24

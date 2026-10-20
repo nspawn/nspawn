@@ -1,0 +1,76 @@
+services:
+  web:
+    image: nginx:1.27
+    command: nginx -g "daemon off;"
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+      - "127.0.0.1:8443:443/tcp"
+      - 9000-9001:9000-9001/udp
+      - target: 5000
+        published: "5001"
+        host_ip: 0.0.0.0
+    volumes:
+      - ./html:/usr/share/nginx/html:ro
+      - logs:/var/log/nginx
+      - type: tmpfs
+        target: /cache
+        tmpfs:
+          size: 64m
+    environment:
+      - TZ=UTC
+      - EMPTY=
+      - BARE
+    labels:
+      com.example.role: frontend
+      com.example.tier: "1"
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 1m30s
+    networks:
+      front:
+        aliases: [www]
+      back: {}
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+  app:
+    image: python:3.12-slim
+    entrypoint: ["python", "-m", "http.server"]
+    working_dir: /srv
+    user: "1000:1000"
+    environment:
+      MODE: production
+      DEBUG: "false"
+      COUNT: 3
+    healthcheck:
+      test: python -c "print(1)"
+    networks:
+      - back
+    stop_grace_period: 20s
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
+      nproc: 512
+    extra_hosts:
+      - "host.local=10.0.0.1"
+      - "other:10.0.0.2"
+    cap_add: [NET_ADMIN]
+    tmpfs: /tmp
+    shm_size: 128m
+    init: true
+networks:
+  front: {}
+  back:
+    internal: true
+volumes:
+  logs: {}

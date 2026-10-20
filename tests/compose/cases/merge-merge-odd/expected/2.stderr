@@ -1,0 +1,1 @@
+services.web.depends_on: cannot use int as a mapping key

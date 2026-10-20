@@ -1,0 +1,5 @@
+services:
+  web:
+    image: alpine
+    expose:
+      - {a: 1}

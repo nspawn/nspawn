@@ -1,0 +1,1 @@
+failed to parse /compose/yaml-mergekeytypes/d.yaml: yaml: construct errors: line 1: go-yaml load error in constructor at L7.C7: runtime error: hash of unhashable type []interface {}

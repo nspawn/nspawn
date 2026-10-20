@@ -1,0 +1,11 @@
+name: yaml-jsonctrl
+services:
+  web:
+    environment:
+      A: "a\bb\fc"
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: yaml-jsonctrl_default

@@ -1,0 +1,1 @@
+go-yaml load error in constructor at L1.C3: runtime error: hash of unhashable type []interface {}

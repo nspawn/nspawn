@@ -1,0 +1,1 @@
+go-yaml load error in scanner (while scanning a directive) at L1.C1-C2: could not find expected directive name

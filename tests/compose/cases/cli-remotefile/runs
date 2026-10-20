@@ -1,0 +1,4 @@
+-f oci://example.invalid/app:1 config
+-f git@example.invalid:a/b.git config
+-f https://example.invalid/a/b.git config
+-f ./git@example.invalid:a/b.git config

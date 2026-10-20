@@ -1,0 +1,6 @@
+services:
+  web:
+    image: x
+  other:
+    image: y
+    env_file: missing.env

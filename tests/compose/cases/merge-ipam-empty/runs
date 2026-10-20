@@ -1,0 +1,3 @@
+-f compose.yaml -f b.yaml config
+-f c.yaml -f d.yaml config
+-f c.yaml -f d.yaml config --format json

@@ -1,0 +1,4 @@
+services:
+  web:
+    image: alpine
+"a\u200bb": 1

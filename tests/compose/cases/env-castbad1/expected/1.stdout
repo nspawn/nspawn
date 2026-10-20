@@ -1,0 +1,10 @@
+name: env-castbad1
+services:
+  web:
+    cpu_percent: 10
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: env-castbad1_default

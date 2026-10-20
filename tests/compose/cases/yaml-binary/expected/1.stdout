@@ -1,0 +1,10 @@
+name: yaml-binary
+services:
+  web:
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: yaml-binary_default
+x-a: f

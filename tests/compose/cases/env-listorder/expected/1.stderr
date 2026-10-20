@@ -1,0 +1,2 @@
+error while interpolating services.web.ports.[].target: required variable A is missing a value: a
+error while interpolating services.web.ports.[].published: required variable B is missing a value: b

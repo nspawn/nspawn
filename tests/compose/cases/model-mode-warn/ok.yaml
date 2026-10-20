@@ -1,0 +1,10 @@
+services:
+  web:
+    image: alpine
+    secrets:
+      - source: s
+        mode: 0400
+        uid: "1"
+secrets:
+  s:
+    file: ./s

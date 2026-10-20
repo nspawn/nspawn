@@ -1,0 +1,4 @@
+services:
+  web:
+    image: x
+   bad: y

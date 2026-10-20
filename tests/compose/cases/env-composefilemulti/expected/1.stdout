@@ -1,0 +1,11 @@
+name: env-composefilemulti
+services:
+  web:
+    command:
+      - hi
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: env-composefilemulti_default

@@ -1,0 +1,10 @@
+services:
+  web:
+    image: nginx
+    env_file: ./web.env
+    label_file: ./labels/web.labels
+  job:
+    image: busybox
+    env_file:
+      - path: ./missing.env
+        required: false

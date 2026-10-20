@@ -1,0 +1,22 @@
+name: env-profiles1
+services:
+  pa:
+    profiles:
+      - a
+    image: x
+    networks:
+      default: null
+  pc:
+    profiles:
+      - c
+      - d
+    image: x
+    networks:
+      default: null
+    depends_on:
+      pa:
+        condition: service_started
+        required: true
+networks:
+  default:
+    name: env-profiles1_default

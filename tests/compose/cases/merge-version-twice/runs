@@ -1,0 +1,2 @@
+-f compose.yaml -f compose.yaml config
+-f multi.yaml config

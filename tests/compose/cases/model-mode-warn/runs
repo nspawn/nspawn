@@ -1,0 +1,3 @@
+-f ok.yaml config
+-f neg.yaml config
+-f zero.yaml config

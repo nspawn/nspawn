@@ -1,0 +1,9 @@
+name: merge-empty-docs
+services:
+  web:
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-empty-docs_default

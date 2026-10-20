@@ -1,0 +1,22 @@
+name: include
+services:
+  included:
+    image: nginx:from-sub-env
+    networks:
+      default: null
+    volumes:
+      - type: bind
+        source: /compose/include/sub/www
+        target: /www
+        bind: {}
+  main:
+    image: alpine
+    networks:
+      default: null
+    depends_on:
+      included:
+        condition: service_started
+        required: true
+networks:
+  default:
+    name: include_default

@@ -1,0 +1,6 @@
+services:
+  web:
+    image: alpine
+    bogus: 1
+---
+services: [

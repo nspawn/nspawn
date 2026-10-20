@@ -1,0 +1,10 @@
+name: env-f32round
+services:
+  web:
+    cpus: 1.0000001
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: env-f32round_default

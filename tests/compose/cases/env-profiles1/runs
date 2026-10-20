@@ -1,0 +1,5 @@
+config --services
+config --profiles
+config pc
+--profile c config --services
+--profile * config --services

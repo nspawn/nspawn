@@ -1,0 +1,1 @@
+failed to parse /compose/yaml-decode/selfalias.yaml: yaml: construct errors: line 1: cycle detected: node at path a.1.1 references node at path a.1

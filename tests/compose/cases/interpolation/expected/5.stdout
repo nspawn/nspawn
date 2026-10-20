@@ -1,0 +1,7 @@
+COMPOSE_PROJECT_NAME=interpolation
+DB_PASSWORD=secret
+FALLBACK=from .env
+HOME=/home/user
+PATH=/usr/local/bin:/usr/bin:/bin
+PWD=/compose/interpolation
+SET_VAR=1

@@ -1,0 +1,4 @@
+include: 1
+services:
+  web:
+    image: alpine

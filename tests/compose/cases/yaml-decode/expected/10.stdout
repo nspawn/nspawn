@@ -1,0 +1,9 @@
+name: hello
+services:
+  web:
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: hello_default

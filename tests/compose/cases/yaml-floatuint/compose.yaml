@@ -1,0 +1,4 @@
+services:
+  web:
+    image: nginx
+x-a: !!float 18446744073709551615

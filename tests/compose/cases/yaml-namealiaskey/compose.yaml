@@ -1,0 +1,6 @@
+x-n: &k name
+*k : realname
+<<: {name: other}
+services:
+  web:
+    image: nginx

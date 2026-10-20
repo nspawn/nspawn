@@ -1,0 +1,11 @@
+name: cli-flags
+services:
+  web:
+    environment:
+      FOO: x
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: cli-flags_default

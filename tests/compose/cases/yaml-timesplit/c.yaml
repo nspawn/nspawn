@@ -1,0 +1,4 @@
+services:
+  web:
+    image: nginx
+x-a: 2001-12-14T21:59:43+25:00

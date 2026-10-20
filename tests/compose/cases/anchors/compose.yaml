@@ -1,0 +1,20 @@
+x-defaults: &defaults
+  restart: always
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+x-env: &env
+  TZ: UTC
+services:
+  a:
+    <<: *defaults
+    image: alpine
+    environment:
+      <<: *env
+      NAME: a
+  b:
+    <<: [*defaults]
+    image: alpine
+    restart: "no"
+    x-custom: value

@@ -1,0 +1,9 @@
+{
+    "FOO": {
+        "Name": "FOO",
+        "DefaultValue": "x",
+        "PresenceValue": "",
+        "Required": false
+    }
+}
+

@@ -1,0 +1,22 @@
+name: model-port-bracket
+services:
+  web:
+    image: alpine
+    networks:
+      default: null
+    ports:
+      - mode: ingress
+        host_ip: ::1
+        target: 80
+        published: "8080"
+        protocol: tcp
+      - mode: ingress
+        target: 80
+        protocol: udp
+      - mode: ingress
+        target: 81
+        published: "81"
+        protocol: tcp
+networks:
+  default:
+    name: model-port-bracket_default

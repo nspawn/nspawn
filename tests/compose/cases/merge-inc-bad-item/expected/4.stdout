@@ -1,0 +1,9 @@
+name: merge-inc-bad-item
+services:
+  web:
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-inc-bad-item_default

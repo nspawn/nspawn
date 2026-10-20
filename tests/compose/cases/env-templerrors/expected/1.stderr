@@ -1,0 +1,26 @@
+invalid interpolation format for services.web.command.[].
+You may need to escape any $ with another $.
+${
+error while interpolating services.web.command.[]: required variable UNSET is missing a value: inlist
+invalid interpolation format for services.web.environment.E1.
+You may need to escape any $ with another $.
+${
+invalid interpolation format for services.web.environment.E2.
+You may need to escape any $ with another $.
+${SET:-x} then ${
+invalid interpolation format for services.web.environment.E3.
+You may need to escape any $ with another $.
+${UNSET:-a}${
+invalid interpolation format for services.web.environment.E4.
+You may need to escape any $ with another $.
+b${}c}
+error while interpolating services.web.environment.E5: required variable UNSET is missing a value: msg val
+invalid interpolation format for services.web.environment.E6.
+You may need to escape any $ with another $.
+${UNSET:?${
+invalid interpolation format for services.web.environment.E8.
+You may need to escape any $ with another $.
+${
+invalid interpolation format for services.web.environment.EA.
+You may need to escape any $ with another $.
+a${

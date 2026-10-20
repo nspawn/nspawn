@@ -1,0 +1,3 @@
+NAME                REQUIRED            DEFAULT VALUE       ALTERNATE VALUE
+LONGERNAME          false               c                   
+A                   false               a                   b                   

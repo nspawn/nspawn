@@ -1,0 +1,4 @@
+x-a: .nan
+services:
+  web:
+    image: alpine

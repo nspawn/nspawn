@@ -13,6 +13,7 @@ mod cli;
 mod client;
 mod commands;
 mod completion;
+mod compose;
 mod config;
 mod daemon;
 mod getent;
@@ -59,6 +60,11 @@ fn main() {
 
 #[tokio::main]
 async fn run() {
+    // nspawn compose reads its arguments as docker compose reads its own, not as clap does.
+    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if let Some(args) = compose::arguments(&argv) {
+        std::process::exit(compose::main(&args));
+    }
     let args = cli::Cli::parse();
     // The service writes into its clients' pipes (events, attached runs): a client that
     // leaves must cost it a write error, not its life.

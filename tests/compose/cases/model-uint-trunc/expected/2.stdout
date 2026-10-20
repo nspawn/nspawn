@@ -1,0 +1,38 @@
+{
+  "name": "model-uint-trunc",
+  "networks": {
+    "default": {
+      "name": "model-uint-trunc_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "web": {
+      "blkio_config": {
+        "weight": 1
+      },
+      "command": null,
+      "entrypoint": null,
+      "image": "alpine",
+      "networks": {
+        "default": null
+      },
+      "volumes": [
+        {
+          "type": "tmpfs",
+          "target": "/t",
+          "tmpfs": {
+            "mode": 1
+          }
+        }
+      ],
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 80,
+          "protocol": "tcp"
+        }
+      ]
+    }
+  }
+}

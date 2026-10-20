@@ -1,0 +1,11 @@
+name: b
+services:
+  web:
+    environment:
+      FOO: x
+    image: nginx
+    networks:
+      default: null
+networks:
+  default:
+    name: b_default

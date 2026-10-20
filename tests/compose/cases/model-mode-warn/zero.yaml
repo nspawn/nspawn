@@ -1,0 +1,9 @@
+services:
+  web:
+    image: alpine
+    secrets:
+      - source: s
+        mode: 0
+secrets:
+  s:
+    file: ./s

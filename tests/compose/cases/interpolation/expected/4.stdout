@@ -1,0 +1,63 @@
+{
+    "DB_PASSWORD": {
+        "Name": "DB_PASSWORD",
+        "DefaultValue": "",
+        "PresenceValue": "",
+        "Required": true
+    },
+    "DB_USER": {
+        "Name": "DB_USER",
+        "DefaultValue": "",
+        "PresenceValue": "",
+        "Required": false
+    },
+    "FALLBACK": {
+        "Name": "FALLBACK",
+        "DefaultValue": "deep",
+        "PresenceValue": "",
+        "Required": false
+    },
+    "MISSING": {
+        "Name": "MISSING",
+        "DefaultValue": "${FALLBACK:-deep}",
+        "PresenceValue": "",
+        "Required": false
+    },
+    "PG_VERSION": {
+        "Name": "PG_VERSION",
+        "DefaultValue": "16",
+        "PresenceValue": "",
+        "Required": false
+    },
+    "PORT": {
+        "Name": "PORT",
+        "DefaultValue": "5432",
+        "PresenceValue": "",
+        "Required": false
+    },
+    "PRIV": {
+        "Name": "PRIV",
+        "DefaultValue": "yes",
+        "PresenceValue": "",
+        "Required": false
+    },
+    "RO": {
+        "Name": "RO",
+        "DefaultValue": "false",
+        "PresenceValue": "",
+        "Required": false
+    },
+    "SET_VAR": {
+        "Name": "SET_VAR",
+        "DefaultValue": "",
+        "PresenceValue": "set",
+        "Required": false
+    },
+    "UNSET_VAR": {
+        "Name": "UNSET_VAR",
+        "DefaultValue": "",
+        "PresenceValue": "unset",
+        "Required": false
+    }
+}
+

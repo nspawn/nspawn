@@ -1,0 +1,5 @@
+name: ${PROJECT:-From_Yaml}
+services:
+  app:
+    image: alpine
+    container_name: fixed-name

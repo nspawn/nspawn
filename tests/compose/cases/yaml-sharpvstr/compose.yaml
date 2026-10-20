@@ -1,0 +1,6 @@
+services:
+  web:
+    image: nginx
+x-a:
+  ? ["a\x07"]
+  : x

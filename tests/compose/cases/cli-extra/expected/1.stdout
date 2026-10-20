@@ -1,0 +1,20 @@
+AVAR:
+    name: AVAR
+    defaultvalue: ""
+    presencevalue: alt
+    required: false
+BVAR:
+    name: BVAR
+    defaultvalue: ""
+    presencevalue: ""
+    required: true
+TAG:
+    name: TAG
+    defaultvalue: latest
+    presencevalue: ""
+    required: false
+ZVAR:
+    name: ZVAR
+    defaultvalue: ""
+    presencevalue: ""
+    required: false

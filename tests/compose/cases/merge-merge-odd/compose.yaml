@@ -1,0 +1,18 @@
+services:
+  web:
+    image: alpine
+    logging:
+      driver: local
+    depends_on: [db]
+    networks: [n]
+    build: .
+    ulimits:
+      nofile: {soft: 1, hard: 2}
+    ports: ["80"]
+  db:
+    image: alpine
+networks:
+  n:
+    ipam:
+      config:
+        - subnet: 10.0.0.0/24

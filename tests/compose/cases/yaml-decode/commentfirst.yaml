@@ -1,0 +1,6 @@
+# c
+
+services:
+  web:
+    image: x
+    image: y

@@ -1,0 +1,3 @@
+x: &n proj
+name: *n
+services: {web: {image: x}}

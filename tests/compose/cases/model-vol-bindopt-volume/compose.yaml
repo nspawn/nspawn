@@ -1,0 +1,11 @@
+services:
+  web:
+    image: alpine
+    volumes:
+      - data:/data:z
+      - data:/data2:rshared
+      - data:/data3:ro,nocopy
+      - ./h:/h:nocopy
+      - ./h2:/h2:rslave,Z
+volumes:
+  data: {}

@@ -1,0 +1,7 @@
+services:
+  web:
+    image: alpine
+    deploy:
+      resources:
+        limits:
+          cpus: abc

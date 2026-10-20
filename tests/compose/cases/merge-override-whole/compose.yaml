@@ -1,0 +1,7 @@
+services:
+  base:
+    image: alpine
+    command: echo hi
+  web: !override
+    extends: base
+    environment: [A=1]

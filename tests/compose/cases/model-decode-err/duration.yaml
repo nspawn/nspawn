@@ -1,0 +1,4 @@
+services:
+  web:
+    image: alpine
+    stop_grace_period: abc

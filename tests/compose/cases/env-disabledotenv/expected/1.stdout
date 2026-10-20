@@ -1,0 +1,9 @@
+name: fromdotenv
+services:
+  web:
+    image: x:none
+    networks:
+      default: null
+networks:
+  default:
+    name: fromdotenv_default

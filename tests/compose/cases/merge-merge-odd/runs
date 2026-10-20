@@ -1,0 +1,11 @@
+-f compose.yaml -f o1.yaml config
+-f compose.yaml -f o2.yaml config
+-f compose.yaml -f o3.yaml config
+-f compose.yaml -f o4.yaml config
+-f compose.yaml -f o5.yaml config
+-f compose.yaml -f o6.yaml config
+-f compose.yaml -f o7.yaml config
+-f compose.yaml -f o8.yaml config
+-f compose.yaml -f o9.yaml config
+-f compose.yaml -f o10.yaml config
+-f compose.yaml -f o12.yaml -f o11.yaml config

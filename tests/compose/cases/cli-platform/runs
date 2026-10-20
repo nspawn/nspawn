@@ -1,0 +1,3 @@
+config --hash *
+-f bad.yaml config --hash *
+-f bad.yaml config

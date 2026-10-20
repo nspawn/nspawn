@@ -1,0 +1,15 @@
+services:
+  web:
+    command: echo override
+    environment:
+      - B=3
+      - C=4
+    ports: !override ["81:80"]
+    labels: !reset []
+    depends_on: [cache]
+    dns: [1.1.1.1, ""]
+  cache:
+    volumes:
+      - other:/data
+volumes:
+  other: {}

@@ -1,0 +1,9 @@
+name: cli-envfiles
+services:
+  web:
+    image: nginx:fromcustom
+    networks:
+      default: null
+networks:
+  default:
+    name: cli-envfiles_default

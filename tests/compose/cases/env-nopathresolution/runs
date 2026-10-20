@@ -1,0 +1,3 @@
+config --no-path-resolution
+config --no-path-resolution --format json
+config

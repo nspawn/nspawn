@@ -1,0 +1,36 @@
+{
+  "name": "scalars",
+  "networks": {
+    "default": {
+      "name": "scalars_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "app": {
+      "command": [
+        "echo",
+        "it's",
+        "\u003chtml\u003e\u0026"
+      ],
+      "entrypoint": null,
+      "image": "alpine",
+      "labels": {
+        "bool": "true",
+        "colon": "a: b",
+        "date": "2001-12-14 00:00:00 +0000 UTC",
+        "empty": "",
+        "float": "1500",
+        "multiline": "line one\nline two\n",
+        "number_string": "8080",
+        "octal": "493",
+        "sexagesimal": "1:30",
+        "tilde": "",
+        "yes_word": "yes"
+      },
+      "networks": {
+        "default": null
+      }
+    }
+  }
+}

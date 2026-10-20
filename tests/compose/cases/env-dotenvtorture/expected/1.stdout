@@ -1,0 +1,44 @@
+COMPOSE_PROJECT_NAME=env-dotenvtorture
+HOME=/home/user
+K_A=plain value
+K_AA=plain value
+K_AB=plain valuex}
+K_AC={"json":1}
+K_AD=plain valuevalue#nocommentdouble 
+ escaped 	 tab \ backslash $ dollar " quote
+K_AF=
+K_AG=
+K_AH=#notcomment
+K_AI=val	# tabcomment
+K_AJ=crlf
+K_AK=crq
+K_AL=last
+K_B=value#nocomment
+K_C=double 
+ escaped 	 tab \ backslash $ dollar " quote
+K_D=single \n $K_A ${K_A} ' q
+K_E=multi
+line
+K_EMPTY=
+K_F=exported
+K_G=spaced
+K_H=colon
+K_I=plain value-def-d2-alt-e
+K_J=xw
+K_K=A\\1\400ÿ\189
+K_L=\c\x\qé
+K_M=leading spaces
+K_N=trailing spaces
+K_O=quoted
+K_P=indented
+K_Q=a=b=c
+K_R=plain value
+K_S=${K_A}
+K_T=$K_A
+K_U=$K_A
+K_W=x
+K_Y=a\
+b
+K_Z=spaced quoted
+PATH=/usr/local/bin:/usr/bin:/bin
+PWD=/compose/env-dotenvtorture

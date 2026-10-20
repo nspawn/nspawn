@@ -1,0 +1,5 @@
+include:
+  - path: 1
+services:
+  web:
+    image: alpine

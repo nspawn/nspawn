@@ -1,0 +1,4 @@
+services:
+  web:
+    image: x
+    command: "${A:-a\tb} ${LONGERNAME:-c}"

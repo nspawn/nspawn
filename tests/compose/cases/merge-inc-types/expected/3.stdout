@@ -1,0 +1,13 @@
+name: merge-inc-types
+services:
+  other:
+    image: busybox
+    networks:
+      default: null
+  web:
+    image: alpine
+    networks:
+      default: null
+networks:
+  default:
+    name: merge-inc-types_default

@@ -1,0 +1,23 @@
+{
+  "name": "yaml-mergescalar",
+  "networks": {
+    "default": {
+      "name": "yaml-mergescalar_default",
+      "ipam": {}
+    }
+  },
+  "services": {
+    "web": {
+      "command": [
+        "echo",
+        "b"
+      ],
+      "entrypoint": null,
+      "image": "nginx",
+      "networks": {
+        "default": null
+      }
+    }
+  },
+  "x-c": "keep"
+}

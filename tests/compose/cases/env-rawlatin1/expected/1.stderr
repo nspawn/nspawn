@@ -1,0 +1,1 @@
+failed to parse env_file /compose/env-rawlatin1/raw.env: invalid utf8 bytes at line 1: [65 61 99 97 102 233]

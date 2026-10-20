@@ -1,0 +1,5 @@
+include:
+  - d.yaml
+services:
+  b:
+    image: alpine

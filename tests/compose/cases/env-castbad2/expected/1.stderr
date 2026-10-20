@@ -1,0 +1,1 @@
+error while interpolating services.web.cpu_percent: failed to cast to expected type: strconv.ParseFloat: parsing "+nan": invalid syntax

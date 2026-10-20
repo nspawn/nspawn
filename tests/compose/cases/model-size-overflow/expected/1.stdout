@@ -1,0 +1,13 @@
+name: model-size-overflow
+services:
+  web:
+    image: alpine
+    mem_limit: "-9223372036854775808"
+    mem_reservation: "-9223372036854775808"
+    memswap_limit: "-9223372036854775808"
+    networks:
+      default: null
+    shm_size: "-9223372036854775808"
+networks:
+  default:
+    name: model-size-overflow_default

@@ -1,0 +1,1 @@
+validating /compose/merge-multidoc-order/compose.yaml: services.web.bogus false schema

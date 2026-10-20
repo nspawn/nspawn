@@ -1,0 +1,43 @@
+name: extends
+services:
+  base:
+    environment:
+      FROM: base
+    image: alpine
+    networks:
+      default: null
+    volumes:
+      - type: bind
+        source: /compose/extends/base
+        target: /base
+        bind: {}
+  child:
+    environment:
+      CHILD: 'yes'
+      FROM: base
+    image: alpine
+    networks:
+      default: null
+    volumes:
+      - type: bind
+        source: /compose/extends/base
+        target: /base
+        bind: {}
+  other:
+    command:
+      - run
+    environment:
+      X: "1"
+    image: debian
+    labels:
+      origin: common
+    networks:
+      default: null
+    volumes:
+      - type: bind
+        source: /compose/extends/common/data
+        target: /data
+        bind: {}
+networks:
+  default:
+    name: extends_default

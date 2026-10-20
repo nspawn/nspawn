@@ -1,0 +1,9 @@
+name: link
+services:
+  web:
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: link_default

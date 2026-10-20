@@ -1,0 +1,16 @@
+name: model-ipam-ext
+services:
+  web:
+    image: alpine
+    networks:
+      'n': null
+networks:
+  'n':
+    name: model-ipam-ext_n
+    ipam:
+      driver: default
+      config:
+        - subnet: 10.0.0.0/24
+          aux_addresses:
+            host1: 10.0.0.5
+      x-ipam: 1

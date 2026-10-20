@@ -1,0 +1,5 @@
+x-k: &image image
+services:
+  web:
+    *image : nginx
+    image: foo

@@ -1,0 +1,3 @@
+services:
+  other:
+    image: alpine:${TAG_FROM_DOTENV}

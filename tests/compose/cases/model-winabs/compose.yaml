@@ -1,0 +1,15 @@
+services:
+  web:
+    image: alpine
+    volumes:
+      - type: bind
+        source: '\\server\share\dir'
+        target: /a
+      - type: bind
+        source: '1:/x'
+        target: /b
+      - '\\server\share2:/c'
+    secrets: [s]
+secrets:
+  s:
+    file: '\\srv\sec'
