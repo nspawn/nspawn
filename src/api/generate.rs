@@ -132,7 +132,11 @@ pub fn generate(ctx: &Context, names: &[String]) -> Result<Script> {
                 r.reference, r.name
             ));
         }
-        for volume in r.volumes.iter().filter(|v| v.source.starts_with('/')) {
+        for volume in r
+            .volumes
+            .iter()
+            .filter(|v| v.source.starts_with('/') && !v.is_api_socket())
+        {
             script.notes.push(format!(
                 "{} mounts {} of this host, which has to exist where this script runs",
                 r.name, volume.source
@@ -264,7 +268,7 @@ fn option(name: &str, value: &str) -> Vec<String> {
 
 /// The flags of start and run that make `r` what it is, a group each, and the command
 /// that follows `--`.
-fn flags(r: &ImageRecord) -> (Vec<Vec<String>>, Vec<String>) {
+pub(crate) fn flags(r: &ImageRecord) -> (Vec<Vec<String>>, Vec<String>) {
     let mut out: Vec<Vec<String>> = Vec::new();
     let flag = |out: &mut Vec<Vec<String>>, name: &str, value: &str| out.push(option(name, value));
     if r.no_network {

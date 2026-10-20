@@ -72,6 +72,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             api::network::remove_after_exit(&Context::new(config), &name, &invocation).await
         }
         Command::HealthRun { name } => crate::health::run(&Context::new(config), &name).await,
+        Command::ApiServe { name } => crate::dockerapi::serve(&name, config).await,
         Command::AwaitDependencies { name } => {
             api::dependencies::await_all(&Context::new(config), &name).await
         }
@@ -740,6 +741,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         Command::Top(args) => machines::top(args, client).await,
         Command::Update(args) => machines::update(args, client).await,
         Command::Stats(args) => stats::stats(args, client).await,
+        Command::AutoUpdate(args) => machines::auto_update(args, client).await,
         Command::Events(args) => machines::events(args, client).await,
         Command::Exec(args) => machines::exec(args, client).await,
         Command::Shell(args) => machines::shell(args, client).await,
@@ -752,6 +754,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         | Command::Manpage
         | Command::RemoveAfterExit { .. }
         | Command::HealthRun { .. }
+        | Command::ApiServe { .. }
         | Command::AwaitDependencies { .. }
         | Command::AttachExec { .. } => {
             unreachable!("handled before")

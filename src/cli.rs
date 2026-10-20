@@ -80,6 +80,10 @@ pub enum Command {
     Update(UpdateArgs),
     /// What running machines use: CPU, memory, network, disk, processes, like docker stats.
     Stats(StatsArgs),
+    /// Give the machines labelled org.nspawn.auto-update=registry the image their
+    /// reference names now, like podman auto-update: each is made anew with every option
+    /// it had, and put back when it does not come up (healthy, with a healthcheck).
+    AutoUpdate(AutoUpdateArgs),
     /// What happens to machines, networks and volumes, as it happens, like docker events.
     Events(EventsArgs),
     /// Remove machines and what they alone use, like docker rm (same as images rm).
@@ -108,6 +112,10 @@ pub enum Command {
     /// From a transient unit: runs a machine's health probes until it is gone.
     #[command(hide = true)]
     HealthRun { name: String },
+    /// From nspawn-api@NAME.socket: serves the Docker API on the socket a machine mounts
+    /// as docker's.
+    #[command(hide = true)]
+    ApiServe { name: String },
     /// ExecStartPre of a machine with --depends-on: waits until the other machines are
     /// what it asks of them.
     #[command(hide = true)]
@@ -703,6 +711,19 @@ pub struct StatsArgs {
     #[arg(long)]
     pub no_stream: bool,
     /// One JSON object per machine and sample.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct AutoUpdateArgs {
+    /// Machine names (every labelled machine when none is given).
+    #[arg(add = candidates(Kind::Any))]
+    pub names: Vec<String>,
+    /// Only say which machines have a newer image waiting.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// One JSON object per machine.
     #[arg(long)]
     pub json: bool,
 }

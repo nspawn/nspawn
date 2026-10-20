@@ -155,6 +155,24 @@ pub fn pidfd_open(pid: Pid) -> nix::Result<OwnedFd> {
     Errno::result(fd).map(|fd| unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
+/// The listening socket systemd hands a socket-activated service as descriptor 3, once
+/// LISTEN_PID says it is this process's and LISTEN_FDS that there is one. It is made
+/// close-on-exec, so that programs the service runs do not keep it.
+pub fn listen_fd() -> Option<OwnedFd> {
+    let pid: u32 = std::env::var("LISTEN_PID").ok()?.parse().ok()?;
+    let count: u32 = std::env::var("LISTEN_FDS").ok()?.parse().ok()?;
+    if pid != std::process::id() || count < 1 {
+        return None;
+    }
+    // SAFETY: systemd passed descriptor 3 to this process, which owns it from here on.
+    let fd = unsafe { OwnedFd::from_raw_fd(3) };
+    let _ = nix::fcntl::fcntl(
+        &fd,
+        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+    );
+    Some(fd)
+}
+
 /// pidfd_send_signal(2): `signal` to the process behind `pidfd`, ESRCH once it is gone.
 /// A raw number, so that the realtime signals images ask for work too.
 pub fn pidfd_signal(pidfd: &OwnedFd, signal: i32) -> nix::Result<()> {

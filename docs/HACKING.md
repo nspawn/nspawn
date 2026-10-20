@@ -49,6 +49,14 @@ Go runs in a container.
   it starts with, how warnings and errors reach stderr, the exit status.
 - `NSPAWN_COMPOSE_CORPUS=DIR cargo test corpus -- --ignored` does the same with
   cases kept outside the repository, recorded with `oracle.sh record DIR`.
+- The Docker API (`src/dockerapi`) is checked against what docker answers:
+  `tests/dockerapi/oracle.sh record DIR` runs `scenario.sh` in a docker-in-docker
+  container of the release it follows (2 GiB of memory at most), keeps docker's
+  answers under `tests/dockerapi/golden/` (the shapes `cargo test` compares,
+  `sanitize.py` replacing what tells of the host) and, for caddy-docker-proxy,
+  Traefik, nginx-proxy, acme-companion, homepage and Dozzle, every request each made
+  of the socket under `tests/dockerapi/requests/` (`logproxy.py` sits between them),
+  which `cargo test` routes to see that each is served.
 - The YAML parser and emitter, `src/compose/libyaml.rs` and
   `src/compose/emitter.rs`, are ports of those of go-yaml, the release docker
   compose builds with. `tests/compose/go-yaml.sh events DIR` writes what
@@ -77,9 +85,9 @@ firewall zones, units), so it runs as root on a disposable VM only.
 Requirements on the VM: systemd-nspawn and machined 255 or newer (Ubuntu 24.04
 is the oldest host the suite runs on; Debian 12 with systemd 252 does not
 work), overlayfs, `ip`, `nft`, `curl`, `python3`, `openssl` (the suite signs
-an image of its own with a key it makes), access to Docker Hub, to lscr.io
-(linuxserver.io's s6-overlay bases) and to hub.nspawn.org (a signed image is
-pulled from it), a registry with the test
+an image of its own with a key it makes), access to Docker Hub (busybox,
+caddy-docker-proxy and curl among what it pulls), to lscr.io (linuxserver.io's
+s6-overlay bases) and to hub.nspawn.org (a signed image is pulled from it), a registry with the test
 image (`fedora:44` by default) that serves the OCI referrers API (zot does),
 mkosi for the build step, and for the `--interface` step the `dummy` and
 `mac80211_hwsim` kernel modules (Fedora ships the latter in

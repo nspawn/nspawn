@@ -39,6 +39,8 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `api/copy.rs` | cp: tar streams packed and unpacked relative to directory descriptors, paths resolved with openat2 inside the machine's root, tried again when a `..` crossed a rename or mount on the host (EAGAIN) |
 | `systemd.rs` | typed D-Bus calls, job waiting |
 | `journal.rs`, `api/events.rs` | structured journal entries for nspawn's own events; the journal read back as events |
+| `dockerapi/` | the read-only Docker Engine API (`api-serve`), served on a machine's own socket: routing and versions, containers and networks in docker's shapes, filters, events, logs, stats; the one write is a kill through the service |
+| `api/recreate.rs`, `api/autoupdate.rs` | a machine made anew from a newer image with its options, and put back from its rollback when the new one does not come up; `auto-update`: candidates by label, the registry asked once per reference, dependents restarted |
 
 ## On disk
 
@@ -50,7 +52,8 @@ files, and the machine units call nspawn back through drop-in hooks.
   layers-foreign/    layers shifted into the foreign UID range (mstack)
   blobs/             compressed blobs, kept for push; .hold-* lists the blobs
                      of a pull in flight, which the collector leaves alone
-  images/NAME.json   the record: reference, backend, mode, network (and
+  images/NAME.json   the record: reference, index_digest (the index a tag
+                     named at the pull), backend, mode, pid1, network (and
                      network_name for a user-defined one), address,
                      extra_networks with their addresses, aliases,
                      no_network, ports, entrypoint/cmd, env, volumes,
@@ -58,7 +61,9 @@ files, and the machine units call nspawn back through drop-in hooks.
                      signed_at when the pull verified a signature
   manifests/NAME.json raw manifest bytes (digest stays valid)
   machines/NAME/     overlay upper/work, host0.network (host1.. for the
-                     other networks), hosts, resolv.conf, getent (the
+                     other networks), docker/containers/ID/hostname (bound
+                     at /etc/hostname of a machine that takes the Docker
+                     API), hosts, resolv.conf, getent (the
                      stand-in bound into an app that runs as a user),
                      hostname (a booted machine's --hostname),
                      units/ for the volume wait unit, exit-on-next when
@@ -74,6 +79,9 @@ files, and the machine units call nspawn back through drop-in hooks.
                      labels
   starting/NAME      a start in progress, until the machine is registered:
                      nothing removes or replaces the image meanwhile
+  rollback/NAME/     auto-update's copy of a machine's previous record,
+                     manifest and upper/work, until its new image is up;
+                     its layers and blobs stay meanwhile
   .lock              flock serialising commands that change the store
 /var/lib/machines/NAME        the root machined boots (mount point or dir)
 /var/lib/machines/NAME.mstack mstack layout (layer@N links, rw/)
@@ -85,12 +93,16 @@ files, and the machine units call nspawn back through drop-in hooks.
                         LogRateLimitIntervalSec=0, Restart= and
                         MemoryMax=/MemorySwapMax=/CPUQuota=/TasksMax= when set,
                         for an app ExecStart= behind `nspawn attach-exec`,
-                        Wants=/After= the units of --depends-on
+                        Wants=/After= the units of --depends-on and the
+                        machine's Docker API socket
 /etc/systemd/system/machines.target.wants/systemd-nspawn@NAME.service
                         --restart always or unless-stopped: started at boot
 /etc/nspawn/auth.json  registry credentials, 0600
 /run/nspawn/attach/NAME.sock  where an attached run waits for its machine's
                         systemd-nspawn (0700 directory)
+/run/nspawn/api/NAME.sock     a machine's Docker API, opened by
+                        nspawn-api@NAME.socket (0660, 0700 directory) and bound
+                        where the machine mounts docker's socket
 /run/nspawn/firewalld/NAME    the interfaces of a veth machine bound to
                         firewalld's trusted zone, for the release hook to unbind
 ```

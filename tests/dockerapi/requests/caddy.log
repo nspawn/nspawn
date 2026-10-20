@@ -1,0 +1,6 @@
+HEAD /_ping
+GET /v1.51/events?filters=%7B%22scope%22%3A%7B%22local%22%3Atrue%2C%22swarm%22%3Atrue%7D%2C%22type%22%3A%7B%22config%22%3Atrue%2C%22container%22%3Atrue%2C%22network%22%3Atrue%2C%22service%22%3Atrue%7D%7D
+GET /v1.51/containers/7d9790a4a796d7ae3b435dae7232c2dff12011077951b6f203ac44812be3f0d4/json
+GET /v1.51/networks/b90b4b9f430e7ac244ba7212451819f4cfda5814b6ba70b92f55fc7afd7187ab
+GET /v1.51/info
+GET /v1.51/containers/json

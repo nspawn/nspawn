@@ -1,4 +1,4 @@
-policy_module(nspawn, 1.8.0)
+policy_module(nspawn, 1.9.0)
 
 ########################################
 #
@@ -25,7 +25,8 @@ type nspawn_etc_t;
 files_config_file(nspawn_etc_t)
 
 # /run/nspawn: the sockets an attached run waits on for its machine, the verdicts of
-# the health probes, the secrets decrypted for a running machine.
+# the health probes, the secrets decrypted for a running machine, the machines'
+# Docker API sockets.
 type nspawn_var_run_t;
 files_pid_file(nspawn_var_run_t)
 
@@ -98,6 +99,11 @@ allow nspawn_t systemd_networkd_unit_file_t:service { start status };
 systemd_dbus_chat_machined(nspawn_t)
 firewalld_dbus_chat(nspawn_t)
 policykit_dbus_chat(nspawn_t)
+# A machine's Docker API socket: systemd opens /run/nspawn/api/NAME.sock for
+# nspawn-api@NAME.socket before the machine starts and removes it after.
+files_pid_filetrans(init_t, nspawn_var_run_t, dir, "nspawn")
+manage_dirs_pattern(init_t, nspawn_var_run_t, nspawn_var_run_t)
+manage_sock_files_pattern(init_t, nspawn_var_run_t, nspawn_var_run_t)
 # machined lists the images and reads os-release inside the machines' trees.
 list_dirs_pattern(systemd_machined_t, nspawn_var_lib_t, nspawn_var_lib_t)
 read_files_pattern(systemd_machined_t, nspawn_var_lib_t, nspawn_var_lib_t)
@@ -119,6 +125,8 @@ userdom_search_user_tmp_dirs(nspawn_t)
 # The bus: its own name, and the pipes and pseudo terminals it hands to its
 # clients, which the bus relays.
 dbus_system_domain(nspawn_t, nspawn_exec_t)
+# The Docker API server sends its one change, a kill, to the service.
+allow nspawn_t self:dbus send_msg;
 allow system_dbusd_t nspawn_t:fd use;
 allow system_dbusd_t nspawn_t:fifo_file rw_fifo_file_perms;
 term_use_ptmx(nspawn_t)

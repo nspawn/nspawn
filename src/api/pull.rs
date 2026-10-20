@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use futures_util::{StreamExt, TryStreamExt};
-use oci_client::manifest::OciDescriptor;
+use oci_client::manifest::{OciDescriptor, OciImageManifest};
 
 use crate::api::{line, note, require_root, Context, Report};
 use crate::backend::{Backend, BackendChoice};
@@ -11,7 +11,8 @@ use crate::hub::{short_digest, Hub, Resolved};
 use crate::install::{ensure_replaceable, install, remove_existing, Install};
 use crate::oci::Mode;
 use crate::reference::{validate_machine_name, ImageRef};
-use crate::store::validate_digest;
+use crate::store::{validate_digest, BlobHold};
+use crate::verify::Signed;
 
 /// Blobs fetched at once.
 const CONCURRENT_DOWNLOADS: usize = 3;
@@ -58,28 +59,34 @@ fn missing_once<'a>(
     (wanted, there)
 }
 
-pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> Result<Pulled> {
-    require_root("pull")?;
+/// An image brought into the store from its registry, its record not written yet.
+pub struct Fetched {
+    pub manifest: OciImageManifest,
+    pub manifest_bytes: Vec<u8>,
+    pub manifest_digest: String,
+    /// The index the reference named, when it named one: what the registry answers for
+    /// the tag, which a later check compares.
+    pub index_digest: Option<String>,
+    pub signed: Option<Signed>,
+    /// Keeps an images rm meanwhile from collecting the blobs until a record refers to
+    /// them.
+    pub _hold: BlobHold,
+}
+
+/// Resolves `image` on its registry, checks its signature as the registry's policy says
+/// (unless `verify` is off) and downloads the blobs the store lacks. Nothing is locked:
+/// a long download must not hold up other commands or the unit hooks. `assembling`
+/// names the backend the caller will assemble it with, for the manifest's line.
+pub async fn fetch(
+    ctx: &Context,
+    image: &ImageRef,
+    verify: bool,
+    assembling: Option<&str>,
+    report: Report<'_>,
+) -> Result<Fetched> {
     let config = &ctx.config;
-    let image = ImageRef::parse(&request.reference, &config.registry)?;
-    let oci = image.to_oci()?;
-    let name = request.name.clone().unwrap_or_else(|| image.local_name());
-    validate_machine_name(&name)?;
-
-    let sd = ctx.sd().await?;
     let store = &ctx.store;
-    store.init()?;
-    ensure_replaceable(store, sd, &name, request.force).await?;
-
-    let choice = if request.backend == BackendChoice::Auto {
-        config.backend
-    } else {
-        request.backend
-    };
-    let backend = Backend::choose(choice, sd).await?;
-    if backend == Backend::Mstack {
-        note(report, crate::backend::MSTACK_EXPERIMENTAL);
-    }
+    let oci = image.to_oci()?;
     let hub = Hub::new(config)?;
     let resolved = hub.resolve(&oci).await?;
     // Digests become path components in the store; the registry does not get to choose them.
@@ -97,7 +104,7 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
     }
     // Before a single layer comes down: an image that is not what it claims is not
     // worth the download.
-    let signed = if !request.verify {
+    let signed = if !verify {
         note(
             report,
             format!("note: signature verification of {image} skipped (--no-verify)"),
@@ -115,25 +122,23 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
     let Resolved {
         manifest,
         digest: manifest_digest,
-        ..
+        index_digest,
     } = resolved;
     let manifest_bytes = hub.manifest_bytes(&oci, &manifest_digest).await?;
-    // Held from here until the record refers to them: an images rm meanwhile must not
-    // collect what this pull is bringing in.
     let digests: Vec<String> = manifest
         .layers
         .iter()
         .chain(std::iter::once(&manifest.config))
         .map(|d| d.digest.clone())
         .collect();
-    let _hold = store.hold_blobs(&digests)?;
+    let hold = store.hold_blobs(&digests)?;
+    let assembling = assembling.map_or(String::new(), |b| format!(", assembling as {b}"));
     line(
         report,
         format!(
-            "{image}: manifest {} with {} layer(s), assembling as {}",
+            "{image}: manifest {} with {} layer(s){assembling}",
             short_digest(&manifest_digest),
             manifest.layers.len(),
-            backend.name()
         ),
     );
 
@@ -179,13 +184,46 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
         .buffer_unordered(CONCURRENT_DOWNLOADS)
         .try_collect::<Vec<()>>()
         .await?;
+    Ok(Fetched {
+        manifest,
+        manifest_bytes,
+        manifest_digest,
+        index_digest,
+        signed,
+        _hold: hold,
+    })
+}
 
-    // The store is locked only now: a long download must not hold up other commands or
-    // the unit hooks. The name is checked again, the old image goes only at this point.
+pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> Result<Pulled> {
+    require_root("pull")?;
+    let config = &ctx.config;
+    let image = ImageRef::parse(&request.reference, &config.registry)?;
+    let name = request.name.clone().unwrap_or_else(|| image.local_name());
+    validate_machine_name(&name)?;
+
+    let sd = ctx.sd().await?;
+    let store = &ctx.store;
+    store.init()?;
+    ensure_replaceable(store, sd, &name, request.force).await?;
+
+    let choice = if request.backend == BackendChoice::Auto {
+        config.backend
+    } else {
+        request.backend
+    };
+    let backend = Backend::choose(choice, sd).await?;
+    if backend == Backend::Mstack {
+        note(report, crate::backend::MSTACK_EXPERIMENTAL);
+    }
+    let fetched = fetch(ctx, &image, request.verify, Some(backend.name()), report).await?;
+
+    // The store is locked only now. The name is checked again, the old image goes only
+    // at this point.
     let _lock = store.lock().await?;
     ensure_replaceable(store, sd, &name, request.force).await?;
-    crate::install::stage_layers(store, backend, &manifest, request.mode, &name).await?;
+    crate::install::stage_layers(store, backend, &fetched.manifest, request.mode, &name).await?;
     remove_existing(store, sd, &name, report).await?;
+    let signed = fetched.signed.as_ref();
     let mode = install(
         store,
         sd,
@@ -194,13 +232,14 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
         Install {
             name: &name,
             reference: &image.to_string(),
-            manifest_bytes: &manifest_bytes,
-            manifest: &manifest,
-            manifest_digest: &manifest_digest,
+            manifest_bytes: &fetched.manifest_bytes,
+            manifest: &fetched.manifest,
+            manifest_digest: &fetched.manifest_digest,
+            index_digest: fetched.index_digest.as_deref(),
             origin: "pull",
             mode: request.mode,
-            signed_by: signed.as_ref().map(|s| s.signed_by.as_str()),
-            signed_at: signed.as_ref().and_then(|s| s.signed_at),
+            signed_by: signed.map(|s| s.signed_by.as_str()),
+            signed_at: signed.and_then(|s| s.signed_at),
         },
         report,
     )
@@ -210,7 +249,7 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
         ("image", reference.as_str()),
         ("reference", reference.as_str()),
     ];
-    if let Some(signed) = &signed {
+    if let Some(signed) = signed {
         attributes.push(("signed_by", signed.signed_by.as_str()));
     }
     crate::api::events::emit("machine", "pull", &name, &attributes);
@@ -218,7 +257,7 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
         name,
         reference,
         mode,
-        signed_by: signed.map(|s| s.signed_by),
+        signed_by: fetched.signed.map(|s| s.signed_by),
     })
 }
 

@@ -22,6 +22,8 @@ pub struct Install<'a> {
     pub manifest_bytes: &'a [u8],
     pub manifest: &'a OciImageManifest,
     pub manifest_digest: &'a str,
+    /// The index the reference named, for a pull of a tag that names one.
+    pub index_digest: Option<&'a str>,
     pub origin: &'a str,
     /// Force boot or app instead of detecting it from the image.
     pub mode: Option<Mode>,
@@ -166,6 +168,7 @@ pub async fn install(
             limits: &crate::policy::Limits::default(),
             remove_on_exit: false,
             tuning: &Default::default(),
+            api_socket: false,
         },
     )? {
         sd.reload().await?;
@@ -175,6 +178,7 @@ pub async fn install(
         name: spec.name.to_string(),
         reference: spec.reference.to_string(),
         manifest_digest: spec.manifest_digest.to_string(),
+        index_digest: spec.index_digest.map(str::to_string),
         layers: spec
             .manifest
             .layers

@@ -771,6 +771,58 @@ impl Manager {
 
     /// Like `volume prune`: a job removing every volume no machine uses; its result lists
     /// them.
+    /// Like `auto-update`: the machines labelled org.nspawn.auto-update=registry, or the
+    /// ones named, get the image their reference names now at its registry, made anew
+    /// with every option they had and put back when they do not come up. Option dry_run
+    /// (b) only looks. The job's result: machines (aa{ss}: name, image, policy, updated
+    /// (false, pending, true, failed, rolled back or skipped), reason, from, to).
+    async fn auto_update(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        names: Vec<String>,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<OwnedObjectPath> {
+        let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let mut options = Options::new(&options);
+        let dry_run = options.bool("dry_run", false)?;
+        options.finish()?;
+        for name in &names {
+            crate::reference::validate_entry_name(name)?;
+        }
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "auto-update",
+            "",
+            move |ctx, reporter| async move {
+                let request = api::autoupdate::Request { names, dry_run };
+                let outcomes =
+                    api::autoupdate::run(&ctx, &request, jobs::report(&reporter)).await?;
+                let machines: Vec<HashMap<String, String>> = outcomes
+                    .into_iter()
+                    .map(|o| {
+                        HashMap::from([
+                            ("name".to_string(), o.name),
+                            ("image".to_string(), o.image),
+                            ("policy".to_string(), o.policy),
+                            ("updated".to_string(), o.updated.word().to_string()),
+                            ("reason".to_string(), o.reason),
+                            ("from".to_string(), o.from),
+                            ("to".to_string(), o.to),
+                        ])
+                    })
+                    .collect();
+                Ok(HashMap::from([(
+                    "machines".to_string(),
+                    values::v(machines),
+                )]))
+            },
+        )
+        .await?)
+    }
+
     async fn prune_volumes(&self, #[zbus(header)] hdr: Header<'_>) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;
@@ -1352,6 +1404,7 @@ impl Manager {
             all: options.bool("all", false)?,
             inside: options.bool("inside", false)?,
             namespace: None,
+            json: false,
         };
         options.finish()?;
         crate::reference::validate_entry_name(&request.machine)?;
@@ -1366,28 +1419,9 @@ impl Manager {
             }
         }
         let mut request = request;
-        if let Ok(Some(record)) = self.ctx().store.load_image(&request.machine) {
-            api::machines::check_logs_kept(&record, request.inside)
-                .map_err(|e| Error::Failed(format!("{e:#}")))?;
-            if let Some(namespace) = record.tuning.journal_namespace() {
-                if let Ok(sd) = self.ctx().sd().await {
-                    // Its files must exist for journalctl to read them.
-                    let _ = api::run::ensure_journal_namespace(sd, namespace).await;
-                }
-                request.namespace = Some(namespace.to_string());
-            }
-            let created = record.created;
-            request = tokio::task::spawn_blocking(move || {
-                api::machines::from_creation(
-                    &mut request,
-                    created,
-                    api::machines::journal_time_before,
-                );
-                request
-            })
+        api::machines::prepare_logs(self.ctx(), &mut request)
             .await
-            .map_err(|e| Error::Failed(e.to_string()))?;
-        }
+            .map_err(|e| Error::Failed(format!("{e:#}")))?;
         let argv = api::machines::journalctl_arguments(&request);
         let pipe = || {
             nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
@@ -1483,24 +1517,16 @@ impl Manager {
         let watch = out_w
             .try_clone()
             .map_err(|e| Error::Failed(e.to_string()))?;
-        let mut child = tokio::process::Command::new("journalctl")
-            .args(&argv)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(err_w))
-            .spawn()
-            .map_err(|e| Error::Failed(format!("running journalctl: {e}")))?;
-        let pid = child.id().unwrap_or(0);
+        let mut follow =
+            api::events::Follow::spawn(since.as_deref(), until.as_deref(), Stdio::from(err_w))
+                .map_err(|e| Error::Failed(format!("{e:#}")))?;
+        let pid = follow.pid();
         let pidfd = nsenter::pidfd_open(nix::unistd::Pid::from_raw(pid as i32)).ok();
-        let entries = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::Failed("journalctl has no output".to_string()))?;
         let mut out = tokio::net::unix::pipe::Sender::from_owned_fd(out_w)
             .map_err(|e| Error::Failed(format!("preparing the events' pipe: {e}")))?;
         let ctx = self.state.ctx.clone();
         let wait = async move {
-            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            use tokio::io::AsyncWriteExt;
             let reader_gone = async {
                 match tokio::io::unix::AsyncFd::with_interest(watch, tokio::io::Interest::ERROR) {
                     Ok(watch) => {
@@ -1510,25 +1536,10 @@ impl Manager {
                 }
             };
             tokio::pin!(reader_gone);
-            let mut lines = tokio::io::BufReader::new(entries).lines();
-            let mut mapper = api::events::Mapper::default();
             loop {
                 tokio::select! {
-                    line = lines.next_line() => {
-                        let Ok(Some(line)) = line else { break };
-                        let Ok(entry) = serde_json::from_str(&line) else { continue };
-                        let Some(mut event) = mapper.map(&entry) else { continue };
-                        if event.kind == "machine" {
-                            // systemd's own events (start, die, ...) say nothing of the
-                            // image; ours carry it, and it stays once the record is gone.
-                            if let Ok(Some(record)) = ctx.store.load_image(&event.name) {
-                                event
-                                    .attributes
-                                    .entry("image".into())
-                                    .or_insert_with(|| record.reference.clone());
-                                event.labels = record.effective_labels();
-                            }
-                        }
+                    event = follow.next(&ctx.store) => {
+                        let Some(event) = event else { break };
                         if !filters.matches(&event) {
                             continue;
                         }
@@ -1541,17 +1552,7 @@ impl Manager {
                 }
             }
             drop(out);
-            match child.try_wait() {
-                Ok(Some(status)) => status_code(status),
-                _ => {
-                    let _ = child.kill().await;
-                    match child.wait().await {
-                        // Ended at until on its own between the two looks.
-                        Ok(status) if status.success() => 0,
-                        _ => 128 + nix::libc::SIGKILL,
-                    }
-                }
-            }
+            follow.finish().await
         };
         let mut command = vec!["journalctl".to_string()];
         command.extend(argv);

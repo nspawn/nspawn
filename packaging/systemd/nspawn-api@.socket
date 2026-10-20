@@ -1,0 +1,10 @@
+[Unit]
+Description=Docker API of nspawn for machine %i
+Documentation=https://github.com/nspawn/nspawn
+BindsTo=systemd-nspawn@%i.service
+
+[Socket]
+ListenStream=/run/nspawn/api/%i.sock
+SocketMode=0660
+DirectoryMode=0700
+RemoveOnStop=yes

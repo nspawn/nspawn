@@ -262,6 +262,7 @@ mod tests {
                 name: name.into(),
                 reference: "hub.example/img:1".into(),
                 manifest_digest: "sha256:m".into(),
+                index_digest: None,
                 layers: Vec::new(),
                 backend: BackendChoice::Flat,
                 created: 1,

@@ -24,11 +24,20 @@ override_dh_auto_install:
 	install -D -m 0644 debian/nspawn.1 debian/nspawn/usr/share/man/man1/nspawn.1
 	install -D -m 0644 packaging/systemd/nspawn.service debian/nspawn/usr/lib/systemd/system/nspawn.service
 	install -D -m 0644 packaging/systemd/journald@nspawn.conf debian/nspawn/usr/lib/systemd/journald@nspawn.conf
+	install -D -m 0644 packaging/systemd/nspawn-api@.socket debian/nspawn/usr/lib/systemd/system/nspawn-api@.socket
+	install -D -m 0644 packaging/systemd/nspawn-api@.service debian/nspawn/usr/lib/systemd/system/nspawn-api@.service
+	install -D -m 0644 packaging/systemd/nspawn-auto-update.service debian/nspawn/usr/lib/systemd/system/nspawn-auto-update.service
+	install -D -m 0644 packaging/systemd/nspawn-auto-update.timer debian/nspawn/usr/lib/systemd/system/nspawn-auto-update.timer
 	install -D -m 0644 packaging/dbus/org.nspawn.service debian/nspawn/usr/share/dbus-1/system-services/org.nspawn.service
 	install -D -m 0644 packaging/dbus/org.nspawn.conf debian/nspawn/usr/share/dbus-1/system.d/org.nspawn.conf
 	install -D -m 0644 packaging/polkit/org.nspawn.policy debian/nspawn/usr/share/polkit-1/actions/org.nspawn.policy
 	install -d -m 0755 debian/nspawn/etc/nspawn
 	install -d -m 0711 debian/nspawn/var/lib/nspawn
+
+# Nothing is enabled or started: the service starts on demand from the bus, and the
+# auto-update timer only when the administrator turns it on.
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
 
 # The state directory holds the images' files, setuid programs and device nodes among
 # them: passable, not readable, which dh_fixperms would widen to 0755.

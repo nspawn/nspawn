@@ -12,8 +12,9 @@ use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow, Signal};
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 use crate::cli::{
-    EventsArgs, ExecArgs, KillArgs, LogsArgs, ModeChoice, NamesArgs, PsArgs, PullPolicy,
-    RestartArgs, RunArgs, ShellArgs, StartArgs, StartOptions, StopArgs, TopArgs, UpdateArgs,
+    AutoUpdateArgs, EventsArgs, ExecArgs, KillArgs, LogsArgs, ModeChoice, NamesArgs, PsArgs,
+    PullPolicy, RestartArgs, RunArgs, ShellArgs, StartArgs, StartOptions, StopArgs, TopArgs,
+    UpdateArgs,
 };
 use crate::client::{self, Client, Dict, Ended, Options};
 use crate::config::Config;
@@ -689,6 +690,59 @@ pub async fn top(args: TopArgs, client: &Client) -> Result<()> {
         })
         .collect();
     println!("{}", table(&["PID", "USER", "TIME", "COMMAND"], rows));
+    Ok(())
+}
+
+/// auto-update: podman's table, the reasons on standard error; fails when a machine
+/// failed or went back to its old image, so that the timer's unit says so.
+pub async fn auto_update(args: AutoUpdateArgs, client: &Client) -> Result<()> {
+    let mut options = Options::new();
+    options.insert("dry_run", Value::from(args.dry_run));
+    let result = client
+        .run_job_to_stderr(|| client.manager.auto_update(&args.names, options))
+        .await?;
+    let machines: Vec<HashMap<String, String>> = result
+        .get("machines")
+        .and_then(|v| Vec::<HashMap<String, String>>::try_from(v.try_clone().ok()?).ok())
+        .unwrap_or_default();
+    let field = |m: &HashMap<String, String>, k: &str| m.get(k).cloned().unwrap_or_default();
+    if args.json {
+        for m in &machines {
+            println!("{}", serde_json::to_string(m)?);
+        }
+    } else {
+        let rows = machines
+            .iter()
+            .map(|m| {
+                vec![
+                    format!("systemd-nspawn@{}.service", field(m, "name")),
+                    field(m, "name"),
+                    field(m, "image"),
+                    field(m, "policy"),
+                    field(m, "updated"),
+                ]
+            })
+            .collect();
+        println!(
+            "{}",
+            table(&["UNIT", "CONTAINER", "IMAGE", "POLICY", "UPDATED"], rows)
+        );
+        for m in &machines {
+            let reason = field(m, "reason");
+            // A machine without the label is skipped quietly unless it was named.
+            let named = args.names.contains(&field(m, "name"));
+            if !reason.is_empty() && (field(m, "updated") != "skipped" || named) {
+                eprintln!("{}: {reason}", field(m, "name"));
+            }
+        }
+    }
+    let failed = machines
+        .iter()
+        .filter(|m| matches!(field(m, "updated").as_str(), "failed" | "rolled back"))
+        .count();
+    if failed > 0 {
+        bail!("{failed} machine(s) could not be updated");
+    }
     Ok(())
 }
 

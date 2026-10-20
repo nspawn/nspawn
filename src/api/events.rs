@@ -91,6 +91,104 @@ pub fn journalctl_arguments(since: Option<&str>, until: Option<&str>) -> Vec<Str
     argv
 }
 
+/// journalctl reading nspawn's events from `since` (new ones only without it) until
+/// `until` (following without it), each mapped and enriched as it comes.
+pub struct Follow {
+    child: tokio::process::Child,
+    lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    mapper: Mapper,
+}
+
+impl Follow {
+    /// `stderr` is where journalctl's complaints go.
+    pub fn spawn(
+        since: Option<&str>,
+        until: Option<&str>,
+        stderr: std::process::Stdio,
+    ) -> Result<Self> {
+        use tokio::io::AsyncBufReadExt;
+        let mut child = tokio::process::Command::new("journalctl")
+            .args(journalctl_arguments(since, until))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(stderr)
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("running journalctl: {e}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("journalctl has no output"))?;
+        Ok(Follow {
+            child,
+            lines: tokio::io::BufReader::new(stdout).lines(),
+            mapper: Mapper::default(),
+        })
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id().unwrap_or(0)
+    }
+
+    /// The next event; None once journalctl has ended (at `until`, or failing).
+    pub async fn next(&mut self, store: &crate::store::Store) -> Option<Event> {
+        loop {
+            let line = self.lines.next_line().await.ok()??;
+            let Ok(entry) = serde_json::from_str(&line) else {
+                continue;
+            };
+            let Some(mut event) = self.mapper.map(&entry) else {
+                continue;
+            };
+            enrich(store, &mut event);
+            return Some(event);
+        }
+    }
+
+    /// How journalctl ended: its own status when it is done, 128 + SIGKILL when it has
+    /// to be stopped now.
+    pub async fn finish(mut self) -> i32 {
+        use std::os::unix::process::ExitStatusExt;
+        let code = |status: std::process::ExitStatus| {
+            status
+                .code()
+                .or_else(|| status.signal().map(|s| 128 + s))
+                .unwrap_or(126)
+        };
+        match self.child.try_wait() {
+            Ok(Some(status)) => code(status),
+            _ => {
+                let _ = self.child.kill().await;
+                match self.child.wait().await {
+                    // Ended at until on its own between the two looks.
+                    Ok(status) if status.success() => 0,
+                    _ => 128 + nix::libc::SIGKILL,
+                }
+            }
+        }
+    }
+}
+
+/// A machine's event with what its record knows: systemd's own events (start, die, ...)
+/// say nothing of the image; ours carry it, and it stays once the record is gone.
+pub fn enrich(store: &crate::store::Store, event: &mut Event) {
+    if event.kind != "machine" {
+        return;
+    }
+    if let Ok(Some(record)) = store.load_image(&event.name) {
+        event
+            .attributes
+            .entry("image".into())
+            .or_insert_with(|| record.reference.clone());
+        // Which machine of the name it was, as remove events carry it too.
+        event
+            .attributes
+            .entry("created".into())
+            .or_insert_with(|| record.created.to_string());
+        event.labels = record.effective_labels();
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     /// Microseconds since the epoch.

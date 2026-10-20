@@ -1,0 +1,11 @@
+GET /v1.24/version
+GET /v1.24/containers/json
+GET /v1.24/containers/0267eadaccfbcfb749b7b4f9645670076c00abf5a148c6364a9e6d524b1917de/json
+GET /v1.24/containers/aa3d51b6ed000a849a6552769cda4177e943aa8b19089ba3e2191f965019d2fe/json
+GET /v1.24/containers/7cad94517cff65b7fcfc6fc4e58932a0565369d80f6f8f2de394d230b3c95962/json
+GET /v1.24/events?filters=%7B%22type%22%3A%7B%22container%22%3Atrue%7D%7D
+GET /v1.24/containers/json
+GET /v1.24/containers/861898eef10542fa414aeea796a581e0c719ff7a170f2461a537530b990585f1/json
+GET /v1.24/containers/0267eadaccfbcfb749b7b4f9645670076c00abf5a148c6364a9e6d524b1917de/json
+GET /v1.24/containers/aa3d51b6ed000a849a6552769cda4177e943aa8b19089ba3e2191f965019d2fe/json
+GET /v1.24/containers/7cad94517cff65b7fcfc6fc4e58932a0565369d80f6f8f2de394d230b3c95962/json

@@ -211,7 +211,7 @@ pub async fn remove_machines(
     // stays keeps them.
     let order = crate::api::dependencies::removal_order(&records, names);
     for name in order.iter().filter(|n| !skip.contains(*n)) {
-        let outcome: Result<Option<String>> = async {
+        let outcome: Result<Option<(String, u64)>> = async {
             let staying = crate::api::dependencies::holders(&records, name, &removal.removed);
             if !staying.is_empty() {
                 let (stays, needs) = if staying.len() == 1 {
@@ -239,6 +239,8 @@ pub async fn remove_machines(
                     store.remove_machine_files(name)?;
                     crate::api::machines::release_machine(name, Some(&rec))?;
                     store.remove_record(name)?;
+                    // An update that was still deciding about it has nothing left to decide.
+                    store.forget_rollback(name)?;
                     crate::install::take_off_boot(sd, name, report).await;
                     // Named volumes outlive the machine.
                     for volume in rec.volumes.iter().filter(|v| v.is_named()) {
@@ -250,7 +252,7 @@ pub async fn remove_machines(
                             ),
                         );
                     }
-                    Ok(Some(rec.reference))
+                    Ok(Some((rec.reference, rec.created)))
                 }
                 None => {
                     // Not recorded: an image machined knows, or leftovers of ours. A name
@@ -272,10 +274,14 @@ pub async fn remove_machines(
         match outcome {
             Ok(image) => {
                 line(report, format!("removed {name}"));
-                // The record is gone: what the event says of the image has to travel
+                // The record is gone: what the event says of the machine has to travel
                 // with it.
-                let attributes: Vec<(&str, &str)> =
-                    image.iter().map(|i| ("image", i.as_str())).collect();
+                let created = image.as_ref().map(|(_, c)| c.to_string());
+                let mut attributes: Vec<(&str, &str)> = Vec::new();
+                if let (Some((reference, _)), Some(created)) = (&image, &created) {
+                    attributes.push(("image", reference.as_str()));
+                    attributes.push(("created", created.as_str()));
+                }
                 crate::api::events::emit("machine", "remove", name, &attributes);
                 removal.removed.push(name.clone());
             }

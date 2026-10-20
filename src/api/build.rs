@@ -175,6 +175,7 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
                 manifest_bytes: &manifest_bytes,
                 manifest: &manifest,
                 manifest_digest: &manifest_digest,
+                index_digest: None,
                 origin: "build",
                 mode: request.mode,
                 signed_by: None,

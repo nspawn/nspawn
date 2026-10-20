@@ -330,7 +330,10 @@ fn volumes(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
                 let create = sub(volume, "bind")
                     .and_then(|b| b.get("create_host_path"))
                     .is_none_or(|v| v != &Value::Bool(false));
-                if create && !std::path::Path::new(source).exists() {
+                // docker's socket is the machine's Docker API, which nspawn provides: a
+                // host without docker must not get a directory there.
+                let api = crate::volume::DOCKER_SOCKETS.contains(&source);
+                if create && !api && !std::path::Path::new(source).exists() {
                     made.host_paths.push(source.to_string());
                 }
                 binds.push(format!("{source}:{target}{ro}"));
@@ -367,6 +370,16 @@ fn volumes(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
                 spec.service
             ),
         }
+    }
+    // use_api_socket: the socket where docker's clients look for it, unless the service
+    // mounts something there itself.
+    if service.get("use_api_socket") == Some(&Value::Bool(true))
+        && !binds
+            .iter()
+            .any(|b| b.split(':').nth(1) == Some(crate::volume::DOCKER_SOCKETS[0]))
+    {
+        let socket = crate::volume::DOCKER_SOCKETS[0];
+        binds.push(format!("{socket}:{socket}"));
     }
     put_list(&mut made.options, "volume", binds);
     put_list(&mut made.options, "tmpfs", tmpfs);

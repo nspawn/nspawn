@@ -206,11 +206,66 @@ takes. Not on mstack machines yet.
 `create`, `push`, `kill`, `update`, `pause`, `unpause`, `remove`), networks, volumes and
 secrets, as it happens or between `--since` and `--until`, filtered by name, type, event
 or label, as text or `--json`. Every event of a kind carries the same metadata whatever
-the action, so a `remove` says as much as a `create`: `image=` on a machine's (and its
-labels while it has a record), `subnet=`, `interface=` and `internal=` on a network's,
-`path=` on a volume's, `size=` on a secret's. It reads
+the action, so a `remove` says as much as a `create`: `image=` and `created=` (which
+machine of the name it was) on a machine's (and its labels while it has a record),
+`subnet=`, `interface=`, `internal=` and `created=` on a network's, `path=` on a
+volume's, `size=` on a secret's. It reads
 the journal, so machines started by `machinectl`, at boot or by a restart policy are
 there too, and so is what happened while nobody watched.
+
+### The Docker API for proxies and dashboards
+
+Tools that follow containers through docker's socket, reverse proxies routing by
+labels (caddy-docker-proxy, Traefik, nginx-proxy with docker-gen and acme-companion),
+dashboards (homepage) and log viewers (Dozzle), find nspawn's machines the same way: a
+machine that mounts `/var/run/docker.sock` or `/run/docker.sock` from the host
+(`-v /var/run/docker.sock:/var/run/docker.sock[:ro]`, or compose's `use_api_socket`)
+gets nspawn's Docker API there instead of the host's docker. It answers what docker
+answers, in the shapes of its API 1.51 (and the versions down to 1.24 that clients ask
+for): the machines as containers with their labels, networks and addresses, inspect
+with the environment, events as they happen, logs, stats and top, the networks. It
+changes nothing, with one exception: `POST /containers/ID/kill`, which sends a signal
+as `nspawn kill` does, so that docker-gen and acme-companion can have nginx read new
+configuration and certificates; any other write (create, exec, pull...) is refused
+with 403. As with docker's socket, a machine that has it sees every machine and their
+`-e` variables (`--secret` values never show), and only root inside can connect.
+
+Each such machine has its own socket, `/run/nspawn/api/NAME.sock`, opened by systemd
+(`nspawn-api@NAME.socket`) before the machine starts and closed after it stops; the
+server behind it starts when something connects and leaves after a minute without a
+connection. A container ID is derived from the machine's name and creation time, so it
+stays across restarts and updates, and the tools that look for their own container in
+`/proc/self/mountinfo` find it, as nspawn binds the machine's `/etc/hostname` from a
+directory named after it, as docker does. mstack machines cannot take the socket yet.
+
+### Updates of the image a tag names
+
+`nspawn auto-update` gives the machines labelled `org.nspawn.auto-update=registry`
+(podman's `io.containers.autoupdate=registry` is taken too, on the machine, never from
+its image) the image their reference names now at its registry, as podman auto-update
+does and watchtower did. For each, the registry is asked for the tag's digest (a HEAD,
+which registries do not count against their limits); a newer image is pulled, signature
+policy included, and the machine is made anew from it with every option it had: its
+networks and address, ports, volumes, variables, labels, limits, policy and the rest
+(`generate` prints the same command before and after), and its creation time, so its
+Docker API ID stays. A running machine is stopped and started again, and has to come
+up: healthy when it has a healthcheck (within its start period and as many probes as
+would make it unhealthy, ten minutes at most), still running ten seconds after its
+start otherwise. When it does not, the old image and what the machine had written are
+put back and it starts again, which the table reports as `rolled back`. A machine on
+the new image starts with a fresh writable layer, as docker's recreate does: what it
+keeps belongs in volumes. Machines that share its network (`--network container:`) start
+again with it, and so do compose services whose `depends_on` asks for `restart: true`;
+a compose machine's image label follows, so that `compose up` does not take it back.
+Built images, references pinned by digest, `run --rm` machines, booted machines (their
+state is their writable layer) and flat and mstack ones are left alone and say why.
+
+`--dry-run` only says which machines have a newer image waiting (`pending`). The output
+is podman's table, `UNIT CONTAINER IMAGE POLICY UPDATED` with `false`, `pending`,
+`true`, `failed`, `rolled back` or `skipped`, the reasons on standard error (`--json`
+for scripts), and the command fails when a machine failed or went back. The packages
+ship `nspawn-auto-update.timer`, daily with up to fifteen minutes of random delay,
+disabled: `systemctl enable --now nspawn-auto-update.timer` turns the updates on.
 
 ### Where the output goes
 

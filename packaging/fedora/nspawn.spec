@@ -85,6 +85,10 @@ bzip2 -9 packaging/selinux/%{name}.pp
 install -D -m 0755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
 install -D -m 0644 packaging/systemd/%{name}.service %{buildroot}%{_unitdir}/%{name}.service
 install -D -m 0644 packaging/systemd/journald@%{name}.conf %{buildroot}%{_prefix}/lib/systemd/journald@%{name}.conf
+install -D -m 0644 packaging/systemd/%{name}-api@.socket %{buildroot}%{_unitdir}/%{name}-api@.socket
+install -D -m 0644 packaging/systemd/%{name}-api@.service %{buildroot}%{_unitdir}/%{name}-api@.service
+install -D -m 0644 packaging/systemd/%{name}-auto-update.service %{buildroot}%{_unitdir}/%{name}-auto-update.service
+install -D -m 0644 packaging/systemd/%{name}-auto-update.timer %{buildroot}%{_unitdir}/%{name}-auto-update.timer
 install -D -m 0644 packaging/dbus/org.nspawn.service %{buildroot}%{_datadir}/dbus-1/system-services/org.nspawn.service
 install -D -m 0644 packaging/dbus/org.nspawn.conf %{buildroot}%{_datadir}/dbus-1/system.d/org.nspawn.conf
 install -D -m 0644 packaging/polkit/org.nspawn.policy %{buildroot}%{_datadir}/polkit-1/actions/org.nspawn.policy
@@ -101,13 +105,14 @@ install -d -m 0711 %{buildroot}%{_sharedstatedir}/%{name}
 cargo test --release --offline
 
 %post
-%systemd_post %{name}.service
+%systemd_post %{name}.service %{name}-auto-update.timer
 
 %preun
-%systemd_preun %{name}.service
+%systemd_preun %{name}.service %{name}-auto-update.timer
 
 %postun
 %systemd_postun_with_restart %{name}.service
+%systemd_postun %{name}-auto-update.timer
 
 %pre selinux
 %selinux_relabel_pre -s %{selinuxtype}
@@ -137,6 +142,10 @@ fi
 %{_bindir}/%{name}
 %{_unitdir}/%{name}.service
 %{_prefix}/lib/systemd/journald@%{name}.conf
+%{_unitdir}/%{name}-api@.socket
+%{_unitdir}/%{name}-api@.service
+%{_unitdir}/%{name}-auto-update.service
+%{_unitdir}/%{name}-auto-update.timer
 %{_datadir}/dbus-1/system-services/org.nspawn.service
 %{_datadir}/dbus-1/system.d/org.nspawn.conf
 %{_datadir}/polkit-1/actions/org.nspawn.policy

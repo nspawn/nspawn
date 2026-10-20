@@ -518,6 +518,24 @@ impl Systemd {
         Ok((code != 0).then_some((code, status)))
     }
 
+    /// When the unit's main process last ended, in microseconds; 0 before any run.
+    pub async fn exec_main_exit_usec(&self, unit: &str) -> Result<u64> {
+        self.service(unit)
+            .await?
+            .exec_main_exit_timestamp()
+            .await
+            .with_context(|| format!("reading when {unit} ended"))
+    }
+
+    /// How many times systemd restarted the unit since it was started.
+    pub async fn n_restarts(&self, unit: &str) -> Result<u32> {
+        self.service(unit)
+            .await?
+            .n_restarts()
+            .await
+            .with_context(|| format!("reading the restarts of {unit}"))
+    }
+
     pub async fn reset_failed(&self, unit: &str) -> Result<()> {
         match self.manager.reset_failed_unit(unit.to_string()).await {
             Ok(()) => Ok(()),

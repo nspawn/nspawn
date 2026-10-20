@@ -557,8 +557,35 @@ pub async fn prepare(
     if record.backend == BackendChoice::Overlay {
         crate::backend::mount_root(sd, store, name).await?;
     }
+    if record.takes_api_socket() && record.backend == BackendChoice::Mstack {
+        bail!("{name} mounts docker's socket, which nspawn's Docker API cannot reach into an mstack machine yet; make it with --backend overlay");
+    }
     let mut binds = Vec::new();
     for volume in &record.volumes {
+        if volume.is_api_socket() {
+            let socket = crate::dockerapi::socket_path(name);
+            if pass == Pass::Hook && !socket.exists() {
+                bail!(
+                    "{} is missing: nspawn-api@{name}.socket did not open it (the packages ship nspawn-api@.socket, nspawn daemon --install writes it); see systemctl status nspawn-api@{name}.socket",
+                    socket.display()
+                );
+            }
+            if pass == Pass::Ahead && std::path::Path::new(&volume.source).exists() {
+                note(
+                    report,
+                    format!(
+                        "note: {} in {name} is nspawn's Docker API, not this host's docker",
+                        volume.target
+                    ),
+                );
+            }
+            binds.push(Bind {
+                source: socket,
+                target: volume.target.clone(),
+                read_only: volume.read_only,
+            });
+            continue;
+        }
         let source = volume.host_path(&store.volumes_dir());
         if !source.exists() {
             if volume.source.starts_with('/') {
@@ -611,17 +638,34 @@ pub async fn prepare(
         true
     });
     // A booted machine's systemd sets the hostname from /etc/hostname, over the one
-    // systemd-nspawn set: --hostname goes in as that file.
-    let hostname_file = match (&record.tuning.hostname, record.mode) {
-        (Some(hostname), Mode::Boot) => {
-            let dir = store.machine_files_dir(name);
-            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            let path = dir.join("hostname");
-            std::fs::write(&path, format!("{hostname}\n"))
-                .with_context(|| format!("writing {}", path.display()))?;
-            Some(path)
+    // systemd-nspawn set: --hostname goes in as that file. A machine that takes the
+    // Docker API gets it from a directory named after its container ID, as docker binds
+    // it: the tools reading the socket find their own container by that line of their
+    // mountinfo.
+    let hostname_file = if record.takes_api_socket() {
+        let id = crate::dockerapi::util::container_id(name, record.created);
+        let docker = store.machine_files_dir(name).join("docker");
+        let _ = std::fs::remove_dir_all(&docker);
+        let dir = docker.join("containers").join(id);
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join("hostname");
+        let hostname = record.tuning.hostname.as_deref().unwrap_or(name);
+        std::fs::write(&path, format!("{hostname}\n"))
+            .with_context(|| format!("writing {}", path.display()))?;
+        Some(path)
+    } else {
+        match (&record.tuning.hostname, record.mode) {
+            (Some(hostname), Mode::Boot) => {
+                let dir = store.machine_files_dir(name);
+                std::fs::create_dir_all(&dir)
+                    .with_context(|| format!("creating {}", dir.display()))?;
+                let path = dir.join("hostname");
+                std::fs::write(&path, format!("{hostname}\n"))
+                    .with_context(|| format!("writing {}", path.display()))?;
+                Some(path)
+            }
+            _ => None,
         }
-        _ => None,
     };
     let managed_userns = record.backend == BackendChoice::Mstack;
     binds.extend(crate::api::secrets::materialize(store, &record)?);
@@ -716,6 +760,7 @@ pub async fn prepare(
             limits: &record.limits,
             remove_on_exit: record.remove_on_exit,
             tuning: &record.tuning,
+            api_socket: record.takes_api_socket(),
         },
     )? {
         sd.reload().await?;
@@ -777,6 +822,33 @@ pub struct StartRequest {
     pub health: crate::health::Overrides,
     /// hostname, user, capabilities and the rest.
     pub tuning: crate::tuning::Overrides,
+}
+
+impl StartRequest {
+    /// A start that changes nothing the machine has.
+    pub fn keep(name: &str) -> StartRequest {
+        StartRequest {
+            name: name.to_string(),
+            wait: true,
+            network: Vec::new(),
+            aliases: Vec::new(),
+            publish: Vec::new(),
+            entrypoint: None,
+            env: Vec::new(),
+            volume: Vec::new(),
+            label: Vec::new(),
+            restart: None,
+            memory: None,
+            memory_swap: None,
+            cpus: None,
+            pids_limit: None,
+            image_command: false,
+            command: Vec::new(),
+            remove: false,
+            health: Default::default(),
+            tuning: Default::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1710,6 +1782,7 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
             limits: &record.limits,
             remove_on_exit: record.remove_on_exit,
             tuning: &record.tuning,
+            api_socket: record.takes_api_socket(),
         },
     )?;
     let running = state.active == "active";
@@ -2082,6 +2155,34 @@ pub struct LogsRequest {
     /// The journald namespace the machine writes to (--log-driver local), read together
     /// with the system's journal, which holds what it wrote before and systemd's lines.
     pub namespace: Option<String>,
+    /// journalctl's JSON entries instead of text, for whoever needs each line's time.
+    pub json: bool,
+}
+
+/// What a logs request needs from the machine's record: refused when its output was
+/// dropped, its journal namespace, and the start at its creation. A name without a record
+/// is read as it is.
+pub async fn prepare_logs(ctx: &Context, request: &mut LogsRequest) -> Result<()> {
+    let Some(record) = ctx.store.load_image(&request.machine)? else {
+        return Ok(());
+    };
+    check_logs_kept(&record, request.inside)?;
+    if let Some(namespace) = record.tuning.journal_namespace() {
+        if let Ok(sd) = ctx.sd().await {
+            // Its files must exist for journalctl to read them.
+            let _ = crate::api::run::ensure_journal_namespace(sd, namespace).await;
+        }
+        request.namespace = Some(namespace.to_string());
+    }
+    let created = record.created;
+    let mut moved = std::mem::take(request);
+    moved = tokio::task::spawn_blocking(move || {
+        from_creation(&mut moved, created, journal_time_before);
+        moved
+    })
+    .await?;
+    *request = moved;
+    Ok(())
 }
 
 const FOLLOW_TAIL: u32 = 10;
@@ -2157,7 +2258,13 @@ pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
         "--quiet".to_string(),
         "--all".to_string(),
     ];
-    let output = if args.timestamps { "short-iso" } else { "cat" };
+    let output = if args.json {
+        "json"
+    } else if args.timestamps {
+        "short-iso"
+    } else {
+        "cat"
+    };
     if args.inside {
         argv.push(format!("--machine={}", args.machine));
         argv.push(format!("--output={output}"));
@@ -2548,6 +2655,7 @@ mod tests {
             all: true,
             inside: false,
             namespace: None,
+            json: false,
         };
         assert_eq!(
             journalctl_arguments(&full),

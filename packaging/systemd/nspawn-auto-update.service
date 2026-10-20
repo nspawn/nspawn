@@ -1,0 +1,9 @@
+[Unit]
+Description=Update the nspawn machines labelled org.nspawn.auto-update
+Documentation=https://github.com/nspawn/nspawn
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nspawn auto-update

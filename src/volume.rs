@@ -207,9 +207,18 @@ pub struct Volume {
     pub read_only: bool,
 }
 
+/// Where docker's clients look for its socket; a machine that mounts either from the host
+/// gets nspawn's Docker API there.
+pub const DOCKER_SOCKETS: [&str; 2] = ["/var/run/docker.sock", "/run/docker.sock"];
+
 impl Volume {
     pub fn is_named(&self) -> bool {
         !self.source.starts_with('/')
+    }
+
+    /// A bind of docker's socket, which becomes the machine's Docker API socket.
+    pub fn is_api_socket(&self) -> bool {
+        DOCKER_SOCKETS.contains(&self.source.as_str())
     }
 
     /// Where the volume lives on the host.

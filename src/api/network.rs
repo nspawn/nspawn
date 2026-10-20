@@ -641,11 +641,12 @@ pub async fn remove_ended(ctx: &Context) -> Result<()> {
 }
 
 /// What every event of a network says of it.
-fn network_attributes(spec: &NetSpec) -> [(&'static str, String); 3] {
+fn network_attributes(spec: &NetSpec) -> [(&'static str, String); 4] {
     [
         ("subnet", spec.subnet.to_string()),
         ("interface", spec.interface.clone()),
         ("internal", spec.internal.to_string()),
+        ("created", spec.created.to_string()),
     ]
 }
 

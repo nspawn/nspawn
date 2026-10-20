@@ -86,6 +86,7 @@ pub trait Manager {
     fn create_volume(&self, name: &str) -> zbus::Result<String>;
     fn remove_volumes(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
     fn prune_volumes(&self) -> zbus::Result<OwnedObjectPath>;
+    fn auto_update(&self, names: &[String], options: Options<'_>) -> zbus::Result<OwnedObjectPath>;
     fn start_machine(
         &self,
         name: &str,
@@ -292,6 +293,19 @@ fn gone(signal: &zbus::fdo::NameOwnerChanged) -> bool {
 pub struct Client {
     pub connection: zbus::Connection,
     pub manager: ManagerProxy<'static>,
+}
+
+/// KillMachine for a caller that is no client of its own (the Docker API's kill).
+pub async fn kill_machine(name: &str, signal: &str) -> Result<()> {
+    let client = Client::connect().await?;
+    let mut options = Options::new();
+    options.insert("signal", zbus::zvariant::Value::from(signal));
+    client
+        .manager
+        .kill_machine(name, options)
+        .await
+        .map_err(error)?;
+    Ok(())
 }
 
 impl Client {

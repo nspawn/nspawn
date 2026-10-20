@@ -27,6 +27,10 @@ pub struct ImageRecord {
     pub name: String,
     pub reference: String,
     pub manifest_digest: String,
+    /// The index the reference named when it was pulled, if it named one: what the
+    /// registry answers for the tag, which auto-update compares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_digest: Option<String>,
     pub layers: Vec<String>,
     pub backend: BackendChoice,
     pub created: u64,
@@ -149,6 +153,11 @@ impl ImageRecord {
     /// signals its own way.
     pub fn under_stub_init(&self) -> bool {
         self.mode == Mode::App && !self.program_is_pid1()
+    }
+
+    /// Whether it mounts docker's socket, and so gets nspawn's Docker API.
+    pub fn takes_api_socket(&self) -> bool {
+        self.volumes.iter().any(Volume::is_api_socket)
     }
 
     /// The image's labels with the ones given to this machine on top.
@@ -307,7 +316,7 @@ impl Store {
     /// Root's alone: layers hold setuid programs and device nodes that would work for any
     /// local user reaching them, records hold the machines' environment, volumes and
     /// builds their data.
-    fn private_dirs(&self) -> [PathBuf; 11] {
+    fn private_dirs(&self) -> [PathBuf; 12] {
         [
             self.layers_dir(Ownership::Root),
             self.layers_dir(Ownership::Foreign),
@@ -320,7 +329,70 @@ impl Store {
             self.root.join("starting"),
             self.networks_dir(),
             self.secrets_dir(),
+            self.root.join("rollback"),
         ]
+    }
+
+    /// Where auto-update keeps a machine's previous record, manifest and writable layer
+    /// until its new image has proved itself.
+    pub fn rollback_dir(&self, name: &str) -> PathBuf {
+        self.root.join("rollback").join(name)
+    }
+
+    /// Keeps `record` and its manifest's bytes for a rollback.
+    pub fn save_rollback(&self, record: &ImageRecord, manifest: &[u8]) -> Result<()> {
+        let dir = self.rollback_dir(&record.name);
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        restrict(&dir, PRIVATE)?;
+        write_atomically(&dir.join("manifest.json"), manifest)?;
+        let json = serde_json::to_vec_pretty(record)?;
+        write_atomically(&dir.join("record.json"), &json)
+    }
+
+    /// The record and manifest kept for a rollback of `name`, if any.
+    pub fn load_rollback(&self, name: &str) -> Result<Option<(ImageRecord, Vec<u8>)>> {
+        let dir = self.rollback_dir(name);
+        let record = match fs::read(dir.join("record.json")) {
+            Ok(bytes) => serde_json::from_slice::<ImageRecord>(&bytes)
+                .with_context(|| format!("parsing {}", dir.join("record.json").display()))?
+                .normalize(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+        };
+        let manifest = fs::read(dir.join("manifest.json"))
+            .with_context(|| format!("reading {}", dir.join("manifest.json").display()))?;
+        Ok(Some((record, manifest)))
+    }
+
+    pub fn forget_rollback(&self, name: &str) -> Result<()> {
+        let dir = self.rollback_dir(name);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("removing {}", dir.display())),
+        }
+    }
+
+    /// The names with a rollback kept.
+    pub fn rollbacks(&self) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(self.root.join("rollback")) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .collect()
+    }
+
+    /// The records a rollback keeps, whose layers and blobs stay until it is decided.
+    fn rollback_records(&self) -> Result<Vec<(ImageRecord, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for name in self.rollbacks() {
+            if let Some(kept) = self.load_rollback(&name)? {
+                out.push(kept);
+            }
+        }
+        Ok(out)
     }
 
     /// Gives what exists below the state directory the modes of the table. The state
@@ -624,6 +696,17 @@ impl Store {
                 })?;
             set.insert(layer_dir_name(&manifest.config.digest));
         }
+        for (record, bytes) in self.rollback_records()? {
+            set.extend(record.layers.iter().map(|l| layer_dir_name(l)));
+            let manifest = serde_json::from_slice::<oci_client::manifest::OciImageManifest>(&bytes)
+                .with_context(|| {
+                    format!(
+                        "the manifest kept for a rollback of {} cannot be read",
+                        record.name
+                    )
+                })?;
+            set.insert(layer_dir_name(&manifest.config.digest));
+        }
         Ok(set)
     }
 
@@ -808,7 +891,8 @@ impl Store {
     /// and flat machines none at all. Returns the digests removed.
     pub fn gc_layers(&self) -> Result<Vec<String>> {
         let mut referenced: HashMap<Ownership, HashSet<String>> = HashMap::new();
-        for record in self.list_images_strict()? {
+        let kept = self.rollback_records()?.into_iter().map(|(r, _)| r);
+        for record in self.list_images_strict()?.into_iter().chain(kept) {
             let ownership = match record.backend {
                 BackendChoice::Overlay => Ownership::Root,
                 BackendChoice::Mstack => Ownership::Foreign,
@@ -1666,6 +1750,7 @@ mod tests {
             name: "fedora-44".into(),
             reference: "hub/fedora:44".into(),
             manifest_digest: "sha256:m".into(),
+            index_digest: None,
             layers: vec!["sha256:aaa".into()],
             backend: BackendChoice::Overlay,
             created: 1,
@@ -1741,6 +1826,7 @@ mod tests {
             name: "img".into(),
             reference: "hub.example/img:1".into(),
             manifest_digest: "sha256:m".into(),
+            index_digest: None,
             layers: vec!["sha256:lay".into()],
             backend: BackendChoice::Flat,
             created: 1,
@@ -1950,6 +2036,7 @@ mod tests {
             name: name.into(),
             reference: "hub/x:1".into(),
             manifest_digest: "sha256:m".into(),
+            index_digest: None,
             layers: vec!["sha256:shared".into()],
             backend,
             created: 1,

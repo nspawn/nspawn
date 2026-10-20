@@ -16,6 +16,7 @@ mod completion;
 mod compose;
 mod config;
 mod daemon;
+mod dockerapi;
 mod getent;
 mod health;
 mod hostnet;

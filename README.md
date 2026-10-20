@@ -62,8 +62,16 @@ requirements, building from source and usage examples.
 
 - **Two kinds of machine.** An image that ships systemd boots like `machinectl start`
   does. Any other image, for example anything from Docker Hub, runs as an app: its
-  entrypoint under a stub init, with the environment, user, working directory and
-  stop signal of its OCI config. Both take the same flags and join the same networks.
+  entrypoint under a stub init, or as PID 1 when it brings a supervisor of its own
+  (s6-overlay, as linuxserver.io's images and Home Assistant's), with the environment,
+  user, working directory and stop signal of its OCI config. Both take the same flags
+  and join the same networks.
+- **docker's socket for the tools that read it.** A machine that mounts
+  `/var/run/docker.sock` gets a read-only Docker API there, so reverse proxies that
+  route by labels (caddy-docker-proxy, Traefik, nginx-proxy) and dashboards find the
+  machines as containers; `auto-update` gives labelled machines the image their tag
+  names now and puts them back when the new one does not come up, with a timer to run
+  it daily.
 - **docker's flags and semantics.** `run`, `create` and `start` take `-e`, `-v`, `-p`,
   `--restart`, `-m`, `--cpus`, `--pids-limit`, the `--health-*` flags, `--secret`,
   `--label`, `--hostname`, `-u`, `-w`, `--cap-add`, `--cap-drop`, `--privileged`,

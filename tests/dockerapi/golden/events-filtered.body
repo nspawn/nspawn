@@ -1,0 +1,1 @@
+{"status":"die","id":"5279044992e277c698040a1f473f9e3abf265a3abc25de5cf343ed47daf784bc","from":"busybox:1.37","Type":"container","Action":"die","Actor":{"ID":"5279044992e277c698040a1f473f9e3abf265a3abc25de5cf343ed47daf784bc","Attributes":{"execDuration":"0","exitCode":"3","image":"busybox:1.37","name":"done"}},"scope":"local","time":1792344104,"timeNano":1792344104351691357}

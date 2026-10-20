@@ -3,6 +3,7 @@
 //! through a `Report`, what it found comes back as a value, and the command line and
 //! the D-Bus service are two clients of the same functions.
 
+pub mod autoupdate;
 pub mod build;
 pub mod copy;
 pub mod create;
@@ -17,6 +18,7 @@ pub mod names;
 pub mod network;
 pub mod pull;
 pub mod push;
+pub mod recreate;
 pub mod run;
 pub mod search;
 pub mod secrets;

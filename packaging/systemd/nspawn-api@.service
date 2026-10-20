@@ -1,0 +1,8 @@
+[Unit]
+Description=Docker API of nspawn for machine %i
+Documentation=https://github.com/nspawn/nspawn
+PartOf=nspawn-api@%i.socket
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/bin/nspawn api-serve %i

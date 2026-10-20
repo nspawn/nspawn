@@ -66,6 +66,10 @@ pub struct RunSpec {
     /// VOLUME of a Containerfile: paths the image expects a mount over.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<String>,
+    /// EXPOSE of a Containerfile, PORT/PROTOCOL: what the program listens on, which tools
+    /// reading the Docker API take as its port when nothing else names one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exposed_ports: Vec<String>,
 }
 
 impl RunSpec {
@@ -88,6 +92,7 @@ impl RunSpec {
         let spec = RunSpec {
             healthcheck: crate::health::Healthcheck::from_config(&raw),
             volumes,
+            exposed_ports: exposed_ports(&raw),
             entrypoint: config.entrypoint.unwrap_or_default(),
             cmd: config.cmd.unwrap_or_default(),
             command: Vec::new(),
@@ -99,6 +104,14 @@ impl RunSpec {
         };
         spec.check_plain()?;
         Ok(spec)
+    }
+
+    /// Its exposed ports, read from the config blob of the image's manifest: a record
+    /// written before they were kept has none of its own.
+    pub fn exposed_ports_of(config_blob: &[u8]) -> Vec<String> {
+        serde_json::from_slice(config_blob)
+            .map(|raw| exposed_ports(&raw))
+            .unwrap_or_default()
     }
 
     /// Refuses a config whose values carry control characters: they go into the
@@ -161,6 +174,31 @@ fn plain(field: &str, value: &str, quoted: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The keys of the config's ExposedPorts as PORT/PROTOCOL, sorted by port; anything
+/// else is left out.
+fn exposed_ports(raw: &serde_json::Value) -> Vec<String> {
+    let mut ports: Vec<(u16, String)> = raw
+        .get("config")
+        .and_then(|c| c.get("ExposedPorts"))
+        .and_then(serde_json::Value::as_object)
+        .map(|ports| {
+            ports
+                .keys()
+                .filter_map(|key| {
+                    let (port, protocol) = key.split_once('/').unwrap_or((key, "tcp"));
+                    let port: u16 = port.parse().ok().filter(|p| *p > 0)?;
+                    let protocol = protocol.to_ascii_lowercase();
+                    matches!(protocol.as_str(), "tcp" | "udp" | "sctp")
+                        .then(|| (port, format!("{port}/{protocol}")))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ports.sort();
+    ports.dedup();
+    ports.into_iter().map(|(_, p)| p).collect()
 }
 
 const INIT_PATHS: [&str; 4] = [
@@ -285,7 +323,8 @@ mod tests {
             "Env":["PATH=/usr/bin","NGINX_VERSION=1.27"],"WorkingDir":"/srv","User":"nginx","StopSignal":"SIGQUIT",
             "Labels":{"org.opencontainers.image.title":"nginx","maintainer":"someone"},
             "Healthcheck":{"Test":["CMD-SHELL","curl -f http://localhost/ || exit 1"],"Interval":30000000000,"Timeout":3000000000,"Retries":3},
-            "Volumes":{"/var/lib/data":{},"/cache":{}}}}"#;
+            "Volumes":{"/var/lib/data":{},"/cache":{}},
+            "ExposedPorts":{"443/tcp":{},"80":{},"53/UDP":{},"x/tcp":{},"0/tcp":{},"9/icmp":{}}}}"#;
         let spec = RunSpec::from_config(json).unwrap();
         assert_eq!(spec.entrypoint(), ["/docker-entrypoint.sh"]);
         assert_eq!(spec.cmd(), ["nginx", "-g", "daemon off;"]);
@@ -308,6 +347,8 @@ mod tests {
             (30_000_000, 3_000_000, 3)
         );
         assert_eq!(spec.volumes, ["/cache", "/var/lib/data"]);
+        // Docker takes a bare port as tcp; ports that are not ones are left out.
+        assert_eq!(spec.exposed_ports, ["53/udp", "80/tcp", "443/tcp"]);
         assert_eq!(
             spec.labels,
             BTreeMap::from([

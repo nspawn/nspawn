@@ -372,9 +372,9 @@ pub static ATTRIBUTES: &[Attribute] = &[
     full("services.*.tmpfs"),
     full("services.*.tty"),
     full("services.*.ulimits").and_below(),
-    refused(
+    partly(
         "services.*.use_api_socket",
-        "there is no Docker API socket to hand to a machine",
+        "nspawn's Docker API, which reads but does not change machines (a kill aside), and no registry credentials with it",
     ),
     partly("services.*.user", BOOTED),
     ignored(
