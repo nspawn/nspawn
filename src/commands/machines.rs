@@ -12,9 +12,9 @@ use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow, Signal};
 use zbus::zvariant::{OwnedObjectPath, Value};
 
 use crate::cli::{
-    AutoUpdateArgs, EventsArgs, ExecArgs, KillArgs, LogsArgs, ModeChoice, NamesArgs, PsArgs,
-    PullPolicy, RestartArgs, RunArgs, ShellArgs, StartArgs, StartOptions, StopArgs, TopArgs,
-    UpdateArgs,
+    AutoUpdateArgs, EventsArgs, ExecArgs, KillArgs, LogsArgs, ModeChoice, NamesArgs, PortArgs,
+    PsArgs, PullPolicy, RestartArgs, RunArgs, ShellArgs, StartArgs, StartOptions, StopArgs,
+    TopArgs, UpdateArgs, WaitArgs,
 };
 use crate::client::{self, Client, Dict, Ended, Options};
 use crate::config::Config;
@@ -25,11 +25,50 @@ use crate::store::now_unix;
 
 pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
     let now = now_unix();
-    let machines = client
+    let filters = crate::dockerapi::filters::Filters::from_pairs(&args.filters)
+        .map_err(|e| anyhow::anyhow!("{}", e.0))?;
+    filters
+        .only(PS_FILTERS)
+        .map_err(|e| anyhow::anyhow!("{}", e.0))?;
+    // A status or exit code asked for looks at stopped machines too, as docker's does.
+    let all = args.all || filters.values("status").is_some() || filters.values("exited").is_some();
+    let listed = client
         .manager
-        .list_machines(args.all)
+        .list_machines(all)
         .await
         .map_err(client::error)?;
+    let machines: Vec<Dict> = listed
+        .iter()
+        .filter(|m| ps_matches(&filters, m, &listed))
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        v.try_clone()
+                            .expect("plain values carry no file descriptor"),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    if args.quiet {
+        for m in &machines {
+            println!("{}", client::string(m, "name"));
+        }
+        return Ok(());
+    }
+    if let Some(format) = &args.format {
+        let rows: Vec<serde_json::Value> = machines.iter().map(|m| ps_row(m, now)).collect();
+        // docker's rows have a Label method; here the labels are a map to index.
+        let label_call =
+            regex::Regex::new(r#"\.Label\s+("(?:[^"\\]|\\.)*")"#).expect("a valid expression");
+        let format = label_call.replace_all(format, "(index .LabelsMap $1)");
+        let text = crate::gotemplate::format_list(&format, PS_TABLE, &ps_headers(), &rows)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        print!("{text}");
+        return Ok(());
+    }
     if args.output.json {
         client::print_json(&serde_json::Value::Array(
             machines.iter().map(client::dict_to_json).collect(),
@@ -71,6 +110,191 @@ pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
         )
     );
     Ok(())
+}
+
+/// The filters `ps` takes, as docker ps does.
+const PS_FILTERS: &[&str] = &[
+    "ancestor", "before", "expose", "exited", "health", "id", "is-task", "label", "name",
+    "network", "publish", "since", "status", "volume",
+];
+
+/// docker ps's default table, for --format table.
+const PS_TABLE: &str =
+    "table {{.Names}}\t{{.Image}}\t{{.Command}}\t{{.RunningFor}}\t{{.Status}}\t{{.Ports}}";
+
+/// docker's state word for a machine.
+fn docker_state(machine: &Dict) -> &'static str {
+    match client::string(machine, "state").as_str() {
+        "running" | "opening" | "closing" => "running",
+        "paused" => "paused",
+        "restarting" => "restarting",
+        "stopped" if machine.contains_key("exit_code") => "exited",
+        _ => "created",
+    }
+}
+
+fn exit_code(machine: &Dict) -> Option<i32> {
+    machine
+        .get("exit_code")
+        .and_then(|v| i32::try_from(v.clone()).ok())
+}
+
+fn ps_matches(filters: &crate::dockerapi::filters::Filters, m: &Dict, all: &[Dict]) -> bool {
+    let name = client::string(m, "name");
+    let json = client::dict_to_json(m);
+    let labels: std::collections::BTreeMap<String, String> = json["labels"]
+        .as_object()
+        .map(|l| {
+            l.iter()
+                .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let reference = client::string(m, "reference");
+    let familiar = crate::dockerapi::util::familiar(&reference);
+    let ports = client::strings(m, "ports");
+    let created_of = |n: &str| {
+        all.iter()
+            .find(|o| client::string(o, "name") == n)
+            .map(|o| client::u64(o, "created"))
+    };
+    let health = match client::string(m, "health").as_str() {
+        "" => "none".to_string(),
+        h => h.to_string(),
+    };
+    filters.exact("status", docker_state(m))
+        && filters.matches("name", &name)
+        && filters
+            .values("id")
+            .is_none_or(|ids| ids.iter().any(|i| name.starts_with(i.as_str())))
+        && filters.labels("label", &labels)
+        && filters.exact("health", &health)
+        && filters.values("exited").is_none_or(|codes| {
+            docker_state(m) == "exited"
+                && codes.iter().any(|c| c.parse::<i32>().ok() == exit_code(m))
+        })
+        && filters.values("network").is_none_or(|nets| {
+            client::strings(m, "networks")
+                .iter()
+                .any(|n| nets.contains(n))
+        })
+        && filters.values("ancestor").is_none_or(|images| {
+            images.iter().any(|i| {
+                *i == familiar || *i == reference || familiar.starts_with(&format!("{i}:"))
+            })
+        })
+        && filters.values("volume").is_none_or(|volumes| {
+            client::strings(m, "volumes")
+                .iter()
+                .any(|v| v.split(':').take(2).any(|part| volumes.contains(part)))
+        })
+        && filters.values("publish").is_none_or(|wanted| {
+            ports.iter().any(|p| {
+                let host = p.split("->").next().unwrap_or_default();
+                let port = host.rsplit(':').next().unwrap_or(host);
+                let proto = p.rsplit('/').next().unwrap_or("tcp");
+                wanted.contains(port) || wanted.contains(&format!("{port}/{proto}"))
+            })
+        })
+        && filters.values("expose").is_none_or(|wanted| {
+            ports.iter().any(|p| {
+                let inside = p.split("->").nth(1).unwrap_or_default();
+                wanted.contains(inside)
+                    || wanted.contains(inside.split('/').next().unwrap_or_default())
+            })
+        })
+        && !filters
+            .values("is-task")
+            .is_some_and(|v| v.contains("true"))
+        && filters.values("before").is_none_or(|before| {
+            before
+                .iter()
+                .all(|b| created_of(b).is_some_and(|c| client::u64(m, "created") < c))
+        })
+        && filters.values("since").is_none_or(|since| {
+            since
+                .iter()
+                .all(|s| created_of(s).is_some_and(|c| client::u64(m, "created") > c))
+        })
+}
+
+/// A machine with the fields of docker ps's --format, and nspawn's own.
+fn ps_row(m: &Dict, now: u64) -> serde_json::Value {
+    let json = client::dict_to_json(m);
+    let created = client::u64(m, "created");
+    let started = client::u64(m, "started");
+    let labels = json["labels"].clone();
+    let label_text = labels
+        .as_object()
+        .map(|l| {
+            l.iter()
+                .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default()))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    let command = if client::string(m, "mode") == "boot" {
+        "\"/sbin/init\"".to_string()
+    } else {
+        format!("\"{}\"", client::strings(m, "command").join(" "))
+    };
+    let state = docker_state(m);
+    let since = |t: u64| crate::dockerapi::util::human_duration(now.saturating_sub(t));
+    let status = match state {
+        "running" => match client::string(m, "health").as_str() {
+            "" => format!("Up {}", since(started)),
+            "starting" => format!("Up {} (health: starting)", since(started)),
+            h => format!("Up {} ({h})", since(started)),
+        },
+        "paused" => format!("Up {} (Paused)", since(started)),
+        "restarting" => "Restarting".to_string(),
+        "exited" => format!("Exited ({})", exit_code(m).unwrap_or(0)),
+        _ => "Created".to_string(),
+    };
+    let ports: Vec<String> = client::strings(m, "ports")
+        .iter()
+        .filter_map(|p| {
+            let (host, inside) = p.split_once("->")?;
+            let host = if host.contains(':') {
+                host.to_string()
+            } else {
+                format!("0.0.0.0:{host}")
+            };
+            Some(format!("{host}->{inside}"))
+        })
+        .collect();
+    serde_json::json!({
+        "ID": client::string(m, "name"),
+        "Names": client::string(m, "name"),
+        "Image": crate::dockerapi::util::familiar(&client::string(m, "reference")),
+        "Command": command,
+        "CreatedAt": crate::dockerapi::util::rfc3339_nano(created * 1_000_000, false),
+        "RunningFor": format!("{} ago", since(created)),
+        "Ports": ports.join(", "),
+        "State": state,
+        "Status": status,
+        "Size": "",
+        "Labels": label_text,
+        "LabelsMap": labels,
+        "Mounts": client::strings(m, "volumes").iter().map(|v| v.split(':').next().unwrap_or_default().to_string()).collect::<Vec<_>>().join(","),
+        "Networks": client::strings(m, "networks").join(","),
+        "LocalVolumes": client::strings(m, "volumes").iter().filter(|v| !v.starts_with('/')).count().to_string(),
+        "Mode": client::string(m, "mode"),
+        "Address": client::string(m, "address"),
+        "OS": client::string(m, "os"),
+        "Pid": client::u64(m, "leader"),
+    })
+}
+
+/// The header of each field in a --format table, as docker names its columns.
+fn ps_headers() -> serde_json::Value {
+    serde_json::json!({
+        "ID": "CONTAINER ID", "Names": "NAMES", "Image": "IMAGE", "Command": "COMMAND",
+        "CreatedAt": "CREATED AT", "RunningFor": "CREATED", "Ports": "PORTS", "State": "STATE",
+        "Status": "STATUS", "Size": "SIZE", "Labels": "LABELS", "Mounts": "MOUNTS",
+        "Networks": "NETWORKS", "LocalVolumes": "LOCAL VOLUMES", "Mode": "MODE",
+        "Address": "ADDRESS", "OS": "OS", "Pid": "PID",
+    })
 }
 
 /// The state, and the healthcheck's verdict next to it.
@@ -143,7 +367,13 @@ pub async fn start(args: StartArgs, client: &Client) -> Result<()> {
 }
 
 /// The options of a StartMachine call from what start or run was given.
-fn start_options(args: StartOptions, command: Vec<String>) -> Result<Options<'static>> {
+fn start_options(mut args: StartOptions, command: Vec<String>) -> Result<Options<'static>> {
+    // --mount is -v or --tmpfs written out; the files come before the flags, which win.
+    let (mounted, tmpfs) = crate::mountopt::split(&args.mount)?;
+    args.volume.extend(mounted);
+    args.tuning.tmpfs.extend(tmpfs);
+    args.env = crate::kvfile::env_with_files(&args.env_file, &args.env)?;
+    args.label = crate::kvfile::labels_with_files(&args.label_file, &args.label)?;
     let mut options = Options::new();
     options.insert("wait", Value::from(args.wait));
     if !args.network.is_empty() {
@@ -151,6 +381,9 @@ fn start_options(args: StartOptions, command: Vec<String>) -> Result<Options<'st
     }
     if !args.network_alias.is_empty() {
         options.insert("aliases", Value::from(args.network_alias));
+    }
+    if !args.ip.is_empty() {
+        options.insert("addresses", Value::from(args.ip));
     }
     if !args.publish.is_empty() {
         options.insert("publish", Value::from(args.publish));
@@ -693,6 +926,121 @@ pub async fn top(args: TopArgs, client: &Client) -> Result<()> {
     Ok(())
 }
 
+/// wait: each machine's exit code once it has stopped, in the order named; a name that
+/// is no machine is an error for the end, as docker reports it.
+pub async fn wait(args: WaitArgs, client: &Client) -> Result<()> {
+    let mut failed = Vec::new();
+    for name in &args.names {
+        loop {
+            match client.manager.get_machine(name).await {
+                Ok(machine) => {
+                    if client::string(&machine, "state") == "stopped" {
+                        let code = machine
+                            .get("exit_code")
+                            .and_then(|v| i32::try_from(v.clone()).ok())
+                            .unwrap_or(0);
+                        println!("{code}");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    failed.push(format!("{:#}", client::error(e)));
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+    if !failed.is_empty() {
+        bail!("{}", failed.join("\n"));
+    }
+    Ok(())
+}
+
+/// port: PORT/PROTO -> HOST:PORT for each published port of a running machine, in
+/// natural order, or the host's end of one port.
+pub async fn port(args: PortArgs, client: &Client) -> Result<()> {
+    let machine = client
+        .manager
+        .get_machine(&args.name)
+        .await
+        .map_err(client::error)?;
+    let running = client::string(&machine, "state") != "stopped";
+    // "[IP:]HOST->CONTAINER/PROTO", as the service writes them.
+    let published: Vec<(String, String)> = if running {
+        client::strings(&machine, "ports")
+            .iter()
+            .filter_map(|p| {
+                let (host, container) = p.split_once("->")?;
+                let host = if host.contains(':') {
+                    host.to_string()
+                } else {
+                    format!("0.0.0.0:{host}")
+                };
+                Some((container.to_string(), host))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut out: Vec<String> = match &args.port {
+        Some(wanted) => {
+            let key = if wanted.contains('/') {
+                wanted.clone()
+            } else {
+                format!("{wanted}/tcp")
+            };
+            let hosts: Vec<String> = published
+                .iter()
+                .filter(|(c, _)| *c == key)
+                .map(|(_, h)| h.clone())
+                .collect();
+            if hosts.is_empty() {
+                bail!("no public port '{wanted}' published for {}", args.name);
+            }
+            hosts
+        }
+        None => published
+            .iter()
+            .map(|(c, h)| format!("{c} -> {h}"))
+            .collect(),
+    };
+    out.sort_by(|a, b| natural_order(a, b));
+    for line in out {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Digits compared as numbers, as docker sorts port lines.
+fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
+    let split = |s: &str| -> Vec<(bool, String)> {
+        let mut parts: Vec<(bool, String)> = Vec::new();
+        for c in s.chars() {
+            let digit = c.is_ascii_digit();
+            match parts.last_mut() {
+                Some((d, part)) if *d == digit => part.push(c),
+                _ => parts.push((digit, c.to_string())),
+            }
+        }
+        parts
+    };
+    let (pa, pb) = (split(a), split(b));
+    for (x, y) in pa.iter().zip(&pb) {
+        let ordering = match (x.0, y.0) {
+            (true, true) => {
+                let (nx, ny) = (x.1.trim_start_matches('0'), y.1.trim_start_matches('0'));
+                nx.len().cmp(&ny.len()).then_with(|| nx.cmp(ny))
+            }
+            _ => x.1.cmp(&y.1),
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    pa.len().cmp(&pb.len())
+}
+
 /// auto-update: podman's table, the reasons on standard error; fails when a machine
 /// failed or went back to its old image, so that the timer's unit says so.
 pub async fn auto_update(args: AutoUpdateArgs, client: &Client) -> Result<()> {
@@ -1157,6 +1505,26 @@ fn pump_prefixed(streams: Vec<(String, OwnedFd, OwnedFd)>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ports_in_natural_order() {
+        let mut lines = vec![
+            "9000/tcp -> 0.0.0.0:9000",
+            "80/tcp -> 0.0.0.0:8080",
+            "443/tcp -> 127.0.0.1:443",
+            "80/udp -> 0.0.0.0:8080",
+        ];
+        lines.sort_by(|a, b| natural_order(a, b));
+        assert_eq!(
+            lines,
+            [
+                "80/tcp -> 0.0.0.0:8080",
+                "80/udp -> 0.0.0.0:8080",
+                "443/tcp -> 127.0.0.1:443",
+                "9000/tcp -> 0.0.0.0:9000"
+            ]
+        );
+    }
 
     /// A machine with every flag `generate` knows, and the same machine before any.
     fn generated_pair() -> (crate::store::ImageRecord, crate::store::ImageRecord) {

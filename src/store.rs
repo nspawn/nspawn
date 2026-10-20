@@ -43,6 +43,9 @@ pub struct ImageRecord {
     /// An app whose image wants its program to be PID 1 (s6-overlay), found at install.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pid1: bool,
+    /// When it first started, in unix seconds: a record that never did is an image only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<u64>,
     /// The OCI config's command, environment and the rest.
     #[serde(default)]
     pub run: RunSpec,
@@ -1757,6 +1760,7 @@ mod tests {
             origin: "pull".into(),
             mode: Mode::Boot,
             pid1: false,
+            started: None,
             run: RunSpec::default(),
             network: Network::Veth,
             network_name: None,
@@ -1833,6 +1837,7 @@ mod tests {
             origin: "build".into(),
             mode: Mode::App,
             pid1: false,
+            started: None,
             run: RunSpec::default(),
             network: Network::Host,
             network_name: None,
@@ -2043,6 +2048,7 @@ mod tests {
             origin: "pull".into(),
             mode: Mode::Boot,
             pid1: false,
+            started: None,
             run: RunSpec::default(),
             network: Network::Bridge,
             network_name: None,

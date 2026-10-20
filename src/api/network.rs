@@ -246,6 +246,169 @@ pub fn validate_network_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// A network's event about a machine joining or leaving it: the network's metadata, and
+/// which machine of the name.
+fn emit_membership(action: &str, net: &NetSpec, record: &ImageRecord) {
+    let mut attributes = network_attributes(net).to_vec();
+    attributes.push(("container", record.name.clone()));
+    attributes.push(("container_created", record.created.to_string()));
+    crate::api::events::emit("network", action, &net.name, &borrowed(&attributes));
+}
+
+/// What a machine on host networking, sharing another's, without a network or on veth
+/// cannot do, in docker's words where it has them.
+fn joins_bridges(record: &ImageRecord, what: &str) -> Result<()> {
+    if record.network == Network::Host {
+        bail!("container cannot be disconnected from host network or connected to host network");
+    }
+    if record.network_container.is_some() {
+        bail!("container sharing network namespace with another container or host cannot be {what} any other network");
+    }
+    if record.no_network {
+        bail!("container cannot be {what} multiple networks with one of the networks in private (none) mode");
+    }
+    if record.network == Network::Veth {
+        bail!(
+            "{} has a veth of its own (--network veth), outside every bridge network",
+            record.name
+        );
+    }
+    if record.backend == BackendChoice::Mstack {
+        bail!("{} runs under managed user namespaces (mstack), whose interfaces systemd makes; it cannot join a network while it runs", record.name);
+    }
+    Ok(())
+}
+
+/// network connect: the machine joins `network` with `aliases` and, when given, a fixed
+/// address on it; a running one at once, with an interface of its own (its default
+/// route stays where it is), and from its next start as any other network it joins.
+pub async fn connect(
+    ctx: &Context,
+    network: &str,
+    machine: &str,
+    aliases: &[String],
+    address: Option<Ipv4Addr>,
+    report: Report<'_>,
+) -> Result<()> {
+    require_root("network connect")?;
+    let (store, config, sd) = (&ctx.store, &ctx.config, ctx.sd().await?);
+    let net =
+        find(store, config, network).map_err(|_| anyhow::anyhow!("network {network} not found"))?;
+    let _lock = store.lock().await?;
+    let mut record = store
+        .load_image(machine)?
+        .ok_or_else(|| anyhow::anyhow!("No such container: {machine}"))?;
+    joins_bridges(&record, "connected to")?;
+    if bridge::networks_of(&record).contains(&network) {
+        bail!("endpoint with name {machine} already exists in network {network}");
+    }
+    for alias in aliases {
+        validate_alias(alias)?;
+    }
+    if let Some(addr) = address {
+        bridge::check_requested(store, &net, machine, addr)?;
+    }
+    let running = sd.machine_exists(machine).await?;
+    let addr = match address {
+        Some(addr) => addr,
+        None if running => {
+            let used: Vec<Ipv4Addr> = store
+                .list_images_strict()?
+                .iter()
+                .filter_map(|r| bridge::address_on(r, network))
+                .collect();
+            net.subnet.allocate(&used)?
+        }
+        // A stopped machine gets one at its next start.
+        None => Ipv4Addr::UNSPECIFIED,
+    };
+    record.extra_networks.push(crate::bridge::Attachment {
+        network: network.to_string(),
+        address: (!addr.is_unspecified()).then_some(addr),
+    });
+    if !aliases.is_empty() {
+        let list = record.aliases.entry(network.to_string()).or_default();
+        for alias in aliases {
+            if !list.contains(alias) {
+                list.push(alias.clone());
+            }
+        }
+    }
+    if running {
+        let all = all(store, config)?;
+        bridge::up(&net, &all, sd, report).await?;
+        let leader = sd.machine_leader(machine).await?;
+        let inside = bridge::connect_live(machine, leader, record.mode == Mode::App, &net, addr)?;
+        line(report, format!("{machine}: {inside} on {network}, {addr}"));
+    }
+    store.record_image(&record)?;
+    bridge::write_hosts_files(store, &all(store, config)?)?;
+    emit_membership("connect", &net, &record);
+    Ok(())
+}
+
+/// network disconnect: the machine leaves `network`, at once when it runs. Its primary
+/// network handed over to the next one it joins; the only one it cannot leave.
+pub async fn disconnect(
+    ctx: &Context,
+    network: &str,
+    machine: &str,
+    force: bool,
+    report: Report<'_>,
+) -> Result<()> {
+    require_root("network disconnect")?;
+    let (store, config, sd) = (&ctx.store, &ctx.config, ctx.sd().await?);
+    let net =
+        find(store, config, network).map_err(|_| anyhow::anyhow!("network {network} not found"))?;
+    let _lock = store.lock().await?;
+    let Some(mut record) = store.load_image(machine)? else {
+        if force {
+            return Ok(());
+        }
+        bail!("No such container: {machine}");
+    };
+    joins_bridges(&record, "disconnected from")?;
+    let networks: Vec<String> = bridge::networks_of(&record)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if !networks.iter().any(|n| n == network) {
+        if force {
+            return Ok(());
+        }
+        bail!("container {machine} is not connected to network {network}");
+    }
+    if networks.len() == 1 {
+        bail!("{network} is the only network of {machine}: nspawn network connect another one first, or start it with --network none");
+    }
+    if networks[0] == network {
+        // The next network becomes the primary one, with its address.
+        let next = record.extra_networks.remove(0);
+        record.network_name =
+            (next.network != bridge::DEFAULT_NETWORK).then(|| next.network.clone());
+        record.address = next.address;
+        if !record.ports.is_empty() {
+            line(
+                report,
+                format!(
+                    "note: the ports of {machine} go to its address on {} from its next start",
+                    next.network
+                ),
+            );
+        }
+    } else {
+        record.extra_networks.retain(|a| a.network != network);
+    }
+    record.aliases.remove(network);
+    if sd.machine_exists(machine).await? && bridge::disconnect_live(machine, &net)? {
+        line(report, format!("{machine}: left {network}"));
+    }
+    store.record_image(&record)?;
+    bridge::write_hosts_files(store, &all(store, config)?)?;
+    emit_membership("disconnect", &net, &record);
+    Ok(())
+}
+
 /// Brings up every network, for boot-time setup and troubleshooting (start brings up its
 /// machine's own). Returns the default network and the names of all.
 pub async fn up(ctx: &Context, report: Report<'_>) -> Result<(BridgeInfo, Vec<String>)> {

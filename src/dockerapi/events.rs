@@ -109,11 +109,22 @@ pub fn translate(event: &Event, networks: &[(String, String)]) -> Vec<Value> {
             let action = match event.action.as_str() {
                 "create" => "create",
                 "remove" => "destroy",
+                "connect" => "connect",
+                "disconnect" => "disconnect",
                 _ => return Vec::new(),
             };
             let mut attributes = Map::new();
             attributes.insert("name".into(), json!(event.name));
             attributes.insert("type".into(), json!("bridge"));
+            if let (Some(machine), Some(created)) = (
+                event.attributes.get("container"),
+                event
+                    .attributes
+                    .get("container_created")
+                    .and_then(|c| c.parse::<u64>().ok()),
+            ) {
+                attributes.insert("container".into(), json!(container_id(machine, created)));
+            }
             let created = event
                 .attributes
                 .get("created")

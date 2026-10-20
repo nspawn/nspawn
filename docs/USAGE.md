@@ -153,6 +153,18 @@ command, and then only once they are gone.
 
 ### The other flags of docker run
 
+`--env-file FILE` and `--label-file FILE` read variables and labels from files of
+KEY=VALUE lines as docker reads them (no quoting, no expansion, `#` comments, a KEY
+alone copied from here for a variable and left out for a label), before the `-e` and
+`--label` that follow and win. `--mount type=bind|volume|tmpfs,source=...,target=...`
+is the long form of `-v` and `--tmpfs` (`readonly`, `tmpfs-size`, `tmpfs-mode`; a
+volume needs its name, since nspawn has no anonymous volumes, and image, cluster or
+npipe mounts, `volume-subpath` and driver options are refused). `--ip ADDRESS` fixes the
+address on the primary network, `--ip NETWORK=ADDRESS` on another one: a network made
+with `network create` (docker refuses it on its default network too), inside its
+subnet, and nobody else's address there, or the start or create is refused as docker
+words it.
+
 The other flags of `docker run` are there too, remembered like the rest: `--hostname`,
 `-u/--user USER[:GROUP]` and `-w/--workdir` (instead of the image's; the user is
 resolved from the image's passwd and group files by a stand-in for getent that nspawn
@@ -306,7 +318,9 @@ kills at once. `restart` is a stop and a start with the remembered options, `pau
 `unpause` freeze and thaw a machine's cgroup like docker pause (`ps` shows it paused),
 `top` lists a machine's processes, and `inspect` of a stopped machine shows the exit code
 of its last run. Stopping a machine that already ended is not an error: it only drops what
-the machine left behind.
+the machine left behind. `wait NAME...` waits for machines to stop and prints each one's
+exit code, and `port NAME [PORT[/PROTO]]` the ports a running machine publishes
+(`80/tcp -> 0.0.0.0:8080`), as docker's do.
 
 ### The unit hooks
 
@@ -396,6 +410,30 @@ service answered instead of a table, and `nspawn inspect NAME...` prints the who
 record of machines or images (running or not) as a JSON array, like docker inspect:
 what a script or an agent reads. The keys are the ones of the D-Bus interface (see
 [DBUS.md](DBUS.md)), so the command line and the bus never disagree.
+
+`ps` also takes docker's scripting flags: `-q` prints the names alone (where docker
+prints IDs), `--filter KEY=VALUE` keeps the machines that match (`name` (a regular
+expression), `label`, `status`, `network`, `ancestor`, `health`, `exited`, `volume`,
+`publish`, `expose`, `id`, `before`, `since`; the same key twice matches either value,
+different keys all), and `--format` takes a Go template over docker's fields (`.Names`,
+`.Image`, `.Command`, `.CreatedAt`, `.RunningFor`, `.Ports`, `.State`, `.Status`,
+`.Labels`, `.Label "KEY"`, `.Mounts`, `.Networks`) and nspawn's (`.Mode`, `.Address`,
+`.OS`, `.Pid`), `table TEMPLATE` for aligned columns with headers, or `json` for a
+JSON object per line. `inspect -f TEMPLATE` prints a template over each object, a line
+each, as docker inspect -f does, over the keys inspect prints (`{{.state}}`,
+`{{json .labels}}`, `{{index .addresses "front"}}`); the templates are Go's
+text/template, with docker's functions (`json`, `join`, `split`, `lower`, `upper`,
+`title`, `pad`, `truncate`).
+
+`system df` is docker's: images, machines (containers), volumes and build cache, with
+what each takes and what a prune would give back (`-v` for each of them, `--json`).
+Records are images and machines both here: an image is a record pulled or built and
+never started, anything else a machine. `images prune -a` removes the images no machine
+was made from; without `-a` it removes the dangling ones, which nspawn's store never has
+(a tag pulled or built again replaces its record). `system prune` removes stopped
+machines and networks no machine uses, and with `-a` the images no machine was made
+from; `--filter label=...` and `until=...` narrow what goes, and `-f` skips the
+question.
 
 ## Compose
 
@@ -550,6 +588,16 @@ with docker. `-p`, `--network-alias`, `--dns`, `--dns-search`, `--add-host` and
 `--sysctl` are refused on such a machine, since they shape a network of its own, and
 so is a booted image, whose systemd would configure the shared interfaces again. `ps`
 and `inspect` show it as `container:NAME`.
+
+`network connect [--alias NAME] [--ip ADDRESS] NETWORK MACHINE` and `network disconnect
+NETWORK MACHINE` change the networks a machine joins, like docker's: a running app or
+booted machine gets an interface on the network at once (`hostN`, with its address; its
+default route stays where it was) and loses it at once, and from its next start the
+network is one of those it joins as `--network` would have made it. A machine on host
+networking, on veth, sharing another's or without a network, and an mstack machine,
+cannot; nor can a machine leave the only network it has (connect another one first, or
+start it with `--network none`). Leaving the primary network makes the next one primary,
+where its published ports go from its next start.
 
 ### App machines
 

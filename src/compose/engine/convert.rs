@@ -219,12 +219,21 @@ fn network(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
     }
     let mut names = Vec::new();
     let mut aliases = Vec::new();
+    let mut addresses = Vec::new();
     let container_name = s(service, "container_name");
     for (key, opts) in service_networks(service) {
         let name = network_name(project, &key);
+        // A one-off machine runs beside the service's own, whose fixed address it
+        // cannot take as well.
         if spec.oneoff {
             names.push(name);
             continue;
+        }
+        if let Some(opts) = &opts {
+            let ip = s(opts, "ipv4_address");
+            if !ip.is_empty() {
+                addresses.push(format!("{name}={ip}"));
+            }
         }
         let mut own = vec![spec.service.to_string()];
         // container_name stays a name on the service's networks where the machine's
@@ -245,6 +254,7 @@ fn network(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
     }
     put_list(&mut made.options, "networks", names);
     put_list(&mut made.options, "aliases", aliases);
+    put_list(&mut made.options, "addresses", addresses);
     Ok(())
 }
 

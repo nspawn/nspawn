@@ -265,10 +265,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
         "services.*.networks.*.interface_name",
         "nspawn names the interfaces of a machine host0, host1 and on",
     ),
-    refused(
-        "services.*.networks.*.ipv4_address",
-        "a machine takes the next free address of a network; a fixed one is not supported",
-    ),
+    full("services.*.networks.*.ipv4_address"),
     ignored(
         "services.*.networks.*.ipv6_address",
         "nspawn networks are IPv4 only",

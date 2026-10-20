@@ -269,6 +269,7 @@ mod tests {
                 origin: "pull".into(),
                 mode: Mode::App,
                 pid1: false,
+                started: None,
                 run: RunSpec::default(),
                 network: Network::Host,
                 network_name: None,

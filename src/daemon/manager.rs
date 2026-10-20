@@ -177,7 +177,7 @@ async fn caller_gone(connection: zbus::Connection, name: Option<String>) {
 }
 
 /// What StartMachine and RunMachine are asked: wait (b, default `wait`), network (s) or
-/// networks (as), aliases (as), publish (as), entrypoint (s), env (as), volume (as),
+/// networks (as), aliases (as), addresses (as, IP or NETWORK=IP), publish (as), entrypoint (s), env (as), volume (as),
 /// label (as), restart (s), memory (t), memory_swap (x), cpus (d), pids_limit (t),
 /// image_command (b), command (as), remove (b), and the flags of `health_overrides` and `tuning_overrides`.
 pub(crate) fn start_request(
@@ -190,6 +190,7 @@ pub(crate) fn start_request(
         wait: options.bool("wait", wait)?,
         network: network_choice(options.string("network")?, options.strings("networks")?)?,
         aliases: options.strings("aliases")?,
+        addresses: options.strings("addresses")?,
         publish: options.strings("publish")?,
         entrypoint: options.string("entrypoint")?,
         env: options.strings("env")?,
@@ -434,6 +435,7 @@ impl Manager {
             backend: backend_choice(options.string("backend")?.as_deref())?,
             network: network_choice(options.string("network")?, options.strings("networks")?)?,
             aliases: options.strings("aliases")?,
+            addresses: options.strings("addresses")?,
             publish: options.strings("publish")?,
             force: options.bool("force", false)?,
             entrypoint: options.string("entrypoint")?,
@@ -823,6 +825,104 @@ impl Manager {
         .await?)
     }
 
+    /// Like `images prune`: with option all (b), every image (a record pulled or built
+    /// and never started) no machine was made from; without, the dangling ones, which
+    /// nspawn's store does not have. Options labels (as, KEY or KEY=VALUE) and until (t,
+    /// unix seconds) narrow it. The job's result: removed (as), reclaimed (t, bytes).
+    async fn prune_images(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<OwnedObjectPath> {
+        let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let mut options = Options::new(&options);
+        let all = options.bool("all", false)?;
+        let labels = options.strings("labels")?;
+        let until = options.maybe_u64("until")?;
+        options.finish()?;
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "image-prune",
+            "",
+            move |ctx, reporter| async move {
+                let pruned =
+                    api::disk::prune_images(&ctx, all, &labels, until, jobs::report(&reporter))
+                        .await?;
+                Ok(HashMap::from([
+                    ("removed".to_string(), values::v(pruned.removed)),
+                    ("reclaimed".to_string(), values::v(pruned.reclaimed)),
+                ]))
+            },
+        )
+        .await?)
+    }
+
+    /// Like `system df`: images, containers (machines), local_volumes and build_cache,
+    /// each a{st} of total, active, size and reclaimable (bytes), and the rows of
+    /// `system df -v`: image_rows (aa{sv}: name, reference, created, size, containers),
+    /// container_rows (name, reference, size, running) and volume_rows (name, links, size).
+    async fn disk_usage(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Dict> {
+        let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
+        let usage = api::disk::usage(self.ctx()).await?;
+        let kind = |k: &api::disk::Kind| {
+            values::v(HashMap::from([
+                ("total".to_string(), k.total as u64),
+                ("active".to_string(), k.active as u64),
+                ("size".to_string(), k.size),
+                ("reclaimable".to_string(), k.reclaimable),
+            ]))
+        };
+        let images: Vec<Dict> = usage
+            .image_rows
+            .iter()
+            .map(|r| {
+                HashMap::from([
+                    ("name".to_string(), values::v(r.name.as_str())),
+                    ("reference".to_string(), values::v(r.reference.as_str())),
+                    ("created".to_string(), values::v(r.created)),
+                    ("size".to_string(), values::v(r.size)),
+                    ("containers".to_string(), values::v(r.containers as u64)),
+                ])
+            })
+            .collect();
+        let machines: Vec<Dict> = usage
+            .machine_rows
+            .iter()
+            .map(|r| {
+                HashMap::from([
+                    ("name".to_string(), values::v(r.name.as_str())),
+                    ("reference".to_string(), values::v(r.reference.as_str())),
+                    ("size".to_string(), values::v(r.size)),
+                    ("running".to_string(), values::v(r.running)),
+                ])
+            })
+            .collect();
+        let volumes: Vec<Dict> = usage
+            .volume_rows
+            .iter()
+            .map(|r| {
+                HashMap::from([
+                    ("name".to_string(), values::v(r.name.as_str())),
+                    ("links".to_string(), values::v(r.links as u64)),
+                    ("size".to_string(), values::v(r.size)),
+                ])
+            })
+            .collect();
+        Ok(HashMap::from([
+            ("images".to_string(), kind(&usage.images)),
+            ("containers".to_string(), kind(&usage.containers)),
+            ("local_volumes".to_string(), kind(&usage.volumes)),
+            ("build_cache".to_string(), kind(&usage.build_cache)),
+            ("image_rows".to_string(), values::v(images)),
+            ("container_rows".to_string(), values::v(machines)),
+            ("volume_rows".to_string(), values::v(volumes)),
+        ]))
+    }
+
     async fn prune_volumes(&self, #[zbus(header)] hdr: Header<'_>) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;
@@ -995,6 +1095,79 @@ impl Manager {
 
     /// Like `network prune`: a job removing every user-defined network no machine names;
     /// its result lists them.
+    /// Like `network connect`: the machine joins the network, at once when it runs.
+    /// Options aliases (as), address (s, a fixed IPv4 address on a network made with
+    /// CreateNetwork). A job.
+    async fn connect_network(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        network: String,
+        machine: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<OwnedObjectPath> {
+        let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let mut options = Options::new(&options);
+        let aliases = options.strings("aliases")?;
+        let address = match options.string("address")?.filter(|a| !a.is_empty()) {
+            Some(text) => Some(
+                text.parse::<std::net::Ipv4Addr>()
+                    .map_err(|_| Error::Failed(format!("{text} is not an IPv4 address")))?,
+            ),
+            None => None,
+        };
+        options.finish()?;
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "network-connect",
+            &machine.clone(),
+            move |ctx, reporter| async move {
+                api::network::connect(
+                    &ctx,
+                    &network,
+                    &machine,
+                    &aliases,
+                    address,
+                    jobs::report(&reporter),
+                )
+                .await?;
+                Ok(HashMap::new())
+            },
+        )
+        .await?)
+    }
+
+    /// Like `network disconnect`: the machine leaves the network, at once when it runs.
+    /// Option force (b): a machine or a membership that is not there is no error. A job.
+    async fn disconnect_network(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        network: String,
+        machine: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<OwnedObjectPath> {
+        let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let mut options = Options::new(&options);
+        let force = options.bool("force", false)?;
+        options.finish()?;
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "network-disconnect",
+            &machine.clone(),
+            move |ctx, reporter| async move {
+                api::network::disconnect(&ctx, &network, &machine, force, jobs::report(&reporter))
+                    .await?;
+                Ok(HashMap::new())
+            },
+        )
+        .await?)
+    }
+
     async fn prune_networks(&self, #[zbus(header)] hdr: Header<'_>) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;

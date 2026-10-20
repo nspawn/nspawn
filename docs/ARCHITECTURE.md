@@ -39,6 +39,9 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `api/copy.rs` | cp: tar streams packed and unpacked relative to directory descriptors, paths resolved with openat2 inside the machine's root, tried again when a `..` crossed a rename or mount on the host (EAGAIN) |
 | `systemd.rs` | typed D-Bus calls, job waiting |
 | `journal.rs`, `api/events.rs` | structured journal entries for nspawn's own events; the journal read back as events |
+| `kvfile.rs`, `mountopt.rs` | `--env-file` and `--label-file` (KEY=VALUE files as docker reads them, shared with compose's raw `env_file`), `--mount` read as docker's CSV form and turned into `-v` and `--tmpfs` |
+| `gotemplate.rs` | Go's text/template over JSON values, with docker's functions and `table` layout: `ps --format`, `inspect -f` |
+| `api/disk.rs`, `commands/system.rs` | what is an image and what a machine (a record pulled or built and never started is an image only), sizes by kind for `system df`, `images prune`, and `system prune` on top of the removals and prunes of the service |
 | `dockerapi/` | the read-only Docker Engine API (`api-serve`), served on a machine's own socket: routing and versions, containers and networks in docker's shapes, filters, events, logs, stats; the one write is a kill through the service |
 | `api/recreate.rs`, `api/autoupdate.rs` | a machine made anew from a newer image with its options, and put back from its rollback when the new one does not come up; `auto-update`: candidates by label, the registry asked once per reference, dependents restarted |
 
@@ -53,7 +56,8 @@ files, and the machine units call nspawn back through drop-in hooks.
   blobs/             compressed blobs, kept for push; .hold-* lists the blobs
                      of a pull in flight, which the collector leaves alone
   images/NAME.json   the record: reference, index_digest (the index a tag
-                     named at the pull), backend, mode, pid1, network (and
+                     named at the pull), backend, mode, pid1, started (its
+                     first start), network (and
                      network_name for a user-defined one), address,
                      extra_networks with their addresses, aliases,
                      no_network, ports, entrypoint/cmd, env, volumes,

@@ -91,7 +91,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-img e2e-ip e2e-ip2 e2e-cip-app-1 busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -99,8 +99,10 @@ cleanup_machines() {
   ip link del e2e-dummy0 >/dev/null 2>&1 || true
   rmmod mac80211_hwsim >/dev/null 2>&1 || true
   $NSPAWN network rm e2e-na e2e-nb e2e-nc e2e-nd e2e-ne e2e-gn e2e-api e2e-capi_default e2e-au-net >/dev/null 2>&1 || true
-  $NSPAWN volume rm e2e-au-vol >/dev/null 2>&1 || true
-  $NSPAWN images rm lucaslorentz-caddy-docker-proxy-2.13-alpine curlimages-curl-8.11.1 >/dev/null 2>&1 || true
+  $NSPAWN volume rm e2e-au-vol e2e-cli-vol >/dev/null 2>&1 || true
+  $NSPAWN network rm e2e-cli-net e2e-ip-net e2e-ip-net2 e2e-cip_fixed >/dev/null 2>&1 || true
+  rm -rf /tmp/e2e-cli
+  $NSPAWN images rm e2e-mirror mirror-curlimages-curl-8.11.1 curl-8.11.1 >/dev/null 2>&1 || true
   rm -rf /tmp/e2e-compose-api
   $NSPAWN secret rm e2e-pw e2e-pw2 e2e-gen-pw >/dev/null 2>&1 || true
   rm -f /var/lib/nspawn/secrets/e2e-pw.cred /var/lib/nspawn/secrets/e2e-pw.json /var/lib/nspawn/secrets/e2e-pw2.cred /var/lib/nspawn/secrets/e2e-pw2.json
@@ -2312,7 +2314,7 @@ if command -v busctl >/dev/null 2>&1; then
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
   $NSPAWN ps 2>&1 >/dev/null | grep_q "warning: the nspawn service runs" && fail "the command and the service disagree on their version: $($NSPAWN ps 2>&1 >/dev/null)"
-  for m in ListImages GetImage Generate PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ImageDigest ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine PauseMachine UnpauseMachine MachineProcesses UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes AutoUpdate; do
+  for m in ListImages GetImage Generate PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ImageDigest ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine PauseMachine UnpauseMachine MachineProcesses UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes AutoUpdate PruneImages DiskUsage ConnectNetwork DisconnectNetwork; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do
@@ -2616,6 +2618,24 @@ echo "$out" | grep_q -E '^    image: docker\.io/library/busybox:1\.36@sha256:[0-
 printf 'services:\n  app:\n    image: %s/%s:missing\n' "$NSPAWN_REGISTRY" "$repo" > /tmp/e2e-compose/digests.yaml
 out=$($NSPAWN compose -f /tmp/e2e-compose/digests.yaml -p e2e-digests config --resolve-image-digests 2>&1) && fail "a tag the registry lacks was pinned: $out"
 echo "$out" | grep_q -F "failed to resolve digest for $NSPAWN_REGISTRY/$repo:missing" || fail "the missing tag was not explained: $out"
+# The images of Docker Hub the steps below use, copied once into the test registry and
+# taken from there: Docker Hub limits anonymous pulls by address, which the hosts that
+# run the suite share. Prints the reference to use.
+mirror() {
+  local src=$1 path=${1#docker.io/}
+  local repo=${path%:*} tag=${path##*:}
+  if ! curl -sf $ca -u tester:s3cret -I -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+      "https://$NSPAWN_REGISTRY/v2/mirror/$repo/manifests/$tag" >/dev/null; then
+    $NSPAWN pull "$src" --name e2e-mirror --force >/dev/null 2>&1 \
+      && $NSPAWN push e2e-mirror --to "$NSPAWN_REGISTRY/mirror/$repo:$tag" >/dev/null 2>&1
+    $NSPAWN images rm e2e-mirror >/dev/null 2>&1
+  fi
+  echo "$NSPAWN_REGISTRY/mirror/$repo:$tag"
+}
+caddy_image=$(mirror docker.io/lucaslorentz/caddy-docker-proxy:2.13-alpine)
+curl_image=$(mirror docker.io/curlimages/curl:8.11.1)
+busybox137_image=$(mirror docker.io/library/busybox:1.37)
+
 step "Docker API: proxies and dashboards that read docker's socket find the machines"
 api() { curl -sS --unix-socket "/run/nspawn/api/$1.sock" "http://docker$2" "${@:3}"; }
 $NSPAWN network create e2e-api >/dev/null || fail "network create e2e-api"
@@ -2630,7 +2650,7 @@ backend e2e-api-web
 # routes by the labels of the others; with polling an hour away, a backend started later
 # reaches it only through the event stream.
 $NSPAWN run -d --name e2e-api-caddy --network e2e-api -p 18110:80 -e CADDY_DOCKER_POLLING_INTERVAL=1h \
-  -v /var/run/docker.sock:/var/run/docker.sock docker.io/lucaslorentz/caddy-docker-proxy:2.13-alpine >/dev/null || fail "run caddy-docker-proxy"
+  -v /var/run/docker.sock:/var/run/docker.sock "$caddy_image" >/dev/null || fail "run caddy-docker-proxy"
 [ -S /run/nspawn/api/e2e-api-caddy.sock ] || fail "no Docker API socket for e2e-api-caddy"
 [ -d /var/run/docker.sock ] && fail "a directory was made where docker's socket would be"
 grep -q '^Wants=nspawn-api@e2e-api-caddy.socket' /etc/systemd/system/systemd-nspawn@e2e-api-caddy.service.d/*.conf || fail "the machine's unit does not want its socket"
@@ -2651,10 +2671,10 @@ api e2e-api-caddy /containers/nope/json | grep_q 'No such container: nope' || fa
 # A machine in a user namespace: its root reaches the socket through the idmapped bind,
 # sees every machine and their environment, as docker's socket shows them; another user
 # cannot connect.
-out=$($NSPAWN run --rm --network none -u 0 -v /var/run/docker.sock:/var/run/docker.sock:ro docker.io/curlimages/curl:8.11.1 \
+out=$($NSPAWN run --rm --network none -u 0 -v /var/run/docker.sock:/var/run/docker.sock:ro "$curl_image" \
   -- -sS --unix-socket /var/run/docker.sock http://docker/containers/e2e-api-web/json 2>&1) || fail "curl from a machine in a user namespace: $out"
 echo "$out" | grep_q "E2E_ENV=$nonce" || fail "inspect through the Docker API lacks the machine's environment: $out"
-out=$($NSPAWN run --rm --network none -v /var/run/docker.sock:/var/run/docker.sock docker.io/curlimages/curl:8.11.1 \
+out=$($NSPAWN run --rm --network none -v /var/run/docker.sock:/var/run/docker.sock "$curl_image" \
   -- -sS --unix-socket /var/run/docker.sock http://docker/_ping 2>&1) && fail "a user other than root reached the Docker API: $out"
 # A booted machine takes it at /run/docker.sock.
 $NSPAWN create "$IMAGE" e2e-api-boot -v /run/docker.sock:/run/docker.sock >/dev/null || fail "create e2e-api-boot"
@@ -2684,13 +2704,13 @@ api e2e-capi-a-1 /containers/json | grep_q '"com.docker.compose.project":"e2e-ca
 $NSPAWN compose -f /tmp/e2e-compose-api/compose.yaml -p e2e-capi down >/dev/null 2>&1 || fail "compose down of e2e-capi"
 for m in e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot; do $NSPAWN rm -f $m >/dev/null 2>&1; done
 $NSPAWN network rm e2e-api >/dev/null || fail "network rm e2e-api"
-for i in lucaslorentz-caddy-docker-proxy-2.13-alpine curlimages-curl-8.11.1; do $NSPAWN images rm $i >/dev/null 2>&1; done
+for i in mirror-curlimages-curl-8.11.1 curl-8.11.1; do $NSPAWN images rm $i >/dev/null 2>&1; done
 
 step "auto-update: a labelled machine gets the image its tag names now, and goes back when it fails"
 repo=e2e/au-$nonce
 base="https://$NSPAWN_REGISTRY/v2/$repo"
 ref="$NSPAWN_REGISTRY/$repo:1"
-$NSPAWN pull docker.io/library/busybox:1.37 --name e2e-au-137 --force >/dev/null || fail "pull busybox 1.37"
+$NSPAWN pull "$busybox137_image" --name e2e-au-137 --force >/dev/null || fail "pull busybox 1.37"
 $NSPAWN push busybox-1.36 --to "$ref" >/dev/null 2>&1 || fail "push busybox 1.36 as $ref"
 $NSPAWN network create e2e-au-net >/dev/null || fail "network create e2e-au-net"
 page='mkdir -p /www; busybox | head -1 > /www/index.html; exec httpd -f -p 80 -h /www'
@@ -2757,6 +2777,111 @@ systemctl start nspawn-auto-update.service || fail "nspawn-auto-update.service: 
 for m in e2e-au-side e2e-au e2e-au-137; do $NSPAWN rm -f $m >/dev/null 2>&1; done
 $NSPAWN network rm e2e-au-net >/dev/null 2>&1
 $NSPAWN volume rm e2e-au-vol >/dev/null 2>&1
+
+step "docker's other flags and commands: --env-file, --mount, ps --filter and --format, inspect -f, port, wait, network connect, prune and df"
+d=/tmp/e2e-cli
+rm -rf $d && mkdir -p $d/bind
+printf '# comment\nE2E_A=from file\nE2E_B=overridden\n' > $d/env
+printf 'e2e.file=yes\n' > $d/labels
+echo bound > $d/bind/f
+$NSPAWN network create e2e-cli-net >/dev/null || fail "network create e2e-cli-net"
+$NSPAWN run -d --name e2e-cli -p 18130:80 --env-file $d/env -e E2E_B=flag --label-file $d/labels \
+  --mount type=bind,source=$d/bind,target=/b,readonly --mount source=e2e-cli-vol,target=/v \
+  --mount type=tmpfs,target=/t,tmpfs-size=1m busybox-1.36 \
+  -- /bin/sh -c 'mkdir -p /www; echo cli > /www/index.html; exec httpd -f -p 80 -h /www' >/dev/null || fail "run with --env-file, --label-file and --mount"
+[ "$($NSPAWN exec e2e-cli -- /bin/sh -c 'echo "$E2E_A/$E2E_B"' </dev/null | tr -d '\r')" = "from file/flag" ] || fail "--env-file and -e did not reach the program"
+[ "$($NSPAWN inspect -f '{{index .labels "e2e.file"}}' e2e-cli)" = yes ] || fail "--label-file, or inspect -f: $($NSPAWN inspect -f '{{json .labels}}' e2e-cli)"
+[ "$($NSPAWN exec e2e-cli -- cat /b/f </dev/null | tr -d '\r')" = bound ] || fail "the bind of --mount"
+$NSPAWN exec e2e-cli -- touch /b/x </dev/null 2>/dev/null && fail "a readonly --mount took a write"
+$NSPAWN exec e2e-cli -- /bin/sh -c 'grep -q " /t tmpfs " /proc/mounts && touch /v/x' </dev/null || fail "the volume and tmpfs of --mount"
+[ "$($NSPAWN inspect -f '{{.state}} {{len .volumes}}' e2e-cli)" = "running 2" ] || fail "inspect -f with a function: $($NSPAWN inspect -f '{{.state}} {{len .volumes}}' e2e-cli 2>&1)"
+$NSPAWN ps -q | grep_q -x e2e-cli || fail "ps -q misses e2e-cli: $($NSPAWN ps -q)"
+[ "$($NSPAWN ps -q --filter label=e2e.file=yes)" = e2e-cli ] || fail "ps --filter label: $($NSPAWN ps -q --filter label=e2e.file=yes)"
+[ -z "$($NSPAWN ps -q --filter name=^e2e-none-such$)" ] || fail "ps --filter name matched what it should not"
+$NSPAWN ps --format '{{.Names}} {{.State}} {{.Label "e2e.file"}}' | grep_q -x 'e2e-cli running yes' || fail "ps --format: $($NSPAWN ps --format '{{.Names}} {{.State}} {{.Label "e2e.file"}}' 2>&1)"
+$NSPAWN ps --format 'table {{.Names}}\t{{.Ports}}' | head -1 | grep_q -E '^NAMES +PORTS$' || fail "ps --format table: $($NSPAWN ps --format 'table {{.Names}}\t{{.Ports}}' 2>&1)"
+$NSPAWN ps --format json --filter name=e2e-cli | python3 -c "import json,sys; rows = [json.loads(l) for l in sys.stdin]; assert rows[0]['Names'] == 'e2e-cli' and rows[0]['Ports'] == '0.0.0.0:18130->80/tcp', rows" || fail "ps --format json"
+[ "$($NSPAWN port e2e-cli)" = "80/tcp -> 0.0.0.0:18130" ] || fail "port: $($NSPAWN port e2e-cli 2>&1)"
+[ "$($NSPAWN port e2e-cli 80)" = "0.0.0.0:18130" ] || fail "port with a port: $($NSPAWN port e2e-cli 80 2>&1)"
+out=$($NSPAWN port e2e-cli 81 2>&1) && fail "port of a port not published: $out"
+echo "$out" | grep_q "no public port '81' published for e2e-cli" || fail "port of a port not published was not explained: $out"
+# A running app and a running booted machine join a network and leave it.
+$NSPAWN run -d --name e2e-cli-peer --network e2e-cli-net busybox-1.36 \
+  -- /bin/sh -c 'mkdir -p /www; echo peer > /www/index.html; exec httpd -f -p 80 -h /www' >/dev/null || fail "run e2e-cli-peer"
+$NSPAWN network connect --alias cliweb e2e-cli-net e2e-cli >/dev/null || fail "network connect of a running app"
+retry 5 bash -c "$NSPAWN exec e2e-cli-peer -- wget -qO- http://cliweb/ </dev/null | grep_q cli" || fail "the peer does not reach the connected machine by its alias"
+retry 5 bash -c "$NSPAWN exec e2e-cli -- wget -qO- http://e2e-cli-peer/ </dev/null | grep_q peer" || fail "the connected machine does not reach the peer"
+$NSPAWN inspect -f '{{json .networks}}' e2e-cli | grep_q e2e-cli-net || fail "inspect does not show the network joined"
+$NSPAWN network connect e2e-cli-net e2e-cli 2>&1 | grep_q "already exists in network e2e-cli-net" || fail "a second connect was not refused"
+$NSPAWN create "$IMAGE" e2e-cli-boot >/dev/null && $NSPAWN start e2e-cli-boot >/dev/null || fail "start e2e-cli-boot"
+$NSPAWN network connect e2e-cli-net e2e-cli-boot >/dev/null || fail "network connect of a running booted machine"
+retry 10 bash -c "$NSPAWN exec e2e-cli-boot -- curl -s http://e2e-cli-peer/ </dev/null | grep_q peer" || fail "the booted machine does not reach the peer on the network it joined"
+$NSPAWN network disconnect e2e-cli-net e2e-cli >/dev/null || fail "network disconnect"
+$NSPAWN exec e2e-cli -- wget -T 3 -qO- http://e2e-cli-peer/ </dev/null >/dev/null 2>&1 && fail "the disconnected machine still reaches the peer"
+$NSPAWN inspect -f '{{json .networks}}' e2e-cli | grep_q e2e-cli-net && fail "inspect still shows the network left"
+$NSPAWN stop e2e-cli-boot >/dev/null
+# wait prints the code a machine ends with; ps finds it by it.
+$NSPAWN run -d --name e2e-cli-wait busybox-1.36 -- /bin/sh -c 'sleep 2; exit 3' >/dev/null || fail "run e2e-cli-wait"
+[ "$(timeout 30 $NSPAWN wait e2e-cli-wait)" = 3 ] || fail "wait did not print the exit code"
+$NSPAWN ps -q --filter exited=3 | grep_q -x e2e-cli-wait || fail "ps --filter exited=3"
+$NSPAWN ps -q --filter status=exited | grep_q -x e2e-cli-wait || fail "ps --filter status=exited"
+# What takes the disk, and its prune: only what no machine uses goes.
+out=$($NSPAWN system df) || fail "system df"
+for kind in Images Containers "Local Volumes" "Build Cache"; do echo "$out" | grep_q "^$kind " || fail "system df misses $kind: $out"; done
+$NSPAWN system df -v | grep_q "^Images space usage:" || fail "system df -v"
+$NSPAWN pull "$busybox137_image" --name e2e-cli-img --force >/dev/null || fail "pull e2e-cli-img"
+out=$($NSPAWN images prune -f) || fail "images prune: $out"
+echo "$out" | grep_q "^Total reclaimed space: 0B$" || fail "images prune without -a removed something: $out"
+out=$($NSPAWN images prune -a -f) || fail "images prune -a: $out"
+echo "$out" | grep_q "^deleted: e2e-cli-img$" || fail "images prune -a kept an unused image: $out"
+$NSPAWN images ls | grep_q "^ *busybox-1.36 " || fail "images prune -a removed an image machines were made from"
+out=$($NSPAWN system prune -f) || fail "system prune: $out"
+echo "$out" | grep_q -x e2e-cli-wait || fail "system prune kept a stopped machine: $out"
+$NSPAWN ps -q | grep_q -x e2e-cli || fail "system prune removed a running machine"
+for m in e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-img; do $NSPAWN rm -f $m >/dev/null 2>&1; done
+$NSPAWN network rm e2e-cli-net >/dev/null 2>&1
+$NSPAWN volume rm e2e-cli-vol >/dev/null 2>&1
+rm -rf $d
+
+step "--ip: a fixed address on a network of the user's, kept across starts"
+$NSPAWN network create e2e-ip-net --subnet 10.97.42.0/24 >/dev/null || fail "network create e2e-ip-net"
+$NSPAWN create busybox-1.36 e2e-ip --network e2e-ip-net --ip 10.97.42.50 -- /bin/sleep 300 >/dev/null || fail "create --ip"
+$NSPAWN start e2e-ip >/dev/null || fail "start e2e-ip"
+[ "$(addr_of e2e-ip)" = 10.97.42.50 ] || fail "the address asked for is not the machine's: $(addr_of e2e-ip)"
+$NSPAWN exec e2e-ip -- ip -4 addr show host0 </dev/null | grep_q "inet 10.97.42.50/24" || fail "the machine does not have the address it asked for"
+$NSPAWN stop e2e-ip >/dev/null && $NSPAWN start e2e-ip >/dev/null || fail "restart of e2e-ip"
+[ "$(addr_of e2e-ip)" = 10.97.42.50 ] || fail "the fixed address changed across a restart"
+out=$($NSPAWN create busybox-1.36 e2e-ip2 --network e2e-ip-net --ip 10.97.42.50 -- /bin/sleep 300 2>&1) && fail "a second machine took a taken address: $out"
+echo "$out" | grep_q "Address already in use" || fail "a taken address was not explained: $out"
+out=$($NSPAWN create busybox-1.36 e2e-ip2 --network e2e-ip-net --ip 10.97.43.5 -- /bin/sleep 300 2>&1) && fail "an address outside the subnet was taken: $out"
+echo "$out" | grep_q "no configured subnet or ip-range contain the IP address 10.97.43.5" || fail "an address outside the subnet was not explained: $out"
+out=$($NSPAWN create busybox-1.36 e2e-ip2 --ip 10.99.0.200 -- /bin/sleep 300 2>&1) && fail "an address on the default network was taken: $out"
+echo "$out" | grep_q "user specified IP address is supported on user defined networks only" || fail "an address on the default network was not explained: $out"
+$NSPAWN network create e2e-ip-net2 --subnet 10.97.43.0/24 >/dev/null || fail "network create e2e-ip-net2"
+$NSPAWN network connect --ip 10.97.43.7 e2e-ip-net2 e2e-ip >/dev/null || fail "network connect --ip"
+$NSPAWN exec e2e-ip -- ip -4 addr </dev/null | grep_q "inet 10.97.43.7/24" || fail "network connect --ip did not give the address"
+$NSPAWN rm -f e2e-ip >/dev/null 2>&1
+# compose's ipv4_address.
+mkdir -p /tmp/e2e-compose-ip
+cat > /tmp/e2e-compose-ip/compose.yaml <<'COMPOSE'
+services:
+  app:
+    image: busybox:1.36
+    command: ["sleep", "300"]
+    networks:
+      fixed:
+        ipv4_address: 10.97.44.9
+networks:
+  fixed:
+    ipam:
+      config:
+        - subnet: 10.97.44.0/24
+COMPOSE
+out=$($NSPAWN compose -f /tmp/e2e-compose-ip/compose.yaml -p e2e-cip up -d 2>&1) || fail "compose up with ipv4_address: $out"
+[ "$($NSPAWN inspect e2e-cip-app-1 | python3 -c "import json,sys; print(json.load(sys.stdin)[0]['addresses'].get('e2e-cip_fixed', ''))")" = 10.97.44.9 ] || fail "compose's ipv4_address was not the machine's: $($NSPAWN inspect e2e-cip-app-1)"
+$NSPAWN compose -f /tmp/e2e-compose-ip/compose.yaml -p e2e-cip down >/dev/null 2>&1 || fail "compose down of e2e-cip"
+$NSPAWN network rm e2e-ip-net e2e-ip-net2 >/dev/null 2>&1
+rm -rf /tmp/e2e-compose-ip
 
 $NSPAWN images rm busybox-1.36 > /dev/null 2>&1
 

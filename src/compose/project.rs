@@ -1112,7 +1112,7 @@ fn load_mapping_file(
         "raw" => {
             let bytes =
                 read(&mut file).map_err(|e| format!("failed to parse env_file {path}: {e}"))?;
-            for line in kv_file(&bytes, lookup)
+            for line in crate::kvfile::parse(&bytes, lookup)
                 .map_err(|e| format!("failed to parse env_file {path}: {e}"))?
             {
                 let (key, value) = line.split_once('=').unwrap_or((&line, ""));
@@ -1122,58 +1122,4 @@ fn load_mapping_file(
         }
         other => Err(format!("unsupported env_file format {}", go_quote(other))),
     }
-}
-
-/// kvfile: `KEY=value` lines read with bufio.Scanner (lines of up to 64 KiB, a
-/// carriage return before each line end dropped), each line UTF-8, a BOM at the start
-/// of the first dropped, a `KEY` alone taking the value lookup has.
-fn kv_file(bytes: &[u8], lookup: &dyn Fn(&str) -> Option<String>) -> Result<Vec<String>, String> {
-    const MAX_TOKEN: usize = 64 * 1024;
-    let mut lines = Vec::new();
-    let mut rest = bytes;
-    let mut number = 1;
-    while !rest.is_empty() {
-        let (mut line, next) = match rest.iter().position(|&b| b == b'\n') {
-            Some(i) if i < MAX_TOKEN => (&rest[..i], &rest[i + 1..]),
-            None if rest.len() < MAX_TOKEN => (rest, &rest[rest.len()..]),
-            _ => return Err("bufio.Scanner: token too long".to_string()),
-        };
-        rest = next;
-        if line.last() == Some(&b'\r') {
-            line = &line[..line.len() - 1];
-        }
-        let Ok(text) = std::str::from_utf8(line) else {
-            let decimal: Vec<String> = line.iter().map(u8::to_string).collect();
-            return Err(format!(
-                "invalid utf8 bytes at line {number}: [{}]",
-                decimal.join(" ")
-            ));
-        };
-        let text = if number == 1 {
-            text.strip_prefix('\u{feff}').unwrap_or(text)
-        } else {
-            text
-        };
-        number += 1;
-        let line = text.trim_start_matches(gostr::is_space);
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, has_value) = match line.split_once('=') {
-            Some((key, _)) => (key, true),
-            None => (line, false),
-        };
-        if key.is_empty() {
-            return Err(format!("no variable name on line '{line}'"));
-        }
-        if key.contains([' ', '\t']) {
-            return Err(format!("variable '{key}' contains whitespaces"));
-        }
-        if has_value {
-            lines.push(line.to_string());
-        } else if let Some(value) = lookup(line) {
-            lines.push(format!("{key}={value}"));
-        }
-    }
-    Ok(lines)
 }

@@ -6,6 +6,7 @@ pub(crate) mod copy;
 mod login;
 pub(crate) mod machines;
 pub(crate) mod stats;
+pub(crate) mod system;
 
 use anyhow::{bail, Context as _, Result};
 use zbus::zvariant::Value;
@@ -16,7 +17,7 @@ use clap::CommandFactory;
 
 use crate::cli::{
     Cli, Command, HubCommand, ImagesCommand, MachinesCommand, NetworkCommand, SecretCommand,
-    VolumeCommand,
+    SystemCommand, VolumeCommand,
 };
 use crate::client::{self, Client, Options};
 use crate::config::Config;
@@ -191,6 +192,38 @@ pub async fn run(cli: Cli) -> Result<()> {
                 let client = Client::connect().await?;
                 client
                     .run_job(|| client.manager.remove_networks(&names))
+                    .await?;
+                Ok(())
+            }
+            NetworkCommand::Connect {
+                network,
+                machine,
+                alias,
+                ip,
+            } => {
+                let client = Client::connect().await?;
+                let mut options = Options::new();
+                put_all(&mut options, "aliases", alias);
+                put_opt(&mut options, "address", ip);
+                client
+                    .run_job(|| client.manager.connect_network(&network, &machine, options))
+                    .await?;
+                Ok(())
+            }
+            NetworkCommand::Disconnect {
+                network,
+                machine,
+                force,
+            } => {
+                let client = Client::connect().await?;
+                let mut options = Options::new();
+                put(&mut options, "force", force);
+                client
+                    .run_job(|| {
+                        client
+                            .manager
+                            .disconnect_network(&network, &machine, options)
+                    })
                     .await?;
                 Ok(())
             }
@@ -466,11 +499,18 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             );
             Ok(())
         }
-        Command::Create(a) => {
+        Command::Create(mut a) => {
+            // --mount is -v or --tmpfs written out; the files come before the flags.
+            let (mounted, tmpfs) = crate::mountopt::split(&a.mount)?;
+            a.volume.extend(mounted);
+            a.tuning.tmpfs.extend(tmpfs);
+            a.env = crate::kvfile::env_with_files(&a.env_file, &a.env)?;
+            a.label = crate::kvfile::labels_with_files(&a.label_file, &a.label)?;
             let mut options = client::registry_options(config);
             backend(&mut options, a.backend);
             put_all(&mut options, "networks", a.network);
             put_all(&mut options, "aliases", a.network_alias);
+            put_all(&mut options, "addresses", a.ip);
             put_all(&mut options, "publish", a.publish);
             put(&mut options, "force", a.force);
             put_opt(&mut options, "entrypoint", a.entrypoint);
@@ -591,6 +631,11 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 client.run_job(|| manager.remove_images(&a.names)).await?;
                 Ok(())
             }
+            ImagesCommand::Prune(a) => system::images_prune(a, client).await,
+        },
+        Command::System(args) => match args.command {
+            SystemCommand::Df(a) => system::df(a, client).await,
+            SystemCommand::Prune(a) => system::prune(a, client).await,
         },
         Command::Rm(a) => {
             let mut options = Options::new();
@@ -728,7 +773,20 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 let machine = manager.get_machine(name).await.map_err(client::error)?;
                 out.push(client::dict_to_json(&machine));
             }
-            client::print_json(&serde_json::Value::Array(out));
+            match args.format.as_deref() {
+                // A template per object, a line each, as docker inspect -f prints them.
+                Some(format) if format != "json" => {
+                    let template = crate::gotemplate::Template::parse(format)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    for object in &out {
+                        let text = template
+                            .execute(object)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        println!("{text}");
+                    }
+                }
+                _ => client::print_json(&serde_json::Value::Array(out)),
+            }
             Ok(())
         }
         Command::Start(args) => machines::start(args, client).await,
@@ -739,6 +797,8 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         Command::Pause(args) => machines::pause(args, client, true).await,
         Command::Unpause(args) => machines::pause(args, client, false).await,
         Command::Top(args) => machines::top(args, client).await,
+        Command::Wait(args) => machines::wait(args, client).await,
+        Command::Port(args) => machines::port(args, client).await,
         Command::Update(args) => machines::update(args, client).await,
         Command::Stats(args) => stats::stats(args, client).await,
         Command::AutoUpdate(args) => machines::auto_update(args, client).await,

@@ -190,6 +190,7 @@ pub async fn install(
         origin: spec.origin.to_string(),
         mode,
         pid1,
+        started: None,
         run,
         network,
         network_name: None,

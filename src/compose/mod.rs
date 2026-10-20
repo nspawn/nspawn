@@ -14,7 +14,7 @@ mod emitter;
 mod engine;
 mod extends;
 mod golib;
-mod gostr;
+pub(crate) mod gostr;
 mod gotime;
 mod include;
 mod interpolate;

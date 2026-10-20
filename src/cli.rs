@@ -75,6 +75,10 @@ pub enum Command {
     Unpause(NamesArgs),
     /// The processes of a running machine, like docker top.
     Top(TopArgs),
+    /// Wait for machines to stop and print each one's exit code, like docker wait.
+    Wait(WaitArgs),
+    /// The ports a running machine publishes, like docker port.
+    Port(PortArgs),
     /// Change the restart policy and limits of machines, like docker update; a running
     /// machine gets the limits at once.
     Update(UpdateArgs),
@@ -102,6 +106,8 @@ pub enum Command {
     Volume(VolumeArgs),
     /// Manage secrets (--secret NAME), like docker secret: kept encrypted for this host.
     Secret(SecretArgs),
+    /// What nspawn keeps on disk, and its prune, like docker system.
+    System(SystemArgs),
     /// Run docker compose files on nspawn machines, with docker compose's commands.
     Compose(crate::compose::cli::ComposeArgs),
     /// Serve org.nspawn on the system bus (started by the bus; see --install).
@@ -202,6 +208,35 @@ pub enum NetworkCommand {
         /// Network names.
         #[arg(required = true, add = candidates(Kind::Network))]
         names: Vec<String>,
+    },
+    /// Join a machine to a network, like docker network connect: a running one at once,
+    /// with an interface of its own on it.
+    Connect {
+        /// Network name.
+        #[arg(add = candidates(Kind::Network))]
+        network: String,
+        /// Machine name.
+        #[arg(add = candidates(Kind::Any))]
+        machine: String,
+        /// Another name for the machine on this network. Repeatable.
+        #[arg(long, value_name = "NAME")]
+        alias: Vec<String>,
+        /// A fixed IPv4 address on the network (one made with network create).
+        #[arg(long, value_name = "ADDRESS")]
+        ip: Option<String>,
+    },
+    /// Take a machine off a network, like docker network disconnect: a running one at
+    /// once.
+    Disconnect {
+        /// Network name.
+        #[arg(add = candidates(Kind::Network))]
+        network: String,
+        /// Machine name.
+        #[arg(add = candidates(Kind::Any))]
+        machine: String,
+        /// No error when the machine or its membership is not there.
+        #[arg(long, short = 'f')]
+        force: bool,
     },
     /// Remove every network no machine uses.
     Prune {
@@ -393,6 +428,11 @@ pub struct CreateArgs {
     /// its primary network, or NETWORK=NAME. Repeatable.
     #[arg(long, value_name = "[NETWORK=]NAME")]
     pub network_alias: Vec<String>,
+    /// A fixed IPv4 address on the primary network, like docker --ip (NETWORK=IP for
+    /// another network it joins): one made with network create, inside its subnet, and
+    /// nobody else's. Remembered.
+    #[arg(long, value_name = "[NETWORK=]IP")]
+    pub ip: Vec<String>,
     /// Ports to publish on the host, like start -p.
     #[arg(long, short = 'p', value_name = "[IP:]HOST:CONTAINER[/udp]")]
     pub publish: Vec<String>,
@@ -412,6 +452,18 @@ pub struct CreateArgs {
     /// Mount a host directory or a named volume, SOURCE:TARGET[:ro], like docker -v.
     #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]", value_hint = clap::ValueHint::AnyPath)]
     pub volume: Vec<String>,
+    /// Read variables from a file of VAR=value lines, like docker --env-file: no quoting
+    /// or expansion, a VAR alone copied from here; -e comes after and wins. Repeatable.
+    #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+    pub env_file: Vec<std::path::PathBuf>,
+    /// Read labels from a file of KEY=VALUE lines, like docker --label-file; --label comes
+    /// after and wins. Repeatable.
+    #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+    pub label_file: Vec<std::path::PathBuf>,
+    /// A mount in docker's long form, type=bind|volume|tmpfs,source=...,target=...[,readonly]
+    /// (tmpfs-size, tmpfs-mode): -v or --tmpfs written out. Repeatable.
+    #[arg(long, value_name = "type=TYPE,source=SRC,target=DST")]
+    pub mount: Vec<String>,
     /// Label the machine, KEY=VALUE, like docker --label; the image's own labels stay
     /// underneath. Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'l', value_name = "KEY=VALUE")]
@@ -639,6 +691,64 @@ pub enum ImagesCommand {
     Ls(OutputArgs),
     /// Remove local images (and the layers nobody uses any more).
     Rm(ImagesRmArgs),
+    /// Remove images no machine uses, like docker image prune: with -a every image no
+    /// machine was made from; without, the dangling ones, which nspawn's store has none
+    /// of.
+    Prune(ImagesPruneArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ImagesPruneArgs {
+    /// Every image no machine was made from.
+    #[arg(long, short = 'a')]
+    pub all: bool,
+    /// Do not ask.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+    /// label=KEY, label=KEY=VALUE or until=DURATION|UNIX-SECONDS. Repeatable.
+    #[arg(long = "filter", value_name = "KEY=VALUE")]
+    pub filters: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct SystemArgs {
+    #[command(subcommand)]
+    pub command: SystemCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SystemCommand {
+    /// What images, machines and volumes take on disk, like docker system df.
+    Df(SystemDfArgs),
+    /// Remove stopped machines, unused networks and, with -a, unused images, like docker
+    /// system prune.
+    Prune(SystemPruneArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct SystemDfArgs {
+    /// Each image, machine and volume with its size.
+    #[arg(long, short = 'v')]
+    pub verbose: bool,
+    /// The service's answer as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct SystemPruneArgs {
+    /// Every image no machine was made from, not only the dangling ones.
+    #[arg(long, short = 'a')]
+    pub all: bool,
+    /// Anonymous volumes too, as docker takes it: nspawn has none.
+    #[arg(long)]
+    pub volumes: bool,
+    /// Do not ask.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+    /// label=KEY, label=KEY=VALUE or until=DURATION|UNIX-SECONDS. Repeatable.
+    #[arg(long = "filter", value_name = "KEY=VALUE")]
+    pub filters: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -777,6 +887,18 @@ pub struct PsArgs {
     /// Also list nspawn images that are not running.
     #[arg(long, short = 'a')]
     pub all: bool,
+    /// Only the names, one per line, as docker ps -q gives IDs.
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+    /// Only matching machines, like docker ps --filter: name, label, status, network,
+    /// ancestor, health, exited, volume, publish, expose, id, before, since. Repeatable:
+    /// the same key matches either value, different keys must all match.
+    #[arg(long = "filter", short = 'f', value_name = "KEY=VALUE")]
+    pub filters: Vec<String>,
+    /// A Go template over docker's fields (.Names, .Image, .Status, .Ports, .Label "k",
+    /// ...) and nspawn's (.Mode, .Address, .OS), "table TEMPLATE" for a table, or json.
+    #[arg(long, value_name = "FORMAT")]
+    pub format: Option<String>,
     #[command(flatten)]
     pub output: OutputArgs,
 }
@@ -794,6 +916,10 @@ pub struct InspectArgs {
     /// Machine or image names.
     #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
+    /// A Go template over each object, like docker inspect -f: '{{.state}}',
+    /// '{{json .labels}}'; the keys are the ones inspect prints.
+    #[arg(long, short = 'f', value_name = "FORMAT")]
+    pub format: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -901,6 +1027,11 @@ pub struct StartOptions {
     /// them.
     #[arg(long, value_name = "[NETWORK=]NAME")]
     pub network_alias: Vec<String>,
+    /// A fixed IPv4 address on the primary network, like docker --ip (NETWORK=IP for
+    /// another network it joins): one made with network create, inside its subnet, and
+    /// nobody else's. Remembered.
+    #[arg(long, value_name = "[NETWORK=]IP")]
+    pub ip: Vec<String>,
     /// Publish a port on the host, like docker -p: HOST:CONTAINER[/udp], on one address
     /// of the host with IP:HOST:CONTAINER, several with a range on both sides
     /// (8000-8010:8000-8010). Repeatable and remembered for the image; "none" forgets
@@ -918,6 +1049,18 @@ pub struct StartOptions {
     /// Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]", value_hint = clap::ValueHint::AnyPath)]
     pub volume: Vec<String>,
+    /// Read variables from a file of VAR=value lines, like docker --env-file: no quoting
+    /// or expansion, a VAR alone copied from here; -e comes after and wins. Repeatable.
+    #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+    pub env_file: Vec<std::path::PathBuf>,
+    /// Read labels from a file of KEY=VALUE lines, like docker --label-file; --label comes
+    /// after and wins. Repeatable.
+    #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+    pub label_file: Vec<std::path::PathBuf>,
+    /// A mount in docker's long form, type=bind|volume|tmpfs,source=...,target=...[,readonly]
+    /// (tmpfs-size, tmpfs-mode): -v or --tmpfs written out. Repeatable.
+    #[arg(long, value_name = "type=TYPE,source=SRC,target=DST")]
+    pub mount: Vec<String>,
     /// Label the machine, KEY=VALUE, like docker --label; the image's own labels stay
     /// underneath. Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'l', value_name = "KEY=VALUE")]
@@ -985,6 +1128,23 @@ pub struct NamesArgs {
     /// Machine names.
     #[arg(required = true, add = candidates(Kind::Running))]
     pub names: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct WaitArgs {
+    /// Machine names.
+    #[arg(required = true, add = candidates(Kind::Any))]
+    pub names: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct PortArgs {
+    /// Machine name.
+    #[arg(add = candidates(Kind::Running))]
+    pub name: String,
+    /// Only this port of the machine: PORT or PORT/PROTOCOL.
+    #[arg(value_name = "PRIVATE_PORT[/PROTO]")]
+    pub port: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1319,6 +1479,55 @@ mod tests {
         assert!(Cli::try_parse_from(["nspawn", "logs", "web", "--since", "-10min"]).is_ok());
         assert!(run.detach);
         assert_eq!(run.options.publish, ["80:80"]);
+        // docker's file and long mount flags on the three commands that make or start a
+        // machine.
+        for args in [
+            &[
+                "nspawn",
+                "run",
+                "--env-file",
+                "a.env",
+                "--label-file",
+                "l",
+                "--mount",
+                "type=tmpfs,dst=/t",
+                "img",
+            ][..],
+            &[
+                "nspawn",
+                "create",
+                "--env-file",
+                "a.env",
+                "--label-file",
+                "l",
+                "--mount",
+                "type=tmpfs,dst=/t",
+                "img",
+                "m",
+            ][..],
+            &[
+                "nspawn",
+                "start",
+                "--env-file",
+                "a.env",
+                "--label-file",
+                "l",
+                "--mount",
+                "type=tmpfs,dst=/t",
+                "m",
+            ][..],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let (env_file, label_file, mount) = match cli.command {
+                Command::Run(a) => (a.options.env_file, a.options.label_file, a.options.mount),
+                Command::Create(a) => (a.env_file, a.label_file, a.mount),
+                Command::Start(a) => (a.options.env_file, a.options.label_file, a.options.mount),
+                _ => panic!("{args:?}"),
+            };
+            assert_eq!(env_file, [std::path::PathBuf::from("a.env")], "{args:?}");
+            assert_eq!(label_file, [std::path::PathBuf::from("l")], "{args:?}");
+            assert_eq!(mount, ["type=tmpfs,dst=/t"], "{args:?}");
+        }
         let cli = Cli::try_parse_from(["nspawn", "rm", "-f", "a", "b"]).unwrap();
         let Command::Rm(rm) = cli.command else {
             panic!("not rm");

@@ -87,6 +87,8 @@ pub trait Manager {
     fn remove_volumes(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
     fn prune_volumes(&self) -> zbus::Result<OwnedObjectPath>;
     fn auto_update(&self, names: &[String], options: Options<'_>) -> zbus::Result<OwnedObjectPath>;
+    fn prune_images(&self, options: Options<'_>) -> zbus::Result<OwnedObjectPath>;
+    fn disk_usage(&self) -> zbus::Result<Dict>;
     fn start_machine(
         &self,
         name: &str,
@@ -136,6 +138,18 @@ pub trait Manager {
     fn create_network(&self, name: &str, options: Options<'_>) -> zbus::Result<Dict>;
     fn remove_networks(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
     fn prune_networks(&self) -> zbus::Result<OwnedObjectPath>;
+    fn connect_network(
+        &self,
+        network: &str,
+        machine: &str,
+        options: Options<'_>,
+    ) -> zbus::Result<OwnedObjectPath>;
+    fn disconnect_network(
+        &self,
+        network: &str,
+        machine: &str,
+        options: Options<'_>,
+    ) -> zbus::Result<OwnedObjectPath>;
     fn network_up(&self) -> zbus::Result<Dict>;
     fn login(
         &self,

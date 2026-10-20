@@ -29,6 +29,8 @@ pub struct CreateRequest {
     pub network: Vec<String>,
     /// NAME or NETWORK=NAME.
     pub aliases: Vec<String>,
+    /// Fixed addresses: IP on the primary network or NETWORK=IP.
+    pub addresses: Vec<String>,
     /// HOST:CONTAINER[/udp], like start -p.
     pub publish: Vec<String>,
     pub force: bool,
@@ -161,6 +163,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     // publish the same one), nor a user-defined network or another machine's
     // namespace, which a machine joins only when told to.
     let mut draft = ImageRecord {
+        started: None,
         network_name: None,
         address: None,
         extra_networks: Vec::new(),
@@ -184,6 +187,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         draft.aliases =
             crate::api::network::parse_aliases(&request.aliases, &bridge::networks_of(&draft))?;
     }
+    crate::api::machines::apply_addresses(store, config, &mut draft, &request.addresses)?;
     if let Some(entrypoint) = &request.entrypoint {
         volume::reject_control_characters_but_tab(entrypoint)?;
         draft.entrypoint = Some(if entrypoint.is_empty() {

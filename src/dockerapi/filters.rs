@@ -42,6 +42,22 @@ impl Filters {
         Ok(Filters(out))
     }
 
+    /// From the command line's KEY=VALUE pairs (`--filter name=web`).
+    pub fn from_pairs(pairs: &[String]) -> Result<Filters, Invalid> {
+        let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for pair in pairs {
+            let (key, value) = pair.split_once('=').ok_or_else(|| {
+                Invalid(format!(
+                    "bad format of filter (expected name=value): {pair}"
+                ))
+            })?;
+            out.entry(key.trim().to_lowercase())
+                .or_default()
+                .insert(value.to_string());
+        }
+        Ok(Filters(out))
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = &String> {
         self.0.keys()
     }

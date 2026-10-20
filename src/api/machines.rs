@@ -429,6 +429,10 @@ pub async fn prepare(
         hostnet::ensure_networkd(sd, report).await?;
         return Ok(Network::Veth);
     };
+    // From its first start on it is a machine, not an image only.
+    if record.started.is_none() {
+        record.started = Some(now_unix());
+    }
     // A new run: the marks `kill` and `stop` left for the last one go.
     store.take_exit_on_next(name)?;
     store.forget_signal(name)?;
@@ -792,6 +796,8 @@ pub struct StartRequest {
     pub network: Vec<String>,
     /// NAME or NETWORK=NAME; "none" forgets them.
     pub aliases: Vec<String>,
+    /// Fixed addresses: IP on the primary network or NETWORK=IP (--ip).
+    pub addresses: Vec<String>,
     /// HOST:CONTAINER[/udp]; "none" forgets them all.
     pub publish: Vec<String>,
     /// An empty string runs the arguments alone.
@@ -832,6 +838,7 @@ impl StartRequest {
             wait: true,
             network: Vec::new(),
             aliases: Vec::new(),
+            addresses: Vec::new(),
             publish: Vec::new(),
             entrypoint: None,
             env: Vec::new(),
@@ -892,6 +899,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     match record.as_mut() {
         Some(r) => {
             apply_flags(r, args)?;
+            apply_addresses(store, config, r, &args.addresses)?;
             crate::api::dependencies::check(
                 store,
                 &args.name,
@@ -1040,6 +1048,42 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
 
 /// What a start's flags make of the machine's record: each one given replaces what the
 /// machine had. Shared with the round trip of `generate`.
+/// --ip: an address on the primary network, or NETWORK=IP on one the machine joins,
+/// refused as docker refuses it, and kept as the machine's address there.
+pub fn apply_addresses(
+    store: &Store,
+    config: &Config,
+    r: &mut ImageRecord,
+    addresses: &[String],
+) -> Result<()> {
+    for text in addresses {
+        if !bridge::bridge_kind(r) {
+            bail!(
+                "a fixed address is one on a bridge network; {} joins none",
+                r.name
+            );
+        }
+        let networks: Vec<String> = bridge::networks_of(r)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let (network, ip) = match text.split_once('=') {
+            Some((network, ip)) => (network.to_string(), ip),
+            None => (networks[0].clone(), text.as_str()),
+        };
+        if !networks.contains(&network) {
+            bail!("--ip {text}: {} does not join network {network}", r.name);
+        }
+        let addr: std::net::Ipv4Addr = ip
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid IPv4 address: {ip}"))?;
+        let net = crate::api::network::find(store, config, &network)?;
+        bridge::check_requested(store, &net, &r.name, addr)?;
+        bridge::set_address(r, &network, addr);
+    }
+    Ok(())
+}
+
 pub fn apply_flags(r: &mut ImageRecord, args: &StartRequest) -> Result<()> {
     if !args.network.is_empty() {
         crate::api::network::apply(r, &crate::api::network::choices(&args.network)?);

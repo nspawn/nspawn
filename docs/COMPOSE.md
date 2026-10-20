@@ -257,7 +257,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.networks.*.driver_opts` and below | ignored | driver options are docker's; nspawn attaches a machine its own way |
 | `services.*.networks.*.gw_priority` | yes |  |
 | `services.*.networks.*.interface_name` | ignored | nspawn names the interfaces of a machine host0, host1 and on |
-| `services.*.networks.*.ipv4_address` | no | a machine takes the next free address of a network; a fixed one is not supported |
+| `services.*.networks.*.ipv4_address` | yes |  |
 | `services.*.networks.*.ipv6_address` | ignored | nspawn networks are IPv4 only |
 | `services.*.networks.*.link_local_ips` | ignored | nspawn gives a machine no link-local address |
 | `services.*.networks.*.mac_address` | ignored | systemd-nspawn chooses the MAC address of a machine |

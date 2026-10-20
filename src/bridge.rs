@@ -883,29 +883,7 @@ pub fn create_netns(
     let result = (|| {
         run("ip", &["-n", &ns, "link", "set", "lo", "up"])?;
         for (i, (net, addr)) in nets.iter().enumerate() {
-            let host_end = host_end_name_at(name, i);
-            let inside = format!("host{i}");
-            let mac = mac_of(*addr);
-            run(
-                "ip",
-                &[
-                    "link", "add", &host_end, "type", "veth", "peer", "name", &inside, "address",
-                    &mac, "netns", &ns,
-                ],
-            )?;
-            run(
-                "ip",
-                &["link", "set", &host_end, "master", &net.interface, "up"],
-            )?;
-            let address = format!("{addr}/{}", net.subnet.prefix);
-            run("ip", &["-n", &ns, "addr", "add", &address, "dev", &inside])?;
-            // No link-local IPv6 address for machined to hand out under the machine's
-            // name. A host booted without IPv6 refuses the setting and has none anyway.
-            let _ = run(
-                "ip",
-                &["-n", &ns, "link", "set", &inside, "addrgenmode", "none"],
-            );
-            run("ip", &["-n", &ns, "link", "set", &inside, "up"])?;
+            add_veth(&ns, name, i, net, *addr)?;
         }
         let gateway = gateway.to_string();
         run(
@@ -925,6 +903,110 @@ pub fn create_netns(
         delete_netns(name);
     }
     result
+}
+
+/// The veth of a machine's `index`th network: its host end on the network's bridge,
+/// `host{index}` in the namespace named `ns` with its address and up.
+fn add_veth(ns: &str, name: &str, index: usize, net: &NetSpec, addr: Ipv4Addr) -> Result<()> {
+    let host_end = host_end_name_at(name, index);
+    let inside = format!("host{index}");
+    let mac = mac_of(addr);
+    run(
+        "ip",
+        &[
+            "link", "add", &host_end, "type", "veth", "peer", "name", &inside, "address", &mac,
+            "netns", ns,
+        ],
+    )?;
+    run(
+        "ip",
+        &["link", "set", &host_end, "master", &net.interface, "up"],
+    )?;
+    let address = format!("{addr}/{}", net.subnet.prefix);
+    run("ip", &["-n", ns, "addr", "add", &address, "dev", &inside])?;
+    // No link-local IPv6 address for machined to hand out under the machine's
+    // name. A host booted without IPv6 refuses the setting and has none anyway.
+    let _ = run(
+        "ip",
+        &["-n", ns, "link", "set", &inside, "addrgenmode", "none"],
+    );
+    run("ip", &["-n", ns, "link", "set", &inside, "up"])
+}
+
+/// The most networks a machine joins at once, which bounds the search for its veths.
+const MAX_ATTACHMENTS: usize = 64;
+
+/// A network joined while the machine runs: a veth at the first index none of its
+/// interfaces has, in its namespace (an app's has a name already; a booted machine's is
+/// reached through its leader). The default route stays where it is, as docker leaves
+/// it. Returns the interface's name inside.
+pub fn connect_live(
+    name: &str,
+    leader: u32,
+    app: bool,
+    net: &NetSpec,
+    addr: Ipv4Addr,
+) -> Result<String> {
+    let index = (1..MAX_ATTACHMENTS)
+        .find(|i| !Path::new(SYS_NET).join(host_end_name_at(name, *i)).exists())
+        .context("the machine has no veth left to join another network with")?;
+    if !app {
+        attach_netns(name, leader)?;
+    }
+    let result = add_veth(&netns_name(name), name, index, net, addr);
+    if !app {
+        delete_netns(name);
+    }
+    if result.is_err() {
+        let _ = run("ip", &["link", "del", &host_end_name_at(name, index)]);
+    }
+    result.map(|()| format!("host{index}"))
+}
+
+/// The veth of `net` goes, and its peer inside the machine with it. Whether there was
+/// one.
+pub fn disconnect_live(name: &str, net: &NetSpec) -> Result<bool> {
+    for index in 0..MAX_ATTACHMENTS {
+        let host_end = host_end_name_at(name, index);
+        let master = fs::read_link(Path::new(SYS_NET).join(&host_end).join("master"));
+        if master.is_ok_and(|m| m.file_name().is_some_and(|f| f == net.interface.as_str())) {
+            run("ip", &["link", "del", &host_end])?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// An address asked for on `net` (--ip), refused as docker refuses it: on a network
+/// made with network create only, inside its subnet, and not another machine's.
+pub fn check_requested(store: &Store, net: &NetSpec, machine: &str, addr: Ipv4Addr) -> Result<()> {
+    if net.name == DEFAULT_NETWORK {
+        bail!("user specified IP address is supported on user defined networks only");
+    }
+    if addr == net.subnet.gateway() {
+        bail!(
+            "Address already in use: {addr} is the gateway of network {}",
+            net.name
+        );
+    }
+    if !net.subnet.usable(addr) {
+        bail!(
+            "invalid config for network {}: invalid endpoint settings:\nno configured subnet or ip-range contain the IP address {addr}",
+            net.name
+        );
+    }
+    if let Some(other) = store
+        .list_images_strict()?
+        .iter()
+        .find(|r| r.name != machine && address_on(r, &net.name) == Some(addr))
+    {
+        bail!(
+            "Address already in use: {addr} is the address of {} on network {}",
+            other.name,
+            net.name
+        );
+    }
+    Ok(())
 }
 
 /// Under managed user namespaces (mstack) systemd-nsresourced makes the veths and Bridge=
@@ -1399,7 +1481,7 @@ pub fn address_on(record: &ImageRecord, network: &str) -> Option<Ipv4Addr> {
         .and_then(|a| a.address)
 }
 
-fn set_address(record: &mut ImageRecord, network: &str, addr: Ipv4Addr) {
+pub fn set_address(record: &mut ImageRecord, network: &str, addr: Ipv4Addr) {
     if network_of(record) == network {
         record.address = Some(addr);
     } else if let Some(a) = record
