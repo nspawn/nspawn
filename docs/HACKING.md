@@ -85,10 +85,14 @@ firewall zones, units), so it runs as root on a disposable VM only.
 Requirements on the VM: systemd-nspawn and machined 255 or newer (Ubuntu 24.04
 is the oldest host the suite runs on; Debian 12 with systemd 252 does not
 work), overlayfs, `ip`, `nft`, `curl`, `python3`, `openssl` (the suite signs
-an image of its own with a key it makes), access to Docker Hub (busybox,
-caddy-docker-proxy and curl among what it pulls), to lscr.io (linuxserver.io's
-s6-overlay bases) and to hub.nspawn.org (a signed image is pulled from it), a registry with the test
-image (`fedora:44` by default) that serves the OCI referrers API (zot does),
+an image of its own with a key it makes), access to Docker Hub (the images the steps
+use, busybox, alpine, memcached, caddy-docker-proxy and curl, are copied once into the
+test registry and taken from there, since Docker Hub limits anonymous pulls by address
+and the hosts of the suite share one; one step pulls from Docker Hub itself), to
+lscr.io (linuxserver.io's s6-overlay bases) and to hub.nspawn.org (a signed image is
+pulled from it), a registry with the test image (`fedora:44` by default) that serves
+the OCI referrers API and takes OCI media types (zot does; so the copies are of
+images published with them),
 mkosi for the build step, and for the `--interface` step the `dummy` and
 `mac80211_hwsim` kernel modules (Fedora ships the latter in
 `kernel-modules-internal`, Ubuntu in `linux-modules-extra`; without it the

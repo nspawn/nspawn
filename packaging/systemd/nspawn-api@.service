@@ -6,3 +6,7 @@ StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/bin/nspawn api-serve %i
+# What a machine's clients can make it take of the host.
+TasksMax=64
+MemoryMax=256M
+LimitNOFILE=1024

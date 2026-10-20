@@ -38,7 +38,7 @@ files_pid_file(nspawn_var_run_t)
 gen_require(`
 	type init_t, system_dbusd_t, journalctl_t, unconfined_service_t;
 	type systemd_machined_t, systemd_machined_var_lib_t, systemd_networkd_unit_file_t, tmpfs_t;
-	type root_t;
+	type root_t, ifconfig_t;
 ')
 
 allow nspawn_t self:capability { chown dac_override dac_read_search fowner fsetid kill mknod net_admin setfcap setgid setpcap setuid sys_admin sys_chroot sys_ptrace sys_resource };
@@ -154,6 +154,10 @@ modutils_domtrans_kmod(nspawn_t)
 # The bridge: ip, nft and iptables in their own domains, the forwarding
 # sysctls, the network namespaces prepared for apps.
 sysnet_domtrans_ifconfig(nspawn_t)
+# network connect of a running booted machine: ip makes the veth peer right in the
+# machine's network namespace, which its user namespace owns, and enters it (ip -n)
+# to give the peer its address.
+allow ifconfig_t self:cap_userns { net_admin sys_admin };
 iptables_domtrans(nspawn_t)
 kernel_rw_net_sysctls(nspawn_t)
 sysnet_read_ifconfig_run_files(nspawn_t)
@@ -224,18 +228,23 @@ fs_manage_tmpfs_dirs(nspawn_t)
 fs_manage_tmpfs_files(nspawn_t)
 fs_manage_tmpfs_symlinks(nspawn_t)
 
+# CDI specs: /etc/cdi and /var/run/cdi, read at every start of a machine that names
+# a CDI device.
+files_read_generic_pids(nspawn_t)
+
 # CDI hooks run in a private mount namespace where the machine's root is a mount
-# point of its own (bound onto itself once / is made private), the CDI mounts are
-# bound below it and remounted read-only where they say so, a tmpfs /dev gets the
-# CDI device nodes and a /proc is mounted; the hook itself is executed in the
-# domain of systemd-nspawn@.service.
+# point of its own (bound onto itself once / is made private; an overlay root has
+# the type of its upper directory, a flat one machined's), a tmpfs /dev gets the
+# machine's device nodes bound onto empty files and the mount points of the CDI
+# mounts below it, a /proc is mounted, and the CDI mounts are bound on top and
+# remounted read-only where they say so; the hook itself is executed in the domain
+# of systemd-nspawn@.service.
 allow nspawn_t root_t:dir mounton;
-allow nspawn_t nspawn_var_lib_t:{ dir file } mounton;
+allow nspawn_t { nspawn_var_lib_t systemd_machined_var_lib_t }:{ dir file } mounton;
+allow nspawn_t tmpfs_t:{ dir file } mounton;
 fs_mount_tmpfs(nspawn_t)
 fs_remount_all_fs(nspawn_t)
 kernel_mount_proc(nspawn_t)
-fs_manage_tmpfs_chr_files(nspawn_t)
-fs_manage_tmpfs_blk_files(nspawn_t)
 
 # mkosi builds images with mounts and chroots of its own; it runs unconfined,
 # as it does from a shell.

@@ -2,6 +2,7 @@
 //! response body reads from. A client that goes away closes the channel, which ends the
 //! writer and what it runs.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,8 +67,20 @@ pub async fn logs(query: LogsQuery, tx: Sender<Bytes>) {
         return;
     };
     let mut lines = tokio::io::BufReader::new(stdout).lines();
+    // A follow ends with the machine, as docker's does with the container: machined's
+    // file of it goes when it stops.
+    let registered = std::path::Path::new("/run/systemd/machines").join(&query.request.machine);
+    let mut ticks = tokio::time::interval(std::time::Duration::from_secs(2));
+    let mut gone = 0;
     loop {
         tokio::select! {
+            _ = ticks.tick(), if query.request.follow => {
+                gone = if registered.exists() { 0 } else { gone + 1 };
+                // A tick of grace for its last lines.
+                if gone > 1 {
+                    break;
+                }
+            }
             line = lines.next_line() => {
                 let Ok(Some(line)) = line else { break };
                 let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
@@ -244,13 +257,20 @@ pub async fn stats(
 
 /// docker's events, from `since` (unix seconds) or only new ones, until `until` or
 /// the client goes.
+/// A machine's attributes (created, image) and labels.
+type Known = (BTreeMap<String, String>, BTreeMap<String, String>);
+
 pub async fn events(
     ctx: Arc<Context>,
     since: Option<String>,
     until: Option<String>,
+    deadline: Option<std::time::Duration>,
     filters: Filters,
     tx: Sender<Bytes>,
 ) {
+    if deadline == Some(std::time::Duration::ZERO) {
+        return;
+    }
     let mut follow = match crate::api::events::Follow::spawn(
         since.as_deref(),
         until.as_deref(),
@@ -259,10 +279,57 @@ pub async fn events(
         Ok(follow) => follow,
         Err(_) => return,
     };
+    let ends = async {
+        match deadline {
+            Some(after) => tokio::time::sleep(after).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(ends);
+    // What each machine's record said, for its events once the record is gone: the die
+    // of a machine of run --rm comes after its removal more often than not.
+    let mut known: BTreeMap<String, Known> = ctx
+        .store
+        .list_images()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| {
+            let attributes = BTreeMap::from([
+                ("created".to_string(), r.created.to_string()),
+                ("image".to_string(), r.reference.clone()),
+            ]);
+            (r.name.clone(), (attributes, r.effective_labels()))
+        })
+        .collect();
     loop {
         tokio::select! {
+            () = &mut ends => break,
             event = follow.next(&ctx.store) => {
-                let Some(event) = event else { break };
+                let Some(mut event) = event else { break };
+                if event.kind == "machine" {
+                    match event.attributes.get("created") {
+                        Some(created) => {
+                            let attributes = BTreeMap::from([
+                                ("created".to_string(), created.clone()),
+                                (
+                                    "image".to_string(),
+                                    event.attributes.get("image").cloned().unwrap_or_default(),
+                                ),
+                            ]);
+                            known.insert(event.name.clone(), (attributes, event.labels.clone()));
+                        }
+                        None => {
+                            if let Some((attributes, labels)) = known.get(&event.name) {
+                                for (k, v) in attributes {
+                                    event.attributes.entry(k.clone()).or_insert_with(|| v.clone());
+                                }
+                                if event.labels.is_empty() {
+                                    event.labels.clone_from(labels);
+                                }
+                            }
+                        }
+                    }
+                }
                 let networks = match Snapshot::networks_of(&ctx, &event.name) {
                     Some(nets) if event.kind == "machine" => nets,
                     _ => Vec::new(),

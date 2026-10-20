@@ -1,8 +1,8 @@
 //! `--mount`, the long form of `-v` and `--tmpfs`: comma-separated KEY=VALUE fields,
-//! read as docker's command line reads them, and given to the machine as the volume or
-//! tmpfs they describe.
+//! read as the reference's command line reads them, and given to the machine as the
+//! volume or tmpfs they describe.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 
 /// What one `--mount` becomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,7 +72,7 @@ fn bool_value(key: &str, value: &str, given: bool) -> Result<bool> {
 }
 
 /// One `--mount` value. A bind's relative source starting with `.` is taken from the
-/// current directory, as docker's client does.
+/// current directory of the command line.
 pub fn parse(text: &str) -> Result<Mount> {
     let text = text.trim();
     if text.is_empty() {
@@ -81,6 +81,7 @@ pub fn parse(text: &str) -> Result<Mount> {
     let mut kind = "volume".to_string();
     let (mut source, mut target) = (String::new(), String::new());
     let mut read_only = false;
+    let mut create_source = false;
     let (mut bind_options, mut volume_options, mut tmpfs_options) = (false, false, false);
     let (mut size, mut mode) = (None::<u64>, None::<u32>);
     for field in csv_fields(text)? {
@@ -123,7 +124,7 @@ pub fn parse(text: &str) -> Result<Mount> {
             }
             "target" | "dst" | "destination" => target = value.to_string(),
             "readonly" | "ro" => read_only = bool_value(&key, value, given)?,
-            // Docker Desktop's file sharing; nothing here.
+            // A setting of file sharing with a VM; nothing here.
             "consistency" => {}
             // A bind into a machine propagates nothing either way.
             "bind-propagation" => bind_options = true,
@@ -142,11 +143,10 @@ pub fn parse(text: &str) -> Result<Mount> {
                     ),
                 }
             }
+            // Made once every field is known good, whatever their order.
             "bind-create-src" => {
                 bind_options = true;
-                if bool_value(&key, value, given)? && !source.is_empty() {
-                    std::fs::create_dir_all(&source)?;
-                }
+                create_source = bool_value(&key, value, given)?;
             }
             "volume-subpath" => bail!("volume-subpath is not supported: a volume is mounted whole"),
             // A new volume is filled from the image all the same; nspawn volumes carry no
@@ -199,6 +199,10 @@ pub fn parse(text: &str) -> Result<Mount> {
             }
             if !source.starts_with('/') {
                 bail!("invalid mount config for type \"bind\": invalid mount path: '{source}' mount path must be absolute");
+            }
+            if create_source {
+                std::fs::create_dir_all(&source)
+                    .with_context(|| format!("creating {source} (bind-create-src)"))?;
             }
             Ok(Mount::Volume(format!("{source}:{target}{ro}")))
         }
@@ -362,6 +366,25 @@ mod tests {
             "bind-nonrecursive is deprecated, use bind-recursive=disabled instead"
         );
         assert!(err("type=\"bind,src=/a").contains("quoted-field"));
+    }
+
+    #[test]
+    fn a_source_is_made_only_for_a_good_bind() {
+        let dir = tempfile::tempdir().unwrap();
+        let made = dir.path().join("made");
+        let text = format!(
+            "bind-create-src,type=bind,source={},target=/x",
+            made.display()
+        );
+        parse(&text).unwrap();
+        assert!(made.is_dir(), "the order of the fields does not matter");
+        let refused = dir.path().join("refused");
+        let text = format!(
+            "type=volume,bind-create-src,source={},target=/x",
+            refused.display()
+        );
+        assert!(parse(&text).is_err());
+        assert!(!refused.exists(), "nothing is made for a refused mount");
     }
 
     #[test]

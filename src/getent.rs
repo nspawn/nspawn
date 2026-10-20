@@ -147,6 +147,69 @@ pub fn shim(store: &Store, name: &str, record: &ImageRecord) -> Result<Vec<Bind>
     Ok(binds)
 }
 
+/// The binds of the stand-in for a program run as `user` (USER[:GROUP]) in the plain
+/// directory `root`, written to `dir`: what `shim` gives an app machine, for a build
+/// step.
+pub fn shim_in_dir(root: &Path, user: &str, dir: &Path) -> Result<Vec<Bind>> {
+    let Some(name) = switches_to(Some(user)) else {
+        return Ok(Vec::new());
+    };
+    let resolve = |r: &str| crate::backend::chase(root, Path::new(r));
+    let group = match group_of(Some(user)) {
+        Some(group) => Some(match group.parse::<u32>() {
+            Ok(gid) => gid,
+            Err(_) => gid_in(&text_in(&resolve, "etc/group"), group).with_context(|| {
+                format!("unable to find group {group}: no matching entries in group file")
+            })?,
+        }),
+        None => None,
+    };
+    let has = |path: &str| {
+        resolve(path)
+            .and_then(|p| p.symlink_metadata().ok())
+            .is_some_and(|m| !m.is_file() || m.len() > 0)
+    };
+    let arch = native();
+    let Some(placement) = target("the step", name, has, arch.is_some())? else {
+        return Ok(Vec::new());
+    };
+    let content = match (placement.kind, arch) {
+        (Kind::Program, Some(arch)) => {
+            let passwd = text_in(&resolve, "etc/passwd");
+            let groups = text_in(&resolve, "etc/group");
+            let (passwd, initgroups) =
+                answers(&passwd, &groups, name, group).with_context(|| {
+                    format!("unable to find user {name}: no matching entries in passwd file")
+                })?;
+            program(arch, name, &passwd, &initgroups)
+        }
+        _ => script(group).into_bytes(),
+    };
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let mut binds = vec![Bind {
+        source: write(dir, &content)?,
+        target: TARGET.to_string(),
+        read_only: true,
+    }];
+    if let Some(real) = placement.real {
+        // Inside the root whatever its links say: the step's image is anybody's.
+        let Some(source) = resolve(real) else {
+            return Ok(binds);
+        };
+        if source.symlink_metadata().is_ok_and(|m| m.is_file()) {
+            binds.push(Bind {
+                source,
+                target: REAL.to_string(),
+                read_only: true,
+            });
+        }
+    }
+    Ok(binds)
+}
+
+/// Where the stand-in and the image's own getent go, mount points a run may leave.
+pub const TARGETS: [&str; 2] = [TARGET, REAL];
+
 /// The user systemd-nspawn switches to, if any: root and 0 are no switch unless a group
 /// comes with them, which only the stand-in can hand over.
 fn switches_to(user: Option<&str>) -> Option<&str> {
@@ -199,12 +262,17 @@ pub fn script(group: Option<u32>) -> String {
 /// A file of the machine's root as text, its links followed inside the root and never
 /// onto the host; empty when there is none, or it is not a regular file.
 fn root_text(store: &Store, name: &str, backend: BackendChoice, relative: &str) -> String {
+    text_in(
+        &|r: &str| crate::backend::root_path(store, name, backend, r),
+        relative,
+    )
+}
+
+/// `root_text` over a root `resolve` finds paths in.
+fn text_in(resolve: &dyn Fn(&str) -> Option<PathBuf>, relative: &str) -> String {
     let mut relative = PathBuf::from(relative);
     for _ in 0..40 {
-        let Some(path) = relative
-            .to_str()
-            .and_then(|r| crate::backend::root_path(store, name, backend, r))
-        else {
+        let Some(path) = relative.to_str().and_then(resolve) else {
             return String::new();
         };
         let Ok(link) = fs::read_link(&path) else {

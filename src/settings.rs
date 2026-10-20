@@ -162,7 +162,7 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
             }
             // What a stop of the unit sends PID 1: the stub init gets a poweroff request
             // (the image's stop signal is what `nspawn stop` sends the program itself), a
-            // program that is PID 1 its stop signal, as docker sends it.
+            // program that is PID 1 its stop signal.
             if s.pid1 {
                 let signal = s
                     .tuning

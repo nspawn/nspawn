@@ -3,6 +3,7 @@
 //! the org.nspawn bus as the command line drives them. A project is known by the
 //! labels of its machines.
 
+mod build;
 mod convert;
 mod info;
 mod lifecycle;
@@ -12,7 +13,7 @@ mod up;
 
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{bail, Result};
 
 use super::cli::{ComposeArgs, ComposeCommand};
 use super::config::Host;
@@ -39,7 +40,7 @@ pub mod label {
 }
 
 /// The docker compose release nspawn compose stamps its machines with.
-fn compose_version() -> &'static str {
+pub(super) fn compose_version() -> &'static str {
     super::support::DOCKER_COMPOSE.trim_start_matches('v')
 }
 
@@ -128,6 +129,8 @@ impl Engine<'_> {
             .map_err(client::error)?
             .into_iter()
             .map(Machine::from_dict)
+            // An image the project built carries its labels too, and is no machine.
+            .filter(|m| client::string(&m.dict, "origin") == "create")
             .filter(|m| m.labels.get(label::PROJECT) == Some(&self.name))
             .collect();
         machines.sort_by(|a, b| a.name.cmp(&b.name));
@@ -170,17 +173,7 @@ pub fn valid_machine_name(name: &str) -> bool {
 /// An image of a compose file as nspawn's registry client reads it: one that names no
 /// registry comes from Docker Hub, an official one under library/.
 pub fn image_reference(image: &str) -> Result<crate::reference::ImageRef> {
-    let first = image.split('/').next().unwrap_or("");
-    let has_registry =
-        image.contains('/') && (first.contains('.') || first.contains(':') || first == "localhost");
-    let full = if has_registry {
-        image.to_string()
-    } else if image.contains('/') {
-        format!("docker.io/{image}")
-    } else {
-        format!("docker.io/library/{image}")
-    };
-    crate::reference::ImageRef::parse(&full, "docker.io").with_context(|| format!("image {image}"))
+    crate::reference::ImageRef::docker(image)
 }
 
 /// Runs a command that drives machines; the error is the line to print.
@@ -213,6 +206,7 @@ fn named(command: &ComposeCommand) -> Vec<String> {
         C::Pause(c) => c.service.clone(),
         C::Ps(c) => c.service.clone(),
         C::Pull(c) => c.service.clone(),
+        C::Build(c) => c.service.clone(),
         C::Restart(c) => c.service.clone(),
         C::Rm(c) => c.service.clone(),
         C::Start(c) => c.service.clone(),
@@ -246,6 +240,7 @@ fn wants(command: &ComposeCommand) -> Wants {
         | C::Create(_)
         | C::Run(_)
         | C::Pull(_)
+        | C::Build(_)
         | C::Scale(_)
         | C::Exec(_)
         | C::Port(_)
@@ -310,6 +305,7 @@ async fn dispatch(
         C::Up(c) => up::up(&mut engine, c).await,
         C::Create(c) => up::create(&mut engine, c).await,
         C::Pull(c) => up::pull(&mut engine, c).await,
+        C::Build(c) => build::run(&mut engine, c).await,
         C::Scale(c) => up::scale(&mut engine, c).await,
         C::Run(c) => logs::run(&mut engine, c).await,
         C::Down(c) => lifecycle::down(&mut engine, c).await,

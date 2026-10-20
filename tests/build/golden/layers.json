@@ -1,0 +1,387 @@
+{
+ "architecture": "amd64",
+ "config": {
+  "Cmd": [
+   "sh"
+  ],
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "WorkingDir": "/app"
+ },
+ "history": [
+  {
+   "created_by": "BusyBox 1.37.0 (glibc), Debian 13"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "WORKDIR /app"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY files/ ./"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY --chmod=0750 run.sh /opt/bin/"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY --chown=1000:1000 owned.txt /app/owned/"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN /bin/sh -c echo \"made\" > /app/made && ln -s made /app/link && ln /app/made /app/hard && chmod 4755 /app/made"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN /bin/sh -c rm /bin/vi /app/top.txt && mkdir -p /etc/opaque && echo a > /etc/opaque/a && echo changed >> /etc/hostname"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN /bin/sh -c rm -rf /etc/opaque && mkdir /etc/opaque && echo b > /etc/opaque/b"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN /bin/sh -c true"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN /bin/sh -c set -e\necho heredoc > /app/heredoc\nmkfifo /app/fifo\n"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY <<EOT /app/inline.txt"
+  }
+ ],
+ "layers": [
+  {
+   "base": true,
+   "diff_id": "sha256:5a9bfd996c6d49c6c3cb4ddfb76e8d09cf16b6b7cf6601d1f2dffbdbc3edb5d4"
+  },
+  {
+   "diff_id": "sha256:1465afee920ecad2f12efc81bb928d6ec57830e98006f4c74c72239adaeaac3f",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "app",
+     "type": "dir",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:0a51eb01783234d87073d53350acf9c5161b51b1a52101dcdc2a1a1a6c5bccfc",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "app",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "app/sub",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "app/sub/nested.txt",
+     "sha256": "sha256:370a8c04b8a65bb4494275eec227f1b694db04c76da6b0b8ae88ed1ab19790a3",
+     "size": 7,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "link": "top.txt",
+     "mode": "0777",
+     "path": "app/top-link",
+     "type": "symlink",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "app/top.txt",
+     "sha256": "sha256:f7de2947c64cb6435e15fb2bef359d1ed5f6356b2aebb7b20535e3772904e6db",
+     "size": 4,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:286c370bd00729f718e3521049736f8bda43245e1e2ab95de3c78e5cc691cd9c",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0750",
+     "path": "opt",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0750",
+     "path": "opt/bin",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0750",
+     "path": "opt/bin/run.sh",
+     "sha256": "sha256:a4e0317eafab5cf1bc4a0041c7c8aeb6ece56fe72e7b2b3017a8a6574614cd35",
+     "size": 19,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:6f18a1dea28638ed812963cb5aa8f8e3dcdcc76d43d5bce3a19c3421fba24f28",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "app",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 1000,
+     "mode": "0755",
+     "path": "app/owned",
+     "type": "dir",
+     "uid": 1000
+    },
+    {
+     "gid": 1000,
+     "mode": "0644",
+     "path": "app/owned/owned.txt",
+     "sha256": "sha256:33bff9108736f23280e9cd50cb1472e3a5b4403ed3f2da1fe67b8487a4fb75c6",
+     "size": 6,
+     "type": "file",
+     "uid": 1000
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:c2369701b896931b9eb7583119f60f66120ecb4e4c849212500538c837e28b9e",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "app",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "4755",
+     "path": "app/hard",
+     "sha256": "sha256:9ccbd3f1b19a1cdfd8d7c6ae48e9e822e2345f5be1a6187b19e41486c6941004",
+     "size": 5,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "link": "made",
+     "mode": "0777",
+     "path": "app/link",
+     "type": "symlink",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "link": "app/hard",
+     "mode": "4755",
+     "path": "app/made",
+     "type": "hardlink",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "proc",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "sys",
+     "type": "dir",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:f086b23c9e583edbd0b7eb30cb7f397976c62b36d4fc71b809715d0e5b2c18f5",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "app",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0000",
+     "path": "app/.wh.top.txt",
+     "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "size": 0,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "bin",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0000",
+     "path": "bin/.wh.vi",
+     "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "size": 0,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "etc",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "etc/hostname",
+     "sha256": "sha256:7f8b1dfc466b6249f06cbe55c9174df2578e7754da793fded244ef5cba2a38f1",
+     "size": 8,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "etc/opaque",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "etc/opaque/a",
+     "sha256": "sha256:87428fc522803d31065e7bce3cf03fe475096631e5e07bbd7a0fde60c4cf25c7",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:467f93fc5b034c35ba76df78252f7458453f9d9d20e056593212eb716eba0bea",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "etc",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "etc/opaque",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0000",
+     "path": "etc/opaque/.wh.a",
+     "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+     "size": 0,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "etc/opaque/b",
+     "sha256": "sha256:0263829989b6fd954f72baaf2fc64bc2e2f01d692d4de72986ea808f6e99813f",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+   "entries": []
+  },
+  {
+   "diff_id": "sha256:a3dac4a73312e9b2547dafe21ddafd2886486cca50c1a02caece5a445de67d59",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "app",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "app/fifo",
+     "type": "fifo",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "app/heredoc",
+     "sha256": "sha256:c6f7bd2284ea81f19cd4521a2ade46ef98d9f246ae6d0cb5f59aaac57da13102",
+     "size": 8,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:355d2df55697c015ee60f703bd2866bf1f5cea262911509ba66d889eccccf4cf",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "app",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "app/inline.txt",
+     "sha256": "sha256:5f4c49229ad3c148a35f0af9f7cd671ba71575dd7998041478ab5cd48c7822d4",
+     "size": 8,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  }
+ ],
+ "os": "linux"
+}

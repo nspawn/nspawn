@@ -435,15 +435,6 @@ impl Project {
                     "service {quoted} has neither an image nor a build context specified"
                 )));
             }
-            if build.is_some() && string(&s, "image").is_empty() && get(&s, "provider").is_none() {
-                self.refused.push(Refusal {
-                    service: name.clone(),
-                    path: "build".to_string(),
-                    line: format!(
-                        "service {quoted} has a build section and no image: nspawn runs images published on Docker Hub or any registry, but does not build Dockerfiles; building is not supported"
-                    ),
-                });
-            }
             if let Some(build) = build {
                 if !string(build, "dockerfile_inline").is_empty()
                     && !string(build, "dockerfile").is_empty()

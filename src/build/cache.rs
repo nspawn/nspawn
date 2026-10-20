@@ -1,0 +1,326 @@
+//! The build cache: a layer each step made, by a key of the step and everything it
+//! depends on, and the base images builds took from registries. What it names stays in
+//! the store until `builder prune` lets it go.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context as _, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// A step that made a layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Entry {
+    /// The gzip blob, as the store names layers.
+    pub layer: String,
+    pub diff_id: String,
+    pub size: u64,
+    /// When the step ran: the history entry keeps it, so that a build taken whole from
+    /// the cache gives the same image.
+    pub created: String,
+    /// Unix seconds of its last use.
+    #[serde(default)]
+    pub used: u64,
+    /// The stage it was made in, for --no-cache-filter and the listing.
+    #[serde(default)]
+    pub description: String,
+}
+
+/// A base image a build pulled: its config and layers, kept with the cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Base {
+    pub reference: String,
+    pub manifest_digest: String,
+    pub config: String,
+    pub layers: Vec<String>,
+    #[serde(default)]
+    pub used: u64,
+}
+
+/// The key of a step: the parts it depends on, each length-prefixed so that no two
+/// lists of parts give the same bytes.
+pub fn key(parts: &[&[u8]]) -> String {
+    let mut hash = Sha256::new();
+    for part in parts {
+        hash.update((part.len() as u64).to_le_bytes());
+        hash.update(part);
+    }
+    format!("sha256:{}", hex::encode(hash.finalize()))
+}
+
+#[derive(Debug, Clone)]
+pub struct Cache {
+    dir: PathBuf,
+}
+
+fn file_name(key: &str) -> String {
+    key.replacen(':', "-", 1)
+}
+
+impl Cache {
+    pub fn new(dir: &Path) -> Cache {
+        Cache {
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    fn entries_dir(&self) -> PathBuf {
+        self.dir.join("entries")
+    }
+
+    fn bases_dir(&self) -> PathBuf {
+        self.dir.join("bases")
+    }
+
+    /// The entry of `key`, its use noted.
+    pub fn get(&self, key: &str) -> Option<Entry> {
+        let path = self.entries_dir().join(format!("{}.json", file_name(key)));
+        let mut entry: Entry = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+        entry.used = crate::store::now_unix();
+        let _ = self.write(&path, &entry);
+        Some(entry)
+    }
+
+    pub fn put(&self, key: &str, entry: &Entry) -> Result<()> {
+        let dir = self.entries_dir();
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        self.write(&dir.join(format!("{}.json", file_name(key))), entry)
+    }
+
+    pub fn put_base(&self, base: &Base) -> Result<()> {
+        let dir = self.bases_dir();
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        self.write(
+            &dir.join(format!("{}.json", file_name(&base.manifest_digest))),
+            base,
+        )
+    }
+
+    fn write<T: Serialize>(&self, path: &Path, value: &T) -> Result<()> {
+        // Two builds may write one entry at once: each through a file of its own.
+        let tmp = path.with_extension(format!("json.tmp-{}", crate::store::unique_suffix()));
+        std::fs::write(&tmp, serde_json::to_vec(value)?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// Every entry, with its file.
+    pub fn entries(&self) -> Vec<(PathBuf, Entry)> {
+        read_all(&self.entries_dir())
+    }
+
+    pub fn bases(&self) -> Vec<(PathBuf, Base)> {
+        read_all(&self.bases_dir())
+    }
+
+    /// The blobs the cache keeps: its layers, and the configs and layers of its bases.
+    pub fn blobs(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.entries().into_iter().map(|(_, e)| e.layer).collect();
+        for (_, base) in self.bases() {
+            out.push(base.config);
+            out.extend(base.layers);
+        }
+        out
+    }
+}
+
+/// A row of `builder du`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Usage {
+    /// The entry's key, or the cache mount's or base image's name.
+    pub id: String,
+    /// layer, mount or base.
+    pub kind: &'static str,
+    pub description: String,
+    pub size: u64,
+    pub used: u64,
+    /// Whether an image of the store takes the blob too.
+    pub shared: bool,
+}
+
+/// What the cache holds, most recently used first.
+pub fn usage(store: &crate::store::Store) -> Result<Vec<Usage>> {
+    let cache = Cache::new(&store.build_cache_dir());
+    let in_images: std::collections::HashSet<String> = store
+        .list_images()?
+        .into_iter()
+        .flat_map(|r| r.layers)
+        .collect();
+    let blob_size = |d: &str| std::fs::metadata(store.blob_path(d)).map_or(0, |m| m.len());
+    let mut out = Vec::new();
+    for (path, entry) in cache.entries() {
+        out.push(Usage {
+            id: path
+                .file_stem()
+                .map(|s| s.to_string_lossy().replacen('-', ":", 1))
+                .unwrap_or_default(),
+            kind: "layer",
+            description: entry.description.clone(),
+            size: blob_size(&entry.layer),
+            used: entry.used,
+            shared: in_images.contains(&entry.layer),
+        });
+    }
+    for (_, base) in cache.bases() {
+        let shared = base.layers.iter().all(|l| in_images.contains(l));
+        out.push(Usage {
+            id: base.manifest_digest.clone(),
+            kind: "base",
+            description: base.reference.clone(),
+            size: base.layers.iter().map(|l| blob_size(l)).sum::<u64>() + blob_size(&base.config),
+            used: base.used,
+            shared,
+        });
+    }
+    if let Ok(mounts) = std::fs::read_dir(cache.dir.join("mounts")) {
+        for mount in mounts.flatten() {
+            let meta = mount.metadata().ok();
+            out.push(Usage {
+                id: mount.file_name().to_string_lossy().into_owned(),
+                kind: "mount",
+                description: "RUN --mount=type=cache".to_string(),
+                size: crate::api::disk::tree_size(&mount.path(), &mut Default::default()),
+                used: meta.and_then(|m| m.modified().ok()).map_or(0, |t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs())
+                }),
+                shared: false,
+            });
+        }
+    }
+    out.sort_by(|a, b| b.used.cmp(&a.used).then(a.id.cmp(&b.id)));
+    Ok(out)
+}
+
+/// What `builder prune` takes: without `all`, what no image takes too; everything
+/// last used before `until`; and, with `keep_storage`, the least recently used beyond
+/// that many bytes.
+pub fn prunable(
+    rows: &[Usage],
+    all: bool,
+    until: Option<u64>,
+    keep_storage: Option<u64>,
+) -> Vec<Usage> {
+    let mut kept = 0u64;
+    let mut out = Vec::new();
+    for row in rows {
+        let old = until.is_none_or(|t| row.used < t);
+        let fits = keep_storage.is_some_and(|limit| kept + row.size <= limit);
+        if (all || !row.shared) && old && !fits {
+            out.push(row.clone());
+        } else {
+            kept += row.size;
+        }
+    }
+    out
+}
+
+/// Removes `rows` from the cache; the store's gc then takes the blobs and layers nothing
+/// else keeps.
+pub fn remove(store: &crate::store::Store, rows: &[Usage]) -> Result<()> {
+    let cache = Cache::new(&store.build_cache_dir());
+    for row in rows {
+        let path = match row.kind {
+            "layer" => cache
+                .entries_dir()
+                .join(format!("{}.json", file_name(&row.id))),
+            "base" => cache
+                .bases_dir()
+                .join(format!("{}.json", file_name(&row.id))),
+            _ => {
+                let dir = cache.dir.join("mounts").join(&row.id);
+                std::fs::remove_dir_all(&dir)
+                    .with_context(|| format!("removing {}", dir.display()))?;
+                continue;
+            }
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing {}", path.display())),
+        }
+    }
+    Ok(())
+}
+
+fn read_all<T: serde::de::DeserializeOwned>(dir: &Path) -> Vec<(PathBuf, T)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(PathBuf, T)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .filter_map(|p| {
+            let value = serde_json::from_slice(&std::fs::read(&p).ok()?).ok()?;
+            Some((p, value))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prune_takes_what_the_options_say() {
+        let row = |id: &str, size, used, shared| Usage {
+            id: id.into(),
+            kind: "layer",
+            description: String::new(),
+            size,
+            used,
+            shared,
+        };
+        // Most recently used first, as `usage` sorts them.
+        let rows = [
+            row("a", 10, 30, false),
+            row("b", 10, 20, true),
+            row("c", 10, 10, false),
+        ];
+        let ids = |v: Vec<Usage>| v.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(ids(prunable(&rows, false, None, None)), ["a", "c"]);
+        assert_eq!(ids(prunable(&rows, true, None, None)), ["a", "b", "c"]);
+        assert_eq!(ids(prunable(&rows, true, Some(25), None)), ["b", "c"]);
+        assert_eq!(ids(prunable(&rows, true, None, Some(15))), ["b", "c"]);
+    }
+
+    #[test]
+    fn keys_tell_lists_of_parts_apart() {
+        assert_ne!(key(&[b"ab", b"c"]), key(&[b"a", b"bc"]));
+        assert_eq!(key(&[b"x"]), key(&[b"x"]));
+    }
+
+    #[test]
+    fn entries_and_bases_name_their_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path());
+        assert!(cache.get("sha256:k").is_none());
+        let entry = Entry {
+            layer: "sha256:l".into(),
+            diff_id: "sha256:d".into(),
+            size: 3,
+            created: "2026-10-18T00:00:00.000000000Z".into(),
+            used: 0,
+            description: "RUN true".into(),
+        };
+        cache.put("sha256:k", &entry).unwrap();
+        let got = cache.get("sha256:k").unwrap();
+        assert_eq!(got.layer, "sha256:l");
+        assert!(got.used > 0);
+        cache
+            .put_base(&Base {
+                reference: "busybox".into(),
+                manifest_digest: "sha256:m".into(),
+                config: "sha256:c".into(),
+                layers: vec!["sha256:b1".into()],
+                used: 0,
+            })
+            .unwrap();
+        let mut blobs = cache.blobs();
+        blobs.sort();
+        assert_eq!(blobs, ["sha256:b1", "sha256:c", "sha256:l"]);
+    }
+}

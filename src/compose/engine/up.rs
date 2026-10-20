@@ -32,6 +32,10 @@ pub struct Converge {
     pub wait: bool,
     pub wait_timeout: Option<Duration>,
     pub timeout: Option<u64>,
+    /// How images are built where a service builds its own; none with --no-build.
+    pub build: Option<super::build::Flags>,
+    /// --build: every service with a build section is built.
+    pub force_build: bool,
 }
 
 /// A local image a service runs.
@@ -137,6 +141,13 @@ pub async fn up(e: &mut Engine<'_>, a: &UpArgs) -> Result<()> {
     if a.no_start && a.wait {
         bail!("--no-start and --wait are incompatible");
     }
+    if a.build && a.no_build {
+        bail!("--build and --no-build are incompatible");
+    }
+    let flags = super::build::Flags {
+        quiet: a.quiet_build,
+        ..Default::default()
+    };
     let converge = Converge {
         services: a.service.clone(),
         force_recreate: a.force_recreate,
@@ -158,6 +169,8 @@ pub async fn up(e: &mut Engine<'_>, a: &UpArgs) -> Result<()> {
             .filter(|t| *t > 0)
             .map(|t| Duration::from_secs(t as u64)),
         timeout: a.timeout.map(|t| t.max(0) as u64),
+        build: (!a.no_build).then_some(flags),
+        force_build: a.build,
     };
     let machines = converge_project(e, &converge).await?;
     if a.detach || a.no_start || a.wait {
@@ -170,6 +183,9 @@ pub async fn create(e: &mut Engine<'_>, a: &CreateArgs) -> Result<()> {
     if a.force_recreate && a.no_recreate {
         bail!("--force-recreate and --no-recreate are incompatible");
     }
+    if a.build && a.no_build {
+        bail!("--build and --no-build are incompatible");
+    }
     let converge = Converge {
         services: a.service.clone(),
         force_recreate: a.force_recreate,
@@ -178,6 +194,8 @@ pub async fn create(e: &mut Engine<'_>, a: &CreateArgs) -> Result<()> {
         scale: scale_overrides(&a.scale)?,
         pull: a.pull.clone(),
         quiet_pull: a.quiet_pull,
+        build: (!a.no_build).then(Default::default),
+        force_build: a.build,
         ..Default::default()
     };
     converge_project(e, &converge).await.map(|_| ())
@@ -223,25 +241,36 @@ pub async fn pull(e: &mut Engine<'_>, a: &PullArgs) -> Result<()> {
     } else {
         a.service.clone()
     };
+    // --ignore-buildable leaves every service that can build its image.
     names.retain(|n| {
         project
             .services
             .get(n)
             .and_then(Value::as_map)
-            .is_some_and(|s| !s.get("image").is_none_or(Value::is_null) || !a.ignore_buildable)
+            .is_some_and(|s| !(a.ignore_buildable && s.contains_key("build")))
     });
-    let policy = a.policy.clone().unwrap_or_else(|| "always".to_string());
-    if !matches!(policy.as_str(), "always" | "missing") {
-        bail!("invalid pull policy {policy:?}: must be one of \"always\" or \"missing\"");
+    if let Some(policy) = &a.policy {
+        if !matches!(policy.as_str(), "always" | "missing") {
+            bail!("invalid pull policy {policy:?}: must be one of \"always\" or \"missing\"");
+        }
     }
-    images(e, &names, Some(&policy), a.quiet, a.ignore_pull_failures).await?;
+    let pulls = Pulls {
+        flag: a.policy.as_deref(),
+        quiet: a.quiet,
+        ignore_failures: a.ignore_pull_failures,
+        pull_only: true,
+        ..Default::default()
+    };
+    images(e, &names, &pulls).await?;
     Ok(())
 }
 
-/// The pull policy a service gets: --pull, else its own.
-fn policy(service: &Map, flag: Option<&str>) -> String {
+/// The pull policy a service gets: --pull, else its own; `unset` for a service without
+/// one (missing for up, always for pull).
+fn policy(service: &Map, flag: Option<&str>, unset: &str) -> String {
     let own = match s(service, "pull_policy") {
-        "" | "if_not_present" | "missing" => "missing",
+        "" => unset,
+        "if_not_present" | "missing" => "missing",
         "always" | "refresh" | "daily" | "weekly" => "always",
         p if p.starts_with("every_") => "always",
         p => p,
@@ -252,98 +281,207 @@ fn policy(service: &Map, flag: Option<&str>) -> String {
     }
 }
 
-/// The local image of each service, pulled where its policy says: by service.
+/// Whether a service's image is pulled: one it names, as its policy says.
+fn pulls(policy: &str, named: bool, present: bool) -> Result<bool> {
+    Ok(match policy {
+        _ if !named => false,
+        "always" => true,
+        "missing" => !present,
+        "never" | "build" => false,
+        other => bail!("invalid pull policy {other:?}"),
+    })
+}
+
+/// Whether a service's image is built, once a pull did what it could: with its policy
+/// build, or when it is not here.
+fn rebuilds(policy: &str, buildable: bool, present: bool) -> bool {
+    buildable && (policy == "build" || !present)
+}
+
+/// What `images` is asked: the pull policy given on the command line and how images
+/// are built, if at all.
+#[derive(Default)]
+pub struct Pulls<'a> {
+    pub flag: Option<&'a str>,
+    pub quiet: bool,
+    pub ignore_failures: bool,
+    pub build: Option<&'a super::build::Flags>,
+    pub force_build: bool,
+    /// compose pull: an image that is not there and can be built is left for compose
+    /// build.
+    pub pull_only: bool,
+}
+
+/// The local image of each service, pulled or built where compose would: an image a
+/// service names is pulled as its policy says, its failure only a warning when a
+/// service of the project builds that image; then each image a build section makes is
+/// built once, when the policy of its service is build, with --build, or when the
+/// image is not there after the pulls.
 pub async fn images(
     e: &Engine<'_>,
     services: &[String],
-    flag: Option<&str>,
-    quiet: bool,
-    ignore_failures: bool,
+    p: &Pulls<'_>,
 ) -> Result<BTreeMap<String, Image>> {
     let project = e.project();
-    let local: Vec<(String, String)> = e
-        .client
-        .manager
-        .list_images()
-        .await
-        .map_err(client::error)?
-        .iter()
-        .filter(|i| client::string(i, "origin") == "pull")
-        .map(|i| (client::string(i, "reference"), client::string(i, "name")))
-        .collect();
-    let mut done: BTreeMap<String, Image> = BTreeMap::new();
+    let list = || async {
+        Ok::<Vec<(String, String)>, anyhow::Error>(
+            e.client
+                .manager
+                .list_images()
+                .await
+                .map_err(client::error)?
+                .iter()
+                .filter(|i| matches!(client::string(i, "origin").as_str(), "pull" | "build"))
+                .map(|i| (client::string(i, "reference"), client::string(i, "name")))
+                .collect(),
+        )
+    };
+    let find = |local: &[(String, String)], full: &str| {
+        local
+            .iter()
+            .find(|(r, _)| r == full)
+            .map(|(_, n)| n.clone())
+    };
+    let unset = if p.pull_only { "always" } else { "missing" };
+    // The service that builds each image, the first one of the project to.
+    let mut builders: BTreeMap<String, String> = BTreeMap::new();
+    for (name, service) in &project.services {
+        let Some(service) = service.as_map() else {
+            continue;
+        };
+        if service.get("build").and_then(Value::as_map).is_some() {
+            builders
+                .entry(super::build::image_of(&project.name, name, service))
+                .or_insert_with(|| name.clone());
+        }
+    }
+    let mut local = list().await?;
+    // The pulls.
+    let mut pulled = BTreeSet::new();
+    let mut failed = Vec::new();
+    let mut must_build = Vec::new();
+    for name in services {
+        let service = convert::service(project, name)?;
+        let named = s(service, "image");
+        if named.is_empty() || pulled.contains(named) {
+            continue;
+        }
+        let reference = super::image_reference(named)?;
+        let full = reference.to_string();
+        let existing = find(&local, &full);
+        let policy = policy(service, p.flag, unset);
+        if !pulls(&policy, true, existing.is_some()).with_context(|| format!("service {name:?}"))? {
+            continue;
+        }
+        pulled.insert(named.to_string());
+        let id = format!("Image {named}");
+        e.progress.event(&id, "Pulling", "", Status::Working);
+        let mut options = Options::new();
+        options.insert(
+            "name",
+            Bus::from(existing.clone().unwrap_or_else(|| reference.local_name())),
+        );
+        options.insert("force", Bus::from(existing.is_some()));
+        let manager = &e.client.manager;
+        let result = e
+            .client
+            .run_job_silent(|| manager.pull_image(&full, options), p.quiet)
+            .await;
+        match result {
+            Ok(_) => e.progress.event(&id, "Pulled", "", Status::Done),
+            Err(err) if builders.contains_key(named) => {
+                e.progress
+                    .event(&id, "Warning", &format!("{err:#}"), Status::Warning);
+                if p.pull_only {
+                    must_build.push(builders[named].clone());
+                    failed.push(err.context(format!("pulling {named}")));
+                }
+            }
+            Err(err) => {
+                e.progress
+                    .event(&id, "Error", &format!("{err:#}"), Status::Error);
+                if p.ignore_failures {
+                    continue;
+                }
+                if !p.pull_only {
+                    return Err(err.context(format!("pulling {named}")));
+                }
+                failed.push(err.context(format!("pulling {named}")));
+            }
+        }
+    }
+    local = list().await?;
+    // The builds, each image once.
+    if let Some(flags) = p.build {
+        let mut built = BTreeSet::new();
+        for name in services {
+            let service = convert::service(project, name)?;
+            if service.get("build").and_then(Value::as_map).is_none() {
+                continue;
+            }
+            let image = super::build::image_of(&project.name, name, service);
+            if built.contains(&image) {
+                continue;
+            }
+            let full = super::image_reference(&image)?.to_string();
+            let mut policy = policy(service, p.flag, unset);
+            if p.force_build {
+                policy = "build".to_string();
+            }
+            if rebuilds(&policy, true, find(&local, &full).is_some()) {
+                super::build::build(e, name, service, &image, flags).await?;
+                built.insert(image);
+            }
+        }
+        local = list().await?;
+    }
+    // What each service runs.
     let mut out = BTreeMap::new();
     for name in services {
         let service = convert::service(project, name)?;
-        let image = s(service, "image");
-        if image.is_empty() {
+        let named = s(service, "image");
+        let buildable = service.get("build").and_then(Value::as_map).is_some();
+        if named.is_empty() && !buildable {
             continue;
         }
-        if let Some(found) = done.get(image) {
-            out.insert(name.clone(), found.clone());
-            continue;
-        }
-        let reference = super::image_reference(image)?;
-        let full = reference.to_string();
-        let existing = local
-            .iter()
-            .find(|(r, _)| *r == full)
-            .map(|(_, n)| n.clone());
-        let policy = policy(service, flag);
-        let pull = match (policy.as_str(), &existing) {
-            ("always", _) => true,
-            ("missing", None) => true,
-            ("missing", Some(_)) => false,
-            ("never", Some(_)) => false,
-            ("never", None) => bail!(
-                "service {name:?}: image {image} is not on this host and its pull policy is never"
-            ),
-            ("build", _) => bail!(
-                "service {name:?}: pull_policy build: nspawn runs published images and does not build Dockerfiles"
-            ),
-            (other, _) => bail!("service {name:?}: invalid pull policy {other:?}"),
-        };
-        let local_name = existing.clone().unwrap_or_else(|| reference.local_name());
-        if pull {
-            let id = format!("Image {image}");
-            e.progress.event(&id, "Pulling", "", Status::Working);
-            let mut options = Options::new();
-            options.insert("name", Bus::from(local_name.clone()));
-            options.insert("force", Bus::from(existing.is_some()));
-            let manager = &e.client.manager;
-            let result = e
-                .client
-                .run_job_silent(|| manager.pull_image(&full, options), quiet)
-                .await;
-            if let Err(err) = result {
-                e.progress
-                    .event(&id, "Error", &format!("{err:#}"), Status::Error);
-                if ignore_failures {
-                    continue;
-                }
-                // Such an image is built from the service's build section; nspawn
-                // only has a registry to ask.
-                if service.contains_key("build") {
-                    return Err(err.context(format!(
-                        "pulling {image}: service {name:?} builds it with docker, which nspawn does not do; push it to a registry, or name one that has it"
-                    )));
-                }
-                return Err(err.context(format!("pulling {image}")));
+        let image = super::build::image_of(&project.name, name, service);
+        let full = super::image_reference(&image)?.to_string();
+        let Some(local_name) = find(&local, &full) else {
+            if p.pull_only || (p.ignore_failures && !named.is_empty()) {
+                continue;
             }
-            e.progress.event(&id, "Pulled", "", Status::Done);
-        }
+            if buildable || builders.contains_key(&image) {
+                bail!(
+                    "service {name:?}: image {image} is not on this host; compose build makes it"
+                );
+            }
+            bail!(
+                "service {name:?}: image {image} is not on this host and its pull policy is never"
+            );
+        };
         let record = e
             .client
             .manager
             .get_image(&local_name)
             .await
             .map_err(client::error)?;
-        let found = Image {
-            name: local_name,
-            digest: client::string(&record, "digest"),
-        };
-        done.insert(image.to_string(), found.clone());
-        out.insert(name.clone(), found);
+        out.insert(
+            name.clone(),
+            Image {
+                name: local_name,
+                digest: client::string(&record, "digest"),
+            },
+        );
+    }
+    if !must_build.is_empty() {
+        eprintln!(
+            "WARNING: Some service image(s) must be built from source by running:\n    nspawn compose build {}",
+            must_build.join(" ")
+        );
+    }
+    if !failed.is_empty() && !p.ignore_failures {
+        let text: Vec<String> = failed.iter().map(|e| format!("{e:#}")).collect();
+        bail!("{}", text.join("\n"));
     }
     Ok(out)
 }
@@ -513,7 +651,14 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
         }
     }
     let order = order(&project);
-    let images = images(e, &order, c.pull.as_deref(), c.quiet_pull, false).await?;
+    let pulls = Pulls {
+        flag: c.pull.as_deref(),
+        quiet: c.quiet_pull,
+        build: c.build.as_ref(),
+        force_build: c.force_build,
+        ..Default::default()
+    };
+    let images = images(e, &order, &pulls).await?;
     networks(e).await?;
     volumes(e).await?;
     secrets(e).await?;
@@ -944,6 +1089,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn images_are_pulled_and_built_as_compose_decides() {
+        // An image a service names, by its policy.
+        assert!(pulls("always", true, true).unwrap());
+        assert!(pulls("missing", true, false).unwrap());
+        assert!(!pulls("missing", true, true).unwrap());
+        assert!(!pulls("never", true, false).unwrap());
+        assert!(!pulls("build", true, false).unwrap());
+        // One it does not name is never pulled.
+        assert!(!pulls("always", false, false).unwrap());
+        assert!(pulls("sometimes", true, false).is_err());
+        // Built when missing after the pull, or every time with the policy build.
+        assert!(rebuilds("missing", true, false));
+        assert!(!rebuilds("missing", true, true));
+        assert!(!rebuilds("always", true, true));
+        assert!(rebuilds("build", true, true));
+        assert!(rebuilds("never", true, false));
+        assert!(!rebuilds("build", false, false));
+    }
+
+    #[test]
     fn scale_options_read_as_docker_compose_reads_them() {
         assert_eq!(
             scale_overrides(&["web=3".to_string()]).unwrap(),
@@ -955,9 +1120,17 @@ mod tests {
     #[test]
     fn pull_policies_follow_the_flag_then_the_service() {
         let service = |p: &str| Map::from([("pull_policy".to_string(), Value::str(p))]);
-        assert_eq!(policy(&Map::new(), None), "missing");
-        assert_eq!(policy(&service("daily"), None), "always");
-        assert_eq!(policy(&service("never"), Some("always")), "always");
-        assert_eq!(policy(&service("never"), Some("policy")), "never");
+        assert_eq!(policy(&Map::new(), None, "missing"), "missing");
+        assert_eq!(policy(&Map::new(), None, "always"), "always");
+        assert_eq!(policy(&service("missing"), None, "always"), "missing");
+        assert_eq!(policy(&service("daily"), None, "missing"), "always");
+        assert_eq!(
+            policy(&service("never"), Some("always"), "missing"),
+            "always"
+        );
+        assert_eq!(
+            policy(&service("never"), Some("policy"), "missing"),
+            "never"
+        );
     }
 }

@@ -114,8 +114,25 @@ pub async fn run(config: Config, idle_exit: Option<Duration>) -> Result<()> {
     // Nothing waits on a socket of an earlier service, and a machine of run --rm that
     // ended while nothing could remove it goes now.
     crate::attach::sweep();
+    // A build of a service that went away left its step roots and network namespace.
+    crate::build::exec::sweep(&state.ctx).await;
     if let Err(e) = crate::api::network::remove_ended(&state.ctx).await {
         eprintln!("warning: removing the machines of run --rm that ended: {e:#}");
+    }
+    // An update the end of an earlier service cut short is undone, or kept when its
+    // machine runs on the new image.
+    if !state.ctx.store.rollbacks().is_empty() {
+        let state = state.clone();
+        let busy = state.enter();
+        tokio::spawn(async move {
+            let _busy = busy;
+            crate::api::autoupdate::recover_at_start(&state.ctx, &|event| {
+                if let crate::api::Event::Line(text) | crate::api::Event::Note(text) = event {
+                    eprintln!("{text}");
+                }
+            })
+            .await;
+        });
     }
     let connection = zbus::connection::Builder::system()?
         .serve_at(MANAGER_PATH, Manager::new(state.clone()))?

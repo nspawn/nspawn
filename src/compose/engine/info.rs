@@ -419,6 +419,9 @@ pub async fn ls(e: &mut Engine<'_>, a: &LsArgs, out: &mut dyn Write) -> Result<(
         let Some(project) = m.labels.get(label::PROJECT).cloned() else {
             continue;
         };
+        if client::string(&m.dict, "origin") != "create" {
+            continue;
+        }
         let entry = projects.entry(project).or_default();
         entry.0.push(state(&m).to_string());
         if entry.1.is_empty() {
@@ -493,7 +496,8 @@ pub async fn images(e: &mut Engine<'_>, a: &ImagesArgs, out: &mut dyn Write) -> 
         images
             .iter()
             .find(|i| {
-                client::string(i, "reference") == reference && client::string(i, "origin") == "pull"
+                client::string(i, "reference") == reference
+                    && matches!(client::string(i, "origin").as_str(), "pull" | "build")
             })
             .map(|i| client::u64(i, "size"))
             .unwrap_or(0)

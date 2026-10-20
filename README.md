@@ -24,7 +24,7 @@ nspawn stop web
 nspawn rm -f web2                   # remove a machine, stopping it first
 nspawn images rm fedora-44          # also frees layers and blobs nobody references
 nspawn network create backend       # a network of its own: --network backend on start
-nspawn build -t team/app:1 ./app    # mkosi -t oci on ./app, imported as a local image
+nspawn build -t team/app:1 ./app    # its Dockerfile built (or its mkosi.conf), a local image
 nspawn push team/app:1              # upload it to the hub, layers already there skipped
 nspawn compose up -d                # the compose.yaml of this directory, as docker compose runs it
 nspawn compose down -v
@@ -90,6 +90,11 @@ requirements, building from source and usage examples.
 - **GPUs through CDI.** `--gpus all` and `--device nvidia.com/gpu=all` hand a machine
   the devices of the CDI specs vendors' tools write (`nvidia-ctk cdi generate`), their
   libraries and hooks included, as docker and podman do; compose's `gpus:` too.
+- **Dockerfiles.** `build` runs a Dockerfile with a builder of nspawn's own, as
+  `docker build` does: multi-stage builds, the build cache, `RUN --mount`, build
+  arguments and secrets, each `RUN` confined like an app machine; the layers come out
+  with the same contents as BuildKit's. Compose's `build:` sections and `compose build` use it,
+  and mkosi configurations build too.
 - **One image, many machines.** A pulled image is a machine; `create` makes more from
   it, sharing its layers, each with settings, ports and an address of its own.
 - **Signed images.** Every image on hub.nspawn.org is signed by its build workflow,

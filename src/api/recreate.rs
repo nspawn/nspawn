@@ -1,7 +1,7 @@
 //! A machine made anew from a newer image of its reference, with every option it had,
 //! and put back as it was when the new one does not come up. What the machine wrote
-//! outside its volumes goes with the old image, as when docker recreates a container;
-//! it is kept until the new one has proved itself.
+//! outside its volumes goes with the old image; it is kept until the new one has proved
+//! itself.
 
 use std::time::{Duration, Instant};
 
@@ -49,6 +49,91 @@ pub enum Verdict {
     Failed(String),
 }
 
+/// Where an update of a machine got to, kept in its rollback directory: what a run cut
+/// short is undone from it, and nothing of the old machine is let go before it says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    /// The old record and manifest are kept; nothing else changed.
+    Saved,
+    /// The old writable layer is going, or has gone, into the rollback directory.
+    Aside,
+    /// The machine is on the new image.
+    Installed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Progress {
+    pub phase: Phase,
+    /// It ran before the update, and is started again whichever image it ends up on.
+    pub running: bool,
+    /// Its unit was enabled at boot.
+    pub enabled: bool,
+}
+
+fn progress_path(store: &Store, name: &str) -> std::path::PathBuf {
+    store.rollback_dir(name).join("progress.json")
+}
+
+fn write_progress(store: &Store, name: &str, progress: Progress) -> Result<()> {
+    let path = progress_path(store, name);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&progress)?)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))
+}
+
+/// The progress of an update of `name`, from what its rollback directory holds when it
+/// says nothing.
+pub fn progress(store: &Store, name: &str) -> Progress {
+    std::fs::read(progress_path(store, name))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_else(|| Progress {
+            phase: if has_layer_aside(store, name) {
+                Phase::Aside
+            } else {
+                Phase::Saved
+            },
+            running: false,
+            enabled: enabled_at_boot_now(name),
+        })
+}
+
+fn has_layer_aside(store: &Store, name: &str) -> bool {
+    let aside = store.rollback_dir(name);
+    ["upper", "work"].iter().any(|d| aside.join(d).exists())
+}
+
+/// Whether the machine's unit is enabled at boot now, by nspawn or by hand.
+fn enabled_at_boot_now(name: &str) -> bool {
+    std::path::Path::new(&format!(
+        "/etc/systemd/system/machines.target.wants/systemd-nspawn@{name}.service"
+    ))
+    .symlink_metadata()
+    .is_ok()
+}
+
+/// Refuses while the machine runs, starts or its unit is busy: nothing of it is moved
+/// under it.
+async fn ensure_down(store: &Store, sd: &crate::systemd::Systemd, name: &str) -> Result<()> {
+    if store.is_starting(name) || sd.machine_exists(name).await? {
+        bail!("{name} is running");
+    }
+    if let Some(why) = crate::api::machines::unit_busy(sd, name).await? {
+        bail!("{why}");
+    }
+    Ok(())
+}
+
+/// What an update did to a machine.
+pub struct Recreated {
+    pub result: Result<()>,
+    /// It was started again, on its new image or its old one: what takes its network
+    /// follows it into the new namespace.
+    pub restarted: bool,
+}
+
 /// Swaps the machine to the image `fetched` brought, starts it when it ran, and waits for
 /// it to be up (healthy, when it has a healthcheck). On a failure the old machine is
 /// put back and started again; the error says what failed, and whether the old one is
@@ -58,6 +143,18 @@ pub async fn recreate(
     name: &str,
     fetched: &Fetched,
     report: Report<'_>,
+) -> Recreated {
+    let mut restarted = false;
+    let result = update(ctx, name, fetched, report, &mut restarted).await;
+    Recreated { result, restarted }
+}
+
+async fn update(
+    ctx: &Context,
+    name: &str,
+    fetched: &Fetched,
+    report: Report<'_>,
+    restarted: &mut bool,
 ) -> Result<()> {
     let sd = ctx.sd().await?;
     let store = &ctx.store;
@@ -66,6 +163,13 @@ pub async fn recreate(
         .with_context(|| format!("no machine named {name}"))?;
     if old.backend != BackendChoice::Overlay {
         bail!("{name} is not an overlay machine; only those are updated");
+    }
+    let backend = Backend::choose(BackendChoice::Overlay, sd).await?;
+    // The new image's layers come in before anything stops: a failure there leaves the
+    // machine as it was. The swap stages them again, in case a gc took them meanwhile.
+    {
+        let _lock = store.lock().await?;
+        stage_layers(store, backend, &fetched.manifest, Some(old.mode), name).await?;
     }
     let unit = format!("systemd-nspawn@{name}.service");
     let running = sd.machine_exists(name).await? || sd.unit_status(&unit).await?.restarting();
@@ -79,30 +183,76 @@ pub async fn recreate(
         };
         crate::api::machines::stop(ctx, &stop, report).await?;
     }
-    {
+    let enabled = enabled_at_boot_now(name);
+    let mut back = true;
+    let swapped = async {
         let _lock = store.lock().await?;
+        // A dependent's start or a restart policy may have brought it back meanwhile.
+        ensure_down(store, sd, name)
+            .await
+            .context("it started again while it was being updated")?;
         let manifest = store.load_manifest(name)?;
         store.save_rollback(&old, &manifest)?;
-        keep_writable_layer(store, name)?;
-        let backend = Backend::choose(BackendChoice::Overlay, sd).await?;
-        if let Err(e) = swap(ctx, &old, fetched, backend, report).await {
-            restore(ctx, name, report).await?;
+        let mut progress = Progress {
+            phase: Phase::Saved,
+            running,
+            enabled,
+        };
+        write_progress(store, name, progress)?;
+        progress.phase = Phase::Aside;
+        write_progress(store, name, progress)?;
+        let swap = match keep_writable_layer(store, name) {
+            Ok(()) => swap(ctx, &old, fetched, backend, &mut progress, report).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = swap {
+            if let Err(again) = restore(ctx, name, report).await {
+                back = false;
+                return Err(e.context(format!(
+                    "{name} could not be made anew, nor put back as it was ({again:#}); its old record and writable layer are in {}",
+                    store.rollback_dir(name).display()
+                )));
+            }
             return Err(e.context(format!(
                 "{name} could not be made anew; it is back as it was"
             )));
         }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(e) = swapped {
+        if running && back {
+            *restarted = true;
+            if let Err(start) =
+                crate::api::machines::start(ctx, &StartRequest::keep(name), report).await
+            {
+                note(report, format!("warning: starting {name} again: {start:#}"));
+            }
+        }
+        return Err(e);
     }
     let verdict = if running {
+        *restarted = true;
         start_and_watch(ctx, name, report).await
     } else {
         Verdict::Up
     };
     match verdict {
         Verdict::Up => {
-            let _lock = store.lock().await?;
-            store.forget_rollback(name)?;
-            store.gc_layers()?;
-            store.gc_blobs()?;
+            // The machine is on its new image whatever happens here.
+            let cleaned = async {
+                let _lock = store.lock().await?;
+                store.forget_rollback(name)?;
+                store.gc_layers()?;
+                store.gc_blobs()?;
+                Ok::<(), anyhow::Error>(())
+            };
+            if let Err(e) = cleaned.await {
+                note(
+                    report,
+                    format!("warning: {name} is updated; cleaning up after it: {e:#}"),
+                );
+            }
             Ok(())
         }
         Verdict::Failed(why) => {
@@ -116,7 +266,12 @@ pub async fn recreate(
             let _ = crate::api::machines::stop(ctx, &force, report).await;
             {
                 let _lock = store.lock().await?;
-                restore(ctx, name, report).await?;
+                restore(ctx, name, report).await.with_context(|| {
+                    format!(
+                        "{why}; the old image could not be put back; its old record and writable layer are in {}",
+                        store.rollback_dir(name).display()
+                    )
+                })?;
             }
             let back =
                 match crate::api::machines::start(ctx, &StartRequest::keep(name), report).await {
@@ -154,6 +309,7 @@ async fn swap(
     old: &ImageRecord,
     fetched: &Fetched,
     backend: Backend,
+    progress: &mut Progress,
     report: Report<'_>,
 ) -> Result<()> {
     let (store, sd) = (&ctx.store, ctx.sd().await?);
@@ -184,14 +340,17 @@ async fn swap(
         .load_image(&old.name)?
         .context("the record of the new machine is missing")?;
     store.record_image(&renewed(old, installed))?;
-    enable_at_boot(ctx, old).await
+    progress.phase = Phase::Installed;
+    write_progress(store, &old.name, *progress)?;
+    enable_if(ctx, &old.name, progress.enabled).await
 }
 
-async fn enable_at_boot(ctx: &Context, record: &ImageRecord) -> Result<()> {
-    if record.restart.enabled_at_boot() {
+/// The unit enabled at boot again when it was before the machine was made anew.
+async fn enable_if(ctx: &Context, name: &str, enabled: bool) -> Result<()> {
+    if enabled {
         let sd = ctx.sd().await?;
         if sd
-            .enable_unit(&format!("systemd-nspawn@{}.service", record.name))
+            .enable_unit(&format!("systemd-nspawn@{name}.service"))
             .await?
         {
             sd.reload().await?;
@@ -200,63 +359,93 @@ async fn enable_at_boot(ctx: &Context, record: &ImageRecord) -> Result<()> {
     Ok(())
 }
 
-/// Puts back the machine the rollback directory keeps: its image, its record and its
-/// writable layer. The caller holds the store lock and the machine is not running.
+/// The old writable layer moved back from the rollback directory: over the one the new
+/// machine has with `replace`, else only where there is none.
+fn put_back(store: &Store, name: &str, replace: bool) -> Result<()> {
+    let aside = store.rollback_dir(name);
+    let private = store.machines_private_dir().join(name);
+    for dir in ["upper", "work"] {
+        let from = aside.join(dir);
+        if !from.exists() {
+            continue;
+        }
+        let target = private.join(dir);
+        if target.exists() {
+            if !replace {
+                bail!(
+                    "{} and {} both exist; left as they are",
+                    from.display(),
+                    target.display()
+                );
+            }
+            std::fs::remove_dir_all(&target)
+                .with_context(|| format!("removing {}", target.display()))?;
+        }
+        std::fs::create_dir_all(&private)
+            .with_context(|| format!("creating {}", private.display()))?;
+        std::fs::rename(&from, &target)
+            .with_context(|| format!("putting back {}", target.display()))?;
+    }
+    Ok(())
+}
+
+/// Puts back the machine the rollback directory keeps, as far as the update got: its
+/// image, its record and its writable layer. The caller holds the store lock; a machine
+/// that runs is left alone.
 pub async fn restore(ctx: &Context, name: &str, report: Report<'_>) -> Result<()> {
     let (store, sd) = (&ctx.store, ctx.sd().await?);
     let Some((old, manifest_bytes)) = store.load_rollback(name)? else {
-        return Ok(());
+        if has_layer_aside(store, name) {
+            bail!(
+                "{} keeps a writable layer but no record; left as it is",
+                store.rollback_dir(name).display()
+            );
+        }
+        return store.forget_rollback(name);
     };
-    let manifest: OciImageManifest = serde_json::from_slice(&manifest_bytes)
-        .with_context(|| format!("reading the manifest kept for {name}"))?;
-    let backend = Backend::choose(BackendChoice::Overlay, sd).await?;
-    stage_layers(store, backend, &manifest, Some(old.mode), name).await?;
-    // The new machine goes, its writable layer with it, unless nothing replaced the old
-    // one yet.
-    let aside = store.rollback_dir(name);
+    ensure_down(store, sd, name).await?;
+    let progress = progress(store, name);
     let private = store.machines_private_dir().join(name);
-    let mut kept = Vec::new();
-    for dir in ["upper", "work"] {
-        let tmp = store
-            .machines_private_dir()
-            .join(format!(".rollback-{name}-{dir}"));
-        let _ = std::fs::remove_dir_all(&tmp);
-        if aside.join(dir).exists() {
-            std::fs::rename(aside.join(dir), &tmp)
-                .with_context(|| format!("keeping {}", aside.join(dir).display()))?;
-            kept.push((dir, tmp));
+    let untouched = private.exists()
+        && store
+            .load_image(name)?
+            .is_some_and(|c| c.manifest_digest == old.manifest_digest && c.layers == old.layers);
+    match progress.phase {
+        Phase::Saved => {}
+        // The old machine is all there but for its writable layer.
+        Phase::Aside if untouched => put_back(store, name, false)?,
+        _ => {
+            let manifest: OciImageManifest = serde_json::from_slice(&manifest_bytes)
+                .with_context(|| format!("reading the manifest kept for {name}"))?;
+            let backend = Backend::choose(BackendChoice::Overlay, sd).await?;
+            stage_layers(store, backend, &manifest, Some(old.mode), name).await?;
+            remove_existing(store, sd, name, report).await?;
+            install(
+                store,
+                sd,
+                &ctx.config,
+                backend,
+                Install {
+                    name,
+                    reference: &old.reference,
+                    manifest_bytes: &manifest_bytes,
+                    manifest: &manifest,
+                    manifest_digest: &old.manifest_digest,
+                    index_digest: old.index_digest.as_deref(),
+                    origin: &old.origin,
+                    mode: Some(old.mode),
+                    signed_by: old.signed_by.as_deref(),
+                    signed_at: old.signed_at,
+                },
+                report,
+            )
+            .await?;
+            put_back(store, name, true)?;
+            store.record_image(&old)?;
+            enable_if(ctx, name, progress.enabled).await?;
         }
     }
-    remove_existing(store, sd, name, report).await?;
-    install(
-        store,
-        sd,
-        &ctx.config,
-        backend,
-        Install {
-            name,
-            reference: &old.reference,
-            manifest_bytes: &manifest_bytes,
-            manifest: &manifest,
-            manifest_digest: &old.manifest_digest,
-            index_digest: old.index_digest.as_deref(),
-            origin: &old.origin,
-            mode: Some(old.mode),
-            signed_by: old.signed_by.as_deref(),
-            signed_at: old.signed_at,
-        },
-        report,
-    )
-    .await?;
-    for (dir, tmp) in kept {
-        let target = private.join(dir);
-        let _ = std::fs::remove_dir_all(&target);
-        std::fs::rename(&tmp, &target)
-            .with_context(|| format!("putting back {}", target.display()))?;
-    }
-    store.record_image(&old)?;
-    store.forget_rollback(name)?;
-    enable_at_boot(ctx, &old).await
+    store.forget_rollback(name)
 }
 
 /// Starts the machine and waits until it is up: healthy, when it has a healthcheck, or
@@ -395,6 +584,41 @@ mod tests {
         assert_eq!(new.address, old.address);
         assert_eq!(new.restart, old.restart);
         assert_eq!(new.ports, old.ports);
+    }
+
+    #[test]
+    fn an_update_cut_short_is_undone_from_where_it_got() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(&dir.path().join("m"), &dir.path().join("s"));
+        let aside = store.rollback_dir("web");
+        std::fs::create_dir_all(&aside).unwrap();
+        assert_eq!(progress(&store, "web").phase, Phase::Saved);
+        std::fs::create_dir_all(aside.join("upper")).unwrap();
+        std::fs::write(aside.join("upper").join("data"), "old").unwrap();
+        // Only the layer says where it got.
+        assert_eq!(progress(&store, "web").phase, Phase::Aside);
+        let written = Progress {
+            phase: Phase::Installed,
+            running: true,
+            enabled: false,
+        };
+        write_progress(&store, "web", written).unwrap();
+        assert_eq!(progress(&store, "web"), written);
+        // The old layer goes back only over nothing, unless it replaces the new one's.
+        let private = store.machines_private_dir().join("web");
+        std::fs::create_dir_all(private.join("upper")).unwrap();
+        std::fs::write(private.join("upper").join("data"), "new").unwrap();
+        assert!(put_back(&store, "web", false).is_err());
+        assert!(
+            aside.join("upper").exists(),
+            "a refused put back moves nothing"
+        );
+        put_back(&store, "web", true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(private.join("upper").join("data")).unwrap(),
+            "old"
+        );
+        assert!(!aside.join("upper").exists());
     }
 
     #[test]

@@ -442,6 +442,28 @@ pub fn chase(root: &Path, relative: &Path) -> Option<PathBuf> {
     Some(current)
 }
 
+/// `relative` inside `root`, its last component followed too when it is a link: where a
+/// mount on that path lands, resolved as the machine would.
+pub fn resolve_in_root(root: &Path, relative: &str) -> Result<PathBuf> {
+    let mut wanted = PathBuf::from(relative.trim_start_matches('/'));
+    for _ in 0..40 {
+        let path = chase(root, &wanted)
+            .with_context(|| format!("{relative}: a component of the image is not a directory"))?;
+        match std::fs::read_link(&path) {
+            Ok(target) => {
+                let parent = wanted.parent().map(Path::to_path_buf).unwrap_or_default();
+                wanted = if target.is_absolute() {
+                    PathBuf::from(target.strip_prefix("/").unwrap_or(&target))
+                } else {
+                    parent.join(target)
+                };
+            }
+            Err(_) => return Ok(path),
+        }
+    }
+    bail!("{relative}: too many levels of symbolic links in the image")
+}
+
 /// The directories of an image's layers in the store, bottom layer first, for what is
 /// read from the image itself ahead of any run: the assembled root would show what
 /// earlier runs did to it, such as a copy chowned into a picked user namespace. A tree

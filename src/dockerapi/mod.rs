@@ -40,6 +40,33 @@ pub fn socket_path(machine: &str) -> std::path::PathBuf {
 /// How long the server stays without a connection before it leaves.
 const IDLE: Duration = Duration::from_secs(60);
 
+/// What a machine may hold of the host at once: connections, and streams (logs that
+/// follow, events, stats), each of which reads the journal or the cgroup as it goes.
+static CONNECTIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
+static STREAMS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+
+/// How long a client has to send a request's headers.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `response`, its body written by `work`, or the error that there are too many
+/// streams.
+fn spawn_stream<F>(work: F, response: Response<Body>) -> Response<Body>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let Ok(permit) = STREAMS.try_acquire() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many streams are open on this socket",
+        );
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
+        work.await;
+    });
+    response
+}
+
 pub async fn serve(machine: &str, config: Config) -> Result<()> {
     let fd = crate::nsenter::listen_fd().with_context(|| {
         format!("no socket was handed over; nspawn api-serve runs from nspawn-api@{machine}.socket")
@@ -53,15 +80,27 @@ pub async fn serve(machine: &str, config: Config) -> Result<()> {
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else { continue };
+                let (stream, _) = match accepted {
+                    Ok(accepted) => accepted,
+                    // Out of descriptors, say: tried again in a moment rather than at once.
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                };
+                // Over the limit the connection is closed right away.
+                let Ok(permit) = CONNECTIONS.try_acquire() else { continue };
                 open.fetch_add(1, Ordering::SeqCst);
                 let (ctx, open, last) = (ctx.clone(), open.clone(), last.clone());
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let service = hyper::service::service_fn(move |request| {
                         let ctx = ctx.clone();
                         async move { Ok::<_, Infallible>(handle(ctx, request).await) }
                     });
                     let _ = hyper::server::conn::http1::Builder::new()
+                        .timer(hyper_util::rt::TokioTimer::new())
+                        .header_read_timeout(HEADER_TIMEOUT)
                         .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
                         .await;
                     *last.lock().unwrap() = Instant::now();
@@ -111,8 +150,8 @@ fn streaming(content_type: &str) -> (Response<Body>, tokio::sync::mpsc::Sender<B
     (response, tx)
 }
 
-/// The query string's parameters, percent-decoded; a key given twice keeps its last
-/// value except where all are read.
+/// The query string's parameters, percent-decoded; a key given twice keeps its first
+/// value, as docker reads it, except where all are read.
 fn query(request: &Request<Incoming>) -> Vec<(String, String)> {
     request
         .uri()
@@ -157,16 +196,19 @@ impl Query {
     fn get(&self, key: &str) -> Option<&str> {
         self.0
             .iter()
-            .rev()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
     }
 
-    /// Go's strconv.ParseBool, which the API's flags go through; absent is `default`.
+    /// docker's BoolValue: anything but nothing, 0, no, false and none is true; absent is
+    /// `default`.
     fn flag(&self, key: &str, default: bool) -> bool {
         match self.get(key) {
             None => default,
-            Some(v) => matches!(v, "1" | "t" | "T" | "true" | "TRUE" | "True"),
+            Some(v) => !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "" | "0" | "no" | "false" | "none"
+            ),
         }
     }
 }
@@ -563,7 +605,8 @@ fn container_matches(snapshot: &Snapshot, filters: &Filters, m: &model::Machine)
     if !filters.exact("status", m.state()) {
         return false;
     }
-    if !filters.matches("name", &format!("/{}", m.name())) {
+    // As docker matches it: with the slash and without.
+    if !filters.matches("name", &format!("/{}", m.name())) && !filters.matches("name", m.name()) {
         return false;
     }
     if let Some(ids) = filters.values("id") {
@@ -762,22 +805,23 @@ async fn logs(ctx: &Arc<Context>, machine: &model::Machine, query: &Query) -> Re
         stream: if stdout { 1 } else { 2 },
         request,
     };
-    tokio::spawn(streams::logs(query, tx));
-    response
+    spawn_stream(streams::logs(query, tx), response)
 }
 
 async fn stats(ctx: &Arc<Context>, machine: &model::Machine, query: &Query) -> Response<Body> {
     let pids_limit = machine.record.limits.pids;
     if query.flag("stream", true) {
         let (response, tx) = streaming("application/json");
-        tokio::spawn(streams::stats(
-            ctx.clone(),
-            machine.name().to_string(),
-            machine.id.clone(),
-            pids_limit,
-            tx,
-        ));
-        return response;
+        return spawn_stream(
+            streams::stats(
+                ctx.clone(),
+                machine.name().to_string(),
+                machine.id.clone(),
+                pids_limit,
+                tx,
+            ),
+            response,
+        );
     }
     let name = machine.name();
     let before = if query.flag("one-shot", false) {
@@ -845,14 +889,26 @@ fn events(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
         return error(StatusCode::BAD_REQUEST, message);
     }
     let since = journal_time(query.get("since"));
-    let mut until = journal_time(query.get("until"));
-    // A window of the past needs its start; without one it follows from now.
-    if since.is_none() && until.is_some() {
-        until = None;
-    }
+    // An end still to come is waited for while the events follow; one gone by ends a
+    // window of the past, which without a start has nothing in it.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let end = query
+        .get("until")
+        .filter(|t| !t.is_empty() && *t != "0")
+        .and_then(|t| t.split('.').next().unwrap_or(t).parse::<u64>().ok());
+    let (until, deadline) = match end {
+        Some(end) if end > now => (None, Some(Duration::from_secs(end - now))),
+        Some(end) if since.is_some() => (Some(format!("@{end}")), None),
+        Some(_) => (None, Some(Duration::ZERO)),
+        None => (None, None),
+    };
     let (response, tx) = streaming("application/json");
-    tokio::spawn(streams::events(ctx.clone(), since, until, filters, tx));
-    response
+    spawn_stream(
+        streams::events(ctx.clone(), since, until, deadline, filters, tx),
+        response,
+    )
 }
 
 /// The one change served: a signal for a machine's program, through the service as

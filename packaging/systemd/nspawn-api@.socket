@@ -5,6 +5,6 @@ BindsTo=systemd-nspawn@%i.service
 
 [Socket]
 ListenStream=/run/nspawn/api/%i.sock
-SocketMode=0660
+SocketMode=0600
 DirectoryMode=0700
 RemoveOnStop=yes

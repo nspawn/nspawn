@@ -707,6 +707,25 @@ impl Systemd {
         Ok(())
     }
 
+    /// Starts a transient unit and waits until systemd reports its start job finished.
+    pub async fn start_transient_wait(
+        &self,
+        unit: &str,
+        properties: Vec<(String, zbus::zvariant::OwnedValue)>,
+    ) -> Result<()> {
+        let mut jobs = self
+            .manager
+            .receive_job_removed()
+            .await
+            .context("subscribing to job events")?;
+        let job = self
+            .manager
+            .start_transient_unit(unit.to_string(), "fail".to_string(), properties, Vec::new())
+            .await
+            .with_context(|| format!("starting {unit}"))?;
+        wait_for_job(&mut jobs, &job, unit, "starting").await
+    }
+
     /// Queues a stop job for a unit and returns at once, without watching the job.
     pub async fn queue_stop(&self, unit: &str) -> Result<()> {
         self.manager

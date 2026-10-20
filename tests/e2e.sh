@@ -91,7 +91,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -120,6 +120,18 @@ cleanup_machines() {
   $NSPAWN network rm e2e-compose_default >/dev/null 2>&1 || true
   $NSPAWN volume rm e2e-compose_data >/dev/null 2>&1 || true
   rm -rf /tmp/e2e-compose
+  # The project of the compose build check: its machines, the images it built, its
+  # network.
+  for m in $($NSPAWN ps -a 2>/dev/null | awk '$1 ~ /^e2e-cb-/ {print $1}'); do
+    $NSPAWN rm -f "$m" >/dev/null 2>&1 || true
+  done
+  for m in $($NSPAWN images ls 2>/dev/null | awk '$1 ~ /^e2e-cb-/ {print $1}'); do
+    $NSPAWN images rm "$m" >/dev/null 2>&1 || true
+  done
+  for n in $($NSPAWN network ls 2>/dev/null | awk '$1 ~ /^e2e-cb-.*_default$/ {print $1}'); do
+    $NSPAWN network rm "$n" >/dev/null 2>&1 || true
+  done
+  rm -rf /tmp/e2e-compose-build /tmp/e2e-build-two
   # The signature step keeps a dated hub image under the name pulling it gives; one cut
   # short leaves it behind. Only one this run pulled: the host may keep others.
   if [ -s /tmp/e2e-dated-image ]; then
@@ -166,12 +178,15 @@ mirror() {
   local src=$1 path=${1#docker.io/}
   path=${path#library/}
   local repo=${path%:*} tag=${path##*:}
-  if ! curl -sf --cacert "$NSPAWN_CA_CERT" -u tester:s3cret -I -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
-      "https://$NSPAWN_REGISTRY/v2/$repo/manifests/$tag" >/dev/null; then
+  local here="curl -sf --cacert $NSPAWN_CA_CERT -u tester:s3cret -I -H Accept:application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json https://$NSPAWN_REGISTRY/v2/$repo/manifests/$tag"
+  # Another host of the suite may be copying it at the same time: tried again once.
+  for attempt in 1 2; do
+    $here >/dev/null 2>&1 && break
     $NSPAWN pull "$src" --name e2e-mirror --force >/dev/null 2>&1 \
       && $NSPAWN push e2e-mirror --to "$NSPAWN_REGISTRY/$repo:$tag" >/dev/null 2>&1
     $NSPAWN images rm e2e-mirror >/dev/null 2>&1
-  fi
+    sleep 5
+  done
   echo "$NSPAWN_REGISTRY/$repo:$tag"
 }
 echo s3cret | $NSPAWN login "$NSPAWN_REGISTRY" -u tester --password-stdin >/dev/null || { echo "cannot log in to the test registry"; exit 1; }
@@ -180,7 +195,9 @@ busybox136_ref=$(mirror docker.io/library/busybox:1.36)
 busybox137_ref=$(mirror docker.io/library/busybox:1.37)
 memcached_ref=$(mirror docker.io/library/memcached:alpine)
 caddy_image=$(mirror docker.io/lucaslorentz/caddy-docker-proxy:2.13-alpine)
-curl_image=$(mirror docker.io/curlimages/curl:8.11.1)
+# A curl of OCI media types: the test registry takes no others.
+curl_image=$(mirror docker.io/alpine/curl:8.22.0)
+alpine322_ref=$(mirror docker.io/library/alpine:3.22)
 $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1
 
 step "hub ls"
@@ -869,6 +886,8 @@ systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "unit le
 
 step "run attached: output, input, terminal, signals, exit code, --rm"
 bb=$busybox_ref
+# Here under a name of the run's own, which run then finds by its reference.
+$NSPAWN pull "$bb" --name e2e-bb --force >/dev/null || fail "pull e2e-bb"
 out=$($NSPAWN run --rm $bb --name e2e-run -- /bin/sh -c 'echo out-$0; echo err-$0 >&2; exit 3' $nonce 2>/tmp/e2e-run.err); rc=$?
 [ "$rc" = 3 ] || fail "run did not exit with the program's code: $rc"
 # stdout and stderr come merged, from the journal; nothing of nspawn's own is among them.
@@ -2131,6 +2150,8 @@ systemctl is-failed systemd-nspawn@$app.service >/dev/null 2>&1 && fail "rm -f l
 [ -e /etc/systemd/nspawn/$app.nspawn ] && fail "settings file left behind for $app"
 ls /etc/systemd/system/ | grep_q "$app" && fail "unit files left behind for $app"
 
+# Nothing else holds the blobs of busybox now: the pull below downloads them again.
+$NSPAWN images rm e2e-bb >/dev/null 2>&1
 step "progress: a bar follows each download on a terminal, nothing of it in a pipe"
 # rm -f collected the blobs of busybox, so this pull downloads them again.
 bar='[0-9] [KMG]?i?B/[0-9.]+ [KMG]?i?B'
@@ -2705,7 +2726,7 @@ $NSPAWN pull "$curl_image" --name e2e-api-curl --force >/dev/null || fail "pull 
 out=$($NSPAWN run --rm --network none -u 0 -v /var/run/docker.sock:/var/run/docker.sock:ro "$curl_image" \
   -- -sS --unix-socket /var/run/docker.sock http://docker/containers/e2e-api-web/json 2>&1) || fail "curl from a machine in a user namespace: $out"
 echo "$out" | grep_q "E2E_ENV=$nonce" || fail "inspect through the Docker API lacks the machine's environment: $out"
-out=$($NSPAWN run --rm --network none -v /var/run/docker.sock:/var/run/docker.sock "$curl_image" \
+out=$($NSPAWN run --rm --network none -u 100 -v /var/run/docker.sock:/var/run/docker.sock "$curl_image" \
   -- -sS --unix-socket /var/run/docker.sock http://docker/_ping 2>&1) && fail "a user other than root reached the Docker API: $out"
 # A booted machine takes it at /run/docker.sock.
 $NSPAWN create "$IMAGE" e2e-api-boot -v /run/docker.sock:/run/docker.sock >/dev/null || fail "create e2e-api-boot"
@@ -2715,6 +2736,13 @@ $NSPAWN stop e2e-api-boot >/dev/null || fail "stop e2e-api-boot"
 # The socket goes with the unit, a moment after the machine itself.
 retry 10 bash -c "[ ! -e /run/nspawn/api/e2e-api-boot.sock ]" || fail "the socket stayed after the machine stopped"
 retry 10 bash -c "[ \"\$(systemctl is-active nspawn-api@e2e-api-boot.socket)\" != active ]" || fail "the socket unit stayed after the machine stopped"
+# A unit written before the socket existed (no Wants= of it) still gets its socket when
+# systemd starts the machine itself.
+sed -i '/nspawn-api@e2e-api-boot.socket/d' /etc/systemd/system/systemd-nspawn@e2e-api-boot.service.d/*.conf
+systemctl daemon-reload
+systemctl start systemd-nspawn@e2e-api-boot.service || fail "systemctl start of a machine whose unit does not want its socket: $(journalctl -u systemd-nspawn@e2e-api-boot.service -n 20 --no-pager)"
+retry 10 bash -c "[ -S /run/nspawn/api/e2e-api-boot.sock ]" || fail "the socket was not opened for a unit that does not want it"
+$NSPAWN stop e2e-api-boot >/dev/null || fail "stop e2e-api-boot again"
 # Compose: use_api_socket, and the short form with :ro.
 mkdir -p /tmp/e2e-compose-api
 cat > /tmp/e2e-compose-api/compose.yaml <<'COMPOSE'
@@ -2845,22 +2873,34 @@ $NSPAWN network connect --alias cliweb e2e-cli-net e2e-cli >/dev/null || fail "n
 retry 5 bash -c "$NSPAWN exec e2e-cli-peer -- wget -qO- http://cliweb/ </dev/null | grep_q cli" || fail "the peer does not reach the connected machine by its alias"
 retry 5 bash -c "$NSPAWN exec e2e-cli -- wget -qO- http://e2e-cli-peer/ </dev/null | grep_q peer" || fail "the connected machine does not reach the peer"
 $NSPAWN inspect -f '{{json .networks}}' e2e-cli | grep_q e2e-cli-net || fail "inspect does not show the network joined"
-$NSPAWN network connect e2e-cli-net e2e-cli 2>&1 | grep_q "already exists in network e2e-cli-net" || fail "a second connect was not refused"
+out=$($NSPAWN network connect e2e-cli-net e2e-cli 2>&1) && fail "a second connect went through"
+echo "$out" | grep_q "already exists in network e2e-cli-net" || fail "a second connect was not explained: $out"
 $NSPAWN create "$IMAGE" e2e-cli-boot >/dev/null && $NSPAWN start e2e-cli-boot >/dev/null || fail "start e2e-cli-boot"
 $NSPAWN network connect e2e-cli-net e2e-cli-boot >/dev/null || fail "network connect of a running booted machine"
 retry 10 bash -c "$NSPAWN exec e2e-cli-boot -- curl -s http://e2e-cli-peer/ </dev/null | grep_q peer" || fail "the booted machine does not reach the peer on the network it joined"
 $NSPAWN network disconnect e2e-cli-net e2e-cli >/dev/null || fail "network disconnect"
 $NSPAWN exec e2e-cli -- wget -T 3 -qO- http://e2e-cli-peer/ </dev/null >/dev/null 2>&1 && fail "the disconnected machine still reaches the peer"
 $NSPAWN inspect -f '{{json .networks}}' e2e-cli | grep_q e2e-cli-net && fail "inspect still shows the network left"
+# Leaving the network of the default route hands it to the next one.
+$NSPAWN network connect e2e-cli-net e2e-cli >/dev/null || fail "network connect again"
+$NSPAWN network disconnect bridge e2e-cli >/dev/null || fail "network disconnect of the network of the default route"
+$NSPAWN exec e2e-cli -- ip -4 route show default </dev/null | grep_q "default via" || fail "no default route after leaving the network that had it: $($NSPAWN exec e2e-cli -- ip -4 route </dev/null 2>&1)"
 $NSPAWN stop e2e-cli-boot >/dev/null
 # wait prints the code a machine ends with; ps finds it by it.
 $NSPAWN run -d --name e2e-cli-wait --label e2e.prune=$nonce "$bb136" -- /bin/sh -c 'sleep 2; exit 3' >/dev/null || fail "run e2e-cli-wait"
 [ "$(timeout 30 $NSPAWN wait e2e-cli-wait)" = 3 ] || fail "wait did not print the exit code"
 $NSPAWN ps -q --filter exited=3 | grep_q -x e2e-cli-wait || fail "ps --filter exited=3"
 $NSPAWN ps -q --filter status=exited | grep_q -x e2e-cli-wait || fail "ps --filter status=exited"
+# A machine of run -d --rm is gone once it ends, and one with a restart policy runs
+# again: wait gives the code of the end all the same.
+$NSPAWN run -d --rm --name e2e-cli-wrm "$bb136" -- /bin/sh -c 'sleep 2; exit 4' >/dev/null || fail "run -d --rm e2e-cli-wrm"
+[ "$(timeout 30 $NSPAWN wait e2e-cli-wrm)" = 4 ] || fail "wait did not give the code of a run -d --rm machine"
+$NSPAWN run -d --restart always --name e2e-cli-wrs "$bb136" -- /bin/sh -c 'sleep 2; exit 5' >/dev/null || fail "run -d --restart always e2e-cli-wrs"
+[ "$(timeout 30 $NSPAWN wait e2e-cli-wrs)" = 5 ] || fail "wait did not return at the end of a machine with a restart policy"
+$NSPAWN rm -f e2e-cli-wrs >/dev/null 2>&1
 # What takes the disk, and its prune: only what no machine uses goes.
 out=$($NSPAWN system df) || fail "system df"
-for kind in Images Containers "Local Volumes" "Build Cache"; do echo "$out" | grep_q "^$kind " || fail "system df misses $kind: $out"; done
+for kind in Images Containers "Local Volumes" "Build Cache"; do echo "$out" | grep_q "^ *$kind " || fail "system df misses $kind: $out"; done
 $NSPAWN system df -v | grep_q "^Images space usage:" || fail "system df -v"
 # The prunes only ever run with a filter that selects what this run made: a host that
 # runs the suite has images and machines of its own. An image of the run's own is
@@ -2869,6 +2909,9 @@ python3 - "$NSPAWN_REGISTRY" "$NSPAWN_CA_CERT" "$busybox137_ref" "e2e/prune-$non
 import base64, hashlib, json, ssl, sys, urllib.request
 reg, ca, src, dst, nonce = sys.argv[1:]
 ctx = ssl.create_default_context(cafile=ca)
+# The test registry's CA has no key usage extension, which Python 3.13 and later
+# refuse by default.
+ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
 auth = "Basic " + base64.b64encode(b"tester:s3cret").decode()
 def req(method, url, data=None, headers={}):
     return urllib.request.urlopen(urllib.request.Request(url, data=data, method=method, headers={"Authorization": auth, **headers}), context=ctx)
@@ -2923,6 +2966,9 @@ $NSPAWN stop e2e-ip >/dev/null && $NSPAWN start e2e-ip >/dev/null || fail "resta
 [ "$(addr_of e2e-ip)" = 10.97.42.50 ] || fail "the fixed address changed across a restart"
 out=$($NSPAWN create busybox-1.36 e2e-ip2 --network e2e-ip-net --ip 10.97.42.50 -- /bin/sleep 300 2>&1) && fail "a second machine took a taken address: $out"
 echo "$out" | grep_q "Address already in use" || fail "a taken address was not explained: $out"
+# A machine made from e2e-ip cannot take its address either.
+out=$($NSPAWN create e2e-ip e2e-ip2 --network e2e-ip-net --ip 10.97.42.50 2>&1) && fail "a machine made from e2e-ip took its address: $out"
+echo "$out" | grep_q "is the address of e2e-ip" || fail "the address of the source was not explained: $out"
 out=$($NSPAWN create busybox-1.36 e2e-ip2 --network e2e-ip-net --ip 10.97.43.5 -- /bin/sleep 300 2>&1) && fail "an address outside the subnet was taken: $out"
 echo "$out" | grep_q "no configured subnet or ip-range contain the IP address 10.97.43.5" || fail "an address outside the subnet was not explained: $out"
 out=$($NSPAWN create busybox-1.36 e2e-ip2 --ip 10.99.0.200 -- /bin/sleep 300 2>&1) && fail "an address on the default network was taken: $out"
@@ -3043,18 +3089,21 @@ assert seen['argv'] == ['/usr/local/bin/e2e-cdi-hook', 'one'] or seen['argv'][1:
 assert seen['hook_env'] == 'yes' and seen['lib'] == 'e2e library $nonce', seen
 assert seen['node'] and seen['proc'], seen
 " || fail "the hook did not see the machine as a runtime shows it: $(echo "$out" | tail -1)"
-# Permissions: r only; a node the host lacks is made with the spec's numbers.
+# A node the host lacks is made with the spec's numbers; the access rules go to the
+# unit (the template allows /dev/zero fully anyway, so the kernel is not asked here).
 out=$($NSPAWN run --rm --device e2e.nspawn.test/dev=two --device e2e.nspawn.test/dev=made "$bb136" -- /bin/sh -c \
-  'echo "env $E2E_CDI"; head -c 4 /dev/e2e-zero | wc -c; head -c 4 /dev/e2e-made | wc -c; echo x > /dev/e2e-zero && echo wrote' 2>&1)
+  'echo "env $E2E_CDI"; head -c 4 /dev/e2e-zero | wc -c; head -c 4 /dev/e2e-made | wc -c' 2>&1)
 echo "$out" | grep_q -x "env two" || fail "the device's variable: $out"
 [ "$(echo "$out" | grep -cx 4)" = 2 ] || fail "the CDI nodes cannot be read: $out"
-echo "$out" | grep_q -x wrote && fail "a node allowed r only took a write: $out"
+$NSPAWN create busybox-1.36 e2e-cdi-perm --device e2e.nspawn.test/dev=two -- /bin/sleep 300 >/dev/null && $NSPAWN start e2e-cdi-perm >/dev/null || fail "start e2e-cdi-perm"
+systemctl show -p DeviceAllow systemd-nspawn@e2e-cdi-perm.service | grep_q "/dev/zero r\b" || fail "the r of the spec is not the unit's: $(systemctl show -p DeviceAllow systemd-nspawn@e2e-cdi-perm.service)"
+$NSPAWN rm -f e2e-cdi-perm >/dev/null 2>&1
 # --gpus: the NVIDIA spec's devices, as docker's flag names them.
-out=$($NSPAWN run --rm --gpus all "$bb136" -- /bin/sh -c 'echo "$NVIDIA_VISIBLE_DEVICES"; ls /dev/nvidia0 /dev/nvidia1' 2>&1) || fail "run --gpus all: $out"
-echo "$out" | grep_q -x void && echo "$out" | grep_q -x /dev/nvidia1 || fail "--gpus all: $out"
-out=$($NSPAWN run --rm --gpus 1 "$bb136" -- /bin/sh -c 'ls /dev/nvidia0; ls /dev/nvidia1 2>&1' 2>&1)
-echo "$out" | grep_q -x /dev/nvidia0 && ! echo "$out" | grep_q -x /dev/nvidia1 || fail "--gpus 1: $out"
-out=$($NSPAWN run --rm --gpus '"device=1"' "$bb136" -- ls /dev/nvidia1 2>&1) || fail "--gpus device=1: $out"
+out=$($NSPAWN run --rm --gpus all "$bb136" -- /bin/sh -c 'echo "$NVIDIA_VISIBLE_DEVICES"; for n in 0 1; do test -c /dev/nvidia$n && echo nvidia$n; done' 2>&1) || fail "run --gpus all: $out"
+echo "$out" | grep_q -x void && echo "$out" | grep_q -x nvidia1 || fail "--gpus all: $out"
+out=$($NSPAWN run --rm --gpus 1 "$bb136" -- /bin/sh -c 'for n in 0 1; do test -c /dev/nvidia$n && echo nvidia$n; done' 2>&1)
+echo "$out" | grep_q -x nvidia0 && ! echo "$out" | grep_q -x nvidia1 || fail "--gpus 1: $out"
+out=$($NSPAWN run --rm --gpus '"device=1"' "$bb136" -- test -c /dev/nvidia1 2>&1) || fail "--gpus device=1: $out"
 out=$($NSPAWN run --rm --gpus 3 "$bb136" -- true 2>&1) && fail "--gpus 3 ran with two GPUs: $out"
 echo "$out" | grep_q "unresolvable CDI devices nvidia.com/gpu=2" || fail "--gpus 3 was not explained: $out"
 out=$($NSPAWN run --rm --device e2e.nspawn.test/dev=nope "$bb136" -- true 2>&1) && fail "a device the specs lack: $out"
@@ -3095,6 +3144,202 @@ rm -f /etc/cdi/e2e-nspawn.yaml /etc/cdi/e2e-nspawn-bad.yaml /usr/local/bin/e2e-c
 rm -rf $d
 
 $NSPAWN images rm busybox-1.36 > /dev/null 2>&1
+
+step "build: Dockerfiles built as the reference builds them, the cache, the sandbox"
+# Each case of tests/build was built by docker in tests/build/oracle.sh; here nspawn
+# builds it from the same bases (copies in the test registry) and the images must have
+# the same settings, history and layer contents.
+cases="$(dirname "$0")/build/cases"
+# What the host's build cache held before: a prune at the end runs only when nothing.
+cache_before=$($NSPAWN builder du --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)
+golden="$(dirname "$0")/build/golden"
+for dir in "$cases"/*/; do
+  name=$(basename "$dir")
+  work=/tmp/e2e-build-$name
+  rm -rf $work && cp -a "$dir" $work
+  # The modes git gives the files, as the reference saw them, whatever the umask the
+  # tree was unpacked with.
+  find $work -type d -exec chmod 0755 {} +
+  find $work -type f -perm -u=x -exec chmod 0755 {} +
+  find $work -type f ! -perm -u=x -exec chmod 0644 {} +
+  args=()
+  if [ -f $work/args ]; then
+    while read -r line; do args+=($(echo "$line" | sed "s#@CASE@#$work#g")); done < $work/args
+  fi
+  if [ -f $work/expect-error ]; then
+    out=$($NSPAWN build -t e2e-case-$name --build-arg BUSYBOX="$busybox137_ref" --build-arg ALPINE="$alpine322_ref" "${args[@]}" $work 2>&1) && fail "build of $name went through"
+    wanted=$(sed 's/^ERROR: failed to build: failed to solve: //' "$golden/$name.error")
+    echo "$out" | grep_q -F "$wanted" || fail "build of $name failed otherwise: $out"
+  else
+    $NSPAWN build -t e2e-case-$name --build-arg BUSYBOX="$busybox137_ref" --build-arg ALPINE="$alpine322_ref" "${args[@]}" $work > /tmp/e2e-build.txt 2>&1 || { cat /tmp/e2e-build.txt; fail "build of $name"; continue; }
+    python3 -I "$(dirname "$0")/build/describe.py" store /var/lib/nspawn e2e-case-$name --bases "$golden/bases.json" > /tmp/e2e-build-$name.json || fail "describe $name"
+    out=$(python3 -I "$(dirname "$0")/build/describe.py" compare "$golden/$name.json" /tmp/e2e-build-$name.json) || fail "the image of $name differs from the reference's:
+$out"
+  fi
+  rm -rf $work
+done
+# The same build again comes from the cache whole, with the same image.
+work=/tmp/e2e-build-layers && rm -rf $work && cp -a "$cases/layers" $work
+id1=$($NSPAWN build -q -t e2e-case-layers --build-arg BUSYBOX="$busybox137_ref" $work 2>/dev/null) || fail "quiet build"
+out=$($NSPAWN build -t e2e-case-layers --build-arg BUSYBOX="$busybox137_ref" $work 2>&1) || fail "second build: $out"
+echo "$out" | grep_q CACHED || fail "the second build took nothing from the cache: $out"
+id2=$($NSPAWN build -q -t e2e-case-layers --build-arg BUSYBOX="$busybox137_ref" $work 2>/dev/null) || fail "third build"
+[ "$id1" = "$id2" ] || fail "a build taken from the cache gave another image: $id1 $id2"
+# A file of the context that changes builds again from the step that copies it: to
+# contents of this run, which no earlier run left in the cache.
+echo changed-$nonce > $work/files/top.txt
+out=$($NSPAWN build -t e2e-case-layers --build-arg BUSYBOX="$busybox137_ref" $work 2>&1) || fail "build after a change: $out"
+echo "$out" | grep -A1 'COPY files/ ./' | grep_q CACHED && fail "the changed file came from the cache: $out"
+id3=$($NSPAWN build -q -t e2e-case-layers --build-arg BUSYBOX="$busybox137_ref" $work 2>/dev/null)
+[ "$id3" != "$id1" ] || fail "a changed context gave the same image"
+out=$($NSPAWN build --no-cache -t e2e-case-layers --build-arg BUSYBOX="$busybox137_ref" $work 2>&1) || fail "--no-cache: $out"
+echo "$out" | grep_q CACHED && fail "--no-cache took steps from the cache"
+rm -rf $work
+# The image runs, and goes to a registry and back.
+# An exec form CMD is not expanded: echo gets $GREETING as it is written.
+[ "$($NSPAWN run --rm e2e-case-settings 2>/dev/null)" = 'serve $GREETING' ] || fail "the built image does not run its entrypoint: $($NSPAWN run --rm e2e-case-settings 2>&1)"
+$NSPAWN push e2e-case-multistage --to "$NSPAWN_REGISTRY/e2e/built-$nonce:1" >/dev/null 2>&1 || fail "push of a built image"
+$NSPAWN images rm e2e-case-multistage >/dev/null || fail "images rm of a built image"
+$NSPAWN pull "$NSPAWN_REGISTRY/e2e/built-$nonce:1" --name e2e-case-multistage >/dev/null || fail "pull of a pushed built image"
+[ "$($NSPAWN run --rm "$NSPAWN_REGISTRY/e2e/built-$nonce:1" 2>/dev/null)" = built ] || fail "the pulled built image does not run: $($NSPAWN run --rm "$NSPAWN_REGISTRY/e2e/built-$nonce:1" 2>&1)"
+# ADD of a URL: checked against --checksum, and taken by its contents, so that what the
+# server has now is fetched again.
+work=/tmp/e2e-build-url && rm -rf $work && mkdir -p $work/served
+echo fetched-one-$nonce > $work/served/file.txt
+python3 -m http.server --bind 127.0.0.1 18199 --directory $work/served >/dev/null 2>&1 &
+served=$!
+sum=$(sha256sum $work/served/file.txt | cut -d' ' -f1)
+printf 'ARG BUSYBOX\nFROM ${BUSYBOX}\nADD --checksum=sha256:%s http://127.0.0.1:18199/file.txt /fetched.txt\nCMD ["cat", "/fetched.txt"]\n' $sum > $work/Dockerfile
+retry 10 bash -c "curl -sf http://127.0.0.1:18199/file.txt >/dev/null" || fail "the local HTTP server did not come up"
+$NSPAWN build -t e2e-build-url --build-arg BUSYBOX="$busybox137_ref" $work >/dev/null 2>&1 || fail "ADD of a URL with its checksum"
+[ "$($NSPAWN run --rm e2e-build-url 2>/dev/null)" = fetched-one-$nonce ] || fail "the image does not have what the URL served"
+printf 'ARG BUSYBOX\nFROM ${BUSYBOX}\nADD http://127.0.0.1:18199/file.txt /fetched.txt\nCMD ["cat", "/fetched.txt"]\n' > $work/Dockerfile
+$NSPAWN build -t e2e-build-url --build-arg BUSYBOX="$busybox137_ref" $work >/dev/null 2>&1 || fail "ADD of a URL"
+echo fetched-two-$nonce > $work/served/file.txt
+out=$($NSPAWN build -t e2e-build-url --build-arg BUSYBOX="$busybox137_ref" $work 2>&1) || fail "ADD of a URL whose contents changed: $out"
+echo "$out" | grep -A1 'ADD http' | grep_q CACHED && fail "a URL whose contents changed came from the cache: $out"
+[ "$($NSPAWN run --rm e2e-build-url 2>/dev/null)" = fetched-two-$nonce ] || fail "the image does not have what the URL serves now"
+printf 'ARG BUSYBOX\nFROM ${BUSYBOX}\nADD --checksum=sha256:%064d http://127.0.0.1:18199/file.txt /fetched.txt\n' 0 > $work/Dockerfile
+out=$($NSPAWN build -t e2e-build-url --build-arg BUSYBOX="$busybox137_ref" $work 2>&1) && fail "ADD with a wrong checksum went through"
+echo "$out" | grep_q "digest mismatch" || fail "a wrong checksum was not explained: $out"
+kill $served 2>/dev/null; wait $served 2>/dev/null
+rm -rf $work
+# A step runs confined: no kexec, no module loading, root without the host's devices.
+work=/tmp/e2e-build-sandbox && rm -rf $work && mkdir -p $work
+printf 'ARG BUSYBOX\nFROM ${BUSYBOX}\nRUN id -u > /uid && (insmod /x.ko 2>/dev/null; echo $? > /insmod) && ls /dev > /devs && (ping -c1 -W2 10.0.0.1 >/dev/null 2>&1; true)\n' > $work/Dockerfile
+$NSPAWN build -t e2e-build-sandbox --build-arg BUSYBOX="$busybox137_ref" $work >/dev/null 2>&1 || fail "build of the sandbox case"
+[ "$($NSPAWN run --rm e2e-build-sandbox cat /uid 2>/dev/null)" = 0 ] || fail "a step does not run as root"
+$NSPAWN run --rm e2e-build-sandbox cat /devs 2>/dev/null | grep_q '^sda$\|^vda$\|^nvme' && fail "a step saw the host's disks"
+# --network none and host.
+printf 'ARG BUSYBOX\nFROM ${BUSYBOX}\nRUN --network=none ip -o link | grep -v " lo:" | wc -l > /links\n' > $work/Dockerfile
+$NSPAWN build -t e2e-build-sandbox --build-arg BUSYBOX="$busybox137_ref" $work >/dev/null 2>&1 || fail "RUN --network=none"
+[ "$($NSPAWN run --rm e2e-build-sandbox cat /links 2>/dev/null)" = 0 ] || fail "RUN --network=none had an interface"
+printf 'ARG BUSYBOX\nFROM ${BUSYBOX}\nRUN --network=host true\n' > $work/Dockerfile
+# Built with --allow first, so that the step is in the cache: the entitlement is asked
+# for all the same.
+$NSPAWN build --allow network.host -t e2e-build-sandbox --build-arg BUSYBOX="$busybox137_ref" $work >/dev/null 2>&1 || fail "RUN --network=host with --allow, into the cache"
+out=$($NSPAWN build -t e2e-build-sandbox --build-arg BUSYBOX="$busybox137_ref" $work 2>&1) && fail "RUN --network=host without --allow: $out"
+echo "$out" | grep_q "network.host is not allowed" || fail "RUN --network=host without --allow was not explained: $out"
+$NSPAWN build --allow network.host -t e2e-build-sandbox --build-arg BUSYBOX="$busybox137_ref" $work >/dev/null 2>&1 || fail "RUN --network=host with --allow"
+# A failed build leaves no mount, namespace or directory behind.
+grep -q '/var/lib/nspawn/builds/df-' /proc/self/mountinfo && fail "a build left a mount: $(grep /var/lib/nspawn/builds/ /proc/self/mountinfo)"
+ls /var/lib/nspawn/builds/ 2>/dev/null | grep_q '^df-' && fail "a build left its directory: $(ls /var/lib/nspawn/builds/)"
+ip netns list | grep_q 'nspawn-build_' && fail "a build left its network namespace: $(ip netns list)"
+rm -rf $work
+# Two builds at once, each with its own steps, both whole.
+work=/tmp/e2e-build-two && rm -rf $work && mkdir -p $work/a $work/b
+for x in a b; do printf 'ARG BUSYBOX\nFROM ${BUSYBOX}\nRUN echo %s-%s > /which && sleep 2\nCMD ["cat", "/which"]\n' $x $nonce > $work/$x/Dockerfile; done
+$NSPAWN build -t e2e-build-two-a --build-arg BUSYBOX="$busybox137_ref" $work/a > /tmp/e2e-build-a.txt 2>&1 &
+pa=$!
+$NSPAWN build -t e2e-build-two-b --build-arg BUSYBOX="$busybox137_ref" $work/b > /tmp/e2e-build-b.txt 2>&1 &
+pb=$!
+wait $pa || fail "the first of two builds at once: $(cat /tmp/e2e-build-a.txt)"
+wait $pb || fail "the second of two builds at once: $(cat /tmp/e2e-build-b.txt)"
+[ "$($NSPAWN run --rm e2e-build-two-a 2>/dev/null)" = "a-$nonce" ] || fail "the first of two builds at once made another image"
+[ "$($NSPAWN run --rm e2e-build-two-b 2>/dev/null)" = "b-$nonce" ] || fail "the second of two builds at once made another image"
+# A build whose client goes away stops, and leaves nothing behind.
+printf 'ARG BUSYBOX\nFROM ${BUSYBOX}\nRUN echo cancel-%s && sleep 300\n' $nonce > $work/a/Dockerfile
+$NSPAWN build -t e2e-build-cancel --build-arg BUSYBOX="$busybox137_ref" $work/a > /tmp/e2e-build-cancel.txt 2>&1 &
+pc=$!
+for i in $(seq 1 60); do grep -q "cancel-$nonce" /tmp/e2e-build-cancel.txt && break; sleep 1; done
+grep -q "cancel-$nonce" /tmp/e2e-build-cancel.txt || fail "the build to cancel did not start: $(cat /tmp/e2e-build-cancel.txt)"
+kill -TERM $pc; wait $pc 2>/dev/null
+for i in $(seq 1 30); do pgrep -f "cancel-$nonce" >/dev/null || break; sleep 1; done
+pgrep -af "cancel-$nonce" && fail "the step of a cancelled build still runs"
+for i in $(seq 1 10); do ls /var/lib/nspawn/builds/ 2>/dev/null | grep_q '^df-' || break; sleep 1; done
+ls /var/lib/nspawn/builds/ 2>/dev/null | grep_q '^df-' && fail "a cancelled build left its directory: $(ls /var/lib/nspawn/builds/)"
+grep -q '/var/lib/nspawn/builds/df-' /proc/self/mountinfo && fail "a cancelled build left a mount"
+ip netns list | grep_q 'nspawn-build_' && fail "a cancelled build left its network namespace"
+$NSPAWN images ls | grep_q '^ *e2e-build-cancel ' && fail "a cancelled build made an image"
+rm -rf $work
+# compose: a service without an image is built by up as PROJECT-SERVICE, from the
+# cache by compose build; pull_policy build builds at every up; --build rebuilds;
+# --push sends a named one; down --rmi local takes the images the project built.
+cb=e2e-cb-$nonce
+work=/tmp/e2e-compose-build && rm -rf $work && mkdir -p $work/app
+printf 'ARG BUSYBOX\nFROM ${BUSYBOX}\nARG GREETING\nCOPY msg /msg\nRUN echo "$GREETING" > /greeting\nCMD ["sh", "-c", "cat /msg /greeting; exec sleep 600"]\n' > $work/app/Dockerfile
+echo from-context > $work/app/msg
+cat > $work/compose.yaml <<COMPOSE
+name: $cb
+services:
+  web:
+    build:
+      context: ./app
+      args:
+        BUSYBOX: $busybox137_ref
+        GREETING: hello-build
+      labels:
+        e2e.build: "yes"
+  tagged:
+    image: $NSPAWN_REGISTRY/e2e/cb-$nonce:1
+    pull_policy: build
+    build:
+      context: ./app
+      dockerfile_inline: |
+        ARG BUSYBOX
+        FROM \$\${BUSYBOX}
+        CMD ["sh", "-c", "echo inline; exec sleep 600"]
+      args:
+        BUSYBOX: $busybox137_ref
+COMPOSE
+out=$($NSPAWN compose -f $work/compose.yaml up --no-build -d 2>&1) && fail "compose up --no-build with an image to build: $out"
+echo "$out" | grep_q "compose build makes it" || fail "compose up --no-build was not explained: $out"
+$NSPAWN compose -f $work/compose.yaml up -d > /tmp/e2e-cb.txt 2>&1 || fail "compose up of services that build: $(cat /tmp/e2e-cb.txt)"
+$NSPAWN images ls | grep_q "^ *$cb-web " || fail "compose up did not build $cb-web: $($NSPAWN images ls)"
+for i in $(seq 1 20); do $NSPAWN logs $cb-web-1 2>/dev/null | grep_q hello-build && break; sleep 1; done
+$NSPAWN logs $cb-web-1 2>&1 | grep_q from-context || fail "the built service does not run its image: $($NSPAWN logs $cb-web-1 2>&1)"
+$NSPAWN logs $cb-web-1 2>&1 | grep_q hello-build || fail "the build args of the service were not given"
+[ "$($NSPAWN inspect -f '{{index .labels "e2e.build"}}' $cb-web)" = yes ] || fail "the build labels are not on the image"
+[ "$($NSPAWN inspect -f '{{index .labels "com.docker.compose.project"}}' $cb-web)" = $cb ] || fail "the image has no project label"
+for i in $(seq 1 20); do $NSPAWN logs $cb-tagged-1 2>/dev/null | grep_q inline && break; sleep 1; done
+$NSPAWN logs $cb-tagged-1 2>&1 | grep_q inline || fail "dockerfile_inline was not built"
+created=$($NSPAWN inspect -f '{{.created}}' $cb-web-1)
+out=$($NSPAWN compose -f $work/compose.yaml build 2>&1) || fail "compose build: $out"
+echo "$out" | grep_q CACHED || fail "compose build took nothing from the cache: $out"
+out=$($NSPAWN compose -f $work/compose.yaml up -d 2>&1) || fail "compose up again: $out"
+echo "$out" | grep_q "Image $NSPAWN_REGISTRY/e2e/cb-$nonce:1 Built" || fail "pull_policy build did not build at up: $out"
+[ "$($NSPAWN inspect -f '{{.created}}' $cb-web-1)" = "$created" ] || fail "an image built the same recreated its machine"
+echo changed > $work/app/msg
+$NSPAWN compose -f $work/compose.yaml up -d --build >/dev/null 2>&1 || fail "compose up --build"
+for i in $(seq 1 20); do $NSPAWN logs $cb-web-1 2>/dev/null | grep_q changed && break; sleep 1; done
+$NSPAWN logs $cb-web-1 2>&1 | grep_q changed || fail "compose up --build did not rebuild and recreate"
+$NSPAWN compose -f $work/compose.yaml build --push tagged >/dev/null 2>&1 || fail "compose build --push"
+$NSPAWN pull "$NSPAWN_REGISTRY/e2e/cb-$nonce:1" --name e2e-cb-pulled >/dev/null || fail "the pushed image is not in the registry"
+$NSPAWN images rm e2e-cb-pulled >/dev/null
+$NSPAWN compose -f $work/compose.yaml ps -a --format '{{.Name}}' | grep_q "^$cb-web$" && fail "compose ps lists the built image as a machine"
+$NSPAWN compose -f $work/compose.yaml down --rmi local >/dev/null 2>&1 || fail "compose down --rmi local"
+$NSPAWN images ls | grep_q "^ *$cb-web \|^ *e2e-cb-$nonce-1 " && fail "down --rmi local left a built image: $($NSPAWN images ls)"
+rm -rf $work
+# The cache: listed, and pruned.
+$NSPAWN builder du | grep_q '^Total:' || fail "builder du"
+if [ "$cache_before" = 0 ]; then
+  out=$($NSPAWN builder prune -a -f) || fail "builder prune: $out"
+  echo "$out" | grep_q '^Total reclaimed space:' || fail "builder prune said nothing: $out"
+  [ -z "$($NSPAWN builder du --json | python3 -c 'import json,sys; print(len(json.load(sys.stdin)) or "")')" ] || fail "builder prune -a left cache"
+else
+  echo "the host's build cache had entries before: builder prune -a not run"
+fi
+for i in $($NSPAWN images ls | awk '$1 ~ /^e2e-case-|^e2e-build-/ {print $1}'); do $NSPAWN images rm $i >/dev/null 2>&1; done
 
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"

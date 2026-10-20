@@ -1,0 +1,202 @@
+moby/buildkit v0.33.1
+
+Ported to src/build/dockerfile (Apache-2.0, see LICENSE.buildkit in this directory):
+
+  frontend/dockerfile/parser/parser.go            parser.rs
+  frontend/dockerfile/parser/line_parsers.go      parser.rs
+  frontend/dockerfile/parser/split_command.go     parser.rs
+  frontend/dockerfile/parser/directives.go        parser.rs
+  frontend/dockerfile/parser/errors.go            mod.rs (Error, Range, Position)
+  frontend/dockerfile/shell/lex.go                shell.rs
+  frontend/dockerfile/shell/equal_env_unix.go     shell.rs
+  frontend/dockerfile/command/command.go          instructions.rs (names only)
+  frontend/dockerfile/instructions/parse.go       instructions.rs
+  frontend/dockerfile/instructions/commands.go    instructions.rs
+  frontend/dockerfile/instructions/support.go     instructions.rs
+  frontend/dockerfile/instructions/errors_unix.go instructions.rs
+  frontend/dockerfile/instructions/bflag.go       bflag.rs
+  frontend/dockerfile/instructions/commands_runmount.go     run_flags.rs
+  frontend/dockerfile/instructions/commands_runnetwork.go   run_flags.rs
+  frontend/dockerfile/instructions/commands_runsecurity.go  run_flags.rs
+  frontend/dockerfile/instructions/commands_rundevice.go    run_flags.rs
+  util/suggest/error.go                           compat.rs
+
+Tests ported as unit tests next to the code:
+
+  frontend/dockerfile/parser/parser_test.go
+  frontend/dockerfile/parser/line_parsers_test.go
+  frontend/dockerfile/parser/json_test.go
+  frontend/dockerfile/parser/parser_heredoc_test.go
+  frontend/dockerfile/parser/directives_test.go
+  frontend/dockerfile/shell/lex_test.go
+  frontend/dockerfile/instructions/parse_test.go
+  frontend/dockerfile/instructions/bflag_test.go
+  frontend/dockerfile/instructions/parse_heredoc_test.go
+  frontend/dockerfile/instructions/support_test.go
+  frontend/dockerfile/instructions/commands_rundevice_test.go
+
+Test vectors copied verbatim to tests/build/buildkit:
+
+  frontend/dockerfile/parser/testfiles/          parser/testfiles/
+  frontend/dockerfile/parser/testfiles-negative/ parser/testfiles-negative/
+  frontend/dockerfile/parser/testfile-line/      parser/testfile-line/
+  frontend/dockerfile/shell/envVarTest           shell/envVarTest
+  frontend/dockerfile/shell/wordsTest            shell/wordsTest
+
+Behaviour of buildkit's dependencies reproduced in compat.rs and json.rs,
+at the versions buildkit v0.33.1 requires:
+
+  github.com/agext/levenshtein v1.2.3 (Apache-2.0)
+      Distance with the default parameters
+  github.com/docker/go-units v0.5.0 (Apache-2.0)
+      size.go: RAMInBytes
+  github.com/tonistiigi/go-csvvalue v0.0.0-20240814133006-030d3b2625d0 (MIT)
+      csvvalue.go: Fields with the default parser
+  Go standard library (BSD-3-Clause)
+      strconv (Quote, ParseBool, ParseInt, ParseUint, ParseFloat),
+      time.ParseDuration, the strings case mapping helpers, the subset of
+      encoding/json and regexp the reference relies on, unicode.IsLetter,
+      unicode.IsDigit and unicode.IsPrint
+
+The MIT license of go-csvvalue:
+
+  Copyright 2024 Tõnis Tiigi <tonistiigi@gmail.com>
+
+  Permission is hereby granted, free of charge, to any person obtaining
+  a copy of this software and associated documentation files (the
+  "Software"), to deal in the Software without restriction, including
+  without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to
+  the following conditions:
+
+  The above copyright notice and this permission notice shall be
+  included in all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+  LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+  OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+  WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+The modules of src/build port the following Go sources to Rust. The license of each
+project is next to this file, copied verbatim.
+
+github.com/moby/patternmatcher v0.6.1
+    License: LICENSE.patternmatcher (Apache-2.0), NOTICE.patternmatcher
+    patternmatcher.go, patternmatcher_test.go
+    ignorefile/ignorefile.go, ignorefile/ignorefile_test.go
+    Ported in: ignore.rs
+
+github.com/tonistiigi/fsutil v0.0.0-20260819142231-83cac42c1c52
+    License: LICENSE.fsutil (MIT)
+    fs.go, filter.go, followlinks.go, followlinks_unix.go, stat.go, stat_unix.go,
+    filter_test.go, followlinks_test.go
+    Ported in: walk.rs
+    copy/copy.go, copy/copy_linux.go, copy/copy_nowindows.go, copy/hardlink.go,
+    copy/hardlink_unix.go, copy/mkdir.go, copy/mkdir_unix.go, copy/stat_sysv.go,
+    copy/copy_test.go, copy/copy_unix_test.go, copy/mkdir_test.go
+    Ported in: copy.rs
+
+github.com/moby/buildkit v0.33.1
+    License: LICENSE.buildkit (Apache-2.0)
+    solver/llbsolver/file/backend.go (docopy, cleanPath)
+    solver/llbsolver/file/backend_unix.go (mapUserToChowner, platformCopy)
+    frontend/dockerfile/dockerfile2llb/convert_copy.go (dispatchCopy: the flags of
+        COPY and ADD, --chmod, --parents)
+    frontend/dockerfile/dockerfile2llb/convert.go (pathRelativeToWorkingDir)
+    client/llb/fileop.go (normalizePath, CopyInfo to FileActionCopy)
+    util/system/path.go (NormalizePath)
+    cache/contenthash/checksum.go (the required paths of --parents)
+    Ported in: copy.rs
+
+github.com/containerd/continuity v0.5.0
+    License: LICENSE.continuity (Apache-2.0)
+    fs/path.go (RootPath), fs/path_test.go (TestRootPath)
+    Ported in: copy.rs (root_path)
+
+github.com/tonistiigi/dchapes-mode v0.0.0-20250318174251-73d941a28323
+    License: LICENSE.dchapes-mode (BSD-2-Clause), and NOTICE.dchapes-mode: the
+    copyright notice of BSD's setmode.c, from the header of its mode.go
+    mode.go, bits.go, mode_test.go
+    Ported in: copy.rs (mode)
+
+The Go standard library, go1.x, as these sources use it: path/filepath (Clean, Join,
+Split, Dir, Base, Rel, Match) and the syntax and matching rules of regexp with its
+Perl flags, reimplemented in ignore.rs.
+    License: LICENSE.go (BSD-3-Clause), the Go project's license as golang.org/x/sys
+    v0.48.0 ships it.
+
+src/build/layer.rs is a port to Rust of the code below. The port follows it line by line
+where the output depends on it; layer.rs names the reference files in its comments.
+
+github.com/moby/buildkit v0.33.1 (Apache-2.0, LICENSE.buildkit)
+  util/overlay/overlay_linux.go
+    Changes, checkDelete, checkOpaque, checkRedirect, sameDirent, compareSysStat,
+    compareCapabilities, compareSymlinkTarget, compareFileContent. The mounts of
+    WriteUpperdir (the lower snapshot, and the view lowerdir=upper:empty) are not made:
+    layer.rs reads the lowers and the upper as those mounts show them.
+  util/overlay/overlay_linux_test.go
+    TestSimpleDiff, TestRenameDiff, TestEmptyFileDiff, TestNestedDeletion,
+    TestDirectoryReplace, TestRemoveDirectoryTree, TestRemoveDirectoryTreeWithDash,
+    TestFileReplace, TestParentDirectoryPermission, TestUpdateWithSameTime, TestLchtimes.
+  util/compression/gzip.go
+    The level of the blob (gzip.DefaultCompression).
+  cache/blobs_linux.go
+    diff_id as the sha256 of the uncompressed tar, digest and size of the blob.
+
+github.com/containerd/containerd/v2 v2.4.1 (Apache-2.0, LICENSE.containerd, NOTICE.containerd)
+  pkg/archive/tar.go
+    ChangeWriter: NewChangeWriter, HandleChange, includeParents, copyBuffered; the
+    whiteout prefix.
+  pkg/archive/tar_unix.go
+    chmodTarEntry, setHeaderForSpecialDevice, getxattr.
+  pkg/archive/tarheader/tarheader.go, pkg/archive/tarheader/tarheader_unix.go
+    FileInfoHeaderNoLookups.
+  pkg/archive/tar_test.go
+    TestDiffTar: EmptyDiff, ParentInclusion, HardlinkParentInclusion,
+    UpdateDirectoryPermission, HardlinkUpdatedParent, WhiteoutIncludesParents,
+    WhiteoutParentRemoval, IgnoreSockets.
+  buildkit v0.33.1 requires containerd v2.3.6 or later; v2.4.1 is the version its
+  consumers resolved.
+
+github.com/containerd/continuity v0.5.0 (Apache-2.0, same text as LICENSE.containerd)
+  fs/diff.go
+    doubleWalkDiff.
+  fs/path.go
+    pathChange, directoryCompare, sameFile, compareSymlinkTarget, compareFileContent,
+    pathWalk.
+  fs/diff_unix.go
+    compareSysStat, compareCapabilities, isLinked.
+  fs/hardlink_unix.go
+    getLinkInfo.
+  devices/devices_unix.go
+    DeviceInfo, which tells a whiteout (0:0) from other character devices.
+
+Go 1.26.9 standard library (BSD-3-Clause, LICENSE.go)
+  archive/tar/writer.go
+    WriteHeader, writeUSTARHeader, writePAXHeader, templateV7Plus, writeRawFile,
+    writeRawHeader, Close, splitUSTARPath.
+  archive/tar/common.go
+    allowedFormats, FileInfoHeader, isHeaderOnlyType, basicKeys.
+  archive/tar/format.go
+    The header block layout, setFormat, computeChecksum, blockPadding.
+  archive/tar/strconv.go
+    isASCII, toASCII, formatString, formatOctal, fitsInOctal, formatPAXRecord,
+    validPAXRecord.
+  archive/tar/writer_test.go, archive/tar/strconv_test.go
+    TestSplitUSTARPath, TestFitsInOctal, the octal vectors of TestFormatNumeric,
+    TestFormatPAXRecord.
+  os (the FileMode of a stat), path.Join, time.Time.Truncate.
+
+golang.org/x/sys v0.48.0 (BSD-3-Clause, same text as LICENSE.go)
+  unix/dev_linux.go
+    Major, Minor.
+
+The expected tar digests in the tests of layer.rs come from running the code above,
+unchanged, under Go 1.26.9: Changes with containerd's ChangeWriter, over the trees the
+tests describe, built as root on tmpfs, with the lowers mounted as the overlayfs
+snapshotter mounts a lower snapshot and the upper read through the view WriteUpperdir
+mounts.

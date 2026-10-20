@@ -101,7 +101,7 @@ mod tests {
         })
     }
 
-    /// The cases of docker's kvfile_test.go.
+    /// The cases of the reference's kvfile_test.go.
     #[test]
     fn as_docker_reads_them() {
         assert_eq!(

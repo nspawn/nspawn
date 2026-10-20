@@ -44,6 +44,8 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `gotemplate.rs` | Go's text/template over JSON values, with docker's functions and `table` layout: `ps --format`, `inspect -f` |
 | `api/disk.rs`, `commands/system.rs` | what is an image and what a machine (a record pulled or built and never started is an image only), sizes by kind for `system df`, `images prune`, and `system prune` on top of the removals and prunes of the service |
 | `dockerapi/` | the read-only Docker Engine API (`api-serve`), served on a machine's own socket: routing and versions, containers and networks in docker's shapes, filters, events, logs, stats; the one write is a kill through the service |
+| `build/` | the Dockerfile builder: ports of BuildKit's frontend (`dockerfile/`: the parser, the shell lexer, instructions and flags; `dispatch/`: stages, build arguments and the image's settings as convert.go makes them), of its context rules (`ignore.rs`, `walk.rs`, `copy.rs`) and of its overlay differ (`layer.rs`, the tar of a layer as containerd writes it); `root.rs` the overlay mount of a step, `sandbox.rs` the systemd-nspawn of a RUN and the mount points it leaves, `cache.rs` the build cache, `image.rs` the config and manifest, `exec.rs` the steps run in order, the layers committed into the store and the images installed |
+| `commands/build.rs`, `compose/engine/build.rs` | `build` of a Dockerfile on the client: the builder picked, the context packed as the user with `.dockerignore`, secrets read; compose's `build` sections, image names and labels |
 | `api/recreate.rs`, `api/autoupdate.rs` | a machine made anew from a newer image with its options, and put back from its rollback when the new one does not come up; `auto-update`: candidates by label, the registry asked once per reference, dependents restarted |
 
 ## On disk
@@ -58,7 +60,8 @@ files, and the machine units call nspawn back through drop-in hooks.
                      of a pull in flight, which the collector leaves alone
   images/NAME.json   the record: reference, index_digest (the index a tag
                      named at the pull), backend, mode, pid1, started (its
-                     first start), network (and
+                     first start), fixed_addresses (the networks whose
+                     address was asked for), network (and
                      network_name for a user-defined one), address,
                      extra_networks with their addresses, aliases,
                      no_network, ports, entrypoint/cmd, env, volumes,
@@ -89,6 +92,14 @@ files, and the machine units call nspawn back through drop-in hooks.
   rollback/NAME/     auto-update's copy of a machine's previous record,
                      manifest and upper/work, until its new image is up;
                      its layers and blobs stay meanwhile
+  builds/df-ID/      a Dockerfile build while it runs: the context, the
+                     upper and work of each step, its network namespace's
+                     address; removed at its end, and at the service's start
+                     for builds a service that went away left
+  cache/build/       the build cache: entries/ (a step's layer by its key),
+                     bases/ (the base images builds pulled), mounts/ (RUN
+                     --mount=type=cache); its layers and blobs stay until
+                     `builder prune`
   .lock              flock serialising commands that change the store
 /var/lib/machines/NAME        the root machined boots (mount point or dir)
 /var/lib/machines/NAME.mstack mstack layout (layer@N links, rw/)
@@ -108,7 +119,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 /run/nspawn/attach/NAME.sock  where an attached run waits for its machine's
                         systemd-nspawn (0700 directory)
 /run/nspawn/api/NAME.sock     a machine's Docker API, opened by
-                        nspawn-api@NAME.socket (0660, 0700 directory) and bound
+                        nspawn-api@NAME.socket (0600, 0700 directory) and bound
                         where the machine mounts docker's socket
 /run/nspawn/firewalld/NAME    the interfaces of a veth machine bound to
                         firewalld's trusted zone, for the release hook to unbind

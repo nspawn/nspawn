@@ -109,6 +109,8 @@ pub enum Command {
     Secret(SecretArgs),
     /// What nspawn keeps on disk, and its prune, like docker system.
     System(SystemArgs),
+    /// The cache of Dockerfile builds, like docker builder.
+    Builder(BuilderArgs),
     /// Run docker compose files on nspawn machines, with docker compose's commands.
     Compose(crate::compose::cli::ComposeArgs),
     /// Serve org.nspawn on the system bus (started by the bus; see --install).
@@ -786,15 +788,36 @@ impl DockerfileArgs {
     /// The flags of docker build nspawn's builder has no counterpart of.
     pub fn refused(&self) -> Option<&'static str> {
         [
-            (!self.ssh.is_empty(), "--ssh: SSH agent forwarding into a build is not supported"),
-            (!self.output.is_empty(), "--output: a build makes a local image; nspawn push sends it to a registry"),
-            (!self.cache_to.is_empty(), "--cache-to: the build cache stays on this host"),
-            (!self.build_context.is_empty(), "--build-context: a build takes one context"),
+            (
+                !self.ssh.is_empty(),
+                "--ssh: SSH agent forwarding into a build is not supported",
+            ),
+            (
+                !self.output.is_empty(),
+                "--output: a build makes a local image; nspawn push sends it to a registry",
+            ),
+            (
+                !self.cache_to.is_empty(),
+                "--cache-to: the build cache stays on this host",
+            ),
+            (
+                !self.build_context.is_empty(),
+                "--build-context: a build takes one context",
+            ),
             (self.check.is_some(), "--check: the builder has no linter"),
             (self.call.is_some(), "--call: the builder only builds"),
-            (self.sbom.is_some(), "--sbom: the builder writes no attestations"),
-            (self.provenance.is_some(), "--provenance: the builder writes no attestations"),
-            (!self.attest.is_empty(), "--attest: the builder writes no attestations"),
+            (
+                self.sbom.is_some(),
+                "--sbom: the builder writes no attestations",
+            ),
+            (
+                self.provenance.is_some(),
+                "--provenance: the builder writes no attestations",
+            ),
+            (
+                !self.attest.is_empty(),
+                "--attest: the builder writes no attestations",
+            ),
         ]
         .into_iter()
         .find_map(|(given, text)| given.then_some(text))
@@ -917,6 +940,47 @@ pub struct SystemPruneArgs {
     /// label=KEY, label=KEY=VALUE or until=DURATION|UNIX-SECONDS. Repeatable.
     #[arg(long = "filter", value_name = "KEY=VALUE")]
     pub filters: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct BuilderArgs {
+    #[command(subcommand)]
+    pub command: BuilderCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BuilderCommand {
+    /// Remove build cache, like docker builder prune: without -a what no image takes
+    /// too.
+    Prune(BuilderPruneArgs),
+    /// What the build cache holds, most recently used first.
+    Du(BuilderDuArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct BuilderPruneArgs {
+    /// Everything, what images take too.
+    #[arg(long, short = 'a')]
+    pub all: bool,
+    /// Do not ask.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+    /// until=DURATION|UNIX-SECONDS: only what was last used before. Repeatable.
+    #[arg(long = "filter", value_name = "KEY=VALUE")]
+    pub filters: Vec<String>,
+    /// Keep the most recently used cache up to this size (64m, 2g).
+    #[arg(long, value_name = "SIZE", value_parser = crate::policy::parse_size)]
+    pub keep_storage: Option<u64>,
+}
+
+#[derive(Args, Debug)]
+pub struct BuilderDuArgs {
+    /// Every row, not only the total.
+    #[arg(long, short = 'v')]
+    pub verbose: bool,
+    /// The rows as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]

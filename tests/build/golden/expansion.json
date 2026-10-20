@@ -1,0 +1,134 @@
+{
+ "architecture": "amd64",
+ "config": {
+  "Cmd": [
+   "sh"
+  ],
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+   "A=fallback",
+   "B=alt",
+   "C=from-global",
+   "D=override",
+   "E=override",
+   "F=override",
+   "G=fallback-alt"
+  ],
+  "Labels": {
+   "from.arg": "override",
+   "literal": "${DEF}"
+  },
+  "WorkingDir": "/w/override"
+ },
+ "history": [
+  {
+   "created_by": "BusyBox 1.37.0 (glibc), Debian 13"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ARG GLOBAL=from-global",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ARG UNSET",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ARG DEF=override",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ENV A=fallback B=alt C=from-global D=override E=override F=override",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ENV G=fallback-alt",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "WORKDIR /w/override"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN |3 GLOBAL=from-global UNSET= DEF=override /bin/sh -c echo \"$A $B $C $D $E $F $G $DEF\" > out"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "LABEL from.arg=override literal=${DEF}",
+   "empty_layer": true
+  }
+ ],
+ "layers": [
+  {
+   "base": true,
+   "diff_id": "sha256:5a9bfd996c6d49c6c3cb4ddfb76e8d09cf16b6b7cf6601d1f2dffbdbc3edb5d4"
+  },
+  {
+   "diff_id": "sha256:ad1860572bbd95f1e5887e358c6d8676057cb13bceed2eef0ef8361b35d5ff6a",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "w",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "w/override",
+     "type": "dir",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:bf924620b9d350a49befeeae28e2d0909a7fc68a1b552061d2a02aab6c222928",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "proc",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "sys",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "w",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "w/override",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "w/override/out",
+     "sha256": "sha256:05eaf941eb48fa0f5ac0ba5203c000f72eb8f0b7d7bc79ff920677e5e60e655a",
+     "size": 74,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  }
+ ],
+ "os": "linux"
+}

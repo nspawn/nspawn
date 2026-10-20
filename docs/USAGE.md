@@ -45,10 +45,62 @@ verified before any layer comes down (see [Signed images](#signed-images)): `pul
 says who signed it, refuses it without a valid signature, and `--no-verify` skips the
 check for that command, on `run` and `create` too.
 
+`build` builds a Dockerfile the way `docker build` does, or runs mkosi on an mkosi
+configuration: a directory with a `Dockerfile` (or `dockerfile`, `Containerfile`), `-f`
+naming one, `-` on standard input or any of the Dockerfile flags below make it a
+Dockerfile build; a directory with `mkosi.conf` or `mkosi.conf.d` and nothing else, or
+the mkosi flags, an mkosi build. Either result is stored like a pulled image (blobs,
+manifest, assembled machine) and can be started right away or pushed; `--force`
+replaces an image of the same name (`-f` is the Dockerfile, as with docker).
+
+### Dockerfiles
+
+`nspawn build -t app:1 .` reads the Dockerfile as the reference frontend (BuildKit's,
+`# syntax=docker/dockerfile:1` included; another frontend image is refused) and runs it
+with a builder of nspawn's own: every stage the target needs (`--target`, the last one
+otherwise), multi-stage builds, `COPY --from`, `ARG` and `--build-arg`, `ONBUILD`,
+heredocs, `COPY --chown --chmod --parents --exclude --link`, `ADD` of local archives
+(gzip, bzip2, xz, zstd or plain tar, unpacked) and of http(s) URLs (`--checksum`), `RUN --mount`
+of the cache, bind, tmpfs and secret kinds (`--secret id=ID,src=PATH`, or `env=VAR`, read
+by the command line as the user), `RUN --network=none|host` (host with `--allow
+network.host`), `--network`, `--add-host`, `--label`, `--shm-size`, `--ulimit`, `--pull`
+(the registry is asked for base images even when one with the reference is here),
+`--no-cache`, `--no-cache-filter`, `-q`, `--iidfile` and `--push` (the tags, once built).
+The context is the directory given, packed by the command line as the user with what
+`.dockerignore` (or `Dockerfile.dockerignore` next to the Dockerfile) excludes left out,
+everything owned by root, as docker sends it; `-` takes a context tar, or a Dockerfile
+with no context, from standard input.
+
+Every step runs in a root of its own, an overlay of the layers so far, and what it
+changes becomes a layer; a `RUN` runs under systemd-nspawn with the confinement of an
+app machine (the default capabilities, the system call filter, no user namespace so
+that files keep their owners), as PID 1, on a network namespace of the build's on the
+default bridge. Steps that ran before with the same inputs (the instruction, the build
+arguments, the files of the context it copies) come from the build cache, so a build
+taken whole from it gives the same image ID. The output follows the reference's plain
+progress, a numbered line per step; a failing step ends the build with the
+reference's text, `process "/bin/sh -c false" did not complete successfully: exit code:
+1`. `builder du` lists the cache, `builder prune` removes what no image takes too
+(`-a` all of it, `--filter until=`, `--keep-storage SIZE`), and `system df` and `system
+prune` count it. A build whose command line goes away (Ctrl-C) stops, its step killed
+and nothing of it left behind; two builds at once each run on their own.
+
+Differences from docker build: no SSH forwarding (`--ssh`), no output other than a local
+image (`--output`, `--cache-to`), no named contexts, no remote contexts or git sources,
+no attestations, only this host's platform, no `RUN --security=insecure` or `RUN
+--device`, and no linter. Stages run one after another; `COPY --link` copies as a
+plain COPY; `/run` is a tmpfs during a `RUN`, so what a step writes there is not kept;
+systemd-nspawn adds `container=systemd-nspawn` to a step's environment; the mount
+points systemd-nspawn makes for a step (an empty `/etc/machine-id`, `/bin` and the like
+as links into `/usr` where the base had none) are taken out of its layer, even when the
+step made them itself; the layers' gzip blobs differ from BuildKit's while their
+contents and diff IDs are the same.
+
+### mkosi
+
 `build` runs `mkosi` in the given directory with `--format=oci`, so the same
 `mkosi.conf` tree that works on its own works here; `--distribution`, `--release`,
-`--profile` and anything after `--` are passed through. The result is stored like a pulled
-image (blobs, manifest, assembled machine) and can be started right away or pushed.
+`--profile` and anything after `--` are passed through, and `-t` names the result.
 
 ## Machines and apps
 
@@ -484,7 +536,15 @@ carry docker compose's labels, which is how `ps`, `logs`, `stop`, `down` and the
 find a project again, from its files or from `-p NAME` alone. A machine is made anew
 when its service changed (docker compose's config hash) or its image did.
 
-What nspawn cannot do, a `build` without an image, a fixed `ipv4_address` and the
+A service with a `build` section is built by nspawn's builder (see
+[Dockerfiles](#dockerfiles)) as docker compose decides it: when its image is not
+here (an image it names is pulled first, and built when the pull fails), every time
+with `pull_policy: build`, and always with `up --build` or `compose build`;
+`--no-build` builds nothing. Its image is the one it names or `PROJECT-SERVICE`, with
+the section's `tags`, `labels` and compose's project labels; `build --push` sends the
+named ones, and `down --rmi local` removes the images the project built.
+
+What nspawn cannot do, remote build contexts, SSH forwarding into a build and the
 rest of the table in [COMPOSE.md](COMPOSE.md), `config` shows as warnings, and `up`,
 `create`, `run` and `scale` refuse for the services they start. COMPOSE.md has every
 attribute and option with what nspawn compose does with it, and where it differs

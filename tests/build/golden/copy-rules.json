@@ -1,0 +1,494 @@
+{
+ "architecture": "amd64",
+ "config": {
+  "Cmd": [
+   "sh"
+  ],
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ]
+ },
+ "history": [
+  {
+   "created_by": "BusyBox 1.37.0 (glibc), Debian 13"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY src /dir-as-is"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY src/ /dir-slash/"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY src/a/b/f.txt /newfile"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY src/a/b/f.txt /newdir/"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY src/*.txt /wild/"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY src/a/b/f.txt src/c/g.txt /two/"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY --parents src/a/b/f.txt src/c/g.txt /parents/"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY src /excluded"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY src/c /existing-file-dir/"
+  }
+ ],
+ "layers": [
+  {
+   "base": true,
+   "diff_id": "sha256:5a9bfd996c6d49c6c3cb4ddfb76e8d09cf16b6b7cf6601d1f2dffbdbc3edb5d4"
+  },
+  {
+   "diff_id": "sha256:57c55c043832bf824c7824bb7991dec5760814204aff0211d42c1adc6e14bca4",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "dir-as-is",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "dir-as-is/a",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "dir-as-is/a/b",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "dir-as-is/a/b/f.txt",
+     "sha256": "sha256:092fcfbbcfca3b5be7ae1b5e58538e92c35ab273ae13664fed0d67484c8e78a6",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "dir-as-is/c",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "dir-as-is/c/g.log",
+     "sha256": "sha256:2b339bc1dc359c68272a135c375bc6d7892146ba3bf14ee2576f2e370551c89d",
+     "size": 5,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "dir-as-is/c/g.txt",
+     "sha256": "sha256:768c71d785bf6bbbf8c4d6af6582041f2659027140a962cd0c55b11eddfd5e3d",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "dir-as-is/drop.log",
+     "sha256": "sha256:9b75290f6a6359a2a3471022cbba4b724e45105b313ae8f6c103a2f79e82a857",
+     "size": 4,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "dir-as-is/other.txt",
+     "sha256": "sha256:7e4fa2eb8c7ac089739d5defc4489fad68a100d92082ca35c6b40a4524821f87",
+     "size": 6,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "dir-as-is/top.txt",
+     "sha256": "sha256:f7de2947c64cb6435e15fb2bef359d1ed5f6356b2aebb7b20535e3772904e6db",
+     "size": 4,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:c22c9e36bab97793f108bf468e0abf1cff8b19737c71d3a4de8bce469ad07f4c",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "dir-slash",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "dir-slash/a",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "dir-slash/a/b",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "dir-slash/a/b/f.txt",
+     "sha256": "sha256:092fcfbbcfca3b5be7ae1b5e58538e92c35ab273ae13664fed0d67484c8e78a6",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "dir-slash/c",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "dir-slash/c/g.log",
+     "sha256": "sha256:2b339bc1dc359c68272a135c375bc6d7892146ba3bf14ee2576f2e370551c89d",
+     "size": 5,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "dir-slash/c/g.txt",
+     "sha256": "sha256:768c71d785bf6bbbf8c4d6af6582041f2659027140a962cd0c55b11eddfd5e3d",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "dir-slash/drop.log",
+     "sha256": "sha256:9b75290f6a6359a2a3471022cbba4b724e45105b313ae8f6c103a2f79e82a857",
+     "size": 4,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "dir-slash/other.txt",
+     "sha256": "sha256:7e4fa2eb8c7ac089739d5defc4489fad68a100d92082ca35c6b40a4524821f87",
+     "size": 6,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "dir-slash/top.txt",
+     "sha256": "sha256:f7de2947c64cb6435e15fb2bef359d1ed5f6356b2aebb7b20535e3772904e6db",
+     "size": 4,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:84f780a278131c625a6159cc0339922cb62bff1510b485a1d868e3e7ff6dfce1",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "newfile",
+     "sha256": "sha256:092fcfbbcfca3b5be7ae1b5e58538e92c35ab273ae13664fed0d67484c8e78a6",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:611fd439b7a0d454c7ff15bdabd793b19d9d2d70ec244f60e8c1da1eb68d2cbb",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "newdir",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "newdir/f.txt",
+     "sha256": "sha256:092fcfbbcfca3b5be7ae1b5e58538e92c35ab273ae13664fed0d67484c8e78a6",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:49901a6afef5bb2fa6b2af9c598cdbdbb14be119a3d9f0302421bc20d20c7221",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "wild",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "wild/other.txt",
+     "sha256": "sha256:7e4fa2eb8c7ac089739d5defc4489fad68a100d92082ca35c6b40a4524821f87",
+     "size": 6,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "wild/top.txt",
+     "sha256": "sha256:f7de2947c64cb6435e15fb2bef359d1ed5f6356b2aebb7b20535e3772904e6db",
+     "size": 4,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:227d5a92254fe5e1d9d4c9dc10b031c7e31bfe7e5fee3b505901fefce8655e51",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "two",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "two/f.txt",
+     "sha256": "sha256:092fcfbbcfca3b5be7ae1b5e58538e92c35ab273ae13664fed0d67484c8e78a6",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "two/g.txt",
+     "sha256": "sha256:768c71d785bf6bbbf8c4d6af6582041f2659027140a962cd0c55b11eddfd5e3d",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:34ce0e214c3308280df56d70915ed5b15d796a6fade4b68f682d086f3733667e",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "parents",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "parents/src",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "parents/src/a",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "parents/src/a/b",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "parents/src/a/b/f.txt",
+     "sha256": "sha256:092fcfbbcfca3b5be7ae1b5e58538e92c35ab273ae13664fed0d67484c8e78a6",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "parents/src/c",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "parents/src/c/g.txt",
+     "sha256": "sha256:768c71d785bf6bbbf8c4d6af6582041f2659027140a962cd0c55b11eddfd5e3d",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:3e51e408f10ff9fb6665cf5ebcdfd256b5a17012eaa4b03454c2138d434debcb",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "excluded",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "excluded/a",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "excluded/a/b",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "excluded/a/b/f.txt",
+     "sha256": "sha256:092fcfbbcfca3b5be7ae1b5e58538e92c35ab273ae13664fed0d67484c8e78a6",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "excluded/c",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "excluded/c/g.log",
+     "sha256": "sha256:2b339bc1dc359c68272a135c375bc6d7892146ba3bf14ee2576f2e370551c89d",
+     "size": 5,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "excluded/c/g.txt",
+     "sha256": "sha256:768c71d785bf6bbbf8c4d6af6582041f2659027140a962cd0c55b11eddfd5e3d",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "excluded/other.txt",
+     "sha256": "sha256:7e4fa2eb8c7ac089739d5defc4489fad68a100d92082ca35c6b40a4524821f87",
+     "size": 6,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "excluded/top.txt",
+     "sha256": "sha256:f7de2947c64cb6435e15fb2bef359d1ed5f6356b2aebb7b20535e3772904e6db",
+     "size": 4,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:044763718dc398db7e03d959ea609dc47b3274b75002591a6a85cfba3c250b5e",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "existing-file-dir",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "existing-file-dir/g.log",
+     "sha256": "sha256:2b339bc1dc359c68272a135c375bc6d7892146ba3bf14ee2576f2e370551c89d",
+     "size": 5,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "existing-file-dir/g.txt",
+     "sha256": "sha256:768c71d785bf6bbbf8c4d6af6582041f2659027140a962cd0c55b11eddfd5e3d",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  }
+ ],
+ "os": "linux"
+}

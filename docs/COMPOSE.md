@@ -149,7 +149,43 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.annotations` and below | ignored | nspawn machines have no OCI runtime annotations |
 | `services.*.attach` | yes |  |
 | `services.*.blkio_config` and below | ignored | block I/O limits are not set on nspawn machines |
-| `services.*.build` and below | ignored | nspawn runs published images and does not build Dockerfiles: the image is pulled, and a service without one is refused |
+| `services.*.build` | partly | built by nspawn's builder, which runs its steps one after another for this host's platform |
+| `services.*.build.additional_contexts` and below | no | named contexts are not supported by nspawn's builder |
+| `services.*.build.args` | yes |  |
+| `services.*.build.args.*` | yes |  |
+| `services.*.build.cache_from` | ignored | the build cache is nspawn's own, on this host |
+| `services.*.build.cache_to` | ignored | the build cache is nspawn's own, on this host |
+| `services.*.build.context` | partly | a directory of this host; a remote context is refused |
+| `services.*.build.dockerfile` | yes |  |
+| `services.*.build.dockerfile_inline` | yes |  |
+| `services.*.build.entitlements` | partly | network.host; security.insecure is refused |
+| `services.*.build.extra_hosts` | yes |  |
+| `services.*.build.extra_hosts.*` | yes |  |
+| `services.*.build.isolation` | ignored | isolation is a setting of Windows containers |
+| `services.*.build.labels` | yes |  |
+| `services.*.build.labels.*` | yes |  |
+| `services.*.build.network` | partly | default, none or host |
+| `services.*.build.no_cache` | yes |  |
+| `services.*.build.no_cache_filter` | yes |  |
+| `services.*.build.platforms` | partly | this host's platform only; another is refused |
+| `services.*.build.privileged` | no | build steps run with the confinement of an app machine |
+| `services.*.build.provenance` | ignored | nspawn's builder writes no attestations |
+| `services.*.build.pull` | yes |  |
+| `services.*.build.sbom` | ignored | nspawn's builder writes no attestations |
+| `services.*.build.secrets` | partly | secrets from a file or the environment, which RUN --mount=type=secret takes |
+| `services.*.build.secrets.[].gid` | ignored | the RUN --mount of the Dockerfile sets the owner and mode of a build secret |
+| `services.*.build.secrets.[].mode` | ignored | the RUN --mount of the Dockerfile sets the owner and mode of a build secret |
+| `services.*.build.secrets.[].source` | yes |  |
+| `services.*.build.secrets.[].target` | yes |  |
+| `services.*.build.secrets.[].uid` | ignored | the RUN --mount of the Dockerfile sets the owner and mode of a build secret |
+| `services.*.build.shm_size` | yes |  |
+| `services.*.build.ssh` and below | no | SSH agent forwarding into a build is not supported |
+| `services.*.build.tags` | yes |  |
+| `services.*.build.target` | yes |  |
+| `services.*.build.ulimits` | yes |  |
+| `services.*.build.ulimits.*` | yes |  |
+| `services.*.build.ulimits.*.hard` | yes |  |
+| `services.*.build.ulimits.*.soft` | yes |  |
 | `services.*.cap_add` | yes |  |
 | `services.*.cap_drop` | yes |  |
 | `services.*.cgroup` | yes |  |
@@ -245,7 +281,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.healthcheck.timeout` | yes |  |
 | `services.*.hostname` | yes |  |
 | `services.*.image` | yes |  |
-| `services.*.init` | yes |  |
+| `services.*.init` | partly | refused for an image that boots, whose init runs as it is |
 | `services.*.ipc` | ignored | a machine always has an IPC namespace of its own |
 | `services.*.isolation` | ignored | isolation is for Windows containers |
 | `services.*.label_file` | yes |  |
@@ -308,7 +344,6 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.profiles` | yes |  |
 | `services.*.provider` and below | no | provider services are docker compose plugins, which nspawn does not run |
 | `services.*.pull_policy` | yes |  |
-| `services.*.pull_policy`: `build` | no | nspawn runs published images and does not build Dockerfiles |
 | `services.*.pull_policy`: `daily` | partly | pulled every time; a pull of an unchanged image downloads nothing |
 | `services.*.pull_policy`: `weekly` | partly | pulled every time; a pull of an unchanged image downloads nothing |
 | `services.*.pull_policy`: `every_...` | partly | pulled every time; a pull of an unchanged image downloads nothing |
@@ -395,7 +430,25 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `alpha` | no | alpha is not supported by nspawn compose |
 | `attach` | no | attach is not supported by nspawn compose; logs --follow shows a service's output |
 | `bridge` | no | bridge is not supported by nspawn compose |
-| `build` | no | nspawn runs published images and does not build Dockerfiles |
+| `build` | partly | with nspawn's builder; see nspawn build for what it does not do |
+| `build --build-arg` | yes |  |
+| `build --builder` | ignored | nspawn builds with its own builder |
+| `build --check` | no | nspawn's builder has no linter |
+| `build --compress` | ignored | the context goes to the service through a pipe |
+| `build --force-rm` | ignored | steps leave no intermediate containers |
+| `build --memory` | ignored | build steps run without a memory limit |
+| `build --no-cache` | yes |  |
+| `build --no-rm` | ignored | steps leave no intermediate containers |
+| `build --parallel` | ignored | services are built one after another |
+| `build --print` | no | there is no bake definition to print |
+| `build --progress` | ignored | the steps print plain progress |
+| `build --provenance` | no | nspawn's builder writes no attestations |
+| `build --pull` | yes |  |
+| `build --push` | yes |  |
+| `build --quiet` | yes |  |
+| `build --sbom` | no | nspawn's builder writes no attestations |
+| `build --ssh` | no | SSH agent forwarding into a build is not supported |
+| `build --with-dependencies` | yes |  |
 | `commit` | no | commit is not supported by nspawn compose |
 | `config` | yes |  |
 | `config --environment` | yes |  |
@@ -423,7 +476,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `cp --follow-link` | ignored | a symbolic link is copied as a link |
 | `cp --index` | yes |  |
 | `create` | yes |  |
-| `create --build` | no | nspawn runs published images and does not build Dockerfiles |
+| `create --build` | yes |  |
 | `create --force-recreate` | yes |  |
 | `create --no-build` | yes |  |
 | `create --no-recreate` | yes |  |
@@ -494,7 +547,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `pull --parallel` | yes |  |
 | `pull --policy` | yes |  |
 | `pull --quiet` | yes |  |
-| `push` | no | push is not supported by nspawn compose, which builds no image |
+| `push` | no | push is not supported by nspawn compose; compose build --push or nspawn push sends an image |
 | `restart` | yes |  |
 | `restart --no-deps` | yes |  |
 | `restart --timeout` | yes |  |
@@ -504,7 +557,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `rm --stop` | yes |  |
 | `rm --volumes` | partly | nspawn has no anonymous volumes |
 | `run` | yes |  |
-| `run --build` | no | nspawn runs published images and does not build Dockerfiles |
+| `run --build` | yes |  |
 | `run --cap-add` | yes |  |
 | `run --cap-drop` | yes |  |
 | `run --detach` | yes |  |
@@ -549,7 +602,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `up --always-recreate-deps` | yes |  |
 | `up --attach` | yes |  |
 | `up --attach-dependencies` | yes |  |
-| `up --build` | no | nspawn runs published images and does not build Dockerfiles |
+| `up --build` | yes |  |
 | `up --detach` | yes |  |
 | `up --exit-code-from` | yes |  |
 | `up --force-recreate` | yes |  |

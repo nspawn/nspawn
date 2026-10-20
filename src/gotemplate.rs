@@ -1,13 +1,14 @@
-//! Go's text/template evaluated over JSON values, with docker's template
-//! functions and its `--format` handling of lists.
+//! Go's text/template evaluated over JSON values, with the template functions
+//! and the `--format` handling of lists of docker/cli's templates and formatter
+//! packages, the reference below.
 //!
-//! `ps --format` and `inspect -f` take the formats people write for docker, so
-//! the lexer, the parser, the evaluator, the printing and the error messages
-//! follow Go 1.26's text/template, fmt and strconv. Data is seen the way Go
-//! sees the result of json.Unmarshal into an interface{}, except that JSON
-//! integers are Go ints instead of float64: docker evaluates these formats
-//! over typed structs, where sizes and pids are integers, and Go prints a
-//! float64 of 1234567 as 1.234567e+06 and refuses `eq .Pid 0`.
+//! `ps --format` and `inspect -f` take the formats people already write, so the
+//! lexer, the parser, the evaluator, the printing and the error messages follow
+//! Go 1.26's text/template, fmt and strconv. Data is seen the way Go sees the
+//! result of json.Unmarshal into an interface{}, except that JSON integers are
+//! Go ints instead of float64: the reference evaluates these formats over typed
+//! structs, where sizes and pids are integers, and Go prints a float64 of
+//! 1234567 as 1.234567e+06 and refuses `eq .Pid 0`.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -20,6 +21,11 @@ use serde_json::Value as Json;
 /// stack even in a debug build.
 const MAX_EXEC_DEPTH: usize = 100;
 const MAX_PAREN_DEPTH: usize = 100;
+/// Controls (if, with, range) nested in a template, and nested as it runs across the
+/// templates it calls: each level is a few frames of the parser's and the executor's
+/// recursion, which Go's growing stacks take and a thread's does not.
+const MAX_CONTROL_DEPTH: usize = 100;
+const MAX_RUN_DEPTH: usize = 1000;
 
 // ---------------------------------------------------------------------------
 // Lexer (text/template/parse/lex.go)
@@ -984,6 +990,7 @@ struct TreeState {
     action_line: usize,
     range_depth: usize,
     stack_depth: usize,
+    control_depth: usize,
 }
 
 impl TreeState {
@@ -995,6 +1002,7 @@ impl TreeState {
             action_line: 0,
             range_depth: 0,
             stack_depth: 0,
+            control_depth: 0,
         }
     }
 }
@@ -1325,6 +1333,16 @@ impl Parser<'_> {
     }
 
     fn parse_control(&mut self, context: &str) -> PResult<Branch> {
+        if self.t.control_depth >= MAX_CONTROL_DEPTH {
+            return Err(self.errorf("max nesting depth exceeded"));
+        }
+        self.t.control_depth += 1;
+        let branch = self.parse_control_body(context);
+        self.t.control_depth -= 1;
+        branch
+    }
+
+    fn parse_control_body(&mut self, context: &str) -> PResult<Branch> {
         let vars = self.t.vars.len();
         let pipe = self.pipeline(context, It::RightDelim)?;
         if context == "range" {
@@ -1582,6 +1600,10 @@ fn unquote_char(s: &str, quote: u8) -> Result<(u32, bool, &str), &'static str> {
         return Err(ERR_SYNTAX);
     }
     let c = b[1];
+    // A backslash before a character of several bytes escapes nothing Go knows.
+    if c >= 0x80 {
+        return Err(ERR_SYNTAX);
+    }
     let mut rest = &s[2..];
     let mut multibyte = false;
     let value = match c {
@@ -1797,7 +1819,9 @@ fn parse_float(s: &str) -> Option<f64> {
 
 fn parse_hex_float(s: &str) -> Option<f64> {
     let (mant, exp) = s.split_once(['p', 'P'])?;
-    let exp: i32 = exp.parse().ok()?;
+    // Wide enough that no exponent a number can be written with overflows; beyond a
+    // few thousand the value is 0 or infinite anyway.
+    let exp: i64 = exp.parse().ok()?;
     let mut m: u64 = 0;
     let mut e = exp;
     let mut seen_dot = false;
@@ -1816,12 +1840,12 @@ fn parse_hex_float(s: &str) -> Option<f64> {
         if m >> 60 == 0 {
             m = m * 16 + d;
             if seen_dot {
-                e -= 4;
+                e = e.saturating_sub(4);
             }
         } else {
             sticky |= d != 0;
             if !seen_dot {
-                e += 4;
+                e = e.saturating_add(4);
             }
         }
     }
@@ -1831,6 +1855,7 @@ fn parse_hex_float(s: &str) -> Option<f64> {
     if sticky {
         m |= 1;
     }
+    let mut e = e.clamp(-5000, 5000) as i32;
     let mut v = m as f64;
     while e > 0 {
         let step = e.min(1000);
@@ -2222,7 +2247,9 @@ impl Pp {
         } else {
             4
         };
-        let mut s = format!("U+{:0>width$X}", u, width = prec);
+        // By hand: Rust's widths stop at 65535, Go's go on.
+        let hex = format!("{u:X}");
+        let mut s = format!("U+{}{hex}", "0".repeat(prec.saturating_sub(hex.len())));
         if self.f.sharp && u <= 0x10FFFF {
             if let Some(c) = char::from_u32(u as u32).filter(|c| is_print(*c)) {
                 let _ = write!(s, " '{}'", c);
@@ -2923,21 +2950,37 @@ fn append_float(v: f64, fmt: u8, prec: i32) -> String {
         (digs, dp)
     } else {
         match fmt {
+            // An f64 has at most 1074 digits after the point and 767 significant ones:
+            // Rust's precisions stop at 65535, so beyond those the digits are zeros
+            // added by hand.
             b'f' => {
-                let s = format!("{:.*}", prec as usize, v.abs());
+                let exact = (prec as usize).min(MAX_FRACTION_DIGITS);
+                let mut s = format!("{:.*}", exact, v.abs());
+                s.push_str(&"0".repeat(prec as usize - exact));
                 return if neg { format!("-{}", s) } else { s };
             }
-            b'e' | b'E' => decimal_digits(&format!("{:.*e}", prec as usize, v.abs())),
+            b'e' | b'E' => decimal_digits(&format!(
+                "{:.*e}",
+                (prec as usize).min(MAX_SIGNIFICANT_DIGITS),
+                v.abs()
+            )),
             _ => {
                 if prec == 0 {
                     prec = 1;
                 }
-                decimal_digits(&format!("{:.*e}", (prec - 1) as usize, v.abs()))
+                decimal_digits(&format!(
+                    "{:.*e}",
+                    ((prec - 1) as usize).min(MAX_SIGNIFICANT_DIGITS),
+                    v.abs()
+                ))
             }
         }
     };
     format_digits(shortest, neg, &digs, dp, prec, fmt)
 }
+
+const MAX_FRACTION_DIGITS: usize = 1074;
+const MAX_SIGNIFICANT_DIGITS: usize = 767;
 
 /// The digits of Rust's exponent form without trailing zeros, and the
 /// position of the decimal point.
@@ -3090,7 +3133,7 @@ fn fmt_hex_float(prec: i32, fmt: u8, neg: bool, mant: u64, exp: i32) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// encoding/json, as docker's json function calls it
+// encoding/json, as the reference's json function calls it
 
 fn json_encode(v: &V, out: &mut String) -> Result<(), String> {
     match v {
@@ -3179,7 +3222,7 @@ fn json_string(s: &str, out: &mut String) {
 }
 
 // ---------------------------------------------------------------------------
-// Functions (text/template/funcs.go and docker's templates.go)
+// Functions (text/template/funcs.go and the reference's templates.go)
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Func {
@@ -3210,7 +3253,7 @@ enum Func {
     Upper,
     Pad,
     Truncate,
-    // docker's header stand-ins, which return their first argument.
+    // The header stand-ins, which return their first argument.
     HeaderStr,
     HeaderStrStr,
     HeaderStrInt,
@@ -3827,6 +3870,11 @@ struct Exec<'t> {
     node: Option<NodeRef<'t>>,
     vars: Vec<(&'t str, Val)>,
     depth: usize,
+    /// Controls and template calls being walked, all templates together.
+    run_depth: usize,
+    /// A key a map lacks is an error, as a field a struct lacks is in Go: the rows of
+    /// a list stand for the reference's structs.
+    strict: bool,
     out: String,
 }
 
@@ -3897,11 +3945,24 @@ impl<'t> Exec<'t> {
             }
             Node::Break { .. } => return Ok(Flow::Break),
             Node::Continue { .. } => return Ok(Flow::Continue),
-            Node::If(b) => return self.walk_if_or_with(false, dot, b),
-            Node::With(b) => return self.walk_if_or_with(true, dot, b),
-            Node::Range(b) => return self.walk_range(dot, node, b),
-            Node::Template { name, pipe, .. } => {
-                return self.walk_template(dot, node, name, pipe.as_ref())
+            Node::If(_) | Node::With(_) | Node::Range(_) | Node::Template { .. } => {
+                if self.run_depth >= MAX_RUN_DEPTH {
+                    return Err(
+                        self.errorf(&format!("exceeded maximum nesting depth ({MAX_RUN_DEPTH})"))
+                    );
+                }
+                self.run_depth += 1;
+                let flow = match node {
+                    Node::If(b) => self.walk_if_or_with(false, dot, b),
+                    Node::With(b) => self.walk_if_or_with(true, dot, b),
+                    Node::Range(b) => self.walk_range(dot, node, b),
+                    Node::Template { name, pipe, .. } => {
+                        self.walk_template(dot, node, name, pipe.as_ref())
+                    }
+                    _ => unreachable!("matched above"),
+                };
+                self.run_depth -= 1;
+                return flow;
             }
             Node::Text { text, .. } => self.out.push_str(text),
             Node::End { .. } | Node::Else { .. } => {}
@@ -4254,10 +4315,13 @@ impl<'t> Exec<'t> {
             if args.len() > 1 || fin.is_some() {
                 return Err(self.errorf(&format!("{} is not a method but has arguments", name)));
             }
-            return Ok(match m.get(name) {
-                Some(e) => Val::elem(e, !strmap),
-                None => Val::invalid(),
-            });
+            return match m.get(name) {
+                Some(e) => Ok(Val::elem(e, !strmap)),
+                None if self.strict && !strmap => {
+                    Err(self.errorf(&format!("can't evaluate field {} in type {}", name, typ)))
+                }
+                None => Ok(Val::invalid()),
+            };
         }
         Err(self.errorf(&format!("can't evaluate field {} in type {}", name, typ)))
     }
@@ -4461,7 +4525,7 @@ impl<'t> Exec<'t> {
 // ---------------------------------------------------------------------------
 // Public API
 
-/// A parsed template with docker's functions available.
+/// A parsed template with the reference's functions available.
 #[derive(Debug)]
 pub struct Template {
     text: String,
@@ -4469,7 +4533,7 @@ pub struct Template {
 }
 
 impl Template {
-    /// Parses a template as docker's templates.Parse does; errors read like
+    /// Parses a template as the reference's templates.Parse does; errors read like
     /// Go's, `template: :1: ...`.
     pub fn parse(text: &str) -> Result<Template, String> {
         let mut p = Parser {
@@ -4490,7 +4554,16 @@ impl Template {
     /// Executes the template over `data`; on error Go's message comes back
     /// and the partial output is dropped.
     pub fn execute(&self, data: &Json) -> Result<String, String> {
-        let (out, err) = self.run(data, false);
+        let (out, err) = self.run_with(data, false, false);
+        match err {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+
+    /// `execute` over a row of a list, whose fields are all there is.
+    fn execute_row(&self, data: &Json) -> Result<String, String> {
+        let (out, err) = self.run_with(data, false, true);
         match err {
             Some(e) => Err(e),
             None => Ok(out),
@@ -4498,9 +4571,13 @@ impl Template {
     }
 
     /// The output and the error, if any, of one execution. `header` swaps in
-    /// docker's header functions and reads an object of strings as the
-    /// map[string]string docker passes for a table's header row.
+    /// the header functions and reads an object of strings as the
+    /// map[string]string the reference passes for a table's header row.
     fn run(&self, data: &Json, header: bool) -> (String, Option<String>) {
+        self.run_with(data, header, false)
+    }
+
+    fn run_with(&self, data: &Json, header: bool, strict: bool) -> (String, Option<String>) {
         let dot = match data {
             Json::Null => Val::invalid(),
             Json::Object(o) if header && o.values().all(Json::is_string) => Val::plain(V::Map(
@@ -4529,6 +4606,8 @@ impl Template {
             node: None,
             vars: vec![("$", dot.clone())],
             depth: 0,
+            run_depth: 0,
+            strict,
             out: String::new(),
         };
         let err = e.walk_list(&dot, root).err();
@@ -4536,12 +4615,12 @@ impl Template {
     }
 }
 
-/// docker's `--format` for a list: "table" (`default_table`, itself starting
+/// The `--format` of a list: "table" (`default_table`, itself starting
 /// with "table "), "table TEMPLATE", "json" or a TEMPLATE. Returns the text to
 /// print, every line ending in a newline; a table gets a header row, the
-/// template run over `headers` (field name to column title) with docker's
-/// header functions, and columns aligned as docker's tabwriter does. Errors
-/// carry docker's "template parsing error: " prefix.
+/// template run over `headers` (field name to column title) with the header
+/// functions, and columns aligned as the reference's tabwriter aligns them.
+/// Errors carry the "template parsing error: " prefix.
 pub fn format_list(
     format: &str,
     default_table: &str,
@@ -4572,7 +4651,7 @@ pub fn format_list(
     let mut body = String::new();
     for row in rows {
         let line = tmpl
-            .execute(row)
+            .execute_row(row)
             .map_err(|e| format!("template parsing error: {}", e))?;
         body.push_str(&line);
         body.push('\n');
@@ -4580,7 +4659,7 @@ pub fn format_list(
     if !is_table {
         return Ok(body);
     }
-    // docker ignores an error in the header row and keeps what it printed.
+    // An error in the header row is ignored, what it printed kept.
     let (header, _) = tmpl.run(headers, true);
     let mut tw = TabWriter::new(10, 3);
     tw.write(&header);
@@ -4590,7 +4669,7 @@ pub fn format_list(
 }
 
 // ---------------------------------------------------------------------------
-// docker's text/tabwriter fork, with the settings docker uses: padding with
+// The reference's text/tabwriter fork, with the settings it uses: padding with
 // spaces, flags 0, cell widths in terminal columns.
 
 #[derive(Clone, Copy, Default)]
@@ -4738,20 +4817,42 @@ impl TabWriter {
         pos
     }
 
+    /// Go's recursive format, a column at a time, with a stack of its own: a line can
+    /// have more columns than a thread has stack.
     fn format(&mut self, pos0: usize, line0: usize, line1: usize) -> usize {
+        struct Frame {
+            line0: usize,
+            line1: usize,
+            this: usize,
+        }
         let mut pos = pos0;
-        let mut line0 = line0;
-        let column = self.widths.len();
-        let mut this = line0;
-        while this < line1 {
-            if column + 1 >= self.lines[this].len() {
+        let mut stack = vec![Frame {
+            line0,
+            line1,
+            this: line0,
+        }];
+        while let Some(frame) = stack.last_mut() {
+            // The frame's column is the one whose width is pushed last.
+            let column = self.widths.len();
+            let mut this = frame.this;
+            while this < frame.line1 && column + 1 >= self.lines[this].len() {
                 this += 1;
+            }
+            if this >= frame.line1 {
+                let (line0, end) = (frame.line0, frame.line1);
+                pos = self.write_lines(pos, line0, end);
+                stack.pop();
+                if let Some(parent) = stack.last_mut() {
+                    self.widths.pop();
+                    parent.line0 = end;
+                    parent.this = end + 1;
+                }
                 continue;
             }
-            pos = self.write_lines(pos, line0, this);
-            line0 = this;
+            pos = self.write_lines(pos, frame.line0, this);
+            let block = this;
             let mut width = self.minwidth;
-            while this < line1 {
+            while this < frame.line1 {
                 let line = &self.lines[this];
                 if column + 1 >= line.len() {
                     break;
@@ -4759,13 +4860,15 @@ impl TabWriter {
                 width = width.max(line[column].width + self.padding);
                 this += 1;
             }
+            frame.line0 = block;
             self.widths.push(width);
-            pos = self.format(pos, line0, this);
-            self.widths.pop();
-            line0 = this;
-            this += 1;
+            stack.push(Frame {
+                line0: block,
+                line1: this,
+                this: block,
+            });
         }
-        self.write_lines(pos, line0, line1)
+        pos
     }
 }
 
@@ -4773,10 +4876,12 @@ impl TabWriter {
 mod tests {
     use super::*;
 
-    // The expectations below are what Go 1.26's text/template with docker's
+    // The expectations below are what Go 1.26's text/template with the reference's
     // functions gives for the same template and data, JSON integers decoded
-    // as int. Two documented differences are kept: the template depth limit
-    // and slice bounds checked against the length rather than a capacity.
+    // as int. Three documented differences are kept: the depth limits, slice
+    // bounds checked against the length rather than a capacity, and a field
+    // missing from a row of a list an error, as one missing from the
+    // reference's structs is.
 
     /// Each case: template, data as JSON, and "ok:" with the output, "err:"
     /// with the execution error or "perr:" with the parse error.
@@ -5144,7 +5249,7 @@ mod tests {
         }
     }
 
-    /// docker's TestHeaderFunctions: in a header row the functions that would
+    /// The reference's TestHeaderFunctions: in a header row the functions that would
     /// change a column title return it unchanged.
     #[test]
     fn header_functions_return_their_argument() {
@@ -5190,6 +5295,31 @@ mod tests {
     }
 
     #[test]
+    fn hostile_literals_and_widths_are_errors_or_output() {
+        for text in [r#"{{"\é"}}"#, r#"{{'\é'}}"#] {
+            assert!(Template::parse(text).is_err(), "{text}");
+        }
+        let out = |text: &str| Template::parse(text).unwrap().execute(&Json::Null).unwrap();
+        let f = out(r#"{{printf "%.70000f" 1.5}}"#);
+        assert_eq!(f.len(), 70002);
+        assert!(f.starts_with("1.5000") && f.ends_with('0'));
+        let e = out(r#"{{printf "%.70000e" 1.5}}"#);
+        assert!(
+            e.starts_with("1.5000") && e.ends_with("e+00"),
+            "{}",
+            &e[..10]
+        );
+        let u = out(r#"{{printf "%.70000U" 65}}"#);
+        assert_eq!(u.len(), 70002);
+        assert!(u.starts_with("U+000") && u.ends_with("41"));
+        assert_eq!(out("{{0x.1p-2147483648}}"), "0");
+        // A row with more columns than a stack has frames for.
+        let rows = vec![Json::Null];
+        let table = format_list("table {{range 100000}}\\t{{end}}x", "", &Json::Null, &rows);
+        assert!(table.is_ok());
+    }
+
+    #[test]
     fn nesting_limits() {
         let nested = |n: usize| format!("{{{{{}1{}}}}}", "(".repeat(n), ")".repeat(n));
         let t = Template::parse(&nested(MAX_PAREN_DEPTH)).unwrap();
@@ -5212,6 +5342,33 @@ mod tests {
             ));
             s
         };
+        // Controls nested beyond the limit, and nested through template calls.
+        let ifs = |n: usize| format!("{}x{}", "{{if .}}".repeat(n), "{{end}}".repeat(n));
+        assert_eq!(
+            Template::parse(&ifs(MAX_CONTROL_DEPTH))
+                .unwrap()
+                .execute(&Json::Bool(true))
+                .unwrap(),
+            "x"
+        );
+        assert_eq!(
+            Template::parse(&ifs(4000)).unwrap_err(),
+            "template: :1: max nesting depth exceeded"
+        );
+        let deep = format!(
+            "{{{{define \"r\"}}}}{}{{{{template \"r\" .}}}}{}{{{{end}}}}{{{{template \"r\" .}}}}",
+            "{{if .}}".repeat(MAX_CONTROL_DEPTH - 1),
+            "{{end}}".repeat(MAX_CONTROL_DEPTH - 1)
+        );
+        // Run where the command line runs it, on a thread of the size of a main one.
+        let err = std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(move || Template::parse(&deep).unwrap().execute(&Json::Bool(true)))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap_err();
+        assert!(err.contains("exceeded maximum"), "{err}");
         let t = Template::parse(&chain(MAX_EXEC_DEPTH - 1)).unwrap();
         assert_eq!(t.execute(&Json::Null).unwrap(), "5");
         let t = Template::parse(&chain(MAX_EXEC_DEPTH)).unwrap();
@@ -5256,7 +5413,7 @@ mod tests {
         }
     }
 
-    /// Checked against docker's tabwriter with the settings it uses.
+    /// Checked against the reference's tabwriter with the settings it uses.
     #[test]
     fn tabwriter_columns() {
         let mut tw = TabWriter::new(10, 3);
@@ -5982,9 +6139,9 @@ mod tests {
         ]);
     }
 
-    /// docker's json, split, join, title, lower, upper, pad and truncate.
+    /// The reference's json, split, join, title, lower, upper, pad and truncate.
     #[test]
-    fn docker_funcs() {
+    fn extra_funcs() {
         check(&[
             ("{{json .Ports}}", "{\"Ports\":\"0.0.0.0:2->8/udp\"}", "ok:\"0.0.0.0:2->8/udp\""),
             ("{{join (split . \":\") \"/\"}}", "\"text:with:colon\"", "ok:text/with/colon"),
@@ -6215,8 +6372,8 @@ mod tests {
             ("{{.Names}}\\t{{.ID}}", ROWS, "ok:web\t3f4e8a1b2c3d\na-much-longer-name\t9a8b7c6d5e4f\n"),
             ("table {{upper .Names}}\\t{{truncate .ID 4}}\\t{{json .Size}}\\t{{lower .Status}}", ROWS, "ok:NAMES                CONTAINER ID   SIZE      STATUS\nWEB                  3f4e           1234567   up 2 hours\nA-MUCH-LONGER-NAME   9a8b           12        exited (0) 3 days ago\n"),
             ("table {{pad .Names 1 1}}|\\t{{.Image}}", ROWS, "ok: NAMES |                IMAGE\n web |                  nginx:latest\n a-much-longer-name |   fedora\n"),
-            ("table {{.Names}}\\t{{.Nope}}\\t{{.Status}}", ROWS, "ok:NAMES                <no value>   STATUS\nweb                  <no value>   Up 2 hours\na-much-longer-name   <no value>   Exited (0) 3 days ago\n"),
-            ("table {{.Names}}\\t{{lower .Nope}}\\t{{.Status}}", ROWS, "err:template parsing error: template: :1:19: executing \"\" at <.Nope>: invalid value; expected string"),
+            ("table {{.Names}}\\t{{.Nope}}\\t{{.Status}}", ROWS, "err:template parsing error: template: :1:13: executing \"\" at <.Nope>: can't evaluate field Nope in type map[string]interface {}"),
+            ("table {{.Names}}\\t{{lower .Nope}}\\t{{.Status}}", ROWS, "err:template parsing error: template: :1:19: executing \"\" at <.Nope>: can't evaluate field Nope in type map[string]interface {}"),
             ("table {{.Names}}\\t\\t{{.Status}}", ROWS, "ok:NAMES                          STATUS\nweb                            Up 2 hours\na-much-longer-name             Exited (0) 3 days ago\n"),
             ("table {{.Names}}\\t{{.Status}}\\t", ROWS, "ok:NAMES                STATUS                  \nweb                  Up 2 hours              \na-much-longer-name   Exited (0) 3 days ago   \n"),
             ("table NAME\\tX\\n{{.Names}}\\t{{.ID}}", ROWS, "ok:NAME                 X\nNAMES                CONTAINER ID\nNAME                 X\nweb                  3f4e8a1b2c3d\nNAME                 X\na-much-longer-name   9a8b7c6d5e4f\n"),

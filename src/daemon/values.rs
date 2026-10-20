@@ -483,6 +483,33 @@ impl<'a> Options<'a> {
             .unwrap_or_default())
     }
 
+    /// Bytes (ay) when given.
+    pub fn bytes(&mut self, key: &'static str) -> anyhow::Result<Option<Vec<u8>>> {
+        self.take(key)
+            .map(|value| {
+                Vec::<u8>::try_from(value.clone())
+                    .map_err(|_| anyhow::anyhow!("option {key} must be bytes (ay)"))
+            })
+            .transpose()
+    }
+
+    /// Bytes by name (a{say}).
+    pub fn byte_map(
+        &mut self,
+        key: &'static str,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        Ok(self
+            .take(key)
+            .map(|value| {
+                HashMap::<String, Vec<u8>>::try_from(value.clone())
+                    .map_err(|_| anyhow::anyhow!("option {key} must be bytes by name (a{{say}})"))
+            })
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .collect())
+    }
+
     /// A boolean when one was given.
     pub fn maybe_bool(&mut self, key: &'static str) -> anyhow::Result<Option<bool>> {
         self.take(key)

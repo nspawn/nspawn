@@ -1,0 +1,121 @@
+{
+ "architecture": "amd64",
+ "config": {
+  "ArgsEscaped": true,
+  "Cmd": [
+   "cat",
+   "/artifact"
+  ],
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "WorkingDir": "/"
+ },
+ "history": [
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ADD alpine-minirootfs-3.22.6-x86_64.tar.gz /"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "CMD [\"/bin/sh\"]",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY /out/artifact /artifact"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY /out/dir /copied/"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "COPY /out /whole"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "CMD [\"cat\" \"/artifact\"]",
+   "empty_layer": true
+  }
+ ],
+ "layers": [
+  {
+   "base": true,
+   "diff_id": "sha256:e477571b896b8d18635f33e4efb8851e6c4929111b0a4fe9b17b34a16fd9c37f"
+  },
+  {
+   "diff_id": "sha256:ceddcb25f27446d54da68728ff2a4d5c01b54204404a48622df44ce2766d6fdb",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0640",
+     "path": "artifact",
+     "sha256": "sha256:56f6e6304d02d413bb7d5d463ac5cdc58551266dc7269b467fc385815f39b913",
+     "size": 6,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:53c475ac351a8ca4bc92bade5fcc0a1245652b1ab207fc37a8d53539b96c828f",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "copied",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "copied/inner",
+     "sha256": "sha256:940a68104d3b690442453f4be394b0a14721a174127d84c1c2f834b7ad05d684",
+     "size": 6,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:4cef45a9d3b7e30deb91615bce505fadd27ea017949ca5ccb774edf16654191e",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "whole",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0640",
+     "path": "whole/artifact",
+     "sha256": "sha256:56f6e6304d02d413bb7d5d463ac5cdc58551266dc7269b467fc385815f39b913",
+     "size": 6,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "whole/dir",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "whole/dir/inner",
+     "sha256": "sha256:940a68104d3b690442453f4be394b0a14721a174127d84c1c2f834b7ad05d684",
+     "size": 6,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  }
+ ],
+ "os": "linux"
+}

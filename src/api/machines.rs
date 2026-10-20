@@ -403,6 +403,21 @@ async fn check_interfaces(
 }
 
 /// Where the CDI device nodes the host lacks are made for a machine.
+/// Whether the running kernel is MAJOR.MINOR or later.
+fn kernel_at_least(major: u32, minor: u32) -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .is_ok_and(|text| release_at_least(&text, major, minor))
+}
+
+fn release_at_least(release: &str, major: u32, minor: u32) -> bool {
+    let mut parts = release
+        .trim()
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|n| n.parse::<u32>().unwrap_or(0));
+    let (have_major, have_minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+    (have_major, have_minor) >= (major, minor)
+}
+
 fn cdi_nodes_dir(store: &Store, name: &str) -> PathBuf {
     store.machine_files_dir(name).join("cdi").join("nodes")
 }
@@ -573,19 +588,33 @@ pub async fn prepare(
     for volume in &record.volumes {
         if volume.is_api_socket() {
             let socket = crate::dockerapi::socket_path(name);
+            // A machine whose unit predates the socket's Wants= opens it here.
+            if pass == Pass::Hook && !socket.exists() {
+                let _ = sd.start_unit(&format!("nspawn-api@{name}.socket")).await;
+            }
             if pass == Pass::Hook && !socket.exists() {
                 bail!(
                     "{} is missing: nspawn-api@{name}.socket did not open it (the packages ship nspawn-api@.socket, nspawn daemon --install writes it); see systemctl status nspawn-api@{name}.socket",
                     socket.display()
                 );
             }
-            if pass == Pass::Ahead && std::path::Path::new(&volume.source).exists() {
+            // In the journal too for a start by systemd: a tool that worked with what
+            // this host serves there gets another answer.
+            if std::path::Path::new(&volume.source).exists() {
                 note(
                     report,
                     format!(
                         "note: {} in {name} is nspawn's Docker API, not this host's docker",
                         volume.target
                     ),
+                );
+            }
+            // In a user namespace the socket is bound idmapped, which a tmpfs such as
+            // /run takes from Linux 6.3 on.
+            let private_users = !(record.mode == Mode::App && record.network == Network::Bridge);
+            if private_users && !kernel_at_least(6, 3) {
+                bail!(
+                    "{name} runs in a user namespace, where the Docker API socket is bound idmapped, which needs Linux 6.3 or later; run it as an app on a bridge network, or on a newer kernel"
                 );
             }
             binds.push(Bind {
@@ -808,6 +837,7 @@ pub async fn prepare(
                     bundle: &store.machine_files_dir(name).join("cdi").join("bundle"),
                     env: &env,
                     command: &record.effective_command(),
+                    nodes: &cdi_nodes_dir(store, name),
                 },
             )
             .await?;
@@ -943,6 +973,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
         None if !args.command.is_empty()
             || !args.network.is_empty()
             || !args.aliases.is_empty()
+            || !args.addresses.is_empty()
             || !args.publish.is_empty()
             || args.entrypoint.is_some()
             || !args.env.is_empty()
@@ -1082,7 +1113,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
 /// What a start's flags make of the machine's record: each one given replaces what the
 /// machine had. Shared with the round trip of `generate`.
 /// --ip: an address on the primary network, or NETWORK=IP on one the machine joins,
-/// refused as docker refuses it, and kept as the machine's address there.
+/// checked as `bridge::check_requested` says, and kept as the machine's address there.
 pub fn apply_addresses(
     store: &Store,
     config: &Config,
@@ -1113,6 +1144,7 @@ pub fn apply_addresses(
         let net = crate::api::network::find(store, config, &network)?;
         bridge::check_requested(store, &net, &r.name, addr)?;
         bridge::set_address(r, &network, addr);
+        r.fixed_addresses.insert(network);
     }
     Ok(())
 }
@@ -1666,6 +1698,11 @@ async fn wait_for_payload(sd: &Systemd, name: &str, pid1: bool) -> Result<(u32, 
     let leader = sd.machine_leader(name).await?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
+        // A program that is PID 1 and gone has nothing left to signal: its PID may be
+        // another process's by now.
+        if pid1 && comm(leader).is_none() {
+            return Ok((leader, None));
+        }
         let payload = program_pid(leader, pid1);
         if running_program(payload, |pid| comm(pid as u32)).is_some() || Instant::now() > deadline {
             return Ok((leader, payload));
@@ -1844,12 +1881,9 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
         let hc = args.health.apply(record.effective_healthcheck())?;
         record.healthcheck = Some(hc);
     }
-    store.record_image(&record)?;
-    let route =
-        settings::namespace_route(sd, &args.name, record.mode, bridge::namespaced(&record)).await?;
-    let app_argv =
-        settings::wrapped_argv(sd, &args.name, record.mode, &route, &record.tuning).await?;
-    // The drop-in keeps the cgroup's access to the CDI nodes of a running machine.
+    // The drop-in keeps the cgroup's access to the CDI nodes of a running machine:
+    // looked up before anything is written, so that a spec gone since the start leaves
+    // the record and the unit as they were.
     let mut tuning = record.tuning.clone();
     if let Some(plan) = crate::cdi::plan(&record.tuning)
         .with_context(|| format!("looking up the CDI devices of {}", args.name))?
@@ -1859,6 +1893,11 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
             &cdi_nodes_dir(store, &args.name),
         ));
     }
+    store.record_image(&record)?;
+    let route =
+        settings::namespace_route(sd, &args.name, record.mode, bridge::namespaced(&record)).await?;
+    let app_argv =
+        settings::wrapped_argv(sd, &args.name, record.mode, &route, &record.tuning).await?;
     let reload = settings::write_hooks(
         &args.name,
         &ctx.config,
@@ -2385,6 +2424,15 @@ pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_releases_compare_by_major_and_minor() {
+        assert!(release_at_least("6.8.0-45-generic\n", 6, 3));
+        assert!(release_at_least("6.3.0", 6, 3));
+        assert!(!release_at_least("6.2.16-arch1", 6, 3));
+        assert!(!release_at_least("5.15.0", 6, 3));
+        assert!(release_at_least("7.2.11-arch1-1", 6, 3));
+    }
 
     #[test]
     fn signals_wait_for_the_program_itself() {

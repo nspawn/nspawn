@@ -1,4 +1,4 @@
-//! What the store holds by kind, as docker's system df counts it, and the image prune:
+//! What the store holds by kind, as system df counts it, and the image prune:
 //! records are both images and machines, so an image here is a record pulled or built
 //! and never started, and a machine is anything else.
 
@@ -8,14 +8,27 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::api::{line, Context, Report};
+use crate::api::{line, note, Context, Report};
 use crate::store::{ImageRecord, Ownership, Store};
 
 /// A record pulled or built and never run as a machine. Records of releases before the
-/// first start was kept say nothing of it: an address or a writable layer with
-/// something in it says it ran.
+/// first start was kept say nothing of it: an address, options only start gives, or a
+/// writable layer with something in it say it ran.
 pub fn image_only(store: &Store, record: &ImageRecord) -> bool {
     if record.origin == "create" || record.started.is_some() || record.address.is_some() {
+        return false;
+    }
+    let given = !record.env.is_empty()
+        || !record.volumes.is_empty()
+        || !record.ports.is_empty()
+        || !record.labels.is_empty()
+        || record.entrypoint.is_some()
+        || record.cmd.is_some()
+        || record.healthcheck.is_some()
+        || record.restart != crate::policy::Restart::default()
+        || record.limits != crate::policy::Limits::default()
+        || record.tuning != crate::tuning::Tuning::default();
+    if given {
         return false;
     }
     let upper = store
@@ -202,6 +215,15 @@ pub async fn usage(ctx: &Context) -> Result<Usage> {
     }
     let _ = images;
 
+    for row in crate::build::cache::usage(store)? {
+        usage.build_cache.total += 1;
+        usage.build_cache.size += row.size;
+        if row.shared {
+            usage.build_cache.active += 1;
+        } else {
+            usage.build_cache.reclaimable += row.size;
+        }
+    }
     for v in crate::api::volumes::list(store)? {
         let mut seen = HashSet::new();
         let size = tree_size(&v.path, &mut seen);
@@ -273,33 +295,71 @@ pub async fn prune_images(
     if names.is_empty() {
         return Ok(Pruned::default());
     }
-    // What goes with them: their layers and blobs that nothing staying refers to.
-    let staying: HashSet<&str> = records
+    // What each takes with it: its layers and blobs that nothing staying, nor the build
+    // cache, refers to; counted before they go.
+    let staying: HashSet<String> = records
         .iter()
         .filter(|r| !names.contains(&r.name))
-        .flat_map(|r| r.layers.iter().map(String::as_str))
+        .flat_map(|r| r.layers.iter().cloned())
+        .chain(crate::build::cache::Cache::new(&store.build_cache_dir()).blobs())
         .collect();
     let mut sizes = BTreeMap::new();
     let mut freed = HashSet::new();
-    let mut reclaimed = 0;
+    let mut own: BTreeMap<String, u64> = BTreeMap::new();
     for r in records.iter().filter(|r| names.contains(&r.name)) {
+        let mut size = 0;
         for layer in &r.layers {
-            if !staying.contains(layer.as_str()) && freed.insert(layer.clone()) {
-                reclaimed += layer_size(store, layer, &mut sizes);
-                reclaimed += std::fs::metadata(store.blob_path(layer)).map_or(0, |m| m.len());
+            if !staying.contains(layer) && freed.insert(layer.clone()) {
+                size += layer_size(store, layer, &mut sizes);
+                size += std::fs::metadata(store.blob_path(layer)).map_or(0, |m| m.len());
             }
         }
+        own.insert(r.name.clone(), size);
     }
     let removal = crate::api::images::remove_machines(ctx, &names, false, report).await?;
     for name in &removal.removed {
         line(report, format!("deleted: {name}"));
     }
+    // One that is still taken (a machine depends on it, say) stays; the rest go.
     if let Some(e) = removal.error() {
-        anyhow::bail!("{e}");
+        note(report, format!("warning: {e}"));
     }
+    let reclaimed = removal.removed.iter().filter_map(|n| own.get(n)).sum();
     Ok(Pruned {
         removed: removal.removed,
         reclaimed,
+    })
+}
+
+/// builder prune: the cache rows `prunable` selects removed, the blobs and layers
+/// nothing keeps any more with them; what it freed.
+pub async fn prune_build_cache(
+    ctx: &Context,
+    all: bool,
+    until: Option<u64>,
+    keep_storage: Option<u64>,
+    report: Report<'_>,
+) -> Result<Pruned> {
+    let store = &ctx.store;
+    let _lock = store.lock().await?;
+    let rows = crate::build::cache::usage(store)?;
+    // A build running now may have a cache mount bound in a step: those wait for it.
+    let building = std::fs::read_dir(store.builds_dir()).is_ok_and(|mut d| {
+        d.any(|e| e.is_ok_and(|e| e.file_name().to_string_lossy().starts_with("df-")))
+    });
+    let gone: Vec<_> = crate::build::cache::prunable(&rows, all, until, keep_storage)
+        .into_iter()
+        .filter(|r| !(building && r.kind == "mount"))
+        .collect();
+    crate::build::cache::remove(store, &gone)?;
+    store.gc_layers()?;
+    store.gc_blobs()?;
+    for row in &gone {
+        line(report, format!("deleted: {}", row.id));
+    }
+    Ok(Pruned {
+        reclaimed: gone.iter().map(|r| r.size).sum(),
+        removed: gone.into_iter().map(|r| r.id).collect(),
     })
 }
 
@@ -343,6 +403,15 @@ mod tests {
         assert!(image_only(&store, &ran));
         std::fs::write(upper.join("f"), "x").unwrap();
         assert!(!image_only(&store, &ran));
+        // Options only start gives say a machine.
+        assert!(!image_only(
+            &store,
+            &record(serde_json::json!({ "env": ["A=b"] }))
+        ));
+        assert!(!image_only(
+            &store,
+            &record(serde_json::json!({ "restart": "always" }))
+        ));
     }
 
     #[test]

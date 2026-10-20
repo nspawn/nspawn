@@ -1,0 +1,1 @@
+--secret id=token,src=@CASE@/token.txt

@@ -522,6 +522,17 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
     };
     let project = e.project().clone();
     let service = convert::service(&project, &service_name)?.clone();
+    // What nspawn cannot do for the service it runs, and the ones it brings up first.
+    up::check_refusals(
+        &project
+            .clone()
+            .with_selected_services(std::slice::from_ref(&service_name), a.no_deps)
+            .map_err(anyhow::Error::msg)?,
+    )?;
+    let flags = super::build::Flags {
+        quiet: a.quiet_build,
+        ..Default::default()
+    };
     // The services it depends on come up first, as up would make them.
     if !a.no_deps {
         let deps = up::dependencies(&service);
@@ -531,6 +542,8 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
                 start: true,
                 pull: a.pull.clone(),
                 quiet_pull: a.quiet_pull,
+                build: Some(flags.clone()),
+                force_build: a.build,
                 ..Default::default()
             };
             let mut deps_project = project.clone();
@@ -544,14 +557,14 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
             result?;
         }
     }
-    let images = up::images(
-        e,
-        std::slice::from_ref(&service_name),
-        a.pull.as_deref(),
-        a.quiet_pull,
-        false,
-    )
-    .await?;
+    let pulls = up::Pulls {
+        flag: a.pull.as_deref(),
+        quiet: a.quiet_pull,
+        build: Some(&flags),
+        force_build: a.build,
+        ..Default::default()
+    };
+    let images = up::images(e, std::slice::from_ref(&service_name), &pulls).await?;
     let Some(image) = images.get(&service_name) else {
         bail!("service {service_name:?} has no image to run");
     };

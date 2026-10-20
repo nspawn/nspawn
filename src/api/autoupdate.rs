@@ -105,7 +105,21 @@ pub fn skip_reason(record: &ImageRecord, built: &BTreeSet<&str>) -> Option<Strin
     if record.mode == Mode::Boot {
         return Some("it boots an init system, whose state is its writable layer".to_string());
     }
+    if let Some(path) = record.run.volumes.iter().find(|p| !covered(record, p)) {
+        return Some(format!(
+            "its image keeps data in {path}, which no volume of the machine covers: it is in the writable layer a new image starts without"
+        ));
+    }
     None
+}
+
+/// Whether a volume of the machine holds `path`.
+fn covered(record: &ImageRecord, path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    record.volumes.iter().any(|v| {
+        let target = v.target.trim_end_matches('/');
+        path == target || target.is_empty() || path.starts_with(&format!("{target}/"))
+    })
 }
 
 /// Machines after the ones they depend on or take their network from.
@@ -150,7 +164,19 @@ fn needs(record: &ImageRecord) -> Vec<String> {
     out
 }
 
-/// What the registry has for a reference, looked up once per run.
+/// What the registry says of a reference, asked once per run whatever the number of
+/// machines that have it.
+#[derive(Default)]
+struct Answer {
+    /// The digest the reference names (an index's for a tag of several platforms).
+    named: Option<String>,
+    /// The manifest for this platform, asked for only when `named` is not a machine's.
+    resolved: Option<crate::hub::Resolved>,
+    /// The new image, brought in once for every machine that takes it.
+    fetched: Option<Arc<Fetched>>,
+}
+
+/// What the registry has for one machine.
 enum Remote {
     Same,
     /// The image the reference names now, brought in when the run is not a dry one.
@@ -183,7 +209,7 @@ pub async fn run(ctx: &Context, request: &Request, report: Report<'_>) -> Result
             chosen.push(record.clone());
         }
     }
-    let mut remotes: BTreeMap<String, Remote> = BTreeMap::new();
+    let mut answers: BTreeMap<String, Answer> = BTreeMap::new();
     let mut outcomes = Vec::new();
     for record in in_dependency_order(chosen) {
         let mut outcome = Outcome {
@@ -200,11 +226,9 @@ pub async fn run(ctx: &Context, request: &Request, report: Report<'_>) -> Result
             outcomes.push(outcome);
             continue;
         }
-        if !remotes.contains_key(&record.reference) {
-            let remote = look_up(ctx, &record, request.dry_run, report).await;
-            remotes.insert(record.reference.clone(), remote);
-        }
-        match &remotes[&record.reference] {
+        let answer = answers.entry(record.reference.clone()).or_default();
+        let remote = look_up(ctx, &record, answer, request.dry_run, report).await;
+        match &remote {
             Remote::Error(why) => {
                 outcome.updated = Updated::Failed;
                 outcome.reason = why.clone();
@@ -227,7 +251,9 @@ pub async fn run(ctx: &Context, request: &Request, report: Report<'_>) -> Result
                             crate::hub::short_digest(&record.manifest_digest)
                         ),
                     );
-                    match crate::api::recreate::recreate(ctx, &record.name, fetched, report).await {
+                    let recreated =
+                        crate::api::recreate::recreate(ctx, &record.name, fetched, report).await;
+                    match recreated.result {
                         Ok(()) => outcome.updated = Updated::Yes,
                         Err(e) => {
                             let text = format!("{e:#}");
@@ -241,7 +267,7 @@ pub async fn run(ctx: &Context, request: &Request, report: Report<'_>) -> Result
                             outcome.reason = text;
                         }
                     }
-                    if outcome.updated != Updated::Failed {
+                    if recreated.restarted {
                         restart_dependents(ctx, &record, report).await;
                     }
                     if outcome.updated == Updated::Yes {
@@ -268,13 +294,27 @@ pub async fn run(ctx: &Context, request: &Request, report: Report<'_>) -> Result
 
 /// Asks the registry what the machine's reference names now: a HEAD for the digest
 /// first, which registries do not count against their pull limits, and the manifest
-/// for this platform when that differs from what the machine was pulled as.
-async fn look_up(ctx: &Context, record: &ImageRecord, dry_run: bool, report: Report<'_>) -> Remote {
+/// for this platform when that differs from what the machine was pulled as. What the
+/// registry said is kept in `answer` for the next machine of the reference.
+async fn look_up(
+    ctx: &Context,
+    record: &ImageRecord,
+    answer: &mut Answer,
+    dry_run: bool,
+    report: Report<'_>,
+) -> Remote {
     let attempt = async {
         let image = ImageRef::parse(&record.reference, &ctx.config.registry)?;
         let oci = image.to_oci()?;
         let hub = Hub::new(&ctx.config)?;
-        let named = hub.digest(&oci).await?;
+        let named = match &answer.named {
+            Some(named) => named.clone(),
+            None => {
+                let named = hub.digest(&oci).await?;
+                answer.named = Some(named.clone());
+                named
+            }
+        };
         let known = record
             .index_digest
             .as_deref()
@@ -283,9 +323,14 @@ async fn look_up(ctx: &Context, record: &ImageRecord, dry_run: bool, report: Rep
             return Ok(Remote::Same);
         }
         // A new index may name the same manifest for this platform.
-        let resolved = hub.resolve(&oci).await?;
+        if answer.resolved.is_none() {
+            answer.resolved = Some(hub.resolve(&oci).await?);
+        }
+        let resolved = answer.resolved.as_ref().expect("resolved above");
         if resolved.digest == record.manifest_digest {
-            if record.index_digest.is_none() || resolved.index_digest != record.index_digest {
+            if !dry_run
+                && (record.index_digest.is_none() || resolved.index_digest != record.index_digest)
+            {
                 let _lock = ctx.store.lock().await?;
                 if let Some(mut current) = ctx.store.load_image(&record.name)? {
                     current.index_digest.clone_from(&resolved.index_digest);
@@ -294,16 +339,14 @@ async fn look_up(ctx: &Context, record: &ImageRecord, dry_run: bool, report: Rep
             }
             return Ok(Remote::Same);
         }
-        let fetched = if dry_run {
-            None
-        } else {
+        if !dry_run && answer.fetched.is_none() {
             let fetched =
                 crate::api::pull::fetch(ctx, &image, true, Some("overlay"), report).await?;
-            Some(Arc::new(fetched))
-        };
+            answer.fetched = Some(Arc::new(fetched));
+        }
         Ok::<Remote, anyhow::Error>(Remote::Newer {
-            digest: resolved.digest,
-            fetched,
+            digest: resolved.digest.clone(),
+            fetched: answer.fetched.clone(),
         })
     };
     attempt
@@ -447,13 +490,26 @@ async fn refresh_compose_image(
     }
 }
 
-/// What a run cut short left: a machine whose new image runs keeps it, any other gets
-/// its old image back.
+/// What a run cut short left (a service that went away, a host that went down): a
+/// machine on its new image that runs keeps it, any other gets its old image back, and
+/// runs again if it ran. One that runs on its old writable layer is left for when it
+/// stops: that layer is in its rollback directory then.
 async fn recover(ctx: &Context, report: Report<'_>) {
+    use crate::api::recreate::Phase;
     let Ok(sd) = ctx.sd().await else { return };
     for name in ctx.store.rollbacks() {
-        if sd.machine_exists(&name).await.unwrap_or(false) {
-            let _ = ctx.store.forget_rollback(&name);
+        let progress = crate::api::recreate::progress(&ctx.store, &name);
+        let runs = ctx.store.is_starting(&name) || sd.machine_exists(&name).await.unwrap_or(true);
+        if runs {
+            if progress.phase == Phase::Aside {
+                note(
+                    report,
+                    format!("warning: {name} runs while an earlier update of it was cut short; it is put back once it stops"),
+                );
+            } else {
+                let _lock = ctx.store.lock().await;
+                let _ = ctx.store.forget_rollback(&name);
+            }
             continue;
         }
         let restored = async {
@@ -461,18 +517,33 @@ async fn recover(ctx: &Context, report: Report<'_>) {
             crate::api::recreate::restore(ctx, &name, report).await
         };
         match restored.await {
-            Ok(()) => note(
-                report,
-                format!(
-                    "note: {name} was left halfway by an earlier update; its old image is back"
-                ),
-            ),
+            Ok(()) => {
+                note(
+                    report,
+                    format!(
+                        "note: {name} was left halfway by an earlier update; its old image is back"
+                    ),
+                );
+                if progress.running {
+                    if let Err(e) =
+                        crate::api::machines::start(ctx, &StartRequest::keep(&name), report).await
+                    {
+                        note(report, format!("warning: starting {name}: {e:#}"));
+                    }
+                }
+            }
             Err(e) => note(
                 report,
                 format!("warning: {name} was left halfway by an earlier update: {e:#}"),
             ),
         }
     }
+}
+
+/// `recover` at the start of the service, whose end may have cut an update short.
+pub async fn recover_at_start(ctx: &Context, report: Report<'_>) {
+    let _one = RUNNING.lock().await;
+    recover(ctx, report).await;
 }
 
 #[cfg(test)]
@@ -522,6 +593,28 @@ mod tests {
         .is_some());
         assert!(skip_reason(&record(serde_json::json!({ "backend": "flat" })), &none).is_some());
         assert!(skip_reason(&record(serde_json::json!({ "mode": "boot" })), &none).is_some());
+        // What the image keeps in a VOLUME is in the writable layer unless a volume of the
+        // machine holds it.
+        let data = |volumes: serde_json::Value| {
+            record(serde_json::json!({
+                "run": { "volumes": ["/var/lib/postgresql/data"] },
+                "volumes": volumes,
+            }))
+        };
+        assert!(skip_reason(&data(serde_json::json!([])), &none)
+            .unwrap()
+            .contains("/var/lib/postgresql/data"));
+        for target in [
+            "/var/lib/postgresql/data",
+            "/var/lib/postgresql",
+            "/var/lib/postgresql/data/",
+        ] {
+            let covered = data(serde_json::json!([{ "source": "pg", "target": target }]));
+            assert_eq!(skip_reason(&covered, &none), None, "{target}");
+        }
+        let elsewhere =
+            data(serde_json::json!([{ "source": "pg", "target": "/var/lib/postgres" }]));
+        assert!(skip_reason(&elsewhere, &none).is_some());
     }
 
     #[test]

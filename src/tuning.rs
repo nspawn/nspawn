@@ -367,6 +367,26 @@ pub fn device_nodes(path: &str) -> Vec<String> {
         let mut out = Vec::new();
         walk(path, &mut out);
         out
+    } else if !path.starts_with("/dev/") {
+        // systemd takes only nodes under /dev for DeviceAllow=, and the numbers of one
+        // anywhere else (a CDI node made for the machine) as /dev/char/MAJ:MIN.
+        use std::os::unix::fs::MetadataExt;
+        let Ok(meta) = path.metadata() else {
+            return Vec::new();
+        };
+        let kind = if meta.file_type().is_char_device() {
+            "char"
+        } else if meta.file_type().is_block_device() {
+            "block"
+        } else {
+            return Vec::new();
+        };
+        let rdev = meta.rdev();
+        vec![format!(
+            "/dev/{kind}/{}:{}",
+            nix::sys::stat::major(rdev),
+            nix::sys::stat::minor(rdev)
+        )]
     } else {
         vec![path.to_string_lossy().into_owned()]
     }
@@ -854,7 +874,7 @@ fn device(text: &str) -> Result<Device> {
 }
 
 /// --add-host HOST:IP (or HOST=IP); "host-gateway" stands for the machine's gateway.
-fn extra_host(text: &str) -> Result<ExtraHost> {
+pub fn extra_host(text: &str) -> Result<ExtraHost> {
     // HOST=IP first, the form for IPv6 addresses, whose colons would split HOST:IP
     // wrong; a hostname never carries an equals sign.
     let (host, ip) = text
@@ -873,7 +893,7 @@ fn extra_host(text: &str) -> Result<ExtraHost> {
 }
 
 /// --ulimit NAME=SOFT[:HARD], NAME one of nofile, nproc, core, ...
-fn ulimit(text: &str) -> Result<(String, (u64, u64))> {
+pub fn ulimit(text: &str) -> Result<(String, (u64, u64))> {
     let (name, values) = text
         .split_once('=')
         .with_context(|| format!("--ulimit {text}: NAME=SOFT[:HARD]"))?;

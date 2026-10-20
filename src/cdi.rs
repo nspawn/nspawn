@@ -644,11 +644,15 @@ impl Registry {
             })
             .map(|(_, kind, _)| *kind)
             .ok_or_else(|| {
-                anyhow!(
+                let mut text = format!(
                     "could not select device driver {:?} with capabilities: [[{}]]",
                     request.driver,
                     capabilities.join(" ")
-                )
+                );
+                if !self.errors.is_empty() {
+                    text.push_str(&format!(" ({})", self.errors.join("; ")));
+                }
+                anyhow!(text)
             })?;
         Ok(if !request.device_ids.is_empty() {
             request
@@ -1071,31 +1075,85 @@ pub fn plan(tuning: &Tuning) -> Result<Option<Plan>> {
 }
 
 /// The device nodes as --device gives them: the host's node where it is the one the
-/// spec describes, else one under `dir` that `devices` makes.
+/// spec describes, else one under `dir` that `devices` makes, which the machine's
+/// cgroup lets it make again (m) when a start finds it gone.
 pub fn device_paths(plan: &Plan, dir: &Path) -> Vec<Device> {
     plan.nodes
         .iter()
         .enumerate()
-        .map(|(i, node)| Device {
-            host: if node.on_host {
-                node.host_path.clone()
-            } else {
-                dir.join(format!("node{i}")).to_string_lossy().into_owned()
-            },
-            container: node.path.clone(),
-            permissions: node.permissions.clone(),
+        .map(|(i, node)| {
+            let mut permissions = node.permissions.clone();
+            if !node.on_host && !permissions.is_empty() && !permissions.contains('m') {
+                permissions.push('m');
+            }
+            Device {
+                host: node_source(node, dir, i).to_string_lossy().into_owned(),
+                container: node.path.clone(),
+                permissions,
+            }
         })
         .collect()
 }
 
+/// Where the machine's node `i` comes from: the host's, or the one made under `dir`.
+fn node_source(node: &Node, dir: &Path, i: usize) -> PathBuf {
+    if node.on_host {
+        PathBuf::from(&node.host_path)
+    } else {
+        dir.join(format!("node{i}"))
+    }
+}
+
 /// `device_paths`, the nodes the host lacks made under `dir` with the spec's numbers,
-/// mode and owner.
+/// mode and owner; those an earlier start made are kept. `dir`'s parent is the
+/// machine's own (0700): a node made there is no node for the host's users.
 pub fn devices(plan: &Plan, dir: &Path) -> Result<Vec<Device>> {
-    let _ = std::fs::remove_dir_all(dir);
-    for (node, device) in plan.nodes.iter().zip(device_paths(plan, dir)) {
-        if !node.on_host {
-            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-            make_node(Path::new(&device.host), node)?;
+    use std::os::unix::fs::DirBuilderExt;
+    let mut wanted = BTreeSet::new();
+    for (i, node) in plan.nodes.iter().enumerate() {
+        if node.on_host {
+            continue;
+        }
+        if let Some(parent) = dir.parent() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("setting the mode of {}", parent.display()))?;
+        }
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = node_source(node, dir, i);
+        wanted.insert(path.clone());
+        let same = std::fs::symlink_metadata(&path).is_ok_and(|meta| {
+            let t = meta.file_type();
+            let kind = if t.is_block_device() {
+                "b"
+            } else if t.is_char_device() {
+                "c"
+            } else if t.is_fifo() {
+                "p"
+            } else {
+                ""
+            };
+            kind == node.kind
+                && (kind == "p"
+                    || meta.rdev() == nix::sys::stat::makedev(node.major as u64, node.minor as u64))
+        });
+        if !same {
+            let _ = std::fs::remove_file(&path);
+            make_node(&path, node)?;
+        } else {
+            set_node_owner(&path, node)?;
+        }
+    }
+    // Nodes of devices the machine no longer takes.
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if !wanted.contains(&entry.path()) {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
     Ok(device_paths(plan, dir))
@@ -1119,6 +1177,10 @@ fn make_node(path: &Path, node: &Node) -> Result<()> {
         makedev(node.major as u64, node.minor as u64),
     )
     .with_context(|| format!("making the CDI device node {}", path.display()))?;
+    set_node_owner(path, node)
+}
+
+fn set_node_owner(path: &Path, node: &Node) -> Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(node.file_mode))
         .with_context(|| format!("setting the mode of {}", path.display()))?;
     if node.uid.is_some() || node.gid.is_some() {
@@ -1127,6 +1189,9 @@ fn make_node(path: &Path, node: &Node) -> Result<()> {
     }
     Ok(())
 }
+
+/// Seconds a hook without a timeout of its own may take.
+const HOOK_TIMEOUT: u64 = 60;
 
 /// What the hooks are told of the machine.
 pub struct HookMachine<'a> {
@@ -1138,27 +1203,8 @@ pub struct HookMachine<'a> {
     /// The image's environment and the machine's.
     pub env: &'a [String],
     pub command: &'a [String],
-}
-
-/// `relative` inside `root`, its last component followed too when it is a link.
-fn inside(root: &Path, relative: &str) -> Result<PathBuf> {
-    let mut wanted = PathBuf::from(relative.trim_start_matches('/'));
-    for _ in 0..40 {
-        let path = crate::backend::chase(root, &wanted)
-            .with_context(|| format!("{relative}: a component of the image is not a directory"))?;
-        match std::fs::read_link(&path) {
-            Ok(target) => {
-                let parent = wanted.parent().map(Path::to_path_buf).unwrap_or_default();
-                wanted = if target.is_absolute() {
-                    PathBuf::from(target.strip_prefix("/").unwrap_or(&target))
-                } else {
-                    parent.join(target)
-                };
-            }
-            Err(_) => return Ok(path),
-        }
-    }
-    bail!("{relative}: too many levels of symbolic links in the image")
+    /// Where `devices` made the nodes the host lacks.
+    pub nodes: &'a Path,
 }
 
 fn cstring(path: &Path) -> Result<CString> {
@@ -1204,63 +1250,61 @@ fn write_bundle(plan: &Plan, machine: &HookMachine) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))
 }
 
-/// The SELinux context the hooks run in: systemd-nspawn's, unconfined, rather than the
-/// service's confined domain, as a runtime runs them in its own.
-fn hook_context() -> Option<CString> {
-    if !Path::new("/sys/fs/selinux/enforce").exists() {
-        return None;
-    }
-    let current = std::fs::read_to_string("/proc/self/attr/current").ok()?;
-    let current = current.trim_end_matches('\0').trim();
-    let mut parts: Vec<&str> = current.splitn(4, ':').collect();
-    if parts.len() < 3 || parts[2] != "nspawn_t" {
-        return None;
-    }
-    parts[2] = "unconfined_service_t";
-    CString::new(parts.join(":")).ok()
-}
-
 /// The mounts the hooks work in, and the mount points they need in the root.
-fn hook_root(plan: &Plan, root: &Path) -> Result<crate::nsenter::HookRoot> {
+fn hook_root(plan: &Plan, root: &Path, nodes_dir: &Path) -> Result<crate::nsenter::HookRoot> {
+    let dev = crate::backend::resolve_in_root(root, "/dev")?;
+    // Mounts below /dev land on the tmpfs the hooks get there, as the machine's land on
+    // the /dev systemd-nspawn makes: their mount points are made on it.
+    let below_dev = |target: &str| {
+        target
+            .strip_prefix("/dev/")
+            .filter(|_| crate::volume::plain_inside_path(target))
+            .map(|relative| dev.join(relative))
+    };
     let mut points: Vec<(String, bool)> = Vec::new();
-    let mut binds = Vec::new();
+    let mut dev_points = Vec::new();
     for bind in &plan.mounts {
-        points.push((bind.target.clone(), bind.source.is_dir()));
+        match below_dev(&bind.target) {
+            Some(path) => dev_points.push((cstring(&path)?, bind.source.is_dir())),
+            None => points.push((bind.target.clone(), bind.source.is_dir())),
+        }
     }
     points.push(("/dev".to_string(), true));
     points.push(("/proc".to_string(), true));
     crate::backend::ensure_mount_points(root, &points)?;
+    let mut binds = Vec::new();
     for bind in &plan.mounts {
-        binds.push((
-            cstring(&bind.source)?,
-            cstring(&inside(root, &bind.target)?)?,
-            bind.read_only,
-        ));
+        let target = match below_dev(&bind.target) {
+            Some(path) => path,
+            None => crate::backend::resolve_in_root(root, &bind.target)?,
+        };
+        binds.push((cstring(&bind.source)?, cstring(&target)?, bind.read_only));
     }
-    let dev = inside(root, "/dev")?;
     let mut dev_dirs = BTreeSet::new();
     let mut dev_nodes = Vec::new();
-    for node in &plan.nodes {
-        let Some(relative) = node.path.strip_prefix("/dev/") else {
-            continue;
-        };
-        if !crate::volume::plain_inside_path(&node.path) {
-            continue;
-        }
-        let path = dev.join(relative);
+    let parents = |path: &Path, dirs: &mut BTreeSet<PathBuf>| {
         let mut parent = path.parent();
         while let Some(dir) = parent.filter(|d| d.starts_with(&dev) && *d != dev) {
-            dev_dirs.insert(dir.to_path_buf());
+            dirs.insert(dir.to_path_buf());
             parent = dir.parent();
         }
+    };
+    for (i, node) in plan.nodes.iter().enumerate() {
+        let Some(path) = below_dev(&node.path) else {
+            continue;
+        };
+        parents(&path, &mut dev_dirs);
+        // The machine's own node bound there: making one would need the cgroup's m.
         dev_nodes.push(crate::nsenter::DevNode {
             path: cstring(&path)?,
-            kind: node_kind(&node.kind),
-            mode: node.file_mode,
-            rdev: nix::sys::stat::makedev(node.major as u64, node.minor as u64),
-            owner: (node.uid.is_some() || node.gid.is_some())
-                .then(|| (node.uid.unwrap_or(0), node.gid.unwrap_or(0))),
+            source: cstring(&node_source(node, nodes_dir, i))?,
         });
+    }
+    for (path, _) in &dev_points {
+        parents(
+            Path::new(std::ffi::OsStr::from_bytes(path.as_bytes())),
+            &mut dev_dirs,
+        );
     }
     Ok(crate::nsenter::HookRoot {
         root: cstring(root)?,
@@ -1268,8 +1312,9 @@ fn hook_root(plan: &Plan, root: &Path) -> Result<crate::nsenter::HookRoot> {
         dev: Some(cstring(&dev)?),
         dev_dirs: dev_dirs.iter().map(|d| cstring(d)).collect::<Result<_>>()?,
         dev_nodes,
-        proc_dir: Some(cstring(&inside(root, "/proc")?)?),
-        context: hook_context(),
+        dev_points,
+        proc_dir: Some(cstring(&crate::backend::resolve_in_root(root, "/proc")?)?),
+        context: crate::nsenter::unit_context(),
     })
 }
 
@@ -1284,7 +1329,7 @@ pub async fn run_hooks(plan: &Plan, machine: &HookMachine<'_>) -> Result<()> {
         return Ok(());
     }
     write_bundle(plan, machine)?;
-    let root = hook_root(plan, machine.root)?;
+    let root = hook_root(plan, machine.root, machine.nodes)?;
     let state = serde_json::to_vec(&serde_json::json!({
         "ociVersion": "1.2.0",
         "id": machine.name,
@@ -1315,21 +1360,24 @@ pub async fn run_hooks(plan: &Plan, machine: &HookMachine<'_>) -> Result<()> {
             // A hook that does not read its state closes the pipe early.
             let _ = stdin.write_all(&state).await;
         }
-        let output = child.wait_with_output();
-        let output = match hook.timeout.filter(|t| *t > 0) {
-            Some(seconds) => {
-                match tokio::time::timeout(std::time::Duration::from_secs(seconds as u64), output)
-                    .await
-                {
-                    Ok(output) => output?,
-                    Err(_) => bail!(
-                        "the {} hook {} of the CDI specs did not end within {seconds}s",
-                        hook.hook_name,
-                        hook.path
-                    ),
-                }
-            }
-            None => output.await?,
+        // The start holds the store while hooks run: one without a timeout of its own
+        // gets the time other starts wait for the store.
+        let seconds = hook
+            .timeout
+            .filter(|t| *t > 0)
+            .map_or(HOOK_TIMEOUT, |t| t as u64);
+        let output = match tokio::time::timeout(
+            std::time::Duration::from_secs(seconds),
+            child.wait_with_output(),
+        )
+        .await
+        {
+            Ok(output) => output?,
+            Err(_) => bail!(
+                "the {} hook {} of the CDI specs did not end within {seconds}s",
+                hook.hook_name,
+                hook.path
+            ),
         };
         for stream in [&output.stdout, &output.stderr] {
             let text = String::from_utf8_lossy(stream);
@@ -1359,6 +1407,50 @@ pub async fn run_hooks(plan: &Plan, machine: &HookMachine<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn made_nodes_get_rules_systemd_takes() {
+        let node = |on_host: bool, permissions: &str| Node {
+            path: "/dev/x".into(),
+            host_path: "/dev/x".into(),
+            kind: "c".into(),
+            major: 1,
+            minor: 3,
+            file_mode: 0o666,
+            uid: None,
+            gid: None,
+            permissions: permissions.into(),
+            on_host,
+        };
+        let plan = Plan {
+            nodes: vec![
+                node(true, "rw"),
+                node(false, "rw"),
+                node(false, ""),
+                node(false, "rwm"),
+            ],
+            ..Plan::default()
+        };
+        let dir = Path::new("/var/lib/nspawn/machines/m/cdi/nodes");
+        let devices = device_paths(&plan, dir);
+        assert_eq!(devices[0].host, "/dev/x");
+        assert_eq!(devices[0].permissions, "rw");
+        // A start may have to make it again, inside the unit's cgroup.
+        assert_eq!(devices[1].host, dir.join("node1").to_string_lossy());
+        assert_eq!(devices[1].permissions, "rwm");
+        assert_eq!(devices[2].permissions, "");
+        assert_eq!(devices[3].permissions, "rwm");
+        // A node outside /dev is allowed by its numbers.
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("node0");
+        std::os::unix::fs::symlink("/dev/null", &link).unwrap();
+        assert_eq!(
+            crate::tuning::device_nodes(&link.to_string_lossy()),
+            ["/dev/char/1:3"]
+        );
+        assert!(crate::tuning::device_nodes(&tmp.path().join("gone").to_string_lossy()).is_empty());
+        assert_eq!(crate::tuning::device_nodes("/dev/null"), ["/dev/null"]);
+    }
 
     fn write(dir: &Path, file: &str, text: &str) {
         std::fs::create_dir_all(dir).unwrap();
@@ -1681,12 +1773,12 @@ containerEdits:
         std::os::unix::fs::symlink("/usr/lib", root.path().join("lib64")).unwrap();
         std::os::unix::fs::symlink("/etc/shadow", root.path().join("usr/lib/evil")).unwrap();
         assert_eq!(
-            inside(root.path(), "/lib64/libcuda.so").unwrap(),
+            crate::backend::resolve_in_root(root.path(), "/lib64/libcuda.so").unwrap(),
             root.path().join("usr/lib/libcuda.so")
         );
         // A link to a host path lands in the root.
         assert_eq!(
-            inside(root.path(), "/usr/lib/evil").unwrap(),
+            crate::backend::resolve_in_root(root.path(), "/usr/lib/evil").unwrap(),
             root.path().join("etc/shadow")
         );
     }

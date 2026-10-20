@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRef {
@@ -64,6 +64,22 @@ impl ImageRef {
             tag,
             digest,
         })
+    }
+
+    /// An image reference as Dockerfiles and compose files write them: one that names no
+    /// registry comes from Docker Hub, an official one under library/.
+    pub fn docker(image: &str) -> Result<Self> {
+        let first = image.split('/').next().unwrap_or("");
+        let has_registry = image.contains('/')
+            && (first.contains('.') || first.contains(':') || first == "localhost");
+        let full = if has_registry {
+            image.to_string()
+        } else if image.contains('/') {
+            format!("docker.io/{image}")
+        } else {
+            format!("docker.io/library/{image}")
+        };
+        ImageRef::parse(&full, "docker.io").with_context(|| format!("image {image}"))
     }
 
     /// The reference as the registry client takes it, built from its parts: parsed from

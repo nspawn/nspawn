@@ -290,8 +290,9 @@ fn lookup(tree: &Path, relative: &Path) -> Lookup {
 }
 
 /// Boot when there is an init and the image does not ask for something else to run: a
-/// command naming the init where systemd-nspawn looks for it, or by its bare name. Any
-/// other program, an `/init` of the image's own among them, runs as an app.
+/// command naming the init where systemd-nspawn looks for it, or by its bare name, or
+/// systemd wherever it is. Any other program, an `/init` of the image's own among them,
+/// runs as an app.
 pub fn detect_mode(init_present: bool, command: &[String]) -> Mode {
     if !init_present {
         return Mode::App;
@@ -300,7 +301,9 @@ pub fn detect_mode(init_present: bool, command: &[String]) -> Mode {
         None => Mode::Boot,
         Some(argv0) => {
             let init = match argv0.strip_prefix('/') {
-                Some(path) => INIT_PATHS.contains(&path),
+                Some(path) => {
+                    INIT_PATHS.contains(&path) || path.rsplit('/').next() == Some("systemd")
+                }
                 None => argv0 == "init" || argv0 == "systemd",
             };
             if init {
@@ -309,6 +312,18 @@ pub fn detect_mode(init_present: bool, command: &[String]) -> Mode {
                 Mode::App
             }
         }
+    }
+}
+
+/// This host's architecture as image platforms name it (GOARCH).
+pub fn host_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "x86" => "386",
+        "powerpc64" => "ppc64le",
+        "loongarch64" => "loong64",
+        other => other,
     }
 }
 
@@ -347,7 +362,7 @@ mod tests {
             (30_000_000, 3_000_000, 3)
         );
         assert_eq!(spec.volumes, ["/cache", "/var/lib/data"]);
-        // Docker takes a bare port as tcp; ports that are not ones are left out.
+        // A bare port is tcp; ports that are not ones are left out.
         assert_eq!(spec.exposed_ports, ["53/udp", "80/tcp", "443/tcp"]);
         assert_eq!(
             spec.labels,
@@ -413,7 +428,14 @@ mod tests {
         );
         assert_eq!(detect_mode(false, &s(&["/sbin/init"])), Mode::App);
         assert_eq!(detect_mode(false, &[]), Mode::App);
-        for init in ["/usr/sbin/init", "/lib/systemd/systemd", "init", "systemd"] {
+        for init in [
+            "/usr/sbin/init",
+            "/lib/systemd/systemd",
+            "init",
+            "systemd",
+            "/bin/systemd",
+            "/usr/bin/systemd",
+        ] {
             assert_eq!(detect_mode(true, &s(&[init])), Mode::Boot, "{init}");
         }
         // s6-overlay's /init, in an Alpine base whose busybox gives /sbin/init too, is the

@@ -1,15 +1,16 @@
-//! images prune, system df and system prune, with docker's prompts and output.
+//! images prune, system df and system prune, their prompts and output as scripts that
+//! read them expect.
 
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Result};
 use zbus::zvariant::{OwnedValue, Value};
 
-use crate::cli::{ImagesPruneArgs, SystemDfArgs, SystemPruneArgs};
+use crate::cli::{BuilderDuArgs, BuilderPruneArgs, ImagesPruneArgs, SystemDfArgs, SystemPruneArgs};
 use crate::client::{self, Client, Dict, Options};
 use crate::output::table;
 
-/// docker's sizes (go-units HumanSize): decimal units, four significant digits.
+/// Sizes as go-units' HumanSize writes them: decimal units, four significant digits.
 pub fn human_size(bytes: u64) -> String {
     const UNITS: [&str; 9] = ["B", "kB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
     let mut size = bytes as f64;
@@ -274,6 +275,8 @@ pub async fn networks_prune(client: &Client, filters: &[String]) -> Result<Vec<S
         .map_err(client::error)?
         .iter()
         .map(client::dict_to_json)
+        // The default network is never pruned, used or not.
+        .filter(|n| n["name"].as_str() != Some(crate::bridge::DEFAULT_NETWORK))
         .filter(|n| {
             n["machines"].as_array().is_some_and(Vec::is_empty) && selected(n, &labels, until)
         })
@@ -286,6 +289,106 @@ pub async fn networks_prune(client: &Client, filters: &[String]) -> Result<Vec<S
         .run_job_silent(|| client.manager.remove_networks(&unused), true)
         .await?;
     Ok(client::strings(&result, "removed"))
+}
+
+async fn prune_cache(
+    client: &Client,
+    all: bool,
+    until: Option<u64>,
+    keep_storage: Option<u64>,
+) -> Result<(Vec<String>, u64)> {
+    let mut options = Options::new();
+    options.insert("all", Value::from(all));
+    if let Some(until) = until {
+        options.insert("until", Value::from(until));
+    }
+    if let Some(size) = keep_storage {
+        options.insert("keep_storage", Value::from(size));
+    }
+    let result = client
+        .run_job_silent(|| client.manager.prune_build_cache(options), true)
+        .await?;
+    Ok((
+        client::strings(&result, "removed"),
+        client::u64(&result, "reclaimed"),
+    ))
+}
+
+pub async fn builder_prune(args: BuilderPruneArgs, client: &Client) -> Result<()> {
+    let (labels, until) = filters(&args.filters)?;
+    if !labels.is_empty() {
+        bail!("builder prune takes until= alone: the build cache has no labels");
+    }
+    let warning = if args.all {
+        "WARNING! This will remove all build cache."
+    } else {
+        "WARNING! This will remove all dangling build cache."
+    };
+    if !confirm(warning, args.force)? {
+        return Ok(());
+    }
+    let (removed, reclaimed) = prune_cache(client, args.all, until, args.keep_storage).await?;
+    if !removed.is_empty() {
+        println!("Deleted build cache objects:");
+        for id in &removed {
+            println!("{id}");
+        }
+        println!();
+    }
+    println!("Total reclaimed space: {}", human_size(reclaimed));
+    Ok(())
+}
+
+pub async fn builder_du(args: BuilderDuArgs, client: &Client) -> Result<()> {
+    let rows = client
+        .manager
+        .build_cache_usage()
+        .await
+        .map_err(client::error)?;
+    if args.json {
+        client::print_json(&serde_json::Value::Array(
+            rows.iter().map(client::dict_to_json).collect(),
+        ));
+        return Ok(());
+    }
+    let total: u64 = rows.iter().map(|r| client::u64(r, "size")).sum();
+    let reclaimable: u64 = rows
+        .iter()
+        .filter(|r| !client::bool(r, "shared"))
+        .map(|r| client::u64(r, "size"))
+        .sum();
+    if args.verbose {
+        let lines = rows
+            .iter()
+            .map(|r| {
+                vec![
+                    client::string(r, "id").chars().take(19).collect(),
+                    client::string(r, "kind"),
+                    if client::bool(r, "shared") {
+                        "true"
+                    } else {
+                        "false"
+                    }
+                    .to_string(),
+                    human_size(client::u64(r, "size")),
+                    crate::output::human_duration(
+                        crate::store::now_unix().saturating_sub(client::u64(r, "used")),
+                    ) + " ago",
+                    client::string(r, "description"),
+                ]
+            })
+            .collect();
+        println!(
+            "{}\n",
+            table(
+                &["ID", "KIND", "SHARED", "SIZE", "LAST USED", "DESCRIPTION"],
+                lines
+            )
+        );
+    }
+    println!("Reclaimable:\t{}", human_size(reclaimable));
+    println!("Total:\t\t{}", human_size(total));
+    Ok(())
 }
 
 pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
@@ -330,7 +433,7 @@ pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
         let result = client
             .run_job_silent(|| manager.remove_machines(&names, Options::new()), true)
             .await;
-        // What could not go stays; the rest of the prune goes on, as docker's does.
+        // What could not go stays; the rest of the prune goes on.
         if let Err(e) = &result {
             eprintln!("warning: {e:#}");
         }
@@ -360,10 +463,19 @@ pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
     };
     let (images, freed) = prune_images(client, args.all, &labels, until).await?;
     reclaimed += freed;
+    // The build cache has no labels: a prune narrowed by them leaves it.
+    let cache = if labels.is_empty() {
+        let (removed, freed) = prune_cache(client, args.all, until, None).await?;
+        reclaimed += freed;
+        removed
+    } else {
+        Vec::new()
+    };
     for (title, list, prefix) in [
         ("Deleted Containers:", &removed_machines, ""),
         ("Deleted Networks:", &networks, ""),
         ("Deleted Images:", &images, "deleted: "),
+        ("Deleted build cache objects:", &cache, ""),
     ] {
         if !list.is_empty() {
             println!("{title}");

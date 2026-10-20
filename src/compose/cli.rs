@@ -69,6 +69,8 @@ pub enum ComposeCommand {
     Config(ConfigArgs),
     /// Show the version information.
     Version(VersionArgs),
+    /// Build or rebuild services.
+    Build(BuildArgs),
     /// Copy files/folders between a service container and the local filesystem.
     Cp(CpArgs),
     /// Creates containers for a service.
@@ -271,6 +273,27 @@ pub fn requested(args: &ComposeArgs) -> Vec<(&'static str, &'static str)> {
             flag(command, "services", c.services);
             flag(command, "status", !c.status.is_empty());
         }
+        Some(ComposeCommand::Build(c)) => {
+            let command = "build";
+            flag(command, "build-arg", !c.build_arg.is_empty());
+            flag(command, "builder", c.builder.is_some());
+            flag(command, "check", c.check);
+            flag(command, "print", c.print);
+            flag(command, "provenance", c.provenance.is_some());
+            flag(command, "sbom", c.sbom.is_some());
+            flag(command, "ssh", c.ssh.is_some());
+            flag(command, "compress", c.compress.is_some());
+            flag(command, "force-rm", c.force_rm.is_some());
+            flag(command, "memory", c.memory.is_some());
+            flag(command, "no-cache", c.no_cache);
+            flag(command, "no-rm", c.no_rm);
+            flag(command, "parallel", c.parallel.is_some());
+            flag(command, "progress", c.progress.is_some());
+            flag(command, "pull", c.pull);
+            flag(command, "push", c.push);
+            flag(command, "quiet", c.quiet);
+            flag(command, "with-dependencies", c.with_dependencies);
+        }
         Some(ComposeCommand::Pull(c)) => {
             let command = "pull";
             flag(command, "ignore-buildable", c.ignore_buildable);
@@ -456,6 +479,29 @@ mod tests {
     }
 
     #[test]
+    fn refused_build_options_reach_the_table() {
+        for flag in [
+            "--check",
+            "--print",
+            "--sbom=true",
+            "--provenance=mode=max",
+            "--ssh=default",
+        ] {
+            let cli =
+                crate::cli::Cli::try_parse_from(["nspawn", "compose", "build", flag]).unwrap();
+            let crate::cli::Command::Compose(args) = cli.command else {
+                unreachable!()
+            };
+            let name = flag.trim_start_matches("--").split('=').next().unwrap();
+            assert!(requested(&args).contains(&("build", name)), "{flag}");
+            assert!(
+                matches!(support::option("build", name), Some(Support::Refused(_))),
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
     fn requested_options_are_named_as_in_the_table() {
         let cli = crate::cli::Cli::try_parse_from([
             "nspawn",
@@ -566,6 +612,66 @@ pub struct CpArgs {
     pub source: Option<String>,
     #[arg(value_name = "DEST")]
     pub destination: Option<String>,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct BuildArgs {
+    /// Set build-time variables for services.
+    #[arg(long, value_name = "BUILD_ARG")]
+    pub build_arg: Vec<String>,
+    /// Set builder to use.
+    #[arg(long, value_name = "BUILDER")]
+    pub builder: Option<String>,
+    /// Check build configuration.
+    #[arg(long, hide = true)]
+    pub check: bool,
+    /// Compress the build context using gzip. DEPRECATED
+    #[arg(long, hide = true, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub compress: Option<bool>,
+    /// Always remove intermediate containers. DEPRECATED
+    #[arg(long, hide = true, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub force_rm: Option<bool>,
+    /// Set memory limit for the build container. Not supported by BuildKit.
+    #[arg(long, short = 'm', value_name = "MEMORY")]
+    pub memory: Option<String>,
+    /// Do not use cache when building the image.
+    #[arg(long)]
+    pub no_cache: bool,
+    /// Do not remove intermediate containers after a successful build. DEPRECATED
+    #[arg(long, hide = true)]
+    pub no_rm: bool,
+    /// Build images in parallel. DEPRECATED
+    #[arg(long, hide = true, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub parallel: Option<bool>,
+    /// Print equivalent bake file.
+    #[arg(long, hide = true)]
+    pub print: bool,
+    /// Set type of ui output (auto, tty, plain, json, quiet)
+    #[arg(long, hide = true, value_name = "PROGRESS")]
+    pub progress: Option<String>,
+    /// Add a provenance attestation.
+    #[arg(long, hide = true, value_name = "PROVENANCE")]
+    pub provenance: Option<String>,
+    /// Always attempt to pull a newer version of the image.
+    #[arg(long)]
+    pub pull: bool,
+    /// Push service images.
+    #[arg(long)]
+    pub push: bool,
+    /// Suppress the build output.
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+    /// Add a SBOM attestation.
+    #[arg(long, hide = true, value_name = "SBOM")]
+    pub sbom: Option<String>,
+    /// Set SSH authentications used when building service images.
+    #[arg(long, hide = true, value_name = "SSH")]
+    pub ssh: Option<String>,
+    /// Also build dependencies (transitively).
+    #[arg(long)]
+    pub with_dependencies: bool,
+    #[arg(value_name = "SERVICE")]
+    pub service: Vec<String>,
 }
 
 #[derive(Args, Debug, Default)]

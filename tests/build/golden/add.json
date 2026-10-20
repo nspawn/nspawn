@@ -1,0 +1,177 @@
+{
+ "architecture": "amd64",
+ "config": {
+  "Cmd": [
+   "sh"
+  ],
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ]
+ },
+ "history": [
+  {
+   "created_by": "BusyBox 1.37.0 (glibc), Debian 13"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ADD tree.tar.gz /unpacked/"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ADD tree.tar.bz2 /unpacked/"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ADD tree.tar.xz /unpacked/"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ADD plain.txt /plain/"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ADD --chown=7:8 --chmod=0600 plain.txt /owned.txt"
+  }
+ ],
+ "layers": [
+  {
+   "base": true,
+   "diff_id": "sha256:5a9bfd996c6d49c6c3cb4ddfb76e8d09cf16b6b7cf6601d1f2dffbdbc3edb5d4"
+  },
+  {
+   "diff_id": "sha256:9ab21413d1b22ca24be35aa1c5220379874c004d1b480cdd92d445da30458065",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "unpacked",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "unpacked/t",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "unpacked/t/inner",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "unpacked/t/inner/x",
+     "sha256": "sha256:ab5080369a968a3638a5a5e0df9932a3656766bec904667f72438fd49cd515b0",
+     "size": 3,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "link": "inner/x",
+     "mode": "0777",
+     "path": "unpacked/t/lx",
+     "type": "symlink",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:7517f78537c9c33d1efee4f2beee1806a81c932a3973a1e30474c65b4377b999",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "unpacked",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "unpacked/bz",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0640",
+     "path": "unpacked/bz/one.txt",
+     "sha256": "sha256:485eb19ef98d340775afc91f50ec3f1751149d58747be4275d142656400c98a2",
+     "size": 11,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:840ba09b43926a32b046ddb8ff90831d75d440e4631234325efb557a15d164c7",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "unpacked",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0750",
+     "path": "unpacked/xz",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0600",
+     "path": "unpacked/xz/two.txt",
+     "sha256": "sha256:aad4b71a1abd333a3f240d222e633380d99d28ebd9bffaa2279c58df4fe544c7",
+     "size": 8,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:f40a2e4dbb223621572873671e1a145510062b03d6d0f2db438ad20f38a48b17",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "plain",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "plain/plain.txt",
+     "sha256": "sha256:dacf36547c7774a0a170806363b5d412991fbc0d6260b2c00b1d3a80a816c23f",
+     "size": 6,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:44d4aa51f6796637a4e223dc02c959b7add911c84fce616a61e43ec2a955b9f4",
+   "entries": [
+    {
+     "gid": 8,
+     "mode": "0600",
+     "path": "owned.txt",
+     "sha256": "sha256:dacf36547c7774a0a170806363b5d412991fbc0d6260b2c00b1d3a80a816c23f",
+     "size": 6,
+     "type": "file",
+     "uid": 7
+    }
+   ]
+  }
+ ],
+ "os": "linux"
+}

@@ -30,7 +30,7 @@ pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
     filters
         .only(PS_FILTERS)
         .map_err(|e| anyhow::anyhow!("{}", e.0))?;
-    // A status or exit code asked for looks at stopped machines too, as docker's does.
+    // A status or exit code asked for looks at stopped machines too.
     let all = args.all || filters.values("status").is_some() || filters.values("exited").is_some();
     let listed = client
         .manager
@@ -60,10 +60,11 @@ pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
     }
     if let Some(format) = &args.format {
         let rows: Vec<serde_json::Value> = machines.iter().map(|m| ps_row(m, now)).collect();
-        // docker's rows have a Label method; here the labels are a map to index.
+        // .Label "k" is a method of the rows formats are written for; here the labels
+        // are a map to index.
         let label_call =
             regex::Regex::new(r#"\.Label\s+("(?:[^"\\]|\\.)*")"#).expect("a valid expression");
-        let format = label_call.replace_all(format, "(index .LabelsMap $1)");
+        let format = label_call.replace_all(format, r#"(or (index .LabelsMap $1) "")"#);
         let text = crate::gotemplate::format_list(&format, PS_TABLE, &ps_headers(), &rows)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         print!("{text}");
@@ -112,18 +113,18 @@ pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// The filters `ps` takes, as docker ps does.
+/// The filters `ps` takes.
 const PS_FILTERS: &[&str] = &[
     "ancestor", "before", "expose", "exited", "health", "id", "is-task", "label", "name",
     "network", "publish", "since", "status", "volume",
 ];
 
-/// docker ps's default table, for --format table.
+/// The default table of --format table.
 const PS_TABLE: &str =
     "table {{.Names}}\t{{.Image}}\t{{.Command}}\t{{.RunningFor}}\t{{.Status}}\t{{.Ports}}";
 
-/// docker's state word for a machine.
-fn docker_state(machine: &Dict) -> &'static str {
+/// The state word of a machine in a --format row and the status filter.
+fn ps_state(machine: &Dict) -> &'static str {
     match client::string(machine, "state").as_str() {
         "running" | "opening" | "closing" => "running",
         "paused" => "paused",
@@ -162,7 +163,7 @@ fn ps_matches(filters: &crate::dockerapi::filters::Filters, m: &Dict, all: &[Dic
         "" => "none".to_string(),
         h => h.to_string(),
     };
-    filters.exact("status", docker_state(m))
+    filters.exact("status", ps_state(m))
         && filters.matches("name", &name)
         && filters
             .values("id")
@@ -170,8 +171,7 @@ fn ps_matches(filters: &crate::dockerapi::filters::Filters, m: &Dict, all: &[Dic
         && filters.labels("label", &labels)
         && filters.exact("health", &health)
         && filters.values("exited").is_none_or(|codes| {
-            docker_state(m) == "exited"
-                && codes.iter().any(|c| c.parse::<i32>().ok() == exit_code(m))
+            ps_state(m) == "exited" && codes.iter().any(|c| c.parse::<i32>().ok() == exit_code(m))
         })
         && filters.values("network").is_none_or(|nets| {
             client::strings(m, "networks")
@@ -218,7 +218,7 @@ fn ps_matches(filters: &crate::dockerapi::filters::Filters, m: &Dict, all: &[Dic
         })
 }
 
-/// A machine with the fields of docker ps's --format, and nspawn's own.
+/// A machine with the fields --format templates are written for, and nspawn's own.
 fn ps_row(m: &Dict, now: u64) -> serde_json::Value {
     let json = client::dict_to_json(m);
     let created = client::u64(m, "created");
@@ -238,7 +238,7 @@ fn ps_row(m: &Dict, now: u64) -> serde_json::Value {
     } else {
         format!("\"{}\"", client::strings(m, "command").join(" "))
     };
-    let state = docker_state(m);
+    let state = ps_state(m);
     let since = |t: u64| crate::dockerapi::util::human_duration(now.saturating_sub(t));
     let status = match state {
         "running" => match client::string(m, "health").as_str() {
@@ -286,7 +286,7 @@ fn ps_row(m: &Dict, now: u64) -> serde_json::Value {
     })
 }
 
-/// The header of each field in a --format table, as docker names its columns.
+/// The header of each field in a --format table.
 fn ps_headers() -> serde_json::Value {
     serde_json::json!({
         "ID": "CONTAINER ID", "Names": "NAMES", "Image": "IMAGE", "Command": "COMMAND",
@@ -927,34 +927,93 @@ pub async fn top(args: TopArgs, client: &Client) -> Result<()> {
 }
 
 /// wait: each machine's exit code once it has stopped, in the order named; a name that
-/// is no machine is an error for the end, as docker reports it.
+/// is no machine is an error for the end, the others waited for all the same.
 pub async fn wait(args: WaitArgs, client: &Client) -> Result<()> {
+    // The ends are followed from a moment before anything is looked at, so that one in
+    // between is not missed: a machine of run --rm is gone right after, and one with a
+    // restart policy runs again.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut filters = vec!["type=machine".to_string(), "event=die".to_string()];
+    filters.extend(args.names.iter().map(|n| format!("name={n}")));
+    let mut options = Options::new();
+    options.insert("since", Value::from(format!("@{}", now.saturating_sub(2))));
+    options.insert("filters", Value::from(filters));
+    let (mut fds, _process) = client
+        .manager
+        .events(options)
+        .await
+        .map_err(client::error)?;
+    let stdout = fds
+        .remove("stdout")
+        .context("the service returned no stream for the events")?;
+    // (name, unix seconds, exit code) of each end.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, u64, i32)>();
+    thread::spawn(move || {
+        use std::io::BufRead;
+        for line in io::BufReader::new(File::from(OwnedFd::from(stdout))).lines() {
+            let Ok(line) = line else { break };
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let name = event["name"].as_str().unwrap_or("").to_string();
+            let time = event["time_usec"].as_u64().unwrap_or(0) / 1_000_000;
+            let code = event["attributes"]["exit_code"]
+                .as_str()
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            if tx.send((name, time, code)).is_err() {
+                break;
+            }
+        }
+    });
+    let mut ends: Vec<(String, u64, i32)> = Vec::new();
     let mut failed = Vec::new();
     for name in &args.names {
-        loop {
-            match client.manager.get_machine(name).await {
-                Ok(machine) => {
-                    if client::string(&machine, "state") == "stopped" {
-                        let code = machine
-                            .get("exit_code")
-                            .and_then(|v| i32::try_from(v.clone()).ok())
-                            .unwrap_or(0);
-                        println!("{code}");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    failed.push(format!("{:#}", client::error(e)));
-                    break;
-                }
+        let machine = match client.manager.get_machine(name).await {
+            Ok(machine) => machine,
+            Err(e) => {
+                failed.push(format!("{:#}", client::error(e)));
+                continue;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        };
+        if client::string(&machine, "state") == "stopped" {
+            println!("{}", exit_code_of(&machine));
+            continue;
         }
+        // An end of this run, not of one before it.
+        let started = client::u64(&machine, "started");
+        let code = loop {
+            if let Some(i) = ends
+                .iter()
+                .position(|(n, time, _)| n == name && *time >= started)
+            {
+                break ends.remove(i).2;
+            }
+            match rx.recv().await {
+                Some(end) => ends.push(end),
+                None => bail!("the service stopped reporting the ends of machines"),
+            }
+        };
+        // The record has the program's own code, when it is still there and done.
+        let code = match client.manager.get_machine(name).await {
+            Ok(m) if client::string(&m, "state") == "stopped" => exit_code_of(&m),
+            _ => code,
+        };
+        println!("{code}");
     }
     if !failed.is_empty() {
         bail!("{}", failed.join("\n"));
     }
     Ok(())
+}
+
+fn exit_code_of(machine: &Dict) -> i32 {
+    machine
+        .get("exit_code")
+        .and_then(|v| i32::try_from(v.clone()).ok())
+        .unwrap_or(0)
 }
 
 /// port: PORT/PROTO -> HOST:PORT for each published port of a running machine, in
@@ -1012,7 +1071,7 @@ pub async fn port(args: PortArgs, client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// Digits compared as numbers, as docker sorts port lines.
+/// Digits compared as numbers: 8080/tcp after 443/tcp.
 fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
     let split = |s: &str| -> Vec<(bool, String)> {
         let mut parts: Vec<(bool, String)> = Vec::new();

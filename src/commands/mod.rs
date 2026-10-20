@@ -2,7 +2,7 @@
 //! org.nspawn service on the system bus; only the service itself, its installation and
 //! the hooks the machine units call run the library in this process.
 
-mod build;
+pub(crate) mod build;
 pub(crate) mod copy;
 mod login;
 pub(crate) mod machines;
@@ -481,7 +481,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         }
         Command::Build(a) => {
             if build::kind(&a)? == build::Kind::Dockerfile {
-                bail!("Dockerfile builds are not wired yet");
+                return build::dockerfile(a, client, config).await;
             }
             let [tag] = a.tag.as_slice() else {
                 bail!("an mkosi build takes one --tag");
@@ -652,6 +652,10 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             SystemCommand::Df(a) => system::df(a, client).await,
             SystemCommand::Prune(a) => system::prune(a, client).await,
         },
+        Command::Builder(args) => match args.command {
+            crate::cli::BuilderCommand::Prune(a) => system::builder_prune(a, client).await,
+            crate::cli::BuilderCommand::Du(a) => system::builder_du(a, client).await,
+        },
         Command::Rm(a) => {
             let mut options = Options::new();
             put(&mut options, "force", a.force);
@@ -789,7 +793,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 out.push(client::dict_to_json(&machine));
             }
             match args.format.as_deref() {
-                // A template per object, a line each, as docker inspect -f prints them.
+                // A template per object, a line each.
                 Some(format) if format != "json" => {
                     let template = crate::gotemplate::Template::parse(format)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;

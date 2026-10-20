@@ -256,7 +256,7 @@ fn emit_membership(action: &str, net: &NetSpec, record: &ImageRecord) {
 }
 
 /// What a machine on host networking, sharing another's, without a network or on veth
-/// cannot do, in docker's words where it has them.
+/// cannot do, in the words tools that read the errors expect where there are such.
 fn joins_bridges(record: &ImageRecord, what: &str) -> Result<()> {
     if record.network == Network::Host {
         bail!("container cannot be disconnected from host network or connected to host network");
@@ -312,11 +312,13 @@ pub async fn connect(
     let addr = match address {
         Some(addr) => addr,
         None if running => {
-            let used: Vec<Ipv4Addr> = store
+            let mut used: Vec<Ipv4Addr> = store
                 .list_images_strict()?
                 .iter()
                 .filter_map(|r| bridge::address_on(r, network))
                 .collect();
+            // What builds' steps hold on it too.
+            used.extend(bridge::build_addresses(store, network));
             net.subnet.allocate(&used)?
         }
         // A stopped machine gets one at its next start.
@@ -326,6 +328,9 @@ pub async fn connect(
         network: network.to_string(),
         address: (!addr.is_unspecified()).then_some(addr),
     });
+    if address.is_some() {
+        record.fixed_addresses.insert(network.to_string());
+    }
     if !aliases.is_empty() {
         let list = record.aliases.entry(network.to_string()).or_default();
         for alias in aliases {
@@ -338,13 +343,34 @@ pub async fn connect(
         let all = all(store, config)?;
         bridge::up(&net, &all, sd, report).await?;
         let leader = sd.machine_leader(machine).await?;
-        let inside = bridge::connect_live(machine, leader, record.mode == Mode::App, &net, addr)?;
+        let app = record.mode == Mode::App;
+        // A booted machine's networkd has a .network file for each interface it started
+        // with: a new one takes a name none of them matches.
+        let first = if app { 1 } else { bound_network_files(machine) };
+        let inside = bridge::connect_live(machine, leader, app, &net, addr, first)?;
         line(report, format!("{machine}: {inside} on {network}, {addr}"));
+        if !net.internal {
+            bridge::ensure_default_route(machine, leader, app, net.subnet.gateway())?;
+        }
     }
     store.record_image(&record)?;
     bridge::write_hosts_files(store, &all(store, config)?)?;
     emit_membership("connect", &net, &record);
     Ok(())
+}
+
+/// How many .network files the booted machine `name` bound at its start, one per
+/// interface it started with (`VirtualEthernetExtra=` and host0).
+fn bound_network_files(name: &str) -> usize {
+    std::fs::read_to_string(
+        std::path::Path::new(crate::settings::SETTINGS_DIR).join(format!("{name}.nspawn")),
+    )
+    .map_or(1, |text| {
+        text.lines()
+            .filter(|l| l.starts_with("BindReadOnly=") && l.contains(".network:"))
+            .count()
+            .max(1)
+    })
 }
 
 /// network disconnect: the machine leaves `network`, at once when it runs. Its primary
@@ -400,8 +426,27 @@ pub async fn disconnect(
         record.extra_networks.retain(|a| a.network != network);
     }
     record.aliases.remove(network);
+    record.fixed_addresses.remove(network);
     if sd.machine_exists(machine).await? && bridge::disconnect_live(machine, &net)? {
         line(report, format!("{machine}: left {network}"));
+        // Its default route may have gone with the network: the next that leads out
+        // takes it.
+        let all = all(store, config)?;
+        let left: Vec<&NetSpec> = bridge::networks_of(&record)
+            .iter()
+            .filter_map(|n| all.iter().find(|s| s.name == *n))
+            .collect();
+        if let Some(next) = left.get(bridge::gateway_index(left.iter().copied())) {
+            if !next.internal {
+                let leader = sd.machine_leader(machine).await?;
+                bridge::ensure_default_route(
+                    machine,
+                    leader,
+                    record.mode == Mode::App,
+                    next.subnet.gateway(),
+                )?;
+            }
+        }
     }
     store.record_image(&record)?;
     bridge::write_hosts_files(store, &all(store, config)?)?;

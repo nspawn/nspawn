@@ -1,0 +1,266 @@
+{
+ "architecture": "amd64",
+ "config": {
+  "Cmd": [
+   "sh"
+  ],
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ],
+  "User": "root:root",
+  "WorkingDir": "/home/app/work/sub"
+ },
+ "history": [
+  {
+   "created_by": "BusyBox 1.37.0 (glibc), Debian 13"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN /bin/sh -c adduser -D -u 1234 app"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "USER app",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "WORKDIR /home/app/work"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN /bin/sh -c echo mine > mine && id -u > uid"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "USER root:root",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "WORKDIR /home/app/work/sub"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN /bin/sh -c pwd > /where"
+  }
+ ],
+ "layers": [
+  {
+   "base": true,
+   "diff_id": "sha256:5a9bfd996c6d49c6c3cb4ddfb76e8d09cf16b6b7cf6601d1f2dffbdbc3edb5d4"
+  },
+  {
+   "diff_id": "sha256:836dfec0643486667df7c5bd1dcf814b22cc91303fe7bd1e266584f7b1dd7fda",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "etc",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "etc/group",
+     "sha256": "sha256:3b9a29c429ceaffa52b8673a229eeb3eea862193a47a0f463a028ebda5ba6888",
+     "size": 318,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "etc/group-",
+     "sha256": "sha256:f55824ead3d8f552bc22020211a8b181af4506e4fbba20389114e46c1cefcd9c",
+     "size": 306,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "etc/passwd",
+     "sha256": "sha256:3a732c6a5c81220ed48e13e0dbafe3b9014710af9934b7f5736210e09a24d6f0",
+     "size": 388,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "etc/passwd-",
+     "sha256": "sha256:466afb852e38d454b87ab903abd189ea4541bd79bdf15449ccce7460af94d711",
+     "size": 340,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0600",
+     "path": "etc/shadow",
+     "sha256": "sha256:595c5ce4c02f594fd64ee275307a2767ee0ec7de45342541a9ed48fb1102deeb",
+     "size": 161,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0600",
+     "path": "etc/shadow-",
+     "sha256": "sha256:b2d68324f72d53c42b64121df172ff36c568a391db7236132a749cecddbe45cd",
+     "size": 136,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 65534,
+     "mode": "0755",
+     "path": "home",
+     "type": "dir",
+     "uid": 65534
+    },
+    {
+     "gid": 1234,
+     "mode": "2755",
+     "path": "home/app",
+     "type": "dir",
+     "uid": 1234
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "proc",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "sys",
+     "type": "dir",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:b250154e2cf66bedf64dcce00fd834eb1b724e90475d960b4fee2e14d0117be8",
+   "entries": [
+    {
+     "gid": 65534,
+     "mode": "0755",
+     "path": "home",
+     "type": "dir",
+     "uid": 65534
+    },
+    {
+     "gid": 1234,
+     "mode": "2755",
+     "path": "home/app",
+     "type": "dir",
+     "uid": 1234
+    },
+    {
+     "gid": 1234,
+     "mode": "2755",
+     "path": "home/app/work",
+     "type": "dir",
+     "uid": 1234
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:40055d00d4d36b5583221714396ab1b888eaff3a79c2301658fa4feb1d82ca11",
+   "entries": [
+    {
+     "gid": 65534,
+     "mode": "0755",
+     "path": "home",
+     "type": "dir",
+     "uid": 65534
+    },
+    {
+     "gid": 1234,
+     "mode": "2755",
+     "path": "home/app",
+     "type": "dir",
+     "uid": 1234
+    },
+    {
+     "gid": 1234,
+     "mode": "2755",
+     "path": "home/app/work",
+     "type": "dir",
+     "uid": 1234
+    },
+    {
+     "gid": 1234,
+     "mode": "0644",
+     "path": "home/app/work/mine",
+     "sha256": "sha256:fcbc800db3f1867000b852f1ce0044b8f1584f76ade1ed6e65189824f95c3cda",
+     "size": 5,
+     "type": "file",
+     "uid": 1234
+    },
+    {
+     "gid": 1234,
+     "mode": "0644",
+     "path": "home/app/work/uid",
+     "sha256": "sha256:a883dafc480d466ee04e0d6da986bd78eb1fdd2178d04693723da3a8f95d42f4",
+     "size": 5,
+     "type": "file",
+     "uid": 1234
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:7f1d539998dde63ee14883da271f51ac57d31c326fd88b2251bc760e5fdac045",
+   "entries": [
+    {
+     "gid": 65534,
+     "mode": "0755",
+     "path": "home",
+     "type": "dir",
+     "uid": 65534
+    },
+    {
+     "gid": 1234,
+     "mode": "2755",
+     "path": "home/app",
+     "type": "dir",
+     "uid": 1234
+    },
+    {
+     "gid": 1234,
+     "mode": "2755",
+     "path": "home/app/work",
+     "type": "dir",
+     "uid": 1234
+    },
+    {
+     "gid": 0,
+     "mode": "2755",
+     "path": "home/app/work/sub",
+     "type": "dir",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:b39b87544e2c63ed48e0b7308932ae10c3c7fdfbc17b80ff3e3fcda5b0f50b45",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "where",
+     "sha256": "sha256:4bb3b2a92bdb3673e0a0e3fa3eccb4c6c9e6983e1fa574f4a4795d786e1ac85b",
+     "size": 19,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  }
+ ],
+ "os": "linux"
+}

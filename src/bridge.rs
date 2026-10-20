@@ -936,18 +936,18 @@ fn add_veth(ns: &str, name: &str, index: usize, net: &NetSpec, addr: Ipv4Addr) -
 /// The most networks a machine joins at once, which bounds the search for its veths.
 const MAX_ATTACHMENTS: usize = 64;
 
-/// A network joined while the machine runs: a veth at the first index none of its
-/// interfaces has, in its namespace (an app's has a name already; a booted machine's is
-/// reached through its leader). The default route stays where it is, as docker leaves
-/// it. Returns the interface's name inside.
+/// A network joined while the machine runs: a veth at the first index from `first` none
+/// of its interfaces has, in its namespace (an app's has a name already; a booted
+/// machine's is reached through its leader). Returns the interface's name inside.
 pub fn connect_live(
     name: &str,
     leader: u32,
     app: bool,
     net: &NetSpec,
     addr: Ipv4Addr,
+    first: usize,
 ) -> Result<String> {
-    let index = (1..MAX_ATTACHMENTS)
+    let index = (first.max(1)..MAX_ATTACHMENTS)
         .find(|i| !Path::new(SYS_NET).join(host_end_name_at(name, *i)).exists())
         .context("the machine has no veth left to join another network with")?;
     if !app {
@@ -961,6 +961,37 @@ pub fn connect_live(
         let _ = run("ip", &["link", "del", &host_end_name_at(name, index)]);
     }
     result.map(|()| format!("host{index}"))
+}
+
+/// The machine's default route through `gateway` when it has none: the network that
+/// carried it went, or every one it had was internal.
+pub fn ensure_default_route(name: &str, leader: u32, app: bool, gateway: Ipv4Addr) -> Result<()> {
+    if !app {
+        attach_netns(name, leader)?;
+    }
+    let ns = netns_name(name);
+    let result = (|| {
+        let routes = output("ip", &["-n", &ns, "-4", "route", "show", "default"])?;
+        if routes.trim().is_empty() {
+            run(
+                "ip",
+                &[
+                    "-n",
+                    &ns,
+                    "route",
+                    "replace",
+                    "default",
+                    "via",
+                    &gateway.to_string(),
+                ],
+            )?;
+        }
+        Ok(())
+    })();
+    if !app {
+        delete_netns(name);
+    }
+    result
 }
 
 /// The veth of `net` goes, and its peer inside the machine with it. Whether there was
@@ -977,8 +1008,8 @@ pub fn disconnect_live(name: &str, net: &NetSpec) -> Result<bool> {
     Ok(false)
 }
 
-/// An address asked for on `net` (--ip), refused as docker refuses it: on a network
-/// made with network create only, inside its subnet, and not another machine's.
+/// An address asked for on `net` (--ip): on a network made with network create only,
+/// inside its subnet, and not another machine's; the errors read as scripts expect.
 pub fn check_requested(store: &Store, net: &NetSpec, machine: &str, addr: Ipv4Addr) -> Result<()> {
     if net.name == DEFAULT_NETWORK {
         bail!("user specified IP address is supported on user defined networks only");
@@ -1390,12 +1421,13 @@ pub fn prepare_machine(
             None => {
                 // Strict: an address handed out twice is worse than a start refused over an
                 // unreadable record.
-                let used: Vec<Ipv4Addr> = store
+                let mut used: Vec<Ipv4Addr> = store
                     .list_images_strict()?
                     .iter()
                     .filter(|r| r.name != record.name)
                     .filter_map(|r| address_on(r, &net.name))
                     .collect();
+                used.extend(build_addresses(store, &net.name));
                 let addr = net.subnet.allocate(&used)?;
                 set_address(record, &net.name, addr);
                 changed = true;
@@ -1479,6 +1511,22 @@ pub fn address_on(record: &ImageRecord, network: &str) -> Option<Ipv4Addr> {
         .iter()
         .find(|a| a.network == network)
         .and_then(|a| a.address)
+}
+
+/// The addresses builds in progress hold on `network`: each build's directory has
+/// NETWORK ADDRESS in its address file.
+pub fn build_addresses(store: &Store, network: &str) -> Vec<Ipv4Addr> {
+    let Ok(entries) = fs::read_dir(store.builds_dir()) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| fs::read_to_string(e.path().join("address")).ok())
+        .filter_map(|text| {
+            let (net, addr) = text.trim().split_once(' ')?;
+            (net == network).then(|| addr.parse().ok())?
+        })
+        .collect()
 }
 
 pub fn set_address(record: &mut ImageRecord, network: &str, addr: Ipv4Addr) {

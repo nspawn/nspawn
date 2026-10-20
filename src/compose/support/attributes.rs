@@ -51,11 +51,93 @@ pub static ATTRIBUTES: &[Attribute] = &[
         "block I/O limits are not set on nspawn machines",
     )
     .and_below(),
-    ignored(
+    partly(
         "services.*.build",
-        "nspawn runs published images and does not build Dockerfiles: the image is pulled, and a service without one is refused",
+        "built by nspawn's builder, which runs its steps one after another for this host's platform",
+    ),
+    refused(
+        "services.*.build.additional_contexts",
+        "named contexts are not supported by nspawn's builder",
     )
     .and_below(),
+    full("services.*.build.args"),
+    full("services.*.build.args.*"),
+    ignored(
+        "services.*.build.cache_from",
+        "the build cache is nspawn's own, on this host",
+    ),
+    ignored(
+        "services.*.build.cache_to",
+        "the build cache is nspawn's own, on this host",
+    ),
+    partly(
+        "services.*.build.context",
+        "a directory of this host; a remote context is refused",
+    ),
+    full("services.*.build.dockerfile"),
+    full("services.*.build.dockerfile_inline"),
+    partly(
+        "services.*.build.entitlements",
+        "network.host; security.insecure is refused",
+    ),
+    full("services.*.build.extra_hosts"),
+    full("services.*.build.extra_hosts.*"),
+    ignored(
+        "services.*.build.isolation",
+        "isolation is a setting of Windows containers",
+    ),
+    full("services.*.build.labels"),
+    full("services.*.build.labels.*"),
+    partly("services.*.build.network", "default, none or host"),
+    full("services.*.build.no_cache"),
+    full("services.*.build.no_cache_filter"),
+    partly(
+        "services.*.build.platforms",
+        "this host's platform only; another is refused",
+    ),
+    refused(
+        "services.*.build.privileged",
+        "build steps run with the confinement of an app machine",
+    ),
+    ignored(
+        "services.*.build.provenance",
+        "nspawn's builder writes no attestations",
+    ),
+    full("services.*.build.pull"),
+    ignored(
+        "services.*.build.sbom",
+        "nspawn's builder writes no attestations",
+    ),
+    partly(
+        "services.*.build.secrets",
+        "secrets from a file or the environment, which RUN --mount=type=secret takes",
+    ),
+    ignored(
+        "services.*.build.secrets.[].gid",
+        "the RUN --mount of the Dockerfile sets the owner and mode of a build secret",
+    ),
+    ignored(
+        "services.*.build.secrets.[].mode",
+        "the RUN --mount of the Dockerfile sets the owner and mode of a build secret",
+    ),
+    full("services.*.build.secrets.[].source"),
+    full("services.*.build.secrets.[].target"),
+    ignored(
+        "services.*.build.secrets.[].uid",
+        "the RUN --mount of the Dockerfile sets the owner and mode of a build secret",
+    ),
+    full("services.*.build.shm_size"),
+    refused(
+        "services.*.build.ssh",
+        "SSH agent forwarding into a build is not supported",
+    )
+    .and_below(),
+    full("services.*.build.tags"),
+    full("services.*.build.target"),
+    full("services.*.build.ulimits"),
+    full("services.*.build.ulimits.*"),
+    full("services.*.build.ulimits.*.hard"),
+    full("services.*.build.ulimits.*.soft"),
     full("services.*.cap_add"),
     full("services.*.cap_drop"),
     full("services.*.cgroup"),
@@ -243,7 +325,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
     full("services.*.healthcheck.timeout"),
     full("services.*.hostname"),
     full("services.*.image"),
-    full("services.*.init"),
+    partly("services.*.init", BOOTED),
     ignored(
         "services.*.ipc",
         "a machine always has an IPC namespace of its own",
@@ -622,11 +704,6 @@ pub static VALUES: &[Value] = &[
         "services.*.ports.[].protocol",
         Is("sctp"),
         Refused("nspawn publishes tcp and udp ports"),
-    ),
-    when(
-        "services.*.pull_policy",
-        Is("build"),
-        Refused("nspawn runs published images and does not build Dockerfiles"),
     ),
     when(
         "services.*.pull_policy",

@@ -270,6 +270,7 @@ mod tests {
                 mode: Mode::App,
                 pid1: false,
                 started: None,
+                fixed_addresses: Default::default(),
                 run: RunSpec::default(),
                 network: Network::Host,
                 network_name: None,

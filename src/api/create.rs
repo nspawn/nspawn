@@ -163,9 +163,11 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     // publish the same one), nor a user-defined network or another machine's
     // namespace, which a machine joins only when told to.
     let mut draft = ImageRecord {
+        name: request.name.clone(),
         started: None,
         network_name: None,
         address: None,
+        fixed_addresses: Default::default(),
         extra_networks: Vec::new(),
         aliases: BTreeMap::new(),
         network_container: None,
@@ -217,6 +219,18 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         draft.healthcheck = Some(hc);
     }
     request.tuning.apply(&mut draft.tuning)?;
+    // Refused here as start refuses them: a booted machine that kept them would never
+    // start.
+    if source.mode == Mode::Boot
+        && (draft.tuning.user.is_some()
+            || draft.tuning.working_dir.is_some()
+            || draft.tuning.init.is_some())
+    {
+        bail!(
+            "{} boots an init system; --user, --workdir and --init only apply to the program of an app image",
+            request.name
+        );
+    }
     crate::api::dependencies::check(
         store,
         &request.name,

@@ -570,8 +570,8 @@ mod tests {
     fn lookups_follow_the_table() {
         // Below a decision that holds below.
         assert_eq!(
-            attribute("services.*.build.context").unwrap().path,
-            "services.*.build"
+            attribute("services.*.build.ssh.default").unwrap().path,
+            "services.*.build.ssh"
         );
         // A job's attribute is the service's of the same name.
         assert_eq!(
@@ -583,9 +583,13 @@ mod tests {
             "services.*.restart"
         );
         assert!(attribute("services.*.nothing").is_none());
-        assert!(matches!(
+        assert_eq!(
             value("services.*.pull_policy", "build"),
-            Some(Support::Refused(_))
+            Some(Support::Full)
+        );
+        assert!(matches!(
+            value("services.*.pull_policy", "weekly"),
+            Some(Support::Partial(_))
         ));
         assert_eq!(
             value("services.*.pull_policy", "missing"),

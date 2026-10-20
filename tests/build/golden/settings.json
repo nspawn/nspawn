@@ -1,0 +1,121 @@
+{
+ "architecture": "amd64",
+ "config": {
+  "ArgsEscaped": true,
+  "Cmd": [
+   "serve",
+   "$GREETING"
+  ],
+  "Entrypoint": [
+   "/bin/echo"
+  ],
+  "Env": [
+   "PATH=/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+   "GREETING=hello world",
+   "VERSION=2.0"
+  ],
+  "ExposedPorts": {
+   "53/udp": {},
+   "8080/tcp": {},
+   "9000/tcp": {},
+   "9001/tcp": {},
+   "9002/tcp": {}
+  },
+  "Healthcheck": {
+   "Interval": 5000000000,
+   "Retries": 4,
+   "StartPeriod": 1000000000,
+   "Test": [
+    "CMD-SHELL",
+    "test -f /etc/passwd"
+   ],
+   "Timeout": 3000000000
+  },
+  "Labels": {
+   "maintainer": "nobody",
+   "org.example.case": "settings",
+   "org.example.multi": "a b"
+  },
+  "Shell": [
+   "/bin/sh",
+   "-ec"
+  ],
+  "StopSignal": "SIGINT",
+  "Volumes": {
+   "/data": {},
+   "[/logs]": {}
+  }
+ },
+ "history": [
+  {
+   "created_by": "BusyBox 1.37.0 (glibc), Debian 13"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "LABEL org.example.case=settings org.example.multi=a b",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "LABEL maintainer=nobody",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ENV GREETING=hello world PATH=/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ARG VERSION=2.0",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ENV VERSION=2.0",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "EXPOSE [53/udp 8080/tcp 9000/tcp 9001/tcp 9002/tcp]",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "VOLUME [/data [/logs]]",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "STOPSIGNAL SIGINT",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "HEALTHCHECK {Test:[CMD-SHELL test -f /etc/passwd] Interval:5s Timeout:3s StartPeriod:1s StartInterval:0s Retries:4}",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "SHELL [/bin/sh -ec]",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "ENTRYPOINT [\"/bin/echo\"]",
+   "empty_layer": true
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "CMD [\"serve\" \"$GREETING\"]",
+   "empty_layer": true
+  }
+ ],
+ "layers": [
+  {
+   "base": true,
+   "diff_id": "sha256:5a9bfd996c6d49c6c3cb4ddfb76e8d09cf16b6b7cf6601d1f2dffbdbc3edb5d4"
+  }
+ ],
+ "os": "linux"
+}

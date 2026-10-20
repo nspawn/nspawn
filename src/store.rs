@@ -1,7 +1,7 @@
 //! Local state under the state directory (/var/lib/nspawn by default): extracted layers,
 //! image records, downloads in flight and per-machine writable directories.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read};
 use std::net::Ipv4Addr;
@@ -59,6 +59,10 @@ pub struct ImageRecord {
     /// Fixed address on the primary network, once assigned.
     #[serde(default)]
     pub address: Option<Ipv4Addr>,
+    /// The networks whose address was asked for (--ip, network connect --ip), not given
+    /// out at a start.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub fixed_addresses: BTreeSet<String>,
     /// The networks joined besides the primary one, with the address on each.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_networks: Vec<Attachment>,
@@ -145,9 +149,9 @@ impl ImageRecord {
             .or(self.run.stop_signal.as_deref())
     }
 
-    /// Whether an app's program runs as PID 1 of the machine, as it would under docker,
-    /// rather than as the child of systemd-nspawn's stub init: --init=false and --init
-    /// say which, and without either the image does.
+    /// Whether an app's program runs as PID 1 of the machine rather than as the child of
+    /// systemd-nspawn's stub init: --init=false and --init say which, and without either
+    /// the image does.
     pub fn program_is_pid1(&self) -> bool {
         self.mode == Mode::App && self.tuning.init.map_or(self.pid1, |init| !init)
     }
@@ -256,6 +260,13 @@ impl Drop for BlobHold {
     }
 }
 
+impl BlobHold {
+    /// What the hold keeps from now on: a build adds its layers as it makes them.
+    pub fn set(&self, digests: &[String]) -> Result<()> {
+        write_atomically(&self.0, digests.join("\n").as_bytes())
+    }
+}
+
 /// A start in progress, from the preparation of its files until the machine registers or
 /// the start fails: keeps a second start, a removal or a replacement off it while
 /// machined does not list it yet.
@@ -334,6 +345,17 @@ impl Store {
             self.secrets_dir(),
             self.root.join("rollback"),
         ]
+    }
+
+    /// Where builds work: a directory each while it runs.
+    pub fn builds_dir(&self) -> PathBuf {
+        self.root.join("builds")
+    }
+
+    /// The build cache: the layers of the steps builds made and the base images they
+    /// pulled.
+    pub fn build_cache_dir(&self) -> PathBuf {
+        self.root.join("cache").join("build")
     }
 
     /// Where auto-update keeps a machine's previous record, manifest and writable layer
@@ -599,7 +621,8 @@ impl Store {
         self.blob_path(digest).is_file()
     }
 
-    /// Keeps `digests` from `gc_blobs` while the guard lives.
+    /// Keeps `digests` from `gc_blobs` and their layers from `gc_layers` while the guard
+    /// lives.
     pub fn hold_blobs(&self, digests: &[String]) -> Result<BlobHold> {
         let dir = self.blobs_dir();
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -699,6 +722,12 @@ impl Store {
                 })?;
             set.insert(layer_dir_name(&manifest.config.digest));
         }
+        set.extend(
+            crate::build::cache::Cache::new(&self.build_cache_dir())
+                .blobs()
+                .iter()
+                .map(|b| layer_dir_name(b)),
+        );
         for (record, bytes) in self.rollback_records()? {
             set.extend(record.layers.iter().map(|l| layer_dir_name(l)));
             let manifest = serde_json::from_slice::<oci_client::manifest::OciImageManifest>(&bytes)
@@ -906,6 +935,15 @@ impl Store {
                 .or_default()
                 .extend(record.layers.iter().map(|d| layer_dir_name(d)));
         }
+        // The build cache's layers are extracted as root's, as an overlay machine's.
+        referenced.entry(Ownership::Root).or_default().extend(
+            crate::build::cache::Cache::new(&self.build_cache_dir())
+                .blobs()
+                .iter()
+                .map(|b| layer_dir_name(b)),
+        );
+        // A build or a pull in flight keeps what it holds.
+        let held = self.held_blobs();
         let mut removed = Vec::new();
         for ownership in [Ownership::Root, Ownership::Foreign] {
             let dir = self.layers_dir(ownership);
@@ -922,7 +960,10 @@ impl Store {
                     let _ = fs::remove_dir_all(entry.path());
                     continue;
                 }
-                if file_name.starts_with('.') || used.contains(&file_name) {
+                if file_name.starts_with('.')
+                    || used.contains(&file_name)
+                    || held.contains(&file_name)
+                {
                     continue;
                 }
                 fs::remove_dir_all(entry.path())
@@ -1761,6 +1802,7 @@ mod tests {
             mode: Mode::Boot,
             pid1: false,
             started: None,
+            fixed_addresses: BTreeSet::new(),
             run: RunSpec::default(),
             network: Network::Veth,
             network_name: None,
@@ -1838,6 +1880,7 @@ mod tests {
             mode: Mode::App,
             pid1: false,
             started: None,
+            fixed_addresses: BTreeSet::new(),
             run: RunSpec::default(),
             network: Network::Host,
             network_name: None,
@@ -2049,6 +2092,7 @@ mod tests {
             mode: Mode::Boot,
             pid1: false,
             started: None,
+            fixed_addresses: BTreeSet::new(),
             run: RunSpec::default(),
             network: Network::Bridge,
             network_name: None,

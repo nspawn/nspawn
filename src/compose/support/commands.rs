@@ -15,7 +15,8 @@ const fn option(command: &'static str, name: &'static str, support: Support) -> 
     }
 }
 
-const BUILD: &str = "nspawn runs published images and does not build Dockerfiles";
+const BUILDER: &str = "nspawn builds with its own builder";
+const NO_ATTESTATIONS: &str = "nspawn's builder writes no attestations";
 const NO_ANONYMOUS: &str = "nspawn has no anonymous volumes";
 const VERSION: &str =
     "--short and json give the docker compose release it matches; the plain form names nspawn's version too";
@@ -32,7 +33,10 @@ pub static COMMANDS: &[Command] = &[
         "bridge",
         Refused("bridge is not supported by nspawn compose"),
     ),
-    command("build", Refused(BUILD)),
+    command(
+        "build",
+        Partial("with nspawn's builder; see nspawn build for what it does not do"),
+    ),
     command(
         "commit",
         Refused("commit is not supported by nspawn compose"),
@@ -61,7 +65,7 @@ pub static COMMANDS: &[Command] = &[
     command("pull", Full),
     command(
         "push",
-        Refused("push is not supported by nspawn compose, which builds no image"),
+        Refused("push is not supported by nspawn compose; compose build --push or nspawn push sends an image"),
     ),
     command("restart", Full),
     command("rm", Full),
@@ -80,6 +84,24 @@ pub static COMMANDS: &[Command] = &[
 ];
 
 pub static OPTIONS: &[Opt] = &[
+    option("build", "build-arg", Full),
+    option("build", "builder", Ignored(BUILDER)),
+    option("build", "check", Refused("nspawn's builder has no linter")),
+    option("build", "compress", Ignored("the context goes to the service through a pipe")),
+    option("build", "force-rm", Ignored("steps leave no intermediate containers")),
+    option("build", "memory", Ignored("build steps run without a memory limit")),
+    option("build", "no-cache", Full),
+    option("build", "no-rm", Ignored("steps leave no intermediate containers")),
+    option("build", "parallel", Ignored("services are built one after another")),
+    option("build", "print", Refused("there is no bake definition to print")),
+    option("build", "progress", Ignored("the steps print plain progress")),
+    option("build", "provenance", Refused(NO_ATTESTATIONS)),
+    option("build", "pull", Full),
+    option("build", "push", Full),
+    option("build", "quiet", Full),
+    option("build", "sbom", Refused(NO_ATTESTATIONS)),
+    option("build", "ssh", Refused("SSH agent forwarding into a build is not supported")),
+    option("build", "with-dependencies", Full),
     // The global options, before any command.
     option("", "all-resources", Full),
     option("", "ansi", Full),
@@ -139,7 +161,7 @@ pub static OPTIONS: &[Opt] = &[
     ),
     option("cp", "index", Full),
     // create
-    option("create", "build", Refused(BUILD)),
+    option("create", "build", Full),
     option("create", "force-recreate", Full),
     option("create", "no-build", Full),
     option("create", "no-recreate", Full),
@@ -220,7 +242,7 @@ pub static OPTIONS: &[Opt] = &[
     option("rm", "stop", Full),
     option("rm", "volumes", Partial(NO_ANONYMOUS)),
     // run
-    option("run", "build", Refused(BUILD)),
+    option("run", "build", Full),
     option("run", "cap-add", Full),
     option("run", "cap-drop", Full),
     option("run", "detach", Full),
@@ -263,7 +285,7 @@ pub static OPTIONS: &[Opt] = &[
     option("up", "always-recreate-deps", Full),
     option("up", "attach", Full),
     option("up", "attach-dependencies", Full),
-    option("up", "build", Refused(BUILD)),
+    option("up", "build", Full),
     option("up", "detach", Full),
     option("up", "exit-code-from", Full),
     option("up", "force-recreate", Full),

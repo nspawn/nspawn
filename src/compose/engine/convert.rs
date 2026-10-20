@@ -374,7 +374,7 @@ fn volumes(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
                     .is_none_or(|v| v != &Value::Bool(false));
                 // docker's socket is the machine's Docker API, which nspawn provides: a
                 // host without docker must not get a directory there.
-                let api = crate::volume::DOCKER_SOCKETS.contains(&source);
+                let api = crate::volume::API_SOCKET_PATHS.contains(&source);
                 if create && !api && !std::path::Path::new(source).exists() {
                     made.host_paths.push(source.to_string());
                 }
@@ -418,9 +418,9 @@ fn volumes(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
     if service.get("use_api_socket") == Some(&Value::Bool(true))
         && !binds
             .iter()
-            .any(|b| b.split(':').nth(1) == Some(crate::volume::DOCKER_SOCKETS[0]))
+            .any(|b| b.split(':').nth(1) == Some(crate::volume::API_SOCKET_PATHS[0]))
     {
-        let socket = crate::volume::DOCKER_SOCKETS[0];
+        let socket = crate::volume::API_SOCKET_PATHS[0];
         binds.push(format!("{socket}:{socket}"));
     }
     put_list(&mut made.options, "volume", binds);
@@ -706,23 +706,7 @@ fn settings(spec: &Spec, service: &Map, made: &mut Made) {
         }
     }
     put_list(o, "extra_hosts", hosts);
-    let mut ulimits = Vec::new();
-    if let Some(limits) = sub(service, "ulimits") {
-        for (name, limit) in limits {
-            match limit {
-                Value::Map(m) => ulimits.push(format!(
-                    "{name}={}:{}",
-                    int(m.get("soft")).unwrap_or(0),
-                    int(m.get("hard")).unwrap_or(0)
-                )),
-                other => {
-                    let n = int(Some(other)).unwrap_or(0);
-                    ulimits.push(format!("{name}={n}:{n}"));
-                }
-            }
-        }
-    }
-    put_list(o, "ulimits", ulimits);
+    put_list(o, "ulimits", ulimits(service));
     let sysctls: Vec<String> = sub(service, "sysctls")
         .map(|m| m.iter().map(|(k, v)| format!("{k}={v}")).collect())
         .unwrap_or_default();
@@ -735,6 +719,27 @@ fn settings(spec: &Spec, service: &Map, made: &mut Made) {
             _ => {}
         }
     }
+}
+
+/// The ulimits of a service or of its build section, as NAME=SOFT:HARD.
+pub(super) fn ulimits(section: &Map) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(limits) = sub(section, "ulimits") {
+        for (name, limit) in limits {
+            match limit {
+                Value::Map(m) => out.push(format!(
+                    "{name}={}:{}",
+                    int(m.get("soft")).unwrap_or(0),
+                    int(m.get("hard")).unwrap_or(0)
+                )),
+                other => {
+                    let n = int(Some(other)).unwrap_or(0);
+                    out.push(format!("{name}={n}:{n}"));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn dependencies(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {

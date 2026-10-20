@@ -182,22 +182,58 @@ pub struct HookRoot {
     pub root: CString,
     /// Host path, mount point below the root, read-only.
     pub binds: Vec<(CString, CString, bool)>,
-    /// The root's /dev, where a tmpfs gets `dev_dirs` (parents first) and `dev_nodes`.
+    /// The root's /dev, where a tmpfs gets `dev_dirs` (parents first), `dev_nodes` and
+    /// the mount points `dev_points` (true for a directory) of the binds below it.
     pub dev: Option<CString>,
     pub dev_dirs: Vec<CString>,
     pub dev_nodes: Vec<DevNode>,
+    pub dev_points: Vec<(CString, bool)>,
     pub proc_dir: Option<CString>,
     /// The SELinux context the hook is executed in.
     pub context: Option<CString>,
 }
 
+/// A node of the machine's, bound from `source` at `path`.
 #[derive(Debug, Clone)]
 pub struct DevNode {
     pub path: CString,
-    pub kind: nix::sys::stat::SFlag,
-    pub mode: u32,
-    pub rdev: libc::dev_t,
-    pub owner: Option<(u32, u32)>,
+    pub source: CString,
+}
+
+/// The SELinux context of systemd-nspawn@.service, unconfined, for what the confined
+/// service runs as systemd-nspawn's peer (CDI hooks, systemd-nspawn for a build step);
+/// None without SELinux or outside the service's domain.
+pub fn unit_context() -> Option<CString> {
+    if !Path::new("/sys/fs/selinux/enforce").exists() {
+        return None;
+    }
+    let current = std::fs::read_to_string("/proc/self/attr/current").ok()?;
+    let current = current.trim_end_matches('\0').trim();
+    let mut parts: Vec<&str> = current.splitn(4, ':').collect();
+    if parts.len() < 3 || parts[2] != "nspawn_t" {
+        return None;
+    }
+    parts[2] = "unconfined_service_t";
+    CString::new(parts.join(":")).ok()
+}
+
+/// Sets `cmd` up to be executed in `context`.
+pub fn in_context(cmd: &mut tokio::process::Command, context: CString) {
+    // SAFETY: the closure runs in the child between fork and exec, on a context made
+    // before the fork: syscalls only.
+    unsafe {
+        cmd.pre_exec(move || exec_context(&context).map_err(std::io::Error::from));
+    }
+}
+
+fn exec_context(context: &CStr) -> nix::Result<()> {
+    let fd = nix::fcntl::open(
+        c"/proc/thread-self/attr/exec",
+        OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    nix::unistd::write(&fd, context.to_bytes())?;
+    Ok(())
 }
 
 /// Sets `cmd` up to run in the mounts `plan` describes.
@@ -229,6 +265,45 @@ fn hook_root(plan: &HookRoot) -> nix::Result<()> {
         bind,
         none,
     )?;
+    // /dev and /proc first, the binds on top, as systemd-nspawn mounts them.
+    if let Some(dev) = &plan.dev {
+        mount(
+            Some(c"tmpfs"),
+            dev.as_c_str(),
+            Some(c"tmpfs"),
+            MsFlags::MS_NOSUID,
+            Some(c"mode=755"),
+        )?;
+        for dir in &plan.dev_dirs {
+            mkdir_or_exists(dir)?;
+        }
+        for node in &plan.dev_nodes {
+            touch(&node.path)?;
+            mount(
+                Some(node.source.as_c_str()),
+                node.path.as_c_str(),
+                none,
+                MsFlags::MS_BIND,
+                none,
+            )?;
+        }
+        for (point, dir) in &plan.dev_points {
+            if *dir {
+                mkdir_or_exists(point)?;
+            } else {
+                touch(point)?;
+            }
+        }
+    }
+    if let Some(proc_dir) = &plan.proc_dir {
+        mount(
+            Some(c"proc"),
+            proc_dir.as_c_str(),
+            Some(c"proc"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+            none,
+        )?;
+    }
     for (source, target, read_only) in &plan.binds {
         mount(Some(source.as_c_str()), target.as_c_str(), none, bind, none)?;
         if *read_only {
@@ -241,57 +316,34 @@ fn hook_root(plan: &HookRoot) -> nix::Result<()> {
             )?;
         }
     }
-    if let Some(dev) = &plan.dev {
-        mount(
-            Some(c"tmpfs"),
-            dev.as_c_str(),
-            Some(c"tmpfs"),
-            MsFlags::MS_NOSUID,
-            Some(c"mode=755"),
-        )?;
-        // The nodes get the modes the specs give them.
-        let umask = nix::sys::stat::umask(Mode::empty());
-        for dir in &plan.dev_dirs {
-            match nix::unistd::mkdir(dir.as_c_str(), Mode::from_bits_truncate(0o755)) {
-                Ok(()) | Err(Errno::EEXIST) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        for node in &plan.dev_nodes {
-            nix::sys::stat::mknod(
-                node.path.as_c_str(),
-                node.kind,
-                Mode::from_bits_truncate(node.mode),
-                node.rdev,
-            )?;
-            if let Some((uid, gid)) = node.owner {
-                nix::unistd::chown(
-                    node.path.as_c_str(),
-                    Some(Uid::from_raw(uid)),
-                    Some(Gid::from_raw(gid)),
-                )?;
-            }
-        }
-        nix::sys::stat::umask(umask);
-    }
-    if let Some(proc_dir) = &plan.proc_dir {
-        mount(
-            Some(c"proc"),
-            proc_dir.as_c_str(),
-            Some(c"proc"),
-            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-            none,
-        )?;
-    }
     if let Some(context) = &plan.context {
-        let fd = nix::fcntl::open(
-            c"/proc/thread-self/attr/exec",
-            OFlag::O_WRONLY | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )?;
-        nix::unistd::write(&fd, context.as_bytes())?;
+        exec_context(context)?;
     }
     Ok(())
+}
+
+fn mkdir_or_exists(dir: &CStr) -> nix::Result<()> {
+    match nix::unistd::mkdir(dir, Mode::from_bits_truncate(0o755)) {
+        Ok(()) | Err(Errno::EEXIST) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// An empty file to mount on.
+fn touch(path: &CStr) -> nix::Result<()> {
+    use nix::fcntl::{open, OFlag};
+    match open(
+        path,
+        OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    ) {
+        Ok(fd) => {
+            drop(fd);
+            Ok(())
+        }
+        Err(Errno::EEXIST) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// pidfd_send_signal(2): `signal` to the process behind `pidfd`, ESRCH once it is gone.

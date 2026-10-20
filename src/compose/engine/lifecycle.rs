@@ -116,7 +116,7 @@ pub async fn down(e: &mut Engine<'_>, a: &DownArgs) -> Result<()> {
     }
     secrets_down(e).await?;
     if let Some(rmi) = &a.rmi {
-        images_down(e, rmi).await?;
+        images_down(e, rmi, a.remove_orphans).await?;
     }
     Ok(())
 }
@@ -233,38 +233,99 @@ async fn secrets_down(e: &Engine<'_>) -> Result<()> {
     Ok(())
 }
 
-/// --rmi: the images the services ran, all of them or those without a tag of their own
-/// (`local`), which on nspawn are the same: an image here is the pull of a reference.
-async fn images_down(e: &Engine<'_>, rmi: &str) -> Result<()> {
+/// --rmi: `local` removes the images the project built for its services, and those of
+/// services without an image named as compose names them; `all` the images the
+/// services name as well.
+async fn images_down(e: &Engine<'_>, rmi: &str, orphans: bool) -> Result<()> {
     if !matches!(rmi, "all" | "local") {
         bail!("invalid --rmi option {rmi:?}: must be one of \"all\" or \"local\"");
     }
     let Some(project) = &e.project else {
+        e.warn(
+            "images are only known from the project's files: run down --rmi with them".to_string(),
+        );
         return Ok(());
     };
-    let local: Vec<(String, String)> = e
+    // Machines made from an image keep it, as containers keep theirs: the project's
+    // own are gone by now.
+    let users: Vec<(String, String)> = e
+        .client
+        .manager
+        .list_machines(true)
+        .await
+        .map_err(client::error)?
+        .iter()
+        .filter(|m| client::string(m, "origin") == "create")
+        .map(|m| (client::string(m, "digest"), client::string(m, "name")))
+        .collect();
+    let records: Vec<(String, String, String)> = e
         .client
         .manager
         .list_images()
         .await
         .map_err(client::error)?
         .iter()
-        .filter(|i| client::string(i, "origin") == "pull")
-        .map(|i| (client::string(i, "reference"), client::string(i, "name")))
+        .filter(|i| matches!(client::string(i, "origin").as_str(), "pull" | "build"))
+        .map(|i| {
+            (
+                client::string(i, "reference"),
+                client::string(i, "name"),
+                client::string(i, "origin"),
+            )
+        })
         .collect();
+    let find = |image: &str| {
+        let reference = super::image_reference(image).ok()?.to_string();
+        records
+            .iter()
+            .find(|(r, _, _)| *r == reference)
+            .map(|(_, n, _)| n.clone())
+    };
     let mut names = BTreeSet::new();
-    for service in project.services.values().filter_map(Value::as_map) {
-        let Some(image) = service.get("image").and_then(Value::as_str) else {
+    for (key, service) in &project.services {
+        let Some(service) = service.as_map() else {
             continue;
         };
-        let Ok(reference) = super::image_reference(image) else {
-            continue;
-        };
-        if let Some((_, name)) = local.iter().find(|(r, _)| *r == reference.to_string()) {
-            names.insert((image.to_string(), name.clone()));
+        let named = service.get("image").and_then(Value::as_str).unwrap_or("");
+        if named.is_empty() || rmi == "all" {
+            let image = super::build::image_of(&project.name, key, service);
+            if let Some(name) = find(&image) {
+                names.insert((image, name));
+            }
         }
     }
+    for (reference, name, _) in records.iter().filter(|(_, _, o)| o == "build") {
+        let Ok(record) = e.client.manager.get_image(name).await else {
+            continue;
+        };
+        let labels: BTreeMap<String, String> = record
+            .get("labels")
+            .and_then(|v| std::collections::HashMap::<String, String>::try_from(v.clone()).ok())
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default();
+        if labels.get(label::PROJECT) != Some(&project.name) {
+            continue;
+        }
+        let service = labels.get(label::SERVICE).map(String::as_str).unwrap_or("");
+        if orphans || project.services.contains_key(service) {
+            names.insert((reference.clone(), name.clone()));
+        }
+    }
+    let mut seen = BTreeSet::new();
     for (image, name) in names {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let digest = match e.client.manager.get_image(&name).await {
+            Ok(record) => client::string(&record, "digest"),
+            Err(_) => continue,
+        };
+        if let Some((_, user)) = users.iter().find(|(d, _)| *d == digest) {
+            e.warn(format!(
+                "image {image} is kept: machine {user} was made from it"
+            ));
+            continue;
+        }
         let id = format!("Image {image}");
         e.progress.event(&id, "Removing", "", Status::Working);
         let list = [name];

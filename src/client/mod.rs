@@ -41,6 +41,13 @@ pub trait Manager {
         tag: &str,
         options: Options<'_>,
     ) -> zbus::Result<OwnedObjectPath>;
+    fn prune_build_cache(&self, options: Options<'_>) -> zbus::Result<OwnedObjectPath>;
+    fn build_cache_usage(&self) -> zbus::Result<Vec<Dict>>;
+    fn build_dockerfile(
+        &self,
+        context: zbus::zvariant::Fd<'_>,
+        options: Options<'_>,
+    ) -> zbus::Result<OwnedObjectPath>;
     fn remove_images(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
     fn remove_machines(
         &self,
@@ -380,6 +387,15 @@ impl Client {
         watch.bars = !quiet;
         let job = start().await.map_err(error)?;
         watch.finish(job).await
+    }
+
+    /// `watch_jobs` with every line on standard error, or none at all when `quiet`.
+    pub async fn watch_jobs_quiet(&self, quiet: bool) -> Result<JobWatch> {
+        let mut watch = self.watch_jobs().await?;
+        watch.lines_to_stderr = true;
+        watch.silent = quiet;
+        watch.bars = !quiet;
+        Ok(watch)
     }
 
     /// Starts listening to the job signals, for a call that returns a job together with

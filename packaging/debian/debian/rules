@@ -34,10 +34,12 @@ override_dh_auto_install:
 	install -d -m 0755 debian/nspawn/etc/nspawn
 	install -d -m 0711 debian/nspawn/var/lib/nspawn
 
-# Nothing is enabled or started: the service starts on demand from the bus, and the
-# auto-update timer only when the administrator turns it on.
+# The service is restarted on upgrade, as before; the auto-update timer stays off
+# until the administrator turns it on; the templates of the Docker API sockets are
+# left alone, a restart of one would leave its machine with a dead socket.
 override_dh_installsystemd:
-	dh_installsystemd --no-enable --no-start
+	dh_installsystemd nspawn.service
+	dh_installsystemd --no-enable --no-start nspawn-auto-update.service nspawn-auto-update.timer
 
 # The state directory holds the images' files, setuid programs and device nodes among
 # them: passable, not readable, which dh_fixperms would widen to 0755.

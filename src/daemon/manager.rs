@@ -513,6 +513,143 @@ impl Manager {
         .await?)
     }
 
+    /// Like `build` of a Dockerfile: the build context a tar stream on `context`, the
+    /// Dockerfile in options. Options: dockerfile (ay), tags (as), build_args (as,
+    /// KEY=VALUE), target (s), no_cache (b), no_cache_filter (as, stages), pull (b),
+    /// labels (as, KEY=VALUE), network (s: default, none or host), add_hosts (as,
+    /// HOST:IP), allow (as, entitlements: network.host), secrets (a{say}, by id),
+    /// shm_size (t, bytes), ulimits (as, NAME=SOFT[:HARD]), verify (b, default true),
+    /// backend (s), mode (s), force (b), registry (s), ca_cert (s). The steps' output
+    /// comes through the job; its result has id (the config digest), manifest_digest and
+    /// names (as, the images made, one per tag). The build stops when its caller leaves
+    /// the bus.
+    async fn build_dockerfile(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        context: zbus::zvariant::OwnedFd,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<OwnedObjectPath> {
+        let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
+        let pairs = |items: Vec<String>,
+                     what: &str|
+         -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+            items
+                .into_iter()
+                .map(|item| {
+                    item.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .ok_or_else(|| anyhow::anyhow!("{what} {item}: KEY=VALUE"))
+                })
+                .collect()
+        };
+        let network = match options.string("network")?.as_deref() {
+            None | Some("") | Some("default") => crate::build::plan::Network::Default,
+            Some("none") => crate::build::plan::Network::None,
+            Some("host") => crate::build::plan::Network::Host,
+            Some(other) => {
+                return Err(anyhow::anyhow!("--network {other}: default, none or host").into())
+            }
+        };
+        let mut allow_host_network = false;
+        for entitlement in options.strings("allow")? {
+            match entitlement.as_str() {
+                "network.host" => allow_host_network = true,
+                "security.insecure" => {
+                    return Err(anyhow::anyhow!(
+                    "--allow security.insecure: steps run with the confinement of an app machine"
+                )
+                    .into())
+                }
+                other => return Err(anyhow::anyhow!("--allow {other}: unknown entitlement").into()),
+            }
+        }
+        let add_hosts = options
+            .strings("add_hosts")?
+            .iter()
+            .map(|h| crate::tuning::extra_host(h).map(|e| (e.host, e.ip)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let ulimits = options
+            .strings("ulimits")?
+            .iter()
+            .map(|u| crate::tuning::ulimit(u))
+            .collect::<anyhow::Result<_>>()?;
+        let request = crate::build::exec::Request {
+            dockerfile: options
+                .bytes("dockerfile")?
+                .ok_or_else(|| anyhow::anyhow!("option dockerfile is missing"))?,
+            context: PathBuf::new(),
+            tags: options.strings("tags")?,
+            options: crate::build::plan::Options {
+                build_args: pairs(options.strings("build_args")?, "--build-arg")?,
+                target: options.string("target")?.filter(|t| !t.is_empty()),
+                labels: pairs(options.strings("labels")?, "--label")?,
+            },
+            no_cache: options.bool("no_cache", false)?,
+            no_cache_filter: options.strings("no_cache_filter")?,
+            pull: options.bool("pull", false)?,
+            network,
+            allow_host_network,
+            add_hosts,
+            secrets: options.byte_map("secrets")?,
+            shm_size: options.maybe_u64("shm_size")?,
+            ulimits,
+            verify: options.bool("verify", true)?,
+            backend: backend_choice(options.string("backend")?.as_deref())?,
+            mode: mode_choice(options.string("mode")?.as_deref())?,
+            force: options.bool("force", false)?,
+        };
+        options.finish()?;
+        let input = std::os::fd::OwnedFd::from(context);
+        let target = request.tags.first().cloned().unwrap_or_default();
+        let state = self.state.clone();
+        // A build whose client goes away stops.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let watch = {
+            let gone = caller_gone(self.state.connection().clone(), owner.name.clone());
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                gone.await;
+                cancel.cancel();
+            })
+        };
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            ctx,
+            "build",
+            &target,
+            move |ctx, reporter| async move {
+                let built = crate::build::exec::build(
+                    &ctx,
+                    request,
+                    input,
+                    jobs::report(&reporter),
+                    cancel,
+                )
+                .await;
+                watch.abort();
+                let built = built?;
+                if let Ok(emitter) = state.emitter() {
+                    for name in &built.names {
+                        let _ = Manager::image_added(&emitter, name).await;
+                    }
+                }
+                Ok(HashMap::from([
+                    ("id".to_string(), values::v(built.id)),
+                    (
+                        "manifest_digest".to_string(),
+                        values::v(built.manifest_digest),
+                    ),
+                    ("names".to_string(), values::strings(&built.names)),
+                ]))
+            },
+        )
+        .await?)
+    }
+
     /// Like `build`. Options: name (s), distribution (s), release (s), profile (as),
     /// backend (s), mode (s), force (b), keep_output (b), mkosi_args (as), registry
     /// (s), ca_cert (s). mkosi's output comes through the job, line by line.
@@ -860,6 +997,67 @@ impl Manager {
             },
         )
         .await?)
+    }
+
+    /// Like `builder prune`: options all (b, what images take too), until (t, unix
+    /// seconds: entries last used before), keep_storage (t, bytes of the most recently
+    /// used kept). A job; its result has removed (as) and reclaimed (t, bytes).
+    async fn prune_build_cache(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<OwnedObjectPath> {
+        let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let mut options = Options::new(&options);
+        let all = options.bool("all", false)?;
+        let until = options.maybe_u64("until")?;
+        let keep_storage = options.maybe_u64("keep_storage")?;
+        options.finish()?;
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "builder-prune",
+            "",
+            move |ctx, reporter| async move {
+                let pruned = api::disk::prune_build_cache(
+                    &ctx,
+                    all,
+                    until,
+                    keep_storage,
+                    jobs::report(&reporter),
+                )
+                .await?;
+                Ok(HashMap::from([
+                    ("removed".to_string(), values::strings(&pruned.removed)),
+                    ("reclaimed".to_string(), values::v(pruned.reclaimed)),
+                ]))
+            },
+        )
+        .await?)
+    }
+
+    /// Like `builder du`: what the build cache holds, most recently used first: id, kind
+    /// (layer, base or mount), description, size (t), used (t, unix seconds), shared (b,
+    /// an image takes it too).
+    async fn build_cache_usage(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Vec<Dict>> {
+        let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
+        let rows = crate::build::cache::usage(&self.ctx().store)?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                HashMap::from([
+                    ("id".to_string(), values::v(r.id.as_str())),
+                    ("kind".to_string(), values::v(r.kind)),
+                    ("description".to_string(), values::v(r.description.as_str())),
+                    ("size".to_string(), values::v(r.size)),
+                    ("used".to_string(), values::v(r.used)),
+                    ("shared".to_string(), values::v(r.shared)),
+                ])
+            })
+            .collect())
     }
 
     /// Like `system df`: images, containers (machines), local_volumes and build_cache,

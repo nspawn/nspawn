@@ -289,6 +289,24 @@ pub(crate) fn flags(r: &ImageRecord) -> (Vec<Vec<String>>, Vec<String>) {
             }
         }
     }
+    // The addresses asked for, as they were asked: the primary network's alone, the
+    // others by name.
+    if bridge::bridge_kind(r) {
+        let networks = bridge::networks_of(r);
+        for (i, network) in networks.iter().enumerate() {
+            if !r.fixed_addresses.contains(*network) {
+                continue;
+            }
+            if let Some(addr) = bridge::address_on(r, network) {
+                let value = if i == 0 {
+                    addr.to_string()
+                } else {
+                    format!("{network}={addr}")
+                };
+                flag(&mut out, "--ip", &value);
+            }
+        }
+    }
     // Aliases stay in the record of a machine that left the bridge, where they mean
     // nothing and start refuses them.
     for (network, aliases) in r.aliases.iter().filter(|_| bridge::bridge_kind(r)) {
@@ -641,6 +659,29 @@ mod tests {
         let mut dashed = spec.clone();
         dashed.labels = [("-k".to_string(), "v".to_string())].into();
         assert_eq!(network_command(&dashed)[1], ["--label=-k=v"]);
+    }
+
+    #[test]
+    fn addresses_asked_for_are_asked_for_again() {
+        let mut r = record("web", "hub.example/app:1");
+        r.network_name = Some("front".into());
+        r.address = Some("10.97.42.50".parse().unwrap());
+        r.extra_networks.push(crate::bridge::Attachment {
+            network: "back".into(),
+            address: Some("10.97.43.7".parse().unwrap()),
+        });
+        // A dynamic address is given out again, not asked for.
+        let words = |r: &ImageRecord| flags(r).0.concat();
+        assert!(!words(&r).contains(&"--ip".to_string()));
+        r.fixed_addresses = ["front".to_string(), "back".to_string()].into();
+        let w = words(&r);
+        let ips: Vec<&String> = w
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && w[i - 1] == "--ip")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(ips, ["10.97.42.50", "back=10.97.43.7"]);
     }
 
     #[test]

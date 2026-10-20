@@ -108,6 +108,9 @@ hundred that ended; older ones are gone with their objects).
 | `CreateMachine(s source, s name, a{sv} options) -> o` | `create` | options backend, network (s) or networks (as, several bridge networks, the first one primary), aliases (as, NAME or NETWORK=NAME), addresses (as, IP or NETWORK=IP), publish (as, [IP:]HOST:CONTAINER[/udp], or ranges of equal length on both sides), force, entrypoint, env, volume, label, restart, memory (t, bytes), memory_swap (x, bytes of memory and swap together, -1 for no bound on swap, 0 for as much swap again as memory), cpus (d), pids_limit (t), command, the health_* and no_healthcheck options and docker's other flags of StartMachine (hostname, user, working_dir, stop_signal, timezone, log_driver, cap_add, cap_drop, tmpfs, devices, gpus, interfaces, dns, dns_search, extra_hosts, ulimits, sysctls, secrets, depends_on, privileged, read_only, init, shm_size, stop_timeout, oom_score_adj), registry, ca_cert; a job |
 | `PushImage(s image, a{sv} options) -> o` | `push` | options to, registry, ca_cert; a job |
 | `BuildImage(s directory, s tag, a{sv} options) -> o` | `build` | options name, distribution, release, profile, backend, mode, force, keep_output, mkosi_args, registry, ca_cert; a job whose output includes mkosi's |
+| `BuildDockerfile(h context, a{sv} options) -> o` | `build` of a Dockerfile, `compose build` | `context` a tar stream of the build context; options dockerfile (ay), tags (as), build_args (as, KEY=VALUE), target (s), no_cache (b), no_cache_filter (as, stages), pull (b), labels (as, KEY=VALUE), network (s: default, none or host), add_hosts (as, HOST:IP or HOST=IP), allow (as: network.host), secrets (a{say}, by id), shm_size (t, bytes), ulimits (as, NAME=SOFT[:HARD]), verify (b, default true), backend, mode, force, registry, ca_cert; a job whose output is the steps' progress and whose result is id (the config digest), manifest_digest and names (as, an image per tag); the build stops when its caller leaves the bus |
+| `PruneBuildCache(a{sv} options) -> o` | `builder prune` | options all (b: what images take too), until (t, unix seconds: entries last used before), keep_storage (t, bytes of the most recently used kept); a job whose result is removed (as) and reclaimed (t, bytes) |
+| `BuildCacheUsage() -> aa{sv}` | `builder du` | what the build cache holds, most recently used first: id, kind (layer, base or mount), description, size (t), used (t, unix seconds), shared (b, an image takes it too) |
 | `RemoveMachines(as names, a{sv} options) -> o` | `rm` | `RemoveImages` with the option force, which stops a running machine first (SIGKILL) instead of refusing it |
 | `RemoveImages(as names) -> o` | `images rm` | a job: every name is tried, its result lists `removed`, and it fails at the end when one could not be removed; a name with nothing behind it fails with `no machine or image named NAME` |
 | `SearchImages(s term, s source, u limit, a{sv} options) -> (aa{sv}, as)` | `search` | source "", "hub" or "dockerhub"; the hits and the notes (a source that could not be reached); options registry, ca_cert |
@@ -249,8 +252,8 @@ poweroff request for a booted one); the signal `Exited(i status)`, sent after
 A job is returned by the long operations and keeps what happened: properties
 `Kind` (pull, create, push, build, rm, volume-rm, volume-prune, cp), `Target`, `State` (running, done,
 failed), `Output` (every line so far), `Error` and `Result` (a dictionary:
-for a pull its name, reference, mode and signed_by; for a build its name, reference,
-mode and output; for a push its name, destination and url; for a create its
+for a pull its name, reference, mode and signed_by; for an mkosi build its name,
+reference, mode and output, for a Dockerfile build its id, manifest_digest and names; for a push its name, destination and url; for a create its
 name and mode; for an rm, volume-rm or volume-prune the names removed; for a cp
 the entries and bytes copied). The
 service does not go idle before a job or a process has announced its end.

@@ -1,0 +1,134 @@
+{
+ "architecture": "amd64",
+ "config": {
+  "Cmd": [
+   "sh"
+  ],
+  "Env": [
+   "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  ]
+ },
+ "history": [
+  {
+   "created_by": "BusyBox 1.37.0 (glibc), Debian 13"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN /bin/sh -c echo x > /cache/x && ls /cache > /cache-listing"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN /bin/sh -c cp -r /src /from-bind"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN /bin/sh -c touch /scratch/gone && ls /scratch > /scratch-listing"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN /bin/sh -c wc -c < /run/secrets/token > /secret-size"
+  },
+  {
+   "comment": "dockerfile.v0",
+   "created_by": "RUN /bin/sh -c test -n \"$TOKEN\" && echo set > /secret-env"
+  }
+ ],
+ "layers": [
+  {
+   "base": true,
+   "diff_id": "sha256:5a9bfd996c6d49c6c3cb4ddfb76e8d09cf16b6b7cf6601d1f2dffbdbc3edb5d4"
+  },
+  {
+   "diff_id": "sha256:932b99f68110bb7dc7edf1c341a597745725429f7697af559996430a3f678941",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "cache-listing",
+     "sha256": "sha256:73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac",
+     "size": 2,
+     "type": "file",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "proc",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "sys",
+     "type": "dir",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:94567c6d69ab298336ded160d4556c0eddf47a9106b164913b2daf4381a4da2b",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0755",
+     "path": "from-bind",
+     "type": "dir",
+     "uid": 0
+    },
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "from-bind/b.txt",
+     "sha256": "sha256:c340efc722efa49f18c856b712ddac6679730bac8f387dc276aced319c8e8114",
+     "size": 6,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:9767ebb66b7fb2589c512dcb4399356b89feee921ae06022c1087fa9a8d39ce7",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "scratch-listing",
+     "sha256": "sha256:4b9f2c32577beb1ebc8ab2a1e226faaa9176a81cd4eedbaa22f8a0db919972b5",
+     "size": 5,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:781915d3699521b5577cdbc7c66136fef4a6d1db3373bbf0a8b627d022eddeff",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "secret-size",
+     "sha256": "sha256:a1fb50e6c86fae1679ef3351296fd6713411a08cf8dd1790a4fd05fae8688164",
+     "size": 3,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  },
+  {
+   "diff_id": "sha256:b74599c7bd5158ec4acfa55145e210f86e7192c124d5fc34c684441820be078c",
+   "entries": [
+    {
+     "gid": 0,
+     "mode": "0644",
+     "path": "secret-env",
+     "sha256": "sha256:07305c91fd87e9932557405d52558b922ef76537478f4adfbb78d0610cafd02e",
+     "size": 4,
+     "type": "file",
+     "uid": 0
+    }
+   ]
+  }
+ ],
+ "os": "linux"
+}
