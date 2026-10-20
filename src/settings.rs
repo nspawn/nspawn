@@ -67,6 +67,8 @@ pub struct MachineSettings<'a> {
     /// mstack images: boot with managed user namespaces instead of the template's -U.
     pub managed_userns: bool,
     pub mode: Mode,
+    /// An app whose program runs as PID 1 instead of under the stub init.
+    pub pid1: bool,
     pub run: &'a RunSpec,
     /// Entrypoint and cmd, overrides applied.
     pub command: &'a [String],
@@ -129,7 +131,11 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
     match s.mode {
         Mode::Boot => out.push_str("Boot=yes\n"),
         Mode::App => {
-            out.push_str("Boot=no\nProcessTwo=yes\n");
+            out.push_str(if s.pid1 {
+                "Boot=no\n"
+            } else {
+                "Boot=no\nProcessTwo=yes\n"
+            });
             if !s.command.is_empty() {
                 let quoted: Vec<String> = s.command.iter().map(|a| quote(a)).collect();
                 out.push_str(&format!("Parameters={}\n", quoted.join(" ")));
@@ -154,9 +160,21 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
                     out.push_str(&format!("User={user}\n"));
                 }
             }
-            // What a stop of the unit sends the stub init: a poweroff request. The image's
-            // stop signal is what `nspawn stop` sends the program itself.
-            out.push_str("KillSignal=SIGRTMIN+4\n");
+            // What a stop of the unit sends PID 1: the stub init gets a poweroff request
+            // (the image's stop signal is what `nspawn stop` sends the program itself), a
+            // program that is PID 1 its stop signal, as docker sends it.
+            if s.pid1 {
+                let signal = s
+                    .tuning
+                    .stop_signal
+                    .as_deref()
+                    .or(s.run.stop_signal.as_deref())
+                    .and_then(|name| crate::api::machines::signal_name(name).ok())
+                    .unwrap_or_else(|| "SIGTERM".to_string());
+                out.push_str(&format!("KillSignal={signal}\n"));
+            } else {
+                out.push_str("KillSignal=SIGRTMIN+4\n");
+            }
             // systemd-nspawn's own resolv.conf handling would bind the host's stub file
             // over the generated one on a read-only root.
             if s.network == Network::Bridge && !s.no_network && s.bridge.is_some() {
@@ -822,6 +840,7 @@ mod tests {
             name: "fedora-44",
             managed_userns: false,
             mode: Mode::Boot,
+            pid1: false,
             run: &run,
             command: &run.argv(),
             extra_env: &[],
@@ -844,6 +863,7 @@ mod tests {
             name: "web",
             managed_userns: false,
             mode: Mode::App,
+            pid1: false,
             run: &run,
             command: &run.argv(),
             extra_env: &[],
@@ -874,6 +894,7 @@ mod tests {
             name: "kali",
             managed_userns: false,
             mode,
+            pid1: false,
             run: &run,
             command: &command,
             extra_env: &[],
@@ -954,6 +975,7 @@ mod tests {
                 name: "web",
                 managed_userns: false,
                 mode: Mode::App,
+                pid1: false,
                 run,
                 command,
                 extra_env: &[],
@@ -1004,6 +1026,7 @@ mod tests {
             name: "fedora-44",
             managed_userns: true,
             mode: Mode::Boot,
+            pid1: false,
             run: &run,
             command: &run.argv(),
             extra_env: &[],
@@ -1021,6 +1044,7 @@ mod tests {
             name: "fedora-44",
             managed_userns: false,
             mode: Mode::Boot,
+            pid1: false,
             run: &run,
             command: &run.argv(),
             extra_env: &[],
@@ -1046,6 +1070,7 @@ mod tests {
             name: "web",
             managed_userns: false,
             mode: Mode::App,
+            pid1: false,
             run: &run,
             command: &run.argv(),
             extra_env: &[],
@@ -1074,6 +1099,7 @@ mod tests {
                 name: "web",
                 managed_userns: false,
                 mode: Mode::App,
+                pid1: false,
                 run: &run,
                 command: &run.argv(),
                 extra_env: &[],
@@ -1098,6 +1124,7 @@ mod tests {
             name: "web",
             managed_userns: false,
             mode: Mode::App,
+            pid1: false,
             run: &run,
             command: &run.argv(),
             extra_env: &[],
@@ -1121,6 +1148,7 @@ mod tests {
             name: "db",
             managed_userns: true,
             mode: Mode::Boot,
+            pid1: false,
             run: &run,
             command: &run.argv(),
             extra_env: &[],
@@ -1142,6 +1170,7 @@ mod tests {
             name: "db",
             managed_userns: false,
             mode: Mode::Boot,
+            pid1: false,
             run: &run,
             command: &run.argv(),
             extra_env: &[],
@@ -1190,6 +1219,7 @@ mod tests {
             name: "web",
             managed_userns: false,
             mode: Mode::App,
+            pid1: false,
             run: &run,
             command: &run.argv(),
             extra_env: &[],
@@ -1206,6 +1236,42 @@ mod tests {
         assert!(app.contains("Environment=PATH=/usr/bin\nEnvironment='GREETING=hello world'\n"));
         assert!(app.contains("WorkingDirectory=/srv\nUser=nginx\nKillSignal=SIGRTMIN+4\n"));
         assert!(app.ends_with("[Network]\nVirtualEthernet=no\n"));
+
+        // A program that is PID 1 gets the unit's stop as its own stop signal, written
+        // the way systemd parses it.
+        let pid1 = |stop_signal: Option<&str>, tuning: &Tuning| {
+            let run = RunSpec {
+                stop_signal: stop_signal.map(str::to_string),
+                ..run.clone()
+            };
+            render(&MachineSettings {
+                name: "web",
+                managed_userns: false,
+                mode: Mode::App,
+                pid1: true,
+                run: &run,
+                command: &run.argv(),
+                extra_env: &[],
+                binds: &[],
+                volume_units: None,
+                network: Network::Host,
+                no_network: false,
+                hostname_file: None,
+                tuning,
+                bridge: None,
+            })
+        };
+        let text = pid1(Some("SIGQUIT"), &Tuning::default());
+        assert!(text.contains("[Exec]\nBoot=no\nParameters="), "{text}");
+        assert!(!text.contains("ProcessTwo"), "{text}");
+        assert!(text.contains("\nKillSignal=SIGQUIT\n"), "{text}");
+        assert!(pid1(None, &Tuning::default()).contains("\nKillSignal=SIGTERM\n"));
+        assert!(pid1(Some("quit"), &Tuning::default()).contains("\nKillSignal=SIGQUIT\n"));
+        let own = Tuning {
+            stop_signal: Some("RTMIN+3".into()),
+            ..Tuning::default()
+        };
+        assert!(pid1(Some("SIGQUIT"), &own).contains("\nKillSignal=SIGRTMIN+3\n"));
 
         let numeric_user = RunSpec {
             user: Some("1000:1000".into()),
@@ -1227,6 +1293,7 @@ mod tests {
             name: "x",
             managed_userns: false,
             mode: Mode::App,
+            pid1: false,
             run: &numeric_user,
             command: &["/bin/sleep".to_string(), "infinity".to_string()],
             extra_env: &["GREETING=hi".to_string()],

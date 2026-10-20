@@ -140,9 +140,10 @@ pub struct Tuning {
     /// Seconds between the stop signal and SIGKILL, the default of `stop -t`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_timeout: Option<u64>,
-    /// Accepted for docker's sake: the stub init reaps anyway.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub init: bool,
+    /// --init (the program under the stub init) or --init=false (the program as PID 1);
+    /// without either the image decides. An older nspawn reads `false` as no --init.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init: Option<bool>,
     /// net.* keys, applied in an app machine's network namespace.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sysctls: BTreeMap<String, String>,
@@ -639,7 +640,7 @@ impl Overrides {
             t.stop_timeout = Some(timeout);
         }
         if let Some(init) = self.init {
-            t.init = init;
+            t.init = Some(init);
         }
         if !self.sysctls.is_empty() {
             t.sysctls = if cleared(&self.sysctls) {

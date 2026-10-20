@@ -223,7 +223,8 @@ pub fn record(r: &ImageRecord) -> Dict {
             "stop_timeout".to_string(),
             v(r.tuning.stop_timeout.unwrap_or(10)),
         ),
-        ("init".to_string(), v(r.tuning.init)),
+        ("init".to_string(), v(r.tuning.init == Some(true))),
+        ("pid1".to_string(), v(r.program_is_pid1())),
         ("sysctls".to_string(), map(&r.tuning.sysctls)),
         (
             "secrets".to_string(),

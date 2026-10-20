@@ -588,14 +588,14 @@ fn settings(spec: &Spec, service: &Map, made: &mut Made) {
     ] {
         put_list(o, option, strings(seq(service, key)));
     }
-    for (key, option) in [
-        ("privileged", "privileged"),
-        ("read_only", "read_only"),
-        ("init", "init"),
-    ] {
+    for (key, option) in [("privileged", "privileged"), ("read_only", "read_only")] {
         if service.get(key) == Some(&Value::Bool(true)) {
             put(o, option, true);
         }
+    }
+    // Either way it says something: false makes the program PID 1, as docker runs it.
+    if let Some(Value::Bool(init)) = service.get("init") {
+        put(o, "init", *init);
     }
     if let Some(size) = int(service.get("shm_size")).filter(|n| *n > 0) {
         put(o, "shm_size", size as u64);

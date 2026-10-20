@@ -264,6 +264,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         created: installed.created,
         origin: installed.origin,
         mode: installed.mode,
+        pid1: installed.pid1,
         run: installed.run,
         signed_by: installed.signed_by,
         signed_at: installed.signed_at,

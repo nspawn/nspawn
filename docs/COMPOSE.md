@@ -231,7 +231,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.healthcheck.timeout` | yes |  |
 | `services.*.hostname` | yes |  |
 | `services.*.image` | yes |  |
-| `services.*.init` | partly | nspawn's stub init reaps orphans whether it is set or not |
+| `services.*.init` | yes |  |
 | `services.*.ipc` | ignored | a machine always has an IPC namespace of its own |
 | `services.*.isolation` | ignored | isolation is for Windows containers |
 | `services.*.label_file` | yes |  |

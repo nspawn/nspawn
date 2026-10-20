@@ -486,7 +486,8 @@ fn tuning_flags(t: &crate::tuning::Tuning) -> Vec<Vec<String>> {
     for (on, name) in [
         (t.privileged, "--privileged"),
         (t.read_only, "--read-only"),
-        (t.init, "--init"),
+        (t.init == Some(true), "--init"),
+        (t.init == Some(false), "--init=false"),
     ] {
         if on {
             out.push(words(&[name]));

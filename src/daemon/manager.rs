@@ -1172,7 +1172,7 @@ impl Manager {
         }
         let signals = processes::Signals {
             poweroff: (!attached.app).then(|| attached.name.clone()),
-            program: attached.app.then(|| attached.name.clone()),
+            program: attached.app.then(|| (attached.name.clone(), attached.pid1)),
             sent: Default::default(),
         };
         let sent = signals.sent.clone();

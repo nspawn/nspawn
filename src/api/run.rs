@@ -34,15 +34,16 @@ const CLD_DUMPED: i32 = 3;
 /// What systemd-nspawn exits with when the machine asked for a reboot.
 const REBOOT: i32 = 133;
 
-/// The exit code: the program's, or 128 plus the signal it died of. systemd-nspawn
-/// reports 255 for any signal that killed an app's program, and 1 after a SIGKILL of
-/// the whole machine on 259 and newer, so the signal nspawn itself sent decides.
-pub fn exit_code(ending: &Ending, sent: Option<i32>, app: bool) -> i32 {
+/// The exit code: the program's, or 128 plus the signal it died of. Under the stub init
+/// (`stub`) systemd-nspawn reports 255 for any signal that killed the program; a program
+/// that is PID 1 killed by a signal, and a SIGKILL of the whole machine on 259 and newer,
+/// end it with 1; so the signal nspawn itself sent decides.
+pub fn exit_code(ending: &Ending, sent: Option<i32>, stub: bool) -> i32 {
     if ending.result == "oom-kill" {
         return 128 + 9;
     }
     match ending.code {
-        CLD_EXITED if ending.status == 255 && app => sent.map_or(255, |s| 128 + s),
+        CLD_EXITED if ending.status == 255 && stub => sent.map_or(255, |s| 128 + s),
         CLD_EXITED if ending.status == 1 && sent == Some(9) => 128 + 9,
         CLD_EXITED => ending.status,
         CLD_KILLED | CLD_DUMPED => 128 + ending.status,
@@ -345,6 +346,8 @@ pub struct RunRequest {
 pub struct Attached {
     pub name: String,
     pub app: bool,
+    /// The app's program runs as PID 1 of the machine rather than under the stub init.
+    pub pid1: bool,
     /// The terminal's master for the caller (-t).
     pub terminal: Option<OwnedFd>,
     /// The service's copy, so that the terminal stays open until the machine is stopped
@@ -491,9 +494,15 @@ pub async fn attach(
     }
     let main_pid = sd.exec_main_pid(&unit).await.unwrap_or(0);
     watch.saw(main_pid);
+    // As the start left it, with the flags of this run applied.
+    let pid1 = ctx
+        .store
+        .load_image(&name)?
+        .is_some_and(|r| r.program_is_pid1());
     Ok(Attached {
         name,
         app,
+        pid1,
         terminal,
         keep,
         output,
@@ -558,7 +567,7 @@ impl Attached {
             follower.finish().await;
         }
         match ending {
-            Ok(ending) => exit_code(&ending, sent, self.app),
+            Ok(ending) => exit_code(&ending, sent, self.app && !self.pid1),
             Err(_) => 125,
         }
     }
@@ -630,6 +639,20 @@ mod tests {
         assert_eq!(
             exit_code(&ending(CLD_EXITED, 1, "oom-kill"), None, true),
             137
+        );
+        // A program that is PID 1 can legitimately exit with 255, and a SIGKILL ends
+        // systemd-nspawn with 1.
+        assert_eq!(
+            exit_code(&ending(CLD_EXITED, 255, "exit-code"), Some(15), false),
+            255
+        );
+        assert_eq!(
+            exit_code(&ending(CLD_EXITED, 1, "exit-code"), Some(9), false),
+            137
+        );
+        assert_eq!(
+            exit_code(&ending(CLD_EXITED, 1, "exit-code"), Some(15), false),
+            1
         );
     }
 

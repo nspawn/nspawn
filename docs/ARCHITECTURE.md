@@ -150,9 +150,9 @@ handles its own signal. Should the program end in between, the stop job also can
 the restart systemd has scheduled. A machine machined no
 longer lists gets the stop job too, which ends a pending restart and waits for
 the release hook of its last run. `kill` with SIGKILL is `stop --force`; any
-other signal goes to the program of an app (the stub init's child, once it no
-longer bears systemd-nspawn's name, which it keeps until it executes the
-program) or the init of a booted machine and
+other signal goes to the program of an app (the stub init's child, or the leader
+when the program is PID 1, once it no longer bears systemd-nspawn's name, which
+it keeps until it executes the program) or the init of a booted machine and
 leaves the policy to decide should the machine end, except the machine's own
 stop signal, which docker counts as a stop: `kill` then leaves `exit-on-next`
 in the machine's directory, and the release hook, finding it, queues the stop
@@ -184,9 +184,18 @@ SELinux's exec attribute on the way.
 ## Machines and apps
 
 An image with an init system whose entrypoint is that init is booted
-(`Boot=yes`). Anything else is an app: its command runs under the stub init
-(`ProcessTwo=yes`), with the OCI config's environment, working directory,
-user and stop signal. systemd-nspawn resolves the user with `getent passwd`
+(`Boot=yes`): the entrypoint must name it where systemd-nspawn looks for it
+(`/sbin/init`, `/usr/lib/systemd/systemd`...) or by its bare name, so that an
+`/init` of the image's own (s6-overlay's) is not mistaken for it in a base that
+also has busybox's `/sbin/init`. Anything else is an app: its command runs under
+the stub init (`ProcessTwo=yes`), with the OCI config's environment, working
+directory, user and stop signal. An image that carries s6-overlay (found at install,
+across the layers, and kept as `pid1` in the record) has its program run as PID 1
+instead (`Boot=no` alone, and `KillSignal=` its stop signal, which systemd-nspawn
+hands to PID 1 when the unit stops), since s6's `/init` refuses anything else;
+`--init=false` and `--init` choose either way for any app. The program is then the
+leader itself for `kill` and `stop`, and a PID 1 killed by a signal ends
+systemd-nspawn with 1 rather than the stub's 255. systemd-nspawn resolves the user with `getent passwd`
 and `getent initgroups` run inside the machine, which busybox lacks, musl's
 getent (alpine) cannot answer and glibc's refuses for a uid the passwd does
 not list; an app that runs as a user gets `getent.rs`'s stand-in, a shell

@@ -52,12 +52,18 @@ image (blobs, manifest, assembled machine) and can be started right away or push
 
 ## Machines and apps
 
-Images that ship an init system (systemd) and whose entrypoint is that init are booted with
-`--boot`, like `machinectl start` does, and `shell` opens machined's login session
-there. Any other image, for example anything from Docker Hub, is an "app":
+Images that ship an init system (systemd) and whose entrypoint is that init (or none) are
+booted with `--boot`, like `machinectl start` does, and `shell` opens machined's login
+session there. Any other image, for example anything from Docker Hub, is an "app":
 its entrypoint runs under nspawn's stub init, with the environment, working
 directory, user and stop signal from the OCI config, and joins the bridge network like
-any other machine (see Networking). The arguments given to `create` or `start` after `--`
+any other machine (see Networking). An image whose own `/init` supervises it, as the
+s6-overlay of linuxserver.io's images, Home Assistant's and others, runs as an app with
+that program as PID 1 of the machine, which s6 insists on, as docker runs every
+program; `--init=false` asks the same of any app, `--init` puts the program back under
+the stub init. A program that is PID 1 ignores the signals it has no handler for, as
+under docker, so `stop` kills it after its timeout when it does not handle its stop
+signal. The arguments given to `create` or `start` after `--`
 replace the image's cmd and follow its entrypoint, exactly as with docker (`nspawn start
 web -- nginx -T` still runs `/docker-entrypoint.sh` first); `--entrypoint PROGRAM` replaces
 the entrypoint and `--entrypoint ""` drops it. Both are remembered, like the command of a
@@ -167,8 +173,9 @@ allowed one by one), `--dns` and `--dns-search`, `--add-host HOST:IP` or `HOST=I
 (systemd-nspawn's `Timezone=`: its default, `auto`, points `/etc/localtime` at the host's
 zone at every start, and `off` leaves the machine's own, so a zone set inside with
 `timedatectl` survives a restart; an app also takes `-e TZ=`), `--log-driver DRIVER`
-(see "Where the output goes" below), `--init` (accepted; the
-stub init reaps anyway), `--sysctl` (`net.*` keys, set in an app machine's network
+(see "Where the output goes" below), `--init` and `--init=false` (the program under
+the stub init, which reaps orphans and turns a poweroff into SIGTERM, or as PID 1; see
+"Machines and apps"), `--sysctl` (`net.*` keys, set in an app machine's network
 namespace) and `--interface IFACE`, which has no docker counterpart: a network
 interface of the host moved into the machine while it runs (see "Physical
 interfaces" under Networking). A `--tmpfs` that lands on `/run` (`/var/run` in most images) is left out

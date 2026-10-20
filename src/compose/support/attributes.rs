@@ -204,10 +204,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
     full("services.*.healthcheck.timeout"),
     full("services.*.hostname"),
     full("services.*.image"),
-    partly(
-        "services.*.init",
-        "nspawn's stub init reaps orphans whether it is set or not",
-    ),
+    full("services.*.init"),
     ignored(
         "services.*.ipc",
         "a machine always has an IPC namespace of its own",

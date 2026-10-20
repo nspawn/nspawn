@@ -44,8 +44,9 @@ pub struct Signals {
     /// A booted machine: any signal asks it to power off, as Ctrl-C of an attached run
     /// stops it.
     pub poweroff: Option<String>,
-    /// An app machine: signals go to its program, whichever process it is by then.
-    pub program: Option<String>,
+    /// An app machine, and whether its program is PID 1: signals go to the program,
+    /// whichever process it is by then.
+    pub program: Option<(String, bool)>,
     /// The last signal sent, which the run's exit code may be made of.
     pub sent: Arc<Mutex<Option<i32>>>,
 }
@@ -173,14 +174,14 @@ impl Process {
             *self.process.signals.sent.lock().unwrap() = Some(signal);
             return Ok(());
         }
-        if let Some(machine) = &self.process.signals.program {
+        if let Some((machine, pid1)) = &self.process.signals.program {
             let sd = self
                 .state
                 .ctx
                 .sd()
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
-            crate::api::machines::signal_program(sd, machine, signal)
+            crate::api::machines::signal_program(sd, machine, *pid1, signal)
                 .await
                 .map_err(|e| zbus::fdo::Error::Failed(format!("{e:#}")))?;
             *self.process.signals.sent.lock().unwrap() = Some(signal);

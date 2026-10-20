@@ -11,7 +11,7 @@ use oci_client::manifest::OciImageManifest;
 use crate::api::{note, Report};
 use crate::backend::{Assembler, Backend, BackendChoice, Layer};
 use crate::config::Config;
-use crate::oci::{detect_mode, has_init, Mode, RunSpec};
+use crate::oci::{detect_mode, has_init, needs_pid1, Mode, RunSpec};
 use crate::settings::{self, MachineSettings, Network};
 use crate::store::{now_unix, ImageRecord, Store};
 use crate::systemd::Systemd;
@@ -117,6 +117,7 @@ pub async fn install(
     let mode = spec
         .mode
         .unwrap_or_else(|| detect_mode(has_init(&trees), &run.argv()));
+    let pid1 = mode == Mode::App && needs_pid1(&trees);
     if mode == Mode::App && backend == Backend::Mstack {
         // Only known now, without a command in the config: no init inside.
         note(
@@ -138,6 +139,7 @@ pub async fn install(
             name: spec.name,
             managed_userns: backend == Backend::Mstack,
             mode,
+            pid1,
             run: &run,
             command: &run.argv(),
             extra_env: &[],
@@ -183,6 +185,7 @@ pub async fn install(
         created: now_unix(),
         origin: spec.origin.to_string(),
         mode,
+        pid1,
         run,
         network,
         network_name: None,

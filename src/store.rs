@@ -33,9 +33,12 @@ pub struct ImageRecord {
     /// "pull" or "build".
     #[serde(default = "default_origin")]
     pub origin: String,
-    /// Booted with an init system, or a single program under nspawn's stub init.
+    /// Booted with an init system, or a single program.
     #[serde(default = "default_mode")]
     pub mode: Mode,
+    /// An app whose image wants its program to be PID 1 (s6-overlay), found at install.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pid1: bool,
     /// The OCI config's command, environment and the rest.
     #[serde(default)]
     pub run: RunSpec,
@@ -133,6 +136,19 @@ impl ImageRecord {
             .stop_signal
             .as_deref()
             .or(self.run.stop_signal.as_deref())
+    }
+
+    /// Whether an app's program runs as PID 1 of the machine, as it would under docker,
+    /// rather than as the child of systemd-nspawn's stub init: --init=false and --init
+    /// say which, and without either the image does.
+    pub fn program_is_pid1(&self) -> bool {
+        self.mode == Mode::App && self.tuning.init.map_or(self.pid1, |init| !init)
+    }
+
+    /// Whether the program runs under the stub init, which reaps, forwards and reports
+    /// signals its own way.
+    pub fn under_stub_init(&self) -> bool {
+        self.mode == Mode::App && !self.program_is_pid1()
     }
 
     /// The image's labels with the ones given to this machine on top.
@@ -1655,6 +1671,7 @@ mod tests {
             created: 1,
             origin: "pull".into(),
             mode: Mode::Boot,
+            pid1: false,
             run: RunSpec::default(),
             network: Network::Veth,
             network_name: None,
@@ -1729,6 +1746,7 @@ mod tests {
             created: 1,
             origin: "build".into(),
             mode: Mode::App,
+            pid1: false,
             run: RunSpec::default(),
             network: Network::Host,
             network_name: None,
@@ -1937,6 +1955,7 @@ mod tests {
             created: 1,
             origin: "pull".into(),
             mode: Mode::Boot,
+            pid1: false,
             run: RunSpec::default(),
             network: Network::Bridge,
             network_name: None,

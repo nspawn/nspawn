@@ -91,7 +91,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -1481,6 +1481,62 @@ $NSPAWN start $app --restart no >/dev/null || fail "start after kill"
 $NSPAWN kill -s BOGUS $app 2>/dev/null && fail "kill -s BOGUS succeeded"
 $NSPAWN ps | grep_q "^ *$app " || fail "a refused kill ended the machine"
 $NSPAWN stop $app >/dev/null || fail "stop after the kill checks"
+
+step "s6-overlay images: the program as PID 1, and --init either way"
+# linuxserver.io's images start s6-overlay's /init, which refuses to run unless it is PID 1;
+# the Alpine base also carries busybox's /sbin/init, which must not make it a booted image.
+s6dir=/tmp/e2e-s6-init
+rm -rf $s6dir && mkdir -p $s6dir
+printf '#!/bin/sh\necho e2e-s6-cont-init-%s\n' "$nonce" > $s6dir/10-marker
+chmod 0755 $s6dir/10-marker
+pid1_of() { $NSPAWN exec "$1" -- cat /proc/1/comm </dev/null 2>/dev/null | tr -d '\r'; }
+field_of() { $NSPAWN inspect "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)[0].get('$2'))"; }
+$NSPAWN run -d --name e2e-s6 -e PUID=1234 -e PGID=1234 -v $s6dir:/custom-cont-init.d:ro lscr.io/linuxserver/baseimage-alpine:3.22 >/dev/null || fail "run of a linuxserver image"
+$NSPAWN ps | grep -q "^ *e2e-s6 .* app " || fail "a linuxserver image was not taken for an app: $($NSPAWN ps)"
+grep -q '^ProcessTwo' /etc/systemd/nspawn/e2e-s6.nspawn && fail "an s6-overlay image runs under the stub init"
+grep -q '^KillSignal=SIGTERM$' /etc/systemd/nspawn/e2e-s6.nspawn || fail "a PID 1 program does not get SIGTERM when its unit stops: $(cat /etc/systemd/nspawn/e2e-s6.nspawn)"
+[ "$(field_of e2e-s6 pid1)" = True ] || fail "inspect does not say the program is PID 1"
+retry 15 bash -c "[ \"\$($NSPAWN exec e2e-s6 -- cat /proc/1/comm </dev/null 2>/dev/null | tr -d '\r')\" = s6-svscan ]" || fail "s6-svscan is not PID 1: $(pid1_of e2e-s6); $($NSPAWN logs e2e-s6 2>&1 | tail -5)"
+retry 15 bash -c "$NSPAWN logs e2e-s6 | grep_q e2e-s6-cont-init-$nonce" || fail "the custom init script did not run: $($NSPAWN logs e2e-s6 | tail -20)"
+$NSPAWN logs e2e-s6 | grep_q "can only run as pid 1" && fail "s6 refused to run"
+[ "$($NSPAWN exec e2e-s6 -- id -u abc </dev/null | tr -d '\r')" = 1234 ] || fail "PUID did not reach the image's user"
+out=$($NSPAWN stop e2e-s6 2>&1) || fail "stop of the s6 machine: $out"
+echo "$out" | grep_q "ignored" && fail "s6 did not end on its stop signal: $out"
+[ "$(field_of e2e-s6 exit_code)" = 0 ] || fail "the s6 machine did not end with 0: $(field_of e2e-s6 exit_code)"
+$NSPAWN restart e2e-s6 >/dev/null || fail "restart of the s6 machine"
+retry 15 bash -c "[ \"\$($NSPAWN logs e2e-s6 | grep -c e2e-s6-cont-init-$nonce)\" -ge 2 ]" || fail "the s6 machine did not run its init again after a restart"
+# A unit stop, as systemctl or a shutdown gives it, reaches s6 as SIGTERM too.
+systemctl stop systemd-nspawn@e2e-s6.service || fail "systemctl stop of the s6 machine"
+[ "$(field_of e2e-s6 exit_code)" = 0 ] || fail "a unit stop did not end s6 cleanly: $(field_of e2e-s6 exit_code)"
+# --init puts the program under the stub init, where s6 refuses; --init=false gives it back.
+$NSPAWN start e2e-s6 --init >/dev/null 2>&1
+retry 10 bash -c "$NSPAWN logs e2e-s6 | grep_q 'can only run as pid 1'" || fail "--init did not put s6 under the stub init"
+retry 10 bash -c "! $NSPAWN ps | grep_q '^ *e2e-s6 '" || $NSPAWN stop e2e-s6 --force >/dev/null 2>&1
+[ "$(field_of e2e-s6 pid1)" = False ] || fail "inspect still says PID 1 after --init"
+$NSPAWN start e2e-s6 --init=false >/dev/null || fail "start --init=false"
+retry 15 bash -c "[ \"\$($NSPAWN exec e2e-s6 -- cat /proc/1/comm </dev/null 2>/dev/null | tr -d '\r')\" = s6-svscan ]" || fail "--init=false did not make s6 PID 1 again"
+$NSPAWN generate e2e-s6 | grep_q -- '--init=false' || fail "generate does not keep --init=false: $($NSPAWN generate e2e-s6)"
+$NSPAWN stop e2e-s6 >/dev/null || fail "stop after --init=false"
+$NSPAWN run -d --name e2e-s6u lscr.io/linuxserver/baseimage-ubuntu:noble >/dev/null || fail "run of the Ubuntu linuxserver base"
+retry 15 bash -c "[ \"\$($NSPAWN exec e2e-s6u -- cat /proc/1/comm </dev/null 2>/dev/null | tr -d '\r')\" = s6-svscan ]" || fail "s6-svscan is not PID 1 in the Ubuntu base: $($NSPAWN logs e2e-s6u 2>&1 | tail -5)"
+out=$($NSPAWN stop e2e-s6u 2>&1) || fail "stop of the Ubuntu s6 machine: $out"
+echo "$out" | grep_q "ignored" && fail "s6 of the Ubuntu base did not end on its stop signal: $out"
+$NSPAWN images rm e2e-s6 e2e-s6u >/dev/null || fail "images rm of the s6 machines"
+rm -rf $s6dir
+# Any app as PID 1: a program without a handler ignores SIGTERM there, as under docker, and
+# stop kills it after its timeout.
+$NSPAWN create $app e2e-pid1 --init=false -- /bin/sleep 300 >/dev/null || fail "create --init=false"
+$NSPAWN start e2e-pid1 >/dev/null || fail "start of a PID 1 program"
+retry 10 bash -c "[ \"\$($NSPAWN exec e2e-pid1 -- cat /proc/1/comm </dev/null 2>/dev/null | tr -d '\r')\" = sleep ]" || fail "sleep is not PID 1: $(pid1_of e2e-pid1)"
+out=$($NSPAWN stop e2e-pid1 -t 2 2>&1) || fail "stop of a PID 1 program: $out"
+echo "$out" | grep_q "ignored SIGTERM for 2 seconds; killing it" || fail "a PID 1 program without a handler was not killed after its timeout: $out"
+[ "$(field_of e2e-pid1 exit_code)" = 137 ] || fail "a killed PID 1 program does not report 137: $(field_of e2e-pid1 exit_code)"
+$NSPAWN start e2e-pid1 -- /bin/sh -c 'trap "exit 7" TERM; while :; do sleep 1; done' >/dev/null || fail "start of a PID 1 program that traps TERM"
+retry 10 bash -c "[ \"\$($NSPAWN exec e2e-pid1 -- cat /proc/1/comm </dev/null 2>/dev/null | tr -d '\r')\" = sh ]" || fail "sh is not PID 1"
+$NSPAWN kill -s TERM e2e-pid1 >/dev/null || fail "kill -s TERM of a PID 1 program"
+retry 10 bash -c "! $NSPAWN ps | grep_q '^ *e2e-pid1 '" || fail "a PID 1 program that traps TERM did not end on kill"
+[ "$(field_of e2e-pid1 exit_code)" = 7 ] || fail "the exit code of a PID 1 program: $(field_of e2e-pid1 exit_code)"
+$NSPAWN images rm e2e-pid1 >/dev/null || fail "images rm e2e-pid1"
 
 step "events: what happens to machines, as it happens and afterwards"
 since=$(date '+%Y-%m-%d %H:%M:%S')

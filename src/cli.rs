@@ -520,7 +520,10 @@ pub struct TuningArgs {
     /// it, straight from the program, and logs has nothing). Remembered.
     #[arg(long, value_name = "DRIVER", value_parser = ["local", "journal", "none"])]
     pub log_driver: Option<String>,
-    /// Accepted for docker's sake: nspawn's stub init reaps orphans anyway.
+    /// Run an app's program under an init that reaps orphans and turns a stop into
+    /// SIGTERM (systemd-nspawn's stub init), like docker --init; --init=false makes the
+    /// program PID 1 of the machine, as docker runs it. Without it, PID 1 only for images
+    /// that ask for it (s6-overlay). Remembered.
     #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     pub init: Option<bool>,
     /// A net.* sysctl for an app machine's network namespace, KEY=VALUE. Repeatable;

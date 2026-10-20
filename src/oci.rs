@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 pub enum Mode {
     /// The image contains systemd (or another init) and is booted with --boot.
     Boot,
-    /// The image's entrypoint runs under nspawn's stub init, as its child.
+    /// The image's entrypoint runs as a single program: under the stub init of
+    /// systemd-nspawn, or as PID 1 when the image or --init=false asks for it.
     App,
 }
 
@@ -34,7 +35,7 @@ pub enum ModeChoice {
     Auto,
     /// Boot the image's init system (systemd machines).
     Boot,
-    /// Run the image's entrypoint under nspawn's stub init (docker-style images).
+    /// Run the image's entrypoint as a single program (docker-style images).
     App,
 }
 
@@ -175,16 +176,33 @@ const INIT_PATHS: [&str; 4] = [
 /// directory hides the lower layers, and a symlink on the way counts as "not this layer"
 /// (it may point anywhere, the host included).
 pub fn has_init(trees: &[PathBuf]) -> bool {
-    INIT_PATHS.iter().any(|p| {
-        for tree in trees.iter().rev() {
-            match lookup(tree, Path::new(p)) {
-                Lookup::Present => return true,
-                Lookup::Hidden => return false,
-                Lookup::Absent => {}
-            }
+    INIT_PATHS.iter().any(|p| present(trees, p))
+}
+
+/// What s6-overlay installs (v3, then v2): its /init refuses to run unless it is PID 1.
+const PID1_MARKERS: [&str; 4] = [
+    "package/admin/s6-overlay",
+    "command/s6-overlay-suexec",
+    "etc/s6-overlay",
+    "etc/s6/init/init-stage1",
+];
+
+/// Whether the image's program must be PID 1 of the machine rather than the stub init's
+/// child, as its supervisor insists on reaping and shutting down the machine itself.
+pub fn needs_pid1(trees: &[PathBuf]) -> bool {
+    PID1_MARKERS.iter().any(|p| present(trees, p))
+}
+
+/// Whether `relative` exists in the merged view of `trees`, base first.
+fn present(trees: &[PathBuf], relative: &str) -> bool {
+    for tree in trees.iter().rev() {
+        match lookup(tree, Path::new(relative)) {
+            Lookup::Present => return true,
+            Lookup::Hidden => return false,
+            Lookup::Absent => {}
         }
-        false
-    })
+    }
+    false
 }
 
 enum Lookup {
@@ -233,7 +251,9 @@ fn lookup(tree: &Path, relative: &Path) -> Lookup {
     Lookup::Absent
 }
 
-/// Boot when there is an init and the image does not ask for something else to run.
+/// Boot when there is an init and the image does not ask for something else to run: a
+/// command naming the init where systemd-nspawn looks for it, or by its bare name. Any
+/// other program, an `/init` of the image's own among them, runs as an app.
 pub fn detect_mode(init_present: bool, command: &[String]) -> Mode {
     if !init_present {
         return Mode::App;
@@ -241,11 +261,11 @@ pub fn detect_mode(init_present: bool, command: &[String]) -> Mode {
     match command.first() {
         None => Mode::Boot,
         Some(argv0) => {
-            let base = Path::new(argv0)
-                .file_name()
-                .and_then(|f| f.to_str())
-                .unwrap_or(argv0);
-            if base == "init" || base == "systemd" {
+            let init = match argv0.strip_prefix('/') {
+                Some(path) => INIT_PATHS.contains(&path),
+                None => argv0 == "init" || argv0 == "systemd",
+            };
+            if init {
                 Mode::Boot
             } else {
                 Mode::App
@@ -352,6 +372,40 @@ mod tests {
         );
         assert_eq!(detect_mode(false, &s(&["/sbin/init"])), Mode::App);
         assert_eq!(detect_mode(false, &[]), Mode::App);
+        for init in ["/usr/sbin/init", "/lib/systemd/systemd", "init", "systemd"] {
+            assert_eq!(detect_mode(true, &s(&[init])), Mode::Boot, "{init}");
+        }
+        // s6-overlay's /init, in an Alpine base whose busybox gives /sbin/init too, is the
+        // image's program, not systemd-nspawn's init to boot.
+        for program in ["/init", "/bin/init", "/usr/bin/tini", "./init", "sbin/init"] {
+            assert_eq!(detect_mode(true, &s(&[program])), Mode::App, "{program}");
+        }
+    }
+
+    #[test]
+    fn s6_overlay_wants_pid1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("base");
+        let top = tmp.path().join("top");
+        std::fs::create_dir_all(base.join("package/admin/s6-overlay-3.2.0.2")).unwrap();
+        std::fs::create_dir_all(&top).unwrap();
+        assert!(!needs_pid1(&[base.clone(), top.clone()]));
+        std::os::unix::fs::symlink("s6-overlay-3.2.0.2", base.join("package/admin/s6-overlay"))
+            .unwrap();
+        assert!(needs_pid1(&[base.clone(), top.clone()]));
+        // v2 kept its stages under /etc/s6/init; a supervisor tree of /etc/s6 alone (as
+        // gitea's) runs anywhere.
+        let v2 = tmp.path().join("v2");
+        std::fs::create_dir_all(v2.join("etc/s6/gitea")).unwrap();
+        assert!(!needs_pid1(std::slice::from_ref(&v2)));
+        std::fs::create_dir_all(v2.join("etc/s6/init")).unwrap();
+        std::fs::write(v2.join("etc/s6/init/init-stage1"), "").unwrap();
+        assert!(needs_pid1(&[v2]));
+        // A layer that removes the overlay's directories takes the requirement away.
+        let removed = tmp.path().join("removed");
+        std::fs::create_dir_all(removed.join("package")).unwrap();
+        std::fs::write(removed.join("package/admin"), "").unwrap();
+        assert!(!needs_pid1(&[base, removed]));
     }
 
     #[test]

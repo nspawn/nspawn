@@ -62,7 +62,7 @@ pub(crate) async fn last_exit_code(
     Some(crate::api::run::exit_code(
         &ending,
         store.last_signal(&record.name),
-        record.mode == Mode::App,
+        record.under_stub_init(),
     ))
 }
 
@@ -687,6 +687,7 @@ pub async fn prepare(
             name,
             managed_userns,
             mode: record.mode,
+            pid1: record.program_is_pid1(),
             run: &record.run,
             command: &record.effective_command(),
             extra_env: &record.env,
@@ -801,8 +802,10 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     let sd = ctx.sd().await?;
     let unit = format!("systemd-nspawn@{}.service", args.name);
     let store = &ctx.store;
-    let mode = store.load_image(&args.name)?.map(|r| r.mode);
-    wait_for_previous(sd, &args.name, &unit, mode).await?;
+    let stub = store
+        .load_image(&args.name)?
+        .is_some_and(|r| r.under_stub_init());
+    wait_for_previous(sd, &args.name, &unit, stub).await?;
     let lock = store.lock().await?;
     // Again under the lock: another start may be preparing it, or it may be up by now.
     if store.is_starting(&args.name) {
@@ -1033,7 +1036,7 @@ pub fn apply_flags(r: &mut ImageRecord, args: &StartRequest) -> Result<()> {
     }
     args.tuning.apply(&mut r.tuning)?;
     if r.mode == Mode::Boot
-        && (r.tuning.user.is_some() || r.tuning.working_dir.is_some() || r.tuning.init)
+        && (r.tuning.user.is_some() || r.tuning.working_dir.is_some() || r.tuning.init.is_some())
     {
         bail!(
             "{} boots an init system; --user, --workdir and --init only apply to the program of an app image",
@@ -1423,7 +1426,8 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
                     .timeout
                     .or_else(|| record.as_ref().and_then(|r| r.tuning.stop_timeout))
                     .unwrap_or(10);
-                let (leader, payload) = wait_for_payload(sd, &args.name).await?;
+                let pid1 = record.as_ref().is_some_and(ImageRecord::program_is_pid1);
+                let (leader, payload) = wait_for_payload(sd, &args.name, pid1).await?;
                 store.mark_signal(&args.name, signal_number(&signal)?)?;
                 match payload {
                     Some(payload) => {
@@ -1503,17 +1507,17 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
     Ok(StopOutcome::Stopped)
 }
 
-/// An app's program (the stub init's child), which signals go to, never the whole cgroup: the stub init
-/// reboots on SIGINT and systemd-nspawn dies of SIGQUIT. Right after a start the child
-/// may still be systemd-nspawn's own, which a signal it does not handle ends before the
-/// program runs, and the machine with it: waits a few seconds at most for the stub to
-/// fork it and for it to execute the program, then takes the child as it is. Returns
-/// the leader too.
-async fn wait_for_payload(sd: &Systemd, name: &str) -> Result<(u32, Option<i32>)> {
+/// An app's program, which signals go to, never the whole cgroup: the stub init reboots
+/// on SIGINT and systemd-nspawn dies of SIGQUIT. The program is the stub init's child,
+/// or the leader itself when it runs as PID 1. Right after a start the process may still
+/// be systemd-nspawn's own, which a signal it does not handle ends before the program
+/// runs, and the machine with it: waits a few seconds at most for the program to be
+/// executed, then takes the process as it is. Returns the leader too.
+async fn wait_for_payload(sd: &Systemd, name: &str, pid1: bool) -> Result<(u32, Option<i32>)> {
     let leader = sd.machine_leader(name).await?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let payload = payload_pid(leader);
+        let payload = program_pid(leader, pid1);
         if running_program(payload, |pid| comm(pid as u32)).is_some() || Instant::now() > deadline {
             return Ok((leader, payload));
         }
@@ -1521,7 +1525,7 @@ async fn wait_for_payload(sd: &Systemd, name: &str) -> Result<(u32, Option<i32>)
     }
 }
 
-/// The stub init's child once it has executed the program; `comm` names a PID.
+/// The program once it has been executed; `comm` names a PID.
 fn running_program(payload: Option<i32>, comm: impl Fn(i32) -> Option<String>) -> Option<i32> {
     payload.filter(|&pid| comm(pid).is_some_and(|name| !in_nspawn_setup(&name)))
 }
@@ -1579,7 +1583,8 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
     }
     let delivered: Result<()> = async {
         if mode == Some(Mode::App) {
-            let (leader, payload) = wait_for_payload(sd, &args.name).await?;
+            let pid1 = record.as_ref().is_some_and(ImageRecord::program_is_pid1);
+            let (leader, payload) = wait_for_payload(sd, &args.name, pid1).await?;
             let payload = payload.with_context(|| {
                 format!(
                     "{} has no program running under its init (leader PID {leader})",
@@ -1752,7 +1757,7 @@ fn stop_signals(record: Option<&ImageRecord>) -> Result<Vec<i32>> {
 /// Waits, within reason, until nothing of the previous run is left: a unit shutting
 /// down, a machine machined still lists, a release hook that would undo what the start
 /// prepares. A machine that really runs, or starts elsewhere, is an error.
-async fn wait_for_previous(sd: &Systemd, name: &str, unit: &str, mode: Option<Mode>) -> Result<()> {
+async fn wait_for_previous(sd: &Systemd, name: &str, unit: &str, stub: bool) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let state = sd.unit_status(unit).await?;
@@ -1767,7 +1772,7 @@ async fn wait_for_previous(sd: &Systemd, name: &str, unit: &str, mode: Option<Mo
             bail!("machine {name} is already starting; see journalctl -u {unit}");
         }
         match active.as_str() {
-            "active" | "activating" if registered && machine_alive(sd, name, mode).await => {
+            "active" | "activating" if registered && machine_alive(sd, name, stub).await => {
                 if active == "activating" {
                     bail!("machine {name} is already starting");
                 }
@@ -1784,15 +1789,16 @@ async fn wait_for_previous(sd: &Systemd, name: &str, unit: &str, mode: Option<Mo
     }
 }
 
-/// The leader, and for an app its program: the leader outlives it for a moment.
-async fn machine_alive(sd: &Systemd, name: &str, mode: Option<Mode>) -> bool {
+/// The leader, and for an app under the stub init its program: the stub outlives it for
+/// a moment.
+async fn machine_alive(sd: &Systemd, name: &str, stub: bool) -> bool {
     let Ok(leader) = sd.machine_leader(name).await else {
         return false;
     };
     if !std::path::Path::new(&format!("/proc/{leader}")).exists() {
         return false;
     }
-    mode != Some(Mode::App) || payload_pid(leader).is_some()
+    !stub || payload_pid(leader).is_some()
 }
 
 /// Repeats the poweroff request every couple of seconds: right after a start the init may
@@ -1865,13 +1871,38 @@ pub fn signal_number(name: &str) -> Result<i32> {
     Ok(signal as i32)
 }
 
-pub async fn signal_program(sd: &Systemd, name: &str, signal: i32) -> Result<()> {
-    let (leader, payload) = wait_for_payload(sd, name).await?;
+/// A signal as systemd writes it (SIGTERM, SIGRTMIN+3), from any form `signal_number`
+/// takes; systemd's own parser wants its case and its realtime notation.
+pub fn signal_name(name: &str) -> Result<String> {
+    let number = signal_number(name)?;
+    if number == libc::SIGRTMIN() {
+        return Ok("SIGRTMIN".to_string());
+    }
+    if number > libc::SIGRTMIN() {
+        return Ok(format!("SIGRTMIN+{}", number - libc::SIGRTMIN()));
+    }
+    let signal = nix::sys::signal::Signal::try_from(number)
+        .map_err(|_| anyhow::anyhow!("unknown signal {name}"))?;
+    Ok(signal.as_str().to_string())
+}
+
+pub async fn signal_program(sd: &Systemd, name: &str, pid1: bool, signal: i32) -> Result<()> {
+    let (leader, payload) = wait_for_payload(sd, name, pid1).await?;
     let payload = payload.with_context(|| {
         format!("{name} has no program running under its init (leader PID {leader})")
     })?;
     send_signal(payload, signal)
         .with_context(|| format!("sending signal {signal} to PID {payload} of {name}"))
+}
+
+/// The process of an app's program: the leader when it runs as PID 1, the stub init's
+/// child otherwise.
+fn program_pid(leader: u32, pid1: bool) -> Option<i32> {
+    if pid1 {
+        i32::try_from(leader).ok()
+    } else {
+        payload_pid(leader)
+    }
 }
 
 /// The stub init's child: from the kernel's children list, or else the oldest child by
@@ -2368,6 +2399,44 @@ mod tests {
         assert!(signal_number("SIGRTMIN+200").is_err());
         assert!(signal_number("0").is_err());
         assert!(signal_number("SIGBOGUS").is_err());
+        for (text, name) in [
+            ("term", "SIGTERM"),
+            ("3", "SIGQUIT"),
+            ("SIGRTMIN", "SIGRTMIN"),
+            ("RTMAX-1", "SIGRTMIN+29"),
+        ] {
+            assert_eq!(signal_name(text).unwrap(), name, "{text}");
+        }
+        assert!(signal_name("SIGBOGUS").is_err());
+    }
+
+    #[test]
+    fn whose_program_is_pid1() {
+        let record = |json: &str| serde_json::from_str::<ImageRecord>(json).unwrap();
+        let base = r#""name": "web", "reference": "r", "manifest_digest": "d", "layers": [], "backend": "overlay", "created": 0"#;
+        // (mode, the image's s6-overlay, --init) -> PID 1
+        for (mode, pid1, init, expected) in [
+            ("app", false, None, false),
+            ("app", true, None, true),
+            ("app", true, Some(true), false),
+            ("app", false, Some(false), true),
+            ("app", false, Some(true), false),
+            ("boot", true, Some(false), false),
+        ] {
+            let init = init.map_or(String::new(), |i| format!(r#", "tuning": {{"init": {i}}}"#));
+            let r = record(&format!(
+                r#"{{{base}, "mode": "{mode}", "pid1": {pid1}{init}}}"#
+            ));
+            assert_eq!(r.program_is_pid1(), expected, "{mode} {pid1} {init}");
+            assert_eq!(r.under_stub_init(), mode == "app" && !expected);
+        }
+        // An older record says nothing of either: the stub, as before.
+        assert!(record(&format!(r#"{{{base}, "mode": "app"}}"#)).under_stub_init());
+        // What an older nspawn wrote for --init still reads as --init.
+        let old = record(&format!(
+            r#"{{{base}, "mode": "app", "tuning": {{"init": true}}}}"#
+        ));
+        assert_eq!(old.tuning.init, Some(true));
     }
 
     #[test]
