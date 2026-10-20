@@ -1,0 +1,372 @@
+//! The commands of nspawn compose that drive machines: a project's services become
+//! machines of nspawn's, its networks, volumes and secrets nspawn's own, all through
+//! the org.nspawn bus as the command line drives them. A project is known by the
+//! labels of its machines.
+
+mod convert;
+mod info;
+mod lifecycle;
+mod logs;
+mod progress;
+mod up;
+
+use std::collections::BTreeMap;
+
+use anyhow::{bail, Context as _, Result};
+
+use super::cli::{ComposeArgs, ComposeCommand};
+use super::config::Host;
+use super::project::Project;
+use super::Log;
+use crate::client::{self, Client, Dict};
+
+pub use progress::Progress;
+
+/// The labels a project puts on what it makes.
+pub mod label {
+    pub const PROJECT: &str = "com.docker.compose.project";
+    pub const SERVICE: &str = "com.docker.compose.service";
+    pub const NUMBER: &str = "com.docker.compose.container-number";
+    pub const ONEOFF: &str = "com.docker.compose.oneoff";
+    pub const CONFIG_HASH: &str = "com.docker.compose.config-hash";
+    pub const WORKING_DIR: &str = "com.docker.compose.project.working_dir";
+    pub const CONFIG_FILES: &str = "com.docker.compose.project.config_files";
+    pub const ENV_FILE: &str = "com.docker.compose.project.environment_file";
+    pub const DEPENDS_ON: &str = "com.docker.compose.depends_on";
+    pub const IMAGE: &str = "com.docker.compose.image";
+    pub const VERSION: &str = "com.docker.compose.version";
+    pub const NETWORK: &str = "com.docker.compose.network";
+}
+
+/// The docker compose release nspawn compose stamps its machines with.
+fn compose_version() -> &'static str {
+    super::support::DOCKER_COMPOSE.trim_start_matches('v')
+}
+
+/// What a command works with: the bus, the project (or its name alone, for the
+/// commands that work from the labels), and where its progress goes.
+pub struct Engine<'a> {
+    pub client: Client,
+    pub name: String,
+    pub project: Option<Project>,
+    pub progress: Progress,
+    pub args: &'a ComposeArgs,
+    pub log: &'a dyn Log,
+}
+
+/// A machine of the project, as ListMachines has it.
+#[derive(Debug, Clone)]
+pub struct Machine {
+    pub name: String,
+    pub service: String,
+    pub number: u32,
+    pub oneoff: bool,
+    /// machined's state, or the service's for one it does not list: running, stopped,
+    /// starting, restarting, closing, paused.
+    pub state: String,
+    pub health: String,
+    pub exit_code: Option<i32>,
+    pub labels: BTreeMap<String, String>,
+    pub created: u64,
+    pub started: u64,
+    pub dict: Dict,
+}
+
+impl Machine {
+    fn from_dict(dict: Dict) -> Machine {
+        let labels: BTreeMap<String, String> = dict
+            .get("labels")
+            .and_then(|v| std::collections::HashMap::<String, String>::try_from(v.clone()).ok())
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default();
+        let number = labels
+            .get(label::NUMBER)
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        Machine {
+            name: client::string(&dict, "name"),
+            service: labels.get(label::SERVICE).cloned().unwrap_or_default(),
+            number,
+            oneoff: labels.get(label::ONEOFF).is_some_and(|v| v == "True"),
+            state: client::string(&dict, "state"),
+            health: client::string(&dict, "health"),
+            exit_code: dict
+                .get("exit_code")
+                .and_then(|v| i32::try_from(v.clone()).ok()),
+            labels,
+            created: client::u64(&dict, "created"),
+            started: client::u64(&dict, "started"),
+            dict,
+        }
+    }
+
+    pub fn running(&self) -> bool {
+        matches!(self.state.as_str(), "running" | "paused" | "opening")
+    }
+
+    pub fn label(&self, key: &str) -> &str {
+        self.labels.get(key).map(String::as_str).unwrap_or("")
+    }
+
+    pub fn string(&self, key: &str) -> String {
+        client::string(&self.dict, key)
+    }
+
+    pub fn strings(&self, key: &str) -> Vec<String> {
+        client::strings(&self.dict, key)
+    }
+}
+
+impl Engine<'_> {
+    /// Every machine of the project, one-offs too, by name.
+    pub async fn machines(&self) -> Result<Vec<Machine>> {
+        let mut machines: Vec<Machine> = self
+            .client
+            .manager
+            .list_machines(true)
+            .await
+            .map_err(client::error)?
+            .into_iter()
+            .map(Machine::from_dict)
+            .filter(|m| m.labels.get(label::PROJECT) == Some(&self.name))
+            .collect();
+        machines.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(machines)
+    }
+
+    /// The project, for the commands that need one.
+    pub fn project(&self) -> &Project {
+        self.project
+            .as_ref()
+            .expect("the commands that make machines load their project")
+    }
+
+    pub fn warn(&self, text: String) {
+        self.log.warn(text);
+    }
+}
+
+/// The name of the machine of a service's replica: `container_name` where it has one,
+/// `PROJECT-SERVICE-N` otherwise, each `_` written `-` since machined takes none.
+pub fn machine_name(project: &str, service: &str, container_name: &str, number: u32) -> String {
+    let name = if container_name.is_empty() {
+        format!("{project}-{service}-{number}")
+    } else {
+        container_name.to_string()
+    };
+    name.replace('_', "-")
+}
+
+/// Whether machined takes a name: letters, digits, `-` and `.`, up to 64, as a host name.
+pub fn valid_machine_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        && !name.starts_with(['-', '.'])
+}
+
+/// An image of a compose file as nspawn's registry client reads it: one that names no
+/// registry comes from Docker Hub, an official one under library/.
+pub fn image_reference(image: &str) -> Result<crate::reference::ImageRef> {
+    let first = image.split('/').next().unwrap_or("");
+    let has_registry =
+        image.contains('/') && (first.contains('.') || first.contains(':') || first == "localhost");
+    let full = if has_registry {
+        image.to_string()
+    } else if image.contains('/') {
+        format!("docker.io/{image}")
+    } else {
+        format!("docker.io/library/{image}")
+    };
+    crate::reference::ImageRef::parse(&full, "docker.io").with_context(|| format!("image {image}"))
+}
+
+/// Runs a command that drives machines; the error is the line to print.
+pub fn execute(
+    args: &ComposeArgs,
+    host: &mut Host,
+    flags: &super::options::Flags,
+    log: &dyn Log,
+    out: &mut dyn std::io::Write,
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime
+        .block_on(dispatch(args, host, flags, log, out))
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// The services a command names.
+fn named(command: &ComposeCommand) -> Vec<String> {
+    use ComposeCommand as C;
+    match command {
+        C::Create(c) => c.service.clone(),
+        C::Down(c) => c.service.clone(),
+        C::Events(c) => c.service.clone(),
+        C::Images(c) => c.service.clone(),
+        C::Kill(c) => c.service.clone(),
+        C::Logs(c) => c.service.clone(),
+        C::Pause(c) => c.service.clone(),
+        C::Ps(c) => c.service.clone(),
+        C::Pull(c) => c.service.clone(),
+        C::Restart(c) => c.service.clone(),
+        C::Rm(c) => c.service.clone(),
+        C::Start(c) => c.service.clone(),
+        C::Stats(c) => c.service.clone(),
+        C::Stop(c) => c.service.clone(),
+        C::Top(c) => c.service.clone(),
+        C::Unpause(c) => c.service.clone(),
+        C::Up(c) => c.service.clone(),
+        C::Volumes(c) => c.service.clone(),
+        C::Wait(c) => c.service.clone(),
+        C::Exec(c) => c.service.iter().cloned().collect(),
+        C::Port(c) => c.service.iter().cloned().collect(),
+        C::Run(c) => c.service.iter().cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// How a command finds its project: loaded with its services (up, create, run, pull,
+/// scale), or by name when no file is given and -p is (down, ps, logs and the others,
+/// projectOrName), or by name alone (ls).
+enum Wants {
+    Project,
+    ProjectOrName,
+    Nothing,
+}
+
+fn wants(command: &ComposeCommand) -> Wants {
+    use ComposeCommand as C;
+    match command {
+        C::Up(_)
+        | C::Create(_)
+        | C::Run(_)
+        | C::Pull(_)
+        | C::Scale(_)
+        | C::Exec(_)
+        | C::Port(_)
+        | C::Cp(_)
+        | C::Images(_)
+        | C::Top(_)
+        | C::Stats(_) => Wants::Project,
+        C::Ls(_) => Wants::Nothing,
+        _ => Wants::ProjectOrName,
+    }
+}
+
+async fn dispatch(
+    args: &ComposeArgs,
+    host: &mut Host,
+    flags: &super::options::Flags,
+    log: &dyn Log,
+    out: &mut dyn std::io::Write,
+) -> Result<()> {
+    let command = args.command.as_ref().expect("a command");
+    let services = named(command);
+    let mut warnings = Vec::new();
+    let (name, project) = {
+        let mut warn = |w: String| warnings.push(w);
+        match wants(command) {
+            Wants::Nothing => (String::new(), None),
+            Wants::Project => {
+                let project = super::config::project_for(args, flags, host, &services, &mut warn)
+                    .map_err(anyhow::Error::msg)?;
+                (project.name.clone(), Some(project))
+            }
+            Wants::ProjectOrName => {
+                let given = args.project_name.clone().unwrap_or_default();
+                if args.file.is_empty() && !given.is_empty() {
+                    (given, None)
+                } else {
+                    match super::config::project_for(args, flags, host, &services, &mut warn) {
+                        Ok(project) => (project.name.clone(), Some(project)),
+                        Err(e) => match host.env.get("COMPOSE_PROJECT_NAME") {
+                            Some(name) if !name.is_empty() => (name.clone(), None),
+                            _ => bail!(e),
+                        },
+                    }
+                }
+            }
+        }
+    };
+    for w in warnings {
+        log.warn(w);
+    }
+    let client = Client::connect().await?;
+    let mut engine = Engine {
+        client,
+        name,
+        project,
+        progress: Progress::new(args, host),
+        args,
+        log,
+    };
+    use ComposeCommand as C;
+    match command {
+        C::Up(c) => up::up(&mut engine, c).await,
+        C::Create(c) => up::create(&mut engine, c).await,
+        C::Pull(c) => up::pull(&mut engine, c).await,
+        C::Scale(c) => up::scale(&mut engine, c).await,
+        C::Run(c) => logs::run(&mut engine, c).await,
+        C::Down(c) => lifecycle::down(&mut engine, c).await,
+        C::Start(c) => lifecycle::start(&mut engine, c).await,
+        C::Stop(c) => lifecycle::stop(&mut engine, c).await,
+        C::Restart(c) => lifecycle::restart(&mut engine, c).await,
+        C::Kill(c) => lifecycle::kill(&mut engine, c).await,
+        C::Pause(c) => lifecycle::pause(&mut engine, &c.service, true).await,
+        C::Unpause(c) => lifecycle::pause(&mut engine, &c.service, false).await,
+        C::Rm(c) => lifecycle::rm(&mut engine, c).await,
+        C::Wait(c) => lifecycle::wait(&mut engine, c).await,
+        C::Ps(c) => info::ps(&mut engine, c, out).await,
+        C::Ls(c) => info::ls(&mut engine, c, out).await,
+        C::Images(c) => info::images(&mut engine, c, out).await,
+        C::Top(c) => info::top(&mut engine, c, out).await,
+        C::Port(c) => info::port(&mut engine, c, out).await,
+        C::Volumes(c) => info::volumes(&mut engine, c, out).await,
+        C::Stats(c) => info::stats(&mut engine, c, out).await,
+        C::Events(c) => info::events(&mut engine, c, out).await,
+        C::Logs(c) => logs::logs(&mut engine, c).await,
+        C::Exec(c) => logs::exec(&mut engine, c).await,
+        C::Cp(c) => logs::cp(&mut engine, c).await,
+        C::Config(_) | C::Version(_) => unreachable!("not a command that drives machines"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn machines_are_named_as_docker_compose_names_containers() {
+        assert_eq!(machine_name("demo", "web", "", 1), "demo-web-1");
+        assert_eq!(machine_name("my_app", "db_main", "", 2), "my-app-db-main-2");
+        assert_eq!(
+            machine_name("ejabberd", "postgres", "ejabberd_postgres", 1),
+            "ejabberd-postgres"
+        );
+        assert!(valid_machine_name("ejabberd-postgres"));
+        assert!(!valid_machine_name("a_b"));
+        assert!(!valid_machine_name(&"x".repeat(65)));
+        assert!(!valid_machine_name("-x"));
+    }
+
+    #[test]
+    fn images_come_from_docker_hub_unless_they_name_a_registry() {
+        let r = image_reference("postgres:18-alpine").unwrap();
+        assert_eq!(r.to_string(), "docker.io/library/postgres:18-alpine");
+        assert_eq!(r.local_name(), "postgres-18-alpine");
+        let r = image_reference("lucaslorentz/caddy-docker-proxy:2.13-alpine").unwrap();
+        assert_eq!(
+            r.to_string(),
+            "docker.io/lucaslorentz/caddy-docker-proxy:2.13-alpine"
+        );
+        let r = image_reference("ghcr.io/processone/ejabberd").unwrap();
+        assert_eq!(r.to_string(), "ghcr.io/processone/ejabberd:latest");
+        let r = image_reference("localhost/x:1").unwrap();
+        assert_eq!(r.registry, "localhost");
+    }
+}

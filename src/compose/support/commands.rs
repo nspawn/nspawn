@@ -17,17 +17,8 @@ const fn option(command: &'static str, name: &'static str, support: Support) -> 
 
 const BUILD: &str = "nspawn runs published images and does not build Dockerfiles";
 const NO_ANONYMOUS: &str = "nspawn has no anonymous volumes";
-const DIGESTS: &str = "images are not pinned to their digests yet";
 const VERSION: &str =
     "--short and json give the docker compose release it matches; the plain form names nspawn's version too";
-
-/// The commands of docker compose that nspawn compose does not have yet: they are
-/// refused, whatever the table decides for when they come.
-pub static NOT_YET: &[&str] = &[
-    "cp", "create", "down", "events", "exec", "images", "kill", "logs", "ls", "pause", "port",
-    "ps", "pull", "restart", "rm", "run", "scale", "start", "stats", "stop", "top", "unpause",
-    "up", "volumes", "wait",
-];
 
 pub static COMMANDS: &[Command] = &[
     command("alpha", Refused("alpha is not supported by nspawn compose")),
@@ -89,7 +80,7 @@ pub static COMMANDS: &[Command] = &[
 ];
 
 pub static OPTIONS: &[Opt] = &[
-    // docker compose itself.
+    // The global options, before any command.
     option("", "all-resources", Full),
     option("", "ansi", Full),
     option(
@@ -119,7 +110,7 @@ pub static OPTIONS: &[Opt] = &[
     option("config", "format", Full),
     option("config", "hash", Full),
     option("config", "images", Full),
-    option("config", "lock-image-digests", Refused(DIGESTS)),
+    option("config", "lock-image-digests", Full),
     option("config", "models", Full),
     option("config", "networks", Full),
     option("config", "no-consistency", Full),
@@ -130,7 +121,7 @@ pub static OPTIONS: &[Opt] = &[
     option("config", "output", Full),
     option("config", "profiles", Full),
     option("config", "quiet", Full),
-    option("config", "resolve-image-digests", Refused(DIGESTS)),
+    option("config", "resolve-image-digests", Full),
     option("config", "services", Full),
     option("config", "variables", Full),
     option("config", "volumes", Full),

@@ -126,8 +126,13 @@ term_use_generic_ptys(nspawn_t)
 
 # Registries: TLS to any port, the host's resolver and its certificates.
 corenet_tcp_connect_all_ports(nspawn_t)
+# A port published with -p is bound for a moment to see that no service of the host
+# has it: any port, tcp or udp, as docker's -p takes them all.
 corenet_tcp_bind_generic_node(nspawn_t)
-corenet_tcp_bind_all_unreserved_ports(nspawn_t)
+corenet_tcp_bind_all_ports(nspawn_t)
+allow nspawn_t self:udp_socket create_socket_perms;
+corenet_udp_bind_generic_node(nspawn_t)
+corenet_udp_bind_all_ports(nspawn_t)
 sysnet_dns_name_resolve(nspawn_t)
 sysnet_read_config(nspawn_t)
 miscfiles_read_generic_certs(nspawn_t)

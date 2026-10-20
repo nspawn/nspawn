@@ -1,0 +1,32 @@
+{
+  "jobs": {
+    "migrate": {
+      "image": "docker.io/library/postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "volumes": [
+        {
+          "source": "docker.io/library/busybox@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "target": "/tools",
+          "type": "image"
+        }
+      ]
+    }
+  },
+  "services": {
+    "db": {
+      "image": "ghcr.io/example/db@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    "web": {
+      "image": "docker.io/library/busybox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "volumes": [
+        {
+          "image": {
+            "subpath": "www"
+          },
+          "source": "docker.io/library/alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "target": "/assets",
+          "type": "image"
+        }
+      ]
+    }
+  }
+}

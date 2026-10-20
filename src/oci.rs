@@ -102,7 +102,9 @@ impl RunSpec {
 
     /// Refuses a config whose values carry control characters: they go into the
     /// machine's settings file, which is line based, and an image does not get to
-    /// write directives there (a newline in WorkingDir would be one).
+    /// write directives there (a newline in WorkingDir would be one). A tab in what
+    /// the file quotes (the program's arguments, the environment) is a character like
+    /// any other.
     pub fn check_plain(&self) -> Result<()> {
         let fields = [
             ("Entrypoint", &self.entrypoint[..]),
@@ -111,7 +113,7 @@ impl RunSpec {
         ];
         for (field, values) in fields {
             for value in values {
-                plain(field, value)?;
+                plain(field, value, true)?;
             }
         }
         for (field, value) in [
@@ -120,7 +122,7 @@ impl RunSpec {
             ("StopSignal", &self.stop_signal),
         ] {
             if let Some(value) = value {
-                plain(field, value)?;
+                plain(field, value, false)?;
             }
         }
         Ok(())
@@ -148,8 +150,11 @@ impl RunSpec {
     }
 }
 
-fn plain(field: &str, value: &str) -> Result<()> {
-    if value.chars().any(char::is_control) {
+fn plain(field: &str, value: &str, quoted: bool) -> Result<()> {
+    if value
+        .chars()
+        .any(|c| c.is_control() && !(quoted && c == '\t'))
+    {
         anyhow::bail!(
             "the image config's {field} holds a control character ({value:?}); refusing the image"
         );
@@ -323,11 +328,13 @@ mod tests {
                 "{field}: {err}"
             );
         }
-        let tab = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{"Cmd":["a	b"]}}"#;
-        assert!(
-            RunSpec::from_config(tab).is_err(),
-            "a tab is a control character too"
-        );
+        // A tab in what the settings file quotes is kept, as postgres:18-alpine has one
+        // in its Env; elsewhere it is refused like the rest.
+        let tab = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{"Cmd":["a\tb"],"Env":["DEPS=llvm21-dev \tclang21"]}}"#;
+        let spec = RunSpec::from_config(tab).unwrap();
+        assert_eq!(spec.env, ["DEPS=llvm21-dev \tclang21"]);
+        let tab = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{"WorkingDir":"/a\tb"}}"#;
+        assert!(RunSpec::from_config(tab).is_err());
     }
 
     #[test]

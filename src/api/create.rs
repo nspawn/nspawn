@@ -185,7 +185,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
             crate::api::network::parse_aliases(&request.aliases, &bridge::networks_of(&draft))?;
     }
     if let Some(entrypoint) = &request.entrypoint {
-        volume::reject_control_characters(entrypoint)?;
+        volume::reject_control_characters_but_tab(entrypoint)?;
         draft.entrypoint = Some(if entrypoint.is_empty() {
             Vec::new()
         } else {
@@ -197,7 +197,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     draft.cmd = None;
     if !request.command.is_empty() {
         for arg in &request.command {
-            volume::reject_control_characters(arg)?;
+            volume::reject_control_characters_but_tab(arg)?;
         }
         draft.cmd = Some(request.command.clone());
     }

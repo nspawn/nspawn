@@ -1,4 +1,4 @@
-//! What docker compose takes from Go libraries, done the same way: splitting a command
+//! What the compose CLI takes from Go libraries, done the same way: splitting a command
 //! line (go-shellwords), sizes (go-units), durations (go-str2duration and Go's
 //! time.Duration), port specs (go-connections) and Go's quoting.
 

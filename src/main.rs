@@ -60,7 +60,7 @@ fn main() {
 
 #[tokio::main]
 async fn run() {
-    // nspawn compose reads its arguments as docker compose reads its own, not as clap does.
+    // nspawn compose reads its arguments by rules of its own, which are not clap's.
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if let Some(args) = compose::arguments(&argv) {
         std::process::exit(compose::main(&args));

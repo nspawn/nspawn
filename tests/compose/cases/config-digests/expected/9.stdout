@@ -1,0 +1,4 @@
+busybox:1.36@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+localhost:5000/tools/init@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+ghcr.io/example/db@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+index.docker.io/library/postgres:18@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

@@ -1,7 +1,6 @@
 //! The model of a compose file between its stages, as compose-go keeps it: the values
 //! go-yaml decodes into `any`, mappings keyed by strings. Scalars keep the type YAML
-//! gave them until a stage converts them, and print as Go prints them, since that is
-//! what docker compose shows of them.
+//! gave them until a stage converts them, and print as Go prints them.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -82,8 +81,8 @@ impl Value {
     }
 }
 
-/// A scalar as Go's fmt prints it with %v: what docker compose writes of a number or a
-/// date where a string goes.
+/// A scalar as Go's fmt prints it with %v: how a number or a date is written where a
+/// string goes.
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

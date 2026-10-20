@@ -2,10 +2,10 @@
 //! org.nspawn service on the system bus; only the service itself, its installation and
 //! the hooks the machine units call run the library in this process.
 
-mod copy;
+pub(crate) mod copy;
 mod login;
-mod machines;
-mod stats;
+pub(crate) mod machines;
+pub(crate) mod stats;
 
 use anyhow::{bail, Context as _, Result};
 use zbus::zvariant::Value;

@@ -1,0 +1,39 @@
+{
+  "jobs": {
+    "migrate": {
+      "command": null,
+      "entrypoint": null,
+      "image": "index.docker.io/library/postgres:18@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "volumes": [
+        {
+          "type": "image",
+          "source": "docker.io/library/busybox@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "target": "/tools"
+        }
+      ]
+    }
+  },
+  "name": "",
+  "services": {
+    "db": {
+      "command": null,
+      "entrypoint": null,
+      "image": "ghcr.io/example/db@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    },
+    "web": {
+      "command": null,
+      "entrypoint": null,
+      "image": "docker.io/library/busybox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "volumes": [
+        {
+          "type": "image",
+          "source": "docker.io/library/alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "target": "/assets",
+          "image": {
+            "subpath": "www"
+          }
+        }
+      ]
+    }
+  }
+}

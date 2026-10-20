@@ -122,7 +122,7 @@ fn run(dir: &Path, n: usize, line: &str) -> Result<(), String> {
         super::Line::Help(_) => Ok(()),
         super::Line::Error { message, .. } => Err(message),
     };
-    // docker compose's notices come before its error, on the same stream.
+    // The notices come before the error, on the same stream.
     let result = result.map_err(|e| format!("{}{e}", record.notices.borrow()));
     let warnings = record.warnings.into_inner();
     let local = |text: &str| text.replace(&real_dir, &virtual_dir);

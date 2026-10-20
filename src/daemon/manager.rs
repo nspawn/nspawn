@@ -1041,6 +1041,23 @@ impl Manager {
         Ok(api::hub::tags(&ctx, &repository).await?)
     }
 
+    /// The digest a reference names on its registry now, an index's for a tag of
+    /// several platforms, without pulling it: what compose config pins images to.
+    /// Options: registry (s), ca_cert (s).
+    async fn image_digest(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        reference: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<String> {
+        let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
+        let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
+        options.finish()?;
+        Ok(api::hub::digest(&ctx, &reference).await?)
+    }
+
     /// Like `ps` (and `ps -a` with `all`): every machine with its state, started time,
     /// leader, os and, when nspawn installed its image, the image's record and
     /// machine_path, its object in machined.

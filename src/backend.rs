@@ -323,6 +323,19 @@ pub fn mount_point_root(store: &Store, name: &str, backend: BackendChoice) -> Re
     }
 }
 
+/// An empty /usr in a machine's root that has none, as an image built from scratch need
+/// not: systemd-nspawn runs a program only in a root with /usr. True when it was made.
+pub fn ensure_usr(store: &Store, name: &str, backend: BackendChoice) -> Result<bool> {
+    if root_has(store, name, backend, "usr", |_| true) {
+        return Ok(false);
+    }
+    ensure_mount_points(
+        &mount_point_root(store, name, backend)?,
+        &[("/usr".to_string(), true)],
+    )?;
+    Ok(true)
+}
+
 /// Whether `relative` is in the root systemd-nspawn gives the machine, and `test` holds
 /// for what is there (a symlink is looked at, not followed: its target is the image's,
 /// not the host's): the assembled root, or any layer of an mstack tree, whose layers
@@ -733,6 +746,29 @@ mod tests {
         assert!(fs::read_dir(&outside).unwrap().next().is_none());
         assert!(ensure_mount_points(&root, &[("/a/../b".to_string(), true)]).is_err());
         assert!(ensure_mount_points(&root, &[("relative".to_string(), true)]).is_err());
+    }
+
+    #[test]
+    fn a_root_without_usr_gets_an_empty_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let root = store.machines_dir.join("scratch");
+        fs::create_dir_all(root.join("app")).unwrap();
+        assert!(ensure_usr(&store, "scratch", BackendChoice::Flat).unwrap());
+        assert!(root.join("usr").is_dir());
+        assert_eq!(fs::read_dir(root.join("usr")).unwrap().count(), 0);
+        assert!(!ensure_usr(&store, "scratch", BackendChoice::Flat).unwrap());
+        // A /usr of the image's own stays as it is, a link included.
+        let linked = store.machines_dir.join("linked");
+        fs::create_dir_all(linked.join("opt")).unwrap();
+        std::os::unix::fs::symlink("opt", linked.join("usr")).unwrap();
+        assert!(!ensure_usr(&store, "linked", BackendChoice::Flat).unwrap());
+        assert!(linked
+            .join("usr")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

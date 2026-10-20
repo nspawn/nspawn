@@ -61,6 +61,7 @@ pub trait Manager {
         options: Options<'_>,
     ) -> zbus::Result<Vec<Dict>>;
     fn list_tags(&self, repository: &str, options: Options<'_>) -> zbus::Result<Vec<String>>;
+    fn image_digest(&self, reference: &str, options: Options<'_>) -> zbus::Result<String>;
     fn list_machines(&self, all: bool) -> zbus::Result<Vec<Dict>>;
     fn get_machine(&self, name: &str) -> zbus::Result<Dict>;
     fn machine_stats(&self, names: &[String]) -> zbus::Result<Vec<Dict>>;
@@ -339,6 +340,20 @@ impl Client {
         watch.finish(job).await
     }
 
+    /// `run_job` without its lines, for a caller that says what happens its own way; a
+    /// transfer still draws its bar on a terminal, unless `quiet`.
+    pub async fn run_job_silent<F, Fut>(&self, start: F, quiet: bool) -> Result<Dict>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = zbus::Result<OwnedObjectPath>>,
+    {
+        let mut watch = self.watch_jobs().await?;
+        watch.silent = true;
+        watch.bars = !quiet;
+        let job = start().await.map_err(error)?;
+        watch.finish(job).await
+    }
+
     /// Starts listening to the job signals, for a call that returns a job together with
     /// something else (a stream) and cannot go through `run_job`.
     pub async fn watch_jobs(&self) -> Result<JobWatch> {
@@ -361,6 +376,8 @@ impl Client {
         Ok(JobWatch {
             connection: self.connection.clone(),
             lines_to_stderr: false,
+            silent: false,
+            bars: true,
             output,
             progress,
             removed,
@@ -375,6 +392,10 @@ pub struct JobWatch {
     /// Every line to standard error, which then carries nothing but what a command's
     /// own program writes (run).
     lines_to_stderr: bool,
+    /// No line at all.
+    silent: bool,
+    /// The bars of transfers, on a terminal.
+    bars: bool,
     output: JobOutputStream,
     progress: JobProgressStream,
     removed: JobRemovedStream,
@@ -387,7 +408,7 @@ impl JobWatch {
     /// its error.
     pub async fn finish(mut self, job: OwnedObjectPath) -> Result<Dict> {
         let mut transfers = Transfers::new(
-            std::io::IsTerminal::is_terminal(&std::io::stderr())
+            (self.bars && std::io::IsTerminal::is_terminal(&std::io::stderr()))
                 .then_some(indicatif::ProgressDrawTarget::stderr),
         );
         let result = loop {
@@ -407,6 +428,7 @@ impl JobWatch {
                             transfers.progress(args.item(), *args.done(), *args.total());
                         }
                     }
+                    if self.silent { continue }
                     let to_stderr = self.lines_to_stderr;
                     transfers.print(|| match args.kind().as_str() {
                         _ if to_stderr => eprintln!("{}", args.line()),

@@ -26,6 +26,8 @@ nspawn images rm fedora-44          # also frees layers and blobs nobody referen
 nspawn network create backend       # a network of its own: --network backend on start
 nspawn build -t team/app:1 ./app    # mkosi -t oci on ./app, imported as a local image
 nspawn push team/app:1              # upload it to the hub, layers already there skipped
+nspawn compose up -d                # the compose.yaml of this directory, as docker compose runs it
+nspawn compose down -v
 ```
 
 `nspawn --help` lists the rest: `login`, `hub ls`, `inspect`, `update`, `stats`, `top`,
@@ -51,6 +53,12 @@ The release also has the plain binary in a tarball and a `SHA256SUMS` over every
 requirements, building from source and usage examples.
 
 ## What it does
+
+- **docker compose files as they are.** `nspawn compose` takes the files and the
+  commands of docker compose (`up`, `down`, `ps`, `logs`, `exec`, `run`, `config` and
+  the rest): each service becomes machines, its networks, volumes and secrets
+  nspawn's own. [docs/COMPOSE.md](docs/COMPOSE.md) has what is supported, attribute
+  by attribute.
 
 - **Two kinds of machine.** An image that ships systemd boots like `machinectl start`
   does. Any other image, for example anything from Docker Hub, runs as an app: its

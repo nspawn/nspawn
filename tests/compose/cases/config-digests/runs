@@ -1,0 +1,9 @@
+config --resolve-image-digests
+config --resolve-image-digests --format json
+config --lock-image-digests
+config --lock-image-digests --format json
+config --no-interpolate --resolve-image-digests
+config --no-interpolate --lock-image-digests
+config --no-interpolate --lock-image-digests --format json
+config --lock-image-digests db
+config --resolve-image-digests --images

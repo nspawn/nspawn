@@ -1561,20 +1561,31 @@ pub async fn check_port_conflicts(store: &Store, sd: &Systemd, record: &ImageRec
             );
         }
         if let Err(e) = host_port_free(*p) {
-            if e.kind() == std::io::ErrorKind::AddrNotAvailable {
-                bail!(
-                    "{} is not an address of the host; -p publishes on one it has",
-                    p.host_ip.map(|ip| ip.to_string()).unwrap_or_default()
-                );
+            if let Some(why) = bind_refusal(e.kind(), p) {
+                bail!(why);
             }
-            bail!(
-                "host port {}/{} is in use by a service on the host",
-                p.host,
-                p.protocol.name()
-            );
         }
     }
     Ok(())
+}
+
+/// What a failed bind of a published port says: an address the host does not have, a
+/// port a service of the host has; anything else (a security module that keeps the
+/// service from binding it) tells nothing about the port, which the DNAT publishes
+/// all the same.
+fn bind_refusal(kind: std::io::ErrorKind, p: &PortMap) -> Option<String> {
+    match kind {
+        std::io::ErrorKind::AddrNotAvailable => Some(format!(
+            "{} is not an address of the host; -p publishes on one it has",
+            p.host_ip.map(|ip| ip.to_string()).unwrap_or_default()
+        )),
+        std::io::ErrorKind::AddrInUse => Some(format!(
+            "host port {}/{} is in use by a service on the host",
+            p.host,
+            p.protocol.name()
+        )),
+        _ => None,
+    }
 }
 
 /// Nothing on the host listens there: bound to the address the port is published on, so
@@ -1621,6 +1632,23 @@ pub async fn sync_ports_except(store: &Store, sd: &Systemd, except: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_port_in_use_or_an_address_elsewhere_refuses_a_publish() {
+        let port: PortMap = "8080:80".parse().unwrap();
+        assert!(bind_refusal(std::io::ErrorKind::AddrInUse, &port)
+            .unwrap()
+            .contains("in use by a service on the host"));
+        let on: PortMap = "10.9.9.9:8080:80".parse().unwrap();
+        assert!(bind_refusal(std::io::ErrorKind::AddrNotAvailable, &on)
+            .unwrap()
+            .contains("10.9.9.9 is not an address of the host"));
+        // SELinux keeping the service from binding it says nothing of the port.
+        assert_eq!(
+            bind_refusal(std::io::ErrorKind::PermissionDenied, &port),
+            None
+        );
+    }
 
     #[test]
     fn the_mac_follows_the_address() {

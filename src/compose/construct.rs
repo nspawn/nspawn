@@ -154,7 +154,7 @@ pub fn sharp_v(value: &Go, nested: bool) -> String {
 }
 
 /// internal/fmtsort's order of the keys of a map[interface{}]interface{}: nil first,
-/// then by type, in the order of where the types are in docker compose's binary, then
+/// then by type, in the order the Go binary lays its types out in, then
 /// by value; a time by its nanoseconds, then its seconds.
 fn fmt_order(a: &Go, b: &Go) -> std::cmp::Ordering {
     use std::cmp::Ordering;

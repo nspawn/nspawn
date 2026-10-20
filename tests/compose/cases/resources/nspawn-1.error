@@ -1,1 +1,0 @@
-service "app": networks.frontnet.ipv4_address: a machine takes the next free address of a network; a fixed one is not supported

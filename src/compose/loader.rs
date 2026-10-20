@@ -79,9 +79,23 @@ pub struct Options {
     pub prune: bool,
     /// The home `~` stands for, the HOME of the process.
     pub home: Option<String>,
+    /// What the support table refuses in the model, found as it loads.
+    pub refused: Rc<RefCell<Vec<Refusal>>>,
 }
 
-/// The warnings a load gives, in the order docker compose prints them.
+/// Something of the model nspawn compose does not do: config says so, the commands
+/// that make machines refuse it for the services they start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    /// The service or job it is in, "" for the project's own resources.
+    pub service: String,
+    /// Its path as the messages write it.
+    pub path: String,
+    /// The line to print.
+    pub line: String,
+}
+
+/// The warnings a load gives, in the order they are printed.
 pub type Warn<'a> = &'a mut dyn FnMut(String);
 
 /// The project name the options and the files give: an explicit name as it is (it
@@ -194,7 +208,8 @@ fn load(details: &Details, opts: &Options, loaded: &[String], warn: Warn) -> Res
     if !opts.skip_validation && opts.project_name.is_empty() {
         return Err("project name must not be empty".to_string());
     }
-    check_support(&model, warn)?;
+    let refused = check_support(&model, warn);
+    opts.refused.borrow_mut().extend(refused);
     if !opts.skip_normalization {
         model.insert("name".to_string(), Value::Str(opts.project_name.clone()));
         model = super::normalize::normalize(model, &details.env)?;
@@ -398,9 +413,9 @@ fn resolve_environment(model: &mut Map, env: &Env) {
 }
 
 /// The support table over the merged model: an ignored attribute or value is a
-/// warning, a refused one an error. Paths are written as docker compose writes those
-/// of the attributes it leaves to Swarm.
-fn check_support(model: &Map, warn: Warn) -> Result<(), String> {
+/// warning, a refused one comes back. Paths are written as those of the attributes
+/// left to Swarm are.
+fn check_support(model: &Map, warn: Warn) -> Vec<Refusal> {
     let mut refused = Vec::new();
     let mut ignored = Vec::new();
     walk_support(
@@ -410,24 +425,24 @@ fn check_support(model: &Map, warn: Warn) -> Result<(), String> {
         &mut refused,
         &mut ignored,
     );
-    // Sorted as docker compose sorts what it reports: by service, then by path.
+    // By service, then by path.
     ignored.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
     for finding in ignored {
         warn(finding.line());
     }
-    if refused.is_empty() {
-        return Ok(());
-    }
     refused.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-    Err(refused
+    refused
         .iter()
-        .map(Finding::line)
-        .collect::<Vec<_>>()
-        .join("\n"))
+        .map(|f| Refusal {
+            service: f.0.clone(),
+            path: f.1.clone(),
+            line: f.line(),
+        })
+        .collect()
 }
 
-/// An attribute the table speaks of: its service, its path as docker compose writes
-/// it, and the table's text.
+/// An attribute the table speaks of: its service, its path as the messages write it,
+/// and the table's text.
 struct Finding(String, String, &'static str);
 
 impl Finding {
@@ -530,7 +545,7 @@ fn walk_support(
     }
 }
 
-/// What docker compose reports of an attribute: the service it is in, and its path
+/// What is reported of an attribute: the service it is in, and its path
 /// in the service, list items written `[]`, but those its Swarm checks name by what
 /// they hold: a port by its target and protocol, a volume by its source, a secret or
 /// a config by its source.

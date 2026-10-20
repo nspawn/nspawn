@@ -1,4 +1,4 @@
-//! Go's local time, for the time logrus writes on docker compose's warnings: the zone
+//! Go's local time, for the time logrus writes on the warnings: the zone
 //! of TZ, or of /etc/localtime, read as Go reads a zoneinfo file, with the POSIX rule at
 //! its end for the years past its last transition.
 

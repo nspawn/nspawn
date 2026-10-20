@@ -91,7 +91,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -106,6 +106,13 @@ cleanup_machines() {
     $NSPAWN rm -f "$m" >/dev/null 2>&1 || true
   done
   $NSPAWN images rm busybox-1.37 >/dev/null 2>&1 || true
+  # The compose step's project, whatever it left.
+  for m in $($NSPAWN ps -a 2>/dev/null | awk '$1 ~ /^e2e-compose-/ {print $1}'); do
+    $NSPAWN rm -f "$m" >/dev/null 2>&1 || true
+  done
+  $NSPAWN network rm e2e-compose_default >/dev/null 2>&1 || true
+  $NSPAWN volume rm e2e-compose_data >/dev/null 2>&1 || true
+  rm -rf /tmp/e2e-compose
   # The signature step keeps a dated hub image under the name pulling it gives; one cut
   # short leaves it behind.
   for m in $($NSPAWN images ls 2>/dev/null | awk '$5 ~ /^hub\.nspawn\.org\/fedora:/ { tag = substr($5, 23); if (tag ~ /-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]$/ && $1 == "fedora-" tag) print $1 }'); do
@@ -584,6 +591,8 @@ echo "$out"
 echo "$out" | grep_q "inside:$app" || fail "exec via namespaces did not run inside the machine"
 [ "$($NSPAWN exec $app -- id -u </dev/null | tr -d '\r')" = "0" ] || fail "exec does not run as the machine's root"
 [ "$($NSPAWN exec $app --user 65534 -- id -u </dev/null | tr -d '\r')" = "65534" ] || fail "exec --user ignored"
+# A uid the passwd lacks runs with group 0 and / as home.
+[ "$($NSPAWN exec $app --user 12345 -- /bin/sh -c 'id -u; id -g; echo $HOME' </dev/null | tr -d '\r' | tr '\n' ' ')" = "12345 0 / " ] || fail "exec -u with a uid the passwd lacks: $($NSPAWN exec $app --user 12345 -- /bin/sh -c 'id; echo $HOME' </dev/null 2>&1)"
 # -u by names: the group named in /etc/group, the home the passwd entry has.
 grp=$($NSPAWN exec $app -- /bin/sh -c 'sed -n 1p /etc/group | cut -d: -f1' </dev/null | tr -d '\r')
 gid=$($NSPAWN exec $app -- /bin/sh -c 'sed -n 1p /etc/group | cut -d: -f3' </dev/null | tr -d '\r')
@@ -1091,6 +1100,45 @@ $NSPAWN stop $app >/dev/null || fail "stop after -u NAME:GROUP"
 out=$($NSPAWN start $app -u nobody:nosuch 2>&1) && fail "an unknown group was accepted"
 echo "$out" | grep_q "unable to find group nosuch" || fail "the unknown group was not explained: $out"
 out=$($NSPAWN start $app -u nobody: 2>&1) && fail "an empty group was accepted"
+# An image without /bin/sh, getent or /usr (distroless, scratch) runs, as a user too:
+# the getent systemd-nspawn runs inside is a program nspawn writes, which needs
+# neither, and an empty /usr is made for it.
+$NSPAWN create $app e2e-noshell -- /bin/sleep 300 >/dev/null || fail "create e2e-noshell"
+$NSPAWN start e2e-noshell >/dev/null || fail "start e2e-noshell"
+$NSPAWN exec e2e-noshell -- /bin/rm -r /bin/sh /usr </dev/null || fail "take /bin/sh and /usr out of e2e-noshell"
+$NSPAWN stop e2e-noshell >/dev/null || fail "stop e2e-noshell"
+ns() { $NSPAWN exec e2e-noshell -- /bin/busybox sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
+noshell_pid() {
+  local p
+  for _ in $(seq 1 20); do
+    p=$(ns 'for c in $(cat /proc/1/task/1/children); do [ "$(cat /proc/$c/comm 2>/dev/null)" = sleep ] && echo $c; done' | head -1)
+    [ -n "$p" ] && { echo "$p"; return 0; }
+    sleep 0.5
+  done
+  return 1
+}
+out=$($NSPAWN start e2e-noshell -u 1000:1000 -- /bin/sleep 300 2>&1) || fail "start an image without a shell as 1000:1000: $out"
+pid=$(noshell_pid) || fail "no program in the image without a shell: $(ns 'ls /proc')"
+[ "$(ns "awk '/^Uid:/ {print \$2} /^Gid:/ {print \$2} /^Groups:/ {print \$2}' /proc/$pid/status" | tr '\n' ' ')" = "1000 1000 1000 " ] || fail "-u 1000:1000 not applied without a shell: $(ns "grep -E '^(Uid|Gid|Groups):' /proc/$pid/status")"
+[ "$(ns 'getent passwd 1000')" = "1000:x:1000:1000::/:/bin/sh" ] || fail "the program does not answer as getent: $(ns 'getent passwd 1000; echo status $?')"
+[ -z "$(ns 'getent hosts localhost')" ] || fail "the program answered what it was not asked"
+# systemd-nspawn runs a program only in a root with /usr, which a scratch image lacks;
+# what is in it now is the mount point of getent.
+[ "$(ns 'ls -A /usr')" = bin ] || fail "e2e-noshell did not get a /usr: $(ns 'ls -la /usr')"
+$NSPAWN stop e2e-noshell >/dev/null || fail "stop e2e-noshell as 1000:1000"
+out=$($NSPAWN start e2e-noshell -u nobody -- /bin/sleep 300 2>&1) || fail "start an image without a shell as nobody: $out"
+pid=$(noshell_pid) || fail "no program in the image without a shell as nobody"
+[ "$(ns "awk '/^Uid:/ {print \$2}' /proc/$pid/status")" = 65534 ] || fail "-u nobody not applied without a shell: $(ns "grep ^Uid: /proc/$pid/status")"
+$NSPAWN stop e2e-noshell >/dev/null || fail "stop e2e-noshell as nobody"
+# A uid the image does not list: group 0 for the program and for exec alike.
+out=$($NSPAWN start e2e-noshell -u 4242 -- /bin/sleep 300 2>&1) || fail "start an image without a shell as 4242: $out"
+pid=$(noshell_pid) || fail "no program in the image without a shell as 4242"
+[ "$(ns "awk '/^Uid:/ {print \$2} /^Gid:/ {print \$2}' /proc/$pid/status" | tr '\n' ' ')" = "4242 0 " ] || fail "-u 4242 without a shell: $(ns "grep -E '^(Uid|Gid):' /proc/$pid/status")"
+[ "$($NSPAWN exec e2e-noshell -u 4242 -- /bin/busybox sh -c 'id -u; id -g' </dev/null | tr -d '\r' | tr '\n' ' ')" = "4242 0 " ] || fail "exec -u 4242 differs from the start: $($NSPAWN exec e2e-noshell -u 4242 -- /bin/busybox id </dev/null 2>&1)"
+$NSPAWN stop e2e-noshell >/dev/null || fail "stop e2e-noshell as 4242"
+out=$($NSPAWN start e2e-noshell -u ghost -- /bin/sleep 300 2>&1) && fail "a user the image lacks was started"
+echo "$out" | grep_q "unable to find user ghost" || fail "the unknown user was not explained: $out"
+$NSPAWN rm -f e2e-noshell >/dev/null || fail "rm e2e-noshell"
 out=$($NSPAWN start $app --sysctl kernel.shmmax=1 2>&1) && fail "a sysctl beyond net.* was accepted"
 # A refused combination is not remembered: the next start without flags must work.
 out=$($NSPAWN start $app --network none --sysctl net.ipv4.ip_forward=1 -- /bin/sleep 300 2>&1) && fail "--sysctl was accepted with --network none"
@@ -2180,7 +2228,7 @@ if command -v busctl >/dev/null 2>&1; then
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
   $NSPAWN ps 2>&1 >/dev/null | grep_q "warning: the nspawn service runs" && fail "the command and the service disagree on their version: $($NSPAWN ps 2>&1 >/dev/null)"
-  for m in ListImages GetImage Generate PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine PauseMachine UnpauseMachine MachineProcesses UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
+  for m in ListImages GetImage Generate PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ImageDigest ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine PauseMachine UnpauseMachine MachineProcesses UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do
@@ -2405,6 +2453,86 @@ rm -rf /tmp/e2e-sentinel
 out=$($NSPAWN --registry 127.0.0.1:9 search --source hub e2e-$nonce 2>&1 >/dev/null); rc=$?
 [ $rc -eq 0 ] || fail "search with an unreachable hub failed instead of warning: $out"
 echo "$out" | grep_q "warning: 127.0.0.1:9" || fail "search did not warn about the unreachable hub: $out"
+
+step "compose: a project up, reconciled, run, stopped and down, known by the labels of its machines"
+rm -rf /tmp/e2e-compose && mkdir -p /tmp/e2e-compose
+cat > /tmp/e2e-compose/compose.yaml <<'COMPOSE'
+name: e2e-compose
+services:
+  db:
+    image: busybox:1.36
+    command: ["sh", "-c", "mkdir -p /www; echo db-ok > /www/index.html; exec httpd -f -p 80 -h /www"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ | grep -q db-ok"]
+      interval: 2s
+      retries: 10
+  web:
+    image: busybox:1.36
+    command: ["sh", "-c", "mkdir -p /www; echo web-$$TAG > /www/index.html; exec httpd -f -p 80 -h /www"]
+    environment:
+      TAG: ${TAG:-one}
+      TABBED: "a\tb"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports: ["127.0.0.1:18090:80", "18092:18092/udp"]
+    volumes: ["data:/data"]
+  job:
+    image: busybox:1.36
+    command: ["echo", "job-done"]
+volumes:
+  data: {}
+COMPOSE
+# In the project's directory, as compose finds its file there; not a subshell, whose
+# failures would not count.
+if pushd /tmp/e2e-compose > /dev/null; then
+  $NSPAWN compose up -d > /tmp/e2e-compose.txt 2>&1 || { cat /tmp/e2e-compose.txt; fail "compose up -d"; }
+  grep_q " Container e2e-compose-db-1 Healthy " /tmp/e2e-compose.txt || fail "compose up did not wait for db to be healthy: $(cat /tmp/e2e-compose.txt)"
+  retry 15 bash -c "curl -fsS http://127.0.0.1:18090/ | grep -q web-one" || fail "the published port of web does not answer"
+  $NSPAWN compose exec -T web wget -qO- http://db/ 2>&1 | grep_q db-ok || fail "web does not reach db by its service name"
+  # A tab in a variable, as postgres:18-alpine has in its image, reaches the program.
+  [ "$($NSPAWN compose exec -T web printenv TABBED)" = "$(printf 'a\tb')" ] || fail "a variable with a tab did not reach the machine as it was"
+  $NSPAWN compose ps -a --format json > /tmp/e2e-compose-ps.txt || fail "compose ps --format json"
+  python3 -c 'import json; rows = {r["Service"]: r for r in map(json.loads, open("/tmp/e2e-compose-ps.txt"))}; assert rows["db"]["Health"] == "healthy" and rows["web"]["State"] == "running" and rows["job"]["State"] == "exited" and rows["job"]["ExitCode"] == 0, rows' || fail "compose ps does not show the services as they are: $(cat /tmp/e2e-compose-ps.txt)"
+  # A udp port, which under SELinux the service must be let bind to look at it.
+  grep_q '18092->18092/udp' /tmp/e2e-compose-ps.txt || fail "the udp port of web is not published: $(cat /tmp/e2e-compose-ps.txt)"
+  $NSPAWN compose logs job | grep_q "^job-1  | job-done" || fail "compose logs has not the line of job behind its name"
+  $NSPAWN inspect e2e-compose-web-1 | python3 -c 'import json,sys; l = json.load(sys.stdin)[0]["labels"]; assert l["com.docker.compose.project"] == "e2e-compose" and l["com.docker.compose.service"] == "web" and l["com.docker.compose.config-hash"], l' || fail "the machine of web lacks the labels of compose"
+  $NSPAWN compose up -d > /tmp/e2e-compose.txt 2>&1 || fail "compose up -d again"
+  grep_q " Container e2e-compose-web-1 Running " /tmp/e2e-compose.txt || fail "an unchanged service is not left running: $(cat /tmp/e2e-compose.txt)"
+  grep_q "Recreate" /tmp/e2e-compose.txt && fail "an unchanged project made machines anew: $(cat /tmp/e2e-compose.txt)"
+  TAG=two $NSPAWN compose up -d > /tmp/e2e-compose.txt 2>&1 || fail "compose up -d with a changed variable"
+  grep_q " Container e2e-compose-web-1 Recreated " /tmp/e2e-compose.txt || fail "a changed service is not made anew: $(cat /tmp/e2e-compose.txt)"
+  grep_q "e2e-compose-db-1 Recreate" /tmp/e2e-compose.txt && fail "an unchanged dependency was made anew"
+  retry 15 bash -c "curl -fsS http://127.0.0.1:18090/ | grep -q web-two" || fail "the service made anew does not answer with its new variable"
+  out=$(TAG=two $NSPAWN compose run --rm job echo hi-run 2>/dev/null)
+  [ "$out" = hi-run ] || fail "compose run --rm: $out"
+  TAG=two $NSPAWN compose run --rm job sh -c 'exit 3' > /dev/null 2>&1
+  [ $? -eq 3 ] || fail "compose run does not exit with the code of its command"
+  $NSPAWN compose stop > /dev/null 2>&1 || fail "compose stop"
+  [ -z "$($NSPAWN compose ps -q)" ] || fail "machines still run after compose stop"
+  $NSPAWN compose start > /dev/null 2>&1 || fail "compose start"
+  retry 15 bash -c "curl -fsS http://127.0.0.1:18090/ | grep -q web-two" || fail "web does not answer after compose start"
+  $NSPAWN compose down -v > /tmp/e2e-compose.txt 2>&1 || { cat /tmp/e2e-compose.txt; fail "compose down -v"; }
+  [ -z "$($NSPAWN compose ps -a -q)" ] || fail "compose down left machines"
+  $NSPAWN network ls | grep_q e2e-compose_default && fail "compose down left its network"
+  $NSPAWN volume ls | grep_q e2e-compose_data && fail "compose down -v left its volume"
+  $NSPAWN compose ls -a | grep_q e2e-compose && fail "compose ls still lists the project"
+  popd > /dev/null || true
+fi
+# Images pinned to the digest their registry names now, asked through the service with
+# the credentials of login: busybox pushed to the test registry under a tag of this run.
+repo=e2e/compose-$nonce
+$NSPAWN push busybox-1.36 --to $repo:1 > /dev/null 2>&1 || fail "push busybox for compose config --lock-image-digests"
+digest="sha256:$(curl -sS --cacert "$NSPAWN_CA_CERT" -H 'Accept: application/vnd.oci.image.manifest.v1+json' "https://$NSPAWN_REGISTRY/v2/$repo/manifests/1" | sha256sum | cut -d' ' -f1)"
+printf 'services:\n  app:\n    image: %s/%s:1\n  hub:\n    image: busybox:1.36\n' "$NSPAWN_REGISTRY" "$repo" > /tmp/e2e-compose/digests.yaml
+out=$($NSPAWN compose -f /tmp/e2e-compose/digests.yaml -p e2e-digests config --lock-image-digests 2>&1) || fail "compose config --lock-image-digests: $out"
+echo "$out" | grep_q -Fx "    image: $NSPAWN_REGISTRY/$repo:1@$digest" || fail "compose config did not pin the image to its digest on the registry ($digest): $out"
+echo "$out" | grep_q -E '^    image: docker\.io/library/busybox:1\.36@sha256:[0-9a-f]{64}$' || fail "compose config did not pin an image of Docker Hub: $out"
+printf 'services:\n  app:\n    image: %s/%s:missing\n' "$NSPAWN_REGISTRY" "$repo" > /tmp/e2e-compose/digests.yaml
+out=$($NSPAWN compose -f /tmp/e2e-compose/digests.yaml -p e2e-digests config --resolve-image-digests 2>&1) && fail "a tag the registry lacks was pinned: $out"
+echo "$out" | grep_q -F "failed to resolve digest for $NSPAWN_REGISTRY/$repo:missing" || fail "the missing tag was not explained: $out"
+$NSPAWN images rm busybox-1.36 > /dev/null 2>&1
 
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"

@@ -937,7 +937,7 @@ fn resolve_user(user: &str) -> Option<(Uid, Gid, String, Vec<Gid>)> {
 }
 
 /// `resolve_user` on the files' text. A user the passwd file lacks is taken as a number
-/// with a group of the same number and no home; a group given explicitly is the only
+/// with group 0 and no home, as the start does; a group given explicitly is the only
 /// group, otherwise the passwd entry's own and every group of /etc/group that lists
 /// the user come along.
 fn resolve_in(passwd: &str, group: &str, user: &str) -> Option<(u32, u32, String, Vec<u32>)> {
@@ -949,7 +949,7 @@ fn resolve_in(passwd: &str, group: &str, user: &str) -> Option<(u32, u32, String
         Some(entry) => entry,
         None => {
             let uid: u32 = who.parse().ok()?;
-            (uid, uid, "/".to_string(), None)
+            (uid, 0, "/".to_string(), None)
         }
     };
     let (gid, groups) = match explicit {
@@ -1074,8 +1074,8 @@ mod tests {
         );
         assert_eq!(
             resolve_in(passwd, group, "12345"),
-            Some((12345, 12345, "/".to_string(), Vec::new())),
-            "a number the passwd lacks"
+            Some((12345, 0, "/".to_string(), Vec::new())),
+            "a number the passwd lacks gets group 0"
         );
         assert_eq!(
             resolve_in(passwd, group, "12345:4321"),
@@ -1093,7 +1093,7 @@ mod tests {
         );
         assert_eq!(
             resolve_in("", "", "65534"),
-            Some((65534, 65534, "/".to_string(), Vec::new()))
+            Some((65534, 0, "/".to_string(), Vec::new()))
         );
         assert_eq!(resolve_in("", "", "1000:x"), None);
     }

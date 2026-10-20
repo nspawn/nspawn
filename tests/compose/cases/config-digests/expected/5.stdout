@@ -1,0 +1,69 @@
+jobs:
+  migrate:
+    image: docker.io/library/postgres@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    networks:
+      default: null
+    triggers:
+      manual: true
+    volumes:
+      - source: docker.io/library/busybox@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        target: /tools
+        type: image
+name: digests
+networks:
+  default:
+    name: digests_default
+  front:
+    name: digests_front
+services:
+  db:
+    depends_on:
+      web:
+        condition: service_started
+        required: true
+    image: ghcr.io/example/db@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    networks:
+      default: null
+  web:
+    command:
+      - sh
+      - -c
+      - echo $$HOME
+    environment:
+      A: b
+    image: docker.io/library/busybox@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    networks:
+      front: null
+    ports:
+      - mode: ingress
+        protocol: tcp
+        published: "8080"
+        target: 80
+    pre_start:
+      - command:
+          - "true"
+        environment:
+          A: b
+        image: localhost:5000/tools/init@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        networks:
+          front: null
+    restart: always
+    volumes:
+      - bind:
+          create_host_path: true
+        source: /compose/config-digests/data
+        target: /data
+        type: bind
+      - image:
+          subpath: www
+        source: docker.io/library/alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        target: /assets
+        type: image
+      - source: cache
+        target: /cache
+        type: volume
+volumes:
+  cache:
+    name: digests_cache
+x-common:
+  restart: always

@@ -98,12 +98,12 @@ pub fn expand_user(path: &str, home: Option<&str>, warn: &mut dyn FnMut(String))
     path.to_string()
 }
 
-/// What nspawn compose refuses in a file docker compose would fetch.
+/// Why a file to fetch from elsewhere is refused.
 pub const REMOTE: &str = "files on this host: a git or oci:// address is refused";
 
-/// Whether docker compose fetches a path instead of reading it: its OCI loader takes
-/// `oci://`, its git loader what buildkit's ParseGitRef takes (the query of the address
-/// is not checked).
+/// Whether a path names a file to fetch rather than read: `oci://` for the OCI loader,
+/// what buildkit's ParseGitRef takes for the git one (the query of the address is not
+/// checked).
 pub fn remote(path: &str) -> bool {
     if path.starts_with("oci://") || path.starts_with("github.com/") {
         return true;

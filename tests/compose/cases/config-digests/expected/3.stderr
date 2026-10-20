@@ -1,0 +1,1 @@
+time="2026-10-16T02:04:23Z" level=warning msg="service \"web\": pre_start hook images are not pinned in the override file produced by --lock-image-digests, use the full --resolve-image-digests output to pin them"

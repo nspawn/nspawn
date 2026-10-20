@@ -14,6 +14,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `api/` | the library: typed operations on images, machines and the network; nothing here prints, progress goes through a `Report` and results come back as values |
 | `cli.rs`, `commands/` | clap definitions and the terminal side: argument conversion into calls on the service, tables, prompts, the commands that own the terminal (exec, shell, logs) and the host's end of cp |
 | `client/` | the proxies for `org.nspawn`, how its errors read, how a job is followed |
+| `compose/` | `nspawn compose`, a client of the service like the rest of the command line: docker compose's command line read as cobra reads it (`cobra.rs`), the files loaded as compose-go loads them (go-yaml's parser and constructor, interpolation, merging, include and extends, the model), `config`, the support table (`support/`), and `engine/`, which makes a project's services machines through the bus: the conversion of a service into the options of `CreateMachine`, up's convergence, the commands on a project's machines, found by docker compose's labels |
 | `daemon/` | the D-Bus service `org.nspawn`: the Manager interface, the Names interface (names alone, for every user), jobs, processes, dictionaries, the files that make the bus start it |
 | `completion.rs` | shell completion: the script a shell sources calls `nspawn` back with `NSPAWN_COMPLETE` set, and the names of machines, images, networks and volumes come from `org.nspawn.Names` at each TAB (`api/names.rs`) |
 | `packaging/` | the unit, bus and SELinux policy files the packages ship, and the Fedora spec |
@@ -31,7 +32,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `tuning.rs` | docker's other per-container flags (hostname, user, capabilities, tmpfs, devices, dns, ulimits, signals, sysctls, timezone), `--interface` and `--depends-on`: parsing, and the settings and unit lines they become |
 | `api/generate.rs` | `generate`: the `network create` and `run -d` commands that make machines again from their records, in the order of their dependencies, quoted for a shell |
 | `api/dependencies.rs` | `--depends-on`: the checks (machines of nspawn's, no cycle), the hook that waits for each condition (`await-dependencies`), the verdict on a dependency as its unit and healthcheck show it |
-| `getent.rs` | the getent stand-in bound into an app that runs as a user |
+| `getent.rs` | the getent stand-in bound into an app that runs as a user: a shell script, or a program for an image without a shell |
 | `bridge.rs`, `hostnet.rs` | the nspawn0 bridge, ports, firewalls; veth mode |
 | `volume.rs`, `volmount.rs` | `-v` parsing; host-side mounts for mstack machines |
 | `nsenter.rs`, `pty.rs` | exec through namespaces, terminal pumping |
@@ -189,7 +190,12 @@ getent (alpine) cannot answer and glibc's refuses for a uid the passwd does
 not list; an app that runs as a user gets `getent.rs`'s stand-in, a shell
 script bound over `/usr/bin/getent` that answers those two from the image's
 passwd and group files as docker reads them and hands anything else to the
-image's own getent, bound at `/run/nspawn/getent`. Apps on the bridge run with
+image's own getent, bound at `/run/nspawn/getent`. An image without `/bin/sh`
+gets a program instead: a few hundred bytes of x86_64 or aarch64 code without a
+libc, into which nspawn writes the two answers it reads from the same files
+ahead of the start, and which hands anything else on the same way. A root without
+`/usr` (an image built from scratch) gets an empty one: systemd-nspawn runs a
+program only in a root that has it. Apps on the bridge run with
 `PrivateUsers=no`, since a user namespace cannot join the network namespace
 prepared on the host, and with docker's default capabilities plus
 `CAP_SYS_BOOT` instead of systemd-nspawn's (`Tuning::exec_lines` spells the

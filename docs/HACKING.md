@@ -21,6 +21,14 @@ Unit tests need no root and touch nothing outside temporary directories. The
 `[lints.clippy]` table of Cargo.toml turns on a few lints about clones and
 allocations beyond clippy's default set; they are part of the same check.
 
+`src/getent.rs` carries the getent nspawn hands an image without a shell as
+machine code, x86_64 and aarch64, each instruction beside its bytes. A change to
+it is assembled with GNU as (`as --64` with `.intel_syntax noprefix`, and
+`aarch64-linux-gnu-as`) from those instructions, the bytes of `objcopy -O binary
+-j .text` copied back; the code reads the table of addresses that follows it at
+the offset its length gives, which a unit test checks. The e2e suite runs it in a
+machine; an aarch64 build can be tried without such a host under `qemu-aarch64`.
+
 ## nspawn compose against docker compose
 
 `nspawn compose` is checked against the docker compose release that

@@ -18,9 +18,41 @@ warnings and errors from. Its tests check it against the schema and the command
 reference of the docker compose release it names, kept under
 `src/compose/upstream` (`fetch.sh` there brings those of another release), and
 against the command line itself: a command it says nspawn compose has is one,
-and its options take docker compose's short forms. A command nspawn compose does
-not have yet is one row; what it will do with that command's options is already
-decided in `src/compose/support`.
+and its options take docker compose's short forms.
+
+What the table refuses, `config` says as a warning and shows the project all the
+same; `up`, `create`, `run` and `scale` refuse it for the services they start and
+the networks, volumes, secrets and configs those use.
+
+## How a project becomes nspawn's
+
+- **Machines.** Each replica of a service is a machine, `PROJECT-SERVICE-N`, the
+  name docker gives its container. machined takes no `_` in a name, so every `_`
+  is written `-`: `container_name: ejabberd_postgres` makes the machine
+  `ejabberd-postgres`, and the name as written stays a name of the machine on the
+  service's networks, where other services reach it by it. A `run` machine is
+  `PROJECT-SERVICE-run-HEX`.
+- **Labels.** A machine carries the labels docker compose puts on its containers
+  (`com.docker.compose.project`, `.service`, `.container-number`, `.oneoff`,
+  `.config-hash`, `.depends_on`, `.image`, `.project.working_dir`,
+  `.project.config_files`); `down`, `ps`, `logs` and the other commands find a
+  project's machines by them, with `-p NAME` alone too. The config hash is docker
+  compose's own: a machine is made anew when its service changed, or the image its
+  pull brought.
+- **Images.** An image without a registry comes from Docker Hub, as with docker,
+  and is kept under its local name (`postgres:18-alpine` is `postgres-18-alpine`);
+  every machine of it is made from that image. `config --resolve-image-digests`
+  and `--lock-image-digests` ask each registry for the digest a tag names now
+  through nspawn's service, with the credentials of `nspawn login`, where docker
+  compose asks the docker daemon.
+- **Networks, volumes, secrets.** A network of the project is an nspawn network,
+  `PROJECT_KEY`, a volume an nspawn volume of the same name. A secret or config
+  from a file is bound read-only where the service reads it, as docker binds it;
+  one from the environment or written in the file is an nspawn secret,
+  `PROJECT_secret_KEY` or `PROJECT_config_KEY`, removed by `down`.
+- **Dependencies.** `depends_on` becomes the machine's own `--depends-on`: up
+  starts the services in order and waits, as docker compose does, and systemd
+  keeps the order when a host boots its machines with a restart policy.
 
 ## Where it differs on purpose
 
@@ -39,6 +71,17 @@ Beyond the rows that say so:
 - `--help` prints nspawn compose's own help, and cobra's hidden `__complete`
   command is not there: the shell completions of nspawn come from
   `nspawn completions`.
+- A machine made anew is stopped, removed and made again: docker makes the new
+  container before it stops the old one, nspawn cannot have two machines of one
+  name. What the old machine wrote outside its volumes goes with it, as with
+  docker.
+- A port with no host port takes a free one of the host when its machine is
+  made, and keeps it; docker picks one at every start.
+- The progress on a terminal is printed line by line; docker compose redraws a
+  block.
+- `ps` and `images` show what a machine has: its name where docker shows a
+  container ID (`ps -q` too), the digest of its image's manifest as the image ID,
+  and `Exited (N)` without how long ago, which nspawn does not keep.
 
 <!-- The support table: src/compose/support makes it, and NSPAWN_UPDATE_DOCS=1 cargo test writes it here. -->
 Decided on docker compose v5.6.0, whose Compose Specification is that of compose-go v2.16.1. An attribute of a job without a row of its own is the service attribute of the same name.
@@ -119,7 +162,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.configs.[].source` | yes |  |
 | `services.*.configs.[].target` | yes |  |
 | `services.*.configs.[].uid` | ignored | uid is not supported outside Swarm mode and will be ignored |
-| `services.*.container_name` | partly | a machine name: letters, digits and hyphens, up to 64 (machined takes no `_`) |
+| `services.*.container_name` | partly | the machine's name with each `_` written `-`, as machined takes none; the name as written stays a name on the service's networks |
 | `services.*.cpu_count` | ignored | only cpus limits the CPU of a machine |
 | `services.*.cpu_percent` | ignored | only cpus limits the CPU of a machine |
 | `services.*.cpu_period` | ignored | only cpus limits the CPU of a machine |
@@ -345,7 +388,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `config --format` | yes |  |
 | `config --hash` | yes |  |
 | `config --images` | yes |  |
-| `config --lock-image-digests` | no | images are not pinned to their digests yet |
+| `config --lock-image-digests` | yes |  |
 | `config --models` | yes |  |
 | `config --networks` | yes |  |
 | `config --no-consistency` | yes |  |
@@ -356,40 +399,173 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `config --output` | yes |  |
 | `config --profiles` | yes |  |
 | `config --quiet` | yes |  |
-| `config --resolve-image-digests` | no | images are not pinned to their digests yet |
+| `config --resolve-image-digests` | yes |  |
 | `config --services` | yes |  |
 | `config --variables` | yes |  |
 | `config --volumes` | yes |  |
-| `cp` | no | not in nspawn compose yet |
-| `create` | no | not in nspawn compose yet |
-| `down` | no | not in nspawn compose yet |
-| `events` | no | not in nspawn compose yet |
-| `exec` | no | not in nspawn compose yet |
+| `cp` | yes |  |
+| `cp --all` | yes |  |
+| `cp --archive` | ignored | what lands in a machine belongs to its root, and on the host to whoever runs cp |
+| `cp --follow-link` | ignored | a symbolic link is copied as a link |
+| `cp --index` | yes |  |
+| `create` | yes |  |
+| `create --build` | no | nspawn runs published images and does not build Dockerfiles |
+| `create --force-recreate` | yes |  |
+| `create --no-build` | yes |  |
+| `create --no-recreate` | yes |  |
+| `create --pull` | yes |  |
+| `create --quiet-pull` | yes |  |
+| `create --remove-orphans` | yes |  |
+| `create --scale` | yes |  |
+| `create --yes` | yes |  |
+| `down` | yes |  |
+| `down --remove-orphans` | yes |  |
+| `down --rmi` | yes |  |
+| `down --timeout` | yes |  |
+| `down --volumes` | yes |  |
+| `events` | yes |  |
+| `events --json` | yes |  |
+| `events --since` | yes |  |
+| `events --until` | yes |  |
+| `exec` | yes |  |
+| `exec --detach` | yes |  |
+| `exec --env` | yes |  |
+| `exec --index` | yes |  |
+| `exec --interactive` | yes |  |
+| `exec --no-tty` | yes |  |
+| `exec --privileged` | ignored | a command runs with the capabilities of its machine |
+| `exec --tty` | yes |  |
+| `exec --user` | yes |  |
+| `exec --workdir` | yes |  |
 | `export` | no | export is not supported by nspawn compose |
-| `images` | no | not in nspawn compose yet |
-| `kill` | no | not in nspawn compose yet |
-| `logs` | no | not in nspawn compose yet |
-| `ls` | no | not in nspawn compose yet |
-| `pause` | no | not in nspawn compose yet |
-| `port` | no | not in nspawn compose yet |
-| `ps` | no | not in nspawn compose yet |
+| `images` | yes |  |
+| `images --format` | yes |  |
+| `images --quiet` | yes |  |
+| `kill` | yes |  |
+| `kill --remove-orphans` | yes |  |
+| `kill --signal` | yes |  |
+| `logs` | yes |  |
+| `logs --follow` | yes |  |
+| `logs --index` | yes |  |
+| `logs --no-color` | yes |  |
+| `logs --no-log-prefix` | yes |  |
+| `logs --since` | yes |  |
+| `logs --tail` | yes |  |
+| `logs --timestamps` | yes |  |
+| `logs --until` | yes |  |
+| `ls` | yes |  |
+| `ls --all` | yes |  |
+| `ls --filter` | yes |  |
+| `ls --format` | yes |  |
+| `ls --quiet` | yes |  |
+| `pause` | yes |  |
+| `port` | yes |  |
+| `port --index` | yes |  |
+| `port --protocol` | yes |  |
+| `ps` | yes |  |
+| `ps --all` | yes |  |
+| `ps --filter` | yes |  |
+| `ps --format` | yes |  |
+| `ps --no-trunc` | yes |  |
+| `ps --orphans` | yes |  |
+| `ps --quiet` | yes |  |
+| `ps --services` | yes |  |
+| `ps --status` | yes |  |
 | `publish` | no | publish is not supported by nspawn compose |
-| `pull` | no | not in nspawn compose yet |
+| `pull` | yes |  |
+| `pull --ignore-buildable` | yes |  |
+| `pull --ignore-pull-failures` | yes |  |
+| `pull --include-deps` | yes |  |
+| `pull --no-parallel` | yes |  |
+| `pull --parallel` | yes |  |
+| `pull --policy` | yes |  |
+| `pull --quiet` | yes |  |
 | `push` | no | push is not supported by nspawn compose, which builds no image |
-| `restart` | no | not in nspawn compose yet |
-| `rm` | no | not in nspawn compose yet |
-| `run` | no | not in nspawn compose yet |
-| `scale` | no | not in nspawn compose yet |
-| `start` | no | not in nspawn compose yet |
-| `stats` | no | not in nspawn compose yet |
-| `stop` | no | not in nspawn compose yet |
-| `top` | no | not in nspawn compose yet |
-| `unpause` | no | not in nspawn compose yet |
-| `up` | no | not in nspawn compose yet |
+| `restart` | yes |  |
+| `restart --no-deps` | yes |  |
+| `restart --timeout` | yes |  |
+| `rm` | yes |  |
+| `rm --all` | yes |  |
+| `rm --force` | yes |  |
+| `rm --stop` | yes |  |
+| `rm --volumes` | partly | nspawn has no anonymous volumes |
+| `run` | yes |  |
+| `run --build` | no | nspawn runs published images and does not build Dockerfiles |
+| `run --cap-add` | yes |  |
+| `run --cap-drop` | yes |  |
+| `run --detach` | yes |  |
+| `run --entrypoint` | yes |  |
+| `run --env` | yes |  |
+| `run --env-from-file` | yes |  |
+| `run --interactive` | yes |  |
+| `run --label` | yes |  |
+| `run --name` | yes |  |
+| `run --no-deps` | yes |  |
+| `run --no-tty` | yes |  |
+| `run --publish` | yes |  |
+| `run --pull` | yes |  |
+| `run --quiet` | yes |  |
+| `run --quiet-build` | yes |  |
+| `run --quiet-pull` | yes |  |
+| `run --remove-orphans` | yes |  |
+| `run --rm` | yes |  |
+| `run --service-ports` | yes |  |
+| `run --tty` | yes |  |
+| `run --use-aliases` | yes |  |
+| `run --user` | yes |  |
+| `run --volume` | yes |  |
+| `run --workdir` | yes |  |
+| `scale` | yes |  |
+| `scale --no-deps` | yes |  |
+| `start` | yes |  |
+| `start --wait` | yes |  |
+| `start --wait-timeout` | yes |  |
+| `stats` | yes |  |
+| `stats --all` | yes |  |
+| `stats --format` | yes |  |
+| `stats --no-stream` | yes |  |
+| `stats --no-trunc` | yes |  |
+| `stop` | yes |  |
+| `stop --timeout` | yes |  |
+| `top` | yes |  |
+| `unpause` | yes |  |
+| `up` | yes |  |
+| `up --abort-on-container-exit` | yes |  |
+| `up --abort-on-container-failure` | yes |  |
+| `up --always-recreate-deps` | yes |  |
+| `up --attach` | yes |  |
+| `up --attach-dependencies` | yes |  |
+| `up --build` | no | nspawn runs published images and does not build Dockerfiles |
+| `up --detach` | yes |  |
+| `up --exit-code-from` | yes |  |
+| `up --force-recreate` | yes |  |
+| `up --menu` | ignored | nspawn compose has no interactive menu |
+| `up --no-attach` | yes |  |
+| `up --no-build` | yes |  |
+| `up --no-color` | yes |  |
+| `up --no-deps` | yes |  |
+| `up --no-log-prefix` | yes |  |
+| `up --no-recreate` | yes |  |
+| `up --no-start` | yes |  |
+| `up --pull` | yes |  |
+| `up --quiet-build` | yes |  |
+| `up --quiet-pull` | yes |  |
+| `up --remove-orphans` | yes |  |
+| `up --renew-anon-volumes` | partly | nspawn has no anonymous volumes |
+| `up --scale` | yes |  |
+| `up --timeout` | yes |  |
+| `up --timestamps` | yes |  |
+| `up --wait` | yes |  |
+| `up --wait-timeout` | yes |  |
+| `up --watch` | no | watch is not supported by nspawn compose |
+| `up --yes` | yes |  |
 | `version` | partly | --short and json give the docker compose release it matches; the plain form names nspawn's version too |
 | `version --format` | yes |  |
 | `version --short` | yes |  |
-| `volumes` | no | not in nspawn compose yet |
-| `wait` | no | not in nspawn compose yet |
+| `volumes` | yes |  |
+| `volumes --format` | yes |  |
+| `volumes --quiet` | yes |  |
+| `wait` | yes |  |
+| `wait --down-project` | yes |  |
 | `watch` | no | watch is not supported by nspawn compose |
 <!-- End of the support table. -->

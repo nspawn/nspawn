@@ -112,7 +112,7 @@ fn field(end: bool, buffer: &str, volume: &mut Spec) -> Result<(), &'static str>
 fn populate_kind(volume: &mut Spec) {
     if is_file_path(&volume.source) {
         volume.kind = "bind";
-        // The short syntax creates a missing host path, as docker-compose did.
+        // The short syntax creates a missing host path.
         volume
             .bind
             .get_or_insert_with(Bind::default)

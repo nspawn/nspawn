@@ -627,6 +627,7 @@ pub async fn prepare(
     binds.extend(crate::api::secrets::materialize(store, &record)?);
     if record.mode == Mode::App {
         binds.extend(crate::getent::shim(store, name, &record)?);
+        crate::backend::ensure_usr(store, name, record.backend)?;
     }
     if record.tuning.read_only {
         // systemd-nspawn makes mount points as it goes, which a read-only root refuses.
@@ -993,7 +994,7 @@ pub fn apply_flags(r: &mut ImageRecord, args: &StartRequest) -> Result<()> {
         );
     }
     if let Some(entrypoint) = &args.entrypoint {
-        volume::reject_control_characters(entrypoint)?;
+        volume::reject_control_characters_but_tab(entrypoint)?;
         r.entrypoint = Some(if entrypoint.is_empty() {
             Vec::new()
         } else {
@@ -1002,7 +1003,7 @@ pub fn apply_flags(r: &mut ImageRecord, args: &StartRequest) -> Result<()> {
     }
     if !args.command.is_empty() {
         for arg in &args.command {
-            volume::reject_control_characters(arg)?;
+            volume::reject_control_characters_but_tab(arg)?;
         }
         r.cmd = Some(args.command.clone());
     }

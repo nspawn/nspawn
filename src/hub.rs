@@ -182,6 +182,15 @@ impl Hub {
         Ok(all)
     }
 
+    /// The digest a reference names on its registry now, as the registry gives it without
+    /// a download: an index's for a tag of several platforms.
+    pub async fn digest(&self, image: &Reference) -> Result<String> {
+        self.client
+            .fetch_manifest_digest(image, &self.auth(image.registry()))
+            .await
+            .with_context(|| format!("fetching the digest of {image}"))
+    }
+
     /// Resolves a reference to the image manifest for this platform (indexes are followed)
     /// and returns it with its digest, and the index's when the reference named one.
     pub async fn resolve(&self, image: &Reference) -> Result<Resolved> {

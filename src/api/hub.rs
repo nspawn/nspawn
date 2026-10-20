@@ -1,10 +1,11 @@
-//! The hub's catalog: repositories and tags.
+//! The hub's catalog: repositories and tags, and the digest a reference names.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use oci_client::Reference;
 
 use crate::api::Context;
 use crate::hub::Hub;
+use crate::reference::ImageRef;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {
@@ -45,4 +46,44 @@ pub async fn tags(ctx: &Context, repository: &str) -> Result<Vec<String>> {
     let hub = Hub::new(config)?;
     let reference = Reference::try_from(format!("{}/{repository}", config.registry))?;
     hub.tags(&reference).await
+}
+
+/// The digest `reference` names on its registry now, without pulling it.
+pub async fn digest(ctx: &Context, reference: &str) -> Result<String> {
+    let image = ImageRef::parse(reference, &ctx.config.registry)?;
+    let digest = Hub::new(&ctx.config)?.digest(&image.to_oci()?).await?;
+    if !is_digest(&digest) {
+        bail!("{image}: the registry answered {digest:?}, which is not a digest");
+    }
+    Ok(digest)
+}
+
+/// ALGORITHM:HEX, as registries name content.
+fn is_digest(text: &str) -> bool {
+    text.split_once(':').is_some_and(|(algorithm, hex)| {
+        !algorithm.is_empty()
+            && algorithm
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            && hex.len() >= 32
+            && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_digest_is_handed_back() {
+        let hex = "a".repeat(64);
+        assert!(is_digest(&format!("sha256:{hex}")));
+        assert!(is_digest(&format!("sha512:{}", "0".repeat(128))));
+        assert!(!is_digest(&hex));
+        assert!(!is_digest(&format!(":{hex}")));
+        assert!(!is_digest("sha256:abc"));
+        assert!(!is_digest(&format!("sha256:{}z", "a".repeat(63))));
+        assert!(!is_digest(&format!("SHA256:{hex}")));
+        assert!(!is_digest(&format!("sha256:{hex}\n")));
+    }
 }

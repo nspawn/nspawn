@@ -416,7 +416,7 @@ async fn run_attached(
 /// run without -d: the machine's output (or its terminal) until it ends, and its
 /// exit code. Ctrl-C and the like go to its program; a third Ctrl-C within a second
 /// leaves it running and returns.
-async fn attached(
+pub(crate) async fn attached(
     client: &Client,
     name: &str,
     mut options: Options<'_>,
@@ -781,12 +781,12 @@ pub async fn exec(args: ExecArgs, client: &Client) -> Result<()> {
 
 /// What `exec` asks beyond the command.
 #[derive(Debug, Default)]
-struct ExecSpec {
-    env: Vec<String>,
-    workdir: Option<String>,
+pub(crate) struct ExecSpec {
+    pub env: Vec<String>,
+    pub workdir: Option<String>,
     /// None: a terminal when this is one.
-    tty: Option<bool>,
-    detach: bool,
+    pub tty: Option<bool>,
+    pub detach: bool,
 }
 
 /// A shell: the login session machined offers for a booted machine, the namespaces
@@ -825,7 +825,7 @@ fn terminal_env() -> Option<String> {
         .map(|t| format!("TERM={t}"))
 }
 
-async fn run_command(
+pub(crate) async fn run_command(
     client: &Client,
     machine: &str,
     argv: &[String],

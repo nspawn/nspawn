@@ -8,8 +8,8 @@ use super::{full, ignored, partly, refused, when, Attribute, Value};
 /// What a machine of an image that boots cannot take: its init runs as it is.
 const BOOTED: &str = "refused for an image that boots, whose init runs as it is";
 
-/// docker compose's own words for what it leaves to Swarm, which nspawn compose leaves
-/// as well.
+/// The words of the warnings on what is left to Swarm, which nspawn compose leaves as
+/// well.
 const SWARM_DEPLOY_MODE: &str = "deploy.mode is only honored in Swarm mode";
 const SWARM_DEPLOY_LABELS: &str = "deploy.labels are only applied to Swarm services";
 const SWARM_UPDATE: &str = "deploy.update_config only applies to rolling updates in Swarm mode";
@@ -68,7 +68,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
     ignored("services.*.configs.[].mode", SWARM_MODE),
     partly(
         "services.*.container_name",
-        "a machine name: letters, digits and hyphens, up to 64 (machined takes no `_`)",
+        "the machine's name with each `_` written `-`, as machined takes none; the name as written stays a name on the service's networks",
     ),
     ignored(
         "services.*.cpu_count",

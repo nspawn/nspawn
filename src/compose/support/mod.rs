@@ -9,7 +9,7 @@ mod attributes;
 mod commands;
 
 pub use attributes::{ATTRIBUTES, VALUES};
-pub use commands::{COMMANDS, NOT_YET, OPTIONS};
+pub use commands::{COMMANDS, OPTIONS};
 
 /// The docker compose release the table is decided on.
 pub const DOCKER_COMPOSE: &str = "v5.6.0";
@@ -176,26 +176,14 @@ pub fn value(path: &str, value: &str) -> Option<Support> {
     )
 }
 
-/// The refusal of a command nspawn compose does not have yet.
-pub const NOT_YET_TEXT: &str = "not in nspawn compose yet";
-
-/// What nspawn compose does with a command today: the table's decision, or the
-/// refusal of a command it does not have yet. A command under a refused one shares its
+/// The table's decision on a command. A command under a refused one shares its
 /// refusal.
 pub fn command(name: &str) -> Option<Support> {
-    if NOT_YET.contains(&name) {
-        return Some(Support::Refused(NOT_YET_TEXT));
-    }
-    decision(name)
-}
-
-/// The table's decision on a command, for when nspawn compose has it.
-fn decision(name: &str) -> Option<Support> {
     if let Some(own) = COMMANDS.iter().find(|c| c.name == name) {
         return Some(own.support);
     }
     let (parent, _) = name.rsplit_once(' ')?;
-    decision(parent).filter(|support| matches!(support, Support::Refused(_)))
+    command(parent).filter(|support| matches!(support, Support::Refused(_)))
 }
 
 /// What nspawn compose does with an option of a command today; every option of a
@@ -529,7 +517,7 @@ mod tests {
             assert!(seen.insert(c.name), "{}: decided twice", c.name);
             if let Some((parent, _)) = c.name.rsplit_once(' ') {
                 assert!(
-                    !matches!(decision(parent), Some(Support::Refused(_))),
+                    !matches!(command(parent), Some(Support::Refused(_))),
                     "{}: {parent} is refused already",
                     c.name
                 );
@@ -545,7 +533,7 @@ mod tests {
                 o.name
             );
             assert!(
-                !matches!(decision(o.command), Some(Support::Refused(_))),
+                !matches!(command(o.command), Some(Support::Refused(_))),
                 "{} --{}: its command is refused already",
                 o.command,
                 o.name
@@ -616,7 +604,7 @@ mod tests {
             Some(Support::Refused(_))
         ));
         assert!(command("up down").is_none());
-        assert_eq!(option("up", "detach"), Some(Support::Refused(NOT_YET_TEXT)));
+        assert_eq!(option("up", "detach"), Some(Support::Full));
         assert_eq!(option("config", "services"), Some(Support::Full));
         assert_eq!(option("", "env-file"), Some(Support::Full));
         assert_eq!(
@@ -669,13 +657,7 @@ mod tests {
         let mut commands: Vec<&Command> = COMMANDS.iter().collect();
         commands.sort_by_key(|c| c.name);
         for c in commands {
-            // A command nspawn compose does not have yet is one row; the decisions on
-            // its options wait for it in src/compose/support.
-            let support = command(c.name).unwrap_or(c.support);
-            out += &row(format!("`{}`", c.name), support);
-            if NOT_YET.contains(&c.name) {
-                continue;
-            }
+            out += &row(format!("`{}`", c.name), c.support);
             let mut options: Vec<&Opt> = OPTIONS.iter().filter(|o| o.command == c.name).collect();
             options.sort_by_key(|o| o.name);
             for o in options {

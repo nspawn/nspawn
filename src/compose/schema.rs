@@ -1,7 +1,7 @@
 //! The structural check of a compose file against the Compose Specification's JSON
-//! schema, the one under src/compose/upstream, with the words docker compose uses: its
-//! validator (santhosh-tekuri/jsonschema v6, which compose-go runs) builds a tree of
-//! errors and compose-go reports the one deepest in the file. The schema uses a small
+//! schema, the one under src/compose/upstream, in the words of compose-go's validator
+//! (santhosh-tekuri/jsonschema v6), which builds a tree of errors of which compose-go
+//! reports the one deepest in the file. The schema uses a small
 //! part of JSON Schema 2020-12, which is what is evaluated here, in the same order.
 
 use std::collections::BTreeSet;

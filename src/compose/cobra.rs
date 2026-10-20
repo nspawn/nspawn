@@ -1,5 +1,5 @@
-//! The command line of docker compose read the way docker compose reads it, with cobra
-//! and pflag: its own flags before the command and only there (but --dry-run), a bool
+//! The command line read the way cobra and pflag read it: the global flags before the
+//! command and only there (but --dry-run), a bool
 //! flag that takes `=false`, the last of a repeated flag winning, flags after the
 //! command's arguments, and their errors word for word. The flags themselves are clap's
 //! definitions in src/compose/cli.rs; what this reads is handed to clap again in a form
@@ -22,6 +22,9 @@ struct Flag {
     name: String,
     short: Option<char>,
     kind: Kind,
+    /// A bool whose default is decided later (a default of true, or what the terminal
+    /// says): clap gets its value either way.
+    tristate: bool,
 }
 
 /// The flags of a command as pflag knows them: its own, and with `persistent` those it
@@ -31,6 +34,7 @@ fn flags_of(command: &Command, inherited: &[Flag]) -> Vec<Flag> {
         name: "help".into(),
         short: Some('h'),
         kind: Kind::Bool,
+        tristate: false,
     }];
     for arg in command.get_arguments() {
         let Some(name) = arg.get_long() else {
@@ -39,16 +43,21 @@ fn flags_of(command: &Command, inherited: &[Flag]) -> Vec<Flag> {
         if name == "help" || arg.is_global_set() && !inherited.is_empty() {
             continue;
         }
+        let parser = arg.get_value_parser().type_id();
+        let tristate = !matches!(arg.get_action(), ArgAction::SetTrue)
+            && parser == std::any::TypeId::of::<bool>();
         let kind = match arg.get_action() {
             ArgAction::SetTrue => Kind::Bool,
+            _ if tristate => Kind::Bool,
             ArgAction::Append => Kind::Strings,
-            _ if arg.get_value_parser().type_id() == std::any::TypeId::of::<i64>() => Kind::Int,
+            _ if parser == std::any::TypeId::of::<i64>() => Kind::Int,
             _ => Kind::Str,
         };
         flags.push(Flag {
             name: name.to_string(),
             short: arg.get_short(),
             kind,
+            tristate,
         });
     }
     for flag in inherited {
@@ -56,6 +65,7 @@ fn flags_of(command: &Command, inherited: &[Flag]) -> Vec<Flag> {
             name: flag.name.clone(),
             short: flag.short,
             kind: flag.kind,
+            tristate: flag.tristate,
         });
     }
     flags
@@ -141,7 +151,7 @@ fn set(values: &mut Values, flag: &Flag, value: &str) -> Result<(), String> {
             Ok(())
         }
         Err(cause) => {
-            // docker's help flag has its -h marked deprecated: pflag names it alone.
+            // The help flag has its -h marked deprecated: pflag names it alone.
             let name = match flag.short {
                 Some(s) if flag.name != "help" => format!("-{s}, --{}", flag.name),
                 _ => format!("--{}", flag.name),
@@ -274,10 +284,9 @@ const CLIENT_VALUES: [&str; 7] = [
     "--log-level",
 ];
 
-/// docker-compose's own conversion of its arguments, as the standalone binary does it
-/// before cobra sees them: up to the first word, `-h` is `--help`, `-v` and
-/// `--version` are the version command, and the flags of the docker client go to it,
-/// which here is nowhere: nspawn compose talks to no docker.
+/// The standalone binary's conversion of its arguments before cobra sees them: up to
+/// the first word, `-h` is `--help`, `-v` and `--version` are the version command, and
+/// the flags of the docker client go to that client, which here is nowhere.
 fn convert(args: &[String]) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -305,7 +314,7 @@ fn convert(args: &[String]) -> Result<Vec<String>, String> {
                 i += 1;
                 continue 'args;
             }
-            // `--hostx=v` is `--host v` to docker-compose.
+            // `--hostx=v` is read as `--host v`.
             if arg.starts_with(flag) && arg.contains('=') {
                 continue 'args;
             }
@@ -361,6 +370,7 @@ fn canonical(flags: &[Flag], values: &Values, out: &mut Vec<String>) {
             continue;
         };
         match flag.kind {
+            Kind::Bool if flag.tristate => out.push(format!("--{}={}", flag.name, set[0])),
             Kind::Bool => {
                 if set[0] == "true" {
                     out.push(format!("--{}", flag.name));
@@ -371,10 +381,9 @@ fn canonical(flags: &[Flag], values: &Values, out: &mut Vec<String>) {
     }
 }
 
-/// compose's --version with words after it: docker compose runs its version command on
-/// its own, on the arguments as they were given, where the flag that got there is not
-/// one of the command's; cobra prints the error and the usage, then docker compose the
-/// error again.
+/// --version with words after it: the version command runs on its own, on the
+/// arguments as they were given, where the flag that got there is not one of the
+/// command's; cobra prints the error and the usage, then the error comes again.
 fn version_again(compose: &Command, given: &[String]) -> Outcome {
     let version = compose
         .find_subcommand("version")
@@ -458,7 +467,9 @@ pub fn parse(compose: &Command, given: &[String]) -> Outcome {
         Err(e) => return Outcome::Fail(e),
     };
     let sub_flags = flags_of(sub, &inherited);
-    let values = match parse_flags(&sub_flags, &args[at + 1..], true) {
+    // exec and run stop at their first argument: what follows is the command's.
+    let interspersed = !matches!(sub.get_name(), "exec" | "run");
+    let values = match parse_flags(&sub_flags, &args[at + 1..], interspersed) {
         Ok(v) => v,
         Err(e) => return Outcome::Fail(e),
     };
@@ -603,6 +614,14 @@ mod tests {
         assert_eq!(parse("config --help"), Outcome::Help(vec!["config".into()]));
         assert_eq!(parse("--help config"), Outcome::Help(vec!["config".into()]));
         assert_eq!(parse("help config"), Outcome::Unknown("help".into()));
+        assert_eq!(
+            parse("exec -T web sh -c ls"),
+            Outcome::Run(
+                ["exec", "--no-tty=true", "--", "web", "sh", "-c", "ls"]
+                    .map(String::from)
+                    .to_vec()
+            )
+        );
         let Outcome::Fail(text) = parse("--version=true x") else {
             panic!("--version with a word runs the version command");
         };

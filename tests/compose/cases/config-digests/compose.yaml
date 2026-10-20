@@ -1,0 +1,42 @@
+name: digests
+x-common: &common
+  restart: always
+services:
+  web:
+    <<: *common
+    image: busybox:1.36@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    command: ["sh", "-c", "echo $$HOME"]
+    environment:
+      A: b
+    ports:
+      - "8080:80"
+    volumes:
+      - ./data:/data
+      - type: image
+        source: alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        target: /assets
+        image:
+          subpath: www
+      - type: volume
+        source: cache
+        target: /cache
+    pre_start:
+      - image: localhost:5000/tools/init@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        command: ["true"]
+    networks: [front]
+  db:
+    image: ghcr.io/example/db@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    depends_on: [web]
+jobs:
+  migrate:
+    triggers:
+      manual: true
+    image: index.docker.io/library/postgres:18@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    volumes:
+      - type: image
+        source: docker.io/library/busybox@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        target: /tools
+networks:
+  front: {}
+volumes:
+  cache: {}

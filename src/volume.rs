@@ -347,6 +347,15 @@ pub fn reject_control_characters(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// The same for a value the settings file carries in quotes (a variable, an argument
+/// of the program), where a tab is a character like any other, as images have them.
+pub fn reject_control_characters_but_tab(text: &str) -> Result<()> {
+    if text.chars().any(|c| c.is_control() && c != '\t') {
+        bail!("{text:?}: control characters other than tabs are not allowed");
+    }
+    Ok(())
+}
+
 /// Environment as a program sees it when `extra` comes after `base`: one entry per
 /// variable, the later value winning (execve keeps duplicates and getenv reads the
 /// first, which is not what a later Environment= line means to systemd).
@@ -386,7 +395,7 @@ pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
     }
     let mut out: Vec<String> = Vec::new();
     for value in values {
-        reject_control_characters(value)?;
+        reject_control_characters_but_tab(value)?;
         let (name, assignment) = match value.split_once('=') {
             Some((name, _)) => (name, value.clone()),
             None => match std::env::var(value) {
@@ -528,6 +537,15 @@ mod tests {
             vec!["HOME=/root", "PATH=/opt/app/bin:/usr/bin", "MODE=prod"]
         );
         assert_eq!(merge_env(&[], &[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn variables_keep_their_tabs() {
+        assert_eq!(
+            parse_env(&["DEPS=a\tb".to_string()]).unwrap(),
+            ["DEPS=a\tb"]
+        );
+        assert!(parse_env(&["A=1\nB=2".to_string()]).is_err());
     }
 
     #[test]

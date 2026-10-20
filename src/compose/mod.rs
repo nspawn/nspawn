@@ -11,6 +11,7 @@ mod construct;
 mod dotenv;
 mod emit;
 mod emitter;
+mod engine;
 mod extends;
 mod golib;
 mod gostr;
@@ -27,6 +28,7 @@ mod options;
 mod path;
 mod paths;
 mod project;
+mod reference;
 mod schema;
 pub mod support;
 mod template;
@@ -44,8 +46,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use cli::{ComposeArgs, ComposeCommand};
 use support::Support;
 
-/// Where docker compose's messages go besides its output, as it writes them: warnings
-/// through logrus, notices straight to stderr.
+/// Where the messages go besides the output: warnings through logrus, notices straight
+/// to stderr.
 pub trait Log {
     fn warn(&self, text: String);
     /// Text written to stderr as it is.
@@ -54,7 +56,7 @@ pub trait Log {
     fn json(&self);
 }
 
-/// docker compose's logrus on this process's stderr: colours and the seconds since the
+/// logrus on this process's stderr: colours and the seconds since the
 /// start on a terminal, `time=... level=warning msg=...` otherwise, JSON once asked.
 struct Stderr {
     start: Instant,
@@ -182,7 +184,7 @@ fn working_directory(env: &dotenv::Env) -> std::io::Result<String> {
 }
 
 /// The arguments after `compose` when the command line is `nspawn [OPTION...] compose
-/// ...`: nspawn's own options may come first, and the rest is docker compose's to read.
+/// ...`: nspawn's own options may come first, and the rest is compose's to read.
 pub fn arguments(argv: &[std::ffi::OsString]) -> Option<Vec<String>> {
     use std::os::unix::ffi::OsStrExt;
     const GLOBAL: [&str; 3] = ["--registry", "--ca-cert", "--config"];
@@ -222,7 +224,7 @@ pub enum Line {
     },
 }
 
-/// Reads the arguments after `nspawn compose` as docker compose reads its own.
+/// Reads the arguments after `nspawn compose`.
 pub fn read(args: &[String]) -> Line {
     use clap::{CommandFactory, Parser};
     let compose = crate::cli::Cli::command()
@@ -239,9 +241,6 @@ pub fn read(args: &[String]) -> Line {
         cobra::Outcome::Fail(message) => return error(message),
         cobra::Outcome::Unknown(word) => {
             return match support::command(&word) {
-                Some(Support::Refused(support::NOT_YET_TEXT)) => {
-                    error(format!("{word} is {}", support::NOT_YET_TEXT))
-                }
                 Some(Support::Refused(text)) => error(text.to_string()),
                 _ => Line::Error {
                     message: format!(
@@ -272,8 +271,8 @@ pub fn read(args: &[String]) -> Line {
 /// only what a document needs is used.
 pub const STACK: usize = 1 << 30;
 
-/// `nspawn compose ARGS...`: runs it and gives the exit status, with errors printed as
-/// docker compose prints them.
+/// `nspawn compose ARGS...`: runs it and gives the exit status, an error printed on
+/// stderr.
 pub fn main(args: &[String]) -> i32 {
     let args = args.to_vec();
     std::thread::Builder::new()
@@ -323,8 +322,9 @@ fn run(args: &[String]) -> i32 {
         Err(e) => return fail(&gostr::errno_text(&e)),
     };
     let mut host = config::Host::new(env, cwd, config::Stdin::Process);
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
+    // Not locked for the whole command: what a machine prints reaches stdout from
+    // threads of its own.
+    let mut out = std::io::stdout();
     let result = execute(&args, &mut host, &mut out, &log);
     let _ = out.flush();
     match result {
@@ -334,7 +334,7 @@ fn run(args: &[String]) -> i32 {
 }
 
 /// Runs a command line nspawn compose has read: the decisions of the table on what it
-/// asks, docker compose's own checks and settings, then the command.
+/// asks, the checks and settings of the command line, then the command.
 pub fn execute(
     args: &ComposeArgs,
     host: &mut config::Host,
@@ -347,7 +347,7 @@ pub fn execute(
             return Err(format!("--{name}: {text}"));
         }
     }
-    // The table's notes once docker compose's own checks have set the format.
+    // The table's notes once the checks have set the format.
     let notes = || {
         for &(command, name) in &requested {
             if let Some(Support::Ignored(text)) = support::option(command, name) {
@@ -376,6 +376,11 @@ pub fn execute(
             notes();
             version(v.format.as_deref(), v.short, out).map_err(|e| e.to_string())
         }
+        Some(_) => {
+            let flags = pre_run(args, host, log)?;
+            notes();
+            engine::execute(args, host, &flags, log, out)
+        }
         None => {
             notes();
             help(&[]);
@@ -392,7 +397,7 @@ fn log_is_json(args: &ComposeArgs, host: &config::Host) -> bool {
         .is_some_and(|p| p == "json")
 }
 
-/// docker compose's PersistentPreRunE for every command but version: the COMPOSE_
+/// PersistentPreRunE for every command but version: the COMPOSE_
 /// variables of the env files, the ANSI and progress settings and their checks, the
 /// deprecated --workdir, the env files made absolute, COMPOSE_PARALLEL_LIMIT. What comes
 /// out are the flags that make the project.
@@ -426,8 +431,8 @@ fn pre_run(
         ansi = "never".to_string();
         log.notice("option '--no-ansi' is DEPRECATED ! Please use '--ansi' instead.\n");
     }
-    // docker compose asks the command's own flags whether --ansi was given, and --ansi
-    // is compose's: COMPOSE_ANSI wins over it.
+    // --ansi is looked for among the command's own flags, where it never is:
+    // COMPOSE_ANSI wins over it.
     if let Some(v) = host.env.get("COMPOSE_ANSI") {
         ansi.clone_from(v);
     }
@@ -671,7 +676,7 @@ mod tests {
         }
     }
 
-    /// The table's notes come once docker compose's checks have set the format.
+    /// The table's notes come once the checks have set the format.
     #[test]
     fn the_table_s_notes_follow_the_progress_format() {
         let dir = std::env::temp_dir().join(format!("nspawn-notes-{}", std::process::id()));
@@ -741,6 +746,82 @@ mod tests {
         assert_eq!(
             result,
             Err(format!("open {}: permission denied", path.display()))
+        );
+    }
+
+    /// --resolve-image-digests pins each image to the digest its registry names now,
+    /// asked once per image, and --lock-image-digests keeps the images alone.
+    #[test]
+    fn images_are_pinned_to_what_their_registry_names() {
+        let hex = |c: char| c.to_string().repeat(64);
+        let (a, b, c) = (hex('a'), hex('b'), hex('c'));
+        let digests = std::collections::HashMap::from([
+            (
+                "docker.io/library/busybox:1.36".to_string(),
+                format!("sha256:{a}"),
+            ),
+            (
+                "docker.io/library/alpine:latest".to_string(),
+                format!("sha256:{b}"),
+            ),
+            ("ghcr.io/x/db:1".to_string(), format!("sha256:{c}")),
+        ]);
+        let run = |yaml: &str, line: &[&str]| -> Result<String, String> {
+            let line: Vec<String> = ["-f", "-", "-p", "p", "config"]
+                .iter()
+                .chain(line)
+                .map(|s| s.to_string())
+                .collect();
+            let Line::Run(args) = read(&line) else {
+                panic!("a command line");
+            };
+            let env = dotenv::Env::from([("HOME".to_string(), "/nowhere".to_string())]);
+            let mut host = config::Host::new(
+                env,
+                "/nowhere".to_string(),
+                config::Stdin::Given(std::cell::RefCell::new(yaml.as_bytes().to_vec())),
+            );
+            host.digests = config::Digests::Given(digests.clone());
+            let mut out = Vec::new();
+            execute(&args, &mut host, &mut out, &Silent).map(|()| String::from_utf8(out).unwrap())
+        };
+        let yaml = "services:\n  web:\n    image: busybox:1.36\n    volumes:\n      - type: image\n        source: alpine\n        target: /a\n  db:\n    image: ghcr.io/x/db:1\n  again:\n    image: docker.io/library/busybox:1.36\n";
+        assert_eq!(
+            run(yaml, &["--lock-image-digests"]).unwrap(),
+            format!("services:\n  again:\n    image: docker.io/library/busybox:1.36@sha256:{a}\n  db:\n    image: ghcr.io/x/db:1@sha256:{c}\n  web:\n    image: docker.io/library/busybox:1.36@sha256:{a}\n    volumes:\n      - type: image\n        source: docker.io/library/alpine:latest@sha256:{b}\n        target: /a\n")
+        );
+        let full = run(yaml, &["--resolve-image-digests", "db"]).unwrap();
+        assert!(
+            full.starts_with(&format!(
+                "name: p\nservices:\n  db:\n    image: ghcr.io/x/db:1@sha256:{c}\n"
+            )),
+            "{full}"
+        );
+        let raw = run(yaml, &["--no-interpolate", "--lock-image-digests"]).unwrap();
+        assert!(
+            raw.contains(&format!(
+                "source: docker.io/library/alpine:latest@sha256:{b}\n"
+            )),
+            "{raw}"
+        );
+        // Without either flag, nothing is asked.
+        assert!(run(yaml, &[])
+            .unwrap()
+            .contains("    image: busybox:1.36\n"));
+        // A tag its registry does not have, and a name that is no reference.
+        assert_eq!(
+            run("services:\n  web:\n    image: nope\n", &["--resolve-image-digests"]),
+            Err("failed to resolve digest for docker.io/library/nope:latest: docker.io/library/nope:latest: not found".to_string())
+        );
+        assert_eq!(
+            run(
+                "services:\n  web:\n    image: Busybox\n",
+                &["--lock-image-digests"]
+            ),
+            Err(
+                "invalid reference format: repository name (library/Busybox) must be lowercase"
+                    .to_string()
+            )
         );
     }
 }

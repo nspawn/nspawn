@@ -1,5 +1,5 @@
-//! What a project is made of before it is loaded, as docker compose works it out from
-//! its flags and the environment (compose-go's cli.ProjectOptions): the files (`-f`,
+//! What a project is made of before it is loaded, as compose-go's cli.ProjectOptions
+//! works it out from the flags and the environment: the files (`-f`,
 //! COMPOSE_FILE, or found from the working directory up), the environment (the
 //! process's, then `.env` or `--env-file`), the profiles and the name.
 
@@ -11,7 +11,7 @@ use super::gostr;
 use super::loader::{self, ConfigFile, Details, Options, Warn};
 use super::paths;
 
-/// The flags of docker compose that make a project.
+/// The flags that make a project.
 #[derive(Debug, Clone, Default)]
 pub struct Flags {
     pub files: Vec<String>,
@@ -237,7 +237,7 @@ fn find_files(names: &[&str], dir: &str) -> Vec<String> {
         .collect()
 }
 
-/// docker compose's setEnvWithDotEnv, before anything else: the COMPOSE_ variables of
+/// setEnvWithDotEnv, before anything else: the COMPOSE_ variables of
 /// the env files become the process's own, where it has none. It reads the env files as
 /// they were given, before --workdir and the making of their paths absolute.
 pub fn compose_env_from_files(
@@ -258,8 +258,7 @@ pub fn compose_env_from_files(
     Ok(())
 }
 
-/// docker compose's toProjectOptions, then ReadConfigFiles and the precedence of the
-/// project's name.
+/// toProjectOptions, then ReadConfigFiles and the precedence of the project's name.
 pub fn prepare(
     flags: &Flags,
     os_env: &Env,
@@ -299,7 +298,7 @@ pub fn prepare(
     if state.config_paths.is_empty() {
         return Err("no configuration file provided: not found".to_string());
     }
-    // docker compose fetches every remote file before it reads any.
+    // Remote files are fetched before any is read: their refusal comes first.
     if let Some(path) = state.config_paths.iter().find(|p| paths::remote(p)) {
         return Err(format!("--file {path}: {}", paths::REMOTE));
     }

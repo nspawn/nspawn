@@ -3,7 +3,7 @@
 //! parsing and the conversions of a float to an integer.
 //!
 //! A Go string is any bytes; text read from files and the environment need not be
-//! UTF-8, and what docker compose prints of it depends on its bytes. Here such text is a
+//! UTF-8, and what is printed of it depends on its bytes. Here such text is a
 //! Rust string where every byte that is not part of a UTF-8 sequence stands as the code
 //! point RAW + byte, from the last private use plane: read with `from_bytes`, written
 //! back with `to_bytes`. Text that holds those code points itself reads as raw bytes too.

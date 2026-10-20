@@ -1,4 +1,4 @@
-//! The model written out as docker compose writes it: YAML with go-yaml's encoder
+//! The model written out: YAML with go-yaml's encoder
 //! (indentation of 2, its choice of plain, quoted and literal scalars, map keys in its
 //! natural order) and JSON with Go's encoding/json (indentation of 2, HTML characters
 //! escaped, map keys sorted).

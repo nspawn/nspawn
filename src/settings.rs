@@ -571,13 +571,15 @@ pub fn write(s: &MachineSettings, route: &NamespaceRoute) -> Result<()> {
 /// is checked where it comes in; this is the last look before the file is written.
 pub fn check_plain(s: &MachineSettings) -> Result<()> {
     let mut values: Vec<(&str, String)> = Vec::new();
-    let mut take = |what: &'static str, value: &str| values.push((what, value.to_string()));
+    let mut quoted: Vec<(&str, String)> = Vec::new();
+    // The command and the environment are written in quotes: a tab there is kept.
     for arg in s.command {
-        take("the command", arg);
+        quoted.push(("the command", arg.clone()));
     }
     for var in s.run.env.iter().chain(s.extra_env) {
-        take("the environment", var);
+        quoted.push(("the environment", var.clone()));
     }
+    let mut take = |what: &'static str, value: &str| values.push((what, value.to_string()));
     for dir in s.run.working_dir.iter().chain(&s.tuning.working_dir) {
         take("the working directory", dir);
     }
@@ -604,8 +606,15 @@ pub fn check_plain(s: &MachineSettings) -> Result<()> {
     if let Some(file) = s.hostname_file {
         take("the hostname file", &file.to_string_lossy());
     }
-    for (what, value) in values {
-        if value.chars().any(char::is_control) {
+    let all = values
+        .into_iter()
+        .map(|(w, v)| (w, v, false))
+        .chain(quoted.into_iter().map(|(w, v)| (w, v, true)));
+    for (what, value, in_quotes) in all {
+        if value
+            .chars()
+            .any(|c| c.is_control() && !(in_quotes && c == '\t'))
+        {
             anyhow::bail!(
                 "{what} of {} holds a control character ({value:?}), which the settings file cannot carry",
                 s.name
@@ -975,6 +984,17 @@ mod tests {
             ..Tuning::default()
         };
         assert!(!plain(&[], &run, &tuning));
+        // A tab in a quoted value is a character like any other.
+        let mut tabbed = run.clone();
+        tabbed.env = vec!["DEPS=llvm21-dev \t\tclang21".into()];
+        assert!(plain(&["a\tb".into()], &tabbed, &none));
+        let mut bad = run.clone();
+        bad.working_dir = Some("/a\tb".into());
+        assert!(!plain(&[], &bad, &none));
+        assert_eq!(
+            quote("DEPS=llvm21-dev \t\tclang21"),
+            "'DEPS=llvm21-dev \t\tclang21'"
+        );
     }
 
     #[test]

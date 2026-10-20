@@ -112,8 +112,8 @@ fn extract_from(text: &str) -> Vec<Variable> {
     values
 }
 
-/// The variables as docker compose prints them: YAML for exactly `yaml`, else what
-/// its formatter.Print takes, a table or JSON, named in any case.
+/// The variables printed: YAML for exactly `yaml`, else what formatter.Print takes, a
+/// table or JSON, named in any case.
 pub fn render(variables: &Variables, format: &str) -> Result<String, String> {
     if format == "yaml" {
         let out = Out::Dict(
@@ -181,11 +181,12 @@ struct Cell {
     htab: bool,
 }
 
-/// Go's text/tabwriter as docker compose sets it up for a table (columns at least 20
-/// wide, 3 spaces of padding, flags 0), written all at once and flushed: cells end at
-/// tabs and line ends, a column's width holds for the run of lines that have it, and
-/// text between two 0xff bytes is taken as it is.
+/// Go's text/tabwriter with a minimum width and a padding of spaces, flags 0, written
+/// all at once and flushed: cells end at tabs and line ends, a column's width holds for
+/// the run of lines that have it, and text between two 0xff bytes is taken as it is.
 struct TabWriter {
+    min_width: usize,
+    padding: usize,
     buf: Vec<u8>,
     pos: usize,
     cell: Cell,
@@ -194,9 +195,6 @@ struct TabWriter {
     widths: Vec<usize>,
     out: Vec<u8>,
 }
-
-const MIN_WIDTH: usize = 20;
-const PADDING: usize = 3;
 
 impl TabWriter {
     fn update_width(&mut self) {
@@ -310,13 +308,13 @@ impl TabWriter {
             }
             pos = self.write_lines(pos, line0, this);
             line0 = this;
-            let mut width = MIN_WIDTH;
+            let mut width = self.min_width;
             while this < line1 {
                 let line = &self.lines[this];
                 if column + 1 >= line.len() {
                     break;
                 }
-                width = width.max(line[column].width + PADDING);
+                width = width.max(line[column].width + self.padding);
                 this += 1;
             }
             self.widths.push(width);
@@ -328,9 +326,17 @@ impl TabWriter {
     }
 }
 
-/// The table of --variables through Go's tabwriter.
+/// The table of --variables through Go's tabwriter (columns at least 20 wide, 3
+/// spaces of padding).
 fn tabwriter(text: &str) -> String {
+    table(text, 20, 3)
+}
+
+/// Lines of tab-separated cells laid out by Go's tabwriter.
+pub fn table(text: &str, min_width: usize, padding: usize) -> String {
     let mut w = TabWriter {
+        min_width,
+        padding,
         buf: Vec::new(),
         pos: 0,
         cell: Cell::default(),

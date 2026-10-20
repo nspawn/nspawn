@@ -113,6 +113,7 @@ hundred that ended; older ones are gone with their objects).
 | `SearchImages(s term, s source, u limit, a{sv} options) -> (aa{sv}, as)` | `search` | source "", "hub" or "dockerhub"; the hits and the notes (a source that could not be reached); options registry, ca_cert |
 | `ListRepositories(s filter, b with_tags, a{sv} options) -> aa{sv}` | `hub ls` | options registry, ca_cert |
 | `ListTags(s repository, a{sv} options) -> as` | `hub tags` | options registry, ca_cert |
+| `ImageDigest(s reference, a{sv} options) -> s` | `compose config --resolve-image-digests` | the digest the reference names on its registry now (an index's for a tag of several platforms), asked without pulling it, with the credentials of `login`; options registry, ca_cert |
 
 ### Machines
 

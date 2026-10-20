@@ -149,7 +149,9 @@ The other flags of `docker run` are there too, remembered like the rest: `--host
 `-u/--user USER[:GROUP]` and `-w/--workdir` (instead of the image's; the user is
 resolved from the image's passwd and group files by a stand-in for getent that nspawn
 binds, since busybox has no getent, musl's answers no initgroups and neither takes a
-uid the passwd does not list, as docker does; a group, a name of the image's group
+uid the passwd does not list, as docker does; an image without a shell (distroless,
+scratch) gets a small program in its place, so `-u 1000:1000` runs there too, and one
+without `/usr`, which systemd-nspawn wants, gets an empty one; a group, a name of the image's group
 file or a number, becomes the primary and only group, as with docker, and a name the
 image lacks is refused), `--cap-add`, `--cap-drop` (on top of the default set: docker's
 and SYS_BOOT for an app on a bridge network, which runs without a user namespace,
@@ -230,7 +232,8 @@ systemd-nspawn has finished confining the machine. It attaches a terminal when s
 (`-t` and `-T` decide otherwise), so redirected output is byte-exact, and `-u USER[:GROUP]` takes
 names or numbers of the image's passwd and group files, with the home of the passwd
 entry and the user's supplementary groups unless a group is given, which is then the
-only one. `shell` opens machined's login session on booted machines and a plain
+only one; a uid the passwd lacks runs with group 0 and `/` as home, as with docker and
+as the machine's own program does. `shell` opens machined's login session on booted machines and a plain
 shell on apps. `stop` sends the image's stop signal to the program of an app machine and
 SIGKILLs it after `--timeout` seconds, or asks a booted machine to power off; `--force`
 kills at once. `restart` is a stop and a start with the remembered options, `pause` and
@@ -327,6 +330,29 @@ service answered instead of a table, and `nspawn inspect NAME...` prints the who
 record of machines or images (running or not) as a JSON array, like docker inspect:
 what a script or an agent reads. The keys are the ones of the D-Bus interface (see
 [DBUS.md](DBUS.md)), so the command line and the bus never disagree.
+
+## Compose
+
+`nspawn compose` runs the files of docker compose with docker compose's commands
+and flags, in the same order and with the same output: `nspawn compose up -d` in a
+directory with a `compose.yaml` brings its services up, `nspawn compose down` takes
+them away. It is a client of the service like every other command, so it takes the
+same permissions (`sudo`, or a polkit rule), and what it makes is nspawn's own:
+`nspawn ps` lists the machines of a project, `nspawn network ls` its networks.
+
+A service becomes a machine per replica, named as docker names its containers,
+`PROJECT-SERVICE-N` with `_` written `-`; its image is pulled from Docker Hub when it
+names no registry and kept under its local name; its networks, volumes, secrets and
+`depends_on` are nspawn's networks, volumes, secrets and `--depends-on`. The machines
+carry docker compose's labels, which is how `ps`, `logs`, `stop`, `down` and the rest
+find a project again, from its files or from `-p NAME` alone. A machine is made anew
+when its service changed (docker compose's config hash) or its image did.
+
+What nspawn cannot do, a `build` without an image, a fixed `ipv4_address` and the
+rest of the table in [COMPOSE.md](COMPOSE.md), `config` shows as warnings, and `up`,
+`create`, `run` and `scale` refuse for the services they start. COMPOSE.md has every
+attribute and option with what nspawn compose does with it, and where it differs
+from docker compose on purpose.
 
 ## Registries and credentials
 

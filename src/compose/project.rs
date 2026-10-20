@@ -9,7 +9,7 @@ use super::dotenv::{self, Env};
 use super::emit::{self, Out};
 use super::golib::go_quote;
 use super::gostr;
-use super::loader::{Options, Warn};
+use super::loader::{Options, Refusal, Warn};
 use super::model::{self, Format, Ty, EXTENSIONS};
 use super::paths;
 use super::types;
@@ -34,6 +34,10 @@ pub struct Project {
     pub files: Vec<String>,
     /// The process's directory, which a path the model leaves relative is relative to.
     pub cwd: String,
+    /// The project's working directory: --project-directory, or the first file's.
+    pub working_dir: String,
+    /// What nspawn compose does not do in the model, the services' and the project's.
+    pub refused: Vec<Refusal>,
 }
 
 fn invalid(message: String) -> String {
@@ -160,6 +164,7 @@ pub fn from_model(
         models: take("models"),
         extensions: take(EXTENSIONS),
         cwd: opts.cwd.clone(),
+        refused: opts.refused.borrow().clone(),
         ..Default::default()
     };
     // secretConfigDecoderHook: a secret from the environment carries its content.
@@ -431,9 +436,13 @@ impl Project {
                 )));
             }
             if build.is_some() && string(&s, "image").is_empty() && get(&s, "provider").is_none() {
-                return Err(format!(
-                    "service {quoted} has a build section and no image: nspawn runs images published on Docker Hub or any registry, but does not build Dockerfiles; building is not supported"
-                ));
+                self.refused.push(Refusal {
+                    service: name.clone(),
+                    path: "build".to_string(),
+                    line: format!(
+                        "service {quoted} has a build section and no image: nspawn runs images published on Docker Hub or any registry, but does not build Dockerfiles; building is not supported"
+                    ),
+                });
             }
             if let Some(build) = build {
                 if !string(build, "dockerfile_inline").is_empty()
@@ -700,12 +709,6 @@ impl Project {
                 return Err(invalid(format!(
                     "services.{attribute}: can't set container_name and {name} as container name must be unique"
                 )));
-            }
-            if !container_name.is_empty() && !machine_name(&container_name) {
-                return Err(format!(
-                    "container_name {} is not a valid machine name: machined takes letters, digits and hyphens, up to 64",
-                    go_quote(&container_name)
-                ));
             }
             if let Some(watch) = s
                 .get("develop")
@@ -1074,16 +1077,8 @@ impl Project {
 }
 
 /// A name machined takes for a machine: letters, digits and hyphens, up to 64.
-fn machine_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        && !name.starts_with('-')
-        && !name.ends_with('-')
-}
-
 /// loadMappingFile: an env or label file read in its format, compose-go's `.env` or
-/// docker compose's `raw`, into `vars`; a relative path is relative to `cwd`.
+/// `raw`, into `vars`; a relative path is relative to `cwd`.
 fn load_mapping_file(
     path: &str,
     cwd: &str,
@@ -1129,7 +1124,7 @@ fn load_mapping_file(
     }
 }
 
-/// docker's kvfile: `KEY=value` lines read with bufio.Scanner (lines of up to 64 KiB, a
+/// kvfile: `KEY=value` lines read with bufio.Scanner (lines of up to 64 KiB, a
 /// carriage return before each line end dropped), each line UTF-8, a BOM at the start
 /// of the first dropped, a `KEY` alone taking the value lookup has.
 fn kv_file(bytes: &[u8], lookup: &dyn Fn(&str) -> Option<String>) -> Result<Vec<String>, String> {
