@@ -91,7 +91,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own busybox-1.37 busybox-1.36 "$(basename "$IMAGE" | tr : -)"; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -584,6 +584,20 @@ grep -q to-stderr-$nonce /tmp/e2e-logs.txt || fail "logs do not show the app's s
 unit_started="Started (systemd-nspawn@$app.service|Container $app)"
 grep -qE "$unit_started" /tmp/e2e-logs.txt && fail "logs include systemd's unit messages without --all"
 $NSPAWN logs $app --all > /tmp/e2e-logs.txt; grep -qE "$unit_started" /tmp/e2e-logs.txt || fail "logs --all misses the unit messages"
+# What a removed machine of the same name wrote is not this one's, whatever --since says.
+$NSPAWN create $app e2e-relogs -- /bin/sh -c "echo e2e-old-$nonce; sleep 1" >/dev/null || fail "create e2e-relogs"
+$NSPAWN start e2e-relogs >/dev/null || fail "start e2e-relogs"
+retry 10 bash -c "$NSPAWN logs e2e-relogs | grep_q e2e-old-$nonce" || fail "logs of the first e2e-relogs"
+$NSPAWN rm -f e2e-relogs >/dev/null || fail "rm the first e2e-relogs"
+sleep 1
+$NSPAWN create $app e2e-relogs -- /bin/sh -c "echo e2e-new-$nonce; sleep 1" >/dev/null || fail "create e2e-relogs again"
+$NSPAWN start e2e-relogs >/dev/null || fail "start e2e-relogs again"
+retry 10 bash -c "$NSPAWN logs e2e-relogs | grep_q e2e-new-$nonce" || fail "logs of the second e2e-relogs"
+$NSPAWN logs e2e-relogs | grep_q e2e-old-$nonce && fail "logs shows what a removed machine of the same name wrote"
+$NSPAWN logs e2e-relogs --since -1h | grep_q e2e-old-$nonce && fail "logs --since reaches back past the machine's creation"
+out=$($NSPAWN logs e2e-relogs --until -1h 2>&1) || fail "logs --until before the machine was made: $out"
+[ -z "$out" ] || fail "logs --until before the machine was made showed: $out"
+$NSPAWN rm -f e2e-relogs >/dev/null || fail "rm e2e-relogs"
 $NSPAWN machines ls | tee /tmp/e2e-m.txt
 grep -q "^ *$app " /tmp/e2e-m.txt || fail "busybox machine not running"
 out=$($NSPAWN exec $app -- /bin/sh -c 'echo inside:$(uname -n); cat /etc/os-release | head -1' </dev/null | tr -d '\r')
@@ -1429,9 +1443,20 @@ systemctl is-active systemd-nspawn@e2e-restart.service >/dev/null && fail "the u
 [ -e /etc/systemd/system/systemd-nspawn@e2e-restart.service.d ] && fail "rm left the drop-in directory behind"
 
 step "kill: a signal for the program, and what ends a machine for good"
-$NSPAWN start $app --restart always -p none -- /bin/sh -c 'trap "echo e2e-got-hup" HUP; while :; do sleep 1; done' >/dev/null || fail "start an app that traps SIGHUP"
+# A signal right after a start goes to the program, never to systemd-nspawn's child that
+# becomes it: stopped there, the program would not run.
+$NSPAWN start $app --restart no -p none -- /bin/sleep 300 >/dev/null || fail "start an app to signal at once"
+$NSPAWN kill -s STOP $app >/dev/null || fail "kill -s STOP right after a start"
+leader=$(machinectl show $app -p Leader --value)
+child=$(cut -d' ' -f1 /proc/$leader/task/$leader/children)
+[ "$(cat /proc/$child/comm)" = sleep ] && retry 3 grep -q '^State:.*stopped' /proc/$child/status || fail "a signal right after a start missed the program: $(cat /proc/$child/comm) $(grep ^State: /proc/$child/status)"
+$NSPAWN kill -s CONT $app >/dev/null || fail "kill -s CONT"
+$NSPAWN stop $app >/dev/null || fail "stop the app signalled at once"
+# The program says when its trap is set: a signal before that would end it.
+$NSPAWN start $app --restart always -p none -- /bin/sh -c "trap 'echo e2e-got-hup-$nonce' HUP; echo e2e-trap-$nonce; while :; do sleep 1; done" >/dev/null || fail "start an app that traps SIGHUP"
+retry 10 bash -c "$NSPAWN logs $app | grep_q e2e-trap-$nonce" || fail "the program did not set its trap"
 [ "$($NSPAWN kill -s HUP $app)" = "$app" ] || fail "kill -s HUP does not print the machine's name"
-retry 5 bash -c "$NSPAWN logs $app | grep_q e2e-got-hup" || fail "the program did not get SIGHUP"
+retry 5 bash -c "$NSPAWN logs $app | grep_q e2e-got-hup-$nonce" || fail "the program did not get SIGHUP"
 $NSPAWN ps | grep_q "^ *$app " || fail "SIGHUP, which the program handles, ended the machine"
 restarts=$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)
 $NSPAWN kill -s USR1 $app >/dev/null || fail "kill -s USR1"

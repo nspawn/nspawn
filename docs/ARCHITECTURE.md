@@ -150,7 +150,9 @@ handles its own signal. Should the program end in between, the stop job also can
 the restart systemd has scheduled. A machine machined no
 longer lists gets the stop job too, which ends a pending restart and waits for
 the release hook of its last run. `kill` with SIGKILL is `stop --force`; any
-other signal goes to the program of an app or the init of a booted machine and
+other signal goes to the program of an app (the stub init's child, once it no
+longer bears systemd-nspawn's name, which it keeps until it executes the
+program) or the init of a booted machine and
 leaves the policy to decide should the machine end, except the machine's own
 stop signal, which docker counts as a stop: `kill` then leaves `exit-on-next`
 in the machine's directory, and the release hook, finding it, queues the stop
@@ -226,7 +228,10 @@ as `sd_journal_stream_fd_with_namespace()` does, and makes it the stdout of
 systemd-nspawn, whose relay carries the machine's output; journald files the lines
 under the unit from the stream's cgroup. Its stderr stays the unit's, in the system's
 journal, with the hooks' messages. `logs` reads the namespace and the system's journal
-interleaved (`--namespace=+nspawn`); an attached run follows the namespace. A machine
+interleaved (`--namespace=+nspawn`), from the machine's creation on, since the unit's
+lines include those of removed machines of the name: a `--since` or `--until` given in
+journalctl's syntax is compared with the creation by journalctl itself (`--lines=0`
+with both, which it refuses when the first is later); an attached run follows the namespace. A machine
 with `--log-driver none` has `StandardOutput=null`
 (and `StandardError=journal`, for systemd-nspawn's and the hooks' messages) in the
 drop-in; an attached run of it hands a pipe over instead, which becomes the

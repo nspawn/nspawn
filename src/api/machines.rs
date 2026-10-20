@@ -1504,17 +1504,26 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
 }
 
 /// An app's program (the stub init's child), which signals go to, never the whole cgroup: the stub init
-/// reboots on SIGINT and systemd-nspawn dies of SIGQUIT. Waits a moment for the stub to
-/// fork it. Returns the leader too.
+/// reboots on SIGINT and systemd-nspawn dies of SIGQUIT. Right after a start the child
+/// may still be systemd-nspawn's own, which a signal it does not handle ends before the
+/// program runs, and the machine with it: waits a few seconds at most for the stub to
+/// fork it and for it to execute the program, then takes the child as it is. Returns
+/// the leader too.
 async fn wait_for_payload(sd: &Systemd, name: &str) -> Result<(u32, Option<i32>)> {
     let leader = sd.machine_leader(name).await?;
-    let mut payload = payload_pid(leader);
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while payload.is_none() && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        payload = payload_pid(leader);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let payload = payload_pid(leader);
+        if running_program(payload, |pid| comm(pid as u32)).is_some() || Instant::now() > deadline {
+            return Ok((leader, payload));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    Ok((leader, payload))
+}
+
+/// The stub init's child once it has executed the program; `comm` names a PID.
+fn running_program(payload: Option<i32>, comm: impl Fn(i32) -> Option<String>) -> Option<i32> {
+    payload.filter(|&pid| comm(pid).is_some_and(|name| !in_nspawn_setup(&name)))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1901,7 +1910,8 @@ fn payload_pid(leader: u32) -> Option<i32> {
 
 /// systemd-nspawn's child keeps the binary's name until it hands over to the stub init,
 /// which renames itself, or executes the machine's init: both come after it has dropped
-/// its capabilities and loaded its seccomp filter.
+/// its capabilities and loaded its seccomp filter. The stub init's child keeps it too,
+/// until it executes the program.
 fn in_nspawn_setup(comm: &str) -> bool {
     comm.trim_end() == "systemd-nspawn"
 }
@@ -2046,7 +2056,8 @@ pub struct LogsRequest {
 const FOLLOW_TAIL: u32 = 10;
 
 /// journalctl's arguments for logs: the console output is in the unit's journal,
-/// earlier runs included; a booted machine also has a journal of its own.
+/// earlier runs included (`from_creation` leaves out other machines of the name); a
+/// booted machine also has a journal of its own.
 /// Refuses logs of a machine whose output was dropped (--log-driver none), as docker
 /// does, rather than showing nothing; a booted machine's own journal is still there.
 pub fn check_logs_kept(record: &ImageRecord, inside: bool) -> Result<()> {
@@ -2062,6 +2073,50 @@ pub fn check_logs_kept(record: &ImageRecord, inside: bool) -> Result<()> {
         "{} keeps no output: its log driver is none (start it with --log-driver journal to keep it){hint}",
         record.name
     )
+}
+
+/// Starts logs where the machine began: the unit's journal also holds what machines of
+/// the same name wrote before it was made, and so may a booted machine's own. A later
+/// `since` stands; an `until` before the creation leaves nothing to show. `before(a, b)`
+/// says whether `a` is no later than `b`, in journalctl's syntax, which the two are in.
+pub fn from_creation(
+    request: &mut LogsRequest,
+    created: u64,
+    mut before: impl FnMut(&str, &str) -> bool,
+) {
+    let creation = format!("@{created}");
+    if !request
+        .since
+        .as_deref()
+        .is_none_or(|since| before(since, &creation))
+    {
+        return;
+    }
+    request.since = Some(creation.clone());
+    if let Some(until) = request.until.clone() {
+        if !before(&creation, &until) {
+            // journalctl still reads the until, so that one it cannot parse is reported.
+            request.since = Some(until);
+            request.lines = Some(0);
+        }
+    }
+}
+
+/// Whether journalctl takes `a` as no later than `b`: it refuses a --since later than
+/// its --until, and one it cannot read.
+pub fn journal_time_before(a: &str, b: &str) -> bool {
+    std::process::Command::new("journalctl")
+        .args([
+            "--quiet",
+            "--lines=0",
+            &format!("--since={a}"),
+            &format!("--until={b}"),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
@@ -2105,6 +2160,23 @@ pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signals_wait_for_the_program_itself() {
+        let names = |pid: i32| match pid {
+            7 => Some("systemd-nspawn".to_string()),
+            8 => Some("sh".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            running_program(Some(7), names),
+            None,
+            "the child has not executed the program yet"
+        );
+        assert_eq!(running_program(Some(8), names), Some(8));
+        assert_eq!(running_program(Some(9), names), None, "gone meanwhile");
+        assert_eq!(running_program(None, names), None);
+    }
 
     #[test]
     fn nspawn_setup_by_the_leader_name() {
@@ -2312,6 +2384,54 @@ mod tests {
         let init = [libc::SIGRTMIN() + 3, libc::SIGRTMIN() + 4];
         assert_eq!(stop_signals(Some(&booted)).unwrap(), init);
         assert_eq!(stop_signals(None).unwrap(), init);
+    }
+
+    #[test]
+    fn logs_start_where_the_machine_began() {
+        // Times as numbers, compared the way journalctl would; "x" it cannot read.
+        let before = |a: &str, b: &str| {
+            let t = |s: &str| s.trim_start_matches('@').parse::<u64>().ok();
+            matches!((t(a), t(b)), (Some(a), Some(b)) if a <= b)
+        };
+        let logs = |since: Option<&str>, until: Option<&str>| {
+            let mut request = LogsRequest {
+                machine: "web".into(),
+                since: since.map(str::to_string),
+                until: until.map(str::to_string),
+                ..LogsRequest::default()
+            };
+            from_creation(&mut request, 100, before);
+            (request.since, request.until, request.lines)
+        };
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(logs(None, None), (some("@100"), None, None));
+        assert_eq!(
+            logs(Some("@50"), None),
+            (some("@100"), None, None),
+            "what came before the machine is another's"
+        );
+        assert_eq!(logs(Some("@150"), None), (some("@150"), None, None));
+        assert_eq!(
+            logs(Some("x"), None),
+            (some("x"), None, None),
+            "journalctl reports what it cannot read"
+        );
+        assert_eq!(logs(None, Some("@200")), (some("@100"), some("@200"), None));
+        assert_eq!(
+            logs(Some("@20"), Some("@50")),
+            (some("@50"), some("@50"), Some(0)),
+            "nothing of the machine is that old"
+        );
+        assert_eq!(
+            logs(None, Some("x")),
+            (some("x"), some("x"), Some(0)),
+            "an until journalctl cannot read still reaches it"
+        );
+        assert_eq!(
+            logs(Some("@150"), Some("@120")),
+            (some("@150"), some("@120"), None),
+            "a since after the until is the caller's, for journalctl to refuse"
+        );
     }
 
     #[test]

@@ -1376,6 +1376,17 @@ impl Manager {
                 }
                 request.namespace = Some(namespace.to_string());
             }
+            let created = record.created;
+            request = tokio::task::spawn_blocking(move || {
+                api::machines::from_creation(
+                    &mut request,
+                    created,
+                    api::machines::journal_time_before,
+                );
+                request
+            })
+            .await
+            .map_err(|e| Error::Failed(e.to_string()))?;
         }
         let argv = api::machines::journalctl_arguments(&request);
         let pipe = || {

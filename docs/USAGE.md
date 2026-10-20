@@ -95,7 +95,9 @@ take an `unless-stopped` machine off the boot list, and a `poweroff` from inside
 ending under `always`. `kill` works as docker's: SIGKILL, its default, stops the machine
 for good; any other signal goes to the program (or the init of a booted machine), and
 should it end the machine the policy decides, unless it was the machine's stop signal,
-which counts as a stop. `-m/--memory`, `--cpus` and `--pids-limit`
+which counts as a stop. Right after a start, `kill` waits a few seconds at most for the
+program to be running, so that the signal is not taken by systemd-nspawn's child, which
+would end the machine before the program ran. `-m/--memory`, `--cpus` and `--pids-limit`
 bound the whole machine (its unit's MemoryMax=, CPUQuota= and TasksMax=), which is why
 they cannot be seen from inside; as with docker, `--memory` also lets the machine use as
 much swap again (MemorySwapMax=), and no more, unless `--memory-swap` gives memory and
@@ -209,7 +211,9 @@ What a machine prints goes, by default (`--log-driver local`), to a journal of
 nspawn's own: journald's `nspawn` namespace, kept apart from the system's journal, so a
 program that writes a lot never floods the host's logs. `logs` and an attached `run`
 read it, with `-f`, `-n`, `--since` and timestamps as before, and
-`journalctl --namespace=nspawn` shows it all. The namespace holds 1 GiB at most, the
+`journalctl --namespace=nspawn` shows it all. As with docker, `logs` shows what this
+machine wrote, from its creation on: a removed machine of the same name, whose lines
+are still in the journal, does not show, even with an earlier `--since`. The namespace holds 1 GiB at most, the
 oldest lines going first (`/usr/lib/systemd/journald@nspawn.conf`, which
 `/etc/systemd/journald@nspawn.conf` or a drop-in overrides); the limit is the
 namespace's, shared by every machine, and a removed machine's lines stay until they age
