@@ -75,6 +75,20 @@ fn filters(values: &[String]) -> Result<(Vec<String>, Option<u64>)> {
     Ok((labels, until))
 }
 
+/// Whether a machine or network (as JSON) has every label of `labels` (KEY or
+/// KEY=VALUE) and was made before `until`.
+fn selected(have: &serde_json::Value, labels: &[String], until: Option<u64>) -> bool {
+    labels.iter().all(|l| {
+        let (k, v) = l
+            .split_once('=')
+            .map_or((l.as_str(), None), |(k, v)| (k, Some(v)));
+        match have["labels"].get(k).and_then(|x| x.as_str()) {
+            Some(value) => v.is_none_or(|v| v == value),
+            None => false,
+        }
+    }) && until.is_none_or(|t| have["created"].as_u64().is_some_and(|c| c < t))
+}
+
 fn confirm(warning: &str, force: bool) -> Result<bool> {
     if force {
         return Ok(true);
@@ -250,6 +264,30 @@ pub async fn df(args: SystemDfArgs, client: &Client) -> Result<()> {
     Ok(())
 }
 
+/// The unused networks `filters` select, removed; their names.
+pub async fn networks_prune(client: &Client, filters: &[String]) -> Result<Vec<String>> {
+    let (labels, until) = self::filters(filters)?;
+    let unused: Vec<String> = client
+        .manager
+        .list_networks()
+        .await
+        .map_err(client::error)?
+        .iter()
+        .map(client::dict_to_json)
+        .filter(|n| {
+            n["machines"].as_array().is_some_and(Vec::is_empty) && selected(n, &labels, until)
+        })
+        .filter_map(|n| n["name"].as_str().map(str::to_string))
+        .collect();
+    if unused.is_empty() {
+        return Ok(Vec::new());
+    }
+    let result = client
+        .run_job_silent(|| client.manager.remove_networks(&unused), true)
+        .await?;
+    Ok(client::strings(&result, "removed"))
+}
+
 pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
     let (labels, until) = filters(&args.filters)?;
     let mut warning = String::from("WARNING! This will remove:\n  - all stopped containers\n  - all networks not used by at least one container\n");
@@ -266,11 +304,11 @@ pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
         return Ok(());
     }
     let manager = &client.manager;
-    // Stopped machines: what system df counts as containers and does not see running.
+    // Stopped machines made from an image: a pulled or built record is the image too.
     let usage = manager.disk_usage().await.map_err(client::error)?;
     let stopped: HashMap<String, u64> = rows(&usage, "container_rows")
         .iter()
-        .filter(|r| !client::bool(r, "running"))
+        .filter(|r| client::bool(r, "made") && !client::bool(r, "running"))
         .map(|r| (client::string(r, "name"), client::u64(r, "size")))
         .collect();
     let mut names: Vec<String> = Vec::new();
@@ -281,18 +319,7 @@ pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
             if !known.contains(&name) || client::string(&machine, "state") != "stopped" {
                 continue;
             }
-            let have = client::dict_to_json(&machine);
-            let matches = labels.iter().all(|l| {
-                let (k, v) = l
-                    .split_once('=')
-                    .map_or((l.as_str(), None), |(k, v)| (k, Some(v)));
-                match have["labels"].get(k).and_then(|x| x.as_str()) {
-                    Some(value) => v.is_none_or(|v| v == value),
-                    None => false,
-                }
-            }) && until
-                .is_none_or(|t| have["created"].as_u64().is_some_and(|c| c < t));
-            if matches {
+            if selected(&client::dict_to_json(&machine), &labels, until) {
                 names.push(name);
             }
         }
@@ -319,11 +346,18 @@ pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
             removed_machines.push(name.clone());
         }
     }
-    let networks = client
-        .run_job_silent(|| manager.prune_networks(), true)
-        .await
-        .map(|r| client::strings(&r, "removed"))
-        .unwrap_or_default();
+    // The service prunes every unused network; with filters, the ones they select.
+    let networks = if args.filters.is_empty() {
+        client
+            .run_job_silent(|| manager.prune_networks(), true)
+            .await
+            .map(|r| client::strings(&r, "removed"))
+            .unwrap_or_default()
+    } else {
+        networks_prune(client, &args.filters)
+            .await
+            .unwrap_or_default()
+    };
     let (images, freed) = prune_images(client, args.all, &labels, until).await?;
     reclaimed += freed;
     for (title, list, prefix) in [
@@ -364,6 +398,16 @@ mod tests {
         ] {
             assert_eq!(human_size(bytes), text, "{bytes}");
         }
+    }
+
+    #[test]
+    fn filters_select_by_label_and_age() {
+        let have = serde_json::json!({ "labels": { "a": "b", "c": "" }, "created": 50 });
+        assert!(selected(&have, &[], None));
+        assert!(selected(&have, &["a=b".into(), "c".into()], Some(51)));
+        assert!(!selected(&have, &["a=x".into()], None));
+        assert!(!selected(&have, &["d".into()], None));
+        assert!(!selected(&have, &[], Some(50)));
     }
 
     #[test]

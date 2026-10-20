@@ -39,6 +39,40 @@ mod value;
 mod variables;
 mod yaml;
 
+/// The first YAML document of `input` as JSON, read by the YAML loader compose files go
+/// through: CDI specs are YAML or JSON. A null in a mapping is left out, as go-yaml
+/// leaves the field it would fill at its zero value.
+pub(crate) fn yaml_to_json(input: &[u8]) -> Result<Option<serde_json::Value>, String> {
+    let mut docs = yaml::Documents::new(input);
+    let Some(doc) = docs.next_document().map_err(|e| e.to_string())? else {
+        return Ok(None);
+    };
+    let (_, value) = yaml::read(doc).map_err(|e| match e {
+        yaml::ReadError::Yaml(e) | yaml::ReadError::Key(e) => e,
+    })?;
+    Ok(Some(json_of(&value)))
+}
+
+fn json_of(value: &value::Value) -> serde_json::Value {
+    use serde_json::Value as J;
+    use value::Value as V;
+    match value {
+        V::Null | V::Time(_) => J::Null,
+        V::Bool(b) => J::Bool(*b),
+        V::Int(i) => J::from(*i),
+        V::Uint(u) => J::from(*u),
+        V::Float(f) => serde_json::Number::from_f64(*f).map_or(J::Null, J::Number),
+        V::Str(s) => J::String(s.clone()),
+        V::Seq(items) => J::Array(items.iter().map(json_of).collect()),
+        V::Map(map) => J::Object(
+            map.iter()
+                .filter(|(_, v)| !matches!(v, V::Null))
+                .map(|(k, v)| (k.clone(), json_of(v)))
+                .collect(),
+        ),
+    }
+}
+
 use std::cell::Cell;
 use std::io::{IsTerminal, Write};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};

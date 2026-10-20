@@ -9,6 +9,7 @@ mod attach;
 mod auth;
 mod backend;
 mod bridge;
+mod cdi;
 mod cli;
 mod client;
 mod commands;

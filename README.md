@@ -87,6 +87,9 @@ requirements, building from source and usage examples.
   `events`, `cp`, `kill`, `pause`, `top`, `stats` and `inspect` behave as docker's.
   Named volumes are seeded from the image and outlive the machines that use them;
   secrets are kept encrypted with systemd-creds and handed to a machine as files.
+- **GPUs through CDI.** `--gpus all` and `--device nvidia.com/gpu=all` hand a machine
+  the devices of the CDI specs vendors' tools write (`nvidia-ctk cdi generate`), their
+  libraries and hooks included, as docker and podman do; compose's `gpus:` too.
 - **One image, many machines.** A pulled image is a machine; `create` makes more from
   it, sharing its layers, each with settings, ports and an address of its own.
 - **Signed images.** Every image on hub.nspawn.org is signed by its build workflow,

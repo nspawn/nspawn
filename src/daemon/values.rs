@@ -181,6 +181,17 @@ pub fn record(r: &ImageRecord) -> Dict {
                     .devices
                     .iter()
                     .map(|d| format!("{}:{}:{}", d.host, d.container, d.permissions))
+                    .chain(r.tuning.cdi_devices.iter().cloned())
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+        (
+            "gpus".to_string(),
+            strings(
+                &r.tuning
+                    .gpus
+                    .iter()
+                    .map(|g| g.to_string())
                     .collect::<Vec<_>>(),
             ),
         ),

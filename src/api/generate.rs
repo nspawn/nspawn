@@ -427,6 +427,12 @@ fn tuning_flags(t: &crate::tuning::Tuning) -> Vec<Vec<String>> {
             ),
         );
     }
+    for name in &t.cdi_devices {
+        flag(&mut out, "--device", name);
+    }
+    for request in &t.gpus {
+        flag(&mut out, "--gpus", &request.to_string());
+    }
     for iface in &t.interfaces {
         flag(&mut out, "--interface", iface);
     }

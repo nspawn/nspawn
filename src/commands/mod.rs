@@ -2,6 +2,7 @@
 //! org.nspawn service on the system bus; only the service itself, its installation and
 //! the hooks the machine units call run the library in this process.
 
+mod build;
 pub(crate) mod copy;
 mod login;
 pub(crate) mod machines;
@@ -227,12 +228,18 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .await?;
                 Ok(())
             }
-            NetworkCommand::Prune { force } => {
+            NetworkCommand::Prune { force, filters } => {
                 if !force && !ask("Remove every network no machine uses?", "network prune -f")? {
                     return Ok(());
                 }
                 let client = Client::connect().await?;
-                client.run_job(|| client.manager.prune_networks()).await?;
+                if filters.is_empty() {
+                    client.run_job(|| client.manager.prune_networks()).await?;
+                } else {
+                    for name in system::networks_prune(&client, &filters).await? {
+                        println!("{name}");
+                    }
+                }
                 Ok(())
             }
         },
@@ -283,6 +290,7 @@ pub fn put_tuning(options: &mut Options<'_>, t: crate::cli::TuningArgs) {
         ("cap_drop", t.cap_drop),
         ("tmpfs", t.tmpfs),
         ("devices", t.device),
+        ("gpus", t.gpus),
         ("interfaces", t.interface),
         ("dns", t.dns),
         ("dns_search", t.dns_search),
@@ -472,21 +480,28 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             Ok(())
         }
         Command::Build(a) => {
+            if build::kind(&a)? == build::Kind::Dockerfile {
+                bail!("Dockerfile builds are not wired yet");
+            }
+            let [tag] = a.tag.as_slice() else {
+                bail!("an mkosi build takes one --tag");
+            };
+            let tag = tag.clone();
             let mut options = client::registry_options(config);
-            put_opt(&mut options, "name", a.name);
-            put_opt(&mut options, "distribution", a.distribution);
-            put_opt(&mut options, "release", a.release);
-            put_all(&mut options, "profile", a.profile);
+            put_opt(&mut options, "name", a.mkosi.name);
+            put_opt(&mut options, "distribution", a.mkosi.distribution);
+            put_opt(&mut options, "release", a.mkosi.release);
+            put_all(&mut options, "profile", a.mkosi.profile);
             backend(&mut options, a.backend);
             mode(&mut options, a.mode);
             put(&mut options, "force", a.force);
-            put(&mut options, "keep_output", a.keep_output);
-            put_all(&mut options, "mkosi_args", a.mkosi_args);
+            put(&mut options, "keep_output", a.mkosi.keep_output);
+            put_all(&mut options, "mkosi_args", a.mkosi.mkosi_args);
             // The service resolves the directory; give it an absolute one.
             let directory = std::fs::canonicalize(&a.directory).unwrap_or(a.directory);
             let directory = directory.to_string_lossy().into_owned();
             let done = client
-                .run_job(|| manager.build_image(&directory, &a.tag, options))
+                .run_job(|| manager.build_image(&directory, &tag, options))
                 .await?;
             let output = client::string(&done, "output");
             if !output.is_empty() {

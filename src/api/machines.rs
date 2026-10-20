@@ -402,6 +402,11 @@ async fn check_interfaces(
     Ok(())
 }
 
+/// Where the CDI device nodes the host lacks are made for a machine.
+fn cdi_nodes_dir(store: &Store, name: &str) -> PathBuf {
+    store.machine_files_dir(name).join("cdi").join("nodes")
+}
+
 /// Who calls `prepare`: both passes do the same checks and write the same files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pass {
@@ -641,6 +646,25 @@ pub async fn prepare(
         }
         true
     });
+    // CDI devices, looked up in the host's specs at every start: a driver update
+    // rewrites them.
+    let cdi = crate::cdi::plan(&record.tuning)?;
+    let mut extra_env = record.env.clone();
+    if let Some(plan) = &cdi {
+        if record.backend == BackendChoice::Mstack {
+            bail!("{name} runs under managed user namespaces (mstack), where CDI devices cannot be applied yet; pull it again with --backend overlay");
+        }
+        if pass == Pass::Ahead {
+            for text in &plan.notes {
+                note(report, format!("note: {name}: {text}"));
+            }
+        }
+        tuning
+            .devices
+            .extend(crate::cdi::devices(plan, &cdi_nodes_dir(store, name))?);
+        binds.extend(plan.mounts.iter().cloned());
+        extra_env.extend(plan.env.iter().cloned());
+    }
     // A booted machine's systemd sets the hostname from /etc/hostname, over the one
     // systemd-nspawn set: --hostname goes in as that file. A machine that takes the
     // Docker API gets it from a directory named after its container ID, as docker binds
@@ -690,13 +714,7 @@ pub async fn prepare(
             })
             .collect();
         points.extend(binds.iter().map(|b| (b.target.clone(), b.source.is_dir())));
-        points.extend(
-            record
-                .tuning
-                .devices
-                .iter()
-                .map(|d| (d.container.clone(), false)),
-        );
+        points.extend(tuning.devices.iter().map(|d| (d.container.clone(), false)));
         if hostname_file.is_some() {
             points.push(("/etc/hostname".to_string(), false));
         }
@@ -738,7 +756,7 @@ pub async fn prepare(
             pid1: record.program_is_pid1(),
             run: &record.run,
             command: &record.effective_command(),
-            extra_env: &record.env,
+            extra_env: &extra_env,
             binds: &binds,
             volume_units: volume_units.as_deref(),
             network: record.network,
@@ -763,7 +781,7 @@ pub async fn prepare(
             restart: record.restart,
             limits: &record.limits,
             remove_on_exit: record.remove_on_exit,
-            tuning: &record.tuning,
+            tuning: &tuning,
             api_socket: record.takes_api_socket(),
         },
     )? {
@@ -778,8 +796,23 @@ pub async fn prepare(
     if record.network == Network::Veth {
         hostnet::ensure_networkd(sd, report).await?;
     }
-    // Last: nothing that could fail is left to leave an interface in the namespace.
     if pass == Pass::Hook {
+        if let Some(plan) = &cdi {
+            let root = crate::backend::mount_point_root(store, name, record.backend)?;
+            let env: Vec<String> = record.run.env.iter().chain(&extra_env).cloned().collect();
+            crate::cdi::run_hooks(
+                plan,
+                &crate::cdi::HookMachine {
+                    name,
+                    root: &root,
+                    bundle: &store.machine_files_dir(name).join("cdi").join("bundle"),
+                    env: &env,
+                    command: &record.effective_command(),
+                },
+            )
+            .await?;
+        }
+        // Last: nothing that could fail is left to leave an interface in the namespace.
         move_interfaces(name, hook_interfaces(&record))?;
     }
     Ok(record.network)
@@ -1816,6 +1849,16 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
         settings::namespace_route(sd, &args.name, record.mode, bridge::namespaced(&record)).await?;
     let app_argv =
         settings::wrapped_argv(sd, &args.name, record.mode, &route, &record.tuning).await?;
+    // The drop-in keeps the cgroup's access to the CDI nodes of a running machine.
+    let mut tuning = record.tuning.clone();
+    if let Some(plan) = crate::cdi::plan(&record.tuning)
+        .with_context(|| format!("looking up the CDI devices of {}", args.name))?
+    {
+        tuning.devices.extend(crate::cdi::device_paths(
+            &plan,
+            &cdi_nodes_dir(store, &args.name),
+        ));
+    }
     let reload = settings::write_hooks(
         &args.name,
         &ctx.config,
@@ -1825,7 +1868,7 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
             restart: record.restart,
             limits: &record.limits,
             remove_on_exit: record.remove_on_exit,
-            tuning: &record.tuning,
+            tuning: &tuning,
             api_socket: record.takes_api_socket(),
         },
     )?;

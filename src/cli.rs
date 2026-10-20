@@ -43,7 +43,8 @@ pub enum Command {
     /// Make a machine from an image and start it, like docker run -d: a local image with
     /// that reference is reused, the hub is asked otherwise.
     Run(RunArgs),
-    /// Build an image with mkosi and make it available locally, ready to push.
+    /// Build an image from a Dockerfile, like docker build, or with mkosi from an mkosi
+    /// configuration, and make it available locally, ready to push.
     Build(BuildArgs),
     /// Make another machine from a local image, like docker create (no registry needed).
     Create(CreateArgs),
@@ -243,6 +244,10 @@ pub enum NetworkCommand {
         /// Do not ask.
         #[arg(long, short = 'f')]
         force: bool,
+        /// Only the networks it selects: label=KEY[=VALUE] or until=TIME (a duration
+        /// ago, or unix seconds). Repeatable; every one must hold.
+        #[arg(long = "filter", value_name = "FILTER")]
+        filters: Vec<String>,
     },
     /// Unit hook (ExecStartPre): prepare a machine's network before it starts.
     #[command(hide = true)]
@@ -537,9 +542,15 @@ pub struct TuningArgs {
     #[arg(long, value_name = "SIZE", value_parser = crate::policy::parse_size)]
     pub shm_size: Option<u64>,
     /// A device node of the host for the machine, HOST[:CONTAINER[:PERMISSIONS]], like
-    /// docker --device. Repeatable; "none" forgets them.
+    /// docker --device, or a CDI device of the host's specs (nvidia.com/gpu=all).
+    /// Repeatable; "none" forgets them.
     #[arg(long, value_name = "HOST[:CONTAINER[:rwm]]", value_hint = clap::ValueHint::AnyPath)]
     pub device: Vec<String>,
+    /// GPUs from the CDI spec of their vendor, like docker --gpus: all, a count, or
+    /// device=0,1 (nvidia-ctk cdi generate writes NVIDIA's). Repeatable; "none" forgets
+    /// them.
+    #[arg(long, value_name = "REQUEST")]
+    pub gpus: Vec<String>,
     /// A network interface of the host, moved into the machine while it runs and given
     /// back when it stops: an ethernet one, or a wifi adapter with its whole phy; the
     /// name is kept inside. Repeatable; "none" forgets them.
@@ -632,13 +643,168 @@ pub struct HealthArgs {
 
 #[derive(Args, Debug)]
 pub struct BuildArgs {
-    /// Directory with the mkosi configuration (mkosi.conf, mkosi.conf.d, ...).
+    /// The build context: a directory with a Dockerfile, or an mkosi configuration
+    /// (mkosi.conf, mkosi.conf.d); - reads a context tar or a Dockerfile from standard
+    /// input.
     #[arg(default_value = ".")]
     pub directory: PathBuf,
     /// Reference for the result, for example myapp:1 or hub.example/team/app:2.
-    #[arg(long, short = 't', required = true)]
-    pub tag: String,
-    /// Local image name (default: derived from the tag).
+    /// Repeatable for a Dockerfile; an mkosi build takes one.
+    #[arg(long, short = 't')]
+    pub tag: Vec<String>,
+    /// Replace an existing image with the same name.
+    #[arg(long)]
+    pub force: bool,
+    /// How to assemble the image on this host: auto is overlay, or flat without overlayfs;
+    /// mstack (systemd 261 or newer, managed user namespaces) is experimental.
+    #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
+    pub backend: BackendChoice,
+    /// Whether the image boots an init system or runs a single program.
+    #[arg(long, value_enum, default_value_t = ModeChoice::Auto)]
+    pub mode: ModeChoice,
+    #[command(flatten)]
+    pub dockerfile: DockerfileArgs,
+    #[command(flatten)]
+    pub mkosi: MkosiArgs,
+}
+
+/// The flags of a Dockerfile build, as docker build takes them.
+#[derive(Args, Debug, Default)]
+pub struct DockerfileArgs {
+    /// The Dockerfile, like docker build -f (default: Dockerfile, dockerfile or
+    /// Containerfile in the context); - reads it from standard input.
+    #[arg(long, short = 'f', value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
+    pub file: Option<String>,
+    /// A build argument, KEY=VALUE, or KEY to take it from the environment. Repeatable.
+    #[arg(long = "build-arg", value_name = "KEY[=VALUE]")]
+    pub build_arg: Vec<String>,
+    /// The stage to build (default: the last one).
+    #[arg(long)]
+    pub target: Option<String>,
+    /// Build every step again instead of taking it from the cache.
+    #[arg(long)]
+    pub no_cache: bool,
+    /// Build these stages again instead of taking their steps from the cache.
+    /// Repeatable.
+    #[arg(long, value_name = "STAGE")]
+    pub no_cache_filter: Vec<String>,
+    /// Ask the registry for the base images again even when they are here.
+    #[arg(long)]
+    pub pull: bool,
+    /// A label for the image, KEY=VALUE. Repeatable.
+    #[arg(long, value_name = "KEY=VALUE")]
+    pub label: Vec<String>,
+    /// The network of RUN steps: default (the bridge), none, or host (with --allow
+    /// network.host).
+    #[arg(long, value_name = "MODE")]
+    pub network: Option<String>,
+    /// A line for the hosts file of RUN steps, HOST:IP. Repeatable.
+    #[arg(long, value_name = "HOST:IP")]
+    pub add_host: Vec<String>,
+    /// Entitlements: network.host lets a step use --network=host. Repeatable.
+    #[arg(long, value_name = "ENTITLEMENT")]
+    pub allow: Vec<String>,
+    /// A secret for RUN --mount=type=secret, id=ID[,src=PATH | ,env=VAR], read here by
+    /// the caller. Repeatable.
+    #[arg(long, value_name = "id=ID[,src=PATH]")]
+    pub secret: Vec<String>,
+    /// Size of /dev/shm in RUN steps, like docker: 64m, 1g.
+    #[arg(long, value_name = "SIZE", value_parser = crate::policy::parse_size)]
+    pub shm_size: Option<u64>,
+    /// A resource limit of RUN steps, NAME=SOFT[:HARD]. Repeatable.
+    #[arg(long, value_name = "NAME=SOFT[:HARD]")]
+    pub ulimit: Vec<String>,
+    /// The platform to build for; this host's is the only one.
+    #[arg(long, value_name = "PLATFORM")]
+    pub platform: Option<String>,
+    /// Print only the image ID.
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+    /// How to show the steps: auto, plain or quiet; all print every line.
+    #[arg(long, value_name = "TYPE")]
+    pub progress: Option<String>,
+    /// Write the image ID to this file.
+    #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+    pub iidfile: Option<PathBuf>,
+    /// Push the tags once built.
+    #[arg(long)]
+    pub push: bool,
+    /// The image is local already; taken for the command lines that ask for it.
+    #[arg(long)]
+    pub load: bool,
+    /// Pull the base images without verifying their signatures.
+    #[arg(long)]
+    pub no_verify: bool,
+    /// Images to take the cache from: ignored, nspawn's cache is this host's.
+    #[arg(long, value_name = "SOURCE", hide = true)]
+    pub cache_from: Vec<String>,
+    #[arg(long, hide = true)]
+    pub ssh: Vec<String>,
+    #[arg(long, short = 'o', hide = true)]
+    pub output: Vec<String>,
+    #[arg(long, hide = true)]
+    pub cache_to: Vec<String>,
+    #[arg(long, hide = true)]
+    pub build_context: Vec<String>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "", hide = true)]
+    pub check: Option<String>,
+    #[arg(long, hide = true)]
+    pub call: Option<String>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide = true)]
+    pub sbom: Option<String>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide = true)]
+    pub provenance: Option<String>,
+    #[arg(long, hide = true)]
+    pub attest: Vec<String>,
+}
+
+impl DockerfileArgs {
+    /// Whether a flag only a Dockerfile build takes was given.
+    pub fn given(&self) -> bool {
+        self.file.is_some()
+            || !self.build_arg.is_empty()
+            || self.target.is_some()
+            || self.no_cache
+            || !self.no_cache_filter.is_empty()
+            || self.pull
+            || !self.label.is_empty()
+            || self.network.is_some()
+            || !self.add_host.is_empty()
+            || !self.allow.is_empty()
+            || !self.secret.is_empty()
+            || self.shm_size.is_some()
+            || !self.ulimit.is_empty()
+            || self.platform.is_some()
+            || self.quiet
+            || self.progress.is_some()
+            || self.iidfile.is_some()
+            || self.push
+            || self.load
+            || self.no_verify
+    }
+
+    /// The flags of docker build nspawn's builder has no counterpart of.
+    pub fn refused(&self) -> Option<&'static str> {
+        [
+            (!self.ssh.is_empty(), "--ssh: SSH agent forwarding into a build is not supported"),
+            (!self.output.is_empty(), "--output: a build makes a local image; nspawn push sends it to a registry"),
+            (!self.cache_to.is_empty(), "--cache-to: the build cache stays on this host"),
+            (!self.build_context.is_empty(), "--build-context: a build takes one context"),
+            (self.check.is_some(), "--check: the builder has no linter"),
+            (self.call.is_some(), "--call: the builder only builds"),
+            (self.sbom.is_some(), "--sbom: the builder writes no attestations"),
+            (self.provenance.is_some(), "--provenance: the builder writes no attestations"),
+            (!self.attest.is_empty(), "--attest: the builder writes no attestations"),
+        ]
+        .into_iter()
+        .find_map(|(given, text)| given.then_some(text))
+    }
+}
+
+/// The flags of an mkosi build.
+#[derive(Args, Debug, Default)]
+pub struct MkosiArgs {
+    /// Local image name of an mkosi build (default: derived from the tag).
     #[arg(long, short = 'n')]
     pub name: Option<String>,
     /// Distribution to build (mkosi --distribution).
@@ -650,22 +816,24 @@ pub struct BuildArgs {
     /// mkosi profile to enable (repeatable).
     #[arg(long)]
     pub profile: Vec<String>,
-    /// How to assemble the image on this host: auto is overlay, or flat without overlayfs;
-    /// mstack (systemd 261 or newer, managed user namespaces) is experimental.
-    #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
-    pub backend: BackendChoice,
-    /// Whether the image boots an init system or runs a single program.
-    #[arg(long, value_enum, default_value_t = ModeChoice::Auto)]
-    pub mode: ModeChoice,
-    /// Replace an existing image with the same name.
-    #[arg(long, short = 'f')]
-    pub force: bool,
     /// Keep the mkosi output directory instead of deleting it after the import.
     #[arg(long)]
     pub keep_output: bool,
     /// Extra arguments passed to mkosi verbatim (after --).
     #[arg(last = true)]
     pub mkosi_args: Vec<String>,
+}
+
+impl MkosiArgs {
+    /// Whether a flag only an mkosi build takes was given.
+    pub fn given(&self) -> bool {
+        self.name.is_some()
+            || self.distribution.is_some()
+            || self.release.is_some()
+            || !self.profile.is_empty()
+            || self.keep_output
+            || !self.mkosi_args.is_empty()
+    }
 }
 
 #[derive(Args, Debug)]

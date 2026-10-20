@@ -7,6 +7,10 @@ use super::{full, ignored, partly, refused, when, Attribute, Value};
 
 /// What a machine of an image that boots cannot take: its init runs as it is.
 const BOOTED: &str = "refused for an image that boots, whose init runs as it is";
+const GPU_CAPABILITIES: &str =
+    "they pick the vendor whose CDI spec is used, as docker picks its device driver";
+const GPU_DRIVER: &str = "nvidia, amd or cdi, through the CDI specs of the host";
+const GPU_OPTIONS: &str = "the CDI spec says what the devices need";
 
 /// The words of the warnings on what is left to Swarm, which nspawn compose leaves as
 /// well.
@@ -115,16 +119,47 @@ pub static ATTRIBUTES: &[Attribute] = &[
     ignored("services.*.deploy.mode", SWARM_DEPLOY_MODE),
     ignored("services.*.deploy.placement", SWARM_PLACEMENT).and_below(),
     full("services.*.deploy.replicas"),
-    partly("services.*.deploy.resources", "the limits are honored"),
+    partly(
+        "services.*.deploy.resources",
+        "the limits and the devices reserved are honored",
+    ),
     full("services.*.deploy.resources.limits"),
     full("services.*.deploy.resources.limits.cpus"),
     full("services.*.deploy.resources.limits.memory"),
     full("services.*.deploy.resources.limits.pids"),
-    ignored(
+    partly(
         "services.*.deploy.resources.reservations",
+        "the devices are honored; nspawn reserves no CPU or memory",
+    ),
+    ignored(
+        "services.*.deploy.resources.reservations.cpus",
+        "nspawn reserves nothing for a machine",
+    ),
+    full("services.*.deploy.resources.reservations.devices"),
+    partly(
+        "services.*.deploy.resources.reservations.devices.[].capabilities",
+        GPU_CAPABILITIES,
+    ),
+    full("services.*.deploy.resources.reservations.devices.[].count"),
+    full("services.*.deploy.resources.reservations.devices.[].device_ids"),
+    partly(
+        "services.*.deploy.resources.reservations.devices.[].driver",
+        GPU_DRIVER,
+    ),
+    ignored(
+        "services.*.deploy.resources.reservations.devices.[].options",
+        GPU_OPTIONS,
+    )
+    .and_below(),
+    ignored(
+        "services.*.deploy.resources.reservations.generic_resources",
         "nspawn reserves nothing for a machine",
     )
     .and_below(),
+    ignored(
+        "services.*.deploy.resources.reservations.memory",
+        "nspawn reserves nothing for a machine",
+    ),
     partly(
         "services.*.deploy.restart_policy",
         "the condition is honored",
@@ -157,7 +192,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
     full("services.*.devices.[].permissions"),
     partly(
         "services.*.devices.[].source",
-        "a device node of the host: a CDI name is refused",
+        "a device node of the host, or a CDI device of the host's specs",
     ),
     full("services.*.devices.[].target"),
     full("services.*.dns"),
@@ -185,11 +220,15 @@ pub static ATTRIBUTES: &[Attribute] = &[
         "a machine reaches others by their names on a shared network",
     ),
     full("services.*.extra_hosts").and_below(),
-    ignored(
+    partly(
         "services.*.gpus",
-        "nspawn hands no GPU to a machine; devices can",
-    )
-    .and_below(),
+        "the devices of the GPU vendor's CDI spec, nvidia-ctk cdi generate writing NVIDIA's",
+    ),
+    partly("services.*.gpus.[].capabilities", GPU_CAPABILITIES),
+    full("services.*.gpus.[].count"),
+    full("services.*.gpus.[].device_ids"),
+    partly("services.*.gpus.[].driver", GPU_DRIVER),
+    ignored("services.*.gpus.[].options", GPU_OPTIONS).and_below(),
     ignored(
         "services.*.group_add",
         "a machine's program runs with the groups of its user",

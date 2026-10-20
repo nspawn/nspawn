@@ -39,6 +39,7 @@ files, and the machine units call nspawn back through drop-in hooks.
 | `api/copy.rs` | cp: tar streams packed and unpacked relative to directory descriptors, paths resolved with openat2 inside the machine's root, tried again when a `..` crossed a rename or mount on the host (EAGAIN) |
 | `systemd.rs` | typed D-Bus calls, job waiting |
 | `journal.rs`, `api/events.rs` | structured journal entries for nspawn's own events; the journal read back as events |
+| `cdi.rs` | CDI specs read as the reference reads them (strict fields, versions, priorities, conflicts), `--gpus` parsed as docker does and mapped to a vendor's devices, the plan a start applies (nodes, binds, variables) and the hooks run before it in a private mount namespace (`nsenter::in_hook_root`) |
 | `kvfile.rs`, `mountopt.rs` | `--env-file` and `--label-file` (KEY=VALUE files as docker reads them, shared with compose's raw `env_file`), `--mount` read as docker's CSV form and turned into `-v` and `--tmpfs` |
 | `gotemplate.rs` | Go's text/template over JSON values, with docker's functions and `table` layout: `ps --format`, `inspect -f` |
 | `api/disk.rs`, `commands/system.rs` | what is an image and what a machine (a record pulled or built and never started is an image only), sizes by kind for `system df`, `images prune`, and `system prune` on top of the removals and prunes of the service |
@@ -70,7 +71,9 @@ files, and the machine units call nspawn back through drop-in hooks.
                      API), hosts, resolv.conf, getent (the
                      stand-in bound into an app that runs as a user),
                      hostname (a booted machine's --hostname),
-                     units/ for the volume wait unit, exit-on-next when
+                     units/ for the volume wait unit, cdi/nodes/ (CDI
+                     device nodes the host lacks) and cdi/bundle/ (the
+                     config.json CDI hooks read the root from), exit-on-next when
                      `kill` sent the stop signal, last-signal (what `kill`
                      or `stop` sent the current run); 0700 with a writable
                      layer, 0711 otherwise (an mstack machine binds its

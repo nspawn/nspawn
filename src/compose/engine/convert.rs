@@ -159,6 +159,38 @@ pub fn service_networks(service: &Map) -> Vec<(String, Option<Map>)> {
     networks
 }
 
+/// A device request of compose (gpus, deploy.resources.reservations.devices) as --gpus
+/// takes it.
+fn gpu_request(device: &Map) -> crate::cdi::GpuRequest {
+    let strings = |key: &str| -> Vec<String> {
+        seq(device, key)
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    };
+    let count = match device.get("count") {
+        Some(Value::Str(all)) if all.eq_ignore_ascii_case("all") => -1,
+        other => int(other).unwrap_or(0),
+    };
+    crate::cdi::GpuRequest {
+        driver: s(device, "driver").to_string(),
+        count,
+        device_ids: strings("device_ids"),
+        capabilities: strings("capabilities")
+            .into_iter()
+            .filter(|c| c != "gpu")
+            .collect(),
+        options: sub(device, "options")
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap_or_default().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
 fn put(options: &mut Options<'static>, key: &'static str, value: impl Into<Bus<'static>>) {
     options.insert(key, value.into());
 }
@@ -630,6 +662,10 @@ fn settings(spec: &Spec, service: &Map, made: &mut Made) {
         .iter()
         .filter_map(Value::as_map)
         .map(|d| {
+            // A CDI device goes by its name alone.
+            if crate::cdi::is_qualified(s(d, "source")) {
+                return s(d, "source").to_string();
+            }
             let permissions = s(d, "permissions");
             format!(
                 "{}:{}:{}",
@@ -648,6 +684,19 @@ fn settings(spec: &Spec, service: &Map, made: &mut Made) {
         })
         .collect();
     put_list(o, "devices", devices);
+    // GPUs and the devices deploy reserves, both device requests.
+    let reserved = sub(service, "deploy")
+        .and_then(|d| sub(d, "resources"))
+        .and_then(|r| sub(r, "reservations"))
+        .map(|r| seq(r, "devices"))
+        .unwrap_or(&[]);
+    let gpus: Vec<String> = reserved
+        .iter()
+        .chain(seq(service, "gpus"))
+        .filter_map(Value::as_map)
+        .map(|d| gpu_request(d).to_string())
+        .collect();
+    put_list(o, "gpus", gpus);
     let mut hosts = Vec::new();
     if let Some(extra) = sub(service, "extra_hosts") {
         for (host, ips) in extra {
@@ -962,6 +1011,51 @@ volumes:
             Some("container:demo-web-1")
         );
         assert!(!side.options.contains_key("networks"));
+    }
+
+    #[test]
+    fn gpus_and_cdi_devices_become_device_requests() {
+        let project = project(
+            "gpu",
+            r#"
+services:
+  ml:
+    image: busybox
+    devices:
+      - /dev/null:/dev/nullo:r
+      - e2e.nspawn.test/dev=one
+    gpus: all
+  train:
+    image: busybox
+    gpus:
+      - driver: nvidia
+        device_ids: ["0", "1"]
+        capabilities: [gpu, compute]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              count: 1
+"#,
+        );
+        let ml = made(&project, "ml", 1);
+        assert_eq!(
+            list(&ml, "devices"),
+            ["/dev/null:/dev/nullo:r", "e2e.nspawn.test/dev=one"]
+        );
+        assert_eq!(list(&ml, "gpus"), ["all"]);
+        let train = made(&project, "train", 1);
+        assert_eq!(
+            list(&train, "gpus"),
+            [
+                "count=1",
+                r#""device=0,1",driver=nvidia,capabilities=compute"#
+            ]
+        );
+        for request in list(&train, "gpus") {
+            crate::cdi::parse_gpus(&request).unwrap();
+        }
     }
 
     #[test]

@@ -120,6 +120,13 @@ pub struct Tuning {
     pub shm_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<Device>,
+    /// CDI devices, VENDOR/CLASS=NAME, looked up in the host's specs at every start: a
+    /// driver update rewrites them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cdi_devices: Vec<String>,
+    /// --gpus: the devices of a GPU vendor's CDI spec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpus: Vec<crate::cdi::GpuRequest>,
     /// Interfaces of the host moved into the machine while it runs, by name.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<String>,
@@ -321,8 +328,10 @@ impl Tuning {
 
     /// `unit_lines`, with `nodes` saying what device nodes a host path stands for.
     pub fn unit_lines_with(&self, nodes: impl Fn(&str) -> Vec<String>) -> Vec<String> {
+        // No permissions: a CDI node the cgroup gives no access to.
         self.devices
             .iter()
+            .filter(|d| !d.permissions.is_empty())
             .flat_map(|d| {
                 nodes(&d.host)
                     .into_iter()
@@ -499,7 +508,9 @@ pub struct Overrides {
     pub read_only: Option<bool>,
     pub tmpfs: Vec<String>,
     pub shm_size: Option<u64>,
+    /// Nodes of the host and CDI device names alike, as --device takes them.
     pub devices: Vec<String>,
+    pub gpus: Vec<String>,
     pub interfaces: Vec<String>,
     pub dns: Vec<String>,
     pub dns_search: Vec<String>,
@@ -570,7 +581,26 @@ impl Overrides {
             t.shm_size = (size > 0).then_some(size);
         }
         if !self.devices.is_empty() {
-            t.devices = list(&self.devices, device)?;
+            let (cdi, nodes): (Vec<String>, Vec<String>) = if cleared(&self.devices) {
+                (Vec::new(), Vec::new())
+            } else {
+                self.devices
+                    .iter()
+                    .cloned()
+                    .partition(|d| crate::cdi::is_qualified(d))
+            };
+            t.devices = nodes.iter().map(|d| device(d)).collect::<Result<_>>()?;
+            t.cdi_devices = Vec::new();
+            for name in cdi {
+                if !t.cdi_devices.contains(&name) {
+                    t.cdi_devices.push(name);
+                }
+            }
+        }
+        if !self.gpus.is_empty() {
+            t.gpus = list(&self.gpus, |g| {
+                crate::cdi::parse_gpus(g).with_context(|| format!("--gpus {g}"))
+            })?;
         }
         if !self.interfaces.is_empty() {
             let mut seen = std::collections::BTreeSet::new();
@@ -791,6 +821,12 @@ fn tmpfs(text: &str) -> Result<String> {
 
 /// --device HOST[:CONTAINER[:PERMISSIONS]].
 fn device(text: &str) -> Result<Device> {
+    // Meant as a CDI name: what is wrong with it.
+    if !text.starts_with('/') && text.contains('=') {
+        if let Err(e) = crate::cdi::parse_qualified(text) {
+            bail!("--device {text}: {e}");
+        }
+    }
     let fields: Vec<&str> = text.split(':').collect();
     let (host, container, permissions) = match fields[..] {
         [host] => (host, host, "rwm"),
@@ -918,6 +954,7 @@ mod tests {
             tmpfs: vec!["/run:size=64m".into(), "/tmp".into()],
             shm_size: Some(1 << 26),
             devices: vec!["/dev/null:/dev/nullo:r".into(), "/dev/dri".into()],
+            gpus: Vec::new(),
             interfaces: vec!["wlan0".into(), "eth1".into(), "wlan0".into()],
             dns: vec!["10.0.0.53".into()],
             dns_search: vec!["example.org".into()],
@@ -1341,5 +1378,70 @@ mod tests {
         .apply(&mut t)
         .unwrap();
         assert!(t.depends_on.is_empty() && t.is_default());
+    }
+
+    #[test]
+    fn cdi_names_and_gpus_are_devices_of_their_own() {
+        let mut t = Tuning::default();
+        Overrides {
+            devices: vec![
+                "/dev/null".into(),
+                "nvidia.com/gpu=all".into(),
+                "nvidia.com/gpu=all".into(),
+                "e2e.test/dev=one".into(),
+            ],
+            gpus: vec!["2".into()],
+            ..Overrides::default()
+        }
+        .apply(&mut t)
+        .unwrap();
+        assert_eq!(t.devices.len(), 1);
+        assert_eq!(t.cdi_devices, ["nvidia.com/gpu=all", "e2e.test/dev=one"]);
+        assert_eq!(t.gpus[0].count, 2);
+        let text = serde_json::to_string(&t).unwrap();
+        assert_eq!(serde_json::from_str::<Tuning>(&text).unwrap(), t);
+        // Another --device replaces both kinds; none forgets them.
+        Overrides {
+            devices: vec!["/dev/zero".into()],
+            ..Overrides::default()
+        }
+        .apply(&mut t)
+        .unwrap();
+        assert!(t.cdi_devices.is_empty());
+        Overrides {
+            devices: vec!["none".into()],
+            gpus: vec!["none".into()],
+            ..Overrides::default()
+        }
+        .apply(&mut t)
+        .unwrap();
+        assert!(t.is_default(), "{t:?}");
+        for (devices, gpus, error) in [
+            (
+                vec!["nvidia.com/gpu=".to_string()],
+                vec![],
+                "--device nvidia.com/gpu=: unqualified device \"nvidia.com/gpu=\", missing vendor",
+            ),
+            (vec![], vec!["count=x".to_string()], "--gpus count=x"),
+        ] {
+            let e = Overrides {
+                devices,
+                gpus,
+                ..Overrides::default()
+            }
+            .apply(&mut Tuning::default())
+            .unwrap_err();
+            assert_eq!(format!("{e}"), error);
+        }
+        // A CDI node without access rules gets no DeviceAllow=.
+        let t = Tuning {
+            devices: vec![Device {
+                host: "/dev/null".into(),
+                container: "/dev/x".into(),
+                permissions: String::new(),
+            }],
+            ..Tuning::default()
+        };
+        assert!(t.unit_lines().is_empty());
     }
 }

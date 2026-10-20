@@ -15,7 +15,7 @@ pub enum Mount {
 
 /// The fields of a CSV record, as Go's encoding/csv reads one line of it: a field in
 /// double quotes may hold commas, and two quotes stand for one.
-fn csv_fields(line: &str) -> Result<Vec<String>> {
+pub(crate) fn csv_fields(line: &str) -> Result<Vec<String>> {
     let mut fields = Vec::new();
     let mut chars = line.chars().peekable();
     loop {

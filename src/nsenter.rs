@@ -173,6 +173,127 @@ pub fn listen_fd() -> Option<OwnedFd> {
     Some(fd)
 }
 
+/// The mounts a CDI hook works in: the machine's root a mount point of its own in a
+/// private mount namespace, binds below it, a tmpfs /dev of device nodes and a /proc, as
+/// a runtime's createContainer hooks find the container's root. Every path is made
+/// before the fork, the mount points included.
+#[derive(Debug, Clone)]
+pub struct HookRoot {
+    pub root: CString,
+    /// Host path, mount point below the root, read-only.
+    pub binds: Vec<(CString, CString, bool)>,
+    /// The root's /dev, where a tmpfs gets `dev_dirs` (parents first) and `dev_nodes`.
+    pub dev: Option<CString>,
+    pub dev_dirs: Vec<CString>,
+    pub dev_nodes: Vec<DevNode>,
+    pub proc_dir: Option<CString>,
+    /// The SELinux context the hook is executed in.
+    pub context: Option<CString>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DevNode {
+    pub path: CString,
+    pub kind: nix::sys::stat::SFlag,
+    pub mode: u32,
+    pub rdev: libc::dev_t,
+    pub owner: Option<(u32, u32)>,
+}
+
+/// Sets `cmd` up to run in the mounts `plan` describes.
+pub fn in_hook_root(cmd: &mut tokio::process::Command, plan: HookRoot) {
+    // SAFETY: the closure runs in the child between fork and exec, on what was prepared
+    // before the fork: syscalls only, and no lock of the parent's.
+    unsafe {
+        cmd.pre_exec(move || hook_root(&plan).map_err(std::io::Error::from));
+    }
+}
+
+fn hook_root(plan: &HookRoot) -> nix::Result<()> {
+    use nix::mount::{mount, MsFlags};
+    let none: Option<&CStr> = None;
+    nix::sched::unshare(CloneFlags::CLONE_NEWNS)?;
+    // Nothing done here reaches the host's mounts.
+    mount(
+        none,
+        c"/",
+        none,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        none,
+    )?;
+    let bind = MsFlags::MS_BIND | MsFlags::MS_REC;
+    mount(
+        Some(plan.root.as_c_str()),
+        plan.root.as_c_str(),
+        none,
+        bind,
+        none,
+    )?;
+    for (source, target, read_only) in &plan.binds {
+        mount(Some(source.as_c_str()), target.as_c_str(), none, bind, none)?;
+        if *read_only {
+            mount(
+                none,
+                target.as_c_str(),
+                none,
+                MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+                none,
+            )?;
+        }
+    }
+    if let Some(dev) = &plan.dev {
+        mount(
+            Some(c"tmpfs"),
+            dev.as_c_str(),
+            Some(c"tmpfs"),
+            MsFlags::MS_NOSUID,
+            Some(c"mode=755"),
+        )?;
+        // The nodes get the modes the specs give them.
+        let umask = nix::sys::stat::umask(Mode::empty());
+        for dir in &plan.dev_dirs {
+            match nix::unistd::mkdir(dir.as_c_str(), Mode::from_bits_truncate(0o755)) {
+                Ok(()) | Err(Errno::EEXIST) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        for node in &plan.dev_nodes {
+            nix::sys::stat::mknod(
+                node.path.as_c_str(),
+                node.kind,
+                Mode::from_bits_truncate(node.mode),
+                node.rdev,
+            )?;
+            if let Some((uid, gid)) = node.owner {
+                nix::unistd::chown(
+                    node.path.as_c_str(),
+                    Some(Uid::from_raw(uid)),
+                    Some(Gid::from_raw(gid)),
+                )?;
+            }
+        }
+        nix::sys::stat::umask(umask);
+    }
+    if let Some(proc_dir) = &plan.proc_dir {
+        mount(
+            Some(c"proc"),
+            proc_dir.as_c_str(),
+            Some(c"proc"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+            none,
+        )?;
+    }
+    if let Some(context) = &plan.context {
+        let fd = nix::fcntl::open(
+            c"/proc/thread-self/attr/exec",
+            OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        nix::unistd::write(&fd, context.as_bytes())?;
+    }
+    Ok(())
+}
+
 /// pidfd_send_signal(2): `signal` to the process behind `pidfd`, ESRCH once it is gone.
 /// A raw number, so that the realtime signals images ask for work too.
 pub fn pidfd_signal(pidfd: &OwnedFd, signal: i32) -> nix::Result<()> {

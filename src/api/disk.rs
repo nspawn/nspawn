@@ -71,6 +71,16 @@ pub struct MachineRow {
     /// Its writable layer.
     pub size: u64,
     pub running: bool,
+    /// Made from an image by create or run. A pulled or built record that ran is the
+    /// image as well, which a prune of machines leaves alone.
+    pub made: bool,
+}
+
+impl MachineRow {
+    /// What system prune removes.
+    pub fn prunable(&self) -> bool {
+        self.made && !self.running
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,20 +183,22 @@ pub async fn usage(ctx: &Context) -> Result<Usage> {
             &store.machines_private_dir().join(&r.name).join("upper"),
             &mut seen,
         );
-        let is_running = running.contains(&r.name);
-        usage.containers.total += 1;
-        usage.containers.size += size;
-        if is_running {
-            usage.containers.active += 1;
-        } else {
-            usage.containers.reclaimable += size;
-        }
-        usage.machine_rows.push(MachineRow {
+        let row = MachineRow {
             name: r.name.clone(),
             reference: r.reference.clone(),
             size,
-            running: is_running,
-        });
+            running: running.contains(&r.name),
+            made: r.origin == "create",
+        };
+        usage.containers.total += 1;
+        usage.containers.size += size;
+        if row.running {
+            usage.containers.active += 1;
+        }
+        if row.prunable() {
+            usage.containers.reclaimable += size;
+        }
+        usage.machine_rows.push(row);
     }
     let _ = images;
 
@@ -348,6 +360,21 @@ mod tests {
             "nothing dangles"
         );
         assert_eq!(prunable(&store, &records, true), ["lone"]);
+    }
+
+    #[test]
+    fn a_prune_of_machines_leaves_pulled_records_alone() {
+        let row = |made, running| MachineRow {
+            name: "m".into(),
+            reference: "r".into(),
+            size: 1,
+            running,
+            made,
+        };
+        assert!(row(true, false).prunable());
+        assert!(!row(true, true).prunable());
+        // A pulled image that was started is still the image.
+        assert!(!row(false, false).prunable());
     }
 
     #[test]

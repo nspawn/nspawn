@@ -598,6 +598,34 @@ impl Machine {
         if let Some(init) = t.init {
             host_config["Init"] = json!(init);
         }
+        // --gpus and CDI names as device requests.
+        let mut requests: Vec<Value> = t
+            .gpus
+            .iter()
+            .map(|g| {
+                let mut capabilities = g.capabilities.clone();
+                capabilities.push("gpu".to_string());
+                json!({
+                    "Driver": g.driver,
+                    "Count": g.count,
+                    "DeviceIDs": if g.device_ids.is_empty() { Value::Null } else { json!(g.device_ids) },
+                    "Capabilities": [capabilities],
+                    "Options": g.options,
+                })
+            })
+            .collect();
+        if !t.cdi_devices.is_empty() {
+            requests.push(json!({
+                "Driver": "cdi",
+                "Count": 0,
+                "DeviceIDs": t.cdi_devices,
+                "Capabilities": null,
+                "Options": null,
+            }));
+        }
+        if !requests.is_empty() {
+            host_config["DeviceRequests"] = Value::Array(requests);
+        }
         if !t.tmpfs.is_empty() {
             host_config["Tmpfs"] = t
                 .tmpfs

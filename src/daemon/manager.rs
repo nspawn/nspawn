@@ -234,7 +234,8 @@ fn health_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::health::
 
 /// The per-machine settings: hostname, user, working_dir, stop_signal, timezone,
 /// log_driver (s), cap_add,
-/// cap_drop, tmpfs, devices (HOST:CONTAINER:PERMISSIONS), interfaces (host interfaces
+/// cap_drop, tmpfs, devices (HOST:CONTAINER:PERMISSIONS or a CDI device name), gpus
+/// (as --gpus takes them), interfaces (host interfaces
 /// moved into the machine), dns, dns_search, extra_hosts (HOST:IP), ulimits
 /// (NAME=SOFT:HARD), sysctls (KEY=VALUE), secrets (NAME[:TARGET[:MODE[:UID:GID]]]) (as,
 /// "none" clears), privileged, read_only, init (b), shm_size, stop_timeout (t),
@@ -251,6 +252,7 @@ fn tuning_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::tuning::
         tmpfs: options.strings("tmpfs")?,
         shm_size: options.maybe_u64("shm_size")?,
         devices: options.strings("devices")?,
+        gpus: options.strings("gpus")?,
         interfaces: options.strings("interfaces")?,
         dns: options.strings("dns")?,
         dns_search: options.strings("dns_search")?,
@@ -863,7 +865,9 @@ impl Manager {
     /// Like `system df`: images, containers (machines), local_volumes and build_cache,
     /// each a{st} of total, active, size and reclaimable (bytes), and the rows of
     /// `system df -v`: image_rows (aa{sv}: name, reference, created, size, containers),
-    /// container_rows (name, reference, size, running) and volume_rows (name, links, size).
+    /// container_rows (name, reference, size, running, made: made from an image by
+    /// create or run, which system prune removes once stopped) and volume_rows (name,
+    /// links, size).
     async fn disk_usage(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Dict> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Inspect).await?;
@@ -898,6 +902,7 @@ impl Manager {
                     ("reference".to_string(), values::v(r.reference.as_str())),
                     ("size".to_string(), values::v(r.size)),
                     ("running".to_string(), values::v(r.running)),
+                    ("made".to_string(), values::v(r.made)),
                 ])
             })
             .collect();

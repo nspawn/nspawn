@@ -179,7 +179,8 @@ systemd-nspawn's for a machine in one; `--cap-drop ALL --cap-add NET_BIND_SERVIC
 with docker) and `--privileged`,
 `--read-only`, `--tmpfs PATH[:OPTIONS]`, `--shm-size`, `--device
 HOST[:CONTAINER[:rwm]]` (a node, or a directory such as `/dev/dri`, whose nodes are
-allowed one by one), `--dns` and `--dns-search`, `--add-host HOST:IP` or `HOST=IP` (with
+allowed one by one; a CDI name such as `nvidia.com/gpu=all` instead, see "GPUs and
+CDI devices" below), `--gpus`, `--dns` and `--dns-search`, `--add-host HOST:IP` or `HOST=IP` (with
 `host-gateway`; the second form for IPv6 addresses), `--ulimit NAME=SOFT[:HARD]` (numbers or `unlimited`), `--oom-score-adj`, `--stop-signal` and
 `--stop-timeout` (what `stop` uses unless `-t` says otherwise), `--timezone MODE`
 (systemd-nspawn's `Timezone=`: its default, `auto`, points `/etc/localtime` at the host's
@@ -198,6 +199,36 @@ shows them all. A path inside the machine, the target of a volume or a secret, a
 since it would land elsewhere once mounted. A path the image declares as a volume and nothing is mounted over gets a
 note at start: nspawn has no anonymous volumes, so what is written there goes with the
 machine.
+
+### GPUs and CDI devices
+
+GPUs reach a machine through the Container Device Interface, as with docker and
+podman: the vendor's tool writes a spec under `/etc/cdi` or `/var/run/cdi` that lists
+the device nodes, libraries, variables and hooks each device needs (`nvidia-ctk cdi
+generate --output=/etc/cdi/nvidia.yaml` for NVIDIA, `amd-ctk cdi generate` for AMD),
+and the machine names the devices: `--device nvidia.com/gpu=all` (or `=0`, a UUID,
+whatever the spec calls them), or docker's `--gpus all`, `--gpus 2`, `--gpus
+'"device=0,1"'`, which stand for the devices of the NVIDIA spec (the AMD one when only
+that is there; `driver=amd` or `driver=cdi,"device=VENDOR/CLASS=NAME"` say which).
+Compose's `gpus:`, the devices of `deploy.resources.reservations` and CDI names in
+`devices:` do the same.
+
+The specs are read again at every start, so a driver update that rewrites them takes
+effect at the next start: their device nodes are bound into the machine and allowed in
+its cgroup, their libraries bound where they say, their variables set after the
+machine's own, and their hooks (`nvidia-cdi-hook update-ldcache`,
+`create-symlinks`) run just before the machine starts, with the OCI state of the
+machine on their standard input and its root mounted in a private mount namespace as
+a runtime's hooks find it (the CDI mounts in place, a `/dev` of the CDI nodes, a
+`/proc`): what they write to the root stays in the machine's writable layer. A device
+the specs do not have, or a spec with a field the CDI reference does not know, fails the
+start with the reference's message; `--gpus` without a spec of the vendor fails with
+docker's `could not select device driver "" with capabilities: [[gpu]]`. nspawn
+leaves out what systemd-nspawn has no setting for, with a note: extra groups for the
+program, Intel RDT classes, and the hooks meant for after the start; a spec that moves
+network interfaces is refused (`--interface` does that). The nodes are the host's,
+with the host's owner and mode. Not on mstack machines yet. This works the same with
+real GPUs, but has been tested with specs written for the test suite only.
 
 ### Secrets
 
@@ -431,9 +462,10 @@ Records are images and machines both here: an image is a record pulled or built 
 never started, anything else a machine. `images prune -a` removes the images no machine
 was made from; without `-a` it removes the dangling ones, which nspawn's store never has
 (a tag pulled or built again replaces its record). `system prune` removes stopped
-machines and networks no machine uses, and with `-a` the images no machine was made
-from; `--filter label=...` and `until=...` narrow what goes, and `-f` skips the
-question.
+machines made from an image (by `create` or `run`) and networks no machine uses, and
+with `-a` the images no machine was made from; a pulled or built image that was
+started is the image as well and stays. `--filter label=...` and `until=...` narrow
+what goes, networks included, and `-f` skips the question.
 
 ## Compose
 
@@ -575,7 +607,8 @@ primary (its gateway is the default route, unless it is internal): a proxy on `f
 `--network-alias NAME` (or `NETWORK=NAME`) gives a machine another name on a network, as
 docker does; `--network none` gives it no interface but `lo`. `network ls` lists the
 networks, `network rm` and `network prune` remove the ones no machine joins, bridge and
-rules included; `network create --label KEY=VALUE` tags one.
+rules included; `network create --label KEY=VALUE` tags one, and `network prune
+--filter label=KEY[=VALUE]` (or `until=`) removes only the unused ones it selects.
 
 `--network container:NAME` puts an app machine in the network namespace of NAME, as
 docker's `--network container:` does: the same interfaces and address, NAME's hosts

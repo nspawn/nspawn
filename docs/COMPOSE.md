@@ -184,12 +184,21 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.deploy.mode` | ignored | deploy.mode is only honored in Swarm mode |
 | `services.*.deploy.placement` and below | ignored | deploy.placement is only honored by the Swarm scheduler |
 | `services.*.deploy.replicas` | yes |  |
-| `services.*.deploy.resources` | partly | the limits are honored |
+| `services.*.deploy.resources` | partly | the limits and the devices reserved are honored |
 | `services.*.deploy.resources.limits` | yes |  |
 | `services.*.deploy.resources.limits.cpus` | yes |  |
 | `services.*.deploy.resources.limits.memory` | yes |  |
 | `services.*.deploy.resources.limits.pids` | yes |  |
-| `services.*.deploy.resources.reservations` and below | ignored | nspawn reserves nothing for a machine |
+| `services.*.deploy.resources.reservations` | partly | the devices are honored; nspawn reserves no CPU or memory |
+| `services.*.deploy.resources.reservations.cpus` | ignored | nspawn reserves nothing for a machine |
+| `services.*.deploy.resources.reservations.devices` | yes |  |
+| `services.*.deploy.resources.reservations.devices.[].capabilities` | partly | they pick the vendor whose CDI spec is used, as docker picks its device driver |
+| `services.*.deploy.resources.reservations.devices.[].count` | yes |  |
+| `services.*.deploy.resources.reservations.devices.[].device_ids` | yes |  |
+| `services.*.deploy.resources.reservations.devices.[].driver` | partly | nvidia, amd or cdi, through the CDI specs of the host |
+| `services.*.deploy.resources.reservations.devices.[].options` and below | ignored | the CDI spec says what the devices need |
+| `services.*.deploy.resources.reservations.generic_resources` and below | ignored | nspawn reserves nothing for a machine |
+| `services.*.deploy.resources.reservations.memory` | ignored | nspawn reserves nothing for a machine |
 | `services.*.deploy.restart_policy` | partly | the condition is honored |
 | `services.*.deploy.restart_policy.condition` | yes |  |
 | `services.*.deploy.restart_policy.delay` | ignored | systemd restarts a machine at once |
@@ -201,7 +210,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.device_cgroup_rules` | ignored | a device reaches a machine through devices |
 | `services.*.devices` | yes |  |
 | `services.*.devices.[].permissions` | yes |  |
-| `services.*.devices.[].source` | partly | a device node of the host: a CDI name is refused |
+| `services.*.devices.[].source` | partly | a device node of the host, or a CDI device of the host's specs |
 | `services.*.devices.[].target` | yes |  |
 | `services.*.dns` | yes |  |
 | `services.*.dns_opt` | ignored | the resolv.conf of a machine takes no options |
@@ -219,7 +228,12 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.extends.service` | yes |  |
 | `services.*.external_links` | ignored | a machine reaches others by their names on a shared network |
 | `services.*.extra_hosts` and below | yes |  |
-| `services.*.gpus` and below | ignored | nspawn hands no GPU to a machine; devices can |
+| `services.*.gpus` | partly | the devices of the GPU vendor's CDI spec, nvidia-ctk cdi generate writing NVIDIA's |
+| `services.*.gpus.[].capabilities` | partly | they pick the vendor whose CDI spec is used, as docker picks its device driver |
+| `services.*.gpus.[].count` | yes |  |
+| `services.*.gpus.[].device_ids` | yes |  |
+| `services.*.gpus.[].driver` | partly | nvidia, amd or cdi, through the CDI specs of the host |
+| `services.*.gpus.[].options` and below | ignored | the CDI spec says what the devices need |
 | `services.*.group_add` | ignored | a machine's program runs with the groups of its user |
 | `services.*.healthcheck` | yes |  |
 | `services.*.healthcheck.disable` | yes |  |
