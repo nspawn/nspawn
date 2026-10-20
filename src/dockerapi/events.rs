@@ -148,47 +148,46 @@ pub fn passes(filters: &Filters, message: &Value) -> bool {
     let action = field(&["Action"]);
     let id = field(&["Actor", "ID"]);
     let name = field(&["Actor", "Attributes", "name"]);
-    if !filters.exact("type", &kind) {
+    if !filters.exact("type", &kind) || !filters.exact("scope", "local") {
         return false;
     }
-    if !filters.exact("scope", "local") {
+    // A health status or an exec among the events wanted takes every action that starts
+    // with one of them.
+    let fuzzy = filters.values("event").is_some_and(|wanted| {
+        ["health_status", "exec_create", "exec_start"]
+            .iter()
+            .any(|e| wanted.contains(*e))
+    });
+    if !(if fuzzy {
+        filters.fuzzy("event", &action)
+    } else {
+        filters.exact("event", &action)
+    }) {
         return false;
     }
-    if let Some(events) = filters.values("event") {
-        let plain = action.split_once(':').map_or(action.as_str(), |(a, _)| a);
-        if !events.contains(&action) && !events.contains(plain) {
+    // Each of these keys holds whatever the event: the ID or the name must start with a
+    // value of it.
+    for key in [
+        "daemon",
+        "container",
+        "plugin",
+        "volume",
+        "network",
+        "node",
+        "service",
+        "secret",
+        "config",
+    ] {
+        if !filters.fuzzy(key, &id) && !filters.fuzzy(key, &name) {
             return false;
         }
     }
-    if let Some(wanted) = filters.values("container") {
-        if kind != "container"
-            || !wanted
-                .iter()
-                .any(|w| *w == id || *w == name || (!w.is_empty() && id.starts_with(w.as_str())))
-        {
-            return false;
-        }
-    }
-    if let Some(wanted) = filters.values("network") {
-        if kind != "network" || !wanted.iter().any(|w| *w == id || *w == name) {
-            return false;
-        }
-    }
-    if let Some(wanted) = filters.values("volume") {
-        if kind != "volume" || !wanted.contains(&id) {
-            return false;
-        }
-    }
-    if let Some(wanted) = filters.values("image") {
-        let image = field(&["Actor", "Attributes", "image"]);
-        if !wanted.contains(&image) {
-            return false;
-        }
-    }
-    for key in ["config", "daemon", "node", "plugin", "secret", "service"] {
-        if filters.values(key).is_some() {
-            return false;
-        }
+    let image = field(&["Actor", "Attributes", "image"]);
+    if ![&id, &image, &strip_tag(&id), &strip_tag(&image)]
+        .iter()
+        .any(|i| filters.exact("image", i))
+    {
+        return false;
     }
     let labels: std::collections::BTreeMap<String, String> = message["Actor"]["Attributes"]
         .as_object()
@@ -199,6 +198,16 @@ pub fn passes(filters: &Filters, message: &Value) -> bool {
         })
         .unwrap_or_default();
     filters.labels("label", &labels)
+}
+
+/// An image's name without its tag or digest, as docker's stripTag gives it; what is no
+/// reference stays as it is.
+fn strip_tag(image: &str) -> String {
+    let id = image.len() == 64 && image.bytes().all(|b| b.is_ascii_hexdigit());
+    match crate::reference::ImageRef::docker(image) {
+        Ok(r) if !id => familiar(&format!("{}/{}", r.registry, r.repository)),
+        _ => image.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -217,6 +226,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             labels: BTreeMap::from([("caddy".to_string(), "http://web.test".to_string())]),
+            run: None,
         }
     }
 
@@ -307,5 +317,29 @@ mod tests {
         assert!(passes(&f(r#"{"label":["caddy"]}"#), &start[0]));
         assert!(!passes(&f(r#"{"label":["traefik.enable"]}"#), &start[0]));
         assert!(!passes(&f(r#"{"service":["x"]}"#), &start[0]));
+        // An event given as false is no event wanted; an image by its name with or without
+        // its tag.
+        assert!(!passes(&f(r#"{"type":{"container":false}}"#), &start[0]));
+        let image = &translate(
+            &event(
+                "machine",
+                "start",
+                &[
+                    ("created", "100"),
+                    ("image", "docker.io/library/busybox:1.37"),
+                ],
+            ),
+            &[],
+        )[0];
+        assert!(passes(&f(r#"{"image":["busybox"]}"#), image));
+        assert!(passes(&f(r#"{"image":["busybox:1.37"]}"#), image));
+        assert!(!passes(&f(r#"{"image":["busybox:1.36"]}"#), image));
+        assert_eq!(strip_tag("ghcr.io/o/app:2"), "ghcr.io/o/app");
+        assert_eq!(
+            strip_tag(&format!("busybox@sha256:{}", "a".repeat(64))),
+            "busybox"
+        );
+        let id = container_id("web", 100);
+        assert_eq!(strip_tag(&id), id);
     }
 }

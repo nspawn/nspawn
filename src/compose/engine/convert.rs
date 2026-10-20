@@ -20,6 +20,8 @@ pub struct Spec<'a> {
     pub oneoff: bool,
     /// The digest of the image the machine is made from.
     pub image_digest: String,
+    /// That image's own command.
+    pub image_cmd: Vec<String>,
     /// The services it depends on are left alone (--no-deps).
     pub no_deps: bool,
     /// The env files the project was given, for its label.
@@ -127,10 +129,19 @@ pub fn volume_name(project: &Project, key: &str) -> String {
         .unwrap_or_else(|| format!("{}_{key}", project.name))
 }
 
+/// A host directory a volume of the project binds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Device {
+    pub path: String,
+    /// `ro` among the mount options: read-only whatever the service's mount says.
+    pub read_only: bool,
+}
+
 /// The host directory a volume of the project binds, as the local driver's `type: none`
 /// with `o: bind` and a `device` does; None for one nspawn makes, and an error for
-/// driver options nothing here honours.
-pub fn volume_device(project: &Project, key: &str) -> Result<Option<String>> {
+/// driver options nothing here honours, a mount option among them: dropping noexec,
+/// say, would give the machine what the file meant to keep from it.
+pub fn volume_device(project: &Project, key: &str) -> Result<Option<Device>> {
     let Some(opts) = project
         .volumes
         .get(key)
@@ -142,16 +153,26 @@ pub fn volume_device(project: &Project, key: &str) -> Result<Option<String>> {
         return Ok(None);
     };
     let device = s(opts, "device");
-    let bind = s(opts, "o")
-        .split(',')
-        .any(|o| matches!(o, "bind" | "rbind"));
+    let options: Vec<&str> = s(opts, "o").split(',').filter(|o| !o.is_empty()).collect();
+    let bind = options.iter().any(|o| matches!(*o, "bind" | "rbind"));
     if s(opts, "type") != "none" || !bind || device.is_empty() {
         bail!("volume {key:?}: driver_opts are taken only as type: none, o: bind and a device, which binds that host directory");
+    }
+    if let Some(other) = options
+        .iter()
+        .find(|o| !matches!(**o, "bind" | "rbind" | "ro" | "rw"))
+    {
+        bail!("volume {key:?}: the mount option {other} of o is not taken; bind, rbind, ro and rw are");
     }
     if !device.starts_with('/') {
         bail!("volume {key:?}: device {device:?} is no absolute path of the host");
     }
-    Ok(Some(device.to_string()))
+    // The last of ro and rw wins, as mount(8) reads its options.
+    let read_only = options.iter().rev().find(|o| matches!(**o, "ro" | "rw")) == Some(&"ro");
+    Ok(Some(Device {
+        path: device.to_string(),
+        read_only,
+    }))
 }
 
 /// The nspawn secret that carries a secret or config of the project with no file
@@ -316,9 +337,13 @@ fn network(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
             own.extend(strings(seq(opts, "aliases")));
         }
         // links: SERVICE:ALIAS of the services that link to this one, an alias on the
-        // default network.
+        // default network; of the services not selected too, which may come up later.
         if key == "default" && !spec.oneoff {
-            for other in project.services.values().filter_map(Value::as_map) {
+            let services = project
+                .services
+                .values()
+                .chain(project.disabled_services.values());
+            for other in services.filter_map(Value::as_map) {
                 for link in strings(seq(other, "links")) {
                     if let Some((linked, alias)) = link.split_once(':') {
                         if linked == spec.service && !alias.is_empty() {
@@ -457,7 +482,10 @@ fn volumes(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
                     continue;
                 }
                 match volume_device(project, source)? {
-                    Some(device) => binds.push(format!("{device}:{target}{ro}")),
+                    Some(device) => {
+                        let ro = if device.read_only { ":ro" } else { ro };
+                        binds.push(format!("{}:{target}{ro}", device.path));
+                    }
                     None => binds.push(format!("{}:{target}{ro}", volume_name(project, source))),
                 }
             }
@@ -548,8 +576,10 @@ fn secrets(spec: &Spec, service: &Map, made: &mut Made) {
 }
 
 /// What the machine runs, and its environment. An entrypoint of the file replaces the
-/// image's and drops its command: the whole command line goes to the
-/// machine as its command, after an empty entrypoint.
+/// image's and drops its command: the whole command line goes to the machine as its
+/// command, after an empty entrypoint. An empty one with no command keeps the image's
+/// command, as docker merges them: compose gives it [] where the command line gives
+/// [""].
 fn program(spec: &Spec, service: &Map, made: &mut Made) {
     let entrypoint = service.get("entrypoint").and_then(Value::as_seq);
     let command = service.get("command").and_then(Value::as_seq);
@@ -557,6 +587,9 @@ fn program(spec: &Spec, service: &Map, made: &mut Made) {
         let mut argv = strings(entrypoint);
         if let Some(command) = command {
             argv.extend(strings(command));
+        }
+        if argv.is_empty() {
+            argv.clone_from(&spec.image_cmd);
         }
         put(&mut made.options, "entrypoint", String::new());
         put_list(&mut made.options, "command", argv);
@@ -702,7 +735,11 @@ fn settings(spec: &Spec, service: &Map, made: &mut Made) {
         put(o, "restart", restart);
     }
     if let Some(ns) = int(service.get("stop_grace_period")) {
-        put(o, "stop_timeout", (ns / 1_000_000_000).max(0) as u64);
+        put(
+            o,
+            "stop_timeout",
+            crate::policy::stop_seconds(ns / 1_000_000_000),
+        );
     }
     for (key, option) in [
         ("cap_add", "cap_add"),
@@ -898,6 +935,19 @@ fn labels(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
     Ok(())
 }
 
+/// The names a machine made of `made` goes by on its networks, NETWORK=NAME: an existing
+/// machine without one of them is stale, as another service's link may add one without
+/// changing its own configuration.
+pub fn aliases(made: &Made) -> std::collections::BTreeSet<String> {
+    match made.options.get("aliases") {
+        Some(Bus::Array(items)) => items
+            .iter()
+            .filter_map(|v| String::try_from(v.clone()).ok())
+            .collect(),
+        _ => std::collections::BTreeSet::new(),
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -905,8 +955,96 @@ pub(crate) mod tests {
 
     /// The project of a compose file, as up loads it.
     pub(crate) fn project(name: &str, yaml: &str) -> Project {
-        let dir =
-            std::env::temp_dir().join(format!("nspawn-convert-{name}-{}", std::process::id()));
+        project_of(name, yaml, &[])
+    }
+
+    /// `base` in a directory of this call's own: tests that load projects of one name at
+    /// once would write and remove each other's files. The name is the project's.
+    fn scratch(base: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir()
+            .join(format!("nspawn-test-{}-{n}", std::process::id()))
+            .join(base)
+    }
+
+    /// What loading these files (compose.yaml first) says is wrong with them.
+    pub(crate) fn load_error(name: &str, files: &[(&str, &str)]) -> String {
+        let dir = scratch(&format!("nspawn-load-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (file, text) in files {
+            std::fs::write(dir.join(file), text).unwrap();
+        }
+        let cli = crate::cli::Cli::try_parse_from(["nspawn", "compose", "up"]).unwrap();
+        let crate::cli::Command::Compose(args) = cli.command else {
+            unreachable!()
+        };
+        let env = crate::compose::dotenv::Env::from([("HOME".to_string(), "/nowhere".to_string())]);
+        let host = crate::compose::config::Host::new(
+            env,
+            dir.to_string_lossy().into_owned(),
+            crate::compose::config::Stdin::Process,
+        );
+        let flags = crate::compose::options::Flags::default();
+        let error = crate::compose::config::project_for(&args, &flags, &host, &[], &mut |_| {})
+            .err()
+            .unwrap_or_default();
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        error
+    }
+
+    #[test]
+    fn what_docker_compose_crashes_on_or_fetches_is_refused() {
+        for services in ["[a, b]", "null"] {
+            let error = load_error(
+                "include-list",
+                &[
+                    (
+                        "compose.yaml",
+                        &format!("include: [other.yaml]\nservices: {services}\n"),
+                    ),
+                    ("other.yaml", "services:\n  web:\n    image: nginx\n"),
+                ],
+            );
+            assert_eq!(error, "services must be a mapping", "{services}");
+        }
+        for file in [
+            "git@github.com:org/stack.git#main:base.yaml",
+            "oci://example.invalid/stack:1",
+        ] {
+            let error = load_error(
+                "extends-remote",
+                &[(
+                    "compose.yaml",
+                    &format!("services:\n  web:\n    extends: {{file: '{file}', service: base}}\n"),
+                )],
+            );
+            assert!(
+                error.contains("services.web.extends.file") && error.contains(file),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absolute_env_file_is_opened_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("app.env");
+        std::fs::write(&file, "A=1\n").unwrap();
+        let path = format!("{}/", file.display());
+        let error = load_error(
+            "envfile-slash",
+            &[(
+                "compose.yaml",
+                &format!("services:\n  web:\n    image: nginx\n    env_file: ['{path}']\n"),
+            )],
+        );
+        assert_eq!(error, format!("open {path}: not a directory"));
+    }
+
+    /// The project with only `services` selected, as `up SERVICE...` loads it.
+    pub(crate) fn project_of(name: &str, yaml: &str, services: &[String]) -> Project {
+        let dir = scratch(&format!("nspawn-convert-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("compose.yaml"), yaml).unwrap();
         let cli = crate::cli::Cli::try_parse_from(["nspawn", "compose", "up"]).unwrap();
@@ -921,9 +1059,57 @@ pub(crate) mod tests {
         );
         let flags = crate::compose::options::Flags::default();
         let project =
-            crate::compose::config::project_for(&args, &flags, &host, &[], &mut |_| {}).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+            crate::compose::config::project_for(&args, &flags, &host, services, &mut |_| {})
+                .unwrap();
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
         project
+    }
+
+    #[test]
+    fn a_job_runs_with_its_env_file_and_the_jobs_it_needs() {
+        let dir = std::env::temp_dir().join(format!("nspawn-job-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("compose.yaml"),
+            "services:\n  web: {image: x, env_file: web.env, volumes: [\"pgdata:/data\"]}\njobs:\n  seed: {image: app, triggers: {manual: true}}\n  migrate: {image: app, env_file: migrate.env, depends_on: [seed], triggers: {schedule: [{cron: \"0 3 * * *\"}]}}\n  off: {image: app, triggers: {manual: false}}\n  uses-off: {image: app, depends_on: [off], triggers: {manual: true}}\nvolumes:\n  pgdata: {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("migrate.env"), "DATABASE_URL=postgres://db\n").unwrap();
+        let job = |name: &str| {
+            let cli = crate::cli::Cli::try_parse_from(["nspawn", "compose", "run", name]).unwrap();
+            let crate::cli::Command::Compose(args) = cli.command else {
+                unreachable!()
+            };
+            let env =
+                crate::compose::dotenv::Env::from([("HOME".to_string(), "/nowhere".to_string())]);
+            let host = crate::compose::config::Host::new(
+                env,
+                dir.to_string_lossy().into_owned(),
+                crate::compose::config::Stdin::Process,
+            );
+            let flags = crate::compose::options::Flags::default();
+            crate::compose::config::job_project(&args, &flags, &host, name, &mut |_| {})
+        };
+        // web.env is not there, and web is not needed: it is not read.
+        let project = job("migrate").unwrap().unwrap();
+        assert!(project.services.contains_key("migrate"));
+        assert!(project.services.contains_key("seed"), "a job it depends on");
+        assert!(!project.services.contains_key("web"));
+        let migrate = &project.services["migrate"];
+        assert_eq!(
+            migrate.get(&["environment", "DATABASE_URL"]),
+            Some(&Value::Str("postgres://db".into()))
+        );
+        assert!(migrate.get(&["triggers"]).is_none(), "run as a service");
+        // The resources the load kept stay, as runProject keeps them: `run -v pgdata:/x`
+        // is the project's volume.
+        assert!(project.volumes.contains_key("pgdata"));
+        assert!(job("nope").unwrap().is_none());
+        assert!(job("off").unwrap_err().contains("cannot be run manually"));
+        assert!(job("uses-off")
+            .unwrap_err()
+            .contains("cannot be triggered even as a dependency of another job"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn made(project: &Project, service: &str, number: u32) -> Made {
@@ -943,6 +1129,7 @@ pub(crate) mod tests {
             name,
             oneoff: false,
             image_digest: "sha256:abc".to_string(),
+            image_cmd: vec!["nginx".into(), "-g".into(), "daemon off;".into()],
             no_deps: false,
             env_files: Vec::new(),
             scale: &BTreeMap::new(),
@@ -1006,6 +1193,16 @@ pub(crate) mod tests {
             list(&db, "aliases")
         );
         assert!(!list(&made(&p, "web", 1), "aliases")
+            .iter()
+            .any(|a| a.ends_with("=database")));
+        // db brought up alone has it as well, for web to come up later.
+        let alone = project_of(
+            "links-alone",
+            "services:\n  db:\n    image: postgres\n  web:\n    image: nginx\n    links: [\"db:database\"]\n",
+            &["db".to_string()],
+        );
+        assert!(alone.disabled_services.contains_key("web"));
+        assert!(aliases(&made(&alone, "db", 1))
             .iter()
             .any(|a| a.ends_with("=database")));
     }
@@ -1079,6 +1276,48 @@ volumes:
 "#;
 
     #[test]
+    fn an_empty_entrypoint_keeps_the_image_command_as_docker_merges_them() {
+        // What docker compose v5.6.0 on docker 28.5.1 made of these with nginx:alpine.
+        let project = project(
+            "q",
+            r#"
+services:
+  empty_list:
+    image: nginx:alpine
+    entrypoint: []
+  empty_string:
+    image: nginx:alpine
+    entrypoint: ""
+  both_empty:
+    image: nginx:alpine
+    entrypoint: []
+    command: []
+  sh_only:
+    image: nginx:alpine
+    entrypoint: ["/bin/sh"]
+  cmd_empty:
+    image: nginx:alpine
+    command: []
+"#,
+        );
+        for service in ["empty_list", "empty_string", "both_empty"] {
+            let m = made(&project, service, 1);
+            assert_eq!(text(&m, "entrypoint").as_deref(), Some(""), "{service}");
+            assert_eq!(
+                list(&m, "command"),
+                ["nginx", "-g", "daemon off;"],
+                "{service}"
+            );
+        }
+        let m = made(&project, "sh_only", 1);
+        assert_eq!(list(&m, "command"), ["/bin/sh"]);
+        // An empty command alone is none: the image's entrypoint and command run.
+        let m = made(&project, "cmd_empty", 1);
+        assert_eq!(text(&m, "entrypoint"), None);
+        assert!(list(&m, "command").is_empty());
+    }
+
+    #[test]
     fn a_service_becomes_the_options_of_its_machine() {
         let project = project("demo", DEMO);
         let web = made(&project, "web", 1);
@@ -1104,6 +1343,15 @@ volumes:
         assert_eq!(list(&web, "ulimits"), ["nofile=64:128"]);
         assert_eq!(text(&web, "log_driver").as_deref(), Some("local"));
         assert_eq!(web.options.get("stop_timeout"), Some(&Bus::from(90u64)));
+        // A negative grace period waits for as long as the program takes, as docker's.
+        let forever = self::project(
+            "q",
+            "services:\n  web:\n    image: nginx\n    stop_grace_period: -1s\n",
+        );
+        assert_eq!(
+            made(&forever, "web", 1).options.get("stop_timeout"),
+            Some(&Bus::from(crate::policy::NO_STOP_TIMEOUT))
+        );
         let labels = list(&web, "label");
         for wanted in [
             "com.docker.compose.project=demo",
@@ -1122,6 +1370,64 @@ volumes:
     }
 
     #[test]
+    fn scheduled_jobs_are_refused_by_up_and_an_empty_schedule_is_none() {
+        let p = project(
+            "sched",
+            "services:\n  db: {image: postgres}\n\
+             jobs:\n  sync: {image: app, triggers: {schedule: [{cron: \"0 * * * *\"}]}}\n\
+             \x20 backup: {image: app, triggers: {schedule: [{cron: \"0 3 * * *\"}]}}\n\
+             \x20 migrate: {image: app, triggers: {manual: true}}\n\
+             \x20 never: {image: app, triggers: {schedule: []}}\n",
+        );
+        assert_eq!(
+            super::super::up::reject_scheduled_jobs(&p)
+                .unwrap_err()
+                .to_string(),
+            "scheduled jobs are not supported in this version: backup, sync"
+        );
+        // Refused by up, not by the support table: run takes a scheduled job.
+        assert!(p.refused.iter().all(|r| r.service != "never"));
+        let mut p = p;
+        p.materialize_job("sync").unwrap();
+        p = p
+            .with_selected_services(&["sync".to_string()], false)
+            .unwrap();
+        super::super::up::check_refusals(&p).unwrap();
+    }
+
+    #[test]
+    fn an_extension_under_jobs_is_no_job() {
+        let dir = std::env::temp_dir().join(format!("nspawn-jobext-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("compose.yaml"),
+            "services:\n  x-svc: {image: x, cpu_shares: 512}\n\
+             jobs:\n  x-template: {image: alpine, cpu_shares: 512, triggers: {manual: true}}\n",
+        )
+        .unwrap();
+        let cli = crate::cli::Cli::try_parse_from(["nspawn", "compose", "up"]).unwrap();
+        let crate::cli::Command::Compose(args) = cli.command else {
+            unreachable!()
+        };
+        let env = crate::compose::dotenv::Env::from([("HOME".to_string(), "/nowhere".to_string())]);
+        let host = crate::compose::config::Host::new(
+            env,
+            dir.to_string_lossy().into_owned(),
+            crate::compose::config::Stdin::Process,
+        );
+        let flags = crate::compose::options::Flags::default();
+        let mut warnings = Vec::new();
+        crate::compose::config::project_for(&args, &flags, &host, &[], &mut |w| warnings.push(w))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(warnings.iter().any(|w| w.contains("x-svc")), "{warnings:?}");
+        assert!(
+            !warnings.iter().any(|w| w.contains("x-template")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
     fn run_makes_a_job_a_service() {
         let mut p = project(
             "jobs",
@@ -1129,15 +1435,15 @@ volumes:
              jobs:\n  migrate:\n    image: app\n    depends_on: [db]\n    triggers: {manual: true}\n\
              \x20 nightly:\n    image: app\n    triggers: {manual: false}\n",
         );
-        super::super::materialize_job(&mut p, "migrate").unwrap();
+        p.materialize_job("migrate").unwrap();
         assert!(p.services.contains_key("migrate") && !p.jobs.contains_key("migrate"));
-        let err = super::super::materialize_job(&mut p, "nightly").unwrap_err();
+        let err = p.materialize_job("nightly").unwrap_err();
         assert_eq!(
             err,
             "job \"nightly\" is declared with manual: false, it cannot be run manually"
         );
         assert_eq!(
-            super::super::materialize_job(&mut p, "nope").unwrap_err(),
+            p.materialize_job("nope").unwrap_err(),
             "no such service: nope"
         );
     }
@@ -1258,6 +1564,26 @@ volumes:
             .to_string();
         assert!(err.contains("subpath"), "{err}");
         assert!(err.contains("app.data.driver"), "{err}");
+        // A resource whose name another one's starts is not that one: unused, its
+        // refusal does not apply.
+        let p = project(
+            "prefixes",
+            "services:\n  web:\n    image: nginx\n    networks: [front]\n    volumes: [data:/d]\n\
+             networks:\n  front: {}\n  front.net: {driver: macvlan}\n\
+             volumes:\n  data: {}\n  data.old: {driver: nfs}\n",
+        );
+        super::super::up::check_refusals(&p).unwrap();
+        // Models only for the services to run that use them.
+        let models = "services:\n  ai:\n    image: alpine\n    models: [llm]\n\
+                      \x20 web:\n    image: nginx\n\
+                      models:\n  llm: {model: ai/smollm2}\n";
+        let web = project_of("models-web", models, &["web".to_string()]);
+        super::super::up::check_refusals(&web).unwrap();
+        let all = project("models-all", models);
+        assert!(super::super::up::check_refusals(&all)
+            .unwrap_err()
+            .to_string()
+            .contains("Docker Model Runner"));
     }
 
     #[test]
@@ -1275,6 +1601,7 @@ volumes:
                 name: "web".to_string(),
                 oneoff: false,
                 image_digest: String::new(),
+                image_cmd: Vec::new(),
                 no_deps: false,
                 env_files: Vec::new(),
                 scale,
@@ -1297,13 +1624,37 @@ volumes:
              \x20 plain: {}\n",
         );
         assert_eq!(
-            volume_device(&local, "pg").unwrap().as_deref(),
-            Some("/srv/pg")
+            volume_device(&local, "pg").unwrap(),
+            Some(Device {
+                path: "/srv/pg".into(),
+                read_only: false
+            })
         );
         assert_eq!(volume_device(&local, "plain").unwrap(), None);
         let db = made(&local, "db", 1);
         let plain = format!("{}_plain:/plain", local.name);
         assert_eq!(list(&db, "volume"), ["/srv/pg:/data", plain.as_str()]);
+        // ro among the options makes the bind read-only; options nspawn cannot apply
+        // are refused rather than dropped.
+        let ro = project(
+            "devices-ro",
+            "services:\n  app:\n    image: x\n    volumes: [conf:/etc/app]\n\
+             volumes:\n  conf:\n    driver_opts: {type: none, o: \"bind,ro\", device: /srv/conf}\n",
+        );
+        assert_eq!(
+            list(&made(&ro, "app", 1), "volume"),
+            ["/srv/conf:/etc/app:ro"]
+        );
+        let noexec = project(
+            "devices-noexec",
+            "services:\n  app:\n    image: x\n    volumes: [conf:/etc/app]\n\
+             volumes:\n  conf:\n    driver_opts: {type: none, o: \"bind,noexec\", device: /srv/conf}\n",
+        );
+        let e = volume_device(&noexec, "conf").unwrap_err().to_string();
+        assert!(
+            e.contains("the mount option noexec of o is not taken"),
+            "{e}"
+        );
         // Options nothing honours are refused, not taken for a directory of nspawn's.
         let nfs = project(
             "nfs",

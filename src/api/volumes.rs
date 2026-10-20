@@ -133,8 +133,9 @@ pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Resu
     require_root("volume rm")?;
     let store = &ctx.store;
     // start makes volumes under the same lock, so nothing starts using one meanwhile.
+    // Trees of any size are removed off the runtime's workers.
     let _lock = store.lock().await?;
-    remove_in(store, names, report)
+    tokio::task::block_in_place(|| remove_in(store, names, report))
 }
 
 fn remove_in(store: &Store, names: &[String], report: Report<'_>) -> Result<Removal> {
@@ -194,7 +195,7 @@ fn remove_one(store: &Store, name: &str, users: &BTreeMap<String, BTreeSet<Strin
     if is_mountpoint(&path)? {
         bail!("{} is a mount point; unmount it first", path.display());
     }
-    fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))
+    crate::store::remove_tree(&path).with_context(|| format!("removing {}", path.display()))
 }
 
 /// Removes every volume no machine uses. Mount points and directories that are not
@@ -203,7 +204,7 @@ pub async fn prune(ctx: &Context, report: Report<'_>) -> Result<Vec<String>> {
     require_root("volume prune")?;
     let store = &ctx.store;
     let _lock = store.lock().await?;
-    prune_in(store, report)
+    tokio::task::block_in_place(|| prune_in(store, report))
 }
 
 fn prune_in(store: &Store, report: Report<'_>) -> Result<Vec<String>> {

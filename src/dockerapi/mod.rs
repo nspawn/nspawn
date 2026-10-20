@@ -151,51 +151,69 @@ fn streaming(content_type: &str) -> (Response<Body>, tokio::sync::mpsc::Sender<B
     (response, tx)
 }
 
-/// The query string's parameters, percent-decoded; a key given twice keeps its first
-/// value, as docker reads it, except where all are read.
-fn query(request: &Request<Incoming>) -> Vec<(String, String)> {
-    request
-        .uri()
-        .query()
-        .unwrap_or_default()
-        .split('&')
-        .filter(|p| !p.is_empty())
-        .map(|pair| {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            (decode(k), decode(v))
-        })
-        .collect()
+/// The query string's parameters, percent-decoded as Go's ParseQuery decodes them: a
+/// pair that does not decode is left out, and the first error kept for the requests
+/// docker answers it for. A key given twice keeps its first value, as docker reads it,
+/// except where all are read.
+fn query(raw: &str) -> Query {
+    let mut pairs = Vec::new();
+    let mut bad = None;
+    for pair in raw.split('&') {
+        if pair.contains(';') {
+            bad.get_or_insert_with(|| "invalid semicolon separator in query".to_string());
+            continue;
+        }
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match (decode(k), decode(v)) {
+            (Ok(k), Ok(v)) => pairs.push((k, v)),
+            (Err(e), _) | (_, Err(e)) => {
+                bad.get_or_insert(e);
+            }
+        }
+    }
+    Query { pairs, bad }
 }
 
-fn decode(text: &str) -> String {
+/// Go's QueryUnescape: `+` a space, `%` and two hex digits a byte, any other `%` an
+/// error.
+fn decode(text: &str) -> Result<String, String> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b'+' => out.push(b' '),
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                    Some(b) => {
-                        out.push(b);
-                        i += 2;
-                    }
-                    None => out.push(b'%'),
-                }
+            b'%' => {
+                let hex = bytes
+                    .get(i + 1..i + 3)
+                    .filter(|h| h.iter().all(u8::is_ascii_hexdigit));
+                let Some(hex) = hex else {
+                    let bad = String::from_utf8_lossy(&bytes[i..(i + 3).min(bytes.len())]);
+                    return Err(format!("invalid URL escape {bad:?}"));
+                };
+                let digit = |b: u8| (b as char).to_digit(16).unwrap_or(0) as u8;
+                out.push(digit(hex[0]) << 4 | digit(hex[1]));
+                i += 2;
             }
             b => out.push(b),
         }
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
-struct Query(Vec<(String, String)>);
+struct Query {
+    pairs: Vec<(String, String)>,
+    /// What made a pair undecodable.
+    bad: Option<String>,
+}
 
 impl Query {
     fn get(&self, key: &str) -> Option<&str> {
-        self.0
+        self.pairs
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
@@ -218,7 +236,7 @@ impl Query {
 async fn handle(ctx: Arc<Context>, request: Request<Incoming>) -> Response<Body> {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
-    let query = Query(query(&request));
+    let query = query(request.uri().query().unwrap_or_default());
     let (version, route) = split_version(&path);
     let mut response = match version {
         Some(v) if v < MIN_API_VERSION => respond(
@@ -322,7 +340,23 @@ async fn route_request(
     path: &str,
     query: &Query,
 ) -> Response<Body> {
-    match classify(method, path) {
+    let route = classify(method, path);
+    // The requests whose handlers docker starts with ParseForm, which answers a query
+    // that does not decode.
+    let parses_form = match &route {
+        Route::Containers
+        | Route::Kill(_)
+        | Route::Networks
+        | Route::Network(_)
+        | Route::Events
+        | Route::DiskUsage => true,
+        Route::Container(_, what) => what != "json",
+        _ => false,
+    };
+    if let (true, Some(bad)) = (parses_form, &query.bad) {
+        return error(StatusCode::BAD_REQUEST, bad.clone());
+    }
+    match route {
         Route::Ping => {
             let mut response = respond(StatusCode::OK, "text/plain; charset=utf-8", "OK");
             let headers = response.headers_mut();
@@ -610,30 +644,26 @@ fn container_matches(
     filters: &Filters,
     m: &model::Machine,
 ) -> bool {
-    if !filters.exact("status", m.state()) {
+    if !filters.matches("status", m.state()) {
         return false;
     }
     // As docker matches it: with the slash and without.
     if !filters.matches("name", &format!("/{}", m.name())) && !filters.matches("name", m.name()) {
         return false;
     }
-    if let Some(ids) = filters.values("id") {
-        if !ids.iter().any(|i| m.id.starts_with(i.as_str())) {
-            return false;
-        }
+    if !filters.matches("id", &m.id) {
+        return false;
     }
     if !filters.labels("label", &m.record.effective_labels()) {
         return false;
     }
-    if let Some(health) = filters.values("health") {
-        let status = m
-            .summary
-            .health
-            .as_ref()
-            .map_or("none", |h| h.status.as_str());
-        if !health.contains(status) {
-            return false;
-        }
+    let health = m
+        .summary
+        .health
+        .as_ref()
+        .map_or("none", |h| h.status.as_str());
+    if !filters.exact("health", health) {
+        return false;
     }
     if let Some(codes) = filters.values("exited") {
         let exited = m.state() == "exited"
@@ -711,7 +741,7 @@ fn container_matches(
     {
         return false;
     }
-    let created_of = |key: &str| snapshot.find(key).map(|o| o.record.created);
+    let created_of = |key: &str| snapshot.find(key).ok().map(|o| o.record.created);
     if let Some(before) = filters.values("before") {
         if !before
             .iter()
@@ -736,8 +766,9 @@ async fn container_read(ctx: &Arc<Context>, id: &str, what: &str, query: &Query)
         Ok(s) => s,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
-    let Some(machine) = snapshot.find(id) else {
-        return error(StatusCode::NOT_FOUND, format!("No such container: {id}"));
+    let machine = match snapshot.find(id) {
+        Ok(m) => m,
+        Err(e) => return error(lookup_status(&e), e),
     };
     match what {
         "json" => json_response(
@@ -882,9 +913,7 @@ async fn list_networks(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
                 })
                 .unwrap_or_default();
             filters.matches("name", &text("Name"))
-                && filters
-                    .values("id")
-                    .is_none_or(|ids| ids.iter().any(|i| text("Id").starts_with(i.as_str())))
+                && filters.matches("id", &text("Id"))
                 && filters.exact("driver", &text("Driver"))
                 && filters.exact("scope", "local")
                 && filters.labels("label", &labels)
@@ -926,26 +955,25 @@ fn events(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
 /// `nspawn kill` sends it, which acme-companion and docker-gen use to have nginx read
 /// new certificates and configuration.
 async fn kill(ctx: &Arc<Context>, id: &str, query: &Query) -> Response<Body> {
-    // The signal first, as docker checks it before the container.
-    let signal = query
-        .get("signal")
-        .filter(|s| !s.is_empty())
-        .unwrap_or("KILL");
-    let number = match crate::api::machines::signal_number(signal) {
-        Ok(number) => number,
-        Err(_) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                format!("cannot kill container: {id}: Invalid signal: {signal}"),
-            )
-        }
+    // The signal first, as docker checks it before the container; every error says
+    // which container it was for.
+    let failed = |status: StatusCode, text: String| {
+        error(status, format!("cannot kill container: {id}: {text}"))
+    };
+    let number = match query.get("signal").filter(|s| !s.is_empty()) {
+        None => nix::libc::SIGKILL,
+        Some(signal) => match docker_signal(signal) {
+            Ok(number) => number,
+            Err(text) => return failed(StatusCode::BAD_REQUEST, text),
+        },
     };
     let snapshot = match Snapshot::take(ctx).await {
         Ok(s) => s,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
-    let Some(machine) = snapshot.find(id) else {
-        return error(StatusCode::NOT_FOUND, format!("No such container: {id}"));
+    let machine = match snapshot.find(id) {
+        Ok(m) => m,
+        Err(e) => return failed(lookup_status(&e), e),
     };
     let restarting = machine.state() == "restarting";
     if !machine.running() && !restarting {
@@ -964,17 +992,97 @@ async fn kill(ctx: &Arc<Context>, id: &str, query: &Query) -> Response<Body> {
         if !ends_restarts(machine.record.effective_stop_signal(), number) {
             return respond(StatusCode::NO_CONTENT, "", Bytes::new());
         }
-        "KILL"
+        nix::libc::SIGKILL
     } else {
-        signal
+        number
     };
-    match crate::client::kill_machine(machine.name(), signal).await {
+    match crate::client::kill_machine(machine.name(), &signal.to_string()).await {
         Ok(()) => respond(StatusCode::NO_CONTENT, "", Bytes::new()),
-        Err(e) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("cannot kill container: {id}: {e:#}"),
-        ),
+        Err(e) => failed(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     }
+}
+
+/// The status of a lookup's failure: a prefix of more than one container is the
+/// caller's to fix.
+fn lookup_status(error: &str) -> StatusCode {
+    if error.starts_with("multiple IDs") {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
+/// moby/sys/signal's ParseSignal, then ValidSignalForPlatform on Linux: a number but 0,
+/// or a name of its map with or without SIG, and only the signals of that map.
+fn docker_signal(raw: &str) -> Result<i32, String> {
+    const NAMES: [(&str, i32); 34] = [
+        ("ABRT", 6),
+        ("ALRM", 14),
+        ("BUS", 7),
+        ("CHLD", 17),
+        ("CLD", 17),
+        ("CONT", 18),
+        ("FPE", 8),
+        ("HUP", 1),
+        ("ILL", 4),
+        ("INT", 2),
+        ("IO", 29),
+        ("IOT", 6),
+        ("KILL", 9),
+        ("PIPE", 13),
+        ("POLL", 29),
+        ("PROF", 27),
+        ("PWR", 30),
+        ("QUIT", 3),
+        ("SEGV", 11),
+        ("STKFLT", 16),
+        ("STOP", 19),
+        ("SYS", 31),
+        ("TERM", 15),
+        ("TRAP", 5),
+        ("TSTP", 20),
+        ("TTIN", 21),
+        ("TTOU", 22),
+        ("URG", 23),
+        ("USR1", 10),
+        ("USR2", 12),
+        ("VTALRM", 26),
+        ("WINCH", 28),
+        ("XCPU", 24),
+        ("XFSZ", 25),
+    ];
+    let (rtmin, rtmax) = (34, 64);
+    let invalid = || format!("invalid signal: {raw}");
+    let number = match crate::compose::gostr::atoi(raw) {
+        Ok(0) => return Err(invalid()),
+        Ok(n) => n,
+        Err(_) => {
+            let upper = raw.to_uppercase();
+            let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+            let offset = |prefix: &str, sign: char, most: i64| {
+                let rest = name.strip_prefix(prefix)?;
+                if rest.is_empty() {
+                    return Some(0);
+                }
+                let n = rest.strip_prefix(sign)?;
+                (!n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| n.parse::<i64>().ok())
+                    .flatten()
+                    .filter(|n| (1..=most).contains(n))
+            };
+            NAMES
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, number)| i64::from(*number))
+                .or_else(|| offset("RTMIN", '+', 15).map(|n| rtmin + n))
+                .or_else(|| offset("RTMAX", '-', 14).map(|n| rtmax - n))
+                .ok_or_else(invalid)?
+        }
+    };
+    if !(1..=31).contains(&number) && !(rtmin..=rtmax).contains(&number) {
+        return Err(format!("the linux daemon does not support signal {number}"));
+    }
+    Ok(number as i32)
 }
 
 /// docker's killWithSignal: whether `signal` keeps a container from being restarted.
@@ -986,6 +1094,39 @@ fn ends_restarts(stop_signal: Option<&str>, signal: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_takes_the_signals_docker_takes() {
+        for (raw, number) in [
+            ("9", 9),
+            ("+9", 9),
+            ("KILL", 9),
+            ("sigterm", 15),
+            ("SIGRTMIN+3", 37),
+            ("RTMAX-14", 50),
+            ("rtmax", 64),
+            ("34", 34),
+        ] {
+            assert_eq!(docker_signal(raw), Ok(number), "{raw}");
+        }
+        for (raw, text) in [
+            ("0", "invalid signal: 0"),
+            ("NOPE", "invalid signal: NOPE"),
+            (" 9", "invalid signal:  9"),
+            ("RTMIN+16", "invalid signal: RTMIN+16"),
+            ("32", "the linux daemon does not support signal 32"),
+            ("33", "the linux daemon does not support signal 33"),
+            ("-9", "the linux daemon does not support signal -9"),
+            ("65", "the linux daemon does not support signal 65"),
+        ] {
+            assert_eq!(docker_signal(raw), Err(text.to_string()), "{raw}");
+        }
+        assert_eq!(
+            lookup_status("multiple IDs found with provided prefix: ab"),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(lookup_status("No such container: x"), StatusCode::NOT_FOUND);
+    }
 
     #[test]
     fn a_signal_between_restarts_ends_them_as_docker_says() {
@@ -1064,9 +1205,24 @@ mod tests {
 
     #[test]
     fn query_values_are_decoded() {
-        assert_eq!(decode("a%20b+c%7B%22x%22%7D"), "a b c{\"x\"}");
-        assert_eq!(decode("100%"), "100%");
-        assert_eq!(decode("%zz"), "%zz");
+        assert_eq!(decode("a%20b+c%7B%22x%22%7D").unwrap(), "a b c{\"x\"}");
+        // As Go's QueryUnescape refuses them.
+        for (bad, escape) in [("100%", "%"), ("%zz", "%zz"), ("%+5", "%+5"), ("%2", "%2")] {
+            assert_eq!(
+                decode(bad),
+                Err(format!("invalid URL escape \"{escape}\"")),
+                "{bad}"
+            );
+        }
+        let q = query("all=%zz&limit=3&a;b=1");
+        assert_eq!(q.get("limit"), Some("3"));
+        assert_eq!(q.get("all"), None);
+        assert_eq!(q.bad.as_deref(), Some("invalid URL escape \"%zz\""));
+        assert_eq!(
+            query("a;b=1").bad.as_deref(),
+            Some("invalid semicolon separator in query")
+        );
+        assert!(query("all=1&filters=%7B%7D").bad.is_none());
         assert_eq!(journal_time(Some("1792344103")), Some("@1792344103".into()));
         assert_eq!(
             journal_time(Some("1792344103.5")),

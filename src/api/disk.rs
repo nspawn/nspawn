@@ -12,10 +12,12 @@ use crate::api::{line, note, Context, Report};
 use crate::backend::BackendChoice;
 use crate::store::{ImageRecord, Ownership, Store};
 
-/// A record pulled or built and never run as a machine. Records of releases before the
-/// first start was kept say nothing of it: an address, options only start gives, or a
-/// writable layer with something in it say it ran, and a flat one, which writes into the
-/// image's own tree, is taken for a machine.
+/// A record pulled or built and never run as a machine. Records of releases that did not
+/// keep the first start (written again by one after a downgrade too) say nothing of it:
+/// an address, options only start gives (a network among them), or a writable layer with
+/// something in it say it ran, whatever else does. A flat one writes into the image's own
+/// tree: made since the first starts are kept, its record says; before, it is taken for a
+/// machine.
 pub fn image_only(store: &Store, record: &ImageRecord) -> bool {
     if record.origin == "create" || record.started.is_some() || record.address.is_some() {
         return false;
@@ -29,15 +31,16 @@ pub fn image_only(store: &Store, record: &ImageRecord) -> bool {
         || record.healthcheck.is_some()
         || record.restart != crate::policy::Restart::default()
         || record.limits != crate::policy::Limits::default()
-        || record.tuning != crate::tuning::Tuning::default();
+        || record.tuning != crate::tuning::Tuning::default()
+        || record.network != crate::settings::Network::Bridge
+        || record.no_network
+        || record.network_name.is_some()
+        || record.network_container.is_some()
+        || !record.extra_networks.is_empty()
+        || !record.aliases.is_empty()
+        || !record.fixed_addresses.is_empty();
     if given {
         return false;
-    }
-    if store
-        .starts_kept_since()
-        .is_some_and(|since| record.created >= since)
-    {
-        return true;
     }
     let writable = match record.backend {
         BackendChoice::Overlay => store
@@ -48,7 +51,11 @@ pub fn image_only(store: &Store, record: &ImageRecord) -> bool {
             .machines_dir
             .join(format!("{}.mstack", record.name))
             .join("rw"),
-        BackendChoice::Flat | BackendChoice::Auto => return false,
+        BackendChoice::Flat | BackendChoice::Auto => {
+            return store
+                .starts_kept_since()
+                .is_some_and(|since| record.created >= since)
+        }
     };
     std::fs::read_dir(writable).map_or(true, |mut d| d.next().is_none())
 }
@@ -142,6 +149,23 @@ fn layer_size(store: &Store, digest: &str, sizes: &mut BTreeMap<String, u64>) ->
     size
 }
 
+/// What a machine wrote, where its backend keeps it: the overlay's upper layer, the
+/// mstack's rw tree, a flat machine's whole tree, which is its image as well.
+fn writable_size(store: &Store, record: &ImageRecord) -> u64 {
+    let path = match record.backend {
+        BackendChoice::Overlay => store
+            .machines_private_dir()
+            .join(&record.name)
+            .join("upper"),
+        BackendChoice::Mstack => store
+            .machines_dir
+            .join(format!("{}.mstack", record.name))
+            .join("rw"),
+        BackendChoice::Flat | BackendChoice::Auto => store.machines_dir.join(&record.name),
+    };
+    tree_size(&path, &mut HashSet::new())
+}
+
 pub async fn usage(ctx: &Context) -> Result<Usage> {
     let store = &ctx.store;
     let sd = ctx.sd().await?;
@@ -154,63 +178,11 @@ pub async fn usage(ctx: &Context) -> Result<Usage> {
     let records = store.list_images()?;
     let (images, machines): (Vec<&ImageRecord>, Vec<&ImageRecord>) =
         records.iter().partition(|r| image_only(store, r));
-    let mut sizes = BTreeMap::new();
     let mut usage = Usage::default();
-
-    // An image is a manifest: what records of it share, active while a machine of it
-    // exists. A layer counts once, and is reclaimable when no machine uses it.
-    let mut by_manifest: BTreeMap<&str, Vec<&ImageRecord>> = BTreeMap::new();
-    for r in &records {
-        by_manifest
-            .entry(r.manifest_digest.as_str())
-            .or_default()
-            .push(r);
-    }
-    let machine_layers: HashSet<&str> = machines
-        .iter()
-        .flat_map(|r| r.layers.iter().map(String::as_str))
-        .collect();
-    let mut counted = HashSet::new();
-    for (digest, group) in &by_manifest {
-        let containers = group.iter().filter(|r| !image_only(store, r)).count();
-        let size: u64 = group[0]
-            .layers
-            .iter()
-            .map(|l| layer_size(store, l, &mut sizes))
-            .sum();
-        usage.images.total += 1;
-        if containers > 0 {
-            usage.images.active += 1;
-        }
-        for layer in &group[0].layers {
-            if counted.insert(layer.as_str()) {
-                let s = layer_size(store, layer, &mut sizes);
-                usage.images.size += s;
-                if !machine_layers.contains(layer.as_str()) {
-                    usage.images.reclaimable += s;
-                }
-            }
-        }
-        let shown = group
-            .iter()
-            .find(|r| image_only(store, r))
-            .unwrap_or(&group[0]);
-        usage.image_rows.push(ImageRow {
-            name: shown.name.clone(),
-            reference: shown.reference.clone(),
-            created: shown.created,
-            size,
-            containers,
-        });
-        let _ = digest;
-    }
+    (usage.images, usage.image_rows) = images_usage(store, &records, &machines);
 
     for r in &machines {
-        let mut seen = HashSet::new();
-        let size = tree_size(
-            &store.machines_private_dir().join(&r.name).join("upper"),
-            &mut seen,
-        );
+        let size = writable_size(store, r);
         let row = MachineRow {
             name: r.name.clone(),
             reference: r.reference.clone(),
@@ -256,6 +228,74 @@ pub async fn usage(ctx: &Context) -> Result<Usage> {
         });
     }
     Ok(usage)
+}
+
+/// The images of `records` as df counts them: an image is a manifest, what records of it
+/// share, active while a machine of it exists. A layer counts once, and is reclaimable
+/// when no machine uses it.
+fn images_usage(
+    store: &Store,
+    records: &[ImageRecord],
+    machines: &[&ImageRecord],
+) -> (Kind, Vec<ImageRow>) {
+    let mut sizes = BTreeMap::new();
+    let mut kind = Kind::default();
+    let mut rows = Vec::new();
+    let mut by_manifest: BTreeMap<&str, Vec<&ImageRecord>> = BTreeMap::new();
+    for r in records {
+        by_manifest
+            .entry(r.manifest_digest.as_str())
+            .or_default()
+            .push(r);
+    }
+    let flat = |r: &ImageRecord| matches!(r.backend, BackendChoice::Flat | BackendChoice::Auto);
+    // A flat machine is a tree of its own: the layers under layers/ are nothing to it.
+    let machine_layers: HashSet<&str> = machines
+        .iter()
+        .filter(|r| !flat(r))
+        .flat_map(|r| r.layers.iter().map(String::as_str))
+        .collect();
+    let mut counted = HashSet::new();
+    for group in by_manifest.values() {
+        let containers = group.iter().filter(|r| !image_only(store, r)).count();
+        kind.total += 1;
+        if containers > 0 {
+            kind.active += 1;
+        }
+        // The layers under layers/ serve every record of the group that is not flat, each
+        // counted once; a flat image is a tree of its own, its layers kept nowhere else.
+        let mut size = 0;
+        if let Some(layered) = group.iter().find(|r| !flat(r)) {
+            for layer in &layered.layers {
+                let s = layer_size(store, layer, &mut sizes);
+                size += s;
+                if counted.insert(layer.as_str()) {
+                    kind.size += s;
+                    if !machine_layers.contains(layer.as_str()) {
+                        kind.reclaimable += s;
+                    }
+                }
+            }
+        }
+        for r in group.iter().filter(|r| flat(r) && image_only(store, r)) {
+            let s = tree_size(&store.machines_dir.join(&r.name), &mut HashSet::new());
+            size += s;
+            kind.size += s;
+            kind.reclaimable += s;
+        }
+        let shown = group
+            .iter()
+            .find(|r| image_only(store, r))
+            .unwrap_or(&group[0]);
+        rows.push(ImageRow {
+            name: shown.name.clone(),
+            reference: shown.reference.clone(),
+            created: shown.created,
+            size,
+            containers,
+        });
+    }
+    (kind, rows)
 }
 
 /// The images `images prune` takes: with `all`, every image no machine was made from
@@ -310,26 +350,18 @@ pub async fn prune_images(
     if names.is_empty() {
         return Ok(Pruned::default());
     }
-    // What each takes with it: its layers and blobs that nothing staying, nor the build
-    // cache, refers to; counted before they go.
-    let staying: HashSet<String> = records
-        .iter()
-        .filter(|r| !names.contains(&r.name))
-        .flat_map(|r| r.layers.iter().cloned())
-        .chain(crate::build::cache::Cache::new(&store.build_cache_dir()).blobs())
-        .collect();
+    // What each layer of them takes, its tree and its blob, measured before anything
+    // goes: what went is known only after the removals, some of which may be refused.
     let mut sizes = BTreeMap::new();
-    let mut freed = HashSet::new();
-    let mut own: BTreeMap<String, u64> = BTreeMap::new();
+    let mut layer_bytes: BTreeMap<String, u64> = BTreeMap::new();
     for r in records.iter().filter(|r| names.contains(&r.name)) {
-        let mut size = 0;
         for layer in &r.layers {
-            if !staying.contains(layer) && freed.insert(layer.clone()) {
-                size += layer_size(store, layer, &mut sizes);
-                size += std::fs::metadata(store.blob_path(layer)).map_or(0, |m| m.len());
+            if !layer_bytes.contains_key(layer) {
+                let size = layer_size(store, layer, &mut sizes)
+                    + std::fs::metadata(store.blob_path(layer)).map_or(0, |m| m.len());
+                layer_bytes.insert(layer.clone(), size);
             }
         }
-        own.insert(r.name.clone(), size);
     }
     // Chosen without the lock: one that a machine was made from or that ran since, and
     // so is no image only any more, stays.
@@ -346,7 +378,19 @@ pub async fn prune_images(
     if let Some(e) = removal.error() {
         note(report, format!("warning: {e}"));
     }
-    let reclaimed = removal.removed.iter().filter_map(|n| own.get(n)).sum();
+    // What went: the layers no record left, nor the build cache, refers to.
+    let staying: HashSet<String> = store
+        .list_images()
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|r| r.layers.iter().cloned())
+        .chain(crate::build::cache::Cache::new(&store.build_cache_dir()).blobs())
+        .collect();
+    let reclaimed = layer_bytes
+        .iter()
+        .filter(|(layer, _)| !staying.contains(*layer))
+        .map(|(_, size)| size)
+        .sum();
     Ok(Pruned {
         removed: removal.removed,
         reclaimed,
@@ -369,7 +413,7 @@ pub async fn prune_build_cache(
     let trash = store
         .build_cache_dir()
         .join(format!(".trash-{}", crate::store::unique_suffix()));
-    let gone: Vec<_> = {
+    let (gone, removed, tidy) = {
         let _lock = store.lock().await?;
         // A build running now may have a cache mount bound in a step: those wait for it.
         // A Dockerfile build's directory, by its marker: an mkosi build of a name that
@@ -382,18 +426,27 @@ pub async fn prune_build_cache(
                 })
             })
         });
-        let gone: Vec<_> = crate::build::cache::prunable(&rows, all, until, keep_storage)
-            .into_iter()
-            .filter(|r| !(building && r.kind == "mount"))
-            .collect();
-        crate::build::cache::remove(store, &gone, &trash)?;
-        store.gc_layers()?;
-        store.gc_blobs()?;
-        gone
+        let held = |r: &crate::build::cache::Usage| building && r.kind == "mount";
+        let gone = crate::build::cache::prunable(&rows, all, until, keep_storage, &held);
+        let removed = crate::build::cache::remove(store, &gone, &trash);
+        // What nothing keeps any more goes too, off the runtime's workers; trouble with
+        // another image's files does not undo what was pruned.
+        let tidy = match &removed {
+            Ok(()) => tokio::task::block_in_place(|| {
+                store.gc_layers().and_then(|_| store.gc_blobs()).map(|_| ())
+            }),
+            Err(_) => Ok(()),
+        };
+        (gone, removed, tidy)
     };
-    let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(trash)).await;
+    // The mounts set aside go whatever happened.
+    let _ = tokio::task::spawn_blocking(move || crate::store::remove_tree(trash)).await;
+    removed?;
     for row in &gone {
         line(report, format!("deleted: {}", row.id));
+    }
+    if let Err(e) = tidy {
+        note(report, format!("warning: {e:#}"));
     }
     // What images take too stays on disk.
     Ok(Pruned {
@@ -415,6 +468,30 @@ mod tests {
             base[k] = v.clone();
         }
         serde_json::from_value(base).unwrap()
+    }
+
+    #[test]
+    fn an_image_is_sized_by_its_own_backend_whatever_its_machines() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(&dir.path().join("m"), &dir.path().join("s"));
+        let layer = format!("sha256:{}", "c".repeat(64));
+        let layer_dir = store.layer_dir(&layer, Ownership::Root);
+        std::fs::create_dir_all(&layer_dir).unwrap();
+        std::fs::write(layer_dir.join("f"), vec![0u8; 4096]).unwrap();
+        // A flat machine sorts first, made from an overlay image of the same manifest.
+        let machine = record(serde_json::json!({
+            "name": "abc", "backend": "flat", "origin": "create", "layers": [layer.clone()],
+        }));
+        let image = record(serde_json::json!({
+            "name": "nginx", "backend": "overlay", "layers": [layer.clone()],
+        }));
+        let records = vec![machine.clone(), image];
+        let (kind, rows) = images_usage(&store, &records, &[&machine]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "nginx");
+        assert!(rows[0].size >= 4096, "{rows:?}");
+        assert_eq!((kind.total, kind.active), (1, 1));
+        assert!(kind.size >= 4096 && kind.reclaimable >= 4096, "{kind:?}");
     }
 
     #[test]
@@ -475,6 +552,41 @@ mod tests {
         ));
         store.keep_starts().unwrap();
         assert_eq!(store.starts_kept_since(), Some(since));
+        // One an older release wrote again after it ran, its first start lost: what it
+        // wrote says so, made since or not.
+        let rewritten = record(serde_json::json!({ "name": "ran", "created": since }));
+        assert!(!image_only(&store, &rewritten));
+        // A network chosen at a start of an older release is one of start's options.
+        for network in [
+            serde_json::json!({ "network": "host" }),
+            serde_json::json!({ "no_network": true }),
+            serde_json::json!({ "network_container": "db" }),
+            serde_json::json!({ "network_name": "front" }),
+        ] {
+            assert!(!image_only(&store, &record(network.clone())), "{network}");
+        }
+    }
+
+    #[test]
+    fn a_machine_is_measured_where_its_backend_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(&dir.path().join("m"), &dir.path().join("s"));
+        let write = |path: std::path::PathBuf, bytes: usize| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![b'x'; bytes]).unwrap();
+        };
+        write(store.machines_private_dir().join("o/upper/f"), 10);
+        write(store.machines_dir.join("s.mstack/rw/f"), 20);
+        write(store.machines_dir.join("f/etc/f"), 30);
+        let of = |name: &str, backend: &str| {
+            writable_size(
+                &store,
+                &record(serde_json::json!({ "name": name, "backend": backend })),
+            )
+        };
+        assert_eq!(of("o", "overlay"), 10);
+        assert_eq!(of("s", "mstack"), 20);
+        assert_eq!(of("f", "flat"), 30);
     }
 
     #[test]

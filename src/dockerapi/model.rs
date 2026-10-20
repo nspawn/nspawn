@@ -34,6 +34,12 @@ pub struct Snapshot {
     pub networks: Vec<NetSpec>,
 }
 
+/// Whether a machine in `state` has a run that ended, whose end docker shows: one
+/// stopped, or between two runs of its restart policy.
+fn ended(state: &str) -> bool {
+    matches!(state, "stopped" | "restarting")
+}
+
 impl Snapshot {
     pub async fn take(ctx: &Context) -> Result<Snapshot> {
         let sd = ctx.sd().await?;
@@ -43,7 +49,7 @@ impl Snapshot {
                 continue;
             };
             let unit = format!("systemd-nspawn@{}.service", record.name);
-            let finished_usec = if summary.state == "stopped" {
+            let finished_usec = if ended(&summary.state) {
                 sd.exec_main_exit_usec(&unit).await.ok().filter(|t| *t > 0)
             } else {
                 None
@@ -63,15 +69,25 @@ impl Snapshot {
 
     /// By ID, by name with or without docker's leading slash, or by a unique prefix of
     /// the ID, in that order, as docker looks one up.
-    pub fn find(&self, key: &str) -> Option<&Machine> {
+    /// A container by its ID, its name or a prefix of its ID, as docker's GetContainer
+    /// finds it, and its words when there is none.
+    pub fn find(&self, key: &str) -> Result<&Machine, String> {
         if let Some(m) = self.machines.iter().find(|m| m.id == key) {
-            return Some(m);
+            return Ok(m);
         }
         let name = key.strip_prefix('/').unwrap_or(key);
         if let Some(m) = self.machines.iter().find(|m| m.record.name == name) {
-            return Some(m);
+            return Ok(m);
         }
-        unique_prefix(self.machines.iter(), key, |m| &m.id)
+        let mut found = self
+            .machines
+            .iter()
+            .filter(|m| !key.is_empty() && m.id.starts_with(key));
+        match (found.next(), found.next()) {
+            (Some(m), None) => Ok(m),
+            (Some(_), Some(_)) => Err(format!("multiple IDs found with provided prefix: {key}")),
+            (None, _) => Err(format!("No such container: {key}")),
+        }
     }
 
     pub fn network(&self, key: &str) -> Option<NetworkView<'_>> {
@@ -213,7 +229,7 @@ impl Machine {
     }
 
     fn command_line(&self) -> String {
-        self.argv().join(" ")
+        super::util::command_line(&self.argv())
     }
 
     /// What `HostConfig.NetworkMode` says: the primary network, host, none, or the
@@ -223,7 +239,7 @@ impl Machine {
         if let Some(owner) = bridge::shares_network(r) {
             let id = snapshot
                 .find(owner)
-                .map_or_else(|| owner.to_string(), |m| m.id.clone());
+                .map_or_else(|_| owner.to_string(), |m| m.id.clone());
             return format!("container:{id}");
         }
         if r.no_network {
@@ -449,17 +465,12 @@ impl Machine {
             .iter()
             .map(|v| (v.clone(), json!({})))
             .collect();
-        let entrypoint = {
-            let e = r
-                .entrypoint
-                .clone()
-                .unwrap_or_else(|| r.run.entrypoint().to_vec());
-            if e.is_empty() {
-                Value::Null
-            } else {
-                json!(e)
-            }
+        // null for none, as docker writes a nil list.
+        let list = |words: &[String]| match words {
+            [] => Value::Null,
+            words => json!(words),
         };
+        let entrypoint = list(r.effective_entrypoint());
         let mut config = json!({
             "Hostname": hostname,
             "Domainname": "",
@@ -471,7 +482,7 @@ impl Machine {
             "OpenStdin": false,
             "StdinOnce": false,
             "Env": env,
-            "Cmd": r.cmd.clone().unwrap_or_else(|| r.run.cmd().to_vec()),
+            "Cmd": list(r.effective_cmd()),
             "Image": familiar(&r.reference),
             "Volumes": if volumes.is_empty() { Value::Null } else { Value::Object(volumes) },
             "WorkingDir": r.effective_working_dir().unwrap_or(""),
@@ -486,7 +497,7 @@ impl Machine {
             config["StopSignal"] = json!(signal);
         }
         if let Some(timeout) = r.tuning.stop_timeout {
-            config["StopTimeout"] = json!(timeout);
+            config["StopTimeout"] = json!(crate::policy::shown_stop_timeout(timeout));
         }
         if let Some(h) = healthcheck {
             config["Healthcheck"] = h;
@@ -942,6 +953,7 @@ mod tests {
                 }],
             }),
             exit_code: None,
+            finished: None,
         };
         let front: NetSpec = serde_json::from_value(json!({
             "name": "front", "interface": "nsbr-front", "subnet": "10.99.1.0/24", "created": 5, "labels": { "e2e": "yes" },
@@ -964,6 +976,34 @@ mod tests {
     use crate::config::Config;
 
     #[test]
+    fn the_program_reads_as_docker_merged_it() {
+        let (ctx, mut snapshot) = fixture();
+        let image = ImageInfo::of(&ctx, &snapshot.machines[0].record);
+        let config = |snapshot: &Snapshot| {
+            snapshot.machines[0].inspect_json(&ctx, snapshot, &image)["Config"].clone()
+        };
+        assert_eq!(config(&snapshot)["Cmd"], json!(["httpd", "-f", "-p", "80"]));
+        assert_eq!(config(&snapshot)["Entrypoint"], Value::Null);
+        // An entrypoint given alone: docker's Cmd is null, not the image's.
+        snapshot.machines[0].record.entrypoint = Some(vec!["/bin/sh".into()]);
+        snapshot.machines[0].record.cmd = Some(Vec::new());
+        assert_eq!(config(&snapshot)["Cmd"], Value::Null);
+        assert_eq!(config(&snapshot)["Entrypoint"], json!(["/bin/sh"]));
+        let m = &snapshot.machines[0];
+        assert_eq!(
+            m.summary_json(&ctx, &snapshot, &image)["Command"],
+            "/bin/sh"
+        );
+        // The arguments with a space in quotes, as docker lists a command.
+        snapshot.machines[0].record.cmd = Some(vec!["-c".into(), "echo a; sleep 1".into()]);
+        let m = &snapshot.machines[0];
+        assert_eq!(
+            m.summary_json(&ctx, &snapshot, &image)["Command"],
+            "/bin/sh -c 'echo a; sleep 1'"
+        );
+    }
+
+    #[test]
     fn a_machine_between_restarts_is_running_to_docker() {
         let (ctx, mut snapshot) = fixture();
         snapshot.machines[0].summary.state = "restarting".into();
@@ -979,6 +1019,14 @@ mod tests {
         assert!(
             running.as_array().is_some_and(|p| p.is_empty()),
             "{running}"
+        );
+        // Its run's end is read, as a stopped one's.
+        assert!(ended("restarting") && ended("stopped") && !ended("running"));
+        let now = 1_792_344_200;
+        snapshot.machines[0].finished_usec = Some((now - 3) * 1_000_000);
+        assert_eq!(
+            snapshot.machines[0].status(now),
+            "Restarting (1) 3 seconds ago"
         );
     }
 

@@ -326,10 +326,12 @@ impl Systemd {
             .get_machine_os_release(name.to_string())
             .await
             .ok()?;
+        // Written inside the machine, and printed on terminals: no control character
+        // leaves here.
         pairs
             .into_iter()
             .find(|(k, _)| k == "PRETTY_NAME")
-            .map(|(_, v)| v)
+            .map(|(_, v)| crate::output::printable(&v))
     }
 
     /// Starts a machine's unit. Returns true when its program ended during the start
@@ -588,6 +590,33 @@ impl Systemd {
         self.stop_unit_job(unit).await?.wait().await
     }
 
+    /// Sends `signal` to every process of a unit; nothing when it is not loaded.
+    pub async fn kill_unit(&self, unit: &str, signal: i32) -> Result<()> {
+        match self
+            .manager
+            .kill_unit(unit.to_string(), "all".to_string(), signal)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(zbus::Error::MethodError(name, _, _))
+                if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).with_context(|| format!("killing {unit}")),
+        }
+    }
+
+    /// The names of the loaded units that match the glob `pattern`.
+    pub async fn units_matching(&self, pattern: &str) -> Result<Vec<String>> {
+        let units = self
+            .manager
+            .list_units_by_patterns(Vec::new(), vec![pattern.to_string()])
+            .await
+            .with_context(|| format!("listing the units {pattern}"))?;
+        Ok(units.into_iter().map(|u| u.0).collect())
+    }
+
     /// Queues a stop job for a unit without waiting for it. From the moment systemd
     /// accepts it the unit is not restarted any more, whatever its Restart= says.
     pub async fn stop_unit_job(&self, unit: &str) -> Result<StopJob> {
@@ -661,15 +690,34 @@ impl Systemd {
             .with_context(|| format!("reading how {unit} ended"))
     }
 
-    /// Whether a job of the unit waits in systemd's queue, as a start ordered after
-    /// another unit's does while that one starts.
-    pub async fn unit_queued(&self, unit: &str) -> Result<bool> {
+    /// The types of the unit's jobs waiting in systemd's queue ("start", "stop", ...).
+    async fn queued_jobs(&self, unit: &str) -> Result<Vec<String>> {
         let listed = self
             .manager
             .list_units_by_names(vec![unit.to_string()])
             .await
             .with_context(|| format!("querying the jobs of {unit}"))?;
-        Ok(listed.iter().any(|u| u.7 != 0))
+        Ok(listed
+            .into_iter()
+            .filter(|u| u.7 != 0)
+            .map(|u| u.8)
+            .collect())
+    }
+
+    /// Whether a job of the unit, of any type, waits in systemd's queue.
+    pub async fn unit_queued(&self, unit: &str) -> Result<bool> {
+        Ok(!self.queued_jobs(unit).await?.is_empty())
+    }
+
+    /// Whether a start of the unit waits in systemd's queue, as one ordered after another
+    /// unit's does while that one starts. A stop queued while the unit went down (a stop
+    /// that waits for its release hook) waits there too for a moment, and starts nothing.
+    pub async fn start_queued(&self, unit: &str) -> Result<bool> {
+        Ok(self
+            .queued_jobs(unit)
+            .await?
+            .iter()
+            .any(|job| starts_unit(job)))
     }
 
     /// The PID of the main process of the unit's current or last run (0 before any).
@@ -679,6 +727,16 @@ impl Systemd {
             .exec_main_pid()
             .await
             .with_context(|| format!("reading the main process of {unit}"))
+    }
+
+    /// When the main process of the unit's current or last run started, on the monotonic
+    /// clock in microseconds (0 before any): unlike a PID, never the same for two runs.
+    pub async fn exec_main_start_usec(&self, unit: &str) -> Result<u64> {
+        self.service(unit)
+            .await?
+            .exec_main_start_timestamp_monotonic()
+            .await
+            .with_context(|| format!("reading when the main process of {unit} started"))
     }
 
     /// The invocation ID of the unit's current or last run, in hex.
@@ -708,6 +766,23 @@ impl Systemd {
             .await
             .with_context(|| format!("reading the invocation of {unit}"))?;
         Ok(hex::encode(id))
+    }
+
+    /// Lets a unit's cgroup make or open these devices at once, a (PATH, PERMISSIONS) each,
+    /// until the next boot: its drop-in gives them only from its next start.
+    pub async fn allow_devices(&self, unit: &str, rules: &[(String, String)]) -> Result<()> {
+        let value =
+            zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::from(rules.to_vec()))
+                .context("encoding DeviceAllow")?;
+        self.manager
+            .set_unit_properties(
+                unit.to_string(),
+                true,
+                vec![("DeviceAllow".to_string(), value)],
+            )
+            .await
+            .with_context(|| format!("letting {unit} make its devices"))?;
+        Ok(())
     }
 
     /// Starts a transient unit with these properties and returns without waiting.
@@ -747,11 +822,19 @@ impl Systemd {
 
     /// Queues a stop job for a unit and returns at once, without watching the job.
     pub async fn queue_stop(&self, unit: &str) -> Result<()> {
-        self.manager
+        match self
+            .manager
             .stop_unit(unit.to_string(), "replace".to_string())
             .await
-            .with_context(|| format!("stopping {unit}"))?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(zbus::Error::MethodError(name, _, _))
+                if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).with_context(|| format!("stopping {unit}")),
+        }
     }
 
     /// Opens a PTY inside the machine running `path` with `args` (argv including argv[0])
@@ -806,6 +889,12 @@ async fn job_result(
     "lost".to_string()
 }
 
+/// Whether an installed job of this type starts its unit: systemd turns try-restart and
+/// reload-or-start into these, or into jobs that start nothing, before it queues them.
+fn starts_unit(job_type: &str) -> bool {
+    matches!(job_type, "start" | "restart")
+}
+
 fn job_outcome(result: &str, unit: &str, verb: &str) -> Result<()> {
     match result {
         "done" | "skipped" => Ok(()),
@@ -839,6 +928,21 @@ mod tests {
                 e.to_string(),
                 format!("stopping u.service ended with result {bad}")
             );
+        }
+    }
+
+    #[test]
+    fn only_a_start_or_a_restart_job_starts_a_unit() {
+        assert!(starts_unit("start") && starts_unit("restart"));
+        for other in [
+            "stop",
+            "reload",
+            "verify-active",
+            "verify-started",
+            "nop",
+            "",
+        ] {
+            assert!(!starts_unit(other), "{other}");
         }
     }
 

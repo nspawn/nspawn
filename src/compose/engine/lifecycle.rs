@@ -110,8 +110,12 @@ fn down_takes(
 
 /// down's and kill's --remove-orphans, whose default is COMPOSE_REMOVE_ORPHANS of the
 /// process's environment, as compose makes it the flag's default.
-fn orphans_too(flag: bool) -> bool {
-    flag || std::env::var("COMPOSE_REMOVE_ORPHANS").is_ok_and(|v| up::string_to_bool(&v))
+/// --remove-orphans, COMPOSE_REMOVE_ORPHANS of the process when it is not given, as
+/// docker compose takes the variable for the flag's default.
+pub(super) fn orphans_too(flag: Option<bool>) -> bool {
+    flag.unwrap_or_else(|| {
+        std::env::var("COMPOSE_REMOVE_ORPHANS").is_ok_and(|v| up::string_to_bool(&v))
+    })
 }
 
 pub async fn down(e: &mut Engine<'_>, a: &DownArgs) -> Result<()> {
@@ -145,7 +149,7 @@ pub async fn down(e: &mut Engine<'_>, a: &DownArgs) -> Result<()> {
         .collect();
     going = start_order(e, going);
     going.reverse();
-    let timeout = a.timeout.map(|t| t.max(0) as u64);
+    let timeout = a.timeout.map(crate::policy::stop_seconds);
     for m in &going {
         pre_stop(e, m).await;
         stop_and_remove(e, m, timeout).await?;
@@ -282,6 +286,31 @@ async fn secrets_down(e: &Engine<'_>) -> Result<()> {
 /// --rmi: `local` removes the images the project built for its services, and those of
 /// services without an image named as compose names them; `all` the images the
 /// services name as well.
+/// The records of a reference down --rmi removes: the images that never ran, as up makes
+/// its machines from those (a copy pulled beside one that ran among them); else the ones
+/// that ran, which are kept with a word.
+fn records_of(
+    records: &[(String, String, String)],
+    ran: &BTreeSet<String>,
+    reference: &str,
+) -> Vec<String> {
+    let of: Vec<&String> = records
+        .iter()
+        .filter(|(r, _, _)| r == reference)
+        .map(|(_, name, _)| name)
+        .collect();
+    let images: Vec<String> = of
+        .iter()
+        .filter(|name| !ran.contains(name.as_str()))
+        .map(|&name| name.clone())
+        .collect();
+    if images.is_empty() {
+        of.into_iter().cloned().collect()
+    } else {
+        images
+    }
+}
+
 async fn images_down(e: &Engine<'_>, rmi: &str, orphans: bool) -> Result<()> {
     if !matches!(rmi, "all" | "local") {
         bail!("invalid --rmi option {rmi:?}: must be one of \"all\" or \"local\"");
@@ -327,12 +356,11 @@ async fn images_down(e: &Engine<'_>, rmi: &str, orphans: bool) -> Result<()> {
         .filter(|i| !client::bool(i, "image_only"))
         .map(|i| client::string(i, "name"))
         .collect();
-    let find = |image: &str| {
-        let reference = super::image_reference(image).ok()?.to_string();
-        records
-            .iter()
-            .find(|(r, _, _)| *r == reference)
-            .map(|(_, n, _)| n.clone())
+    let find = |image: &str| -> Vec<String> {
+        match super::image_reference(image) {
+            Ok(reference) => records_of(&records, &ran, &reference.to_string()),
+            Err(_) => Vec::new(),
+        }
     };
     let mut names = BTreeSet::new();
     for (key, service) in &project.services {
@@ -342,8 +370,8 @@ async fn images_down(e: &Engine<'_>, rmi: &str, orphans: bool) -> Result<()> {
         let named = service.get("image").and_then(Value::as_str).unwrap_or("");
         if named.is_empty() || rmi == "all" {
             let image = super::build::image_of(&project.name, key, service);
-            if let Some(name) = find(&image) {
-                names.insert((image, name));
+            for name in find(&image) {
+                names.insert((image.clone(), name));
             }
         }
     }
@@ -427,6 +455,10 @@ async fn pre_stop(e: &Engine<'_>, m: &Machine) {
 }
 
 pub async fn start(e: &mut Engine<'_>, a: &StartArgs) -> Result<()> {
+    // With a file, as up and create.
+    if let Some(project) = &e.project {
+        super::up::reject_scheduled_jobs(project)?;
+    }
     let machines = selected(e, e.machines().await?, &a.service)?;
     let machines: Vec<Machine> = machines.into_iter().filter(|m| !m.oneoff).collect();
     for name in &a.service {
@@ -460,7 +492,7 @@ pub async fn stop(e: &mut Engine<'_>, a: &StopArgs) -> Result<()> {
     machines.reverse();
     for m in machines.iter().filter(|m| !m.oneoff) {
         pre_stop(e, m).await;
-        stop_one(e, m, a.timeout.map(|t| t.max(0) as u64)).await?;
+        stop_one(e, m, a.timeout.map(crate::policy::stop_seconds)).await?;
     }
     Ok(())
 }
@@ -513,6 +545,11 @@ fn restart_services(
     out
 }
 
+/// Whether a restart of `services` (every one when none is named) restarts `dependency`.
+fn restarted_with(services: &[String], dependency: &str) -> bool {
+    services.is_empty() || services.iter().any(|s| s == dependency)
+}
+
 pub async fn restart(e: &mut Engine<'_>, a: &RestartArgs) -> Result<()> {
     let services = match &e.project {
         Some(project) => restart_services(project, &a.service, a.no_deps),
@@ -523,18 +560,22 @@ pub async fn restart(e: &mut Engine<'_>, a: &RestartArgs) -> Result<()> {
         .into_iter()
         .filter(|m| !m.oneoff)
         .collect();
-    let timeout = a.timeout.map(|t| t.max(0) as u64);
+    let timeout = a.timeout.map(crate::policy::stop_seconds);
     for m in &machines {
         e.progress.container(&m.name, "Restarting", Status::Working);
     }
     for m in &machines {
         // Only the dependencies a restart concerns are waited for: those with
-        // restart: true.
+        // restart: true that it restarts too, as the project narrowed to its services
+        // keeps them (every service when none is named).
         if let Some(project) = &e.project {
             if let Ok(service) = super::convert::service(project, &m.service) {
                 let mut service = service.clone();
                 if let Some(Value::Map(deps)) = service.get_mut("depends_on") {
-                    deps.retain(|_, d| d.get(&["restart"]) == Some(&Value::Bool(true)));
+                    deps.retain(|name, d| {
+                        d.get(&["restart"]) == Some(&Value::Bool(true))
+                            && restarted_with(&services, name)
+                    });
                 }
                 up::wait_dependencies(e, project, &service, &m.service).await?;
             }
@@ -564,6 +605,13 @@ pub async fn restart(e: &mut Engine<'_>, a: &RestartArgs) -> Result<()> {
     Ok(())
 }
 
+/// The machines kill signals, as docker compose's do: running ones, and those between two
+/// runs of their restart policy, which docker counts as running; one still starting only
+/// for SIGKILL, which ends its start.
+fn kills(m: &Machine, sigkill: bool) -> bool {
+    m.running() || m.state == "restarting" || (sigkill && m.state == "starting")
+}
+
 pub async fn kill(e: &mut Engine<'_>, a: &KillArgs) -> Result<()> {
     let machines = selected(e, e.machines().await?, &a.service)?;
     let signal = a.signal.clone().unwrap_or_else(|| "SIGKILL".to_string());
@@ -573,9 +621,10 @@ pub async fn kill(e: &mut Engine<'_>, a: &KillArgs) -> Result<()> {
             .as_ref()
             .is_some_and(|p| !p.services.contains_key(&m.service))
     };
+    let sigkill = crate::api::machines::signal_number(&signal).ok() == Some(nix::libc::SIGKILL);
     for m in machines
         .iter()
-        .filter(|m| m.running() && (orphans_too(a.remove_orphans) || !orphan(m)))
+        .filter(|m| kills(m, sigkill) && (orphans_too(a.remove_orphans) || !orphan(m)))
     {
         e.progress.container(&m.name, "Killing", Status::Working);
         let mut options = Options::new();
@@ -722,7 +771,7 @@ pub async fn wait(e: &mut Engine<'_>, a: &WaitArgs) -> Result<()> {
     }
     if a.down_project {
         let down = DownArgs {
-            remove_orphans: true,
+            remove_orphans: Some(true),
             ..Default::default()
         };
         self::down(e, &down).await?;
@@ -738,6 +787,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn kill_takes_a_machine_between_restarts() {
+        let m = |state: &str| Machine {
+            name: "m".to_string(),
+            service: "s".to_string(),
+            number: 1,
+            oneoff: false,
+            state: state.to_string(),
+            health: String::new(),
+            exit_code: None,
+            labels: BTreeMap::new(),
+            created: 0,
+            started: 0,
+            dict: Default::default(),
+        };
+        assert!(kills(&m("running"), false));
+        assert!(kills(&m("restarting"), false));
+        assert!(!kills(&m("starting"), false));
+        assert!(kills(&m("starting"), true));
+        assert!(!kills(&m("stopped"), true));
+    }
+
+    #[test]
+    fn down_removes_the_copy_up_made_and_keeps_what_ran() {
+        let reference = "docker.io/library/postgres:18";
+        let record = |name: &str| (reference.to_string(), name.to_string(), "pull".to_string());
+        let records = [record("postgres-18"), record("postgres-18-2")];
+        let ran = BTreeSet::from(["postgres-18".to_string()]);
+        assert_eq!(records_of(&records, &ran, reference), ["postgres-18-2"]);
+        // Only the one that ran: it is the one said to be kept.
+        assert_eq!(records_of(&records[..1], &ran, reference), ["postgres-18"]);
+        assert!(records_of(&records, &ran, "docker.io/library/redis:8").is_empty());
+    }
+
+    #[test]
     fn a_restart_takes_the_services_that_restart_with_it() {
         let p = crate::compose::engine::convert::tests::project(
             "restart",
@@ -750,6 +833,10 @@ mod tests {
         );
         assert_eq!(restart_services(&p, &named(&["db"]), true), named(&["db"]));
         assert!(restart_services(&p, &[], false).is_empty());
+        // What each restarted machine waits for: a dependency restarted with it only.
+        assert!(restarted_with(&[], "db"), "every service restarts");
+        assert!(restarted_with(&named(&["db", "web"]), "db"));
+        assert!(!restarted_with(&named(&["web"]), "db"));
     }
 
     #[test]

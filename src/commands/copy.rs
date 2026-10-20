@@ -63,11 +63,14 @@ fn local_kind(path: &Path) -> Result<Option<Kind>> {
 }
 
 /// Which failure to show when both ends failed: the one that is not merely the other
-/// end having gone away.
+/// end having gone away, or having broken the stream on purpose when it failed.
 fn first_cause(local: anyhow::Error, remote: anyhow::Error) -> anyhow::Error {
     let broken = |e: &anyhow::Error| {
         let text = format!("{e:#}");
-        text.contains("Broken pipe") || text.contains("nothing arrived") || text.contains("EOF")
+        text.contains("Broken pipe")
+            || text.contains("nothing arrived")
+            || text.contains("EOF")
+            || text.contains("reading the stream")
     };
     if broken(&local) && !broken(&remote) {
         remote
@@ -138,12 +141,25 @@ async fn copy_out(client: &Client, name: &str, path: &str, destination: &str) ->
 }
 
 async fn copy_in(client: &Client, source: &str, name: &str, path: &str) -> Result<()> {
+    let typed = source;
     let (source, contents) = split_source(source);
     let source = PathBuf::from(source);
     fs::symlink_metadata(&source).with_context(|| format!("{}", source.display()))?;
+    // A source ending in / or /. names a directory, a link to one followed there as path
+    // resolution follows it: the directory is packed under the name given.
+    let trailing = typed.ends_with('/') || typed.ends_with("/.");
     // The parent is opened and the last component read from it without following it;
     // "." and "/" are named by what they are.
     let (parent, leaf, top): (PathBuf, OsString, OsString) = match source.file_name() {
+        Some(leaf)
+            if trailing
+                && source
+                    .components()
+                    .next_back()
+                    .is_some_and(|c| matches!(c, std::path::Component::Normal(_))) =>
+        {
+            (source.clone(), OsString::from("."), leaf.to_os_string())
+        }
         Some(leaf)
             if source
                 .components()
@@ -183,16 +199,19 @@ async fn copy_in(client: &Client, source: &str, name: &str, path: &str) -> Resul
         .await
         .map_err(client::error)?;
     drop(read);
-    let packer = std::thread::spawn(move || {
-        block_sigpipe();
-        pack(
-            parent_fd.as_fd(),
-            &leaf,
-            Path::new(&top),
-            Ids::Keep,
-            File::from(write),
-        )
-    });
+    let packer = std::thread::Builder::new()
+        .stack_size(crate::api::copy::COPY_STACK)
+        .spawn(move || {
+            block_sigpipe();
+            pack(
+                parent_fd.as_fd(),
+                &leaf,
+                Path::new(&top),
+                Ids::Keep,
+                File::from(write),
+            )
+        })
+        .context("starting the copy")?;
     let remote = watch.finish(job).await;
     let local = packer.join().map_err(|_| anyhow!("the copy stopped"))?;
     match (local, remote) {
@@ -220,6 +239,11 @@ mod tests {
             .to_string()
             .contains("Permission"));
         assert!(first_cause(anyhow!("nothing arrived to copy"), real())
+            .to_string()
+            .contains("Permission"));
+        // The sender breaks the stream when it fails: its own error says why.
+        let broken = anyhow!("numeric field did not have utf-8 text").context("reading the stream");
+        assert!(first_cause(broken, real())
             .to_string()
             .contains("Permission"));
     }

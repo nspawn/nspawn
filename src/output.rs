@@ -22,7 +22,7 @@ pub fn table(headers: &[&str], rows: Vec<Vec<String>>) -> String {
 
 /// A cell as the terminal should see it: control characters, which a machine puts in
 /// a process's arguments or its os-release as it likes, shown as '?', as procps does.
-fn printable(text: &str) -> String {
+pub fn printable(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect()

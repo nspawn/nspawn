@@ -108,6 +108,28 @@ pub fn rfc3339_nano(usec: u64, fixed: bool) -> String {
 /// What docker writes for a time never reached (a container that never finished).
 pub const ZERO_TIME: &str = "0001-01-01T00:00:00Z";
 
+/// A container's Command as docker lists it: the program, then its arguments, each one
+/// that has a space in single quotes.
+pub fn command_line(argv: &[String]) -> String {
+    match argv.split_first() {
+        None => String::new(),
+        Some((program, [])) => program.clone(),
+        Some((program, arguments)) => {
+            let arguments: Vec<String> = arguments
+                .iter()
+                .map(|a| {
+                    if a.contains(' ') {
+                        format!("'{a}'")
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect();
+            format!("{program} {}", arguments.join(" "))
+        }
+    }
+}
+
 /// A reference as docker shows an image: without Docker Hub's host and library/.
 pub fn familiar(reference: &str) -> String {
     let short = reference
@@ -120,6 +142,23 @@ pub fn familiar(reference: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn commands_read_as_docker_lists_them() {
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            command_line(&argv(&["sh", "-c", "echo bye; echo oops >&2; exit 3"])),
+            "sh -c 'echo bye; echo oops >&2; exit 3'"
+        );
+        // Only a space quotes, and never the program.
+        assert_eq!(
+            command_line(&argv(&["/my app", "a\tb", "c\nd"])),
+            "/my app a\tb c\nd"
+        );
+        assert_eq!(command_line(&argv(&["httpd"])), "httpd");
+        assert_eq!(command_line(&argv(&["true", ""])), "true ");
+        assert_eq!(command_line(&[]), "");
+    }
 
     #[test]
     fn ids_are_stable_and_distinct() {

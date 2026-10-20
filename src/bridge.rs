@@ -1023,30 +1023,67 @@ pub fn disconnect_live(name: &str, net: &NetSpec, booted: Option<u32>) -> Result
     let Some(leader) = booted else {
         return Ok(false);
     };
+    // The port on the bridge whose peer is in the machine's namespace, by what the host
+    // says of both: what the machine says of its own links (names, indexes) is its to
+    // make up. Listing the ports gives each namespace their peers are in an id first.
     attach_netns(name, leader)?;
-    let links = output("ip", &["-n", &netns_name(name), "-j", "link", "show"]);
+    let ports = output(
+        "ip",
+        &["-d", "-j", "link", "show", "master", &net.interface],
+    );
+    let ids = output("ip", &["-j", "netns", "list-id"]);
+    // ip prints one name per id, whichever /run/netns lists first: a sidecar's bind of
+    // the namespace may be the one. Any name of the leader's namespace is taken.
+    let ours = fs::metadata(format!("/proc/{leader}/ns/net"));
+    let nsid = ours.ok().and_then(|ns| {
+        use std::os::unix::fs::MetadataExt;
+        nsid_of(ids.as_deref().unwrap_or_default(), |named| {
+            fs::metadata(Path::new("/run/netns").join(named))
+                .is_ok_and(|m| (m.dev(), m.ino()) == (ns.dev(), ns.ino()))
+        })
+    });
     delete_netns(name);
-    for index in peer_indexes(&links?) {
-        if let Some(host_end) = interface_by_index(Path::new(SYS_NET), index) {
-            if on_net(&host_end) {
-                run("ip", &["link", "del", &host_end])?;
-                return Ok(true);
-            }
-        }
+    ids?;
+    let Some(nsid) = nsid else {
+        bail!(
+            "{name} runs, and which port of {} is its could not be told: stop it to disconnect it",
+            net.interface
+        );
+    };
+    let mut removed = false;
+    for host_end in ports_into(&ports?, nsid) {
+        run("ip", &["link", "del", &host_end])?;
+        removed = true;
     }
-    Ok(false)
+    Ok(removed)
 }
 
-/// The host indexes of the peers of a namespace's veths, from `ip -j link show` in it.
-fn peer_indexes(json: &str) -> Vec<u32> {
-    let Ok(serde_json::Value::Array(links)) = serde_json::from_str(json) else {
+/// The id the host gives the namespace one of whose names `ours` takes, from `ip -j
+/// netns list-id`.
+fn nsid_of(json: &str, ours: impl Fn(&str) -> bool) -> Option<i64> {
+    let serde_json::Value::Array(ids) = serde_json::from_str(json).ok()? else {
+        return None;
+    };
+    ids.iter()
+        .find(|id| {
+            id.get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(&ours)
+        })
+        .and_then(|id| id.get("nsid").and_then(serde_json::Value::as_i64))
+}
+
+/// The ports of a bridge, from `ip -d -j link show master BRIDGE`, whose peer is in the
+/// namespace the host knows as `nsid`.
+fn ports_into(json: &str, nsid: i64) -> Vec<String> {
+    let Ok(serde_json::Value::Array(ports)) = serde_json::from_str(json) else {
         return Vec::new();
     };
-    links
+    ports
         .iter()
-        .filter(|l| l.get("link_netnsid").is_some())
-        .filter_map(|l| l.get("link_index").and_then(serde_json::Value::as_u64))
-        .filter_map(|i| u32::try_from(i).ok())
+        .filter(|p| p.get("link_netnsid").and_then(serde_json::Value::as_i64) == Some(nsid))
+        .filter_map(|p| p.get("ifname").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
         .collect()
 }
 
@@ -1701,9 +1738,22 @@ struct PortInUse {
     address: Ipv4Addr,
 }
 
-async fn ports_in_use(store: &Store, sd: &Systemd, except: &str) -> Result<Vec<PortInUse>> {
+/// The ports the machines but `except` hold. `strict` for a check before a machine
+/// publishes ports, where an unreadable record might hold one; the DNAT of what is
+/// published leaves such a record's ports out and its machine alone.
+async fn ports_in_use(
+    store: &Store,
+    sd: &Systemd,
+    except: &str,
+    strict: bool,
+) -> Result<Vec<PortInUse>> {
+    let records = if strict {
+        store.list_images_strict()?
+    } else {
+        store.list_images()?
+    };
     let mut used = Vec::new();
-    for r in store.list_images_strict()? {
+    for r in records {
         if r.name == except || !bridge_kind(&r) || r.ports.is_empty() {
             continue;
         }
@@ -1725,7 +1775,7 @@ async fn ports_in_use(store: &Store, sd: &Systemd, except: &str) -> Result<Vec<P
 /// Starting (not listed by machined yet), or registered and not closing (machined lists
 /// a closing machine while ExecStopPost has already withdrawn its ports).
 async fn holds_ports(store: &Store, sd: &Systemd, name: &str) -> Result<bool> {
-    if store.is_starting(name) {
+    if store.is_starting(name) || store.claims_ports(name) {
         return Ok(true);
     }
     if !sd.machine_exists(name).await? {
@@ -1742,7 +1792,11 @@ async fn holds_ports(store: &Store, sd: &Systemd, name: &str) -> Result<bool> {
 
 /// A port taken by another machine or by a host service (the DNAT would hijack it).
 pub async fn check_port_conflicts(store: &Store, sd: &Systemd, record: &ImageRecord) -> Result<()> {
-    let used = ports_in_use(store, sd, &record.name).await?;
+    // Nothing to publish, nothing of the others to read.
+    if record.ports.is_empty() {
+        return Ok(());
+    }
+    let used = ports_in_use(store, sd, &record.name, true).await?;
     for p in &record.ports {
         if let Some(other) = used.iter().find(|u| u.port.clashes(p)) {
             bail!(
@@ -1800,7 +1854,9 @@ pub async fn sync_ports_except(store: &Store, sd: &Systemd, except: &str) -> Res
     if !table_exists() {
         return Ok(());
     }
-    nft(&ports_script(&ports_in_use(store, sd, except).await?))
+    nft(&ports_script(
+        &ports_in_use(store, sd, except, false).await?,
+    ))
 }
 
 /// The nft script of the published ports. A port two machines publish (both started by
@@ -1837,12 +1893,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_peers_of_a_machines_veths_are_read() {
-        let links = r#"[{"ifindex":1,"ifname":"lo"},
-            {"ifindex":2,"link_index":41,"ifname":"host0","link_netnsid":0},
-            {"ifindex":3,"link_index":7,"ifname":"eth1"}]"#;
-        assert_eq!(peer_indexes(links), [41]);
-        assert!(peer_indexes("").is_empty());
+    fn a_machine_s_port_is_found_by_where_its_peer_is() {
+        let ids =
+            r#"[{"nsid":0,"name":"nspawn-other"},{"nsid":3,"name":"nspawn-side"},{"nsid":5}]"#;
+        // The namespace by any of its names: a sidecar's is the one ip may print.
+        let ours = |name: &str| matches!(name, "nspawn-web" | "nspawn-side");
+        assert_eq!(nsid_of(ids, ours), Some(3));
+        assert_eq!(nsid_of(ids, |name| name == "nspawn-gone"), None);
+        assert_eq!(nsid_of("", ours), None);
+        // Another machine's port has its peer elsewhere, whatever index the machine
+        // says its own links lead to.
+        let ports = r#"[{"ifindex":57,"ifname":"vb-victim","link_index":2,"link_netnsid":0},
+            {"ifindex":60,"ifname":"vb-ab12cd34","link_index":2,"link_netnsid":3},
+            {"ifindex":61,"ifname":"eth0"}]"#;
+        assert_eq!(ports_into(ports, 3), ["vb-ab12cd34"]);
+        assert!(ports_into(ports, 9).is_empty());
+        assert!(ports_into("", 3).is_empty());
     }
 
     #[test]

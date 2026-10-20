@@ -53,6 +53,8 @@ pub struct Engine<'a> {
     pub progress: Progress,
     pub args: &'a ComposeArgs,
     pub log: &'a dyn Log,
+    /// The command line's working directory, as Go's os.Getwd gives it.
+    pub cwd: String,
 }
 
 /// A machine of the project, as ListMachines has it.
@@ -258,6 +260,30 @@ fn wants(command: &ComposeCommand) -> Wants {
     }
 }
 
+/// A project named by -p alone, as the command looks for it: lowercased by the commands
+/// whose docker compose counterparts lowercase it, as given by the others.
+fn named_as_given(command: &ComposeCommand, name: String) -> String {
+    use ComposeCommand as C;
+    match command {
+        C::Down(_)
+        | C::Stop(_)
+        | C::Start(_)
+        | C::Restart(_)
+        | C::Rm(_)
+        | C::Kill(_)
+        | C::Pause(_)
+        | C::Unpause(_)
+        | C::Ps(_)
+        | C::Top(_)
+        | C::Port(_)
+        | C::Exec(_)
+        | C::Cp(_)
+        | C::Events(_)
+        | C::Images(_) => name.to_lowercase(),
+        _ => name,
+    }
+}
+
 async fn dispatch(
     args: &ComposeArgs,
     host: &mut Host,
@@ -276,19 +302,15 @@ async fn dispatch(
             Wants::Project => {
                 let project =
                     match super::config::project_for(args, flags, host, &services, &mut warn) {
-                        // run takes a job as a one-off service of its own.
+                        // run takes a job as a one-off service of its own; a name that
+                        // is no job keeps the error of the selection.
                         Err(e)
                             if matches!(command, ComposeCommand::Run(_))
                                 && e.starts_with("no such service") =>
                         {
-                            let mut whole =
-                                super::config::project_for(args, flags, host, &[], &mut warn)
-                                    .map_err(anyhow::Error::msg)?;
-                            materialize_job(&mut whole, &services[0])
-                                .map_err(anyhow::Error::msg)?;
-                            whole
-                                .with_selected_services(&services, false)
+                            super::config::job_project(args, flags, host, &services[0], &mut warn)
                                 .map_err(anyhow::Error::msg)?
+                                .ok_or_else(|| anyhow::Error::msg(e))?
                         }
                         other => other.map_err(anyhow::Error::msg)?,
                     };
@@ -297,7 +319,7 @@ async fn dispatch(
             Wants::ProjectOrName => {
                 let given = args.project_name.clone().unwrap_or_default();
                 if args.file.is_empty() && !given.is_empty() {
-                    (given, None)
+                    (named_as_given(command, given), None)
                 } else {
                     match super::config::project_for(args, flags, host, &services, &mut warn) {
                         Ok(project) => (project.name.clone(), Some(project)),
@@ -326,6 +348,7 @@ async fn dispatch(
         progress: Progress::new(args, host),
         args,
         log,
+        cwd: host.cwd.clone(),
     };
     use ComposeCommand as C;
     match command {
@@ -366,30 +389,46 @@ fn check_arguments(command: &ComposeCommand) -> Result<()> {
         C::Scale(c) if c.service.is_empty() => {
             bail!("requires at least 1 arg(s), only received 0")
         }
-        C::Wait(c) if c.service.is_empty() => {
-            bail!("requires at least 1 arg(s), only received 0")
+        // docker/cli's RequiresMinArgs and ExactArgs, which wait and cp take.
+        C::Wait(c) if c.service.is_empty() => bail!(
+            "docker: 'docker compose wait' requires at least 1 argument\n\nUsage:  docker compose wait SERVICE [SERVICE...] [OPTIONS] [flags]\n\nSee 'docker compose wait --help' for more information"
+        ),
+        C::Cp(c) => {
+            let received = usize::from(c.source.is_some())
+                + usize::from(c.destination.is_some())
+                + c.extra.len();
+            if received != 2 {
+                bail!("docker: 'docker compose cp' requires 2 arguments\n\nUsage:  docker compose cp [OPTIONS] SERVICE:SRC_PATH DEST_PATH|-\n\tdocker compose cp [OPTIONS] SRC_PATH|- SERVICE:DEST_PATH [flags]\n\nRun 'docker compose cp --help' for more information");
+            }
+            Ok(())
         }
         C::Stats(c) if c.service.len() > 1 => {
             bail!("accepts at most 1 arg(s), received {}", c.service.len())
         }
+        C::Exec(c) => {
+            let received = usize::from(c.service.is_some()) + c.command.len();
+            if received < 2 {
+                bail!("requires at least 2 arg(s), only received {received}");
+            }
+            Ok(())
+        }
+        C::Run(c) if c.service.is_none() => {
+            bail!("requires at least 1 arg(s), only received 0")
+        }
+        C::Port(c) => {
+            let received = usize::from(c.service.is_some())
+                + usize::from(c.private_port.is_some())
+                + c.extra.len();
+            if !(1..=2).contains(&received) {
+                bail!("accepts between 1 and 2 arg(s), received {received}");
+            }
+            if let Some(port) = &c.private_port {
+                info::private_port(port)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
-}
-
-/// A job as the service run makes of it, unless the file keeps it from being run by hand.
-fn materialize_job(project: &mut Project, name: &str) -> Result<(), String> {
-    let job = project
-        .jobs
-        .remove(name)
-        .or_else(|| project.disabled_jobs.remove(name))
-        .ok_or_else(|| format!("no such service: {name}"))?;
-    if job.get(&["triggers", "manual"]) == Some(&crate::compose::value::Value::Bool(false)) {
-        return Err(format!(
-            "job {name:?} is declared with manual: false, it cannot be run manually"
-        ));
-    }
-    project.services.insert(name.to_string(), job);
-    Ok(())
 }
 
 /// The name of a command that changes machines, images, networks or volumes; docker
@@ -428,6 +467,74 @@ mod tests {
             service: vec!["web=3".to_string(), "worker=0".to_string()],
         });
         assert_eq!(named(&scale), ["web", "worker"]);
+    }
+
+    fn compose(argv: &[&str]) -> ComposeCommand {
+        use clap::Parser;
+        let mut full = vec!["nspawn", "compose"];
+        full.extend_from_slice(argv);
+        match crate::cli::Cli::try_parse_from(full).unwrap().command {
+            crate::cli::Command::Compose(c) => c.command.unwrap(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn counts_are_checked_before_anything_loads() {
+        let error = |argv: &[&str]| check_arguments(&compose(argv)).err().map(|e| e.to_string());
+        assert_eq!(
+            error(&["exec", "web"]).as_deref(),
+            Some("requires at least 2 arg(s), only received 1")
+        );
+        assert_eq!(
+            error(&["run"]).as_deref(),
+            Some("requires at least 1 arg(s), only received 0")
+        );
+        assert_eq!(
+            error(&["port", "web", "80", "x"]).as_deref(),
+            Some("accepts between 1 and 2 arg(s), received 3")
+        );
+        assert!(error(&["port", "web", "x"])
+            .unwrap()
+            .starts_with("strconv.ParseUint: parsing"));
+        assert!(error(&["cp", "web:/a"])
+            .unwrap()
+            .starts_with("docker: 'docker compose cp' requires 2 arguments"));
+        assert!(error(&["cp", "web:/a", "b", "c"])
+            .unwrap()
+            .starts_with("docker: 'docker compose cp' requires 2 arguments"));
+        assert!(error(&["wait"])
+            .unwrap()
+            .starts_with("docker: 'docker compose wait' requires at least 1 argument"));
+        for fine in [
+            &["exec", "web", "sh"][..],
+            &["port", "web"],
+            &["cp", "web:/a", "b"],
+            &["run", "web"],
+        ] {
+            assert_eq!(error(fine), None, "{fine:?}");
+        }
+    }
+
+    #[test]
+    fn a_project_named_alone_is_looked_for_as_docker_compose_does() {
+        for command in [
+            "down", "stop", "start", "restart", "rm", "kill", "ps", "top",
+        ] {
+            assert_eq!(
+                named_as_given(&compose(&[command]), "MyApp".to_string()),
+                "myapp",
+                "{command}"
+            );
+        }
+        // logs, wait and volumes take it as given.
+        for command in ["logs", "volumes"] {
+            assert_eq!(
+                named_as_given(&compose(&[command]), "MyApp".to_string()),
+                "MyApp",
+                "{command}"
+            );
+        }
     }
 
     #[test]

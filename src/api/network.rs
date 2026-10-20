@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 
 use crate::api::images::Removal;
 use crate::api::{line, machines, require_root, Context, Event, Report};
@@ -421,6 +421,7 @@ pub async fn disconnect(
     if networks.len() == 1 {
         bail!("{network} is the only network of {machine}: nspawn network connect another one first, or start it with --network none");
     }
+    let running = sd.machine_exists(machine).await?;
     if networks[0] == network {
         // The next network becomes the primary one, with its address.
         let next = record.extra_networks.remove(0);
@@ -428,10 +429,15 @@ pub async fn disconnect(
             (next.network != bridge::DEFAULT_NETWORK).then(|| next.network.clone());
         record.address = next.address;
         if !record.ports.is_empty() {
+            let when = if running {
+                "now"
+            } else {
+                "from its next start"
+            };
             line(
                 report,
                 format!(
-                    "note: the ports of {machine} go to its address on {} now",
+                    "note: the ports of {machine} go to its address on {} {when}",
                     next.network
                 ),
             );
@@ -441,22 +447,26 @@ pub async fn disconnect(
     }
     record.aliases.remove(network);
     record.fixed_addresses.remove(network);
-    // The record first: what follows changes a running machine, and a failure there
-    // leaves it as the record says it is from its next start.
+    // A running machine leaves the network first: the record frees its address only once
+    // no interface of it holds that address any more, or the next machine given it
+    // would share it with this one.
+    let left_live = if running {
+        let booted = if record.mode == Mode::Boot {
+            Some(sd.machine_leader(machine).await?)
+        } else {
+            None
+        };
+        bridge::disconnect_live(machine, &net, booted)
+            .with_context(|| format!("taking {machine} off {network}; it stays on it"))?
+    } else {
+        false
+    };
     store.record_image(&record)?;
     let all = all(store, config)?;
     bridge::write_hosts_files(store, &all)?;
     emit_membership("disconnect", &net, &record);
-    if sd.machine_exists(machine).await? {
+    if left_live {
         let live = async {
-            let booted = if record.mode == Mode::Boot {
-                Some(sd.machine_leader(machine).await?)
-            } else {
-                None
-            };
-            if !bridge::disconnect_live(machine, &net, booted)? {
-                return Ok::<(), anyhow::Error>(());
-            }
             line(report, format!("{machine}: left {network}"));
             // Its default route may have gone with the network: the next that leads out
             // takes it.
@@ -481,7 +491,7 @@ pub async fn disconnect(
         if let Err(e) = live.await {
             line(
                 report,
-                format!("warning: {machine} left {network} in its record, not yet live: {e:#}"),
+                format!("warning: {machine} left {network}, but: {e:#}"),
             );
         }
     }
@@ -698,7 +708,11 @@ pub async fn prepare(ctx: &Context, name: &str) -> Result<()> {
     let store = &ctx.store;
     let _lock = store.lock_for(Duration::from_secs(60)).await?;
     let record = store.load_image(name)?;
-    machines::prepare(
+    let before = record.clone();
+    let publishes = record
+        .as_ref()
+        .is_some_and(|r| r.network == Network::Bridge && !r.ports.is_empty());
+    let prepared = machines::prepare(
         sd,
         store,
         &ctx.config,
@@ -707,8 +721,24 @@ pub async fn prepare(ctx: &Context, name: &str) -> Result<()> {
         machines::Pass::Hook,
         &to_journal,
     )
-    .await
-    .map(|_| ())
+    .await;
+    if let Err(e) = prepared {
+        // As start: prepare writes the record before all of its checks, its first start
+        // among them, which the next start would then not take as one (a volume
+        // emptied after a seed that failed would not be filled again).
+        let made = store.load_image(name).ok().flatten();
+        let _ = machines::release_machine(name, made.as_ref().or(before.as_ref()));
+        if let Some(before) = &before {
+            let _ = store.record_image(before);
+        }
+        return Err(e);
+    }
+    // Checked under the lock: the claim is what the next unit's check sees of these
+    // ports until this machine registers.
+    if publishes {
+        store.claim_ports(name)?;
+    }
+    Ok(())
 }
 
 /// A hook's notes go to the journal by its native protocol: under the unit, as journald
@@ -778,7 +808,11 @@ pub async fn publish(ctx: &Context, name: &str) -> Result<()> {
     }
     let _lock = store.lock_for(Duration::from_secs(60)).await?;
     match record.network {
-        Network::Bridge => bridge::sync_ports(store, sd).await?,
+        Network::Bridge => {
+            bridge::sync_ports(store, sd).await?;
+            // Registered by now: machined says it holds them.
+            store.release_ports_claim(name);
+        }
         Network::Veth if hostnet::firewalld_running(sd).await => {
             hostnet::admit(sd, name, &to_journal).await?;
         }
@@ -794,6 +828,8 @@ pub async fn publish(ctx: &Context, name: &str) -> Result<()> {
 /// `images rm` waits for while holding it.
 pub async fn release(ctx: &Context, name: &str) -> Result<()> {
     crate::reference::validate_entry_name(name)?;
+    // First: whatever fails below, the machine publishes nothing any more.
+    ctx.store.release_ports_claim(name);
     let record = ctx.store.load_image(name)?;
     machines::release_machine(name, record.as_ref())?;
     crate::health::clear_status(name);
@@ -801,6 +837,9 @@ pub async fn release(ctx: &Context, name: &str) -> Result<()> {
     // The interfaces admit bound to firewalld's trusted zone, whoever stopped the machine.
     if let Ok(sd) = ctx.sd().await {
         hostnet::release_machine(sd, name).await;
+        if let Err(e) = crate::health::stop_runner_soon(sd, name).await {
+            eprintln!("warning: {e:#}");
+        }
     }
     // `kill` sent the stop signal: a stop job queued while the unit winds down keeps
     // systemd from restarting it. Not waited for: it ends after this hook.

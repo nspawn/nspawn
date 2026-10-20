@@ -119,10 +119,11 @@ cargo test --release --offline
 
 %preun selinux
 if [ $1 -eq 0 ]; then
-    # Before the module goes: a service left running would be in a domain the policy
-    # no longer defines, where every access is denied and not even systemd can
+    # Before the module goes: a process of nspawn left running would be in a domain the
+    # policy no longer defines, where every access is denied and not even systemd can
     # signal it.
-    systemctl stop %{name}.service >/dev/null 2>&1 || :
+    systemctl stop %{name}.service '%{name}-api@*.service' '%{name}-health-*.service' %{name}-auto-update.service >/dev/null 2>&1 || :
+    %selinux_relabel_pre -s %{selinuxtype}
 fi
 
 %post selinux
@@ -131,6 +132,9 @@ fi
 %postun selinux
 if [ $1 -eq 0 ]; then
     %selinux_modules_uninstall -s %{selinuxtype} %{name}
+    # The binary and the store get the labels of the policy without the module back:
+    # with the types it defined gone, systemd could not run the binary any more.
+    %selinux_relabel_post -s %{selinuxtype}
 fi
 
 %posttrans selinux

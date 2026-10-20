@@ -1185,6 +1185,23 @@ fn bases() {
     );
     // Unreachable stages are checked as well.
     assert!(error("FROM bad//name AS x\nFROM busybox\n").starts_with("failed to parse stage name"));
+    // A digest the store does not keep images by is refused before anything is built.
+    let sha512 = format!("busybox@sha512:{}", "a".repeat(128));
+    assert_eq!(
+        error(&format!("FROM {sha512}\n")),
+        format!("\"{sha512}\": an image is taken by a sha256 digest only")
+    );
+    assert_eq!(
+        error(&format!("FROM busybox\nCOPY --from={sha512} /x /x\n")),
+        format!("\"{sha512}\": an image is taken by a sha256 digest only")
+    );
+    // Only what the target builds is fetched: a stage it does not need is parsed alone.
+    let (prepared, _) = build(&format!(
+        "FROM {sha512} AS legacy\nFROM busybox AS old\nCOPY --from={sha512} /x /x\nFROM busybox\nRUN true\n"
+    ));
+    assert_eq!(prepared.order, [2]);
+    let (prepared, _) = build(&format!("FROM busybox@sha256:{}\n", "a".repeat(64)));
+    assert_eq!(prepared.order, [0]);
     let (prepared, _) = build("ARG V=1.37\nFROM busybox:$V AS b\nFROM b\n");
     assert_eq!(
         prepared.stages[0].base,

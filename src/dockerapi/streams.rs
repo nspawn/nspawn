@@ -336,7 +336,15 @@ fn complete(known: &mut BTreeMap<String, Known>, event: &mut crate::api::events:
             known.insert(event.name.clone(), (attributes, event.labels.clone()));
         }
         None => {
-            if let Some((attributes, labels)) = known.get(&event.name) {
+            // Only for an event of that machine's time: one before it was made is of an
+            // earlier machine of the name, and stays without what this one has.
+            let of_it = |attributes: &BTreeMap<String, String>| {
+                attributes
+                    .get("created")
+                    .and_then(|c| c.parse::<u64>().ok())
+                    .is_some_and(|created| event.time_usec / 1_000_000 >= created)
+            };
+            if let Some((attributes, labels)) = known.get(&event.name).filter(|(a, _)| of_it(a)) {
                 for (k, v) in attributes {
                     event
                         .attributes
@@ -436,7 +444,7 @@ mod tests {
     #[test]
     fn a_removed_machine_keeps_its_labels() {
         let event = |action: &str, created: Option<&str>| crate::api::events::Event {
-            time_usec: 0,
+            time_usec: 10_000_000,
             kind: "machine".into(),
             action: action.into(),
             name: "web".into(),
@@ -444,6 +452,7 @@ mod tests {
                 .map(|c| BTreeMap::from([("created".to_string(), c.to_string())]))
                 .unwrap_or_default(),
             labels: BTreeMap::new(),
+            run: None,
         };
         let mut known = BTreeMap::from([(
             "web".to_string(),
@@ -463,6 +472,12 @@ mod tests {
         let mut other = event("remove", Some("9"));
         complete(&mut known, &mut other);
         assert!(other.labels.is_empty());
+        // Nor an event from before the machine known of the name was made: it is an
+        // earlier machine's.
+        let mut earlier = event("start", None);
+        earlier.time_usec = 8_000_000;
+        complete(&mut known, &mut earlier);
+        assert!(!earlier.attributes.contains_key("created"));
     }
 
     #[test]
@@ -474,6 +489,7 @@ mod tests {
             name: "job".into(),
             attributes: BTreeMap::from([("created".to_string(), created.to_string())]),
             labels: BTreeMap::new(),
+            run: None,
         };
         let mut known = BTreeMap::new();
         let mut removed = std::collections::VecDeque::new();

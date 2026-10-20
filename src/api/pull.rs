@@ -132,9 +132,9 @@ pub async fn fetch(
         .map(|d| d.digest.clone())
         .collect();
     // What is found present stays so: the collector cannot pass between the hold and
-    // the look.
-    let (hold, (wanted, present)) = {
-        let _still = crate::store::holds_still();
+    // the look. Waiting for a collection under way is done off the runtime's workers.
+    let (hold, (wanted, present)) = tokio::task::block_in_place(|| {
+        let _still = store.holds_still()?;
         let hold = store.hold_blobs(&digests)?;
         let found = missing_once(
             manifest
@@ -143,8 +143,8 @@ pub async fn fetch(
                 .chain(std::iter::once(&manifest.config)),
             |digest| store.has_blob(digest),
         );
-        (hold, found)
-    };
+        Ok::<_, anyhow::Error>((hold, found))
+    })?;
     let assembling = assembling.map_or(String::new(), |b| format!(", assembling as {b}"));
     line(
         report,
@@ -261,7 +261,7 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
     if let Some(signed) = signed {
         attributes.push(("signed_by", signed.signed_by.as_str()));
     }
-    crate::api::events::emit("machine", "pull", &name, &attributes);
+    crate::api::events::emit_machine(store, "pull", &name, &attributes);
     Ok(Pulled {
         name,
         reference,

@@ -100,23 +100,36 @@ fn walk_link(root: &[u8], path: &[u8], links: &mut usize) -> Result<(Vec<u8>, bo
     Ok((path_bytes(&target).to_vec(), true))
 }
 
+/// The reference's walkLinks, which recurses once per component, as a loop: a path
+/// from an image's config holds as many components as the image likes, more than a
+/// stack takes. The components are taken off the end first, then walked from the first.
 fn walk_links(root: &[u8], path: &[u8], links: &mut usize) -> Result<Vec<u8>> {
-    let (dir, file) = lexical::split(path);
-    if dir.is_empty() {
-        return Ok(walk_link(root, file, links)?.0);
-    }
-    if file.is_empty() {
-        if dir == b"/" {
-            return Ok(dir.to_vec());
+    let mut files: Vec<&[u8]> = Vec::new();
+    let mut rest = path;
+    let mut walked = loop {
+        let (dir, file) = lexical::split(rest);
+        if dir.is_empty() {
+            break walk_link(root, file, links)?.0;
         }
-        return walk_links(root, &dir[..dir.len() - 1], links);
+        if file.is_empty() {
+            if dir == b"/" {
+                break dir.to_vec();
+            }
+            rest = &dir[..dir.len() - 1];
+            continue;
+        }
+        files.push(file);
+        rest = dir;
+    };
+    while let Some(file) = files.pop() {
+        let (newpath, is_link) = walk_link(root, &lexical::join(&[&walked, file]), links)?;
+        walked = if !is_link || lexical::is_abs(&newpath) {
+            newpath
+        } else {
+            lexical::join(&[&walked, &newpath])
+        };
     }
-    let newdir = walk_links(root, dir, links)?;
-    let (newpath, is_link) = walk_link(root, &lexical::join(&[&newdir, file]), links)?;
-    if !is_link || lexical::is_abs(&newpath) {
-        return Ok(newpath);
-    }
-    Ok(lexical::join(&[&newdir, &newpath]))
+    Ok(walked)
 }
 
 /// A source path inside its root: every symlink resolved when `follow_links`, else all
@@ -187,43 +200,65 @@ pub fn mkdir_all(
     mkdir_all_bytes(path_bytes(path), perm, user, tm)
 }
 
+/// The reference's MkdirAll, which recurses once per missing parent, as a loop: up to
+/// the first prefix that exists, then each missing one made in order.
 fn mkdir_all_bytes(
     path: &[u8],
     perm: u32,
     user: Option<Chowner<'_>>,
     tm: Option<TimeSpec>,
 ) -> Result<Vec<PathBuf>> {
-    let p = bytes_path(path);
-    if let Ok(meta) = fs::metadata(&p) {
-        if meta.is_dir() {
-            return Ok(Vec::new());
+    let mut missing: Vec<&[u8]> = Vec::new();
+    let mut prefix = path;
+    loop {
+        let p = bytes_path(prefix);
+        if let Ok(meta) = fs::metadata(&p) {
+            if meta.is_dir() {
+                break;
+            }
+            return Err(PathError::new(
+                "mkdir",
+                p,
+                io::Error::from_raw_os_error(NixErrno::ENOTDIR as i32),
+            )
+            .into());
         }
-        return Err(PathError::new(
-            "mkdir",
-            p,
-            io::Error::from_raw_os_error(NixErrno::ENOTDIR as i32),
-        )
-        .into());
-    }
-    let mut i = path.len();
-    while i > 0 && path[i - 1] == b'/' {
-        i -= 1;
-    }
-    let mut j = i;
-    while j > 0 && path[j - 1] != b'/' {
-        j -= 1;
+        missing.push(prefix);
+        let mut i = prefix.len();
+        while i > 0 && prefix[i - 1] == b'/' {
+            i -= 1;
+        }
+        let mut j = i;
+        while j > 0 && prefix[j - 1] != b'/' {
+            j -= 1;
+        }
+        if j <= 1 {
+            break;
+        }
+        prefix = &prefix[..j - 1];
     }
     let mut created = Vec::new();
-    if j > 1 {
-        created = mkdir_all_bytes(&path[..j - 1], perm, user, tm)?;
+    while let Some(prefix) = missing.pop() {
+        mkdir_one(bytes_path(prefix), perm, user, tm, &mut created)?;
     }
+    Ok(created)
+}
+
+/// One directory of `mkdir_all_bytes`, its parent there already.
+fn mkdir_one(
+    p: PathBuf,
+    perm: u32,
+    user: Option<Chowner<'_>>,
+    tm: Option<TimeSpec>,
+    created: &mut Vec<PathBuf>,
+) -> Result<()> {
     if fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) {
-        return Ok(created);
+        return Ok(());
     }
     if let Err(e) = DirBuilder::new().mode(perm & 0o777).create(&p) {
         // "foo/." and the like: the directory exists after all.
         if fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) {
-            return Ok(created);
+            return Ok(());
         }
         return Err(PathError::new("mkdir", p, e).into());
     }
@@ -238,7 +273,7 @@ fn mkdir_all_bytes(
     created.push(p.clone());
     chown(&p, None, user)?;
     utimes(&p, tm)?;
-    Ok(created)
+    Ok(())
 }
 
 /// Gives the directories created on the way their timestamp back, deepest first, once
@@ -656,7 +691,7 @@ impl<'a> Copier<'a> {
             return Ok(());
         }
         let removed = if target_fi.is_dir() {
-            fs::remove_dir_all(target)
+            crate::store::remove_tree(target)
         } else {
             fs::remove_file(target)
         };
@@ -2815,6 +2850,39 @@ mod tests {
             expected
         );
         assert_eq!(root_path(dir.path(), "").unwrap(), dir.path());
+    }
+
+    #[test]
+    fn long_paths_take_no_stack_per_component() {
+        // A WorkingDir from an image's config, with more components than a recursion
+        // per component fits on this thread.
+        let dir = tmp();
+        let root = dir.path().to_path_buf();
+        std::thread::Builder::new()
+            .stack_size(64 << 10)
+            .spawn(move || {
+                // Past PATH_MAX it is the kernel's error, as with the reference.
+                let e = root_path(&root, &"/a".repeat(20_000))
+                    .unwrap_err()
+                    .to_string();
+                assert!(e.ends_with("file name too long"), "{e}");
+                let workdir = "/a".repeat(1_500);
+                let resolved = root_path(&root, &workdir).unwrap();
+                assert_eq!(resolved, root.join(&workdir[1..]));
+                // Made, as WORKDIR makes it, as long as the kernel takes the path.
+                let made = mkdir_all(&root.join("b/".repeat(1_500)), 0o755, None, None).unwrap();
+                assert_eq!(made.len(), 1_500);
+                assert!(made
+                    .windows(2)
+                    .all(|w| w[1].parent() == Some(w[0].as_path())));
+                assert!(made.last().unwrap().is_dir());
+                assert!(mkdir_all(&root.join("b/".repeat(1_500)), 0o755, None, None)
+                    .unwrap()
+                    .is_empty());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

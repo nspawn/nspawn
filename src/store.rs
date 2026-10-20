@@ -91,12 +91,12 @@ pub struct ImageRecord {
     /// Ports published on the host with -p (bridge network only).
     #[serde(default)]
     pub ports: Vec<PortMap>,
-    /// Entrypoint override (--entrypoint); None keeps the image's. An empty list runs
-    /// the cmd alone.
+    /// Entrypoint override (--entrypoint); None keeps the image's, an empty list none.
     #[serde(default)]
     pub entrypoint: Option<Vec<String>>,
-    /// Cmd override (the arguments after --); None keeps the image's. Also read from a
-    /// "command" key.
+    /// Cmd override (the arguments after --); None keeps the image's. An empty list
+    /// after an entrypoint given is none: an entrypoint given without arguments runs
+    /// alone, as docker runs it. Also read from a "command" key.
     #[serde(default, alias = "command")]
     pub cmd: Option<Vec<String>>,
     /// Environment on top of the image's (-e).
@@ -180,27 +180,35 @@ impl ImageRecord {
 
 impl ImageRecord {
     /// What the machine runs: the overrides where given, the image's otherwise.
-    /// An entrypoint given drops the image's command, as docker's does: the arguments
-    /// given with it are all it gets.
     pub fn effective_command(&self) -> Vec<String> {
-        let mut argv = self
-            .entrypoint
+        let mut argv = self.effective_entrypoint().to_vec();
+        argv.extend_from_slice(self.effective_cmd());
+        argv
+    }
+
+    /// The entrypoint given, none for an empty one, or the image's.
+    pub fn effective_entrypoint(&self) -> &[String] {
+        self.entrypoint
             .as_deref()
             .unwrap_or_else(|| self.run.entrypoint())
-            .to_vec();
-        let cmd: &[String] = match (&self.entrypoint, &self.cmd) {
-            (_, Some(cmd)) => cmd,
-            (Some(_), None) => &[],
-            (None, None) => self.run.cmd(),
-        };
-        argv.extend_from_slice(cmd);
-        argv
+    }
+
+    /// The arguments after the entrypoint: the ones given, none after an entrypoint
+    /// given alone, the image's otherwise. An entrypoint without a cmd at all is how
+    /// records made before an entrypoint dropped the image's command keep an entrypoint
+    /// given alone: the image's command still follows it there.
+    pub fn effective_cmd(&self) -> &[String] {
+        match &self.cmd {
+            Some(cmd) => cmd,
+            None => self.run.cmd(),
+        }
     }
 
     /// An empty cmd override means none, and a run config with only `command` has it as
     /// its cmd.
     fn normalize(mut self) -> Self {
-        if self.cmd.as_ref().is_some_and(|c| c.is_empty()) {
+        // Without an entrypoint of its own an empty cmd is none, as docker merges them.
+        if self.entrypoint.is_none() && self.cmd.as_ref().is_some_and(|c| c.is_empty()) {
             self.cmd = None;
         }
         if self.run.entrypoint.is_empty() && self.run.cmd.is_empty() && !self.run.command.is_empty()
@@ -264,18 +272,40 @@ pub struct StoreLock(#[allow(dead_code)] Flock<File>);
 /// listing the digests, gone with the guard.
 pub struct BlobHold(PathBuf);
 
-/// Read by a pull from writing its hold until it has seen which blobs are there, written
-/// by the collector from reading the holds until it has deleted: a hold made in between
-/// would keep nothing from a collector that read them before it.
-static HOLDS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+/// Shared by a pull from writing its hold until it has seen which blobs are there,
+/// exclusive for the collector from reading the holds until it has deleted: a hold made
+/// in between would keep nothing from a collector that read them before it. An flock,
+/// so that it holds across processes: `nspawn remove-after-exit` collects too.
+pub struct HoldsLock(#[allow(dead_code)] Flock<File>);
 
-/// Keeps the collector waiting while a hold is made and what it holds is looked at.
-pub fn holds_still() -> std::sync::RwLockReadGuard<'static, ()> {
-    HOLDS.read().unwrap_or_else(|e| e.into_inner())
+/// Deletions of what collections moved aside, under way on threads of their own.
+static TRASH: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Deletes trees already moved out of the names, on a thread of their own: a tree of
+/// many files takes long to delete, and the caller may hold the store's lock or run on
+/// the runtime's workers.
+fn delete_later(trees: Vec<PathBuf>) {
+    if trees.is_empty() {
+        return;
+    }
+    let deleting = std::thread::spawn(move || {
+        for tree in trees {
+            let _ = remove_tree(tree);
+        }
+    });
+    let mut under_way = TRASH.lock().unwrap_or_else(|e| e.into_inner());
+    under_way.retain(|handle| !handle.is_finished());
+    under_way.push(deleting);
 }
 
-fn collecting() -> std::sync::RwLockWriteGuard<'static, ()> {
-    HOLDS.write().unwrap_or_else(|e| e.into_inner())
+/// Waits for the deletions of what collections moved aside: a process other than the
+/// service ends with them done, rather than leaving them to the service's next start.
+pub fn finish_trash() {
+    let handles = std::mem::take(&mut *TRASH.lock().unwrap_or_else(|e| e.into_inner()));
+    for handle in handles {
+        let _ = handle.join();
+    }
 }
 
 impl Drop for BlobHold {
@@ -304,6 +334,23 @@ impl Drop for Starting {
 
 /// Holds and start markers older than this belong to a process that died.
 const STALE_MARKER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// This boot's ID, which a marker keeps: one of another boot was left by a crash.
+fn boot_id() -> String {
+    fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|id| id.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Whether a marker at `path` stands: there, of this boot, and younger than a crash
+/// makes one. An empty one, as releases that kept no boot ID wrote, goes by its age.
+fn marked(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let of = text.trim();
+    (of.is_empty() || of == boot_id()) && !is_stale(path)
+}
 
 /// The file that says since when records keep their first start.
 const STARTS_KEPT: &str = "starts-kept-since";
@@ -435,13 +482,20 @@ impl Store {
         Ok(Some((record, manifest)))
     }
 
+    /// Lets a rollback go: renamed out of the names first, at once, so that one cut
+    /// short while it is deleted is no rollback half there, which recover and the start
+    /// guard would read forever.
     pub fn forget_rollback(&self, name: &str) -> Result<()> {
         let dir = self.rollback_dir(name);
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("removing {}", dir.display())),
+        let gone = dir.with_file_name(format!(".gone-{name}-{}", unique_suffix()));
+        match fs::rename(&dir, &gone) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!("removing {}", dir.display())),
         }
+        // A rollback keeps a machine's writable layer: deleted off the caller's thread.
+        delete_later(vec![gone]);
+        Ok(())
     }
 
     /// The names with a rollback kept.
@@ -452,6 +506,7 @@ impl Store {
         entries
             .flatten()
             .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|name| !name.starts_with('.'))
             .collect()
     }
 
@@ -613,26 +668,42 @@ impl Store {
         self.machine_files_dir(name).join("last-signal")
     }
 
-    /// Remembers the signal nspawn sent the machine's current run (kill, stop), which the
-    /// exit code of an attached run is made of: systemd-nspawn only says 255 when its
-    /// program died of one, 1 when the whole machine got SIGKILL.
-    pub fn mark_signal(&self, name: &str, signal: i32) -> Result<()> {
+    /// Remembers the signal nspawn sent the machine's current run (kill, stop), and
+    /// which run that is (its unit's InvocationID), which the exit code of the run is made
+    /// of: systemd-nspawn only says 255 when its program died of one, 1 when the whole
+    /// machine got SIGKILL.
+    pub fn mark_signal(&self, name: &str, signal: i32, run: Option<&str>) -> Result<()> {
         crate::reference::validate_entry_name(name)?;
         let path = self.signal_path(name);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        fs::write(&path, signal.to_string()).with_context(|| format!("writing {}", path.display()))
+        let text = match run {
+            Some(run) => format!("{signal} {run}"),
+            None => signal.to_string(),
+        };
+        fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
     }
 
     /// The signal of `mark_signal`, if any.
     pub fn last_signal(&self, name: &str) -> Option<i32> {
+        self.signal_mark(name).map(|(signal, _)| signal)
+    }
+
+    /// The signal of `mark_signal` when it was sent to the run `run`.
+    pub fn signal_of_run(&self, name: &str, run: &str) -> Option<i32> {
+        match self.signal_mark(name)? {
+            (signal, Some(marked)) if marked == run => Some(signal),
+            _ => None,
+        }
+    }
+
+    fn signal_mark(&self, name: &str) -> Option<(i32, Option<String>)> {
         crate::reference::validate_entry_name(name).ok()?;
-        fs::read_to_string(self.signal_path(name))
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+        let text = fs::read_to_string(self.signal_path(name)).ok()?;
+        let mut parts = text.split_whitespace();
+        let signal = parts.next()?.parse().ok()?;
+        Some((signal, parts.next().map(str::to_string)))
     }
 
     /// Forgets the signal of the last run, as a new run begins.
@@ -649,7 +720,7 @@ impl Store {
     pub fn remove_machine_files(&self, name: &str) -> Result<()> {
         crate::reference::validate_entry_name(name)?;
         let dir = self.machine_files_dir(name);
-        match fs::remove_dir_all(&dir) {
+        match remove_tree(&dir) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e).with_context(|| format!("removing {}", dir.display())),
@@ -732,6 +803,36 @@ impl Store {
         }
     }
 
+    fn claim_path(&self, name: &str) -> PathBuf {
+        self.root.join("claims").join(name)
+    }
+
+    /// Claims the host ports of a machine whose unit passed its check, until its publish
+    /// or its release: a unit systemd starts has no start marker, and machined knows it
+    /// only once it registers, so that another unit's check in between would not see it.
+    pub fn claim_ports(&self, name: &str) -> Result<()> {
+        crate::reference::validate_entry_name(name)?;
+        let path = self.claim_path(name);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        fs::write(&path, boot_id()).with_context(|| format!("writing {}", path.display()))
+    }
+
+    pub fn release_ports_claim(&self, name: &str) {
+        if crate::reference::validate_entry_name(name).is_ok() {
+            let _ = fs::remove_file(self.claim_path(name));
+        }
+    }
+
+    /// Whether `name` claims its ports, by a claim no older than a crash makes stale.
+    pub fn claims_ports(&self, name: &str) -> bool {
+        if crate::reference::validate_entry_name(name).is_err() {
+            return false;
+        }
+        marked(&self.claim_path(name))
+    }
+
     /// Marks `name` as starting until the guard is dropped.
     pub fn mark_starting(&self, name: &str) -> Result<Starting> {
         crate::reference::validate_entry_name(name)?;
@@ -739,7 +840,7 @@ impl Store {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        fs::write(&path, b"").with_context(|| format!("writing {}", path.display()))?;
+        fs::write(&path, boot_id()).with_context(|| format!("writing {}", path.display()))?;
         Ok(Starting(path))
     }
 
@@ -749,8 +850,7 @@ impl Store {
         if crate::reference::validate_entry_name(name).is_err() {
             return false;
         }
-        let path = self.starting_path(name);
-        path.exists() && !is_stale(&path)
+        marked(&self.starting_path(name))
     }
 
     pub fn manifests_dir(&self) -> PathBuf {
@@ -823,7 +923,7 @@ impl Store {
         if !self.blobs_dir().is_dir() {
             return Ok(removed);
         }
-        let _collecting = collecting();
+        let _collecting = self.collecting()?;
         let held = self.held_blobs();
         let dir = self.blobs_dir();
         for entry in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
@@ -867,7 +967,7 @@ impl Store {
             .layers_dir(ownership)
             .join(format!(".tmp-{}", layer_dir_name(digest)));
         if tmp.exists() {
-            fs::remove_dir_all(&tmp).with_context(|| format!("removing {}", tmp.display()))?;
+            remove_tree(&tmp).with_context(|| format!("removing {}", tmp.display()))?;
         }
         fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
         extract_layer(
@@ -987,13 +1087,25 @@ impl Store {
             Err(_) => return Ok(None),
         };
         // By reference: the image itself before a machine that was made from it or ran,
-        // whose network and settings are its own.
+        // whose network and settings are its own; of several, the last one pulled, as
+        // docker's tag names the last pull. A reference recorded before Docker Hub's names
+        // were read as docker reads them is read again.
+        let same = |recorded: &str| {
+            recorded == wanted
+                || crate::reference::ImageRef::parse(recorded, default_registry)
+                    .is_ok_and(|r| r.to_string() == wanted)
+        };
         let mut of: Vec<ImageRecord> = self
             .list_images()?
             .into_iter()
-            .filter(|r| r.reference == wanted)
+            .filter(|r| same(&r.reference))
             .collect();
-        of.sort_by_key(|r| !crate::api::disk::image_only(self, r));
+        of.sort_by_key(|r| {
+            (
+                !crate::api::disk::image_only(self, r),
+                std::cmp::Reverse(r.created),
+            )
+        });
         Ok(of.into_iter().next())
     }
 
@@ -1022,36 +1134,99 @@ impl Store {
                 .map(|b| layer_dir_name(b)),
         );
         // A build or a pull in flight keeps what it holds.
-        let _collecting = collecting();
+        let _collecting = self.collecting()?;
         let held = self.held_blobs();
         let mut removed = Vec::new();
+        // What goes is moved aside under the lock, which a rename does at once, and deleted
+        // after: a layer tree of many files takes long to delete, and the lock is what
+        // every start of a machine waits for.
+        let mut bins = Vec::new();
         for ownership in [Ownership::Root, Ownership::Foreign] {
             let dir = self.layers_dir(ownership);
             if !dir.is_dir() {
                 continue;
             }
             let used = referenced.remove(&ownership).unwrap_or_default();
+            let mut bin: Option<PathBuf> = None;
             for entry in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
                 let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
                 let file_name = entry.file_name().to_string_lossy().to_string();
-                if file_name.starts_with(".tmp-") {
-                    // An extraction that never finished; the store is locked, so nobody
-                    // is writing it now.
-                    let _ = fs::remove_dir_all(entry.path());
-                    continue;
-                }
-                if file_name.starts_with('.')
-                    || used.contains(&file_name)
-                    || held.contains(&file_name)
+                // An extraction that never finished; the store is locked, so nobody is
+                // writing it now.
+                let unfinished = file_name.starts_with(".tmp-");
+                if !unfinished
+                    && (file_name.starts_with('.')
+                        || used.contains(&file_name)
+                        || held.contains(&file_name))
                 {
                     continue;
                 }
-                fs::remove_dir_all(entry.path())
+                let into = match &bin {
+                    Some(bin) => bin.clone(),
+                    None => {
+                        let made = dir.join(format!(".trash-{}", unique_suffix()));
+                        fs::create_dir(&made)
+                            .with_context(|| format!("creating {}", made.display()))?;
+                        bins.push(made.clone());
+                        bin = Some(made.clone());
+                        made
+                    }
+                };
+                fs::rename(entry.path(), into.join(&file_name))
                     .with_context(|| format!("removing layer {file_name}"))?;
-                removed.push(file_name.replacen("sha256-", "sha256:", 1));
+                if !unfinished {
+                    removed.push(file_name.replacen("sha256-", "sha256:", 1));
+                }
             }
         }
+        delete_later(bins);
         Ok(removed)
+    }
+
+    fn holds_lock(&self, arg: FlockArg) -> Result<HoldsLock> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.root.join(".holds");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        match Flock::lock(file, arg) {
+            Ok(lock) => Ok(HoldsLock(lock)),
+            Err((_, errno)) => bail!("locking {}: {errno}", path.display()),
+        }
+    }
+
+    /// Keeps a collector waiting while a hold is made and what it holds is looked at.
+    pub fn holds_still(&self) -> Result<HoldsLock> {
+        self.holds_lock(FlockArg::LockShared)
+    }
+
+    fn collecting(&self) -> Result<HoldsLock> {
+        self.holds_lock(FlockArg::LockExclusive)
+    }
+
+    /// Deletes what a collection moved aside, and the rollbacks let go, that a stop of
+    /// the service cut short.
+    pub fn sweep_trash(&self) {
+        let places = [
+            (self.layers_dir(Ownership::Root), ".trash-"),
+            (self.layers_dir(Ownership::Foreign), ".trash-"),
+            (self.root.join("rollback"), ".gone-"),
+        ];
+        for (dir, prefix) in places {
+            let Ok(entries) = fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(prefix) {
+                    let _ = remove_tree(entry.path());
+                }
+            }
+        }
     }
 }
 
@@ -1392,14 +1567,27 @@ pub fn extract_layer(
         }
         // The entry's own time, 0 included, which tar makes 1.
         if kind.is_dir() {
-            dir_times.push((unpacked, mtime));
+            dir_times.push((path, mtime));
         } else {
             set_mtime(&unpacked, mtime);
         }
         count += 1;
     }
-    for (dir, mtime) in dir_times.iter().rev() {
-        set_mtime(dir, *mtime);
+    // In the order of the entries, a directory given twice taking its last time, as
+    // containerd sets them; each reached from the target with no symlink on its way,
+    // since later entries may have put one there that leads out of it.
+    if !dir_times.is_empty() {
+        if let Ok(root_fd) = nix::fcntl::open(
+            target,
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            FileMode::empty(),
+        ) {
+            for (dir, mtime) in &dir_times {
+                set_dir_mtime_beneath(&root_fd, dir, *mtime);
+            }
+        }
     }
     if ownership == Ownership::Foreign {
         // Directories tar created implicitly for entries without a parent entry, and the
@@ -1407,6 +1595,24 @@ pub fn extract_layer(
         shift_remaining(target)?;
     }
     Ok(count)
+}
+
+/// Sets both times of the directory `relative` below `root`, reached with no symlink on
+/// its way; nothing when it is not there so. Best effort, as tar's.
+fn set_dir_mtime_beneath(root: &std::os::fd::OwnedFd, relative: &Path, mtime: i64) {
+    use nix::fcntl::{openat2, OFlag, OpenHow, ResolveFlag};
+    let how = OpenHow::new()
+        .flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC)
+        .resolve(
+            ResolveFlag::RESOLVE_BENEATH
+                | ResolveFlag::RESOLVE_NO_SYMLINKS
+                | ResolveFlag::RESOLVE_NO_MAGICLINKS,
+        );
+    let Ok(dir) = openat2(root, relative, how) else {
+        return;
+    };
+    let time = nix::sys::time::TimeSpec::new(mtime, 0);
+    let _ = nix::sys::stat::futimens(&dir, &time, &time);
 }
 
 /// Sets a path's access and modification times, a symlink's own; best effort, as tar's.
@@ -1460,8 +1666,9 @@ fn hard_link_in<R: Read>(target: &Path, path: &Path, entry: &tar::Entry<R>) -> R
 }
 
 /// A FIFO or device node of a layer, made as it is, owned as the entry says when root
-/// makes it. Without root a device cannot be made: it is left out, as the reference
-/// leaves it out unprivileged. Whether one was made.
+/// makes it. Without root a device cannot be made, nor one the kernel refuses to make:
+/// it is left out, as the reference leaves it out unprivileged or in a user namespace.
+/// Whether one was made.
 fn make_node(
     dest: &Path,
     kind: tar::EntryType,
@@ -1488,13 +1695,24 @@ fn make_node(
     }
     let major = u64::from(header.device_major().ok().flatten().unwrap_or(0));
     let minor = u64::from(header.device_minor().ok().flatten().unwrap_or(0));
-    mknod(
+    match mknod(
         dest,
         flag,
         Mode::from_bits_truncate(mode),
         makedev(major, minor),
-    )
-    .with_context(|| format!("making {}", dest.display()))?;
+    ) {
+        Ok(()) => {}
+        // Root of a user namespace (a service in a container) may not make a device,
+        // and may be kept from a fifo: the reference leaves them out there.
+        Err(nix::errno::Errno::EPERM) => {
+            eprintln!(
+                "warning: skipping {} in layer: it may not be made here",
+                dest.display()
+            );
+            return Ok(false);
+        }
+        Err(e) => return Err(e).with_context(|| format!("making {}", dest.display())),
+    }
     if root {
         let uid = header.uid().unwrap_or(0) as u32;
         let gid = header.gid().unwrap_or(0) as u32;
@@ -1686,12 +1904,131 @@ fn handle_whiteout(
 
 fn remove_any(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() => fs::remove_dir_all(path)?,
+        Ok(m) if m.is_dir() => remove_tree(path)?,
         Ok(_) => fs::remove_file(path)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
     Ok(())
+}
+
+/// Removes a directory tree as `fs::remove_dir_all` does (a link itself, not what it
+/// points to), without recursion and with a few descriptors open: a machine's writable
+/// layer, a volume or a layer holds a chain of directories as deep as whoever wrote it
+/// made it, where `remove_dir_all` recurses once per level and an overflow of the
+/// thread's stack ends the whole service. Another file system mounted inside is not
+/// entered: the removal stops there with an error. A btrfs subvolume inside, a device of
+/// its own on the same mount, is removed as a directory, as `remove_dir_all` removes it.
+pub fn remove_tree(path: impl AsRef<Path>) -> io::Result<()> {
+    use nix::errno::Errno;
+    use nix::fcntl::{open, openat, AtFlags, OFlag};
+    use nix::sys::stat::{fstat, fstatat};
+    use nix::unistd::{unlinkat, UnlinkatFlags};
+    use std::ffi::CString;
+
+    /// A directory below the top: who it is, its name in its parent, and the names its
+    /// parent has still to go through.
+    struct Level {
+        dev: u64,
+        ino: u64,
+        name: CString,
+        rest: Vec<CString>,
+    }
+
+    let path = path.as_ref();
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return fs::remove_file(path);
+    }
+    if !meta.is_dir() {
+        return Err(io::Error::from_raw_os_error(nix::libc::ENOTDIR));
+    }
+    let changed = || io::Error::other(format!("{} changed while it was removed", path.display()));
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let top = open(path, flags, FileMode::empty())?;
+    let top_st = fstat(&top)?;
+    let top_mount = crate::volmount::mount_id_at(&top, c"")?;
+    let mut levels: Vec<Level> = Vec::new();
+    let mut cur = top.try_clone()?;
+    let mut names = entry_names(&cur)?;
+    loop {
+        if let Some(name) = names.pop() {
+            let st = match fstatat(&cur, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+                Ok(st) => st,
+                Err(Errno::ENOENT) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if st.st_mode & nix::libc::S_IFMT != nix::libc::S_IFDIR {
+                match unlinkat(&cur, name.as_c_str(), UnlinkatFlags::NoRemoveDir) {
+                    Ok(()) | Err(Errno::ENOENT) => {}
+                    Err(e) => return Err(e.into()),
+                }
+                continue;
+            }
+            // Without a mount ID to tell, another device is taken for a mount point.
+            if st.st_dev != top_st.st_dev
+                && (top_mount.is_none()
+                    || crate::volmount::mount_id_at(&cur, name.as_c_str())? != top_mount)
+            {
+                return Err(io::Error::other(format!(
+                    "{} holds a mount point; unmount it first",
+                    path.display()
+                )));
+            }
+            let child = openat(&cur, name.as_c_str(), flags, FileMode::empty())?;
+            let child_st = fstat(&child)?;
+            if (child_st.st_dev, child_st.st_ino) != (st.st_dev, st.st_ino) {
+                return Err(changed());
+            }
+            let below = entry_names(&child)?;
+            levels.push(Level {
+                dev: child_st.st_dev,
+                ino: child_st.st_ino,
+                name,
+                rest: std::mem::replace(&mut names, below),
+            });
+            cur = child;
+        } else {
+            let Some(level) = levels.pop() else { break };
+            // The parent is opened again through "..", since a descriptor kept for each
+            // level runs out on a deep chain; its identity tells that it is the one left.
+            let parent = match levels.last() {
+                None => top.try_clone()?,
+                Some(up) => {
+                    let parent = openat(&cur, c"..", flags, FileMode::empty())?;
+                    let st = fstat(&parent)?;
+                    if (st.st_dev, st.st_ino) != (up.dev, up.ino) {
+                        return Err(changed());
+                    }
+                    parent
+                }
+            };
+            match unlinkat(&parent, level.name.as_c_str(), UnlinkatFlags::RemoveDir) {
+                Ok(()) | Err(Errno::ENOENT) => {}
+                Err(e) => return Err(e.into()),
+            }
+            cur = parent;
+            names = level.rest;
+        }
+    }
+    drop(cur);
+    drop(top);
+    fs::remove_dir(path)
+}
+
+/// The names in a directory, read through a description of their own.
+fn entry_names(dir: &std::os::fd::OwnedFd) -> io::Result<Vec<std::ffi::CString>> {
+    use nix::fcntl::OFlag;
+    let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    let mut listed = nix::dir::Dir::openat(dir, c".", flags, FileMode::empty())?;
+    let mut names = Vec::new();
+    for entry in listed.iter() {
+        let name = entry?.file_name().to_owned();
+        if name.as_bytes() != b"." && name.as_bytes() != b".." {
+            names.push(name);
+        }
+    }
+    Ok(names)
 }
 
 /// flock() on the store's lock file: forever, or until `wait` has passed.
@@ -1755,7 +2092,7 @@ mod tests {
             ["/docker-entrypoint.sh", "nginx", "-g", "daemon off;"]
         );
         assert_eq!(
-            record(serde_json::json!({ "entrypoint": ["/bin/sh"] })).effective_command(),
+            record(serde_json::json!({ "entrypoint": ["/bin/sh"], "cmd": [] })).effective_command(),
             ["/bin/sh"]
         );
         assert_eq!(
@@ -1767,6 +2104,32 @@ mod tests {
             record(serde_json::json!({ "cmd": ["nginx", "-t"] })).effective_command(),
             ["/docker-entrypoint.sh", "nginx", "-t"]
         );
+        // Its parts, as docker's inspect has them: Cmd is none after an entrypoint given
+        // alone, not the image's.
+        let alone = record(serde_json::json!({ "entrypoint": ["/bin/sh"], "cmd": [] }));
+        assert_eq!(alone.effective_entrypoint(), ["/bin/sh"]);
+        assert!(alone.effective_cmd().is_empty());
+        // --entrypoint "" alone: nothing to run, which create and start refuse.
+        let nothing = record(serde_json::json!({ "entrypoint": [], "cmd": [] }));
+        assert!(nothing.effective_command().is_empty());
+        // Records that keep an entrypoint without a cmd at all, as 1.10.0 wrote one given
+        // alone, run the image's command after it still.
+        assert_eq!(
+            record(serde_json::json!({ "entrypoint": ["/bin/sh"] })).effective_command(),
+            ["/bin/sh", "nginx", "-g", "daemon off;"]
+        );
+        assert_eq!(
+            record(serde_json::json!({ "entrypoint": [] })).effective_command(),
+            ["nginx", "-g", "daemon off;"]
+        );
+        // Without an entrypoint of its own an empty cmd is none.
+        assert_eq!(
+            record(serde_json::json!({ "cmd": [] })).effective_command(),
+            ["/docker-entrypoint.sh", "nginx", "-g", "daemon off;"]
+        );
+        let image = record(serde_json::json!({}));
+        assert_eq!(image.effective_entrypoint(), ["/docker-entrypoint.sh"]);
+        assert_eq!(image.effective_cmd(), ["nginx", "-g", "daemon off;"]);
     }
     use std::io::Cursor;
 
@@ -1945,6 +2308,146 @@ mod tests {
         let time = |p: &str| fs::symlink_metadata(target.join(p)).unwrap().mtime();
         assert_eq!(time("usr"), 1_000_000, "made inside, it keeps its time");
         assert_eq!(time("usr/zero"), 0, "0 stays 0");
+    }
+
+    #[test]
+    fn a_later_symlink_on_a_directory_s_path_takes_no_time_out_of_the_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(outside.join("shadow")).unwrap();
+        let old = nix::sys::time::TimeVal::new(5_000_000, 0);
+        nix::sys::stat::utimes(&outside.join("shadow"), &old, &old).unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add = |path: &str, kind: tar::EntryType, mtime: u64, link: Option<&Path>| {
+            let mut header = tar::Header::new_gnu();
+            header_owner(&mut header);
+            header.set_mode(if kind == tar::EntryType::Directory {
+                0o755
+            } else {
+                0o644
+            });
+            header.set_entry_type(kind);
+            header.set_size(0);
+            header.set_mtime(mtime);
+            match link {
+                Some(to) => builder.append_link(&mut header, path, to).unwrap(),
+                None => builder
+                    .append_data(&mut header, path, std::io::empty())
+                    .unwrap(),
+            }
+        };
+        // The directory a later symlink stands in for, and its time set at the end.
+        add("x/", tar::EntryType::Directory, 1_000_000, None);
+        add("x/shadow/", tar::EntryType::Directory, 0, None);
+        add(".wh.x", tar::EntryType::Regular, 0, None);
+        add("x", tar::EntryType::Symlink, 0, Some(&outside));
+        // A directory given twice takes its last time.
+        add("etc/", tar::EntryType::Directory, 1000, None);
+        add("etc/", tar::EntryType::Directory, 2000, None);
+        let blob = tmp.path().join("layer.tar");
+        fs::write(&blob, builder.into_inner().unwrap()).unwrap();
+        let target = tmp.path().join("layer");
+        fs::create_dir(&target).unwrap();
+        extract_layer(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar",
+            &target,
+            WhiteoutMode::Apply,
+            Ownership::Root,
+        )
+        .unwrap();
+        assert!(target
+            .join("x")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::metadata(outside.join("shadow")).unwrap().mtime(),
+            5_000_000,
+            "a time went out of the layer through the symlink"
+        );
+        assert_eq!(fs::metadata(target.join("etc")).unwrap().mtime(), 2000);
+    }
+
+    /// A chain of `depth` directories below `top`, made through descriptors since its
+    /// paths outgrow PATH_MAX.
+    fn chain(top: &Path, depth: usize) {
+        use nix::fcntl::{open, openat, OFlag};
+        use nix::sys::stat::mkdirat;
+        let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+        let mut dir = open(top, flags, FileMode::empty()).unwrap();
+        for _ in 0..depth {
+            mkdirat(&dir, "d", FileMode::from_bits_truncate(0o755)).unwrap();
+            dir = openat(&dir, "d", flags, FileMode::empty()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_unit_claims_its_ports_from_its_check_to_its_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        assert!(!store.claims_ports("web"));
+        store.claim_ports("web").unwrap();
+        assert!(store.claims_ports("web"));
+        assert!(!store.claims_ports("other"));
+        store.release_ports_claim("web");
+        assert!(!store.claims_ports("web"));
+        assert!(store.claim_ports("../web").is_err());
+        assert!(!store.claims_ports("../web"));
+    }
+
+    #[test]
+    fn a_tree_deeper_than_a_stack_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().join("upper");
+        fs::create_dir(&top).unwrap();
+        chain(&top, 30_000);
+        fs::write(top.join("d/f"), "x").unwrap();
+        // remove_dir_all overflows a stack of this size a few thousand levels down.
+        let removed = std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(move || remove_tree(&top).map(|()| top))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(!removed.exists());
+    }
+
+    #[test]
+    fn removing_a_tree_leaves_what_its_links_point_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(outside.join("sub")).unwrap();
+        fs::write(outside.join("sub/keep"), "x").unwrap();
+        let top = tmp.path().join("tree");
+        fs::create_dir_all(top.join("a/b")).unwrap();
+        fs::write(top.join("a/b/f"), "x").unwrap();
+        fs::write(top.join("a/g"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, top.join("a/link")).unwrap();
+        std::os::unix::fs::symlink(outside.join("sub/keep"), top.join("a/b/file-link")).unwrap();
+        remove_tree(&top).unwrap();
+        assert!(!top.exists());
+        assert!(outside.join("sub/keep").exists());
+
+        // A link named as the tree goes itself, as with remove_dir_all.
+        let link = tmp.path().join("named");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        remove_tree(&link).unwrap();
+        assert!(link.symlink_metadata().is_err());
+        assert!(outside.join("sub/keep").exists());
+
+        let file = tmp.path().join("file");
+        fs::write(&file, "x").unwrap();
+        assert_eq!(
+            remove_tree(&file).unwrap_err().raw_os_error(),
+            Some(nix::libc::ENOTDIR)
+        );
+        assert_eq!(
+            remove_tree(tmp.path().join("missing")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]
@@ -2250,6 +2753,16 @@ mod tests {
         store.remove_record("fedora-44").unwrap();
         assert!(store.load_image("fedora-44").unwrap().is_none());
         assert_eq!(store.gc_layers().unwrap(), vec!["sha256:aaa".to_string()]);
+        // What went is deleted by the time a process other than the service ends.
+        finish_trash();
+        for ownership in [Ownership::Root, Ownership::Foreign] {
+            let left: Vec<_> = fs::read_dir(store.layers_dir(ownership))
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            assert!(left.is_empty(), "{left:?}");
+        }
     }
 
     #[test]
@@ -2324,9 +2837,11 @@ mod tests {
         store.gc_layers().unwrap();
         store.forget_rollback("img").unwrap();
         fs::remove_file(store.root.join("rollback").join("junk")).unwrap();
-        // A machine of the same reference that ran, first by name, is not the image.
+        // A machine of the same reference that ran, first by name, is not the image, which
+        // a build makes on the bridge.
         let mut image = rec.clone();
         image.backend = BackendChoice::Overlay;
+        image.network = Network::Bridge;
         store.record_image(&image).unwrap();
         let mut ran = rec.clone();
         ran.name = "aaa".to_string();
@@ -2341,6 +2856,21 @@ mod tests {
             "img"
         );
         store.remove_record("aaa").unwrap();
+        // A reference recorded under Docker Hub's old name is found by the name docker
+        // reads it as.
+        let mut old = rec.clone();
+        old.name = "nginx".to_string();
+        old.reference = "index.docker.io/library/nginx:latest".to_string();
+        store.record_image(&old).unwrap();
+        assert_eq!(
+            store
+                .find_image("docker.io/nginx", "hub.example")
+                .unwrap()
+                .unwrap()
+                .name,
+            "nginx"
+        );
+        store.remove_record("nginx").unwrap();
         assert!(store
             .find_image("other:1", "hub.example")
             .unwrap()
@@ -2565,6 +3095,26 @@ mod tests {
         assert!(store
             .layer_dir("sha256:shared", Ownership::Foreign)
             .is_dir());
+        // What went was moved aside at once and is deleted after, the lock not waiting
+        // for it; what a stop of the service left aside goes at the next start.
+        let aside = |ownership| {
+            fs::read_dir(store.layers_dir(ownership))
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(".trash-"))
+                .count()
+        };
+        for _ in 0..100 {
+            if aside(Ownership::Root) == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(aside(Ownership::Root), 0, "the deletion after the lock ran");
+        let left = store.layers_dir(Ownership::Root).join(".trash-left");
+        fs::create_dir_all(left.join("sha256-x/usr")).unwrap();
+        store.sweep_trash();
+        assert!(!left.exists());
         // Abandoned partial blobs go once nobody has touched them for an hour (a download
         // in flight runs without the lock); finished ones stay.
         let fresh = store.blobs_dir().join(".part-sha256-fresh.1");
@@ -2861,7 +3411,7 @@ mod tests {
         let digest = format!("sha256:{}", "e".repeat(64));
         fs::create_dir_all(store.blobs_dir()).unwrap();
         fs::write(store.blob_path(&digest), b"x").unwrap();
-        let still = holds_still();
+        let still = store.holds_still().unwrap();
         let collector = {
             let store = store.clone();
             std::thread::spawn(move || store.gc_blobs().unwrap())
@@ -2955,6 +3505,27 @@ mod tests {
             "a marker left by a start that died with its process"
         );
         drop(stale);
+        // One of another boot, left by a crash, stands no more; an empty one of a
+        // release that kept no boot ID goes by its age.
+        let other = store.mark_starting("crashed").unwrap();
+        fs::write(
+            store.starting_path("crashed"),
+            "00000000-0000-0000-0000-000000000000",
+        )
+        .unwrap();
+        assert!(!store.is_starting("crashed"));
+        fs::write(store.starting_path("crashed"), "").unwrap();
+        assert!(store.is_starting("crashed"));
+        drop(other);
+        store.claim_ports("web").unwrap();
+        assert!(store.claims_ports("web"));
+        fs::write(
+            store.claim_path("web"),
+            "00000000-0000-0000-0000-000000000000",
+        )
+        .unwrap();
+        assert!(!store.claims_ports("web"), "a claim of another boot");
+        store.release_ports_claim("web");
     }
 
     #[test]
@@ -2962,10 +3533,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
         assert_eq!(store.last_signal("web"), None);
-        store.mark_signal("web", 9).unwrap();
+        store.mark_signal("web", 9, None).unwrap();
         assert_eq!(store.last_signal("web"), Some(9));
-        store.mark_signal("web", 15).unwrap();
+        assert_eq!(store.signal_of_run("web", "abc"), None, "no run said");
+        store.mark_signal("web", 15, Some("abc")).unwrap();
         assert_eq!(store.last_signal("web"), Some(15));
+        assert_eq!(store.signal_of_run("web", "abc"), Some(15));
+        assert_eq!(store.signal_of_run("web", "def"), None);
         store.forget_signal("web").unwrap();
         store.forget_signal("web").unwrap();
         assert_eq!(store.last_signal("web"), None);

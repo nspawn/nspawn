@@ -148,23 +148,30 @@ pub fn plan(
     }
 }
 
-/// How many links a destination is followed through, as docker cp counts them.
+/// How many links a destination is followed through after the first, as docker cp's
+/// CopyInfoDestinationPath counts them.
 const DESTINATION_LINKS: usize = 10;
 
-/// docker cp's destination: a final link stands for what it names, so the copy is
-/// written there, whether that exists or not, and the link stays. `read_link` gives a
-/// path's link target, None for anything else; `rooted` paths are relative to a root
-/// that `..` never climbs above.
+/// How many links resolving a path inside a machine follows, as FollowSymlinkInScope.
+const SCOPED_LINKS: usize = 255;
+
+/// docker cp's destination on the command line's side: a final link stands for what it
+/// names, each target joined to the link's directory as written, so the copy is written
+/// there, whether that exists or not, and the link stays. `read_link` gives a path's
+/// link target, None for anything else; `rooted` paths are relative to a root that `..`
+/// never climbs above.
 pub fn follow_destination(
     dst: &Path,
     rooted: bool,
     mut read_link: impl FnMut(&Path) -> Result<Option<PathBuf>>,
 ) -> Result<PathBuf> {
     let mut path = dst.to_path_buf();
-    for _ in 0..=DESTINATION_LINKS {
-        let Some(target) = read_link(&path)? else {
-            return Ok(path);
-        };
+    let mut followed = 0;
+    while let Some(target) = read_link(&path)? {
+        if followed > DESTINATION_LINKS {
+            bail!("too many symlinks in {}", dst.display());
+        }
+        followed += 1;
         let joined = if target.is_absolute() {
             target
         } else {
@@ -172,7 +179,61 @@ pub fn follow_destination(
         };
         path = clean(&joined, rooted);
     }
-    bail!("too many symlinks in {}", dst.display())
+    Ok(path)
+}
+
+/// docker cp's destination inside a machine: a final link stands for what it names,
+/// resolved all the way inside the root as docker's daemon resolves it (LinkTarget),
+/// links on the way included, so the copy is written there, whether that exists or not,
+/// and the link stays.
+pub fn destination_in(root: BorrowedFd<'_>, dst: &Path) -> Result<PathBuf> {
+    if dst.as_os_str().is_empty() || link_in(root, dst)?.is_none() {
+        return Ok(dst.to_path_buf());
+    }
+    resolve_in(root, dst)
+}
+
+/// `path` beneath `root` with every link on the way followed, the last one too, as
+/// FollowSymlinkInScope resolves it: an absolute target starts at the root, `..` stops
+/// there, and what does not exist yet is taken as written.
+fn resolve_in(root: BorrowedFd<'_>, path: &Path) -> Result<PathBuf> {
+    // The names still to walk, the next one last.
+    fn push(pending: &mut Vec<OsString>, path: &Path) {
+        let names: Vec<OsString> = path
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(name) => Some(name.to_os_string()),
+                Component::ParentDir => Some(OsString::from("..")),
+                _ => None,
+            })
+            .collect();
+        pending.extend(names.into_iter().rev());
+    }
+    let mut pending = Vec::new();
+    push(&mut pending, path);
+    let mut resolved = PathBuf::new();
+    let mut links = 0;
+    while let Some(name) = pending.pop() {
+        if name == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&name);
+        match link_in(root, &candidate)? {
+            Some(target) => {
+                links += 1;
+                if links > SCOPED_LINKS {
+                    bail!("too many symlinks in {}", path.display());
+                }
+                if target.is_absolute() {
+                    resolved = PathBuf::new();
+                }
+                push(&mut pending, &target);
+            }
+            None => resolved = candidate,
+        }
+    }
+    Ok(resolved)
 }
 
 /// A path without `.` and with each `..` taking the name before it, as Go's
@@ -224,12 +285,14 @@ pub fn link_in(root: BorrowedFd<'_>, path: &Path) -> Result<Option<PathBuf>> {
 /// A path as `cp` was given it: `DIR/.` means the contents of DIR, a trailing slash
 /// that it must be a directory.
 pub fn split_source(path: &str) -> (String, bool) {
-    if let Some(stripped) = path.strip_suffix("/.") {
+    // As filepath.Base reads the last element: trailing slashes do not count.
+    let trimmed = path.trim_end_matches('/');
+    if trimmed == "." {
+        return (".".to_string(), true);
+    }
+    if let Some(stripped) = trimmed.strip_suffix("/.") {
         let stripped = if stripped.is_empty() { "/" } else { stripped };
         return (stripped.to_string(), true);
-    }
-    if path == "." {
-        return (".".to_string(), true);
     }
     (path.to_string(), false)
 }
@@ -384,26 +447,54 @@ pub fn split_leaf(path: &Path) -> (PathBuf, OsString) {
     }
 }
 
-/// Reads exactly `left` bytes, zeros when the file shrank meanwhile: the header already
-/// promised the size.
-struct Exact {
-    file: File,
+/// Reads exactly `left` bytes, zeros when the file shrank meanwhile or a read failed: the
+/// header already promised the size, and a failed packing must break the stream where a
+/// header is read, not inside the file. The error is kept for after the entry.
+struct Exact<R> {
+    file: R,
     left: u64,
+    failed: Option<io::Error>,
 }
 
-impl Read for Exact {
+impl<R: Read> Read for Exact<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.left == 0 {
             return Ok(0);
         }
         let want = buf.len().min(self.left.min(usize::MAX as u64) as usize);
-        let mut n = self.file.read(&mut buf[..want])?;
-        if n == 0 {
-            buf[..want].fill(0);
-            n = want;
+        if self.failed.is_none() {
+            match self.file.read(&mut buf[..want]) {
+                Ok(0) => {}
+                Ok(n) => {
+                    self.left -= n as u64;
+                    return Ok(n);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => return Err(e),
+                Err(e) => self.failed = Some(e),
+            }
         }
-        self.left -= n as u64;
-        Ok(n)
+        buf[..want].fill(0);
+        self.left -= want as u64;
+        Ok(want)
+    }
+}
+
+/// How deep `pack` goes into directories: whoever writes a tree makes it as deep as they
+/// like, and each level takes a descriptor and a frame of the copy's stack.
+pub const MAX_DEPTH: usize = 2048;
+
+/// The stack of a thread that packs a tree, room for `MAX_DEPTH` levels.
+pub const COPY_STACK: usize = 32 << 20;
+
+/// Lifts the soft limit of open files to the hard one, as Go programs do: systemd starts
+/// services and sessions at 1024, fewer than a tree `MAX_DEPTH` deep takes, and nspawn
+/// waits on its descriptors with epoll, never with select.
+pub fn raise_open_files() {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    if let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) {
+        if soft < hard {
+            let _ = setrlimit(Resource::RLIMIT_NOFILE, hard, hard);
+        }
     }
 }
 
@@ -418,7 +509,7 @@ pub fn pack<W: Write>(
 ) -> Result<Stats> {
     let mut builder = tar::Builder::new(out);
     let mut stats = Stats::default();
-    if let Err(e) = pack_entry(&mut builder, parent, leaf, top, ids, &mut stats) {
+    if let Err(e) = pack_entry(&mut builder, parent, leaf, top, ids, &mut stats, 0) {
         // The builder ends the archive when dropped, and the other end would take a
         // clean end for the whole tree: a block that is no header breaks it instead.
         let _ = builder.get_mut().write_all(&[0xff; 512]);
@@ -438,6 +529,7 @@ fn pack_entry<W: Write>(
     path: &Path,
     ids: Ids,
     stats: &mut Stats,
+    depth: usize,
 ) -> Result<()> {
     let st = fstatat(dirfd, leaf, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(|e| nix_error(e, path))?;
     let mut header = tar::Header::new_gnu();
@@ -446,6 +538,12 @@ fn pack_entry<W: Write>(
     header.set_uid(u64::from(ids.outward(st.st_uid)));
     header.set_gid(u64::from(ids.outward(st.st_gid)));
     if is(st.st_mode, SFlag::S_IFDIR) {
+        if depth >= MAX_DEPTH {
+            bail!(
+                "{}: more than {MAX_DEPTH} directories deep; nothing that deep is copied",
+                path.display()
+            );
+        }
         let dir = openat(
             dirfd,
             leaf,
@@ -484,7 +582,7 @@ fn pack_entry<W: Write>(
             let child = path.join(&name);
             // What goes or changes kind in a running machine between the listing and
             // its turn is left out, as the reference leaves it; anything else fails.
-            if let Err(e) = pack_entry(builder, dir.as_fd(), &name, &child, ids, stats) {
+            if let Err(e) = pack_entry(builder, dir.as_fd(), &name, &child, ids, stats, depth + 1) {
                 if !went_meanwhile(&e) {
                     return Err(e);
                 }
@@ -510,16 +608,17 @@ fn pack_entry<W: Write>(
         let size = st.st_size.max(0) as u64;
         header.set_entry_type(tar::EntryType::Regular);
         header.set_size(size);
+        let mut data = Exact {
+            file: File::from(file),
+            left: size,
+            failed: None,
+        };
         builder
-            .append_data(
-                &mut header,
-                path,
-                Exact {
-                    file: File::from(file),
-                    left: size,
-                },
-            )
+            .append_data(&mut header, path, &mut data)
             .with_context(|| format!("writing {}", path.display()))?;
+        if let Some(e) = data.failed {
+            return Err(anyhow::Error::new(e).context(format!("reading {}", path.display())));
+        }
         stats.entries += 1;
         stats.bytes += size;
     } else if is(st.st_mode, SFlag::S_IFLNK) {
@@ -591,8 +690,22 @@ pub fn unpack<R: Read>(
     // The directories made, by path: a descriptor held for each would run out of them on
     // a tree of a few thousand.
     let mut directories: Vec<(PathBuf, u64)> = Vec::new();
+    // A file written whole takes its name only once the next header reads well: the
+    // sender breaks the stream after an entry that failed to read, filled to its size.
+    let mut pending: Option<Staged> = None;
     for entry in archive.entries().context("reading the stream")? {
-        let mut entry = entry.context("reading the stream")?;
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                if let Some(staged) = pending.take() {
+                    staged.discard();
+                }
+                return Err(e).context("reading the stream");
+            }
+        };
+        if let Some(staged) = pending.take() {
+            staged.finish()?;
+        }
         let raw = entry
             .path()
             .context("reading an entry's path")?
@@ -703,12 +816,18 @@ pub fn unpack<R: Read>(
                     fchmod(&file, mode).map_err(|e| nix_error(e, &shown))?;
                     futimens(&file, &timespec(mtime), &timespec(mtime))
                         .map_err(|e| nix_error(e, &shown))?;
-                    nix::fcntl::renameat(&parent, staged.as_os_str(), &parent, leaf.as_os_str())
-                        .map_err(|e| nix_error(e, &shown))?;
                     Ok(bytes)
                 })();
                 match written {
-                    Ok(bytes) => stats.bytes += bytes,
+                    Ok(bytes) => {
+                        stats.bytes += bytes;
+                        pending = Some(Staged {
+                            parent,
+                            staged,
+                            leaf,
+                            shown,
+                        });
+                    }
                     Err(e) => {
                         let _ = unlinkat(&parent, staged.as_os_str(), UnlinkatFlags::NoRemoveDir);
                         return Err(e);
@@ -747,17 +866,65 @@ pub fn unpack<R: Read>(
         }
         stats.entries += 1;
     }
+    // The stream ended cleanly after it.
+    if let Some(staged) = pending.take() {
+        staged.finish()?;
+    }
     let Some(target) = target else {
         bail!("nothing arrived to copy");
     };
-    // Last: writing into a directory changes its time.
+    // Last: writing into a directory changes its time. Set through its parent, which
+    // needs no read permission on it, as a directory of mode 0311 has none.
     for (path, mtime) in directories.iter().rev() {
-        let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW;
-        if let Ok(dir) = scoped_raw(target.root.as_fd(), path, flags) {
-            let _ = futimens(&dir, &timespec(*mtime), &timespec(*mtime));
+        let (parent, leaf) = match (path.parent(), path.file_name()) {
+            (Some(parent), Some(leaf)) => (parent, leaf),
+            _ => continue,
+        };
+        let flags = OFlag::O_PATH | OFlag::O_DIRECTORY;
+        if let Ok(dir) = scoped_raw(target.root.as_fd(), parent, flags) {
+            let _ = nix::sys::stat::utimensat(
+                &dir,
+                leaf,
+                &timespec(*mtime),
+                &timespec(*mtime),
+                nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+            );
         }
     }
     Ok(stats)
+}
+
+/// A file written in full beside its name, which it takes once the stream says it is
+/// whole.
+struct Staged {
+    parent: OwnedFd,
+    staged: OsString,
+    leaf: OsString,
+    shown: PathBuf,
+}
+
+impl Staged {
+    fn finish(self) -> Result<()> {
+        let renamed = nix::fcntl::renameat(
+            &self.parent,
+            self.staged.as_os_str(),
+            &self.parent,
+            self.leaf.as_os_str(),
+        );
+        if let Err(e) = renamed {
+            self.discard();
+            return Err(nix_error(e, &self.shown));
+        }
+        Ok(())
+    }
+
+    fn discard(&self) {
+        let _ = unlinkat(
+            &self.parent,
+            self.staged.as_os_str(),
+            UnlinkatFlags::NoRemoveDir,
+        );
+    }
 }
 
 /// The name a file is written under until it is complete: beside its own, never the
@@ -793,6 +960,7 @@ pub async fn on_thread<T: Send + 'static>(
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("nspawn-cp".to_string())
+        .stack_size(COPY_STACK)
         .spawn(move || {
             block_sigpipe();
             let _ = tx.send(work());
@@ -998,9 +1166,7 @@ pub async fn copy_to(
 ) -> Result<Stats> {
     let root = open_root(ctx, name, report).await?;
     let trailing_slash = path.len() > 1 && path.ends_with('/');
-    let relative = follow_destination(&inside(path.trim_end_matches('/')), true, |p| {
-        link_in(root.fd.as_fd(), p)
-    })?;
+    let relative = destination_in(root.fd.as_fd(), &inside(path.trim_end_matches('/')))?;
     let dst_kind = kind_in(root.fd.as_fd(), &relative)?;
     if dst_kind.is_none() {
         let (parent, _) = split_leaf(&relative);
@@ -1219,6 +1385,11 @@ mod tests {
         assert_eq!(split_source("/."), ("/".to_string(), true));
         assert_eq!(split_source("."), (".".to_string(), true));
         assert_eq!(split_source("/etc"), ("/etc".to_string(), false));
+        // As filepath.Base reads the last element, trailing slashes left out.
+        assert_eq!(split_source("/etc/./"), ("/etc".to_string(), true));
+        assert_eq!(split_source("/etc/.//"), ("/etc".to_string(), true));
+        assert_eq!(split_source("./"), (".".to_string(), true));
+        assert_eq!(split_source("/etc/"), ("/etc/".to_string(), false));
         assert_eq!(
             split_leaf(Path::new("etc/hosts")),
             (PathBuf::from("etc"), OsString::from("hosts"))
@@ -1246,6 +1417,46 @@ mod tests {
         drop(sock);
         let old = nix::sys::time::TimeVal::new(1_000_000, 0);
         nix::sys::stat::utimes(&root.join("src/a.txt"), &old, &old).unwrap();
+    }
+
+    #[test]
+    fn a_tree_too_deep_is_refused_and_not_a_crash() {
+        use nix::sys::stat::mkdirat;
+        // As main does: the walk takes a descriptor per level.
+        raise_open_files();
+        let tmp = tempfile::tempdir().unwrap();
+        let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+        fs::create_dir(tmp.path().join("deep")).unwrap();
+        // deep/d/.../d, MAX_DEPTH - 1 directories below the top: as deep as the walk
+        // goes. The last one stays open to add one level more.
+        let mut last = open_dir(&tmp.path().join("deep"));
+        for _ in 1..MAX_DEPTH {
+            mkdirat(&last, "d", Mode::from_bits_truncate(0o755)).unwrap();
+            last = openat(&last, "d", flags, Mode::empty()).unwrap();
+        }
+        let packing = |dir: PathBuf| {
+            std::thread::Builder::new()
+                .stack_size(COPY_STACK)
+                .spawn(move || {
+                    let parent = open_dir(&dir);
+                    let top = Path::new("deep");
+                    pack(
+                        parent.as_fd(),
+                        OsStr::new("deep"),
+                        top,
+                        Ids::Keep,
+                        std::io::sink(),
+                    )
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+        let whole = packing(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(whole.entries, MAX_DEPTH as u64);
+        mkdirat(&last, "d", Mode::from_bits_truncate(0o755)).unwrap();
+        let e = packing(tmp.path().to_path_buf()).unwrap_err().to_string();
+        assert!(e.contains("more than 2048 directories deep"), "{e}");
     }
 
     fn roundtrip(from: &Path, to: &Path, contents: bool, dst: &Path) -> Stats {
@@ -1315,6 +1526,98 @@ mod tests {
             1,
             "no staged file left"
         );
+    }
+
+    #[test]
+    fn a_file_that_failed_to_read_never_takes_the_name() {
+        struct Failing(usize);
+        impl Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(io::Error::from_raw_os_error(nix::libc::EIO));
+                }
+                let n = buf.len().min(self.0);
+                buf[..n].fill(b'a');
+                self.0 -= n;
+                Ok(n)
+            }
+        }
+        // The sender fills the entry to its size and keeps the error.
+        let mut exact = Exact {
+            file: Failing(3),
+            left: 10,
+            failed: None,
+        };
+        let mut got = Vec::new();
+        exact.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"aaa\0\0\0\0\0\0\0");
+        assert!(exact.failed.is_some());
+        // As pack writes it then: the whole entry, then a block that is no header.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("f"), "old").unwrap();
+        let mut stream = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(1000);
+        stream
+            .append_data(&mut header, "f", io::repeat(0).take(1000))
+            .unwrap();
+        stream.get_mut().extend_from_slice(&[0xff; 512]);
+        let bytes = stream.into_inner().unwrap();
+        let root = open_dir(tmp.path());
+        let result = unpack(
+            &bytes[..],
+            |_, _| {
+                Ok(Target {
+                    root: root.try_clone().unwrap(),
+                    base: PathBuf::new(),
+                    top: Some("f".into()),
+                })
+            },
+            Ids::Keep,
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(tmp.path().join("f")).unwrap(), "old");
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "no staged file left"
+        );
+    }
+
+    #[test]
+    fn a_directory_without_read_permission_keeps_its_time() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stream = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(0o311);
+        header.set_mtime(1_234_567);
+        header.set_size(0);
+        stream
+            .append_data(&mut header, "drop", io::empty())
+            .unwrap();
+        let stream = stream.into_inner().unwrap();
+        let root = open_dir(tmp.path());
+        unpack(
+            &stream[..],
+            |_, _| {
+                Ok(Target {
+                    root: root.try_clone().unwrap(),
+                    base: PathBuf::new(),
+                    top: Some("drop".into()),
+                })
+            },
+            Ids::Keep,
+        )
+        .unwrap();
+        let meta = fs::metadata(tmp.path().join("drop")).unwrap();
+        assert_eq!(meta.mtime(), 1_234_567);
+        fs::set_permissions(tmp.path().join("drop"), fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
@@ -1545,8 +1848,17 @@ mod tests {
         std::os::unix::fs::symlink("/nowhere/new", root.join("etc/dangling")).unwrap();
         std::os::unix::fs::symlink("loop", root.join("etc/loop")).unwrap();
         std::os::unix::fs::symlink("../../../../etc/resolv.conf", root.join("etc/up")).unwrap();
+        // As docker's daemon gives LinkTarget: through the links on the way too.
+        fs::create_dir_all(root.join("var/www/app/releases/5")).unwrap();
+        fs::create_dir_all(root.join("var/www/app/shared/storage")).unwrap();
+        std::os::unix::fs::symlink("releases/5", root.join("var/www/app/current")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../shared/storage",
+            root.join("var/www/app/releases/5/storage"),
+        )
+        .unwrap();
         let fd = open_dir(&root);
-        let follow = |p: &str| follow_destination(Path::new(p), true, |p| link_in(fd.as_fd(), p));
+        let follow = |p: &str| destination_in(fd.as_fd(), Path::new(p));
         if matches!(follow("etc/resolv.conf"), Err(ref e) if e.to_string().contains("Linux 5.6")) {
             return;
         }
@@ -1560,6 +1872,10 @@ mod tests {
             follow("etc/up").unwrap(),
             Path::new("run/systemd/resolve/stub-resolv.conf"),
             "climbing stops at the root"
+        );
+        assert_eq!(
+            follow("var/www/app/current/storage").unwrap(),
+            Path::new("var/www/app/shared/storage")
         );
         assert_eq!(follow("etc").unwrap(), Path::new("etc"));
         assert_eq!(follow("etc/absent").unwrap(), Path::new("etc/absent"));
@@ -1585,6 +1901,29 @@ mod tests {
             follow_destination(Path::new("abs"), false, links).unwrap(),
             Path::new("/srv/x")
         );
+        // Eleven links followed, as CopyInfoDestinationPath follows them; a twelfth is
+        // too many.
+        let chain = |length: usize| {
+            move |p: &Path| {
+                let n: usize = p
+                    .to_str()
+                    .unwrap()
+                    .trim_start_matches('l')
+                    .parse()
+                    .unwrap_or(0);
+                Ok((1..=length)
+                    .contains(&n)
+                    .then(|| PathBuf::from(format!("l{}", n + 1))))
+            }
+        };
+        assert_eq!(
+            follow_destination(Path::new("l1"), false, chain(11)).unwrap(),
+            Path::new("l12")
+        );
+        assert!(follow_destination(Path::new("l1"), false, chain(12))
+            .unwrap_err()
+            .to_string()
+            .contains("too many symlinks"));
     }
 
     #[test]

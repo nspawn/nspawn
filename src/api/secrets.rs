@@ -139,6 +139,16 @@ pub fn get(store: &Store, name: &str) -> Result<SecretInfo> {
         .with_context(|| format!("no secret named {name}"))
 }
 
+/// What `create` does with a name in use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replace {
+    Refuse,
+    Always,
+    /// Only when the content or the labels differ: the comparison is made here, as the
+    /// content is the service's to read.
+    IfChanged,
+}
+
 /// secret create: the content, encrypted for this host, under the state directory.
 /// A name in use is refused unless `replace` says to put this content in its place,
 /// which the machines that name it read at their next start.
@@ -147,7 +157,7 @@ pub async fn create(
     name: &str,
     content: &[u8],
     labels: BTreeMap<String, String>,
-    replace: bool,
+    replace: Replace,
 ) -> Result<()> {
     require_root("secret create")?;
     validate_secret_name(name)?;
@@ -159,8 +169,22 @@ pub async fn create(
     }
     let store = &ctx.store;
     let _lock = store.lock().await?;
-    if blob_path(store, name).exists() && !replace {
-        bail!("secret {name} exists already; remove it first");
+    if blob_path(store, name).exists() {
+        match replace {
+            Replace::Refuse => bail!("secret {name} exists already; remove it first"),
+            Replace::Always => {}
+            // One that cannot be read back (its key gone with the host it was made on)
+            // cannot hold the same content: it is replaced.
+            Replace::IfChanged => {
+                let same_labels = read_meta(store, name)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|m| m.labels == labels);
+                if same_labels && decrypt(store, name).is_ok_and(|c| c == content) {
+                    return Ok(());
+                }
+            }
+        }
     }
     let dir = store.secrets_dir();
     crate::store::create_private_dir(&dir.to_string_lossy())?;
@@ -248,16 +272,7 @@ pub fn materialize(store: &Store, record: &ImageRecord) -> Result<Vec<Bind>> {
                 secret.name
             );
         }
-        let plain = systemd_creds(
-            &[
-                "decrypt",
-                &format!("--name={}", secret.name),
-                &blob_path(store, &secret.name).to_string_lossy(),
-                "-",
-            ],
-            &[],
-        )
-        .with_context(|| format!("decrypting secret {}", secret.name))?;
+        let plain = decrypt(store, &secret.name)?;
         let path = dir.join(format!("{i}-{}", secret.name));
         let mut file = fs::OpenOptions::new()
             .write(true)
@@ -285,9 +300,22 @@ pub fn materialize(store: &Store, record: &ImageRecord) -> Result<Vec<Bind>> {
     Ok(binds)
 }
 
+fn decrypt(store: &Store, name: &str) -> Result<Vec<u8>> {
+    systemd_creds(
+        &[
+            "decrypt",
+            &format!("--name={name}"),
+            &blob_path(store, name).to_string_lossy(),
+            "-",
+        ],
+        &[],
+    )
+    .with_context(|| format!("decrypting secret {name}"))
+}
+
 /// Removes what `materialize` left for a machine.
 pub fn clear(machine: &str) {
-    let _ = fs::remove_dir_all(Path::new(RUN_DIR).join(machine));
+    let _ = crate::store::remove_tree(Path::new(RUN_DIR).join(machine));
 }
 
 /// Runs systemd-creds with `input` on its stdin; its stdout. Its warning about the

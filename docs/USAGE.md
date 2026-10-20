@@ -19,7 +19,10 @@ guides: [getting started](https://nspawn.org/docs/getting-started/),
 
 `run` is `pull` (or `create` from a local image with the same reference, as docker's
 `--pull missing` has it) followed by `start`, with the flags of both; `--pull always` asks
-the registry every time and `--pull never` never. A name that is taken is refused unless
+the registry every time and `--pull never` never. Made from a local image, the machine
+is checked against the start's flags as it is made, so that what docker refuses before
+it makes a container (a mount point given twice, an app with nothing to run) leaves no
+machine behind. A name that is taken is refused unless
 `--force`, which makes the machine anew. What follows the image replaces an app's
 command, as with docker (`nspawn run -it alpine sh`; after `--` as well). Like `docker
 run` it stays attached: the
@@ -27,7 +30,12 @@ machine's output follows until it ends (stdout and stderr together, a line at a 
 from nspawn's journal, so that `logs` shows it later too; with `--log-driver none`
 straight from the program, and nothing is kept), and `run` exits with the program's
 exit code, or 128 plus the signal it died of. Ctrl-C, SIGTERM, SIGHUP and SIGQUIT go to
-the program; a third Ctrl-C within a second leaves it running and returns. `-i` gives the
+the program; a third Ctrl-C within a second leaves it running and returns. Only a
+signal nspawn sent itself is known to be one (Ctrl-C without `-t`, `kill`, `stop`):
+systemd-nspawn ends with 255 whatever signal killed a program under its stub init, and
+with 1 for a program that is PID 1, so a crash, a kill from inside the machine or
+Ctrl-C with `-t` (the machine's terminal raises that one) gives 255 or 1 where docker
+gives 128 plus the signal. `-i` gives the
 program this standard input, `-t` a terminal (`-it` for a shell), `--rm` removes the
 machine once it ends (named volumes stay; an image it had to pull is kept under its own
 name when that name is free, as docker keeps images, and the machine gets a name of its
@@ -43,7 +51,10 @@ of each blob whether it was already present, is downloading or has been download
 on a terminal a bar follows every transfer under way. An image of hub.nspawn.org is
 verified before any layer comes down (see [Signed images](#signed-images)): `pull`
 says who signed it, refuses it without a valid signature, and `--no-verify` skips the
-check for that command, on `run` and `create` too.
+check for that command, on `run` and `create` too. Docker Hub's names read as docker
+reads them: `docker.io/alpine` is `docker.io/library/alpine`, and `index.docker.io` is
+`docker.io`. A reference by digest takes a sha256 digest; sha384 and sha512 ones are
+refused, in a Dockerfile's `FROM` before anything is built.
 
 `build` builds a Dockerfile the way `docker build` does, or runs mkosi on an mkosi
 configuration: a directory with a `Dockerfile` (or `dockerfile`, `Containerfile`), `-f`
@@ -70,7 +81,15 @@ network.host`), `--network`, `--add-host`, `--label`, `--shm-size`, `--ulimit`, 
 The context is the directory given, packed by the command line as the user with what
 `.dockerignore` (or `Dockerfile.dockerignore` next to the Dockerfile) excludes left out,
 everything owned by root, as docker sends it; `-` takes a context tar, or a Dockerfile
-with no context, from standard input.
+with no context, from standard input (`-f` names the Dockerfile in the tar, and is
+refused with a Dockerfile on standard input, as buildx refuses it). An ignore file that
+cannot be read fails the build, and so does a file of the context that fails partway
+through its reading; a file the user cannot open, or a socket, goes in as an empty
+file, as BuildKit sends it. The flags buildx keeps for compatibility and ignores
+(`--rm`, `--force-rm`, `-m`, `--memory-swap`, `-c`, `--cpu-period`, `--cpu-quota`,
+`--cpuset-cpus`, `--cpuset-mems`, `--compress`, `--squash`, `--isolation`,
+`--security-opt`) are taken and ignored here too, with buildx's warnings;
+`--cache-from` is taken and ignored with a note, the build cache being this host's.
 
 Every step runs in a root of its own, an overlay of the layers so far, and what it
 changes becomes a layer; a `RUN` runs under systemd-nspawn with the confinement of an
@@ -79,8 +98,10 @@ that files keep their owners), as PID 1, on a network namespace of the build's o
 default bridge. Steps that ran before with the same inputs (the instruction, the build
 arguments, the files of the context it copies) come from the build cache, so a build
 taken whole from it gives the same image ID. The output follows the reference's plain
-progress, a numbered line per step; a failing step ends the build with the
-reference's text, `process "/bin/sh -c false" did not complete successfully: exit code:
+progress, a numbered line per step, each output stream of a step clipped as the
+reference clips it (`[output clipped, log limit 2MiB reached]` past 2 MiB, or past 200
+KiB a second since the step began, and the last 256 KiB shown if the step fails); a
+failing step ends the build with the reference's text, `process "/bin/sh -c false" did not complete successfully: exit code:
 1`. `builder du` lists the cache, `builder prune` removes what no image takes too
 (`-a` all of it, `--filter until=`, `--keep-storage SIZE`), and `system df` and `system
 prune` count it. A build whose command line goes away (Ctrl-C) stops, its step killed
@@ -127,8 +148,11 @@ signal. The arguments given to `create` or `start` after `--`
 replace the image's cmd and follow its entrypoint, exactly as with docker (`nspawn start
 web -- nginx -T` still runs `/docker-entrypoint.sh` first); `--entrypoint PROGRAM` replaces
 the entrypoint and drops the image's cmd, so only the arguments given after it follow it
-(`--entrypoint /bin/sh` alone is a shell), and `--entrypoint ""` drops it. Both are remembered, like the command of a
-docker container; `start --image-command` goes back to the image's own. `-e VAR=value`
+(`--entrypoint /bin/sh` alone is a shell), and `--entrypoint ""` drops it, so that the
+arguments given run alone; an app left with nothing to run (that without arguments, or
+an image with neither an entrypoint nor a cmd) is refused with docker's `no command
+specified`. Both are remembered, like the command of a docker container; `start
+--image-command` goes back to the image's own. `-e VAR=value`
 adds environment on top of the image's (`-e VAR` copies it from your shell), and
 `-v SOURCE:TARGET[:ro]` mounts a host directory (which has to exist), or a named volume
 that nspawn keeps under `/var/lib/nspawn/volumes/NAME` and creates on first use with
@@ -147,7 +171,11 @@ Named volumes outlive the machines that use them, as in docker: removing a machi
 keeps them and says so. `nspawn volume ls` lists them with the machines whose records
 mount them, `volume create NAME` makes one ahead of its first use, and `volume rm` and
 `volume prune` remove the ones no machine uses; a volume still named by a machine is
-refused until that machine is started with other volumes (or `-v none`) or removed.
+refused until that machine is started with other volumes (or `-v none`) or removed. A
+volume made ahead is filled from the image of the first machine that takes it while it
+is empty, as docker fills it, but not while another machine that mounts it runs, where
+docker fills it anyway: the service would be writing where that machine can change
+things under it.
 
 ### Restart policies, limits and stats
 
@@ -171,7 +199,9 @@ much swap again (MemorySwapMax=), and no more, unless `--memory-swap` gives memo
 swap together: equal to `--memory` for no swap, larger for more, `-1` for swap without a
 bound (it needs `--memory`, and `0` goes back to the default). They are remembered like the ports and apply at the
 next start; `--restart no` and a limit of 0 remove them. `update` changes them without a
-start, like docker update: a running machine gets the new limits in its cgroup at once.
+start, like docker update: a running machine gets the new limits in its cgroup at once,
+and an unless-stopped machine stopped by hand stays off the boot list until its next start,
+its policy given again or not.
 `stats` shows what each running machine uses against them, its unit's cgroup read every
 second (`--no-stream` for one reading, `--json` for scripts). With a policy, `stop --no-wait`
 of an app also lets the stub init send the program SIGTERM and SIGHUP, since nobody
@@ -219,7 +249,9 @@ command, and then only once they are gone.
 `--env-file FILE` and `--label-file FILE` read variables and labels from files of
 KEY=VALUE lines as docker reads them (no quoting, no expansion, `#` comments, a KEY
 alone copied from here for a variable and left out for a label), before the `-e` and
-`--label` that follow and win. `--mount type=bind|volume|tmpfs,source=...,target=...`
+`--label` that follow and win. A variable's value may hold no newline or other control
+character but a tab, which docker passes on: the settings file that carries the
+machine's variables is read a line at a time. `--mount type=bind|volume|tmpfs,source=...,target=...`
 is the long form of `-v` and `--tmpfs` (`readonly`, `tmpfs-size`, `tmpfs-mode`; a
 volume needs its name, since nspawn has no anonymous volumes, and image, cluster or
 npipe mounts, `volume-subpath` and driver options are refused). `--ip ADDRESS` fixes the
@@ -245,7 +277,8 @@ HOST[:CONTAINER[:rwm]]` (a node, or a directory such as `/dev/dri`, whose nodes 
 allowed one by one; a CDI name such as `nvidia.com/gpu=all` instead, see "GPUs and
 CDI devices" below), `--gpus`, `--dns` and `--dns-search`, `--add-host HOST:IP` or `HOST=IP` (with
 `host-gateway`; the second form for IPv6 addresses), `--ulimit NAME=SOFT[:HARD]` (numbers or `unlimited`), `--oom-score-adj`, `--stop-signal` and
-`--stop-timeout` (what `stop` uses unless `-t` says otherwise), `--timezone MODE`
+`--stop-timeout` (what `stop` uses unless `-t` says otherwise; -1, as with docker, for no
+SIGKILL at all), `--timezone MODE`
 (systemd-nspawn's `Timezone=`: its default, `auto`, points `/etc/localtime` at the host's
 zone at every start, and `off` leaves the machine's own, so a zone set inside with
 `timedatectl` survives a restart; an app also takes `-e TZ=`), `--log-driver DRIVER`
@@ -279,8 +312,9 @@ Compose's `gpus:`, the devices of `deploy.resources.reservations` and CDI names 
 `devices:` do the same.
 
 The specs are read again at every start, so a driver update that rewrites them takes
-effect at the next start: their device nodes are bound into the machine and allowed in
-its cgroup, their libraries bound where they say, their variables set after the
+effect at the next start, one systemd makes itself included: their device nodes are
+bound into the machine and allowed in its cgroup (an unbuffered one, type `u`, bound and
+not allowed, as the reference has it), their libraries bound where they say, their variables set after the
 machine's own, and their hooks (`nvidia-cdi-hook update-ldcache`,
 `create-symlinks`) run just before the machine starts, with the OCI state of the
 machine on their standard input and its root mounted in a private mount namespace as
@@ -345,8 +379,9 @@ connection. A container ID is derived from the machine's name and creation time,
 stays across restarts and updates, and the tools that look for their own container in
 `/proc/self/mountinfo` find it, as nspawn binds the machine's `/etc/hostname` from a
 directory named after it, as docker does. mstack machines cannot take the socket yet.
-What one machine's clients hold at once is bounded: 64 connections, of which 16 may
-be logs or events streams (each runs a `journalctl`); more get 503. Stats streams count
+What one machine's clients hold at once is bounded: 64 connections, past which a new one
+is closed at once, of which 16 may be logs or events streams (each runs a `journalctl`),
+past which one gets 503. Stats streams count
 as connections only.
 
 ### Updates of the image a tag names
@@ -370,6 +405,11 @@ again with it, and so do compose services whose `depends_on` asks for `restart: 
 a compose machine's image label follows, so that `compose up` does not take it back.
 Built images, references pinned by digest, `run --rm` machines, booted machines (their
 state is their writable layer) and flat and mstack ones are left alone and say why.
+An update cut short (a crash, a stop of the service) is put back at the next run (not
+`--dry-run`) or start of the service, unless its new image was in place and the machine
+runs on it, which it keeps. Cut short before that, the machine does not start until it is
+put back, and `pull`, `create`, `run` and `build` refuse its name without `--force`,
+which lets the old machine go.
 
 `--dry-run` only says which machines have a newer image waiting (`pending`). The output
 is podman's table, `UNIT CONTAINER IMAGE POLICY UPDATED` with `false`, `pending`,
@@ -412,8 +452,8 @@ entry and the user's supplementary groups unless a group is given, which is then
 only one; a uid the passwd lacks runs with group 0 and `/` as home, as with docker and
 as the machine's own program does. `shell` opens machined's login session on booted machines and a plain
 shell on apps. `stop` sends the image's stop signal to the program of an app machine and
-SIGKILLs it after `--timeout` seconds, or asks a booted machine to power off; `--force`
-kills at once. `restart` is a stop and a start with the remembered options, `pause` and
+SIGKILLs it after `--timeout` seconds (a negative number waits for as long as it takes,
+as docker's `-t -1`), or asks a booted machine to power off; `--force` kills at once. `restart` is a stop and a start with the remembered options, `pause` and
 `unpause` freeze and thaw a machine's cgroup like docker pause (`ps` shows it paused),
 `top` lists a machine's processes, and `inspect` of a stopped machine shows the exit code
 of its last run. Stopping a machine that already ended is not an error: it only drops what
@@ -448,8 +488,12 @@ the name of the copy, and `DIR/.` copies the contents of DIR. What goes in belon
 root inside the machine, whatever user namespace it runs in; what comes out belongs to
 whoever ran `cp`, because the command line writes it. Paths inside the machine are
 resolved inside it, so a link there, absolute or not, never leads to the host; links
-are copied as links, devices, sockets and fifos are left out, and so are the kernel's
-file systems mounted inside a running machine (`/proc`, `/sys` and the like). The service and the
+are copied as links (a source that ends in `/` or `/.` names the directory a link
+leads to, on either side), devices, sockets and fifos are left out, and so are the kernel's
+file systems mounted inside a running machine (`/proc`, `/sys` and the like). A tree
+more than 2048 directories deep is refused with an error, where docker goes on: a
+machine can make its tree as deep as it likes. A file that fails to read while it is
+copied fails the copy and replaces nothing on the other side. The service and the
 command line exchange a tar stream, as docker's API does. Where SELinux enforces, a host
 directory mounted with `-v` keeps its own label, which the service may not be allowed to
 write (docker needs `:z` for the same); named volumes are nspawn's and always work.
@@ -459,7 +503,10 @@ write (docker needs `:z` for the same); named volumes are nspawn's and always wo
 One image, as many machines as you like: `nspawn create SOURCE NAME` makes another
 machine from an image that is already local, without touching the registry (a reference
 that is not local is pulled first, under its own name and with the same signature check,
-as `run` does). It shares the
+as `run` does). Named, SOURCE is taken as it is, a machine that ran included; given by
+its reference, it is an image of it that never ran, the last one pulled of several, as
+`run` takes it: a machine that ran has a backend, a mode and a network of its own, and
+the image is pulled beside it instead. It shares the
 source's layers and gets a writable layer, an address, settings and ports of its own
 (`-p`, `--network`); removing one never affects the others. A pulled image is a machine
 too, so `nspawn rm NAME` and `nspawn images rm NAME` remove the same thing: the record,
@@ -518,7 +565,9 @@ different keys all), and `--format` takes a Go template over docker's fields (`.
 `.Image`, `.Command`, `.CreatedAt`, `.RunningFor`, `.Ports`, `.State`, `.Status`,
 `.Labels`, `.Label "KEY"`, `.Mounts`, `.Networks`) and nspawn's (`.Mode`, `.Address`,
 `.OS`, `.Pid`), `table TEMPLATE` for aligned columns with headers, or `json` for a
-JSON object per line. `inspect -f TEMPLATE` prints a template over each object, a line
+JSON object per line. As in docker, `.Command` is cut to 20 columns and each of
+`.Mounts` to 15, and `.Image` leaves out a digest the reference is pinned to, unless
+`--no-trunc` is given. `inspect -f TEMPLATE` prints a template over each object, a line
 each, as docker inspect -f does, over the keys inspect prints (`{{.state}}`,
 `{{json .labels}}`, `{{index .addresses "front"}}`); the templates are Go's
 text/template, with docker's functions (`json`, `join`, `split`, `lower`, `upper`,
@@ -623,7 +672,9 @@ trusted_root = "/etc/nspawn/trusted_root.json"   # another Sigstore deployment; 
 A signature verifies when it was made with one of the keys, or keyless with the
 identity and issuer; a table names at least one of the two. `required = false` turns a
 missing signature into a note and lets the pull go on, while a signature that is there
-but does not verify still fails it. `rekor = false` trusts the key or certificate alone,
+but does not verify still fails it, one listed whose manifest or bundle cannot be fetched
+included; a valid one beside it is enough. An attestation (a bundle whose predicate type
+is not cosign's signature) is no signature. `rekor = false` trusts the key or certificate alone,
 without the log entry (a private deployment that keeps no log); a bundle still has to
 carry a log entry or a timestamp, which cosign always adds. A table for
 `hub.nspawn.org` replaces the built-in policy, and `verify = false` in a table turns
@@ -706,7 +757,7 @@ network is one of those it joins as `--network` would have made it. A machine on
 networking, on veth, sharing another's or without a network, and an mstack machine,
 cannot; nor can a machine leave the only network it has (connect another one first, or
 start it with `--network none`). Leaving the primary network makes the next one primary,
-where its published ports go from its next start.
+where its published ports go at once while it runs, from its next start otherwise.
 
 ### App machines
 

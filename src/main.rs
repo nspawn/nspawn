@@ -13,6 +13,7 @@ mod build;
 mod cdi;
 mod cli;
 mod client;
+mod columns;
 mod commands;
 mod completion;
 mod compose;
@@ -61,6 +62,7 @@ fn main() {
     clap_complete::CompleteEnv::with_factory(completion::command)
         .var(completion::VARIABLE)
         .complete();
+    api::copy::raise_open_files();
     run();
 }
 

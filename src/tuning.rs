@@ -694,8 +694,8 @@ impl Overrides {
             };
         }
         if let Some(timeout) = self.stop_timeout {
-            if timeout > 86_400 {
-                bail!("--stop-timeout {timeout}: a day at most");
+            if timeout > 86_400 && timeout != crate::policy::NO_STOP_TIMEOUT {
+                bail!("--stop-timeout {timeout}: a day at most, or -1 for no limit");
             }
             t.stop_timeout = Some(timeout);
         }
@@ -1068,6 +1068,20 @@ mod tests {
         );
         assert_eq!(t.sysctls["net.ipv4.ip_forward"], "1");
         assert_eq!((t.user.as_deref(), t.stop_timeout), (Some("1000"), Some(2)));
+        // A day at most, or none at all.
+        for (seconds, ok) in [
+            (86_400, true),
+            (86_401, false),
+            (crate::policy::NO_STOP_TIMEOUT, true),
+        ] {
+            let mut t = Tuning::default();
+            let applied = Overrides {
+                stop_timeout: Some(seconds),
+                ..Overrides::default()
+            }
+            .apply(&mut t);
+            assert_eq!(applied.is_ok(), ok, "{seconds}");
+        }
         assert_eq!(t.secrets[1].target, "/etc/key");
         assert!(Overrides {
             secrets: vec!["a:/x".into(), "b:/x".into()],

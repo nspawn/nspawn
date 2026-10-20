@@ -29,6 +29,12 @@ impl ImageRef {
             }
             _ => (default_registry.to_string(), input),
         };
+        // Docker Hub's old name is Docker Hub, as the reference's splitDockerDomain has it.
+        let registry = if registry == "index.docker.io" {
+            "docker.io".to_string()
+        } else {
+            registry
+        };
         let (rest, digest) = match rest.split_once('@') {
             Some((r, d)) => (r, Some(d.to_string())),
             None => (rest, None),
@@ -40,9 +46,13 @@ impl ImageRef {
         if repository.is_empty() {
             bail!("reference {input:?} has no repository name");
         }
-        if !repository.chars().all(|c| {
-            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-' | '/')
-        }) {
+        // And its official images are under library/.
+        let repository = if registry == "docker.io" && !repository.contains('/') {
+            format!("library/{repository}")
+        } else {
+            repository
+        };
+        if !valid_repository(&repository) {
             bail!("repository name {repository:?} may only contain lowercase letters, digits, '.', '_', '-' and '/'");
         }
         if let Some(d) = &digest {
@@ -51,12 +61,7 @@ impl ImageRef {
         // The reference grammar's tag: what a registry takes in a URL, and nothing that
         // ends a line of a script or a table.
         if let Some(t) = &tag {
-            let mut chars = t.chars();
-            let first = chars.next();
-            if t.len() > 128
-                || !first.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-                || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-            {
+            if !valid_tag(t) {
                 bail!("tag {t:?} may only contain letters, digits, '_', '.' and '-' (128 at most), not starting with '.' or '-'");
             }
         }
@@ -74,28 +79,19 @@ impl ImageRef {
     }
 
     /// An image reference as Dockerfiles and compose files write them: one that names no
-    /// registry comes from Docker Hub, an official one under library/, and Docker Hub's
-    /// old name is Docker Hub, as the reference's splitDockerDomain has it.
+    /// registry comes from Docker Hub, and a first component with an uppercase letter is
+    /// a registry, as the reference's splitDockerDomain has it.
     pub fn docker(image: &str) -> Result<Self> {
-        let (domain, rest) = match image.split_once('/') {
-            Some((first, rest))
-                if looks_like_registry(first) || first.chars().any(|c| c.is_ascii_uppercase()) =>
-            {
-                (first, rest)
+        let parsed = match image.split_once('/') {
+            Some((first, _)) if looks_like_registry(first) => ImageRef::parse(image, "docker.io"),
+            // A host by its case alone, which parse would take for a repository's first
+            // part: it is the registry given.
+            Some((first, _)) if first.chars().any(|c| c.is_ascii_uppercase()) => {
+                ImageRef::parse(image, first)
             }
-            _ => ("docker.io", image),
+            _ => ImageRef::parse(&format!("docker.io/{image}"), "docker.io"),
         };
-        let domain = if domain == "index.docker.io" {
-            "docker.io"
-        } else {
-            domain
-        };
-        let full = if domain == "docker.io" && !rest.contains('/') {
-            format!("docker.io/library/{rest}")
-        } else {
-            format!("{domain}/{rest}")
-        };
-        ImageRef::parse(&full, "docker.io").with_context(|| format!("image {image}"))
+        parsed.with_context(|| format!("image {image}"))
     }
 
     /// The reference as the registry client takes it, built from its parts: parsed from
@@ -231,6 +227,25 @@ pub fn validate_machine_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// A repository's characters as the reference takes them.
+pub fn valid_repository(repository: &str) -> bool {
+    !repository.is_empty()
+        && repository.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-' | '/')
+        })
+}
+
+/// The reference grammar's tag: what a registry takes in a URL, and nothing that ends a
+/// line of a script or a table.
+pub fn valid_tag(tag: &str) -> bool {
+    let mut chars = tag.chars();
+    tag.len() <= 128
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,8 +311,37 @@ mod tests {
                 "{image}"
             );
         }
-        // An upper-case first part is a registry, and a host is no repository name.
-        assert!(ImageRef::docker("Foo/bar").is_err());
+        // An upper-case first part is a registry, as splitDockerDomain takes it.
+        let host = ImageRef::docker("MyReg/app:1").unwrap();
+        assert_eq!(
+            (host.registry.as_str(), host.repository.as_str()),
+            ("MyReg", "app")
+        );
+        assert_eq!(host.to_string(), "MyReg/app:1");
+        assert!(ImageRef::docker("MyReg/App:1").is_err());
+        // The command line reads Docker Hub's names the same way.
+        for (image, want) in [
+            ("docker.io/alpine", "docker.io/library/alpine:latest"),
+            (
+                "index.docker.io/library/nginx",
+                "docker.io/library/nginx:latest",
+            ),
+            (
+                "registry-1.docker.io/library/nginx",
+                "registry-1.docker.io/library/nginx:latest",
+            ),
+        ] {
+            assert_eq!(ImageRef::parse(image, HUB).unwrap().to_string(), want);
+        }
+        let nginx = ImageRef::parse("nginx", "docker.io").unwrap();
+        assert_eq!(nginx.to_string(), "docker.io/library/nginx:latest");
+        assert_eq!(nginx.local_name(), "nginx");
+        assert_eq!(
+            ImageRef::parse("docker.io/alpine:3.22", HUB)
+                .unwrap()
+                .local_name(),
+            "alpine-3.22"
+        );
     }
 
     #[test]
@@ -342,6 +386,13 @@ mod tests {
         assert!(ImageRef::parse("fedora@sha256:zz", HUB).is_err());
         let upper = format!("fedora@sha256:{}", "AB".repeat(32));
         assert!(ImageRef::parse(&upper, HUB).is_err());
+    }
+
+    #[test]
+    fn listings_hold_only_what_a_reference_names() {
+        assert!(valid_tag("1.36") && valid_tag("_x") && !valid_tag("a\0") && !valid_tag(""));
+        assert!(valid_repository("library/busybox") && !valid_repository("a\0b"));
+        assert!(!valid_repository(""));
     }
 
     #[test]

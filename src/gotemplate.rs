@@ -3172,9 +3172,13 @@ fn json_encode(v: &V, out: &mut String) -> Result<(), String> {
         }
         V::Complex(..) => return Err("json: unsupported type: complex128".to_string()),
         V::Str(s) => json_string(s, out),
-        V::Map(m, _) => {
+        V::Map(m, strmap) => {
             out.push('{');
-            for (i, (k, e)) in m.iter().enumerate() {
+            // A row's labels are behind its Label method, no field of its JSON.
+            let fields = m
+                .iter()
+                .filter(|(k, _)| *strmap || k.as_str() != "LabelsMap");
+            for (i, (k, e)) in fields.enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
@@ -4733,35 +4737,33 @@ struct TabWriter {
     out: String,
 }
 
-/// Terminal columns of a character: none for combining marks and controls,
-/// two for East Asian wide and fullwidth forms.
-fn char_width(c: char) -> usize {
-    let u = c as u32;
-    if u < 0x20 || (0x7f..0xa0).contains(&u) {
-        return 0;
+/// docker/cli's formatter.Ellipsis: `s` cut to `max` columns, its last one an ellipsis,
+/// with the widths `columns::ellipsis_width` gives.
+pub fn ellipsis(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
     }
-    if matches!(u, 0x300..=0x36F | 0x483..=0x489 | 0x591..=0x5BD | 0x610..=0x61A | 0x64B..=0x65F
-        | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x200B..=0x200F | 0x20D0..=0x20FF | 0xFE00..=0xFE0F
-        | 0xFE20..=0xFE2F)
-    {
-        return 0;
+    let chars: Vec<char> = s.chars().collect();
+    if max == 1 {
+        return chars.first().map(char::to_string).unwrap_or_default();
     }
-    if matches!(u, 0x1100..=0x115F | 0x231A..=0x231B | 0x2329..=0x232A | 0x23E9..=0x23EC
-        | 0x23F0 | 0x23F3 | 0x25FD..=0x25FE | 0x2614..=0x2615 | 0x2648..=0x2653 | 0x267F
-        | 0x2693 | 0x26A1 | 0x26AA..=0x26AB | 0x26BD..=0x26BE | 0x26C4..=0x26C5 | 0x26CE
-        | 0x26D4 | 0x26EA | 0x26F2..=0x26F3 | 0x26F5 | 0x26FA | 0x26FD | 0x2705 | 0x270A..=0x270B
-        | 0x2728 | 0x274C | 0x274E | 0x2753..=0x2755 | 0x2757 | 0x2795..=0x2797 | 0x27B0
-        | 0x27BF | 0x2B1B..=0x2B1C | 0x2B50 | 0x2B55 | 0x2E80..=0x303E | 0x3041..=0x33FF
-        | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xA000..=0xA4CF | 0xA960..=0xA97F
-        | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE10..=0xFE19 | 0xFE30..=0xFE6F
-        | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x16FE0..=0x16FE4 | 0x17000..=0x18CFF
-        | 0x1B000..=0x1B2FF | 0x1F004 | 0x1F0CF | 0x1F18E | 0x1F191..=0x1F19A
-        | 0x1F200..=0x1F251 | 0x1F300..=0x1F64F | 0x1F680..=0x1F6FF | 0x1F7E0..=0x1F7EB
-        | 0x1F90C..=0x1F9FF | 0x1FA70..=0x1FAFF | 0x20000..=0x3FFFD)
-    {
-        return 2;
+    let mut ends = Vec::with_capacity(chars.len());
+    let mut width = 0;
+    for &c in &chars {
+        width += crate::columns::ellipsis_width(c);
+        ends.push(width);
     }
-    1
+    if width <= max {
+        return s.to_string();
+    }
+    for i in 0..chars.len().saturating_sub(1) {
+        if ends[i] < max && ends[i + 1] > max - 1 {
+            let mut out: String = chars[..=i].iter().collect();
+            out.push('\u{2026}');
+            return out;
+        }
+    }
+    s.to_string()
 }
 
 impl TabWriter {
@@ -4803,7 +4805,7 @@ impl TabWriter {
     }
 
     fn update_width(&mut self) {
-        self.cell.width += self.buf[self.pos..].chars().map(char_width).sum::<usize>();
+        self.cell.width += crate::columns::string_width(&self.buf[self.pos..]);
         self.pos = self.buf.len();
     }
 
@@ -4918,6 +4920,47 @@ impl TabWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ellipsis_cuts_as_docker_cuts() {
+        // formatter.Ellipsis of docker/cli v29.8.2, run on these.
+        for (text, max, cut) in [
+            (
+                "sh -c echo \"a\"\nexec sleep infinity",
+                20,
+                "sh -c echo \"a\"\nexec\u{2026}",
+            ),
+            (
+                "caf\u{e9} \u{4e2d}\u{6587} and more text here",
+                10,
+                "caf\u{e9} \u{4e2d}\u{6587}\u{2026}",
+            ),
+            ("\u{4e2d}\u{6587}abc", 4, "\u{4e2d}\u{2026}"),
+            ("\u{4e2d}\u{6587}abc", 2, "\u{4e2d}\u{6587}abc"),
+            ("\u{4e2d}\u{6587}abc", 3, "\u{4e2d}\u{2026}"),
+            (
+                "caf\u{e9}\nsleep 1000 and 2000 more",
+                20,
+                "caf\u{e9}\nsleep 1000 and\u{2026}",
+            ),
+            (
+                "cafe\u{301} with a combining mark here",
+                12,
+                "cafe\u{301} with \u{2026}",
+            ),
+            (
+                "\u{ff21}\u{ff22}\u{ff23}\u{ff24}",
+                5,
+                "\u{ff21}\u{ff22}\u{2026}",
+            ),
+            ("\u{e9}", 1, "\u{e9}"),
+            ("ab", 0, ""),
+            ("\u{1f600}\u{1f600}\u{1f600}", 4, "\u{1f600}\u{2026}"),
+            ("x\u{2026}yz\u{e9}", 4, "x\u{2026}y\u{2026}"),
+        ] {
+            assert_eq!(ellipsis(text, max), cut, "{text:?} {max}");
+        }
+    }
 
     // The expectations below are what Go 1.26's text/template with the reference's
     // functions gives for the same template and data, JSON integers decoded

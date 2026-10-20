@@ -258,6 +258,43 @@ pub fn project_for(
     Ok(project)
 }
 
+/// The project of `run JOB`, as docker compose's runProject loads it: whole, without
+/// its environment, the job (enabled with its profiles when they are off) and the jobs
+/// it depends on made services, the services they need selected, and only then the
+/// environment resolved, so that the job's env files are read and those of services it
+/// does not need are not. None when `job` is no job.
+pub fn job_project(
+    args: &ComposeArgs,
+    flags: &Flags,
+    host: &Host,
+    job: &str,
+    warn: Warn,
+) -> Result<Option<Project>, String> {
+    // The load before this one said what it had to say of the file.
+    let mut project = load_project(
+        args,
+        flags,
+        &ConfigArgs::default(),
+        host,
+        &[],
+        false,
+        &mut |_| {},
+    )?;
+    if !project.jobs.contains_key(job) {
+        let Some(disabled) = project.disabled_jobs.get(job) else {
+            return Ok(None);
+        };
+        let mut profiles = project.profiles.clone();
+        profiles.extend(super::project::profiles_of(disabled));
+        project = project.with_profiles(&profiles);
+    }
+    project.materialize_job(job)?;
+    // The resources the load kept stay, as runProject keeps them.
+    project = project.with_selected_services(&[job.to_string()], false)?;
+    project.resolve_services_environment(true, warn)?;
+    Ok(Some(project))
+}
+
 /// ToModel: the model as loaded, without its environment.
 fn load_raw(flags: &Flags, config: &ConfigArgs, host: &Host, warn: Warn) -> Result<Map, String> {
     let mut prepared = prepared(flags, config, host, Load::Model, warn)?;

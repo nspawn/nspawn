@@ -420,6 +420,11 @@ pub fn spawn(
         bail!("no command given");
     }
     let cgroup = leader_cgroup(leader);
+    // The machine may freeze the cgroup its init is in, which the helper joins: it would
+    // stop there, and the caller with it.
+    if cgroup.as_deref().is_some_and(cgroup_frozen) {
+        bail!("the machine froze the cgroup its init runs in: nothing runs in it until it thaws");
+    }
     let mut ns_fds = Vec::new();
     for (name, flag) in NAMESPACES {
         // Namespaces the machine shares with us (the host's network namespace for app
@@ -519,6 +524,16 @@ pub fn spawn(
             drop(ns_fds);
             drop(child_io);
             drop(report_w);
+            // A freeze after the look above stops the helper as well: it is given up on,
+            // SIGKILL ending even a frozen process.
+            if !report_within(&report_r, START_WAIT_MS) {
+                let _ = nix::sys::signal::kill(child, nix::sys::signal::Signal::SIGKILL);
+                let _ = waitpid(child, None);
+                bail!(
+                    "the command did not start within {} seconds: the machine may have frozen its own cgroup",
+                    START_WAIT_MS / 1000
+                );
+            }
             let (report, mut fds) = receive(&report_r);
             match report {
                 Some(Started::Command(pid)) => {
@@ -552,6 +567,20 @@ pub fn spawn(
         ForkResult::Child => {
             drop(ours);
             drop(report_r);
+            // The helper waits for the command as long as it runs, past a restart of the
+            // service: nothing else of the service may stay open with it, its lock and
+            // its connection to the bus least of all.
+            let mut keep: Vec<RawFd> = ns_fds.iter().map(|(_, _, fd)| fd.as_raw_fd()).collect();
+            if let ChildIo::Pipes {
+                stdin,
+                stdout,
+                stderr,
+            } = &child_io
+            {
+                keep.extend([stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()]);
+            }
+            keep.push(report_w.as_raw_fd());
+            close_all_but(&keep);
             let code = helper(
                 &ns_fds,
                 cgroup.as_deref(),
@@ -571,6 +600,31 @@ pub fn spawn(
 }
 
 /// The helper's one message, with the descriptors it attaches.
+/// How long the helper has to report the command started, in milliseconds.
+const START_WAIT_MS: u16 = 30_000;
+
+/// Whether the helper's report comes within `ms`.
+fn report_within(socket: &OwnedFd, ms: u16) -> bool {
+    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    loop {
+        let mut fds = [PollFd::new(socket.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::from(ms)) {
+            Ok(0) => return false,
+            Err(Errno::EINTR) => continue,
+            // A report, a helper gone, or an error: receive tells which.
+            _ => return true,
+        }
+    }
+}
+
+/// Whether the cgroup whose cgroup.procs is `procs` is frozen, by itself or an ancestor.
+fn cgroup_frozen(procs: &str) -> bool {
+    Path::new(procs)
+        .parent()
+        .and_then(|dir| std::fs::read_to_string(dir.join("cgroup.events")).ok())
+        .is_some_and(|events| events.lines().any(|line| line == "frozen 1"))
+}
+
 fn receive(socket: &OwnedFd) -> (Option<Started>, Vec<OwnedFd>) {
     let mut buf = [0u8; 4096];
     let mut fds = Vec::new();
@@ -1099,6 +1153,46 @@ fn limit_bounding_set(bounding: u64) -> nix::Result<()> {
 }
 
 /// Closes every descriptor from `first` on.
+/// Closes every descriptor from 3 up but those of `keep`.
+fn close_all_but(keep: &[RawFd]) {
+    let (gaps, rest) = closing_ranges(keep);
+    for (first, last) in gaps {
+        close_range(first, last);
+    }
+    close_from(rest);
+}
+
+/// What `close_all_but` closes: the ranges between the descriptors kept, and everything
+/// from the first one past them.
+fn closing_ranges(keep: &[RawFd]) -> (Vec<(libc::c_uint, libc::c_uint)>, libc::c_uint) {
+    let mut keep: Vec<libc::c_uint> = keep
+        .iter()
+        .filter(|&&fd| fd > 2)
+        .map(|&fd| fd as libc::c_uint)
+        .collect();
+    keep.sort_unstable();
+    keep.dedup();
+    let mut gaps = Vec::new();
+    let mut first: libc::c_uint = 3;
+    for fd in keep {
+        if fd > first {
+            gaps.push((first, fd - 1));
+        }
+        first = fd + 1;
+    }
+    (gaps, first)
+}
+
+fn close_range(first: libc::c_uint, last: libc::c_uint) {
+    // SAFETY: close_range(2) only closes descriptors of this process.
+    let closed = unsafe { libc::syscall(libc::SYS_close_range, first, last, 0) };
+    if closed != 0 {
+        for fd in first..=last {
+            unsafe { libc::close(fd as libc::c_int) };
+        }
+    }
+}
+
 fn close_from(first: libc::c_uint) {
     // SAFETY: close_range(2) only closes descriptors of this process.
     let closed = unsafe { libc::syscall(libc::SYS_close_range, first, libc::c_uint::MAX, 0) };
@@ -1246,6 +1340,39 @@ fn exit_code(status: WaitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_frozen_cgroup_is_seen_before_a_helper_joins_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let procs = tmp.path().join("cgroup.procs").display().to_string();
+        assert!(!cgroup_frozen(&procs), "no events file: not frozen");
+        std::fs::write(tmp.path().join("cgroup.events"), "populated 1\nfrozen 0\n").unwrap();
+        assert!(!cgroup_frozen(&procs));
+        std::fs::write(tmp.path().join("cgroup.events"), "populated 1\nfrozen 1\n").unwrap();
+        assert!(cgroup_frozen(&procs));
+    }
+
+    #[test]
+    fn a_helper_that_never_reports_is_given_up_on() {
+        let (ours, theirs) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        assert!(!report_within(&ours, 50));
+        tell(&theirs, &Started::Failed("x".into()), &[]);
+        assert!(report_within(&ours, 50));
+    }
+
+    #[test]
+    fn the_helper_keeps_only_what_it_was_given() {
+        assert_eq!(closing_ranges(&[]), (vec![], 3));
+        assert_eq!(closing_ranges(&[0, 1, 2]), (vec![], 3));
+        assert_eq!(closing_ranges(&[3, 4]), (vec![], 5));
+        assert_eq!(closing_ranges(&[9, 5, 1, 5, 6]), (vec![(3, 4), (7, 8)], 10));
+    }
 
     #[test]
     fn the_limits_of_a_process_are_read_from_proc() {

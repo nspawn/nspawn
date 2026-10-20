@@ -479,7 +479,7 @@ pub struct CreateArgs {
     /// always (also starts it at
     /// boot) or unless-stopped (like always, until nspawn stop). Remembered; applied at
     /// the next start.
-    #[arg(long, value_name = "POLICY", value_parser = crate::policy::parse_restart)]
+    #[arg(long, value_name = "POLICY", value_parser = crate::policy::RestartParser)]
     pub restart: Option<crate::policy::Restart>,
     /// Memory limit of the whole machine, like docker -m: 512m, 2g, and as much swap
     /// again unless --memory-swap says otherwise; 0 removes it. Remembered; applied at the
@@ -580,9 +580,10 @@ pub struct TuningArgs {
     /// Signal `stop` sends the program, instead of the image's (SIGTERM).
     #[arg(long, value_name = "SIGNAL")]
     pub stop_signal: Option<String>,
-    /// Seconds `stop` waits after the signal before SIGKILL, unless -t says otherwise.
-    #[arg(long, value_name = "SECONDS")]
-    pub stop_timeout: Option<u64>,
+    /// Seconds `stop` waits after the signal before SIGKILL, unless -t says otherwise; a
+    /// negative number waits for as long as the program takes, as docker's -1.
+    #[arg(long, value_name = "SECONDS", allow_negative_numbers = true)]
+    pub stop_timeout: Option<i64>,
     /// How systemd-nspawn sets the machine's /etc/localtime at each start: auto (its
     /// default, the host's zone), off (left alone, so a zone set inside stays), copy,
     /// bind, symlink or delete. Remembered.
@@ -760,11 +761,33 @@ pub struct DockerfileArgs {
     #[arg(long, hide = true)]
     pub attest: Vec<String>,
     /// docker build's (buildx's) compatibility flags, which Makefiles still give:
-    /// accepted and ignored, as buildx ignores them.
+    /// accepted and ignored, as buildx ignores them, three of them with its warning.
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", hide = true)]
     pub rm: Option<bool>,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", hide = true)]
+    pub force_rm: Option<bool>,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", hide = true)]
+    pub compress: Option<bool>,
     #[arg(long, hide = true)]
-    pub force_rm: bool,
+    pub isolation: Option<String>,
+    #[arg(long, hide = true)]
+    pub security_opt: Vec<String>,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", hide = true)]
+    pub squash: Option<bool>,
+    #[arg(long, short = 'm', hide = true)]
+    pub memory: Option<String>,
+    #[arg(long, allow_hyphen_values = true, hide = true)]
+    pub memory_swap: Option<String>,
+    #[arg(long, short = 'c', allow_hyphen_values = true, hide = true)]
+    pub cpu_shares: Option<i64>,
+    #[arg(long, allow_hyphen_values = true, hide = true)]
+    pub cpu_period: Option<i64>,
+    #[arg(long, allow_hyphen_values = true, hide = true)]
+    pub cpu_quota: Option<i64>,
+    #[arg(long, hide = true)]
+    pub cpuset_cpus: Option<String>,
+    #[arg(long, hide = true)]
+    pub cpuset_mems: Option<String>,
 }
 
 impl DockerfileArgs {
@@ -828,6 +851,24 @@ impl DockerfileArgs {
         ]
         .into_iter()
         .find_map(|(given, text)| given.then_some(text))
+    }
+
+    /// buildx's warnings for the ignored flags that have one.
+    pub fn warnings(&self) -> Vec<&'static str> {
+        [
+            (self.isolation.is_some(), "isolation flag is deprecated with BuildKit."),
+            (
+                !self.security_opt.is_empty(),
+                "security-opt flag is deprecated. \"RUN --security=insecure\" should be used with BuildKit.",
+            ),
+            (
+                self.squash.is_some(),
+                "experimental flag squash is removed with BuildKit. You should squash inside build using a multi-stage Dockerfile for efficiency.",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(given, text)| given.then_some(text))
+        .collect()
     }
 }
 
@@ -1032,7 +1073,7 @@ pub struct UpdateArgs {
     pub names: Vec<String>,
     /// Restart policy: no, on-failure[:N] (the count is not kept), always (also starts it
     /// at boot) or unless-stopped.
-    #[arg(long, value_name = "POLICY", value_parser = crate::policy::parse_restart)]
+    #[arg(long, value_name = "POLICY", value_parser = crate::policy::RestartParser)]
     pub restart: Option<crate::policy::Restart>,
     /// Memory limit of the whole machine: 512m, 2g, and as much swap again unless
     /// --memory-swap says otherwise; 0 removes it.
@@ -1139,6 +1180,10 @@ pub struct PsArgs {
     /// ...) and nspawn's (.Mode, .Address, .OS), "table TEMPLATE" for a table, or json.
     #[arg(long, value_name = "FORMAT")]
     pub format: Option<String>,
+    /// Give --format's .Command, .Mounts and .Image whole, which are cut as docker ps
+    /// cuts them otherwise.
+    #[arg(long)]
+    pub no_trunc: bool,
     #[command(flatten)]
     pub output: OutputArgs,
 }
@@ -1309,7 +1354,7 @@ pub struct StartOptions {
     /// always (also starts it at
     /// boot) or unless-stopped (like always, until nspawn stop). Remembered; applied at
     /// the next start.
-    #[arg(long, value_name = "POLICY", value_parser = crate::policy::parse_restart)]
+    #[arg(long, value_name = "POLICY", value_parser = crate::policy::RestartParser)]
     pub restart: Option<crate::policy::Restart>,
     /// Memory limit of the whole machine, like docker -m: 512m, 2g, and as much swap
     /// again unless --memory-swap says otherwise; 0 removes it. Remembered; applied at the
@@ -1348,9 +1393,15 @@ pub struct StopArgs {
     #[arg(long = "no-wait", action = clap::ArgAction::SetFalse)]
     pub wait: bool,
     /// App images: seconds to wait after the stop signal before terminating the machine
-    /// (default: the machine's --stop-timeout, else 10).
-    #[arg(long, short = 't', value_name = "SECONDS")]
-    pub timeout: Option<u64>,
+    /// (default: the machine's --stop-timeout, else 10); a negative number waits for as
+    /// long as it takes.
+    #[arg(
+        long,
+        short = 't',
+        value_name = "SECONDS",
+        allow_negative_numbers = true
+    )]
+    pub timeout: Option<i64>,
 }
 
 #[derive(Args, Debug)]
@@ -1359,9 +1410,15 @@ pub struct RestartArgs {
     #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
     /// App images: seconds to wait after the stop signal before terminating the machine
-    /// (default: the machine's --stop-timeout, else 10).
-    #[arg(long, short = 't', value_name = "SECONDS")]
-    pub timeout: Option<u64>,
+    /// (default: the machine's --stop-timeout, else 10); a negative number waits for as
+    /// long as it takes.
+    #[arg(
+        long,
+        short = 't',
+        value_name = "SECONDS",
+        allow_negative_numbers = true
+    )]
+    pub timeout: Option<i64>,
 }
 
 #[derive(Args, Debug)]
@@ -1426,8 +1483,8 @@ pub struct ExecArgs {
     #[arg(long, hide = true)]
     pub nsenter: bool,
     /// docker's: accepted with a note; the command gets the machine's capabilities.
-    #[arg(long, hide = true)]
-    pub privileged: bool,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", hide = true)]
+    pub privileged: Option<bool>,
     /// Command and arguments.
     #[arg(required = true, trailing_var_arg = true)]
     pub command: Vec<String>,
@@ -1576,6 +1633,33 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["nspawn", "start", "web", "--restart", "always:3"]).is_err());
         assert!(Cli::try_parse_from(["nspawn", "start", "web", "--restart", "sometimes"]).is_err());
+        // docker's -1 for a stop that waits as long as the program takes.
+        let Command::Stop(stop) = Cli::try_parse_from(["nspawn", "stop", "-t", "-1", "web"])
+            .unwrap()
+            .command
+        else {
+            panic!("not stop");
+        };
+        assert_eq!(
+            (stop.timeout, stop.names),
+            (Some(-1), vec!["web".to_string()])
+        );
+        let Command::Restart(restart) =
+            Cli::try_parse_from(["nspawn", "restart", "--timeout", "-1", "web"])
+                .unwrap()
+                .command
+        else {
+            panic!("not restart");
+        };
+        assert_eq!(restart.timeout, Some(-1));
+        let Command::Start(forever) =
+            Cli::try_parse_from(["nspawn", "start", "web", "--stop-timeout", "-1"])
+                .unwrap()
+                .command
+        else {
+            panic!("not start");
+        };
+        assert_eq!(forever.options.tuning.stop_timeout, Some(-1));
         // What Makefiles and docker habits give.
         assert!(
             Cli::try_parse_from(["nspawn", "build", "--rm", "--force-rm", "-t", "app", "."])
@@ -1583,6 +1667,44 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["nspawn", "build", "--rm=false", "-t", "app", "."]).is_ok());
         assert!(Cli::try_parse_from(["nspawn", "exec", "--privileged", "web", "true"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["nspawn", "exec", "--privileged=true", "web", "true"]).is_ok()
+        );
+        let legacy = Cli::try_parse_from([
+            "nspawn",
+            "build",
+            "--force-rm=true",
+            "-m",
+            "2g",
+            "--memory-swap",
+            "-1",
+            "-c",
+            "512",
+            "--cpu-period",
+            "100000",
+            "--cpu-quota",
+            "50000",
+            "--cpuset-cpus",
+            "0-3",
+            "--cpuset-mems",
+            "0",
+            "--compress",
+            "--squash",
+            "--isolation",
+            "default",
+            "--security-opt",
+            "seccomp=unconfined",
+            "-t",
+            "app",
+            ".",
+        ])
+        .unwrap();
+        let Command::Build(legacy) = legacy.command else {
+            panic!("not build");
+        };
+        assert_eq!(legacy.dockerfile.warnings().len(), 3);
+        assert!(!legacy.dockerfile.given(), "none of them picks the builder");
+        assert_eq!(legacy.tag, ["app"]);
         assert_eq!(start.memory, Some(64 << 20));
         assert_eq!(start.cpus, Some(0.5));
         assert_eq!(start.pids_limit, Some(100));

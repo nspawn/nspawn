@@ -223,7 +223,8 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     } else {
         draft.entrypoint = None;
     }
-    draft.cmd = None;
+    // An entrypoint given drops the image's command: only the arguments given follow it.
+    draft.cmd = request.entrypoint.as_ref().map(|_| Vec::new());
     if !request.command.is_empty() {
         for arg in &request.command {
             volume::reject_control_characters_but_tab(arg)?;
@@ -242,6 +243,8 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         draft.healthcheck = Some(hc);
     }
     request.tuning.apply(&mut draft.tuning)?;
+    // Refused when the machine is made, as docker refuses it, not at its first start.
+    crate::api::machines::duplicate_mount_points(&draft)?;
     // Refused here as start refuses them: a booted machine that kept them would never
     // start.
     if source.mode == Mode::Boot
@@ -253,6 +256,9 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
             "{} boots an init system; --user, --workdir and --init only apply to the program of an app image",
             request.name
         );
+    }
+    if source.mode == Mode::App && draft.effective_command().is_empty() {
+        bail!("{}", crate::api::machines::no_command(&request.name));
     }
     crate::api::dependencies::check(
         store,
@@ -320,8 +326,8 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     // install wrote the drop-in of an image; the machine's has its own dependencies,
     // policy and limits.
     crate::api::machines::rewrite_hooks(ctx, sd, &record).await?;
-    crate::api::events::emit(
-        "machine",
+    crate::api::events::emit_machine(
+        store,
         "create",
         &request.name,
         &[

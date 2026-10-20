@@ -430,8 +430,14 @@ struct Spec {
     devices: BTreeMap<String, Edits>,
 }
 
+/// How deep a spec may nest: far past any spec's few levels, and what `SPEC_STACK` holds.
+const SPEC_LEVELS: usize = 1000;
+
+/// The stack the specs are read on.
+const SPEC_STACK: usize = 64 << 20;
+
 fn parse_spec(data: &[u8]) -> Result<RawSpec, String> {
-    let value = crate::compose::yaml_to_json(data)
+    let value = crate::compose::yaml_to_json_within(data, SPEC_LEVELS)
         .map_err(|e| format!("failed to unmarshal CDI Spec: {e}"))?;
     match value {
         None | Some(serde_json::Value::Null) => Err("no Spec data".to_string()),
@@ -930,8 +936,9 @@ fn complete(d: &DeviceNode) -> Result<Node> {
             }
         }
     }
-    // An unbuffered character device ('u') is one to the kernel and to the cgroup.
-    if matches!(node.kind.as_str(), "b" | "c" | "u") {
+    // As the reference, an unbuffered character device ('u') gets no cgroup rule to open
+    // it: the machine has the node, which `device_paths` lets its unit make, and no more.
+    if matches!(node.kind.as_str(), "b" | "c") {
         node.permissions = match d.permissions.as_str() {
             "" => "rwm".to_string(),
             "none" => String::new(),
@@ -1085,9 +1092,10 @@ pub fn plan(tuning: &Tuning) -> Result<Option<Plan>> {
     if tuning.cdi_devices.is_empty() && tuning.gpus.is_empty() {
         return Ok(None);
     }
-    // The specs' YAML goes a level down the stack per level of nesting, as compose's.
+    // The specs' YAML goes a level down the stack per level of nesting: a stack for as
+    // deep as a spec may go.
     let registry = std::thread::Builder::new()
-        .stack_size(crate::compose::STACK)
+        .stack_size(SPEC_STACK)
         .spawn(Registry::load)
         .context("starting a thread")?
         .join()
@@ -1149,22 +1157,7 @@ pub fn devices(plan: &Plan, dir: &Path) -> Result<Vec<Device>> {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = node_source(node, dir, i);
         wanted.insert(path.clone());
-        let same = std::fs::symlink_metadata(&path).is_ok_and(|meta| {
-            let t = meta.file_type();
-            let kind = if t.is_block_device() {
-                "b"
-            } else if t.is_char_device() {
-                "c"
-            } else if t.is_fifo() {
-                "p"
-            } else {
-                ""
-            };
-            (kind == node.kind || (kind == "c" && node.kind == "u"))
-                && (kind == "p"
-                    || meta.rdev() == nix::sys::stat::makedev(node.major as u64, node.minor as u64))
-        });
-        if !same {
+        if !made_as(&path, node) {
             let _ = std::fs::remove_file(&path);
             make_node(&path, node)?;
         } else {
@@ -1180,6 +1173,49 @@ pub fn devices(plan: &Plan, dir: &Path) -> Result<Vec<Device>> {
         }
     }
     Ok(device_paths(plan, dir))
+}
+
+/// Whether the node at `path` is the one `node` describes: its kind ('u' a character
+/// device) and its numbers.
+fn made_as(path: &Path, node: &Node) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        let t = meta.file_type();
+        let kind = if t.is_block_device() {
+            "b"
+        } else if t.is_char_device() {
+            "c"
+        } else if t.is_fifo() {
+            "p"
+        } else {
+            ""
+        };
+        (kind == node.kind || (kind == "c" && node.kind == "u"))
+            && (kind == "p"
+                || meta.rdev() == nix::sys::stat::makedev(node.major as u64, node.minor as u64))
+    })
+}
+
+/// The cgroup rules (PATH, PERMISSIONS) `devices` needs to make the nodes it would make
+/// now: a start that systemd runs makes them under the device policy of its unit, whose
+/// drop-in names the numbers of the nodes it found the last time.
+pub fn rules_to_make(plan: &Plan, dir: &Path) -> Vec<(String, String)> {
+    plan.nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| !node.on_host && node.kind != "p")
+        .filter(|(i, node)| !made_as(&node_source(node, dir, *i), node))
+        .map(|(_, node)| {
+            let class = if node.kind == "b" { "block" } else { "char" };
+            let mut permissions = node.permissions.clone();
+            if !permissions.contains('m') {
+                permissions.push('m');
+            }
+            (
+                format!("/dev/{class}/{}:{}", node.major, node.minor),
+                permissions,
+            )
+        })
+        .collect()
 }
 
 fn node_kind(kind: &str) -> nix::sys::stat::SFlag {
@@ -1449,6 +1485,38 @@ pub async fn run_hooks(plan: &Plan, machine: &HookMachine<'_>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spec_nested_deeper_than_any_is_refused_on_a_small_stack() {
+        let nested = |levels: usize| format!("{}{}", "[".repeat(levels), "]".repeat(levels));
+        let parse = |text: String| {
+            std::thread::Builder::new()
+                .stack_size(SPEC_STACK)
+                .spawn(move || parse_spec(text.as_bytes()).err().unwrap_or_default())
+                .unwrap()
+                .join()
+                .unwrap()
+        };
+        // The document's mapping is a level of its own.
+        let deepest = parse(format!(
+            "cdiVersion: 0.6.0\nx: {}\n",
+            nested(SPEC_LEVELS - 1)
+        ));
+        assert!(!deepest.contains("nested"), "{deepest}");
+        let deeper = parse(format!("cdiVersion: 0.6.0\nx: {}\n", nested(SPEC_LEVELS)));
+        assert!(
+            deeper.contains("nested more than 1000 levels deep"),
+            "{deeper}"
+        );
+        // An alias takes its anchor's levels where it stands.
+        let aliased = format!(
+            "a: &a {}\nb: {}*a{}\n",
+            nested(600),
+            "[".repeat(500),
+            "]".repeat(500)
+        );
+        assert!(parse(aliased).contains("nested more than"));
+    }
 
     #[test]
     fn made_nodes_get_rules_systemd_takes() {
@@ -1833,7 +1901,8 @@ containerEdits:
         .unwrap();
         assert!(!made.on_host);
         assert_eq!(made.permissions, "");
-        // An unbuffered character device is one to the cgroup.
+        // An unbuffered character device gets no rule to open it, as the reference gives
+        // none; its unit may still make it.
         let unbuffered = complete(&DeviceNode {
             path: "/dev/u".into(),
             host_path: "/nonexistent/node".into(),
@@ -1844,7 +1913,12 @@ containerEdits:
         })
         .unwrap();
         assert!(!unbuffered.on_host);
-        assert_eq!(unbuffered.permissions, "rwm");
+        assert_eq!(unbuffered.permissions, "");
+        let plan = Plan {
+            nodes: vec![unbuffered],
+            ..Plan::default()
+        };
+        assert_eq!(device_paths(&plan, Path::new("/x"))[0].permissions, "m");
         assert!(complete(&DeviceNode {
             path: "/dev/z".into(),
             host_path: "/nonexistent/node".into(),

@@ -70,6 +70,7 @@ struct Source {
 
 pub enum Context {
     Dir(PathBuf),
+    /// A tar as standard input gave it, compressed or not.
     Tar(Vec<u8>),
 }
 
@@ -81,49 +82,114 @@ fn read_stdin() -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Bytes as docker's DetectCompression finds them: gzip, bzip2, xz and zstd undone,
-/// anything else as it is, a Dockerfile among them.
-fn decompressed(bytes: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::new();
-    let undone = if bytes.starts_with(&[0x1f, 0x8b, 0x08]) {
-        flate2::read::MultiGzDecoder::new(bytes.as_slice())
-            .read_to_end(&mut out)
-            .is_ok()
+/// How bytes are compressed, by their magic as buildx's isArchive and docker's
+/// DetectCompression tell it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compression {
+    None,
+    Gzip,
+    Bzip2,
+    Xz,
+    Zstd,
+}
+
+fn compression(bytes: &[u8]) -> Compression {
+    if bytes.starts_with(&[0x1f, 0x8b, 0x08]) {
+        Compression::Gzip
     } else if bytes.starts_with(b"BZh") {
-        bzip2::read::MultiBzDecoder::new(bytes.as_slice())
-            .read_to_end(&mut out)
-            .is_ok()
+        Compression::Bzip2
     } else if bytes.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
-        lzma_rs::xz_decompress(&mut bytes.as_slice(), &mut out).is_ok()
+        Compression::Xz
     } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        zstd::stream::read::Decoder::new(bytes.as_slice())
-            .and_then(|mut d| d.read_to_end(&mut out))
-            .is_ok()
+        Compression::Zstd
     } else {
-        false
-    };
-    if undone {
-        out
-    } else {
-        bytes
+        Compression::None
     }
 }
 
-/// Whether bytes are a tar: what `build -` reads as a context.
-fn is_tar(bytes: &[u8]) -> bool {
-    bytes.len() > 262 && &bytes[257..262] == b"ustar"
+/// The tar compressed `bytes` hold, undone as it is read: only the compressed bytes
+/// stay in memory, xz's excepted, which its decoder gives whole.
+fn tar_reader(bytes: &[u8]) -> Result<Box<dyn Read + '_>> {
+    Ok(match compression(bytes) {
+        Compression::None => Box::new(bytes),
+        Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(bytes)),
+        Compression::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(bytes)),
+        Compression::Xz => {
+            let mut out = Vec::new();
+            lzma_rs::xz_decompress(&mut &bytes[..], &mut out)
+                .map_err(|e| anyhow!("reading the context on standard input: {e}"))?;
+            Box::new(std::io::Cursor::new(out))
+        }
+        Compression::Zstd => Box::new(
+            zstd::stream::read::Decoder::new(bytes)
+                .context("reading the context on standard input")?,
+        ),
+    })
 }
 
-/// A file of a context tar.
+/// Whether bytes are a tar: what `build -` reads as a context. As buildx's isArchive
+/// with Go's archive/tar tells it: a first block that is a header, its checksum right,
+/// with or without a magic (a V7 tar has none).
+fn is_tar(bytes: &[u8]) -> bool {
+    let Some(block) = bytes.get(..512) else {
+        return false;
+    };
+    if block.iter().all(|&b| b == 0) {
+        return false;
+    }
+    let field = &block[148..156];
+    let trimmed = {
+        let start = field.iter().position(|&b| b != b' ' && b != 0);
+        let end = field.iter().rposition(|&b| b != b' ' && b != 0);
+        match (start, end) {
+            (Some(start), Some(end)) => &field[start..=end],
+            _ => &field[..0],
+        }
+    };
+    let digits = trimmed.split(|&b| b == 0).next().unwrap_or_default();
+    let value = if digits.is_empty() {
+        Some(0)
+    } else {
+        std::str::from_utf8(digits)
+            .ok()
+            .and_then(|d| u64::from_str_radix(d, 8).ok())
+    };
+    let Some(value) = value else {
+        return false;
+    };
+    let byte = |(i, &b): (usize, &u8)| if (148..156).contains(&i) { b' ' } else { b };
+    let unsigned: u64 = block.iter().enumerate().map(|e| u64::from(byte(e))).sum();
+    let signed: i64 = block
+        .iter()
+        .enumerate()
+        .map(|e| i64::from(byte(e) as i8))
+        .sum();
+    value == unsigned || i64::try_from(value).is_ok_and(|v| v == signed)
+}
+
+/// A path of the context as the reference looks it up there: cleaned, a `..` going no
+/// higher than the root.
+fn in_root(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    parts.join("/")
+}
+
+/// A file of a context tar, compressed or not.
 fn file_in_tar(tar: &[u8], name: &str) -> Result<Option<Vec<u8>>> {
-    let mut archive = tar::Archive::new(tar);
+    let name = in_root(name);
+    let mut archive = tar::Archive::new(tar_reader(tar)?);
     for entry in archive.entries().context("reading the context tar")? {
         let mut entry = entry.context("reading the context tar")?;
-        let path = entry
-            .path()?
-            .to_string_lossy()
-            .trim_start_matches("./")
-            .to_string();
+        let path = in_root(&entry.path()?.to_string_lossy());
         if path == name {
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes)?;
@@ -133,30 +199,39 @@ fn file_in_tar(tar: &[u8], name: &str) -> Result<Option<Vec<u8>>> {
     Ok(None)
 }
 
+/// What standard input holds, as buildx's loadInputs tells it: a context tar with the
+/// Dockerfile in it, compressed (a stream that does not undo is an error then) or not,
+/// or a Dockerfile with no context.
+fn stdin_source(input: Vec<u8>, file: Option<&str>) -> Result<Source> {
+    if compression(&input) != Compression::None || is_tar(&input) {
+        let name = file.unwrap_or("Dockerfile");
+        let dockerfile = file_in_tar(&input, name)?
+            .with_context(|| format!("the context on standard input has no {name}"))?;
+        return Ok(Source {
+            dockerfile,
+            dockerfile_path: None,
+            context: Context::Tar(input),
+        });
+    }
+    if file.is_some() {
+        bail!("ambiguous Dockerfile source: both stdin and flag correspond to Dockerfiles");
+    }
+    Ok(Source {
+        dockerfile: input,
+        dockerfile_path: None,
+        context: Context::Tar(Vec::new()),
+    })
+}
+
 fn source(args: &BuildArgs) -> Result<Source> {
     let file = args.dockerfile.file.as_deref();
     if args.directory == Path::new("-") {
-        let input = decompressed(read_stdin()?);
-        if is_tar(&input) {
-            let name = file.unwrap_or("Dockerfile");
-            let dockerfile = file_in_tar(&input, name)?
-                .with_context(|| format!("the context on standard input has no {name}"))?;
-            return Ok(Source {
-                dockerfile,
-                dockerfile_path: None,
-                context: Context::Tar(input),
-            });
-        }
-        // docker's GetContextFromReader: a Dockerfile on standard input is the
-        // Dockerfile, whatever -f says, but -f - has nothing left to read.
+        // As buildx's loadInputs: standard input is the context or the Dockerfile, and a
+        // Dockerfile there leaves -f nothing to name.
         if file == Some("-") {
-            bail!("build context is not an archive");
+            bail!("invalid argument: can't use stdin for both build context and dockerfile");
         }
-        return Ok(Source {
-            dockerfile: input,
-            dockerfile_path: None,
-            context: Context::Tar(Vec::new()),
-        });
+        return stdin_source(read_stdin()?, file);
     }
     let dir = args.directory.clone();
     if !dir.is_dir() {
@@ -201,12 +276,40 @@ fn excludes(dir: &Path, dockerfile: Option<&Path>) -> Result<Vec<String>> {
         p.with_file_name(name)
     });
     for path in beside.into_iter().chain([dir.join(".dockerignore")]) {
-        if let Ok(file) = File::open(&path) {
-            return crate::build::ignore::read_all(file)
-                .with_context(|| format!("reading {}", path.display()));
+        // One that is not there, or no file, is none, as BuildKit reads it; one that
+        // cannot be read fails the build, as its transfer would.
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        if file.metadata().is_ok_and(|m| m.is_dir()) {
+            continue;
         }
+        return crate::build::ignore::read_all(file)
+            .with_context(|| format!("reading {}", path.display()));
     }
     Ok(Vec::new())
+}
+
+/// A file's bytes, zeros once a read fails, the error kept: the entry keeps the size its
+/// header gives, so what marks a failed packing lands where the service reads a header.
+struct Reading<'a, R> {
+    file: R,
+    failed: &'a mut Option<std::io::Error>,
+}
+
+impl<R: Read> Read for Reading<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.failed.is_none() {
+            match self.file.read(buf) {
+                Err(e) if e.kind() != std::io::ErrorKind::Interrupted => *self.failed = Some(e),
+                read => return read,
+            }
+        }
+        buf.fill(0);
+        Ok(buf.len())
+    }
 }
 
 /// Packs the context into `out` as a tar, everything owned by root, modes and times
@@ -246,16 +349,13 @@ fn pack(dir: &Path, excludes: Vec<String>, out: impl Write) -> Result<()> {
                 }
                 nix::libc::S_IFREG => {
                     // What cannot be opened (a socket, a file the user may not read) goes
-                    // as an empty file, as the reference sends it. The size is the one
-                    // read here: a file that grows or shrinks meanwhile is cut or padded
-                    // to it, or the stream would go out of step.
+                    // as an empty file, as the reference sends it.
                     header.set_entry_type(tar::EntryType::Regular);
                     match File::open(dir.join(&st.path)) {
                         Ok(file) => {
                             let size = file.metadata()?.len();
                             header.set_size(size);
-                            let data = file.take(size).chain(std::io::repeat(0)).take(size);
-                            builder.append_data(&mut header, &st.path, data)?;
+                            append_file(&mut builder, &mut header, &st.path, file, size)?;
                         }
                         Err(_) => {
                             header.set_size(0);
@@ -269,13 +369,43 @@ fn pack(dir: &Path, excludes: Vec<String>, out: impl Write) -> Result<()> {
         },
     );
     if let Err(e) = walked {
-        // The builder ends the archive when dropped, and a clean end would pass for the
-        // whole context: a block that is no header makes the service fail instead.
-        let _ = builder.get_mut().write_all(&[0xff; 512]);
+        broken(&mut builder);
         return Err(e);
     }
     builder.into_inner()?.flush()?;
     Ok(())
+}
+
+/// Appends a regular file of `size` bytes, the size it had when looked at: one that grows
+/// or shrinks meanwhile is cut or padded to it, or the stream would go out of step. A
+/// read that fails fails the packing after the entry is written whole, zeros in place
+/// of what could not be read.
+fn append_file<W: Write>(
+    builder: &mut tar::Builder<W>,
+    header: &mut tar::Header,
+    path: &Path,
+    file: impl Read,
+    size: u64,
+) -> Result<()> {
+    let mut failed = None;
+    let data = Reading {
+        file: file.take(size),
+        failed: &mut failed,
+    }
+    .chain(std::io::repeat(0))
+    .take(size);
+    builder.append_data(header, path, data)?;
+    match failed {
+        Some(e) => Err(anyhow::Error::new(e).context(format!("reading {}", path.display()))),
+        None => Ok(()),
+    }
+}
+
+/// Marks a packing that failed: the builder ends the archive when dropped, and a clean
+/// end would pass for the whole context, so a block that is no header makes the service
+/// fail instead.
+fn broken<W: Write>(builder: &mut tar::Builder<W>) {
+    let _ = builder.get_mut().write_all(&[0xff; 512]);
 }
 
 /// --secret id=ID[,src=PATH][,env=VAR][,type=file|env]: the secret's bytes, read here as
@@ -323,6 +453,15 @@ fn secret_with(
             src.clone_from(&id);
         }
     }
+    // The file is looked at even when the variable is the one taken.
+    if !src.is_empty() {
+        let size = std::fs::metadata(&src)
+            .with_context(|| format!("failed to stat {src}"))?
+            .len();
+        if size > MAX_SECRET {
+            bail!("secret {id} too big. max size 500KiB");
+        }
+    }
     if !env.is_empty() {
         // An unset one is empty, as Go's os.Getenv gives it.
         return Ok((
@@ -331,12 +470,6 @@ fn secret_with(
                 .map(|v| v.into_encoded_bytes())
                 .unwrap_or_default(),
         ));
-    }
-    let size = std::fs::metadata(&src)
-        .with_context(|| format!("failed to stat {src}"))?
-        .len();
-    if size > MAX_SECRET {
-        bail!("secret {id} too big. max size 500KB");
     }
     let bytes = std::fs::read(&src).with_context(|| format!("reading {src}"))?;
     Ok((id, bytes))
@@ -351,6 +484,12 @@ pub async fn send(
     ignore_from: Option<PathBuf>,
     quiet: bool,
 ) -> Result<client::Dict> {
+    // An ignore file that cannot be read fails the build before the service has the
+    // context.
+    let excludes = match &context {
+        Context::Dir(dir) => excludes(dir, ignore_from.as_deref())?,
+        Context::Tar(_) => Vec::new(),
+    };
     let (read, write) = nix::unistd::pipe2(OFlag::O_CLOEXEC).context("creating a pipe")?;
     let watch = client.watch_jobs_quiet(quiet).await?;
     let job = client
@@ -363,14 +502,14 @@ pub async fn send(
         crate::api::copy::block_sigpipe();
         let out = File::from(write);
         match context {
-            Context::Dir(dir) => pack(&dir, excludes(&dir, ignore_from.as_deref())?, out),
+            Context::Dir(dir) => pack(&dir, excludes, out),
             Context::Tar(bytes) => {
                 let mut out = out;
-                // Undone already by `source`.
                 if bytes.is_empty() {
                     tar::Builder::new(&mut out).finish()?;
                 } else {
-                    out.write_all(&bytes)?;
+                    std::io::copy(&mut tar_reader(&bytes)?, &mut out)
+                        .context("reading the context on standard input")?;
                 }
                 Ok(())
             }
@@ -382,9 +521,16 @@ pub async fn send(
         .map_err(|_| anyhow!("packing the context stopped"))?;
     // The service stopping its reads ends the packing with a broken pipe: its own
     // outcome is the one to tell then.
+    let broken_pipe = |e: &anyhow::Error| {
+        e.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
+        })
+    };
     match local {
         Ok(()) => remote,
-        Err(local) if format!("{local:#}").contains("Broken pipe") => remote,
+        Err(local) if broken_pipe(&local) => remote,
         Err(local) => Err(local),
     }
 }
@@ -404,6 +550,9 @@ pub async fn dockerfile(args: BuildArgs, client: &Client, config: &Config) -> Re
         }
     }
     let quiet = d.quiet || d.progress.as_deref() == Some("quiet");
+    for warning in d.warnings() {
+        eprintln!("warning: {warning}");
+    }
     let source = source(&args)?;
     let mut options = client::registry_options(config);
     options.insert("dockerfile", Value::from(source.dockerfile.clone()));
@@ -558,6 +707,104 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unexpected key"));
+        // The file is looked at even when the variable wins.
+        let missing = dir.path().join("missing").display().to_string();
+        assert!(read(&format!("id=t,src={missing},env=TOKEN"))
+            .unwrap_err()
+            .to_string()
+            .contains("failed to stat"));
+        let big = dir.path().join("big");
+        std::fs::write(&big, vec![b'x'; MAX_SECRET as usize + 1]).unwrap();
+        assert_eq!(
+            read(&format!("id=t,src={},env=TOKEN", big.display()))
+                .unwrap_err()
+                .to_string(),
+            "secret t too big. max size 500KiB"
+        );
+    }
+
+    #[test]
+    fn a_file_that_fails_to_read_breaks_the_context() {
+        struct Failing(usize);
+        impl Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::Error::from_raw_os_error(nix::libc::EIO));
+                }
+                let n = buf.len().min(self.0);
+                buf[..n].fill(b'a');
+                self.0 -= n;
+                Ok(n)
+            }
+        }
+        // Sizes where the mark would have been read as the file's own bytes.
+        for (size, good) in [(1000, 0), (1536, 0), (300, 0), (9000, 8192), (2000, 0)] {
+            let mut out = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut out);
+                let mut header = tar::Header::new_gnu();
+                header.set_mode(0o644);
+                header.set_size(size);
+                let read = Failing(good);
+                let packed = append_file(&mut builder, &mut header, Path::new("f"), read, size);
+                assert!(format!("{:#}", packed.unwrap_err()).contains("reading f"));
+                broken(&mut builder);
+            }
+            let mut archive = tar::Archive::new(out.as_slice());
+            let failed = archive.entries().unwrap().any(|e| match e {
+                Err(_) => true,
+                Ok(mut entry) => std::io::copy(&mut entry, &mut std::io::sink()).is_err(),
+            });
+            assert!(
+                failed,
+                "{size} bytes, {good} read: the context passed for whole"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_input_is_the_context_or_the_dockerfile() {
+        let mut tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar);
+            // A V7 header, with no magic, is a tar too.
+            let mut header = tar::Header::new_old();
+            header.set_path("Dockerfile.prod").unwrap();
+            header.set_size(13);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, &b"FROM scratch\n"[..]).unwrap();
+            builder.finish().unwrap();
+        }
+        assert!(is_tar(&tar));
+        assert!(!is_tar(&[0; 1024]));
+        let mut wrong = tar.clone();
+        wrong[0] ^= 1;
+        assert!(!is_tar(&wrong), "its checksum is no longer right");
+        for name in [
+            "Dockerfile.prod",
+            "./Dockerfile.prod",
+            "sub/../Dockerfile.prod",
+            "/Dockerfile.prod",
+        ] {
+            let source = stdin_source(tar.clone(), Some(name)).unwrap();
+            assert_eq!(source.dockerfile, b"FROM scratch\n", "{name}");
+        }
+        assert!(
+            format!("{:#}", stdin_source(tar.clone(), None).err().unwrap())
+                .contains("has no Dockerfile")
+        );
+        let dockerfile = b"FROM scratch\n".to_vec();
+        let source = stdin_source(dockerfile.clone(), None).unwrap();
+        assert_eq!(source.dockerfile, dockerfile);
+        assert!(matches!(source.context, Context::Tar(ref t) if t.is_empty()));
+        assert_eq!(
+            stdin_source(dockerfile, Some("Dockerfile.prod"))
+                .err()
+                .unwrap()
+                .to_string(),
+            "ambiguous Dockerfile source: both stdin and flag correspond to Dockerfiles"
+        );
     }
     use clap::Parser;
     use std::os::unix::fs::PermissionsExt;
@@ -590,6 +837,21 @@ mod tests {
             excludes(&ctx, Some(&ctx.join("Dockerfile"))).unwrap(),
             ["src"]
         );
+        // A directory is no ignore file; one that cannot be read fails.
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(other.join(".dockerignore")).unwrap();
+        assert!(excludes(&other, None).unwrap().is_empty());
+        if !nix::unistd::geteuid().is_root() {
+            let closed = dir.path().join("closed");
+            std::fs::create_dir(&closed).unwrap();
+            std::fs::write(closed.join(".dockerignore"), "secret\n").unwrap();
+            std::fs::set_permissions(
+                closed.join(".dockerignore"),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+            assert!(excludes(&closed, None).is_err());
+        }
         let out = dir.path().join("ctx.tar");
         pack(&ctx, excluded, File::create(&out).unwrap()).unwrap();
         let mut names = Vec::new();
@@ -626,9 +888,23 @@ mod tests {
         lzma_rs::xz_compress(&mut tar.as_slice(), &mut xz).unwrap();
         let zst = zstd::encode_all(tar.as_slice(), 1).unwrap();
         for packed in [gz.finish().unwrap(), bz.finish().unwrap(), xz, zst] {
-            assert_eq!(decompressed(packed), tar);
+            assert_ne!(compression(&packed), Compression::None);
+            let mut undone = Vec::new();
+            tar_reader(&packed)
+                .unwrap()
+                .read_to_end(&mut undone)
+                .unwrap();
+            assert_eq!(undone, tar);
+            assert_eq!(
+                file_in_tar(&packed, "Dockerfile").unwrap().as_deref(),
+                Some(&b"FROM scratch\n"[..])
+            );
+            // Cut short, a compressed context is still one, and broken.
+            let cut = packed[..packed.len() / 2].to_vec();
+            let e = stdin_source(cut, Some("Dockerfile.prod")).err().unwrap();
+            assert!(!format!("{e:#}").contains("ambiguous"), "{e:#}");
         }
-        assert_eq!(decompressed(b"FROM scratch\n".to_vec()), b"FROM scratch\n");
+        assert_eq!(compression(b"FROM scratch\n"), Compression::None);
         assert_eq!(
             file_in_tar(&std::fs::read(&out).unwrap(), "Dockerfile")
                 .unwrap()

@@ -81,6 +81,13 @@ fn extend(
     let mut filename = file.to_string();
     let base = match base_file {
         Some(base_file) => {
+            // A file of a git repository or an OCI artifact is not fetched, as include's.
+            if paths::remote(&base_file) {
+                return Err(format!(
+                    "services.{name}.extends.file: {base_file}: {}",
+                    paths::REMOTE
+                ));
+            }
             let (mut base_services, base_resets) = load_base(
                 name, &reference, file, &base_file, opts, details, &tracker, warn,
             )?;

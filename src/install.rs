@@ -226,6 +226,7 @@ pub async fn ensure_replaceable(
     name: &str,
     force: bool,
 ) -> Result<()> {
+    ensure_no_pending_rollback(store, name, force)?;
     let existing_record = store.load_image(name)?;
     let existing_image = sd.list_images().await?.into_iter().any(|i| i.name == name);
     if existing_record.is_none() && !existing_image {
@@ -244,6 +245,20 @@ pub async fn ensure_replaceable(
     }
     if let Some(why) = crate::api::machines::unit_busy(sd, name).await? {
         anyhow::bail!("{why}");
+    }
+    Ok(())
+}
+
+/// Refuses a name an update cut short left a rollback of, its old machine's record and
+/// writable layer, unless `force` says to let them go: whatever is made under the name
+/// takes their place, the machine having no record meanwhile.
+pub fn ensure_no_pending_rollback(store: &Store, name: &str, force: bool) -> Result<()> {
+    let dir = store.rollback_dir(name);
+    if !force && dir.exists() {
+        anyhow::bail!(
+            "an update of {name} was cut short, and keeps its old machine in {}: nspawn auto-update puts it back, --force lets it go",
+            dir.display()
+        );
     }
     Ok(())
 }
@@ -310,5 +325,15 @@ pub async fn remove_existing(
         }
     }
     store.remove_machine_files(name)?;
+    forget_unit_ending(sd, name).await;
     Ok(())
+}
+
+/// Takes a machine's unit out of the failed state its last run left: systemd keeps a
+/// failed unit loaded with that run's ending, which the next machine of the name would
+/// otherwise show before it ever ran.
+pub async fn forget_unit_ending(sd: &Systemd, name: &str) {
+    let _ = sd
+        .reset_failed(&format!("systemd-nspawn@{name}.service"))
+        .await;
 }

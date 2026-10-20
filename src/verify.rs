@@ -204,11 +204,13 @@ pub struct Verified {
     pub bundle: String,
 }
 
-/// A bundle as fetched: the signature manifest it hung from, and its JSON.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A bundle as fetched: the signature manifest it hung from, and its JSON; or why it could
+/// not be read, which makes it one that does not verify.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Candidate {
     pub manifest_digest: String,
     pub json: String,
+    pub unreadable: Option<String>,
 }
 
 /// What a verified pull remembers.
@@ -392,6 +394,9 @@ fn verify_one(
     artifact: Sha256Hash,
     candidate: &Candidate,
 ) -> std::result::Result<Verified, String> {
+    if let Some(why) = &candidate.unreadable {
+        return Err(why.clone());
+    }
     let bundle =
         Bundle::from_json(&candidate.json).map_err(|e| format!("unreadable bundle: {e}"))?;
     let SignatureContent::DsseEnvelope(envelope) = &bundle.content else {
@@ -504,12 +509,14 @@ mod tests {
                     "sha256:7b5b8bc25c8392e980edcdefba7fcb85805ad18301b006b68183cf540ba30ed3"
                         .to_string(),
                 json: KEYLESS_BUNDLE.to_string(),
+                ..Default::default()
             },
             Candidate {
                 manifest_digest:
                     "sha256:aafdb47c55dcf12192e2818c588603a3c7285809d32a32eedda045a639372d3c"
                         .to_string(),
                 json: KEY_BUNDLE.to_string(),
+                ..Default::default()
             },
         ]
     }
@@ -600,6 +607,7 @@ mod tests {
         let relabelled = vec![Candidate {
             manifest_digest: candidates()[1].manifest_digest.clone(),
             json: json.to_string(),
+            ..Default::default()
         }];
         let verified = verify_bundles(&keys_only, KALI_DIGEST, &relabelled).unwrap();
         let expected = key_hint(&DerPublicKey::from_pem(HUB_KEY_PEM).unwrap());
@@ -608,6 +616,30 @@ mod tests {
             "{:?}",
             verified[0].signer
         );
+    }
+
+    #[test]
+    fn a_referrer_that_cannot_be_read_does_not_hide_a_signature() {
+        let keys_only = Policy {
+            identity: None,
+            ..Policy::hub()
+        };
+        let stale = Candidate {
+            manifest_digest: format!("sha256:{}", "e".repeat(64)),
+            unreadable: Some("fetching manifest: 404 Not Found".to_string()),
+            ..Default::default()
+        };
+        let mut all = vec![stale.clone()];
+        all.extend(candidates());
+        assert_eq!(
+            verify_bundles(&keys_only, KALI_DIGEST, &all).unwrap().len(),
+            1
+        );
+        // Alone, it is one that does not verify, and says why.
+        let e = verify_bundles(&keys_only, KALI_DIGEST, &[stale])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("eeeeeeeeeeee: fetching manifest: 404"), "{e}");
     }
 
     #[test]
@@ -670,6 +702,7 @@ mod tests {
                     "sha256:1111111111111111111111111111111111111111111111111111111111111111"
                         .to_string(),
                 json: v.to_string(),
+                ..Default::default()
             }]
         };
         let reason = |candidates: Vec<Candidate>| {
@@ -731,6 +764,7 @@ mod tests {
                 "sha256:2222222222222222222222222222222222222222222222222222222222222222"
                     .to_string(),
             json: "not json".to_string(),
+            ..Default::default()
         }]);
         assert!(e.contains("222222222222: unreadable bundle: "), "{e}");
     }

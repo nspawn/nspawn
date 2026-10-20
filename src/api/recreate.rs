@@ -63,6 +63,9 @@ pub enum Phase {
     /// The old machine is being made again from the rollback: its writable layer is back
     /// once the directory holds none.
     Restoring,
+    /// The new image failed its watch: the old machine comes back, whatever is found
+    /// running meanwhile.
+    Rejected,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -118,10 +121,23 @@ fn enabled_at_boot_now(name: &str) -> bool {
 }
 
 /// Refuses while the machine runs, starts or its unit is busy: nothing of it is moved
-/// under it.
+/// under it. A start systemd made of its own meanwhile (a dependent's Wants=, a restart
+/// policy, the boot) is stopped first: it waits in its hook, which refuses it while the
+/// update is under way, and systemd would go on trying.
 async fn ensure_down(store: &Store, sd: &crate::systemd::Systemd, name: &str) -> Result<()> {
     if store.is_starting(name) || sd.machine_exists(name).await? {
         bail!("{name} is running");
+    }
+    let unit = format!("systemd-nspawn@{name}.service");
+    let state = sd.unit_status(&unit).await?;
+    // A start waiting in systemd's queue for the machines it depends on too.
+    if state.busy() || state.restarting() || sd.start_queued(&unit).await? {
+        sd.stop_unit(&unit)
+            .await
+            .with_context(|| format!("stopping the start systemd made of {name}"))?;
+        if sd.machine_exists(name).await? {
+            bail!("{name} is running");
+        }
     }
     if let Some(why) = crate::api::machines::unit_busy(sd, name).await? {
         bail!("{why}");
@@ -155,29 +171,37 @@ pub struct Recreated {
 /// it to be up (healthy, when it has a healthcheck). On a failure the old machine is
 /// put back and started again; the error says what failed, and whether the old one is
 /// back.
+/// `looked_at` is the record the run decided on: the machine is updated only while it is
+/// still that one.
 pub async fn recreate(
     ctx: &Context,
-    name: &str,
+    looked_at: &ImageRecord,
     fetched: &Fetched,
     report: Report<'_>,
 ) -> Recreated {
     let mut restarted = false;
-    let result = update(ctx, name, fetched, report, &mut restarted).await;
+    let result = update(ctx, looked_at, fetched, report, &mut restarted).await;
     Recreated { result, restarted }
 }
 
 async fn update(
     ctx: &Context,
-    name: &str,
+    looked_at: &ImageRecord,
     fetched: &Fetched,
     report: Report<'_>,
     restarted: &mut bool,
 ) -> Result<()> {
+    let name = looked_at.name.as_str();
     let sd = ctx.sd().await?;
     let store = &ctx.store;
     let old = store
         .load_image(name)?
         .with_context(|| format!("no machine named {name}"))?;
+    // A run watches each machine for minutes: one changed meanwhile, or another machine
+    // of the name, is no longer what the image was looked up for.
+    if serde_json::to_value(&old)? != serde_json::to_value(looked_at)? {
+        bail!("it changed since this run looked at it; the next run updates it");
+    }
     if old.backend != BackendChoice::Overlay {
         bail!("{name} is not an overlay machine; only those are updated");
     }
@@ -217,15 +241,22 @@ async fn update(
             bail!("it changed while it was being updated; the next run updates it");
         }
         let manifest = store.load_manifest(name)?;
-        store.save_rollback(&old, &manifest)?;
         let mut progress = Progress {
             phase: Phase::Saved,
             running,
             enabled,
         };
-        write_progress(store, name, progress)?;
-        progress.phase = Phase::Aside;
-        write_progress(store, name, progress)?;
+        // Nothing of the machine is moved yet: a rollback that cannot be kept whole is
+        // let go, which the hook would refuse every start of it for.
+        let saved = store.save_rollback(&old, &manifest).and_then(|()| {
+            write_progress(store, name, progress)?;
+            progress.phase = Phase::Aside;
+            write_progress(store, name, progress)
+        });
+        if let Err(e) = saved {
+            let _ = store.forget_rollback(name);
+            return Err(e);
+        }
         let swap = match keep_writable_layer(store, name) {
             Ok(()) => swap(ctx, &old, fetched, backend, &mut progress, report).await,
             Err(e) => Err(e),
@@ -267,9 +298,11 @@ async fn update(
             // The machine is on its new image whatever happens here.
             let cleaned = async {
                 let _lock = store.lock().await?;
-                store.forget_rollback(name)?;
-                store.gc_layers()?;
-                store.gc_blobs()?;
+                tokio::task::block_in_place(|| {
+                    store.forget_rollback(name)?;
+                    store.gc_layers()?;
+                    store.gc_blobs()
+                })?;
                 Ok::<(), anyhow::Error>(())
             };
             if let Err(e) = cleaned.await {
@@ -282,6 +315,12 @@ async fn update(
         }
         Verdict::Failed(why) => {
             note(report, format!("{name}: {why}; putting the old image back"));
+            // Said first: whatever stops this now, the old machine is what comes back.
+            let mut rejected = progress(store, name);
+            rejected.phase = Phase::Rejected;
+            if let Err(e) = write_progress(store, name, rejected) {
+                note(report, format!("warning: {e:#}"));
+            }
             let force = StopRequest {
                 name: name.to_string(),
                 force: true,
@@ -395,7 +434,9 @@ async fn enable_if(ctx: &Context, name: &str, enabled: bool) -> Result<()> {
 fn put_back(store: &Store, name: &str, replace: bool) -> Result<()> {
     let aside = store.rollback_dir(name);
     let private = store.machines_private_dir().join(name);
-    for dir in ["upper", "work"] {
+    // The upper directory last: the old machine's data, whose place says how far a put
+    // back cut short got. Overlay's work directory is scratch.
+    for dir in ["work", "upper"] {
         let from = aside.join(dir);
         if !from.exists() {
             continue;
@@ -409,7 +450,7 @@ fn put_back(store: &Store, name: &str, replace: bool) -> Result<()> {
                     target.display()
                 );
             }
-            std::fs::remove_dir_all(&target)
+            crate::store::remove_tree(&target)
                 .with_context(|| format!("removing {}", target.display()))?;
         }
         std::fs::create_dir_all(&private)
@@ -436,6 +477,7 @@ pub async fn restore(ctx: &Context, name: &str, report: Report<'_>) -> Result<()
     };
     ensure_down(store, sd, name).await?;
     let progress = progress(store, name);
+    let aside = store.rollback_dir(name);
     let private = store.machines_private_dir().join(name);
     let untouched = private.exists()
         && store
@@ -447,7 +489,12 @@ pub async fn restore(ctx: &Context, name: &str, report: Report<'_>) -> Result<()
         Phase::Aside if untouched => put_back(store, name, false)?,
         // A restore cut short after its writable layer went back: the machine is the
         // old one but for its record and unit; making it again would take the layer.
-        Phase::Restoring if !has_layer_aside(store, name) && private.exists() => {
+        Phase::Restoring if !aside.join("upper").exists() && private.exists() => {
+            let work = aside.join("work");
+            if work.exists() {
+                crate::store::remove_tree(&work)
+                    .with_context(|| format!("removing {}", work.display()))?;
+            }
             store.record_image(&old)?;
             crate::api::machines::rewrite_hooks(ctx, sd, &old).await?;
             enable_if(ctx, name, progress.enabled).await?;
@@ -499,12 +546,24 @@ pub async fn restore(ctx: &Context, name: &str, report: Report<'_>) -> Result<()
 /// still running a moment after its start otherwise.
 async fn start_and_watch(ctx: &Context, name: &str, report: Report<'_>) -> Verdict {
     line(report, format!("{name}: starting on the new image"));
-    match crate::api::machines::start(ctx, &StartRequest::keep(name), report).await {
-        Ok(StartOutcome::Started) => {}
-        Ok(StartOutcome::Ended) => return Verdict::Failed(ended(ctx, name).await),
-        // Its policy brings it back, which says nothing of whether it works.
-        Ok(StartOutcome::Restarting) => return Verdict::Failed(ended(ctx, name).await),
-        Err(e) => return Verdict::Failed(format!("{e:#}")),
+    // systemd may have started it of its own once the swap let go of the lock (a
+    // dependent's Wants=): that start is on the new image as well, and is watched.
+    let unit = format!("systemd-nspawn@{name}.service");
+    let started_by_systemd = match ctx.sd().await {
+        Ok(sd) => {
+            sd.machine_exists(name).await.unwrap_or(false)
+                || sd.unit_status(&unit).await.is_ok_and(|s| s.busy())
+        }
+        Err(_) => false,
+    };
+    if !started_by_systemd {
+        match crate::api::machines::start(ctx, &StartRequest::keep(name), report).await {
+            Ok(StartOutcome::Started) => {}
+            Ok(StartOutcome::Ended) => return Verdict::Failed(ended(ctx, name).await),
+            // Its policy brings it back, which says nothing of whether it works.
+            Ok(StartOutcome::Restarting) => return Verdict::Failed(ended(ctx, name).await),
+            Err(e) => return Verdict::Failed(format!("{e:#}")),
+        }
     }
     let record = match ctx.store.load_image(name) {
         Ok(Some(r)) => r,
@@ -520,6 +579,11 @@ async fn start_and_watch(ctx: &Context, name: &str, report: Report<'_>) -> Verdi
             Ok(s) => s,
             Err(e) => return Verdict::Failed(format!("{e:#}")),
         };
+        // A start systemd made is still on its way for a while.
+        if summary.state == "starting" && Instant::now() <= deadline {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
         if summary.state != "running" && summary.state != "opening" {
             return Verdict::Failed(ended(ctx, name).await);
         }
@@ -678,6 +742,32 @@ mod tests {
         write_progress(&store, "web", restoring).unwrap();
         assert_eq!(progress(&store, "web").phase, Phase::Restoring);
         assert!(!has_layer_aside(&store, "web"));
+        // A new image that failed its watch says so before anything else happens.
+        let rejected = Progress {
+            phase: Phase::Rejected,
+            ..written
+        };
+        write_progress(&store, "web", rejected).unwrap();
+        assert_eq!(progress(&store, "web"), rejected);
+        // A name with a rollback kept is not made anew without --force.
+        let refused = crate::install::ensure_no_pending_rollback(&store, "web", false);
+        assert!(refused
+            .unwrap_err()
+            .to_string()
+            .contains("--force lets it go"));
+        crate::install::ensure_no_pending_rollback(&store, "web", true).unwrap();
+        crate::install::ensure_no_pending_rollback(&store, "other", false).unwrap();
+        // Let go of, it is gone from the list at once, the deletion after.
+        store.forget_rollback("web").unwrap();
+        assert!(store.rollbacks().is_empty());
+        let left = store.rollback_dir("web").with_file_name(".gone-web-1.1");
+        std::fs::create_dir_all(left.join("upper")).unwrap();
+        assert!(
+            store.rollbacks().is_empty(),
+            "what is being let go is no rollback"
+        );
+        store.sweep_trash();
+        assert!(!left.exists());
     }
 
     #[test]

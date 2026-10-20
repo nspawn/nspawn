@@ -66,7 +66,17 @@ impl<T> Drop for AbortOnDrop<T> {
 pub struct UnitWatch {
     unit: String,
     changes: zbus::fdo::PropertiesChangedStream,
-    main_pid: u32,
+    main: MainProcess,
+}
+
+/// What the watch of a run knows of the unit's main process, from its changes.
+#[derive(Debug, Default)]
+struct MainProcess {
+    /// When the main process of the unit's run before this one started (0 for none):
+    /// systemd announces that run's ending again as it takes the new start, a unit that
+    /// failed staying loaded with it.
+    earlier: u64,
+    pid: u32,
     code: i32,
     status: i32,
     result: String,
@@ -75,11 +85,89 @@ pub struct UnitWatch {
     rebooting: bool,
 }
 
+type Changed<'a> = HashMap<&'a str, zbus::zvariant::Value<'a>>;
+
+impl MainProcess {
+    fn of_earlier_run(&self, started_usec: Option<u64>) -> bool {
+        self.earlier != 0 && started_usec == Some(self.earlier)
+    }
+
+    /// The main PID read after the start, in case its signal came first, with when that
+    /// process started: the earlier run's is not this one's.
+    fn saw(&mut self, pid: u32, started_usec: u64) -> u32 {
+        if self.of_earlier_run(Some(started_usec)) {
+            return 0;
+        }
+        if pid != 0 && self.pid == 0 {
+            self.pid = pid;
+        }
+        pid
+    }
+
+    /// A change of the unit's Unit interface: the end of a reboot the unit did not follow.
+    fn unit_changed(&self, changed: &Changed<'_>) -> Option<Ending> {
+        let active = changed
+            .get("ActiveState")
+            .and_then(|v| <&str>::try_from(v).ok());
+        (self.rebooting && matches!(active, Some("inactive" | "failed"))).then(|| Ending {
+            code: CLD_EXITED,
+            status: REBOOT,
+            result: self.result.clone(),
+        })
+    }
+
+    /// A change of the unit's Service interface: the ending, once the main process of
+    /// this run ended. A reboot (133) that systemd restarts is not an end.
+    fn service_changed(&mut self, changed: &Changed<'_>) -> Option<Ending> {
+        let started = changed
+            .get("ExecMainStartTimestampMonotonic")
+            .and_then(|v| u64::try_from(v).ok());
+        if self.of_earlier_run(started) {
+            return None;
+        }
+        let get_i32 = |key: &str| changed.get(key).and_then(|v| i32::try_from(v).ok());
+        if let Some(pid) = changed
+            .get("ExecMainPID")
+            .and_then(|v| u32::try_from(v).ok())
+        {
+            if pid != 0 && pid != self.pid {
+                self.pid = pid;
+                self.code = 0;
+                self.status = 0;
+                self.rebooting = false;
+            }
+        }
+        if let Some(code) = get_i32("ExecMainCode") {
+            self.code = code;
+        }
+        if let Some(status) = get_i32("ExecMainStatus") {
+            self.status = status;
+        }
+        if let Some(result) = changed.get("Result").and_then(|v| <&str>::try_from(v).ok()) {
+            self.result = result.to_string();
+        }
+        if self.code == 0 || self.pid == 0 {
+            return None;
+        }
+        if self.code == CLD_EXITED && self.status == REBOOT {
+            self.code = 0;
+            self.rebooting = true;
+            return None;
+        }
+        Some(Ending {
+            code: self.code,
+            status: self.status,
+            result: self.result.clone(),
+        })
+    }
+}
+
 impl UnitWatch {
     pub async fn new(sd: &Systemd, unit: &str) -> Result<Self> {
         // systemd only sends a unit's changes while someone subscribed.
         sd.subscribe().await?;
         let path = sd.unit_path(unit).await?;
+        let earlier = sd.exec_main_start_usec(unit).await.unwrap_or(0);
         let proxy = zbus::fdo::PropertiesProxy::builder(sd.connection())
             .destination("org.freedesktop.systemd1")?
             .path(path)?
@@ -93,77 +181,32 @@ impl UnitWatch {
         Ok(UnitWatch {
             unit: unit.to_string(),
             changes,
-            main_pid: 0,
-            code: 0,
-            status: 0,
-            result: String::new(),
-            rebooting: false,
+            main: MainProcess {
+                earlier,
+                ..MainProcess::default()
+            },
         })
     }
 
-    /// The main PID read after the start, in case its signal came first.
-    pub fn saw(&mut self, pid: u32) {
-        if pid != 0 && self.main_pid == 0 {
-            self.main_pid = pid;
-        }
+    /// The main PID read after the start, in case its signal came first, with when that
+    /// process started; 0 when it is still the earlier run's.
+    pub fn saw(&mut self, pid: u32, started_usec: u64) -> u32 {
+        self.main.saw(pid, started_usec)
     }
 
-    /// Waits for the main process to end. A reboot (133) that systemd restarts is not an
-    /// end.
+    /// Waits for the main process of this run to end.
     pub async fn ended(&mut self) -> Result<Ending> {
         while let Some(signal) = self.changes.next().await {
             let Ok(args) = signal.args() else { continue };
-            let changed: &HashMap<&str, zbus::zvariant::Value<'_>> = args.changed_properties();
-            if args.interface_name().as_str() == "org.freedesktop.systemd1.Unit" {
-                let active = changed
-                    .get("ActiveState")
-                    .and_then(|v| <&str>::try_from(v).ok());
-                if self.rebooting && matches!(active, Some("inactive" | "failed")) {
-                    return Ok(Ending {
-                        code: CLD_EXITED,
-                        status: REBOOT,
-                        result: self.result.clone(),
-                    });
-                }
-                continue;
+            let changed: &Changed<'_> = args.changed_properties();
+            let ending = match args.interface_name().as_str() {
+                "org.freedesktop.systemd1.Unit" => self.main.unit_changed(changed),
+                "org.freedesktop.systemd1.Service" => self.main.service_changed(changed),
+                _ => None,
+            };
+            if let Some(ending) = ending {
+                return Ok(ending);
             }
-            if args.interface_name().as_str() != "org.freedesktop.systemd1.Service" {
-                continue;
-            }
-            let get_i32 = |key: &str| changed.get(key).and_then(|v| i32::try_from(v).ok());
-            if let Some(pid) = changed
-                .get("ExecMainPID")
-                .and_then(|v| u32::try_from(v).ok())
-            {
-                if pid != 0 && pid != self.main_pid {
-                    self.main_pid = pid;
-                    self.code = 0;
-                    self.status = 0;
-                    self.rebooting = false;
-                }
-            }
-            if let Some(code) = get_i32("ExecMainCode") {
-                self.code = code;
-            }
-            if let Some(status) = get_i32("ExecMainStatus") {
-                self.status = status;
-            }
-            if let Some(result) = changed.get("Result").and_then(|v| <&str>::try_from(v).ok()) {
-                self.result = result.to_string();
-            }
-            if self.code == 0 || self.main_pid == 0 {
-                continue;
-            }
-            if self.code == CLD_EXITED && self.status == REBOOT {
-                self.code = 0;
-                self.rebooting = true;
-                continue;
-            }
-            return Ok(Ending {
-                code: self.code,
-                status: self.status,
-                result: self.result.clone(),
-            });
         }
         bail!("lost the signals of {}", self.unit)
     }
@@ -500,8 +543,8 @@ pub async fn attach(
             bail!("{name} did not get its terminal or input ({reason}); was its unit changed by hand?");
         }
     }
-    let main_pid = sd.exec_main_pid(&unit).await.unwrap_or(0);
-    watch.saw(main_pid);
+    let started = sd.exec_main_start_usec(&unit).await.unwrap_or(0);
+    let main_pid = watch.saw(sd.exec_main_pid(&unit).await.unwrap_or(0), started);
     // As the start left it, with the flags of this run applied.
     let pid1 = ctx
         .store
@@ -534,13 +577,21 @@ impl Attached {
             ending = self.watch.ended() => ending,
             _ = caller_gone => {
                 if let Some(drain) = self.drain.take() {
-                    // The machine goes on alone; what it writes is read and dropped until
-                    // it ends, which keeps the service up meanwhile.
-                    std::thread::spawn(move || {
-                        let mut file = std::fs::File::from(drain);
-                        let mut buf = [0u8; 4096];
-                        while matches!(std::io::Read::read(&mut file, &mut buf), Ok(n) if n > 0) {}
-                    });
+                    // The machine goes on alone, and what it writes is read and dropped
+                    // until it ends: by a unit of its own, as a reader in the service
+                    // would end with a restart of the service, and the program with it at
+                    // its next write. Here only when systemd takes no such unit.
+                    let outside = match ctx.sd().await {
+                        Ok(sd) => drain_outside(sd, &self.name, drain).await,
+                        Err(_) => Err(drain),
+                    };
+                    if let Err(drain) = outside {
+                        std::thread::spawn(move || {
+                            let mut file = std::fs::File::from(drain);
+                            let mut buf = [0u8; 4096];
+                            while matches!(std::io::Read::read(&mut file, &mut buf), Ok(n) if n > 0) {}
+                        });
+                    }
                     let _ = self.watch.ended().await;
                     return 0;
                 }
@@ -581,6 +632,40 @@ impl Attached {
     }
 }
 
+/// Hands the read end of a machine's output that nobody reads any more to a transient
+/// unit that reads and drops it until the machine ends; gives it back when systemd
+/// takes no such unit.
+async fn drain_outside(sd: &Systemd, name: &str, drain: OwnedFd) -> Result<(), OwnedFd> {
+    let Ok(copy) = drain.try_clone() else {
+        return Err(drain);
+    };
+    let Ok(properties) = drain_unit(name, copy) else {
+        return Err(drain);
+    };
+    let unit = format!("nspawn-drain-{name}.service");
+    match sd.start_transient(&unit, properties, "fail").await {
+        Ok(()) => Ok(()),
+        Err(_) => Err(drain),
+    }
+}
+
+/// The unit of `drain_outside`: cat from the pipe to nowhere, gone once the pipe ends.
+fn drain_unit(name: &str, read: OwnedFd) -> Result<Vec<(String, OwnedValue)>> {
+    let mut properties = transient_service(
+        &format!("Output of nspawn machine {name}, read and dropped"),
+        &["/usr/bin/cat".to_string()],
+    );
+    let stdin = OwnedValue::try_from(zbus::zvariant::Fd::from(read))
+        .context("passing the output's pipe")?;
+    properties.push(("StandardInputFileDescriptor".into(), stdin));
+    for stream in ["StandardOutput", "StandardError"] {
+        let null = OwnedValue::try_from(zbus::zvariant::Value::from("null"))
+            .expect("plain values carry no file descriptor");
+        properties.push((stream.into(), null));
+    }
+    Ok(properties)
+}
+
 /// Properties of a transient unit that runs `argv` once and goes away when done.
 pub fn transient_service(description: &str, argv: &[String]) -> Vec<(String, OwnedValue)> {
     let value = |v: zbus::zvariant::Value<'_>| {
@@ -610,6 +695,80 @@ mod tests {
         })));
         drop(guard);
         assert!(rx.await.is_err(), "the task and what it held are gone");
+    }
+
+    fn service(pid: u32, started: u64, code: i32, status: i32) -> Changed<'static> {
+        use zbus::zvariant::Value;
+        HashMap::from([
+            ("ExecMainPID", Value::from(pid)),
+            ("ExecMainStartTimestampMonotonic", Value::from(started)),
+            ("ExecMainCode", Value::from(code)),
+            ("ExecMainStatus", Value::from(status)),
+        ])
+    }
+
+    #[test]
+    fn the_output_left_behind_is_read_by_a_unit_of_its_own() {
+        let (read, _write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
+        let properties = drain_unit("web", read).unwrap();
+        let get = |key: &str| {
+            properties
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.to_string())
+                .unwrap_or_default()
+        };
+        assert!(get("ExecStart").contains("/usr/bin/cat"));
+        assert!(properties
+            .iter()
+            .any(|(k, v)| k == "StandardInputFileDescriptor"
+                && matches!(&**v, zbus::zvariant::Value::Fd(_))));
+        assert_eq!(get("StandardOutput"), "\"null\"");
+        assert_eq!(get("StandardError"), "\"null\"");
+        assert_eq!(get("CollectMode"), "\"inactive-or-failed\"");
+    }
+
+    #[test]
+    fn the_ending_of_the_run_before_is_not_this_run_s() {
+        // The run before exited 3 at 1000 and left its unit failed; the start of this one
+        // announces that ending once more before its own process starts.
+        let mut main = MainProcess {
+            earlier: 1000,
+            ..MainProcess::default()
+        };
+        assert!(main
+            .service_changed(&service(41, 1000, CLD_EXITED, 3))
+            .is_none());
+        assert_eq!(
+            main.saw(41, 1000),
+            0,
+            "the earlier run's PID is not this one's"
+        );
+        assert!(main.service_changed(&service(57, 2000, 0, 0)).is_none());
+        assert_eq!(main.saw(57, 2000), 57);
+        let end = main
+            .service_changed(&service(57, 2000, CLD_EXITED, 0))
+            .unwrap();
+        assert_eq!((end.code, end.status), (CLD_EXITED, 0));
+
+        // A unit that never ran, or ran with nothing left: the first ending is the run's.
+        let mut main = MainProcess::default();
+        assert!(main.service_changed(&service(9, 500, 0, 0)).is_none());
+        let end = main
+            .service_changed(&service(9, 500, CLD_EXITED, 3))
+            .unwrap();
+        assert_eq!(end.status, 3);
+
+        // A reboot the unit restarts goes on to the next run.
+        let mut main = MainProcess::default();
+        assert!(main
+            .service_changed(&service(9, 500, CLD_EXITED, REBOOT))
+            .is_none());
+        assert!(main.service_changed(&service(12, 600, 0, 0)).is_none());
+        let end = main
+            .service_changed(&service(12, 600, CLD_EXITED, 0))
+            .unwrap();
+        assert_eq!(end.status, 0);
     }
 
     fn ending(code: i32, status: i32, result: &str) -> Ending {

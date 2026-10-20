@@ -41,12 +41,20 @@ mod yaml;
 
 /// The first YAML document of `input` as JSON, read by the YAML loader compose files go
 /// through: CDI specs are YAML or JSON. A null in a mapping is left out, as go-yaml
-/// leaves the field it would fill at its zero value.
-pub(crate) fn yaml_to_json(input: &[u8]) -> Result<Option<serde_json::Value>, String> {
+/// leaves the field it would fill at its zero value. A document deeper than `levels`,
+/// its aliases followed, is refused before anything is built, so that a small stack
+/// does.
+pub(crate) fn yaml_to_json_within(
+    input: &[u8],
+    levels: usize,
+) -> Result<Option<serde_json::Value>, String> {
     let mut docs = yaml::Documents::new(input);
     let Some(doc) = docs.next_document().map_err(|e| e.to_string())? else {
         return Ok(None);
     };
+    if doc.nodes[doc.root].height > levels {
+        return Err(format!("nested more than {levels} levels deep"));
+    }
     let (_, value) = yaml::read(doc).map_err(|e| match e {
         yaml::ReadError::Yaml(e) | yaml::ReadError::Key(e) => e,
     })?;
@@ -599,6 +607,23 @@ mod tests {
         assert_eq!(up(&["up"]), None);
         assert_eq!(up(&["up", "--remove-orphans"]), Some(true));
         assert_eq!(up(&["up", "--remove-orphans=false"]), Some(false));
+        // down and kill take a false too, which COMPOSE_REMOVE_ORPHANS does not undo.
+        for (words, want) in [
+            (&["down", "--remove-orphans=false"][..], Some(false)),
+            (&["kill", "--remove-orphans"], Some(true)),
+            (&["down"], None),
+        ] {
+            let args: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+            let Line::Run(args) = read(&args) else {
+                panic!("{words:?} is no run")
+            };
+            let got = match args.command {
+                Some(crate::compose::cli::ComposeCommand::Down(d)) => d.remove_orphans,
+                Some(crate::compose::cli::ComposeCommand::Kill(k)) => k.remove_orphans,
+                _ => panic!("{words:?}"),
+            };
+            assert_eq!(got, want, "{words:?}");
+        }
     }
 
     #[test]

@@ -764,6 +764,41 @@ impl ShellPattern {
         row
     }
 
+    /// The end of the match at the start of `text`: the tokens before the first star,
+    /// each one char, compared as they are, and only the rest matched against every
+    /// position of what follows them.
+    fn end_at_start(&self, text: &[char]) -> Option<usize> {
+        let fixed = self
+            .tokens
+            .iter()
+            .position(|t| *t == PatternToken::Star)
+            .unwrap_or(self.tokens.len());
+        if text.len() < fixed {
+            return None;
+        }
+        let same = self.tokens[..fixed]
+            .iter()
+            .zip(text)
+            .all(|(tok, c)| match tok {
+                PatternToken::Literal(l) => c == l,
+                PatternToken::AnyChar => *c != '\n',
+                PatternToken::Star => false,
+            });
+        if !same {
+            return None;
+        }
+        if fixed == self.tokens.len() {
+            return Some(fixed);
+        }
+        let rest = ShellPattern {
+            source: String::new(),
+            tokens: self.tokens[fixed..].to_vec(),
+            greedy: self.greedy,
+            anchored: self.anchored,
+        };
+        rest.first_ends(&text[fixed..])[0].map(|end| fixed + end)
+    }
+
     /// The leftmost match starting at or after `from`.
     fn find(&self, ends: &[Option<usize>], from: usize) -> Option<(usize, usize)> {
         if self.anchored {
@@ -872,9 +907,8 @@ fn trim_prefix(word: &str, value: &str, greedy: bool) -> Result<String, Error> {
     let re = ShellPattern::new(word, greedy, true)
         .map_err(|e| Error::new(format!("invalid pattern ({word}) in substitution: {e}")))?;
     let text: Vec<char> = value.chars().collect();
-    let ends = re.first_ends(&text);
-    Ok(match re.find(&ends, 0) {
-        Some((_, end)) => text[end..].iter().collect(),
+    Ok(match re.end_at_start(&text) {
+        Some(end) => text[end..].iter().collect(),
         None => value.to_string(),
     })
 }
@@ -1377,6 +1411,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(res.result, "something-v1.2.3.linux-arm64.tar.gz");
+    }
+
+    #[test]
+    fn a_prefix_is_matched_from_the_start_only() {
+        // Every pattern of these tokens on every text of these chars, as the whole
+        // table gives it.
+        let alphabet = ['a', 'b', '\n'];
+        let patterns = [
+            "", "a", "ab", "?", "*", "a*", "*a", "a*b", "?*?", "a**b", "*b*", "ab?",
+        ];
+        let mut texts = vec![String::new()];
+        for len in 1..=5 {
+            let mut more = Vec::new();
+            for t in texts.iter().filter(|t| t.chars().count() == len - 1) {
+                for c in alphabet {
+                    more.push(format!("{t}{c}"));
+                }
+            }
+            texts.extend(more);
+        }
+        for pattern in patterns {
+            for greedy in [false, true] {
+                let re = ShellPattern::new(pattern, greedy, true).unwrap();
+                for text in &texts {
+                    let chars: Vec<char> = text.chars().collect();
+                    let whole = re.find(&re.first_ends(&chars), 0).map(|(_, end)| end);
+                    assert_eq!(
+                        re.end_at_start(&chars),
+                        whole,
+                        "{pattern:?} {text:?} {greedy}"
+                    );
+                }
+            }
+        }
+        // A long literal prefix costs its length, not its length times the value's.
+        let value = "a".repeat(1_020_000);
+        let prefix = "a".repeat(60_000);
+        assert_eq!(trim_prefix(&prefix, &value, false).unwrap().len(), 960_000);
+        assert_eq!(trim_suffix(&prefix, &value, true).unwrap().len(), 960_000);
     }
 
     #[test]

@@ -113,13 +113,13 @@ pub fn prepare(dockerfile: &[u8], options: &Options, platform: &Platform) -> Res
 
     let count = stages.len();
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); count];
-    let mut images: Vec<(String, Vec<Range>)> = Vec::new();
+    let mut images: Vec<(usize, String, Vec<Range>)> = Vec::new();
     for (i, st) in stages.iter().enumerate() {
         for cmd in &st.commands {
             for source in command_sources(cmd, &lex, &names, count)? {
                 match source {
                     Source::Stage(k) => deps[i].push(k),
-                    Source::Image(n) => images.push((n, cmd.location().to_vec())),
+                    Source::Image(n) => images.push((i, n, cmd.location().to_vec())),
                     Source::Scratch => {}
                 }
             }
@@ -137,7 +137,7 @@ pub fn prepare(dockerfile: &[u8], options: &Options, platform: &Platform) -> Res
             check_image(name, &st.location)?;
         }
     }
-    for (name, location) in &images {
+    for (_, name, location) in &images {
         check_image(name, location)?;
     }
 
@@ -177,11 +177,23 @@ pub fn prepare(dockerfile: &[u8], options: &Options, platform: &Platform) -> Res
         }
         for (name, location) in &new_images {
             check_image(name, location)?;
+            check_digest(name, location)?;
         }
         if !new_deps {
             break reachable;
         }
     };
+    // What the target builds only: a stage it does not need is parsed, never fetched.
+    for &s in &reachable {
+        if let BaseRef::Image(name) = &infos[s].base {
+            check_digest(name, &stages[s].location)?;
+        }
+    }
+    for (s, name, location) in &images {
+        if reachable.contains(s) {
+            check_digest(name, location)?;
+        }
+    }
 
     // The reference pulls an image for the platform asked for; a stage FROM scratch or
     // FROM another stage gets the target's or that stage's platform whatever it asks.
@@ -546,6 +558,19 @@ fn check_image(name: &str, location: &[Range]) -> Result<(), Error> {
         Error::new(format!("failed to parse stage name {}: {e}", quote(name)))
             .with_location(location.to_vec())
     })
+}
+
+/// The store keeps an image by its sha256 digests: an image the build fetches by
+/// another is refused before anything is built.
+fn check_digest(name: &str, location: &[Range]) -> Result<(), Error> {
+    match name.rsplit_once('@') {
+        Some((_, digest)) if !digest.starts_with("sha256:") => Err(Error::new(format!(
+            "{}: an image is taken by a sha256 digest only",
+            quote(name)
+        ))
+        .with_location(location.to_vec())),
+        _ => Ok(()),
+    }
 }
 
 /// FROM --platform expanded with the meta ARGs and read.

@@ -36,6 +36,9 @@ pub struct Converge {
     pub build: Option<super::build::Flags>,
     /// --build: every service with a build section is built.
     pub force_build: bool,
+    /// When the machines were about to start, made and pulled and built: the output an
+    /// attached up shows begins there, as docker compose attaches before it starts them.
+    pub starting_at: std::cell::Cell<Option<std::time::SystemTime>>,
 }
 
 /// A local image a service runs.
@@ -44,6 +47,8 @@ pub struct Image {
     /// The record nspawn keeps it under, which machines are made from.
     pub name: String,
     pub digest: String,
+    /// Its own command, which an empty entrypoint of the file keeps.
+    pub cmd: Vec<String>,
 }
 
 fn s<'a>(map: &'a Map, key: &str) -> &'a str {
@@ -108,27 +113,26 @@ pub fn dependencies(service: &Map) -> Vec<String> {
 pub fn check_refusals(project: &Project) -> Result<()> {
     let mut lines = Vec::new();
     for refusal in &project.refused {
-        let applies = if refusal.service.is_empty() {
-            // The name may hold dots itself: a resource applies when the path goes on
-            // from its whole name.
-            let (kind, rest) = refusal.path.split_once('.').unwrap_or((&refusal.path, ""));
-            let named = |map: &Map| {
-                map.keys().any(|k| {
-                    rest == k
-                        || rest
-                            .strip_prefix(k.as_str())
-                            .is_some_and(|r| r.starts_with('.'))
-                })
-            };
-            match kind {
-                "networks" => named(&project.networks),
-                "volumes" => named(&project.volumes),
-                "secrets" => named(&project.secrets),
-                "configs" => named(&project.configs),
+        // A job's triggers say when it runs, not what it runs as: run takes a scheduled
+        // job as docker compose does, and up refuses one with reject_scheduled_jobs.
+        if refusal.path == "triggers" || refusal.path.starts_with("triggers.") {
+            continue;
+        }
+        let applies = if !refusal.service.is_empty() {
+            project.services.contains_key(&refusal.service)
+        } else if let Some((kind, name)) = &refusal.resource {
+            // A resource the services to run use, by its whole name.
+            match kind.as_str() {
+                "networks" => project.networks.contains_key(name),
+                "volumes" => project.volumes.contains_key(name),
+                "secrets" => project.secrets.contains_key(name),
+                "configs" => project.configs.contains_key(name),
+                "models" => project.models.contains_key(name),
                 _ => true,
             }
         } else {
-            project.services.contains_key(&refusal.service)
+            // Models as a whole only when a service to run uses one.
+            refusal.path != "models" || !project.models.is_empty()
         };
         if applies {
             lines.push(refusal.line.clone());
@@ -140,19 +144,87 @@ pub fn check_refusals(project: &Project) -> Result<()> {
     Ok(())
 }
 
-pub async fn up(e: &mut Engine<'_>, a: &UpArgs) -> Result<()> {
-    if a.detach && (a.abort_on_container_exit || a.abort_on_container_failure) {
-        bail!("--abort-on-container-exit and --abort-on-container-failure are incompatible with --detach");
+/// rejectScheduledJobs: a project that schedules jobs is not brought up, as nothing
+/// would run them on their schedule.
+pub fn reject_scheduled_jobs(project: &Project) -> Result<()> {
+    let names: Vec<&str> = project
+        .jobs
+        .iter()
+        .filter(|(_, job)| {
+            job.get(&["triggers", "schedule"])
+                .and_then(Value::as_seq)
+                .is_some_and(|s| !s.is_empty())
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !names.is_empty() {
+        bail!(
+            "scheduled jobs are not supported in this version: {}",
+            names.join(", ")
+        );
     }
-    if a.force_recreate && a.no_recreate {
-        bail!("--force-recreate and --no-recreate are incompatible");
+    Ok(())
+}
+
+/// validateFlags: the combinations of up's flags docker compose refuses, in its order
+/// and its words.
+pub fn validate_flags(a: &UpArgs) -> Result<()> {
+    if a.wait_timeout.is_some_and(|t| t < 0) {
+        bail!("--wait-timeout must be a non-negative integer");
     }
-    if a.no_start && a.wait {
-        bail!("--no-start and --wait are incompatible");
+    // --exit-code-from stops everything when one ends, unless failures alone do.
+    let cascade_stop =
+        a.abort_on_container_exit || (a.exit_code_from.is_some() && !a.abort_on_container_failure);
+    if cascade_stop && a.abort_on_container_failure {
+        bail!("--abort-on-container-failure cannot be combined with --abort-on-container-exit");
+    }
+    if a.wait && (a.attach_dependencies || cascade_stop || !a.attach.is_empty()) {
+        bail!("--wait cannot be combined with --abort-on-container-exit, --attach or --attach-dependencies");
     }
     if a.build && a.no_build {
         bail!("--build and --no-build are incompatible");
     }
+    let detach = a.detach || a.wait;
+    if detach
+        && (a.attach_dependencies
+            || cascade_stop
+            || a.abort_on_container_failure
+            || !a.attach.is_empty()
+            || a.watch)
+    {
+        if a.wait {
+            bail!("--wait cannot be combined with --abort-on-container-exit, --abort-on-container-failure, --attach, --attach-dependencies or --watch");
+        }
+        bail!("--detach cannot be combined with --abort-on-container-exit, --abort-on-container-failure, --attach, --attach-dependencies or --watch");
+    }
+    if a.renew_anon_volumes && a.no_recreate {
+        bail!("--no-recreate and --renew-anon-volumes are incompatible");
+    }
+    if a.force_recreate && a.no_recreate {
+        bail!("--force-recreate and --no-recreate are incompatible");
+    }
+    if a.always_recreate_deps && a.no_recreate {
+        bail!("--always-recreate-deps and --no-recreate are incompatible");
+    }
+    if a.no_build && a.watch {
+        bail!("--no-build and --watch are incompatible");
+    }
+    Ok(())
+}
+
+pub async fn up(e: &mut Engine<'_>, a: &UpArgs) -> Result<()> {
+    validate_flags(a)?;
+    let remove_orphans = a
+        .remove_orphans
+        .unwrap_or_else(|| removes_orphans(e.project()));
+    let ignore_orphans = ignores_orphans(e.project());
+    if ignore_orphans && remove_orphans {
+        bail!("cannot combine COMPOSE_IGNORE_ORPHANS and --remove-orphans");
+    }
+    if !a.attach.is_empty() && a.attach_dependencies {
+        bail!("cannot combine --attach and --attach-dependencies");
+    }
+    reject_scheduled_jobs(e.project())?;
     let jobs: Vec<&str> = e.project().jobs.keys().map(String::as_str).collect();
     if !jobs.is_empty() {
         e.warn(format!(
@@ -169,43 +241,42 @@ pub async fn up(e: &mut Engine<'_>, a: &UpArgs) -> Result<()> {
         force_recreate: a.force_recreate,
         no_recreate: a.no_recreate,
         always_recreate_deps: a.always_recreate_deps,
-        // COMPOSE_REMOVE_ORPHANS only when the flag was not given, false included.
-        remove_orphans: a.remove_orphans.unwrap_or_else(|| {
-            e.project()
-                .environment
-                .get("COMPOSE_REMOVE_ORPHANS")
-                .is_some_and(|v| string_to_bool(v))
-        }),
+        remove_orphans,
         scale: scale_overrides(&a.scale)?,
         pull: a.pull.clone(),
         quiet_pull: a.quiet_pull,
         no_deps: a.no_deps,
         start: !a.no_start,
-        wait: a.wait,
+        // --no-start creates and ends there, --wait or not.
+        wait: a.wait && !a.no_start,
         wait_timeout: a
             .wait_timeout
             .filter(|t| *t > 0)
             .map(|t| Duration::from_secs(t as u64)),
-        timeout: a.timeout.map(|t| t.max(0) as u64),
+        timeout: a.timeout.map(crate::policy::stop_seconds),
         build: (!a.no_build).then_some(flags),
         force_build: a.build,
+        ..Default::default()
     };
-    // Attached output starts before anything starts, as docker compose attaches first.
-    let since = std::time::SystemTime::now();
     let machines = converge_project(e, &converge).await?;
     if a.detach || a.no_start || a.wait {
         return Ok(());
     }
+    let since = converge
+        .starting_at
+        .get()
+        .unwrap_or_else(std::time::SystemTime::now);
     super::logs::attach(e, a, &machines, since).await
 }
 
 pub async fn create(e: &mut Engine<'_>, a: &CreateArgs) -> Result<()> {
-    if a.force_recreate && a.no_recreate {
-        bail!("--force-recreate and --no-recreate are incompatible");
-    }
     if a.build && a.no_build {
         bail!("--build and --no-build are incompatible");
     }
+    if a.force_recreate && a.no_recreate {
+        bail!("--force-recreate and --no-recreate are incompatible");
+    }
+    reject_scheduled_jobs(e.project())?;
     let converge = Converge {
         services: a.service.clone(),
         force_recreate: a.force_recreate,
@@ -350,10 +421,39 @@ fn found<'a>(local: &'a [Local], full: &str) -> Option<&'a Local> {
     })
 }
 
-/// compose's utils.StringToBool: strconv.ParseBool of the lowered text, false when it
-/// is none.
+/// isOrphaned: a machine of a service the file no longer has, or a one-off (a job's
+/// among them) that ended; one that runs is somebody's run session.
+fn is_orphan(m: &Machine, known: &BTreeSet<&String>) -> bool {
+    match m.oneoff {
+        true => !m.running(),
+        false => !known.contains(&m.service),
+    }
+}
+
+/// up's --remove-orphans when it is not given: COMPOSE_REMOVE_ORPHANS of the project's
+/// environment, which has the variables of its .env file and --env-file too, as the
+/// command line sets them before up reads it.
+fn removes_orphans(project: &Project) -> bool {
+    project
+        .environment
+        .get("COMPOSE_REMOVE_ORPHANS")
+        .is_some_and(|v| string_to_bool(v))
+}
+
+/// COMPOSE_IGNORE_ORPHANS of the project's environment, its .env file's too.
+fn ignores_orphans(project: &Project) -> bool {
+    project
+        .environment
+        .get("COMPOSE_IGNORE_ORPHANS")
+        .is_some_and(|v| string_to_bool(v))
+}
+
+/// utils.StringToBool: y, or what strconv.ParseBool reads as true, trimmed.
 pub(super) fn string_to_bool(text: &str) -> bool {
-    matches!(text.to_lowercase().as_str(), "1" | "t" | "true")
+    matches!(
+        text.trim().to_lowercase().as_str(),
+        "y" | "1" | "t" | "true"
+    )
 }
 
 /// `base`, or `base-2`, `base-3`... when a record has it.
@@ -536,6 +636,7 @@ pub async fn images(
             Image {
                 name: local_name,
                 digest: client::string(&record, "digest"),
+                cmd: client::strings(&record, "image_cmd"),
             },
         );
     }
@@ -554,7 +655,7 @@ pub async fn images(
 
 /// The networks the project's services join, made where they are not, and the
 /// external ones there.
-async fn networks(e: &Engine<'_>) -> Result<()> {
+pub(super) async fn networks(e: &Engine<'_>) -> Result<()> {
     let project = e.project();
     let existing: BTreeSet<String> = e
         .client
@@ -635,7 +736,7 @@ async fn networks(e: &Engine<'_>) -> Result<()> {
     Ok(())
 }
 
-async fn volumes(e: &Engine<'_>) -> Result<()> {
+pub(super) async fn volumes(e: &Engine<'_>) -> Result<()> {
     let project = e.project();
     let existing: BTreeSet<String> = e
         .client
@@ -672,28 +773,8 @@ async fn volumes(e: &Engine<'_>) -> Result<()> {
 }
 
 /// The secrets and configs with no file behind them, made as nspawn secrets.
-/// The label of a project's secret that says what content it holds.
-const CONTENT_LABEL: &str = "org.nspawn.compose.content";
-
-async fn secrets(e: &Engine<'_>) -> Result<()> {
+pub(super) async fn secrets(e: &Engine<'_>) -> Result<()> {
     let project = e.project();
-    // Each secret there, with the digest of its content when compose made it.
-    let existing: BTreeMap<String, String> = e
-        .client
-        .manager
-        .list_secrets()
-        .await
-        .map_err(client::error)?
-        .iter()
-        .map(|n| {
-            let digest = n
-                .get("labels")
-                .and_then(|l| std::collections::HashMap::<String, String>::try_from(l.clone()).ok())
-                .and_then(|l| l.get(CONTENT_LABEL).cloned())
-                .unwrap_or_default();
-            (client::string(n, "name"), digest)
-        })
-        .collect();
     for (kind, defs) in [("secret", &project.secrets), ("config", &project.configs)] {
         for (key, def) in defs {
             let def = def.as_map().cloned().unwrap_or_default();
@@ -710,23 +791,17 @@ async fn secrets(e: &Engine<'_>) -> Result<()> {
             } else {
                 continue;
             };
-            // The content changes with the file or the environment: a secret made from
-            // other content is replaced, and machines read the new one at their next
-            // start, as the content is given to containers at theirs.
-            let digest = crate::layout::sha256_digest(content.as_bytes());
+            // The content changes with the file or the environment: a secret of other
+            // content is replaced, and machines read the new one at their next start, as
+            // the content is given to containers at theirs. The service compares them:
+            // nothing derived from the content is put where readers of secrets see it.
             let name = convert::secret_name(&project.name, kind, key);
-            if existing.get(&name).is_some_and(|d| *d == digest) {
-                continue;
-            }
             let mut options = Options::new();
             options.insert(
                 "labels",
-                Bus::from(vec![
-                    format!("{}={}", label::PROJECT, project.name),
-                    format!("{CONTENT_LABEL}={digest}"),
-                ]),
+                Bus::from(vec![format!("{}={}", label::PROJECT, project.name)]),
             );
-            options.insert("replace", Bus::from(existing.contains_key(&name)));
+            options.insert("replace_if_changed", Bus::from(true));
             e.client
                 .manager
                 .create_secret(&name, content.as_bytes(), options)
@@ -778,6 +853,13 @@ fn recreates(c: &Converge, service: &str, stale: bool) -> bool {
 /// Makes everything the project needs and its services' machines, and starts them when
 /// asked; the machines of the services, in the order they started.
 pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Machine>> {
+    // --scale names any service of the project loaded, as docker compose applies it before
+    // --no-deps narrows the selection.
+    for name in c.scale.keys() {
+        if !e.project().services.contains_key(name) {
+            bail!("no such service: {name}");
+        }
+    }
     // --no-deps: the services named alone, their dependencies left as they are.
     if c.no_deps && !c.services.is_empty() {
         let selected = e
@@ -789,11 +871,6 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
     }
     let project = e.project().clone();
     check_refusals(&project)?;
-    for name in c.scale.keys() {
-        if !project.services.contains_key(name) {
-            bail!("no such service: {name}");
-        }
-    }
     unique_names(&project, &c.scale)?;
     let order = order(&project);
     let pulls = Pulls {
@@ -818,11 +895,17 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
         .iter()
         .map(|m| client::string(m, "name"))
         .collect();
+    // parentNamespaceRecreated: a machine in the network of a service made anew this
+    // pass would stay in the namespace of the old one.
+    let mut recreated: BTreeSet<String> = BTreeSet::new();
     for name in &order {
         let service = convert::service(&project, name)?.clone();
         let Some(image) = images.get(name) else {
             continue;
         };
+        let parent_recreated = s(&service, "network_mode")
+            .strip_prefix("service:")
+            .is_some_and(|owner| recreated.contains(owner));
         let want = convert::replicas(&service, &c.scale, name);
         let mut existing: Vec<Machine> = machines
             .iter()
@@ -848,6 +931,7 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
                 name: machine.clone(),
                 oneoff: false,
                 image_digest: image.digest.clone(),
+                image_cmd: image.cmd.clone(),
                 no_deps: c.no_deps,
                 env_files: e.args.env_file.clone(),
                 scale: &c.scale,
@@ -859,10 +943,18 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
             match found {
                 Some(current) => {
                     let hash = labels_of(&made).get(label::CONFIG_HASH).cloned();
-                    let stale = current.labels.get(label::CONFIG_HASH) != hash.as_ref()
-                        || current.label(label::IMAGE) != image.digest;
+                    // A name it should go by and does not, as a link of another service
+                    // gives it; one given by hand with network connect stays.
+                    let has: BTreeSet<String> = client::strings(&current.dict, "aliases")
+                        .into_iter()
+                        .collect();
+                    let stale = parent_recreated
+                        || current.labels.get(label::CONFIG_HASH) != hash.as_ref()
+                        || current.label(label::IMAGE) != image.digest
+                        || !convert::aliases(&made).is_subset(&has);
                     let recreate = recreates(c, name, stale);
                     if recreate {
+                        recreated.insert(name.clone());
                         e.progress
                             .container(&current.name, "Recreate", Status::Working);
                         // Made anew in its place, which the service checks before the
@@ -880,6 +972,14 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
                 }
                 None => {
                     if all.contains(&machine) {
+                        // Another service of the project made it: their names differ
+                        // only where machine names write '_' as '-'.
+                        if let Some(other) = machines.iter().find(|m| m.name == machine) {
+                            bail!(
+                                "the services {:?} and {name:?} would both make the machine {machine}: machine names take no '_', which is written '-'; rename one of them or its container_name",
+                                other.service
+                            );
+                        }
                         bail!(
                             "machine {machine} exists and is not one of project {}'s; remove it or rename the service",
                             project.name
@@ -896,6 +996,7 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
     if !c.start {
         return Ok(machines);
     }
+    c.starting_at.set(Some(std::time::SystemTime::now()));
     let started = start_in_order(e, &project, &order, &c.services, c).await?;
     if c.wait {
         wait_running(e, &started, c.wait_timeout).await?;
@@ -991,19 +1092,12 @@ async fn orphans(
         .services
         .keys()
         .chain(project.disabled_services.keys())
-        .chain(project.jobs.keys())
         .collect();
-    let orphans: Vec<&Machine> = machines
-        .iter()
-        .filter(|m| !m.oneoff && !known.contains(&m.service))
-        .collect();
+    let orphans: Vec<&Machine> = machines.iter().filter(|m| is_orphan(m, &known)).collect();
     if orphans.is_empty() {
         return Ok(());
     }
-    let ignore = project
-        .environment
-        .get("COMPOSE_IGNORE_ORPHANS")
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let ignore = ignores_orphans(project);
     if c.remove_orphans {
         for m in orphans {
             stop_and_remove(e, m, c.timeout).await?;
@@ -1183,10 +1277,12 @@ async fn await_condition(
     }
 }
 
-/// Whether a service of the project depends on `service` completing successfully.
-fn awaited_to_complete(e: &Engine<'_>, service: &str) -> bool {
-    e.project.as_ref().is_some_and(|p| {
-        p.services.values().filter_map(Value::as_map).any(|s| {
+/// Whether a service of the project depends on `service` completing successfully: by
+/// the file when one is loaded, by the depends_on labels of `machines` otherwise, as
+/// docker compose rebuilds a project from its containers.
+fn awaited_to_complete(e: &Engine<'_>, machines: &[Machine], service: &str) -> bool {
+    match &e.project {
+        Some(p) => p.services.values().filter_map(Value::as_map).any(|s| {
             s.get("depends_on")
                 .and_then(Value::as_map)
                 .and_then(|d| d.get(service))
@@ -1195,7 +1291,17 @@ fn awaited_to_complete(e: &Engine<'_>, service: &str) -> bool {
                     d.get("condition").and_then(Value::as_str)
                         == Some("service_completed_successfully")
                 })
-        })
+        }),
+        None => machines.iter().any(|m| completes_for(m, service)),
+    }
+}
+
+/// Whether `m`'s depends_on label (NAME:CONDITION:RESTART, comma separated) waits for
+/// `service` to complete successfully.
+fn completes_for(m: &Machine, service: &str) -> bool {
+    m.label(label::DEPENDS_ON).split(',').any(|d| {
+        let mut parts = d.split(':');
+        parts.next() == Some(service) && parts.next() == Some("service_completed_successfully")
     })
 }
 
@@ -1211,7 +1317,14 @@ fn checks_health(m: &Machine) -> bool {
             h.get("test")
                 .and_then(|t| Vec::<String>::try_from(t.clone()).ok())
         })
-        .is_some_and(|test| test.first().is_some_and(|t| t != "NONE"))
+        .is_some_and(|test| {
+            // The service's own rule: a test no probe can run gives no verdict.
+            crate::health::Healthcheck {
+                test,
+                ..Default::default()
+            }
+            .active()
+        })
 }
 
 /// --wait: every machine running, and healthy when it has a healthcheck.
@@ -1221,6 +1334,12 @@ pub async fn wait_running(
     timeout: Option<Duration>,
 ) -> Result<()> {
     let start = Instant::now();
+    // Without a file, what waits for a service to complete is in the labels of the
+    // project's machines.
+    let all = match e.project {
+        Some(_) => Vec::new(),
+        None => e.machines().await?,
+    };
     for m in machines {
         e.progress.container(&m.name, "Waiting", Status::Working);
         loop {
@@ -1242,7 +1361,7 @@ pub async fn wait_running(
             if now.state == "stopped" {
                 // Ending is what a service others wait to complete does; any other
                 // was to keep running.
-                if now.exit_code.unwrap_or(0) == 0 && awaited_to_complete(e, &m.service) {
+                if now.exit_code.unwrap_or(0) == 0 && awaited_to_complete(e, &all, &m.service) {
                     e.progress.container(&m.name, "Exited", Status::Done);
                     break;
                 }
@@ -1279,6 +1398,151 @@ pub async fn wait_running(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_completion_wait_is_read_from_the_labels_without_a_file() {
+        let web = Machine {
+            name: "p-web-1".into(),
+            service: "web".into(),
+            number: 1,
+            oneoff: false,
+            state: "running".into(),
+            health: String::new(),
+            exit_code: None,
+            labels: BTreeMap::from([(
+                label::DEPENDS_ON.to_string(),
+                "migrate:service_completed_successfully:false,db:service_healthy:true".to_string(),
+            )]),
+            created: 0,
+            started: 0,
+            dict: crate::client::Dict::new(),
+        };
+        assert!(completes_for(&web, "migrate"));
+        assert!(!completes_for(&web, "db"));
+        assert!(!completes_for(&web, "web"));
+    }
+
+    #[test]
+    fn orphans_are_read_as_docker_compose_reads_them() {
+        assert!(!super::super::lifecycle::orphans_too(Some(false)));
+        assert!(super::super::lifecycle::orphans_too(Some(true)));
+        // up's default comes from the project's environment, its .env included.
+        let mut project =
+            super::super::convert::tests::project("orph", "services:\n  web: {image: nginx}\n");
+        assert!(!removes_orphans(&project));
+        project
+            .environment
+            .insert("COMPOSE_REMOVE_ORPHANS".into(), "true".into());
+        assert!(removes_orphans(&project));
+        let machine = |service: &str, oneoff: bool, state: &str| Machine {
+            name: format!("orph-{service}-1"),
+            service: service.into(),
+            number: 1,
+            oneoff,
+            state: state.into(),
+            health: String::new(),
+            exit_code: None,
+            labels: BTreeMap::new(),
+            created: 0,
+            started: 0,
+            dict: crate::client::Dict::new(),
+        };
+        let web = "web".to_string();
+        let known = BTreeSet::from([&web]);
+        assert!(!is_orphan(&machine("web", false, "running"), &known));
+        assert!(is_orphan(&machine("gone", false, "running"), &known));
+        // A one-off that ended is one, a running one is somebody's session.
+        assert!(is_orphan(&machine("web", true, "stopped"), &known));
+        assert!(!is_orphan(&machine("web", true, "running"), &known));
+        for text in ["y", " TRUE ", "t", "1", "True"] {
+            assert!(string_to_bool(text), "{text}");
+        }
+        for text in ["yes", "on", "0", ""] {
+            assert!(!string_to_bool(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn up_refuses_what_docker_compose_refuses() {
+        use clap::Parser;
+        let check = |argv: &[&str]| {
+            let mut full = vec!["nspawn", "compose", "up"];
+            full.extend_from_slice(argv);
+            let crate::cli::Command::Compose(c) =
+                crate::cli::Cli::try_parse_from(full).unwrap().command
+            else {
+                unreachable!()
+            };
+            let Some(crate::compose::cli::ComposeCommand::Up(a)) = c.command else {
+                unreachable!()
+            };
+            validate_flags(&a).err().map(|e| e.to_string())
+        };
+        for (argv, text) in [
+            (&["--wait-timeout", "-1"][..], "--wait-timeout must be a non-negative integer"),
+            (
+                &["--abort-on-container-exit", "--abort-on-container-failure"],
+                "--abort-on-container-failure cannot be combined with --abort-on-container-exit",
+            ),
+            (
+                &["--exit-code-from", "web", "--wait"],
+                "--wait cannot be combined with --abort-on-container-exit, --attach or --attach-dependencies",
+            ),
+            (
+                &["--wait", "--attach", "web"],
+                "--wait cannot be combined with --abort-on-container-exit, --attach or --attach-dependencies",
+            ),
+            (
+                &["-d", "--attach", "web"],
+                "--detach cannot be combined with --abort-on-container-exit, --abort-on-container-failure, --attach, --attach-dependencies or --watch",
+            ),
+            (
+                &["-d", "--exit-code-from", "web"],
+                "--detach cannot be combined with --abort-on-container-exit, --abort-on-container-failure, --attach, --attach-dependencies or --watch",
+            ),
+            (
+                &["--always-recreate-deps", "--no-recreate"],
+                "--always-recreate-deps and --no-recreate are incompatible",
+            ),
+            (
+                &["-V", "--no-recreate"],
+                "--no-recreate and --renew-anon-volumes are incompatible",
+            ),
+        ] {
+            assert_eq!(check(argv).as_deref(), Some(text), "{argv:?}");
+        }
+        // --exit-code-from with failures alone, and --no-start with --wait, are taken.
+        assert_eq!(
+            check(&["--exit-code-from", "web", "--abort-on-container-failure"]),
+            None
+        );
+        assert_eq!(check(&["--no-start", "--wait"]), None);
+    }
+
+    #[test]
+    fn a_test_no_probe_can_run_checks_no_health() {
+        use zbus::zvariant::{OwnedValue, Value};
+        let machine = |test: &[&str]| {
+            let test: Vec<String> = test.iter().map(|w| w.to_string()).collect();
+            let hc = crate::client::Dict::from([(
+                "test".to_string(),
+                OwnedValue::try_from(Value::from(test)).unwrap(),
+            )]);
+            let dict = crate::client::Dict::from([(
+                "healthcheck".to_string(),
+                OwnedValue::try_from(Value::from(hc)).unwrap(),
+            )]);
+            Machine::from_dict(dict)
+        };
+        assert!(checks_health(&machine(&["CMD", "/check"])));
+        assert!(checks_health(&machine(&["CMD-SHELL", "curl -f localhost"])));
+        assert!(!checks_health(&machine(&["NONE"])));
+        assert!(!checks_health(&machine(&["FOO", "x"])));
+        assert!(!checks_health(&machine(&["CMD"])));
+        assert!(!checks_health(&Machine::from_dict(
+            crate::client::Dict::new()
+        )));
+    }
 
     #[test]
     fn booleans_of_the_environment_as_compose_reads_them() {

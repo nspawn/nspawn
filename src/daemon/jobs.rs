@@ -3,9 +3,9 @@
 //! JobRemoved, and the object keeps the outcome for whoever asks later, until it is
 //! among the oldest ended ones.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -41,8 +41,123 @@ impl std::fmt::Display for Partly {
 
 impl std::error::Error for Partly {}
 
+/// One event of a job's work: a line or a note kept in its Output and sent as
+/// JobOutput, a progress sent alone.
+async fn forward(state: &Arc<State>, job: &Arc<JobState>, event: Event) {
+    let (kind, text) = match event {
+        Event::Line(t) => ("line", t),
+        Event::Note(t) => ("note", t),
+        // Only for whoever watches now: not kept in the job's output.
+        Event::Progress { item, done, total } => {
+            if let Ok(emitter) =
+                state.emitter_to(crate::daemon::manager_path(), job.client.as_deref())
+            {
+                let _ =
+                    Manager::job_progress(&emitter, job.path.as_ref(), &item, done, total).await;
+            }
+            return;
+        }
+    };
+    let text = crate::daemon::values::bus_text(&text);
+    {
+        let mut output = job.output.lock().unwrap();
+        // Lines that went out together are kept a line each; a note as it is.
+        if kind == "line" {
+            keep_lines(&mut output, text.split('\n'));
+        } else {
+            keep_lines(&mut output, std::iter::once(text.as_str()));
+        }
+    }
+    if let Ok(emitter) = state.emitter_to(crate::daemon::manager_path(), job.client.as_deref()) {
+        let _ = Manager::job_output(&emitter, job.path.as_ref(), kind, &text).await;
+    }
+}
+
+/// Adds lines to what a job keeps of its output: its last lines only, as they went out as
+/// JobOutput, and a long build would otherwise stay in memory as long as the job is kept.
+fn keep_lines<'a>(output: &mut VecDeque<String>, lines: impl DoubleEndedIterator<Item = &'a str>) {
+    let mut last: Vec<&str> = lines.rev().take(OUTPUT_KEPT).collect();
+    last.reverse();
+    output.extend(last.into_iter().map(str::to_string));
+    let mut bytes: usize = output.iter().map(String::len).sum();
+    while output.len() > OUTPUT_KEPT || (bytes > OUTPUT_KEPT_BYTES && output.len() > 1) {
+        if let Some(old) = output.pop_front() {
+            bytes -= old.len();
+        }
+    }
+}
+
+/// What did not fit in a job's queue to the bus: the job's notes, kept to go out later, and
+/// how many lines were dropped.
+#[derive(Default)]
+struct Aside {
+    dropped: AtomicU64,
+    notes: Mutex<Vec<Event>>,
+}
+
+impl Aside {
+    fn send(&self, tx: &mpsc::Sender<Event>, event: Event) {
+        if let Err(mpsc::error::TrySendError::Full(event)) = tx.try_send(event) {
+            match event {
+                Event::Note(_) => self.notes.lock().unwrap().push(event),
+                Event::Line(_) => {
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                // The next one says as much.
+                Event::Progress { .. } => {}
+            }
+        }
+    }
+
+    /// What goes out after `event`, taken from the queue (none once it ended): the notes
+    /// kept aside and a word on the lines dropped.
+    fn after(&self, event: Option<Event>) -> Vec<Event> {
+        let mut events: Vec<Event> = event.into_iter().collect();
+        events.append(&mut self.notes.lock().unwrap());
+        let lost = self.dropped.swap(0, Ordering::Relaxed);
+        if lost > 0 {
+            events.push(Event::Note(format!(
+                "note: {lost} lines of output were dropped: they came faster than they could be sent"
+            )));
+        }
+        events
+    }
+}
+
 /// How many lines of its output a job keeps for its Output property.
 const OUTPUT_KEPT: usize = 1000;
+/// Up to how many bytes of lines queued one behind the other go out in one JobOutput.
+const BATCH_BYTES: usize = 64 << 10;
+
+/// `first` with what queued right behind it, when it is a line: the lines that follow go
+/// out with it, a newline between each, while they fit in `BATCH_BYTES`. A signal a line
+/// cannot keep up with a program that floods its output (a build step), and its lines
+/// would be dropped once the queue is full. What else comes first (a note, a progress)
+/// waits in `next`.
+fn gather(first: Event, rx: &mut mpsc::Receiver<Event>, next: &mut Option<Event>) -> Event {
+    let Event::Line(mut text) = first else {
+        return first;
+    };
+    while text.len() < BATCH_BYTES {
+        match rx.try_recv() {
+            Ok(Event::Line(more)) => {
+                text.push('\n');
+                text.push_str(&more);
+            }
+            Ok(other) => {
+                *next = Some(other);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    Event::Line(text)
+}
+/// And no more than this many bytes of them: a line of a build step may be long.
+const OUTPUT_KEPT_BYTES: usize = 1 << 20;
+/// Lines on their way to the bus: a program prints faster than signals go out, and past
+/// these the rest is counted and dropped, or the service would fill its memory.
+const IN_TRANSIT: usize = 10_000;
 
 /// What a job carries; served as org.nspawn.Job.
 pub struct JobState {
@@ -54,9 +169,11 @@ pub struct JobState {
     pub kind: String,
     pub target: String,
     pub state: Mutex<String>,
-    pub output: Mutex<Vec<String>>,
+    pub output: Mutex<VecDeque<String>>,
     pub error: Mutex<String>,
     pub result: Mutex<Dict>,
+    /// Its end went out: only then may it be retired, its client still to read it.
+    pub announced: AtomicBool,
 }
 
 #[derive(Default)]
@@ -75,21 +192,24 @@ impl Jobs {
             .collect()
     }
 
-    /// Puts a job that ended after every other one: jobs are retired in the order they
-    /// ended, and the one just ended last, its client still to read its outcome.
-    fn ended(&self, path: &OwnedObjectPath) {
+    /// Ends a job: its state, and its place after every other one, at once, so that jobs
+    /// are retired in the order they ended and never one at its starting place.
+    fn end(&self, job: &Arc<JobState>, state: &str) {
         let mut all = self.all.lock().unwrap();
-        if let Some(i) = all.iter().position(|j| j.path == *path) {
+        *job.state.lock().unwrap() = state.to_string();
+        if let Some(i) = all.iter().position(|j| Arc::ptr_eq(j, job)) {
             let job = all.remove(i);
             all.push(job);
         }
     }
 
     /// Forgets the ended jobs that ended first beyond `ENDED_KEPT`; their paths, for the
-    /// object server to drop.
+    /// object server to drop. One whose end has not gone out yet stays.
     fn retire(&self) -> Vec<OwnedObjectPath> {
         let mut all = self.all.lock().unwrap();
-        let ended = |job: &JobState| *job.state.lock().unwrap() != "running";
+        let ended = |job: &JobState| {
+            *job.state.lock().unwrap() != "running" && job.announced.load(Ordering::SeqCst)
+        };
         let mut excess = all
             .iter()
             .filter(|j| ended(j))
@@ -159,7 +279,7 @@ impl Job {
         #[zbus(header)] hdr: Option<Header<'_>>,
     ) -> zbus::fdo::Result<Vec<String>> {
         self.readable(hdr.as_ref()).await?;
-        Ok(self.job.output.lock().unwrap().clone())
+        Ok(self.job.output.lock().unwrap().iter().cloned().collect())
     }
 
     /// Why it failed, when it did.
@@ -200,9 +320,10 @@ where
         kind: kind.to_string(),
         target: target.to_string(),
         state: Mutex::new("running".to_string()),
-        output: Mutex::new(Vec::new()),
+        output: Mutex::default(),
         error: Mutex::new(String::new()),
         result: Mutex::new(Dict::new()),
+        announced: AtomicBool::new(false),
     });
     state.jobs.all.lock().unwrap().push(job.clone());
     state
@@ -217,50 +338,30 @@ where
         )
         .await?;
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<Event>();
-    let reporter: Arc<dyn Fn(Event) + Send + Sync> = Arc::new(move |event| {
-        let _ = tx.send(event);
-    });
+    let (tx, mut rx) = mpsc::channel::<Event>(IN_TRANSIT);
+    let aside = Arc::new(Aside::default());
+    let reporter: Arc<dyn Fn(Event) + Send + Sync> = {
+        let aside = aside.clone();
+        Arc::new(move |event| aside.send(&tx, event))
+    };
     // Lines are relayed as they come; the job's own task does the work.
     let forwarder = {
         let state = state.clone();
         let job = job.clone();
         tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                let (kind, text) = match event {
-                    Event::Line(t) => ("line", t),
-                    Event::Note(t) => ("note", t),
-                    // Only for whoever watches now: not kept in the job's output.
-                    Event::Progress { item, done, total } => {
-                        if let Ok(emitter) =
-                            state.emitter_to(crate::daemon::manager_path(), job.client.as_deref())
-                        {
-                            let _ = Manager::job_progress(
-                                &emitter,
-                                job.path.as_ref(),
-                                &item,
-                                done,
-                                total,
-                            )
-                            .await;
-                        }
-                        continue;
-                    }
+            let mut next = None;
+            loop {
+                let event = match next.take() {
+                    Some(event) => Some(event),
+                    None => rx.recv().await,
                 };
-                let text = crate::daemon::values::bus_text(&text);
-                {
-                    // The last lines only: the output went out as JobOutput, and a long
-                    // build would otherwise stay in memory as long as the job is kept.
-                    let mut output = job.output.lock().unwrap();
-                    if output.len() >= OUTPUT_KEPT {
-                        output.remove(0);
-                    }
-                    output.push(text.clone());
+                let ended = event.is_none();
+                let event = event.map(|event| gather(event, &mut rx, &mut next));
+                for event in aside.after(event) {
+                    forward(&state, &job, event).await;
                 }
-                if let Ok(emitter) =
-                    state.emitter_to(crate::daemon::manager_path(), job.client.as_deref())
-                {
-                    let _ = Manager::job_output(&emitter, job.path.as_ref(), kind, &text).await;
+                if ended {
+                    break;
                 }
             }
         })
@@ -276,7 +377,7 @@ where
         let result = match outcome {
             Ok(dict) => {
                 *job.result.lock().unwrap() = dict;
-                *job.state.lock().unwrap() = "done".to_string();
+                state.jobs.end(&job, "done");
                 "done"
             }
             Err(e) => {
@@ -288,7 +389,7 @@ where
                     Err(e) => e,
                 };
                 *job.error.lock().unwrap() = crate::daemon::values::bus_text(&format!("{e:#}"));
-                *job.state.lock().unwrap() = "failed".to_string();
+                state.jobs.end(&job, "failed");
                 "failed"
             }
         };
@@ -309,7 +410,7 @@ where
         {
             let _ = Manager::job_removed(&emitter, job.path.as_ref(), result).await;
         }
-        state.jobs.ended(&job.path);
+        job.announced.store(true, Ordering::SeqCst);
         for path in state.jobs.retire() {
             let _ = state
                 .connection()
@@ -339,9 +440,10 @@ mod tests {
             kind: "pull".to_string(),
             target: format!("image-{id}"),
             state: Mutex::new(state.to_string()),
-            output: Mutex::new(Vec::new()),
+            output: Mutex::default(),
             error: Mutex::new(String::new()),
             result: Mutex::new(Dict::new()),
+            announced: AtomicBool::new(state != "running"),
         })
     }
 
@@ -380,15 +482,128 @@ mod tests {
             "the oldest running one"
         );
         assert!(kept.iter().any(|p| p.as_str() == path(total)));
-        // A job made first that ends last stays: retirement goes by the end.
-        jobs.all.lock().unwrap().insert(0, job(0, "running"));
-        *jobs.all.lock().unwrap()[0].state.lock().unwrap() = "done".to_string();
-        jobs.ended(&OwnedObjectPath::try_from(path(0)).unwrap());
+        // A job made first that ends last stays: retirement goes by the end, and not
+        // before its end went out.
+        let first = job(0, "running");
+        jobs.all.lock().unwrap().insert(0, first.clone());
+        jobs.end(&first, "done");
+        jobs.all.lock().unwrap().push(job(total + 1, "done"));
         let retired = jobs.retire();
         assert!(
             !retired.iter().any(|p| p.as_str() == path(0)),
             "{retired:?}"
         );
+        first.announced.store(true, Ordering::SeqCst);
+        assert!(
+            !jobs.retire().iter().any(|p| p.as_str() == path(0)),
+            "it ended last"
+        );
         assert!(jobs.retire().is_empty(), "nothing more to retire");
+    }
+
+    #[test]
+    fn a_job_keeps_its_last_lines() {
+        let mut output = VecDeque::new();
+        let one = |output: &mut VecDeque<String>, text: &str| {
+            keep_lines(output, std::iter::once(text));
+        };
+        for i in 0..OUTPUT_KEPT + 5 {
+            one(&mut output, &i.to_string());
+        }
+        assert_eq!(output.len(), OUTPUT_KEPT);
+        assert_eq!(output[0], "5");
+        let long = "x".repeat(OUTPUT_KEPT_BYTES / 2 + 1);
+        one(&mut output, &long);
+        assert_eq!(output.len(), OUTPUT_KEPT);
+        one(&mut output, &long);
+        assert_eq!(output, std::slice::from_ref(&long));
+        // The last line stays, however long.
+        let huge = "y".repeat(OUTPUT_KEPT_BYTES * 2);
+        one(&mut output, &huge);
+        assert_eq!(output, [huge]);
+        // Lines that went out together count one by one.
+        let batch: String = (0..OUTPUT_KEPT + 3).map(|i| format!("b{i}\n")).collect();
+        keep_lines(&mut output, batch.trim_end().split('\n'));
+        assert_eq!(output.len(), OUTPUT_KEPT);
+        assert_eq!(output[0], "b3");
+        assert_eq!(output[OUTPUT_KEPT - 1], format!("b{}", OUTPUT_KEPT + 2));
+    }
+
+    #[test]
+    fn lines_queued_one_behind_the_other_go_out_together() {
+        let text = |event: &Event| match event {
+            Event::Line(t) | Event::Note(t) => t.clone(),
+            Event::Progress { .. } => "progress".to_string(),
+        };
+        let (tx, mut rx) = mpsc::channel::<Event>(100);
+        for event in [
+            Event::Line("line 1".to_string()),
+            Event::Line("line 2".to_string()),
+            Event::Note("note: one".to_string()),
+            Event::Line("line 3".to_string()),
+        ] {
+            tx.try_send(event).unwrap();
+        }
+        let mut next = None;
+        let batch = gather(Event::Line("line 0".to_string()), &mut rx, &mut next);
+        assert_eq!(text(&batch), "line 0\nline 1\nline 2");
+        // The note stops the batch and goes next, alone.
+        let note = next.take().expect("the note waits");
+        assert_eq!(text(&gather(note, &mut rx, &mut next)), "note: one");
+        assert!(next.is_none());
+        let first = rx.try_recv().unwrap();
+        assert_eq!(text(&gather(first, &mut rx, &mut next)), "line 3");
+        // A batch grows past BATCH_BYTES by one line at most; the rest waits its turn.
+        let kib = "k".repeat(1023);
+        for _ in 0..80 {
+            tx.try_send(Event::Line(kib.clone())).unwrap();
+        }
+        let first = rx.try_recv().unwrap();
+        let batch = text(&gather(first, &mut rx, &mut next));
+        assert!(
+            batch.len() >= BATCH_BYTES && batch.len() <= BATCH_BYTES + kib.len(),
+            "{}",
+            batch.len()
+        );
+        assert_eq!(batch.split('\n').count(), 65);
+        assert!(
+            rx.try_recv().is_ok(),
+            "the lines past the batch stay queued"
+        );
+    }
+
+    #[test]
+    fn a_full_queue_drops_lines_and_keeps_notes() {
+        let text = |event: Event| match event {
+            Event::Line(t) | Event::Note(t) => t,
+            Event::Progress { .. } => "progress".to_string(),
+        };
+        let (tx, mut rx) = mpsc::channel::<Event>(2);
+        let aside = Aside::default();
+        for i in 0..5 {
+            aside.send(&tx, Event::Line(format!("line {i}")));
+        }
+        aside.send(&tx, Event::Note("note: kept".to_string()));
+        aside.send(
+            &tx,
+            Event::Progress {
+                item: "1cfa4e2b09e1".to_string(),
+                done: 1,
+                total: 2,
+            },
+        );
+        let first = rx.try_recv().ok();
+        let out: Vec<String> = aside.after(first).into_iter().map(text).collect();
+        assert_eq!(
+            out,
+            [
+                "line 0",
+                "note: kept",
+                "note: 3 lines of output were dropped: they came faster than they could be sent"
+            ]
+        );
+        assert_eq!(rx.try_recv().ok().map(text).as_deref(), Some("line 1"));
+        assert!(rx.try_recv().is_err());
+        assert!(aside.after(None).is_empty(), "nothing more");
     }
 }

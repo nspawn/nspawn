@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
 use anyhow::{bail, Context as _, Result};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, BufReader};
 
 use crate::api::{line, note, require_root, Context, Report};
 use crate::backend::{Backend, BackendChoice};
@@ -77,7 +77,11 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
         note(report, crate::backend::MSTACK_EXPERIMENTAL);
     }
 
-    let build_id = format!("{name}-{}-{}", now_unix(), crate::store::unique_suffix());
+    let build_id = format!(
+        "mkosi-{name}-{}-{}",
+        now_unix(),
+        crate::store::unique_suffix()
+    );
     let output_dir = config.state_dir.join("builds").join(&build_id);
     let cache_dir = config.state_dir.join("cache").join("mkosi");
     // mkosi builds in its workspace and renames the result into place; kept next to
@@ -91,6 +95,10 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
     for dir in [&output_dir, &cache_dir, &workspace_dir] {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
+    // A build the service's end cut short is swept at its next start; an output kept
+    // loses the marker.
+    let marker = output_dir.join(crate::build::exec::MKOSI_MARKER);
+    fs::write(&marker, b"").with_context(|| format!("writing {}", marker.display()))?;
 
     let argv = mkosi_arguments(
         request,
@@ -102,11 +110,14 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
     );
     line(report, format!("running: mkosi {}", argv.join(" ")));
     let status = run_mkosi(&mkosi, &argv, report).await;
-    let _ = fs::remove_dir_all(&workspace_dir);
-    // The output goes on every way out but success, unless it is to be kept.
+    let _ = crate::store::remove_tree(&workspace_dir);
+    // The output goes on every way out but success, unless it is to be kept: then only
+    // its marker goes, the build having ended.
     let drop_output = || {
-        if !request.keep_output {
-            let _ = fs::remove_dir_all(&output_dir);
+        if request.keep_output {
+            let _ = fs::remove_file(&marker);
+        } else {
+            let _ = crate::store::remove_tree(&output_dir);
         }
     };
     let status = status.inspect_err(|_| drop_output())?;
@@ -198,20 +209,19 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
     let mode = match outcome {
         Ok(mode) => mode,
         Err(e) => {
-            if !request.keep_output {
-                let _ = fs::remove_dir_all(&output_dir);
-            }
+            drop_output();
             return Err(e);
         }
     };
     let output = if request.keep_output {
+        let _ = fs::remove_file(&marker);
         Some(output_dir)
     } else {
-        let _ = fs::remove_dir_all(&output_dir);
+        let _ = crate::store::remove_tree(&output_dir);
         None
     };
-    crate::api::events::emit(
-        "machine",
+    crate::api::events::emit_machine(
+        store,
         "build",
         &name,
         &[
@@ -245,12 +255,17 @@ async fn run_mkosi(mkosi: &Path, argv: &[String], report: Report<'_>) -> Result<
             .with_context(|| format!("running {}", mkosi.display()))?
     };
     // Byte by byte lines: one that is not UTF-8 (a package's scriptlet, a progress
-    // bar) must not end the reading, or mkosi blocks on the full pipe for ever.
+    // bar) must not end the reading, or mkosi blocks on the full pipe for ever. A line
+    // with no end in sight goes out in pieces.
     let mut reader = BufReader::new(tokio::fs::File::from_std(fs::File::from(read)));
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        match reader.read_until(b'\n', &mut buf).await {
+        match (&mut reader)
+            .take(MKOSI_LINE)
+            .read_until(b'\n', &mut buf)
+            .await
+        {
             Ok(0) => break,
             Ok(_) => {
                 let text = String::from_utf8_lossy(&buf);
@@ -265,6 +280,9 @@ async fn run_mkosi(mkosi: &Path, argv: &[String], report: Report<'_>) -> Result<
     }
     child.wait().await.context("waiting for mkosi")
 }
+
+/// The longest line of mkosi's output taken whole.
+const MKOSI_LINE: u64 = 64 * 1024;
 
 /// The mkosi command line: OCI output with zstd layers into a private directory.
 pub fn mkosi_arguments(

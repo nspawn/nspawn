@@ -124,6 +124,7 @@ pub async fn run(config: Config, idle_exit: Option<Duration>) -> Result<()> {
     crate::attach::sweep();
     // A build of a service that went away left its step roots and network namespace.
     crate::build::exec::sweep(&state.ctx).await;
+    state.ctx.store.sweep_trash();
     if let Err(e) = crate::api::network::remove_ended(&state.ctx).await {
         eprintln!("warning: removing the machines of run --rm that ended: {e:#}");
     }
@@ -167,8 +168,17 @@ pub async fn run(config: Config, idle_exit: Option<Duration>) -> Result<()> {
             break;
         }
     }
-    // Dropping the connection releases the name; the bus starts the service again when
-    // the next client calls.
+    // The name goes first, so that the bus starts the service again for the next call;
+    // a call that reached this one before is answered, not cut off. systemd stops a
+    // Type=dbus unit whose name goes: its SIGTERM is taken from here on, and the stop
+    // waits for what is under way (TimeoutStopSec bounds it).
+    let _terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("taking SIGTERM while what is under way ends")?;
+    let _ = connection.release_name(BUS_NAME).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    while state.busy.load(Ordering::SeqCst) > 0 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     drop(connection);
     Ok(())
 }

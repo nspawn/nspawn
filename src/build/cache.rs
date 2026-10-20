@@ -199,13 +199,17 @@ pub fn usage(store: &crate::store::Store) -> Result<Vec<Usage>> {
 /// What `builder prune` takes, as BuildKit's prune: without `all`, what no image takes
 /// too; only what was last used before `until`; and with `keep_storage`, the least
 /// recently used first, until what the cache holds of its own fits in that many bytes.
+/// `kept` rows are never taken (a cache mount a build has bound, say), and still count
+/// against `keep_storage`: they stay on disk.
 pub fn prunable(
     rows: &[Usage],
     all: bool,
     until: Option<u64>,
     keep_storage: Option<u64>,
+    kept: &dyn Fn(&Usage) -> bool,
 ) -> Vec<Usage> {
-    let eligible = |row: &&Usage| (all || !row.shared) && until.is_none_or(|t| row.used < t);
+    let eligible =
+        |row: &&Usage| (all || !row.shared) && until.is_none_or(|t| row.used < t) && !kept(row);
     let Some(limit) = keep_storage else {
         return rows.iter().filter(eligible).cloned().collect();
     };
@@ -298,15 +302,39 @@ mod tests {
             row("c", 10, 10, false),
         ];
         let ids = |v: Vec<Usage>| v.into_iter().map(|r| r.id).collect::<Vec<_>>();
-        assert_eq!(ids(prunable(&rows, false, None, None)), ["a", "c"]);
-        assert_eq!(ids(prunable(&rows, true, None, None)), ["a", "b", "c"]);
-        assert_eq!(ids(prunable(&rows, true, Some(25), None)), ["b", "c"]);
+        let none = |_: &Usage| false;
+        assert_eq!(ids(prunable(&rows, false, None, None, &none)), ["a", "c"]);
+        assert_eq!(
+            ids(prunable(&rows, true, None, None, &none)),
+            ["a", "b", "c"]
+        );
+        assert_eq!(
+            ids(prunable(&rows, true, Some(25), None, &none)),
+            ["b", "c"]
+        );
         // 20 bytes of the cache's own: within 25 nothing goes; within 15 the least
         // recently used goes first.
-        assert!(prunable(&rows, true, None, Some(25)).is_empty());
-        assert_eq!(ids(prunable(&rows, true, None, Some(15))), ["c"]);
-        assert_eq!(ids(prunable(&rows, true, None, Some(5))), ["c", "b", "a"]);
-        assert_eq!(ids(prunable(&rows, false, None, Some(5))), ["c", "a"]);
+        assert!(prunable(&rows, true, None, Some(25), &none).is_empty());
+        assert_eq!(ids(prunable(&rows, true, None, Some(15), &none)), ["c"]);
+        assert_eq!(
+            ids(prunable(&rows, true, None, Some(5), &none)),
+            ["c", "b", "a"]
+        );
+        assert_eq!(
+            ids(prunable(&rows, false, None, Some(5), &none)),
+            ["c", "a"]
+        );
+        // An old mount a build holds stays, and the newer rows go in its place.
+        let mut held = rows.to_vec();
+        held.push(Usage {
+            kind: "mount",
+            ..row("m", 30, 1, false)
+        });
+        let building = |r: &Usage| r.kind == "mount";
+        assert_eq!(
+            ids(prunable(&held, false, None, Some(25), &building)),
+            ["c", "a"]
+        );
     }
 
     #[test]

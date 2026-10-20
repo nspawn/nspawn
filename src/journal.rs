@@ -13,10 +13,15 @@ const SOCKET: &str = "/run/systemd/journal/socket";
 const UNIT_PROCESS_EXIT: &str = "98e322203f7a4ed290d09fe03c09fe15";
 const UNIT_SUCCESS: &str = "7ad2d189f7e94e70a38c781354912448";
 
+/// Lookups that may run at once: each is a journalctl, and a listing asks one for every
+/// stopped machine, which must fit in what the Docker API's unit may start.
+static LOOKUPS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
+
 /// How a unit's main process last ended, from what systemd logged when it reaped it:
-/// (CLD_EXITED, CLD_KILLED or CLD_DUMPED, status). Outlives the unit's own ExecMainCode=,
-/// which goes when the unit is unloaded.
-pub async fn last_main_exit(unit: &str, since: u64) -> Option<(i32, i32)> {
+/// (CLD_EXITED, CLD_KILLED or CLD_DUMPED, status, when in microseconds). Outlives the
+/// unit's own ExecMainCode=, which goes when the unit is unloaded.
+pub async fn last_main_exit(unit: &str, since: u64) -> Option<(i32, i32, u64)> {
+    let _turn = LOOKUPS.acquire().await.ok()?;
     let output = tokio::process::Command::new("journalctl")
         .args([
             "--no-pager",
@@ -39,14 +44,18 @@ pub async fn last_main_exit(unit: &str, since: u64) -> Option<(i32, i32)> {
 /// The latest ending of the main process among the entries, newest first: the hooks
 /// systemd reaps are logged the same way, and a hook that failed is not the machine's
 /// program ending.
-fn main_exit_in(entries: &str) -> Option<(i32, i32)> {
+fn main_exit_in(entries: &str) -> Option<(i32, i32, u64)> {
     entries.lines().find_map(parse_main_exit)
 }
 
-fn parse_main_exit(line: &str) -> Option<(i32, i32)> {
+fn parse_main_exit(line: &str) -> Option<(i32, i32, u64)> {
     let entry: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let at = entry["__REALTIME_TIMESTAMP"]
+        .as_str()
+        .and_then(|t| t.parse().ok())
+        .unwrap_or(0);
     if entry["MESSAGE_ID"].as_str() == Some(UNIT_SUCCESS) {
-        return Some((1, 0));
+        return Some((1, 0, at));
     }
     if entry["COMMAND"].as_str() != Some("ExecStart") {
         return None;
@@ -58,7 +67,7 @@ fn parse_main_exit(line: &str) -> Option<(i32, i32)> {
         _ => return None,
     };
     let status = entry["EXIT_STATUS"].as_str()?.parse().ok()?;
-    Some((code, status))
+    Some((code, status, at))
 }
 
 pub fn send(fields: &[(&str, &str)]) -> Result<()> {
@@ -92,20 +101,27 @@ mod tests {
 
     #[test]
     fn the_last_exit_is_read_from_the_journal_entry() {
-        let exited = r#"{"UNIT": "systemd-nspawn@web.service", "EXIT_CODE": "exited", "COMMAND": "ExecStart", "EXIT_STATUS": "3", "MESSAGE_ID": "98e322203f7a4ed290d09fe03c09fe15"}"#;
-        assert_eq!(parse_main_exit(exited), Some((1, 3)));
+        let exited = r#"{"UNIT": "systemd-nspawn@web.service", "EXIT_CODE": "exited", "COMMAND": "ExecStart", "EXIT_STATUS": "3", "MESSAGE_ID": "98e322203f7a4ed290d09fe03c09fe15", "__REALTIME_TIMESTAMP": "1792344103496502"}"#;
+        // And when, which ps says as how long ago.
+        assert_eq!(parse_main_exit(exited), Some((1, 3, 1_792_344_103_496_502)));
         let killed = exited
             .replace("\"exited\"", "\"killed\"")
             .replace("\"3\"", "\"9\"");
-        assert_eq!(parse_main_exit(&killed), Some((2, 9)));
+        assert_eq!(
+            parse_main_exit(&killed),
+            Some((2, 9, 1_792_344_103_496_502))
+        );
         assert_eq!(parse_main_exit(""), None);
         assert_eq!(parse_main_exit(r#"{"EXIT_CODE": "exited"}"#), None);
         let success = r#"{"UNIT": "systemd-nspawn@web.service", "MESSAGE_ID": "7ad2d189f7e94e70a38c781354912448", "MESSAGE": "systemd-nspawn@web.service: Deactivated successfully."}"#;
-        assert_eq!(parse_main_exit(success), Some((1, 0)));
+        assert_eq!(parse_main_exit(success), Some((1, 0, 0)));
         // A hook that failed is logged the same way, and is not the program's ending.
         let hook = exited.replace("\"ExecStart\"", "\"ExecStartPre\"");
         assert_eq!(parse_main_exit(&hook), None);
-        assert_eq!(main_exit_in(&format!("{hook}\n{exited}\n")), Some((1, 3)));
+        assert_eq!(
+            main_exit_in(&format!("{hook}\n{exited}\n")),
+            Some((1, 3, 1_792_344_103_496_502))
+        );
         assert_eq!(main_exit_in(&format!("{hook}\n")), None);
     }
 

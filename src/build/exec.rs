@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{BufWriter, Read as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use tokio_util::sync::CancellationToken;
@@ -123,6 +123,9 @@ const HOST_NETWORK_REFUSED: &str =
 
 /// In the work directory of a Dockerfile build, for the sweep at the service's start.
 pub(crate) const MARKER: &str = ".nspawn-dockerfile-build";
+
+/// In the output directory of an mkosi build until it ends, for the same sweep.
+pub(crate) const MKOSI_MARKER: &str = ".nspawn-mkosi-build";
 
 fn timestamp_now() -> String {
     let nanos = std::time::SystemTime::now()
@@ -265,7 +268,7 @@ impl<'a> Builder<'a> {
                 .args(["link", "del", &crate::bridge::host_end_name_at(&name, 0)])
                 .output();
         }
-        let _ = std::fs::remove_dir_all(&self.work);
+        let _ = crate::store::remove_tree(&self.work);
     }
 
     async fn build(&mut self) -> Result<Built> {
@@ -723,14 +726,16 @@ impl<'a> Builder<'a> {
         let done = match action {
             Action::Run(run) => self.run_step(n, &step_root.merged, run).await,
             Action::Copy(c) => self.copy_step(n, &step_root.merged, c).await,
-            Action::Workdir { path, user } => workdir(&step_root.merged, path, user),
+            Action::Workdir { path, user } => {
+                tokio::task::block_in_place(|| workdir(&step_root.merged, path, user))
+            }
         };
         let unmounted = root::unmount(sd, &step_root).await;
         done?;
         unmounted?;
         let created = timestamp_now();
         let committed = self.commit(n, &step_root.upper, &lowers).await?;
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::store::remove_tree(&dir);
         Ok(cache::Entry {
             layer: committed.digest,
             diff_id: committed.diff_id,
@@ -876,7 +881,10 @@ impl<'a> Builder<'a> {
         let mut secret_env: Vec<(String, Vec<u8>)> = Vec::new();
         let mut targets: Vec<String> = Vec::new();
         let mut locks = Vec::new();
-        let mut locked = std::collections::HashSet::new();
+        // The directory each cache of the step is in: two mounts of one cache are one
+        // directory, as the reference gives a step one ref per cache, and neither waits
+        // for the other's lock.
+        let mut caches: HashMap<String, PathBuf> = HashMap::new();
         for (i, mount) in run.mounts.iter().enumerate() {
             match mount {
                 RunMount::Bind {
@@ -891,17 +899,20 @@ impl<'a> Builder<'a> {
                         // A writable bind keeps nothing: the step writes into a copy.
                         let scratch = dir.join(format!("rw-{i}"));
                         std::fs::create_dir_all(&scratch)?;
-                        copy::docopy(
-                            &src_root,
-                            &scratch,
-                            &copy::CopyAction {
-                                src: source.clone(),
-                                dest: "/data".to_string(),
-                                follow_symlink: true,
-                                create_dest_path: true,
-                                ..Default::default()
-                            },
-                        )?;
+                        // Off the runtime's workers, as long as the files take.
+                        tokio::task::block_in_place(|| {
+                            copy::docopy(
+                                &src_root,
+                                &scratch,
+                                &copy::CopyAction {
+                                    src: source.clone(),
+                                    dest: "/data".to_string(),
+                                    follow_symlink: true,
+                                    create_dest_path: true,
+                                    ..Default::default()
+                                },
+                            )
+                        })?;
                         path = scratch.join("data");
                     }
                     targets.push(target.clone());
@@ -921,48 +932,51 @@ impl<'a> Builder<'a> {
                     uid,
                     gid,
                 } => {
-                    let cache_dir = self
-                        .ctx
-                        .store
-                        .build_cache_dir()
-                        .join("mounts")
-                        .join(short(&cache::key(&[id.as_bytes()])));
-                    if !cache_dir.exists() {
-                        // Made beside its name and renamed into place once seeded: a seed
-                        // cut short is made again by the next build.
-                        let staged = cache_dir
-                            .with_file_name(format!(".new-{}", crate::store::unique_suffix()));
-                        std::fs::create_dir_all(&staged)?;
-                        let seeded: Result<()> = async {
-                            if let Some((f, source)) = from {
-                                let src_root = self.source_root(f).await?;
-                                copy::docopy(
-                                    &src_root,
-                                    &staged,
-                                    &copy::CopyAction {
-                                        src: source.clone(),
-                                        dest: "/".to_string(),
-                                        follow_symlink: true,
-                                        dir_copy_contents: true,
-                                        create_dest_path: true,
-                                        ..Default::default()
-                                    },
-                                )?;
-                            }
-                            std::fs::set_permissions(
-                                &staged,
-                                std::fs::Permissions::from_mode(*mode),
-                            )?;
-                            std::os::unix::fs::chown(&staged, Some(*uid), Some(*gid))?;
-                            Ok(())
+                    // Named as the reference keys a cache: its id and the base it starts
+                    // from, the owner and mode it is made with or what from= seeds it
+                    // with, so that another of these is another cache.
+                    let base = match from {
+                        Some((f, source)) => {
+                            format!("{} {source}", self.source_identity(f, source).await?)
                         }
-                        .await;
-                        // Another build may have made it meanwhile: its copy stays.
-                        if seeded.is_err() || std::fs::rename(&staged, &cache_dir).is_err() {
-                            let _ = std::fs::remove_dir_all(&staged);
-                        }
-                        seeded?;
+                        None => String::new(),
+                    };
+                    let key = cache_mount_name(id, *uid, *gid, *mode, &base);
+                    if let Some(cache_dir) = caches.get(&key) {
+                        targets.push(target.clone());
+                        mounts.push(sandbox::Mount::Bind {
+                            source: cache_dir.clone(),
+                            target: target.clone(),
+                            read_only: *read_only,
+                        });
+                        continue;
                     }
+                    let mounts_dir = self.ctx.store.build_cache_dir().join("mounts");
+                    // A private cache another step holds is taken in an instance of its
+                    // own, as the reference makes one.
+                    let mut instance = 0usize;
+                    let cache_dir = loop {
+                        let name = if instance == 0 {
+                            key.clone()
+                        } else {
+                            format!("{key}-{instance}")
+                        };
+                        let cache_dir = mounts_dir.join(name);
+                        if !cache_dir.exists() {
+                            self.seed_cache(&cache_dir, from.as_ref(), *mode, *uid, *gid)
+                                .await?;
+                        }
+                        if sharing != "private" {
+                            break cache_dir;
+                        }
+                        match try_lock_dir(&cache_dir)? {
+                            Some(lock) => {
+                                locks.push(lock);
+                                break cache_dir;
+                            }
+                            None => instance += 1,
+                        }
+                    };
                     // Its last use, which builder prune goes by: nothing inside need
                     // change for it.
                     let now = nix::sys::time::TimeSpec::UTIME_NOW;
@@ -973,9 +987,8 @@ impl<'a> Builder<'a> {
                         &now,
                         nix::sys::stat::UtimensatFlags::NoFollowSymlink,
                     );
-                    // Waited for off the runtime's threads, and once per directory: a
-                    // second lock of the same one would wait for itself.
-                    if sharing == "locked" && locked.insert(cache_dir.clone()) {
+                    // Waited for off the runtime's threads.
+                    if sharing == "locked" {
                         let dir = cache_dir.clone();
                         let lock = tokio::select! {
                             lock = tokio::task::spawn_blocking(move || lock_dir(&dir)) => {
@@ -985,6 +998,7 @@ impl<'a> Builder<'a> {
                         };
                         locks.push(lock);
                     }
+                    caches.insert(key, cache_dir.clone());
                     targets.push(target.clone());
                     mounts.push(sandbox::Mount::Bind {
                         source: cache_dir,
@@ -1132,34 +1146,27 @@ impl<'a> Builder<'a> {
         let stdout = child.stdout.take().context("no output of the step")?;
         let stderr = child.stderr.take().context("no output of the step")?;
         let report = self.report;
-        // Each stream read to its end by a task of its own, as bytes: a line that is no
-        // UTF-8 is still a line, and a stream nobody reads would hold the step forever
-        // once its pipe filled.
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // Each stream read to its end by a task of its own: a stream nobody reads would hold
+        // the step forever once its pipe filled.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(STEP_LINES_IN_TRANSIT);
         let readers: [Box<dyn tokio::io::AsyncRead + Send + Unpin>; 2] =
             [Box::new(stdout), Box::new(stderr)];
-        for stream in readers {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut reader = tokio::io::BufReader::new(stream);
-                while let Ok(Some(text)) = step_line(&mut reader).await {
-                    if tx.send(text).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+        let pumps = readers.map(|stream| tokio::spawn(pump(stream, tx.clone(), started)));
         drop(tx);
+        let show = |text: &str| {
+            line(
+                report,
+                format!("#{n} {:.3} {text}", started.elapsed().as_secs_f64()),
+            );
+        };
         loop {
             tokio::select! {
                 () = self.cancel.cancelled() => {
-                    // The step's processes end with systemd-nspawn, the init of their
-                    // PID namespace going with it.
-                    let _ = child.kill().await;
+                    self.end_step(&mut child, step).await;
                     bail!(CANCELLED);
                 }
                 text = rx.recv() => match text {
-                    Some(text) => line(report, format!("#{n} {:.3} {text}", started.elapsed().as_secs_f64())),
+                    Some(text) => show(&text),
                     None => break,
                 },
             }
@@ -1167,11 +1174,18 @@ impl<'a> Builder<'a> {
         let status = tokio::select! {
             status = child.wait() => status.context("waiting for systemd-nspawn")?,
             () = self.cancel.cancelled() => {
-                let _ = child.kill().await;
+                self.end_step(&mut child, step).await;
                 bail!(CANCELLED);
             }
         };
         if !status.success() {
+            for pump in pumps {
+                if let Ok(clip) = pump.await {
+                    for kept in &clip.tail {
+                        show(kept);
+                    }
+                }
+            }
             bail!(
                 "process {:?} did not complete successfully: exit code: {}",
                 step.argv.join(" "),
@@ -1181,32 +1195,128 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
+    /// What a cache mount's from= takes, as the step's key names it.
+    async fn source_identity(&mut self, from: &From, source: &str) -> Result<String> {
+        Ok(match from {
+            From::Context => {
+                tokio::task::block_in_place(|| content_hash(&self.req.context, source))?
+            }
+            From::Stage(i) => self
+                .states
+                .get(i)
+                .map(|s| s.key.clone())
+                .with_context(|| format!("stage {i} is not built"))?,
+            From::Image(reference) => self.base(reference).await?.key,
+            From::Scratch => "scratch".to_string(),
+        })
+    }
+
+    /// Makes a cache mount's directory: beside its name, seeded, then put in place unless
+    /// another build put one there meanwhile, whose stays.
+    async fn seed_cache(
+        &mut self,
+        cache_dir: &Path,
+        from: Option<&(From, String)>,
+        mode: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<()> {
+        let staged = cache_dir.with_file_name(format!(".new-{}", crate::store::unique_suffix()));
+        std::fs::create_dir_all(&staged)
+            .with_context(|| format!("creating {}", staged.display()))?;
+        let seeded: Result<()> = async {
+            if let Some((f, source)) = from {
+                let src_root = self.source_root(f).await?;
+                tokio::task::block_in_place(|| {
+                    copy::docopy(
+                        &src_root,
+                        &staged,
+                        &copy::CopyAction {
+                            src: source.clone(),
+                            dest: "/".to_string(),
+                            follow_symlink: true,
+                            dir_copy_contents: true,
+                            create_dest_path: true,
+                            ..Default::default()
+                        },
+                    )
+                })?;
+            }
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode))?;
+            std::os::unix::fs::chown(&staged, Some(uid), Some(gid))?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = seeded {
+            let _ = crate::store::remove_tree(&staged);
+            return Err(e);
+        }
+        // Without replacing: a rename over another build's directory, still empty, would
+        // give the two of them different directories under one name.
+        match nix::fcntl::renameat2(
+            nix::fcntl::AT_FDCWD,
+            &staged,
+            nix::fcntl::AT_FDCWD,
+            cache_dir,
+            nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+        ) {
+            Ok(()) => Ok(()),
+            Err(nix::errno::Errno::EEXIST) => {
+                let _ = crate::store::remove_tree(&staged);
+                Ok(())
+            }
+            Err(e) => {
+                let _ = crate::store::remove_tree(&staged);
+                Err(anyhow!("putting {} in place: {e}", cache_dir.display()))
+            }
+        }
+    }
+
+    /// Ends a step cut short: systemd-nspawn, and the payload, which goes on without it
+    /// (the payload is the init of its PID namespace, systemd-nspawn only its parent) in
+    /// the scope systemd-nspawn moved it to.
+    async fn end_step(&self, child: &mut tokio::process::Child, step: &sandbox::Step) {
+        let _ = child.kill().await;
+        if let Ok(sd) = self.ctx.sd().await {
+            end_scope(sd, &format!("{}.scope", step.machine)).await;
+        }
+    }
+
     async fn copy_step(&mut self, n: usize, merged: &Path, c: &plan::Copy) -> Result<()> {
         let dir = self.work.join(format!("copy-{n}"));
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        let owner = c.chown.as_ref().map(|chown| resolve_chown(merged, chown));
+        let owner = tokio::task::block_in_place(|| {
+            c.chown.as_ref().map(|chown| resolve_chown(merged, chown))
+        });
         let chmod = c.chmod.as_deref().map(copy::parse_chmod).transpose()?;
-        // Each source with whether it is a heredoc: those are taken by their name as it
-        // is, never as a pattern or an archive.
-        let mut sources: Vec<(PathBuf, String, bool)> = Vec::new();
+        // Each source with how its name is taken: a heredoc's and a download's as they are,
+        // never as a pattern, as the reference copies them; a heredoc never as an archive.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Named {
+            Pattern,
+            Inline,
+            Url,
+        }
+        let mut sources: Vec<(PathBuf, String, Named)> = Vec::new();
         for (i, file) in c.inline.iter().enumerate() {
             let inline = dir.join(format!("inline-{i}"));
             std::fs::create_dir_all(&inline)?;
             let name = heredoc_file(&file.name)?;
             std::fs::write(inline.join(&name), &file.data)?;
             std::fs::set_permissions(inline.join(&name), std::fs::Permissions::from_mode(0o644))?;
-            sources.push((inline, name, true));
+            sources.push((inline, name, Named::Inline));
         }
         for source in &c.sources {
             if c.add && is_url(source) {
                 let (fetched, name, _) = self.download(source, c.checksum.as_deref()).await?;
-                sources.push((fetched, name, false));
+                sources.push((fetched, name, Named::Url));
                 continue;
             }
             if c.add && source.contains("://") {
                 bail!("ADD of {source}: only local files and http or https URLs are taken");
             }
-            sources.push((self.source_root(&c.from).await?, source.clone(), false));
+            let root = self.source_root(&c.from).await?;
+            sources.push((root, source.clone(), Named::Pattern));
         }
         // A URL is copied as it came unless --unpack says otherwise, a local archive
         // unpacked unless --unpack=false says so.
@@ -1217,16 +1327,15 @@ impl<'a> Builder<'a> {
             }
             unpack_archive(r, &dir)
         };
-        for (src_root, source, inline) in &sources {
-            let src = copy::copy_source(source, c.parents && !inline);
-            let mut action = copy::CopyAction::for_instruction(&src, &c.dest);
-            action.allow_wildcard &= !inline;
+        for (src_root, source, named) in &sources {
+            let literal = *named != Named::Pattern;
+            let mut action = source_action(source, &c.dest, c.parents, literal);
             action.owner = owner;
             if let Some(chmod) = chmod.clone() {
                 action.set_chmod(chmod);
             }
             action.exclude_patterns.clone_from(&c.exclude);
-            if c.add && !inline {
+            if c.add && *named != Named::Inline {
                 action.unpack = Some(&unpack);
             }
             // Off the runtime's worker while it copies, which takes as long as the files.
@@ -1268,6 +1377,7 @@ impl<'a> Builder<'a> {
             let rebuilt = store
                 .load_image(name)?
                 .is_some_and(|r| replaced_by_build(store, &r, reference));
+            crate::install::ensure_no_pending_rollback(store, name, self.req.force)?;
             crate::install::ensure_replaceable(store, sd, name, self.req.force || rebuilt).await?;
         }
         for (name, reference) in tags {
@@ -1326,6 +1436,7 @@ impl<'a> Builder<'a> {
         let rebuilt = store
             .load_image(name)?
             .is_some_and(|r| replaced_by_build(store, &r, reference));
+        crate::install::ensure_no_pending_rollback(store, name, self.req.force)?;
         crate::install::ensure_replaceable(store, sd, name, self.req.force || rebuilt).await?;
         crate::install::stage_layers(store, backend, manifest, self.req.mode, name).await?;
         crate::install::remove_existing(store, sd, name, self.report).await?;
@@ -1350,7 +1461,12 @@ impl<'a> Builder<'a> {
             self.report,
         )
         .await?;
-        crate::api::events::emit("machine", "build", name, &[("image", reference)]);
+        crate::api::events::emit_machine(
+            store,
+            "build",
+            name,
+            &[("image", reference), ("reference", reference)],
+        );
         Ok(())
     }
 }
@@ -1396,6 +1512,91 @@ fn short(digest: &str) -> String {
 }
 
 /// Holds an exclusive lock of a cache mount while a step uses it (sharing=locked).
+/// BuildKit's limits on what a stream of a step prints: 200 KiB a second since it started,
+/// 2 MiB in all. Past them the output is dropped, said once each time, until it is within
+/// them again; from the first line dropped on, the last 256 KiB are kept, shown if the step
+/// fails.
+#[derive(Default)]
+struct Clip {
+    size: usize,
+    clipping: bool,
+    tail: std::collections::VecDeque<String>,
+    tail_size: usize,
+}
+
+impl Clip {
+    const MAX: usize = 2 << 20;
+    const SPEED: usize = 200 << 10;
+    const TAIL: usize = 256 << 10;
+
+    /// What of `text`, a line, is shown.
+    fn take(&mut self, text: &str, elapsed: Duration) -> Vec<String> {
+        let old = self.size;
+        let wanted = text.len() + 1;
+        self.size = self.size.saturating_add(wanted);
+        let by_speed = (elapsed.as_secs_f64().ceil() as usize).saturating_mul(Self::SPEED);
+        let (max, limit) = if by_speed > Self::MAX {
+            (Self::MAX, "2MiB")
+        } else {
+            (by_speed, "200KiB/s")
+        };
+        let room = max.saturating_sub(old).min(wanted);
+        if room < wanted || !self.tail.is_empty() {
+            self.keep(text);
+        }
+        if room == wanted {
+            self.clipping = false;
+            return vec![text.to_string()];
+        }
+        if self.clipping {
+            return Vec::new();
+        }
+        self.clipping = true;
+        let mut cut = room.min(text.len());
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let mut shown: Vec<String> = Vec::new();
+        if cut > 0 {
+            shown.push(text[..cut].to_string());
+        }
+        shown.push(format!("[output clipped, log limit {limit} reached]"));
+        shown
+    }
+
+    fn keep(&mut self, text: &str) {
+        self.tail_size += text.len() + 1;
+        self.tail.push_back(text.to_string());
+        while self.tail_size > Self::TAIL {
+            let Some(old) = self.tail.pop_front() else {
+                break;
+            };
+            self.tail_size -= old.len() + 1;
+        }
+    }
+}
+
+/// The directory name of a cache mount: its id and the base it starts from.
+fn cache_mount_name(id: &str, uid: u32, gid: u32, mode: u32, base: &str) -> String {
+    short(&cache::key(&[
+        id.as_bytes(),
+        uid.to_string().as_bytes(),
+        gid.to_string().as_bytes(),
+        format!("{mode:o}").as_bytes(),
+        base.as_bytes(),
+    ]))
+}
+
+/// The lock of a directory if nobody holds it, None if somebody does.
+fn try_lock_dir(dir: &Path) -> Result<Option<nix::fcntl::Flock<std::fs::File>>> {
+    let file = std::fs::File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
+    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(Some(lock)),
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Ok(None),
+        Err((_, e)) => Err(anyhow!("locking {}: {e}", dir.display())),
+    }
+}
+
 fn lock_dir(dir: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
     let file = std::fs::File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
     nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
@@ -1414,20 +1615,40 @@ fn workdir(merged: &Path, path: &str, user: &str) -> Result<()> {
     Ok(())
 }
 
+/// The copy of one source of COPY or ADD: a name taken as it is (a heredoc's, a
+/// download's) is no pattern and has no parents.
+fn source_action(
+    source: &str,
+    dest: &str,
+    parents: bool,
+    literal: bool,
+) -> copy::CopyAction<'static> {
+    let src = copy::copy_source(source, parents && !literal);
+    let mut action = copy::CopyAction::for_instruction(&src, dest);
+    action.allow_wildcard &= !literal;
+    action
+}
+
 /// USER[:GROUP] by name or number against the root's passwd and group files, as the
 /// reference resolves --chown: a name the files lack is 0.
 fn resolve_chown(root: &Path, spec: &str) -> copy::User {
+    // A file only: a FIFO an image has there would hold the open for ever.
     let read = |file: &str| -> String {
+        use std::os::unix::fs::OpenOptionsExt;
         copy::root_path(root, file)
             .ok()
             .and_then(|p| {
-                let mut text = String::new();
-                std::fs::File::open(p)
-                    .ok()?
-                    .take(10 << 20)
-                    .read_to_string(&mut text)
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+                    .open(p)
                     .ok()?;
-                Some(text)
+                if !file.metadata().ok()?.is_file() {
+                    return None;
+                }
+                let mut bytes = Vec::new();
+                file.take(10 << 20).read_to_end(&mut bytes).ok()?;
+                Some(String::from_utf8_lossy(&bytes).into_owned())
             })
             .unwrap_or_default()
     };
@@ -1565,6 +1786,35 @@ fn local_base<'a>(
 
 /// The longest line of a step's output taken as one; a longer one comes in pieces.
 const STEP_LINE: u64 = 64 * 1024;
+
+/// Lines of a step read and not yet shown.
+const STEP_LINES_IN_TRANSIT: usize = 1024;
+
+/// One output stream of a step, read to its end a line at a time, as bytes (a line that is
+/// no UTF-8 is still a line), and what the clip lets through sent on; the clip comes back,
+/// with the tail a failure shows. A step printing faster than its lines are taken waits on
+/// its pipe, and that wait is no time of the step's: BuildKit's clip goes by the time the
+/// step took to write, as nothing holds its output back, so counting it would let a step
+/// print more the slower its lines are shown.
+async fn pump(
+    stream: impl tokio::io::AsyncRead + Unpin,
+    tx: tokio::sync::mpsc::Sender<String>,
+    started: Instant,
+) -> Clip {
+    let mut clip = Clip::default();
+    let mut waited = Duration::ZERO;
+    let mut reader = tokio::io::BufReader::new(stream);
+    while let Ok(Some(text)) = step_line(&mut reader).await {
+        for shown in clip.take(&text, started.elapsed().saturating_sub(waited)) {
+            let sending = Instant::now();
+            if tx.send(shown).await.is_err() {
+                return clip;
+            }
+            waited += sending.elapsed();
+        }
+    }
+    clip
+}
 
 /// The next line of a step's output, whatever its bytes, without its newline.
 async fn step_line<R: tokio::io::AsyncBufRead + Unpin>(
@@ -1752,7 +2002,7 @@ fn unpack_archive(r: &copy::UnpackRequest<'_>, dir: &Path) -> Result<bool> {
             ..Default::default()
         },
     )?;
-    let _ = std::fs::remove_dir_all(&scratch);
+    let _ = crate::store::remove_tree(&scratch);
     Ok(true)
 }
 
@@ -1798,7 +2048,7 @@ pub async fn build(
     .await
     .context("unpacking the build context")?;
     if let Err(e) = unpacked {
-        let _ = std::fs::remove_dir_all(&work);
+        let _ = crate::store::remove_tree(&work);
         return Err(e);
     }
     request.context = dir;
@@ -1806,26 +2056,44 @@ pub async fn build(
     builder.run().await
 }
 
+/// Kills what runs in the scope of a step and waits for the scope to go.
+async fn end_scope(sd: &crate::systemd::Systemd, scope: &str) {
+    let _ = sd.kill_unit(scope, nix::libc::SIGKILL).await;
+    let _ = sd.stop_unit(scope).await;
+}
+
 /// Removes what builds of a service that went away left: their work directories, the
-/// mounts in them, the layers they were writing and their network namespaces.
+/// mounts in them, the layers they were writing and their network namespaces, and the
+/// output of mkosi builds.
 pub async fn sweep(ctx: &Context) {
     let entries = std::fs::read_dir(ctx.store.builds_dir())
         .map(|d| d.flatten().collect::<Vec<_>>())
         .unwrap_or_default();
     let sd = ctx.sd().await.ok();
+    // The payloads of steps whose service went: they outlive systemd-nspawn in their
+    // scopes, and hold the step roots below.
+    if let Some(sd) = sd {
+        for scope in sd
+            .units_matching("nspawn-build-*.scope")
+            .await
+            .unwrap_or_default()
+        {
+            end_scope(sd, &scope).await;
+        }
+    }
     // The workspace of an mkosi build the service's end cut short: no build runs yet.
     if let Ok(spaces) =
         std::fs::read_dir(ctx.config.state_dir.join("cache").join("mkosi-workspace"))
     {
         for space in spaces.flatten() {
-            let _ = std::fs::remove_dir_all(space.path());
+            let _ = crate::store::remove_tree(space.path());
         }
     }
     // A cache mount a build was seeding when it went.
     if let Ok(mounts) = std::fs::read_dir(ctx.store.build_cache_dir().join("mounts")) {
         for mount in mounts.flatten() {
             if mount.file_name().to_string_lossy().starts_with(".new-") {
-                let _ = std::fs::remove_dir_all(mount.path());
+                let _ = crate::store::remove_tree(mount.path());
             }
         }
     }
@@ -1833,7 +2101,7 @@ pub async fn sweep(ctx: &Context) {
     if let Ok(entries) = std::fs::read_dir(ctx.store.build_cache_dir()) {
         for entry in entries.flatten() {
             if entry.file_name().to_string_lossy().starts_with(".trash-") {
-                let _ = std::fs::remove_dir_all(entry.path());
+                let _ = crate::store::remove_tree(entry.path());
             }
         }
     }
@@ -1850,8 +2118,12 @@ pub async fn sweep(ctx: &Context) {
     }
     for entry in entries {
         let name = entry.file_name().to_string_lossy().into_owned();
-        // An mkosi build's directory may be named alike; only a Dockerfile build's has
-        // the marker.
+        // Nothing of an mkosi build's output is mounted or runs.
+        if mkosi_left(&name, &entry.path()) {
+            let _ = crate::store::remove_tree(entry.path());
+            continue;
+        }
+        // Only a Dockerfile build's directory has its marker.
         if !name.starts_with("df-") || !entry.path().join(MARKER).exists() {
             continue;
         }
@@ -1873,8 +2145,14 @@ pub async fn sweep(ctx: &Context) {
                 .args(["link", "del", &crate::bridge::host_end_name_at(&ns, 0)])
                 .output();
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = crate::store::remove_tree(&dir);
     }
+}
+
+/// Whether `dir`, an entry `name` of the builds directory, is the output of an mkosi build
+/// that did not end: one whose output was kept has no marker.
+fn mkosi_left(name: &str, dir: &Path) -> bool {
+    name.starts_with("mkosi-") && dir.join(MKOSI_MARKER).exists()
 }
 
 /// The mount units of the step roots below `dir`.
@@ -1899,6 +2177,160 @@ fn mounted_below(dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sweep_takes_only_unfinished_mkosi_outputs() {
+        let builds = tempfile::tempdir().unwrap();
+        let dir = |name: &str, marker: Option<&str>| {
+            let dir = builds.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            if let Some(marker) = marker {
+                std::fs::write(dir.join(marker), b"").unwrap();
+            }
+            (name.to_string(), dir)
+        };
+        let (name, path) = dir("mkosi-app-1-1792344103-4242.1", Some(MKOSI_MARKER));
+        assert!(mkosi_left(&name, &path));
+        // Kept with --keep-output.
+        let (name, path) = dir("mkosi-app-1-1792344103-4242.2", None);
+        assert!(!mkosi_left(&name, &path));
+        // A Dockerfile build, and a directory of an older release.
+        let (name, path) = dir("df-1792344103-4242.3", Some(MARKER));
+        assert!(!mkosi_left(&name, &path));
+        let (name, path) = dir("app-1-1792344103-4242.4", Some(MKOSI_MARKER));
+        assert!(!mkosi_left(&name, &path));
+    }
+
+    #[test]
+    fn a_downloaded_file_is_copied_by_its_name() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("pkg[1].tar"), b"x").unwrap();
+        let literal = source_action("pkg[1].tar", "/opt/", false, true);
+        copy::docopy(src.path(), dest.path(), &literal).unwrap();
+        assert!(dest.path().join("opt/pkg[1].tar").is_file());
+        // As a pattern the name matches pkg1.tar only, and nothing is copied.
+        let other = tempfile::tempdir().unwrap();
+        let pattern = source_action("pkg[1].tar", "/opt/", false, false);
+        copy::docopy(src.path(), other.path(), &pattern).unwrap();
+        assert!(!other.path().join("opt/pkg[1].tar").exists());
+    }
+
+    #[test]
+    fn a_fifo_for_passwd_holds_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("etc")).unwrap();
+        nix::unistd::mkfifo(
+            &root.path().join("etc/passwd"),
+            nix::sys::stat::Mode::from_bits_truncate(0o644),
+        )
+        .unwrap();
+        std::fs::write(root.path().join("etc/group"), b"staff:x:50:\xff\n").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = root.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(resolve_chown(&path, "app:staff"));
+        });
+        let user = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("resolving the owner waited on the FIFO");
+        assert_eq!(
+            (user.uid, user.gid),
+            (0, 50),
+            "a group file that is no UTF-8 still read"
+        );
+    }
+
+    #[test]
+    fn a_step_s_output_is_clipped_as_buildkit_clips_it() {
+        let mut clip = Clip::default();
+        let line = "x".repeat(1023);
+        let second = Duration::from_millis(500);
+        // 200 KiB in the first second, and a word of it once.
+        for _ in 0..200 {
+            assert_eq!(clip.take(&line, second).len(), 1);
+        }
+        let past = clip.take(&line, second);
+        assert_eq!(
+            past.last().unwrap(),
+            "[output clipped, log limit 200KiB/s reached]"
+        );
+        assert!(clip.take(&line, second).is_empty(), "said once");
+        // The next second makes room again.
+        assert_eq!(
+            clip.take(&line, Duration::from_millis(1500)),
+            std::slice::from_ref(&line)
+        );
+        // Past 2 MiB nothing more, whatever the time.
+        let mut clip = Clip::default();
+        let mut said = Vec::new();
+        for _ in 0..3000 {
+            said.extend(clip.take(&line, Duration::from_secs(60)));
+        }
+        assert_eq!(
+            said.last().unwrap(),
+            "[output clipped, log limit 2MiB reached]"
+        );
+        assert_eq!(said.len(), 2048 + 1);
+        // What a failure shows: the last 256 KiB from where the clipping began.
+        assert_eq!(clip.tail.len(), 256);
+        assert!(clip.tail.iter().all(|kept| *kept == line));
+        assert_eq!(Clip::default().tail.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_clip_leaves_out_the_time_lines_wait_to_be_shown() {
+        // 300 KiB in lines of 100 bytes, all there at once: past 200 KiB in its first
+        // second, however slowly its lines are taken.
+        let line = format!("{}\n", "x".repeat(99));
+        let data = std::io::Cursor::new(line.repeat(3072).into_bytes());
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+        let pumped = tokio::spawn(pump(data, tx, Instant::now()));
+        let mut shown = Vec::new();
+        while let Some(text) = rx.recv().await {
+            shown.push(text);
+            // 2048 lines taken in more than a second.
+            if shown.len() % 256 == 0 {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+        let clip = pumped.await.unwrap();
+        assert_eq!(
+            shown.last().unwrap(),
+            "[output clipped, log limit 200KiB/s reached]"
+        );
+        assert_eq!(shown.len(), 2048 + 1);
+        assert_eq!(clip.tail.len(), 3072 - 2048);
+    }
+
+    #[test]
+    fn a_cache_mount_is_named_by_its_id_and_its_base() {
+        let plain = cache_mount_name("/root/.npm", 0, 0, 0o755, "");
+        assert_eq!(plain, cache_mount_name("/root/.npm", 0, 0, 0o755, ""));
+        // Another owner, mode or seed is another cache, as with the reference.
+        for other in [
+            cache_mount_name("/root/.npm", 1000, 0, 0o755, ""),
+            cache_mount_name("/root/.npm", 0, 1000, 0o755, ""),
+            cache_mount_name("/root/.npm", 0, 0, 0o700, ""),
+            cache_mount_name("/root/.npm", 0, 0, 0o755, "stage-key /src"),
+            cache_mount_name("/root/.cache", 0, 0, 0o755, ""),
+        ] {
+            assert_ne!(plain, other);
+        }
+    }
+
+    #[test]
+    fn a_held_cache_is_seen_as_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = try_lock_dir(tmp.path()).unwrap();
+        assert!(first.is_some());
+        assert!(
+            try_lock_dir(tmp.path()).unwrap().is_none(),
+            "held by the first"
+        );
+        drop(first);
+        assert!(try_lock_dir(tmp.path()).unwrap().is_some());
+    }
 
     #[test]
     fn every_tag_is_checked_before_the_build() {

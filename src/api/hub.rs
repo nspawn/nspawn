@@ -45,13 +45,15 @@ pub async fn repositories(
 pub async fn tags(ctx: &Context, repository: &str) -> Result<Vec<String>> {
     let config = &ctx.config;
     let hub = Hub::new(config)?;
-    // From its parts, as the catalog: the configured registry may have no dot.
-    let reference = Reference::with_tag(
-        config.registry.clone(),
-        repository.to_string(),
-        "latest".to_string(),
-    );
-    hub.tags(&reference).await
+    hub.tags(&tags_reference(repository, &config.registry)?)
+        .await
+}
+
+/// The repository `hub tags` lists, as a pull reads its name against the configured
+/// registry, which may have no dot: Docker Hub's official ones under library/, the name
+/// checked.
+fn tags_reference(repository: &str, registry: &str) -> Result<Reference> {
+    ImageRef::parse(repository, registry)?.to_oci()
 }
 
 /// The digest `reference` names on its registry now, without pulling it.
@@ -79,6 +81,18 @@ fn is_digest(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tags_are_listed_for_the_repository_a_pull_would_take() {
+        let hub = tags_reference("nginx", "docker.io").unwrap();
+        assert_eq!(
+            (hub.registry(), hub.repository()),
+            ("docker.io", "library/nginx")
+        );
+        let own = tags_reference("e2e/au", "hub").unwrap();
+        assert_eq!((own.registry(), own.repository()), ("hub", "e2e/au"));
+        assert!(tags_reference("Nginx", "docker.io").is_err());
+    }
 
     #[test]
     fn only_a_digest_is_handed_back() {

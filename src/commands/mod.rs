@@ -59,11 +59,16 @@ pub async fn run(cli: Cli) -> Result<()> {
         cli.ca_cert.clone(),
     ) {
         Ok(config) => config,
-        // The release hook cleans up after a machine that ended: a configuration broken
-        // since it started must not leave its namespace, its rules and its secrets.
-        Err(e) if releasing(&cli.command) => {
-            eprintln!("warning: {e:#}; releasing with the default configuration");
-            Config::merge(Default::default(), None, None)?
+        // The release hook cleans up after a machine that ended, and the removal of a
+        // --rm machine follows it: a configuration broken since the machine started must
+        // not leave its namespace, its rules, its secrets or the machine itself.
+        Err(e) if cleaning_up(&cli.command) => {
+            eprintln!("warning: {e:#}; going by the settings of it that are still valid");
+            Config::load_leniently(
+                cli.config.as_deref(),
+                cli.registry.clone(),
+                cli.ca_cert.clone(),
+            )
         }
         Err(e) => return Err(e),
     };
@@ -87,7 +92,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             crate::daemon::run(config, idle).await
         }
         Command::RemoveAfterExit { name, invocation } => {
-            api::network::remove_after_exit(&Context::new(config), &name, &invocation).await
+            let removed =
+                api::network::remove_after_exit(&Context::new(config), &name, &invocation).await;
+            // The layers it let go are deleted before the transient unit ends.
+            crate::store::finish_trash();
+            removed
         }
         Command::HealthRun { name } => crate::health::run(&Context::new(config), &name).await,
         Command::ApiServe { name } => crate::dockerapi::serve(&name, config).await,
@@ -327,10 +336,15 @@ pub fn put_tuning(options: &mut Options<'_>, t: crate::cli::TuningArgs) {
             put(options, key, value);
         }
     }
-    for (key, value) in [("shm_size", t.shm_size), ("stop_timeout", t.stop_timeout)] {
-        if let Some(value) = value {
-            put(options, key, value);
-        }
+    if let Some(size) = t.shm_size {
+        put(options, "shm_size", size);
+    }
+    if let Some(seconds) = t.stop_timeout {
+        put(
+            options,
+            "stop_timeout",
+            crate::policy::stop_seconds(seconds),
+        );
     }
     if let Some(adj) = t.oom_score_adj {
         put(options, "oom_score_adj", adj);
@@ -568,15 +582,10 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             put_tuning(&mut options, a.tuning);
             // A reference that is not local is pulled first, under its own name, as run
             // does: the machine is then made from that image.
-            let images: Vec<(String, String)> = manager
-                .list_images()
-                .await
-                .map_err(client::error)?
-                .iter()
-                .map(|i| (client::string(i, "name"), client::string(i, "reference")))
-                .collect();
+            let images =
+                machines::Listed::all(&manager.list_images().await.map_err(client::error)?);
             let registry = registry_name(client, config).await;
-            let source = match create_source(&images, &a.source, &a.name, &registry)? {
+            let source = match create_source(&images, &a.source, &a.name, &registry, a.force)? {
                 CreateSource::Local(source) => source,
                 CreateSource::Pull { reference, base } => {
                     let mut pull = client::registry_options(config);
@@ -878,25 +887,32 @@ enum CreateSource {
     Pull { reference: String, base: String },
 }
 
-fn releasing(command: &Command) -> bool {
+fn cleaning_up(command: &Command) -> bool {
     matches!(
         command,
         Command::Network(crate::cli::NetworkArgs {
             command: NetworkCommand::Release { .. }
-        })
+        }) | Command::RemoveAfterExit { .. }
     )
 }
 
-/// `images` are the local images as (name, reference). A reference is compared as the
-/// service records it (`fedora:44` is `hub.example/fedora:44` there), so that an image
-/// pulled by a short reference is not pulled again under a name it already has.
+/// A source named is taken as it is; one given by its reference is an image of it never
+/// run (machines::Listed::image_of), compared as the service records references
+/// (`fedora:44` is `hub.example/fedora:44` there), so that an image pulled by a short
+/// reference is not pulled again, or else a pull: a machine that ran is no image, and
+/// would give the new one its backend, mode and network.
 fn create_source(
-    images: &[(String, String)],
+    images: &[machines::Listed],
     source: &str,
     name: &str,
     registry: &str,
+    force: bool,
 ) -> Result<CreateSource> {
-    if images.iter().any(|(n, r)| n == source || r == source) {
+    // Refused before anything is pulled, as the service would refuse it after.
+    if !force && images.iter().any(|i| i.name == name) {
+        bail!("image {name} already exists; use --force to replace it");
+    }
+    if images.iter().any(|i| i.name == source) {
         return Ok(CreateSource::Local(source.to_string()));
     }
     // What is no reference is left to the service to refuse.
@@ -904,14 +920,28 @@ fn create_source(
         return Ok(CreateSource::Local(source.to_string()));
     };
     let reference = image.to_string();
-    if images.iter().any(|(_, r)| *r == reference) {
-        return Ok(CreateSource::Local(reference));
+    for spelled in [source, reference.as_str()] {
+        if let Some(found) = machines::Listed::image_of(images, spelled, name) {
+            return Ok(CreateSource::Local(found.name.clone()));
+        }
     }
-    let base = image.local_name();
-    if images.iter().any(|(n, r)| *n == base && *r != reference) {
+    let mut base = image.local_name();
+    if images
+        .iter()
+        .any(|i| i.name == base && i.reference != reference)
+    {
         bail!(
             "{base} is an image of another reference; pull {image} under a name of your own first (nspawn pull --name)"
         );
+    }
+    // A machine of the reference that ran holds its name: the image goes beside it.
+    let taken = |n: &str| images.iter().any(|i| i.name == n);
+    if taken(&base) {
+        let stem = base.clone();
+        base = (2..)
+            .map(|n| format!("{stem}-{n}"))
+            .find(|candidate| !taken(candidate) && candidate != name)
+            .expect("a free name");
     }
     // Pulled under the machine's own name, it could not be made from it: said before the
     // download.
@@ -962,26 +992,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_release_hook_goes_on_without_its_configuration() {
+    fn only_the_cleanup_goes_on_without_its_configuration() {
         use clap::Parser;
         let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
-        assert!(releasing(&parse(&["nspawn", "network", "release", "web"])));
-        assert!(!releasing(&parse(&["nspawn", "network", "prepare", "web"])));
-        assert!(!releasing(&parse(&["nspawn", "ps"])));
-        assert!(Config::merge(Default::default(), None, None).is_ok());
+        assert!(cleaning_up(&parse(&[
+            "nspawn", "network", "release", "web"
+        ])));
+        assert!(cleaning_up(&parse(&[
+            "nspawn",
+            "remove-after-exit",
+            "web",
+            "0123456789abcdef"
+        ])));
+        assert!(!cleaning_up(&parse(&[
+            "nspawn", "network", "prepare", "web"
+        ])));
+        assert!(!cleaning_up(&parse(&["nspawn", "ps"])));
     }
 
     #[test]
     fn create_pulls_only_what_is_not_local_by_any_spelling() {
+        let listed = |name: &str, reference: &str, image_only: bool| machines::Listed {
+            name: name.into(),
+            reference: reference.into(),
+            image_only,
+            pulled: 1,
+        };
         let images = vec![
-            ("fedora-44".to_string(), "hub.example/fedora:44".to_string()),
-            (
-                "web".to_string(),
-                "docker.io/library/nginx:1.27".to_string(),
-            ),
-            ("vm".to_string(), String::new()),
+            listed("fedora-44", "hub.example/fedora:44", true),
+            listed("web", "docker.io/library/nginx:1.27", false),
+            listed("vm", "", false),
         ];
-        let source = |s: &str| create_source(&images, s, "machine", "hub.example");
+        let source = |s: &str| create_source(&images, s, "machine", "hub.example", false);
         assert_eq!(
             source("fedora-44").unwrap(),
             CreateSource::Local("fedora-44".to_string()),
@@ -989,13 +1031,22 @@ mod tests {
         );
         assert_eq!(
             source("hub.example/fedora:44").unwrap(),
-            CreateSource::Local("hub.example/fedora:44".to_string()),
+            CreateSource::Local("fedora-44".to_string()),
             "the reference as recorded"
         );
         assert_eq!(
             source("fedora:44").unwrap(),
-            CreateSource::Local("hub.example/fedora:44".to_string()),
+            CreateSource::Local("fedora-44".to_string()),
             "the short reference of a local image"
+        );
+        // A machine that ran is no image: the image is pulled beside it.
+        let ran = vec![listed("nginx-1.27", "hub.example/nginx:1.27", false)];
+        assert_eq!(
+            create_source(&ran, "nginx:1.27", "machine", "hub.example", false).unwrap(),
+            CreateSource::Pull {
+                reference: "nginx:1.27".to_string(),
+                base: "nginx-1.27-2".to_string()
+            }
         );
         assert_eq!(
             source("nginx:1.27").unwrap(),
@@ -1012,13 +1063,12 @@ mod tests {
                 base: "fedora-45".to_string()
             }
         );
-        let taken = vec![(
-            "fedora-45".to_string(),
-            "other.example/fedora:45".to_string(),
-        )];
-        let clash = create_source(&taken, "fedora:45", "machine", "hub.example").unwrap_err();
+        let taken = vec![listed("fedora-45", "other.example/fedora:45", true)];
+        let clash =
+            create_source(&taken, "fedora:45", "machine", "hub.example", false).unwrap_err();
         assert!(clash.to_string().contains("nspawn pull --name"), "{clash}");
-        let own = create_source(&images, "fedora:45", "fedora-45", "hub.example").unwrap_err();
+        let own =
+            create_source(&images, "fedora:45", "fedora-45", "hub.example", false).unwrap_err();
         assert!(
             own.to_string()
                 .starts_with("fedora-45 is the name fedora:45 is pulled under"),
@@ -1029,6 +1079,12 @@ mod tests {
             CreateSource::Local("not a reference".to_string()),
             "the service says what is wrong with it"
         );
+        // A name taken is refused before anything is pulled, unless --force.
+        let pulled = vec![listed("nginx-1.27", "hub.example/nginx:1.27", true)];
+        let taken =
+            create_source(&pulled, "nginx:1.27", "nginx-1.27", "hub.example", false).unwrap_err();
+        assert!(taken.to_string().contains("already exists"), "{taken}");
+        assert!(create_source(&pulled, "nginx:1.27", "nginx-1.27", "hub.example", true).is_ok());
     }
 
     #[test]

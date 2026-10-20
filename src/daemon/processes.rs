@@ -2,9 +2,10 @@
 //! behind Logs): org.nspawn.Process objects that say what runs, let it be signalled and
 //! announce its end.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::os::fd::OwnedFd;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use zbus::message::Header;
@@ -36,6 +37,10 @@ pub struct ProcessState {
     pub state: Mutex<String>,
     pub exit_status: Mutex<i32>,
     pub signals: Signals,
+    /// An Events stream, which a user who may only look holds a bounded number of.
+    pub stream: bool,
+    /// Its exit went out: only then may it be retired, its client still to read it.
+    pub announced: AtomicBool,
 }
 
 /// Where the Signal method of an attached run goes, and what it remembers.
@@ -55,6 +60,23 @@ pub struct Signals {
 pub struct Processes {
     next: AtomicU64,
     all: Mutex<Vec<Arc<ProcessState>>>,
+    /// Events streams being set up, by user: counted with the running ones.
+    reserved: Mutex<HashMap<u32, usize>>,
+}
+
+/// A place among a user's Events streams, held while the stream is set up.
+pub struct StreamSlot<'a> {
+    processes: &'a Processes,
+    uid: u32,
+}
+
+impl Drop for StreamSlot<'_> {
+    fn drop(&mut self) {
+        let mut reserved = self.processes.reserved.lock().unwrap();
+        if let Some(n) = reserved.get_mut(&self.uid) {
+            *n = n.saturating_sub(1);
+        }
+    }
 }
 
 impl Processes {
@@ -67,31 +89,47 @@ impl Processes {
             .collect()
     }
 
-    /// How many processes of `uid` run.
-    pub fn running_for(&self, uid: u32) -> usize {
-        self.all
+    /// A place for one more Events stream of `uid`, none past `most`: the streams that
+    /// run and those being set up counted at once.
+    pub fn reserve_stream(&self, uid: u32, most: usize) -> Option<StreamSlot<'_>> {
+        let mut reserved = self.reserved.lock().unwrap();
+        let running = self
+            .all
             .lock()
             .unwrap()
             .iter()
-            .filter(|p| p.owner == uid && *p.state.lock().unwrap() == "running")
-            .count()
+            .filter(|p| p.owner == uid && p.stream && *p.state.lock().unwrap() == "running")
+            .count();
+        let taken = reserved.entry(uid).or_default();
+        if running + *taken >= most {
+            return None;
+        }
+        *taken += 1;
+        Some(StreamSlot {
+            processes: self,
+            uid,
+        })
     }
 
-    /// Puts a command that exited after every other one, so that retirement goes by the
-    /// exit and the one just exited stays for its client.
-    fn exited(&self, path: &OwnedObjectPath) {
+    /// Ends a command: its state, and its place after every other one, at once, so that
+    /// retirement goes by the exit and never takes one at its starting place.
+    fn exit(&self, process: &Arc<ProcessState>, status: i32) {
         let mut all = self.all.lock().unwrap();
-        if let Some(i) = all.iter().position(|p| p.path == *path) {
+        *process.exit_status.lock().unwrap() = status;
+        *process.state.lock().unwrap() = "exited".to_string();
+        if let Some(i) = all.iter().position(|p| Arc::ptr_eq(p, process)) {
             let process = all.remove(i);
             all.push(process);
         }
     }
 
     /// Forgets the commands that exited first beyond `EXITED_KEPT`; their paths, for the
-    /// object server to drop.
+    /// object server to drop. One whose exit has not gone out yet stays.
     fn retire(&self) -> Vec<OwnedObjectPath> {
         let mut all = self.all.lock().unwrap();
-        let exited = |process: &ProcessState| *process.state.lock().unwrap() != "running";
+        let exited = |process: &ProcessState| {
+            *process.state.lock().unwrap() != "running" && process.announced.load(Ordering::SeqCst)
+        };
         let mut excess = all
             .iter()
             .filter(|p| exited(p))
@@ -243,6 +281,30 @@ pub async fn register(
         pid,
         pidfd,
         Signals::default(),
+        false,
+        wait,
+    )
+    .await
+}
+
+/// `register` of an Events stream.
+pub async fn register_stream(
+    state: &Arc<State>,
+    owner: polkit::Caller,
+    argv: &[String],
+    pid: u32,
+    pidfd: Option<OwnedFd>,
+    wait: impl Future<Output = i32> + Send + 'static,
+) -> zbus::Result<OwnedObjectPath> {
+    register_with(
+        state,
+        owner,
+        "",
+        argv,
+        pid,
+        pidfd,
+        Signals::default(),
+        true,
         wait,
     )
     .await
@@ -258,6 +320,7 @@ pub async fn register_with(
     pid: u32,
     pidfd: Option<OwnedFd>,
     signals: Signals,
+    stream: bool,
     wait: impl Future<Output = i32> + Send + 'static,
 ) -> zbus::Result<OwnedObjectPath> {
     let id = state.processes.next.fetch_add(1, Ordering::SeqCst) + 1;
@@ -273,6 +336,8 @@ pub async fn register_with(
         state: Mutex::new("running".to_string()),
         exit_status: Mutex::new(0),
         signals,
+        stream,
+        announced: AtomicBool::new(false),
     });
     state.processes.all.lock().unwrap().push(entry.clone());
     state
@@ -290,8 +355,7 @@ pub async fn register_with(
     let busy = state.enter();
     tokio::spawn(async move {
         let status = wait.await;
-        *entry.exit_status.lock().unwrap() = status;
-        *entry.state.lock().unwrap() = "exited".to_string();
+        state.processes.exit(&entry, status);
         // Clients that cache properties learn of the change through PropertiesChanged.
         if let Ok(iface) = state
             .connection()
@@ -307,7 +371,7 @@ pub async fn register_with(
         if let Ok(emitter) = state.emitter_to(entry.path.as_ref(), entry.client.as_deref()) {
             let _ = Process::exited(&emitter, status).await;
         }
-        state.processes.exited(&entry.path);
+        entry.announced.store(true, Ordering::SeqCst);
         for path in state.processes.retire() {
             let _ = state
                 .connection()
@@ -337,6 +401,8 @@ mod tests {
             state: Mutex::new(state.to_string()),
             exit_status: Mutex::new(0),
             signals: Signals::default(),
+            stream: false,
+            announced: AtomicBool::new(state != "running"),
         })
     }
 
@@ -358,5 +424,45 @@ mod tests {
         assert!(kept.iter().any(|p| p.as_str() == "/org/nspawn/process/1"));
         assert!(kept.iter().any(|p| p.as_str() == "/org/nspawn/process/6"));
         assert!(processes.retire().is_empty());
+        // One whose exit has not gone out yet is not retired, whatever its place.
+        let unannounced = process(1000, "running");
+        processes.all.lock().unwrap().insert(0, unannounced.clone());
+        processes.exit(&unannounced, 3);
+        processes.all.lock().unwrap().push(process(1001, "exited"));
+        let retired = processes.retire();
+        assert!(
+            !retired
+                .iter()
+                .any(|p| p.as_str() == "/org/nspawn/process/1000"),
+            "{retired:?}"
+        );
+        assert_eq!(*unannounced.exit_status.lock().unwrap(), 3);
+    }
+
+    #[test]
+    fn only_events_streams_count_against_their_cap() {
+        let processes = Processes::default();
+        let of = |id: u64, stream: bool| {
+            let mut p = Arc::into_inner(process(id, "running")).unwrap();
+            p.owner = 1000;
+            p.stream = stream;
+            Arc::new(p)
+        };
+        for id in 1..=5 {
+            processes.all.lock().unwrap().push(of(id, false));
+        }
+        processes.all.lock().unwrap().push(of(6, true));
+        let first = processes.reserve_stream(1000, 2);
+        assert!(first.is_some(), "an exec or a log follow is no stream");
+        assert!(
+            processes.reserve_stream(1000, 2).is_none(),
+            "one runs, one is set up"
+        );
+        drop(first);
+        assert!(processes.reserve_stream(1000, 2).is_some());
+        assert!(
+            processes.reserve_stream(0, 1).is_some(),
+            "another user's own count"
+        );
     }
 }

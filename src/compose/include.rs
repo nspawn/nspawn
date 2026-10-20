@@ -189,9 +189,12 @@ fn import_resources(source: Map, target: &mut Map, resets: &Resets) -> Result<()
         let Some(Value::Map(from)) = source.get(key) else {
             continue;
         };
+        // compose-go takes the including file's section as a mapping and crashes on
+        // anything else; what the schema would say of it is said instead.
         let mut to = match target.remove(key) {
+            None => Map::new(),
             Some(Value::Map(m)) => m,
-            _ => Map::new(),
+            Some(_) => return Err(format!("{key} must be a mapping")),
         };
         for (name, resource) in from {
             match to.get(name) {

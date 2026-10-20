@@ -286,6 +286,7 @@ pub struct Ended {
     proxy: ProcessProxy<'static>,
     exited: ExitedStream,
     lost: zbus::fdo::NameOwnerChangedStream,
+    owner: Option<String>,
 }
 
 impl Ended {
@@ -301,10 +302,12 @@ impl Ended {
             .await
             .context("listening for the process's end")?;
         let lost = service_lost(connection).await?;
+        let owner = service_owner(connection).await;
         Ok(Ended {
             proxy,
             exited,
             lost,
+            owner,
         })
     }
 
@@ -339,7 +342,7 @@ impl Ended {
                     return Ok(*args.status());
                 }
                 Some(signal) = self.lost.next() => {
-                    if gone(&signal) {
+                    if gone(&signal, self.owner.as_deref()) {
                         anyhow::bail!("the nspawn service went away before the command ended");
                     }
                 }
@@ -360,11 +363,30 @@ async fn service_lost(connection: &zbus::Connection) -> Result<zbus::fdo::NameOw
         .context("watching the nspawn service")
 }
 
-fn gone(signal: &zbus::fdo::NameOwnerChanged) -> bool {
+/// Whether a NameOwnerChanged says the service that holds `owner` (its unique name, as
+/// it was when the job or process began) went away: one about an earlier instance,
+/// queued before a new one took the name, says nothing of it.
+fn gone(signal: &zbus::fdo::NameOwnerChanged, owner: Option<&str>) -> bool {
     signal
         .args()
-        .map(|args| args.new_owner().is_none())
+        .map(|args| {
+            let old = args.old_owner().as_ref().map(|o| o.to_string());
+            owner_left(old.as_deref(), args.new_owner().is_none(), owner)
+        })
         .unwrap_or(false)
+}
+
+/// `gone` of the names a NameOwnerChanged carries.
+fn owner_left(old: Option<&str>, no_new_owner: bool, owner: Option<&str>) -> bool {
+    no_new_owner && owner.is_none_or(|owner| old == Some(owner))
+}
+
+/// The unique name that holds org.nspawn now: the instance that answered the call
+/// just made.
+async fn service_owner(connection: &zbus::Connection) -> Option<String> {
+    let bus = zbus::fdo::DBusProxy::new(connection).await.ok()?;
+    let name = zbus::names::BusName::try_from("org.nspawn").ok()?;
+    bus.get_name_owner(name).await.ok().map(|o| o.to_string())
 }
 
 pub struct Client {
@@ -507,6 +529,7 @@ impl JobWatch {
     /// how far a transfer got when stderr is a terminal, and its result comes back, or
     /// its error.
     pub async fn finish(mut self, job: OwnedObjectPath) -> Result<Dict> {
+        let owner = service_owner(&self.connection).await;
         let mut transfers = Transfers::new(
             (self.bars && std::io::IsTerminal::is_terminal(&std::io::stderr()))
                 .then_some(indicatif::ProgressDrawTarget::stderr),
@@ -547,7 +570,7 @@ impl JobWatch {
                     break args.result().clone();
                 }
                 Some(signal) = self.lost.next() => {
-                    if gone(&signal) {
+                    if gone(&signal, owner.as_deref()) {
                         anyhow::bail!("the nspawn service went away while the job ran");
                     }
                 }
@@ -872,6 +895,18 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn only_the_service_that_took_the_job_going_away_counts() {
+        // The instance that answered, gone: the job is lost.
+        assert!(owner_left(Some(":1.40"), true, Some(":1.40")));
+        // An earlier one, its loss queued before the new one took the name: nothing.
+        assert!(!owner_left(Some(":1.12"), true, Some(":1.40")));
+        // A new owner taking the name is no loss.
+        assert!(!owner_left(None, false, Some(":1.40")));
+        // Not known which answered: any loss counts.
+        assert!(owner_left(Some(":1.12"), true, None));
+    }
     use crate::daemon::values::v;
 
     #[test]

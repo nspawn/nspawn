@@ -83,7 +83,10 @@ pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
         return Ok(());
     }
     if let Some(format) = &args.format {
-        let rows: Vec<serde_json::Value> = machines.iter().map(|m| ps_row(m, now)).collect();
+        let rows: Vec<serde_json::Value> = machines
+            .iter()
+            .map(|m| ps_row(m, now, !args.no_trunc))
+            .collect();
         // .Label "k" is a method of the rows, which the template engine gives them.
         let text = crate::gotemplate::format_list(format, PS_TABLE, &ps_headers(), &rows)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -152,6 +155,19 @@ fn ps_state(machine: &Dict) -> &'static str {
         "stopped" if machine.contains_key("exit_code") => "exited",
         _ => "created",
     }
+}
+
+/// docker's status of a container that ran, `Exited (N) X ago` or `Restarting (N) X
+/// ago`, where `word` is Exited or Restarting; without the time when the end of the run
+/// is not known (`finished` 0).
+pub(crate) fn ended_status(word: &str, code: i32, finished: u64, now: u64) -> String {
+    if finished == 0 {
+        return format!("{word} ({code})");
+    }
+    format!(
+        "{word} ({code}) {} ago",
+        crate::dockerapi::util::human_duration(now.saturating_sub(finished))
+    )
 }
 
 fn exit_code(machine: &Dict) -> Option<i32> {
@@ -244,7 +260,9 @@ fn ps_matches(
 }
 
 /// A machine with the fields --format templates are written for, and nspawn's own.
-fn ps_row(m: &Dict, now: u64) -> serde_json::Value {
+/// A machine as docker ps's fields have it; `trunc` cuts what docker cuts without
+/// --no-trunc.
+fn ps_row(m: &Dict, now: u64, trunc: bool) -> serde_json::Value {
     let json = client::dict_to_json(m);
     let created = client::u64(m, "created");
     let started = client::u64(m, "started");
@@ -265,11 +283,21 @@ fn ps_row(m: &Dict, now: u64) -> serde_json::Value {
             pairs.join(",")
         })
         .unwrap_or_default();
-    // Quoted as docker quotes it: a newline of a compose command keeps to its row.
-    let command = if client::string(m, "mode") == "boot" {
-        "\"/sbin/init\"".to_string()
-    } else {
-        crate::gotemplate::go_quote(&client::strings(m, "command").join(" "))
+    // Quoted as docker does it: a newline of a compose command keeps to its row.
+    let command = match client::string(m, "mode").as_str() {
+        "boot" => "/sbin/init".to_string(),
+        _ => crate::dockerapi::util::command_line(&client::strings(m, "command")),
+    };
+    let cut = |text: String, max: usize| match trunc {
+        true => crate::gotemplate::ellipsis(&text, max),
+        false => text,
+    };
+    let command = crate::gotemplate::go_quote(&cut(command, 20));
+    // docker keeps the tag of a reference pinned to a digest and drops the digest.
+    let reference = client::string(m, "reference");
+    let image = match reference.split_once('@') {
+        Some((named, _)) if trunc => named,
+        _ => reference.as_str(),
     };
     let state = ps_state(m);
     let since = |t: u64| crate::dockerapi::util::human_duration(now.saturating_sub(t));
@@ -280,8 +308,19 @@ fn ps_row(m: &Dict, now: u64) -> serde_json::Value {
             h => format!("Up {} ({h})", since(started)),
         },
         "paused" => format!("Up {} (Paused)", since(started)),
-        "restarting" => "Restarting".to_string(),
-        "exited" => format!("Exited ({})", exit_code(m).unwrap_or(0)),
+        "restarting" | "exited" => {
+            let word = if state == "exited" {
+                "Exited"
+            } else {
+                "Restarting"
+            };
+            ended_status(
+                word,
+                exit_code(m).unwrap_or(0),
+                client::u64(m, "finished"),
+                now,
+            )
+        }
         _ => "Created".to_string(),
     };
     let ports: Vec<String> = client::strings(m, "ports")
@@ -299,7 +338,7 @@ fn ps_row(m: &Dict, now: u64) -> serde_json::Value {
     serde_json::json!({
         "ID": client::string(m, "name"),
         "Names": client::string(m, "name"),
-        "Image": crate::dockerapi::util::familiar(&client::string(m, "reference")),
+        "Image": crate::dockerapi::util::familiar(image),
         "Command": command,
         // Go's Time.String in the local zone, as docker prints it; nothing for a machine
         // nspawn has no record of, rather than 1970.
@@ -311,7 +350,7 @@ fn ps_row(m: &Dict, now: u64) -> serde_json::Value {
         "Size": "",
         "Labels": label_text,
         "LabelsMap": labels,
-        "Mounts": client::strings(m, "volumes").iter().map(|v| v.split(':').next().unwrap_or_default().to_string()).collect::<Vec<_>>().join(","),
+        "Mounts": client::strings(m, "volumes").iter().map(|v| cut(v.split(':').next().unwrap_or_default().to_string(), 15)).collect::<Vec<_>>().join(","),
         "Networks": client::strings(m, "networks").join(","),
         "LocalVolumes": client::strings(m, "volumes").iter().filter(|v| !v.starts_with('/')).count().to_string(),
         "Mode": client::string(m, "mode"),
@@ -401,6 +440,25 @@ pub async fn start(args: StartArgs, client: &Client) -> Result<()> {
     start_machine(client, &args.name, options).await
 }
 
+/// `options` of a CreateMachine call with the flags of the start that follows it: the
+/// service checks them as it makes the machine, so that what docker refuses when it
+/// creates a container (a mount point twice, nothing to run) leaves no machine behind.
+fn with_start_flags<'a>(mut options: Options<'a>, start: &Options<'static>) -> Options<'a> {
+    for (key, value) in start {
+        // What only a start takes.
+        if matches!(*key, "wait" | "remove" | "image_command") {
+            continue;
+        }
+        options.insert(
+            key,
+            value
+                .try_clone()
+                .expect("plain values carry no file descriptor"),
+        );
+    }
+    options
+}
+
 /// The options of a StartMachine call from what start or run was given.
 fn start_options(mut args: StartOptions, command: Vec<String>) -> Result<Options<'static>> {
     // --mount is -v or --tmpfs written out; the files come before the flags, which win.
@@ -486,24 +544,59 @@ enum Source {
     Registry,
 }
 
-/// `images` are the local images as (name, reference). An existing machine of that name
-/// is started with start, or made anew with --force; a mode other than auto can only
-/// come with a pull.
+/// A record as ListImages has it, for the commands that look for an image by reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Listed {
+    pub name: String,
+    pub reference: String,
+    /// Never started: an image, where a machine that ran has a backend, a mode and a
+    /// network of its own, which a machine made from it would take.
+    pub image_only: bool,
+    /// When it was pulled or built (unix seconds), not when its image was made.
+    pub pulled: u64,
+}
+
+impl Listed {
+    pub(crate) fn all(images: &[client::Dict]) -> Vec<Listed> {
+        images
+            .iter()
+            .map(|i| Listed {
+                name: client::string(i, "name"),
+                reference: client::string(i, "reference"),
+                image_only: client::bool(i, "image_only"),
+                pulled: client::u64(i, "pulled"),
+            })
+            .collect()
+    }
+
+    /// The image of `reference` a new machine is made from: one never run, the last
+    /// pulled of several, as docker's tag names the last pull; never `but`.
+    pub(crate) fn image_of<'a>(
+        images: &'a [Listed],
+        reference: &str,
+        but: &str,
+    ) -> Option<&'a Listed> {
+        images
+            .iter()
+            .filter(|i| i.reference == reference && i.name != but && i.image_only)
+            .max_by_key(|i| i.pulled)
+    }
+}
+
+/// An existing machine of that name is started with start, or made anew with --force; a
+/// mode other than auto can only come with a pull.
 fn run_source(
-    images: &[(String, String)],
+    images: &[Listed],
     reference: &str,
     name: &str,
     force: bool,
     pull: PullPolicy,
     mode_given: bool,
 ) -> Result<Source> {
-    if !force && images.iter().any(|(n, _)| n == name) {
+    if !force && images.iter().any(|i| i.name == name) {
         bail!("machine {name} exists: nspawn start {name}, or nspawn run --force to make it anew");
     }
-    let local = images
-        .iter()
-        .find(|(n, r)| r == reference && n != name)
-        .map(|(n, _)| n.clone());
+    let local = Listed::image_of(images, reference, name).map(|i| i.name.clone());
     Ok(match (pull, local) {
         (PullPolicy::Always, _) => Source::Registry,
         (PullPolicy::Never, _) if mode_given => {
@@ -539,7 +632,6 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
     }
     // What the start takes is read before anything is pulled or made: a file or a
     // variable that is not there must not leave a machine behind.
-    let network_given = !args.options.network.is_empty();
     let options_of_start = start_options(args.options, args.command)?;
     let registry = super::registry_name(client, config).await;
     let image = ImageRef::parse(&args.reference, &registry)?;
@@ -550,14 +642,7 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
         None if args.rm => run_name(&image.local_name())?,
         None => image.local_name(),
     };
-    // The images themselves before the machines that ran, so that the source found by
-    // reference is the image and not a machine with a network and settings of its own.
-    let mut listed = client.manager.list_images().await.map_err(client::error)?;
-    listed.sort_by_key(|i| !client::bool(i, "image_only"));
-    let images: Vec<(String, String)> = listed
-        .iter()
-        .map(|i| (client::string(i, "name"), client::string(i, "reference")))
-        .collect();
+    let images = Listed::all(&client.manager.list_images().await.map_err(client::error)?);
     let source = run_source(
         &images,
         &image.to_string(),
@@ -584,17 +669,10 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
         && matches!(source, Source::Registry)
         && base != name
         && args.mode == ModeChoice::Auto
-        && images.iter().all(|(n, _)| n != &base);
+        && images.iter().all(|i| i.name != base);
     match source {
         Source::Local(source) => {
-            // A machine that ran is no image of its own: a new one made from it joins
-            // the default network unless told, as with docker.
-            let ran = listed
-                .iter()
-                .any(|i| client::string(i, "name") == source && !client::bool(i, "image_only"));
-            if ran && !network_given {
-                options.insert("network", Value::from("bridge"));
-            }
+            let options = with_start_flags(options, &options_of_start);
             client
                 .run_job_to_stderr(|| manager.create_machine(&source, &name, options))
                 .await?;
@@ -615,6 +693,7 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
             client
                 .run_job_to_stderr(|| manager.pull_image(&args.reference, options))
                 .await?;
+            let create = with_start_flags(create, &options_of_start);
             client
                 .run_job_to_stderr(|| manager.create_machine(&base, &name, create))
                 .await?;
@@ -882,7 +961,15 @@ pub(crate) async fn removed(client: &Client, name: &str) {
 pub async fn stop(args: StopArgs, client: &Client) -> Result<()> {
     let mut failed = 0;
     for name in &args.names {
-        match stop_one(client, name, args.force, args.wait, args.timeout).await {
+        match stop_one(
+            client,
+            name,
+            args.force,
+            args.wait,
+            args.timeout.map(crate::policy::stop_seconds),
+        )
+        .await
+        {
             Ok(was_running) => {
                 if was_running {
                     println!("stopped {name}");
@@ -935,7 +1022,14 @@ pub async fn restart(args: RestartArgs, client: &Client) -> Result<()> {
     let mut failed = 0;
     for name in &args.names {
         let outcome: Result<()> = async {
-            stop_one(client, name, false, true, args.timeout).await?;
+            stop_one(
+                client,
+                name,
+                false,
+                true,
+                args.timeout.map(crate::policy::stop_seconds),
+            )
+            .await?;
             let mut options = Options::new();
             options.insert("wait", Value::from(true));
             let (_, notes) = client
@@ -1074,21 +1168,19 @@ pub async fn wait(args: WaitArgs, client: &Client) -> Result<()> {
         // that ends without its program's (a failed start, a stop during a restart's
         // wait) is seen by looking again now and then.
         let started = client::u64(&machine, "started");
-        let still_this_run = |m: &Dict| {
-            matches!(client::string(m, "state").as_str(), "running" | "opening")
-                && client::u64(m, "started") == started
-        };
+        let from = ends_from(started, &client::string(&machine, "state"), now);
         let mut look = tokio::time::interval(std::time::Duration::from_secs(2));
         look.tick().await;
         let code = loop {
             if let Some(i) = ends
                 .iter()
-                .position(|(n, time, _)| n == name && *time >= started)
+                .position(|(n, time, _)| n == name && *time >= from)
             {
                 let (_, time, code) = ends.remove(i);
-                if time == started {
+                if time == from {
                     if let Ok(m) = client.manager.get_machine(name).await {
-                        if still_this_run(&m) {
+                        let state = client::string(&m, "state");
+                        if still_this_run(started, &state, client::u64(&m, "started")) {
                             continue;
                         }
                     }
@@ -1101,10 +1193,16 @@ pub async fn wait(args: WaitArgs, client: &Client) -> Result<()> {
                     None => bail!("the service stopped reporting the ends of machines"),
                 },
                 _ = look.tick() => {
-                    if let Ok(m) = client.manager.get_machine(name).await {
-                        if client::string(&m, "state") == "stopped" {
+                    match client.manager.get_machine(name).await {
+                        Ok(m) if client::string(&m, "state") == "stopped" => {
                             break exit_code_of(&m);
                         }
+                        Ok(_) => {}
+                        // Gone (a machine of run --rm): its last end seen is its end.
+                        Err(e) => match ends.iter().rev().find(|(n, _, _)| n == name) {
+                            Some((_, _, code)) => break *code,
+                            None => bail!("{:#}", client::error(e)),
+                        },
                     }
                 }
             }
@@ -1120,6 +1218,28 @@ pub async fn wait(args: WaitArgs, client: &Client) -> Result<()> {
         bail!("{}", failed.join("\n"));
     }
     Ok(())
+}
+
+/// From which second an end is the one `wait` waits for. A machine that has not begun
+/// its run yet (a restart's back-off, a start still held) is waited for to its next run,
+/// so an end from before the wait is an earlier run's; one closing has its end, from
+/// before the wait or not.
+fn ends_from(started: u64, state: &str, now: u64) -> u64 {
+    if started == 0 && matches!(state, "restarting" | "starting") {
+        now
+    } else {
+        started
+    }
+}
+
+/// Whether the run `wait` waits for still goes on, as a look again shows the machine:
+/// an end in the very second it began was then an earlier run's.
+fn still_this_run(started: u64, state: &str, started_now: u64) -> bool {
+    if started == 0 {
+        matches!(state, "restarting" | "starting")
+    } else {
+        matches!(state, "running" | "opening" | "paused") && started_now == started
+    }
 }
 
 fn exit_code_of(machine: &Dict) -> i32 {
@@ -1337,7 +1457,7 @@ pub async fn update(args: UpdateArgs, client: &Client) -> Result<()> {
 /// over, a pseudo terminal when this is one, pipes otherwise; the exit status comes
 /// back through the process object.
 pub async fn exec(args: ExecArgs, client: &Client) -> Result<()> {
-    if args.privileged {
+    if args.privileged == Some(true) {
         eprintln!(
             "note: --privileged is not used: the command gets the machine's own capabilities"
         );
@@ -1692,8 +1812,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wait_takes_the_end_of_the_run_it_waits_for() {
+        // Running since 100: an end at 100 or later; one at 100 only once the run is gone.
+        assert_eq!(ends_from(100, "running", 130), 100);
+        assert!(still_this_run(100, "running", 100));
+        assert!(still_this_run(100, "paused", 100));
+        assert!(
+            !still_this_run(100, "running", 101),
+            "a run of its own since"
+        );
+        assert!(!still_this_run(100, "stopped", 100));
+        // In a restart's back-off at 130: the crash that put it there is not waited for.
+        assert_eq!(ends_from(0, "restarting", 130), 130);
+        // Closing, its program ended: the end before the wait is the one.
+        assert_eq!(ends_from(0, "closing", 130), 0);
+        assert!(still_this_run(0, "restarting", 0));
+        assert!(still_this_run(0, "starting", 0));
+        assert!(!still_this_run(0, "running", 131));
+    }
+
+    #[test]
     fn a_machine_without_a_record_has_no_labels_for_ps() {
-        let row = ps_row(&Dict::new(), 0);
+        let row = ps_row(&Dict::new(), 0, true);
         let text = crate::gotemplate::format_list(
             r#"{{.Names}}<{{or (index .LabelsMap "x") ""}}>"#,
             PS_TABLE,
@@ -1713,7 +1853,7 @@ mod tests {
             ))
             .unwrap(),
         )]);
-        let row = ps_row(&m, 0);
+        let row = ps_row(&m, 0, true);
         for (format, want) in [
             (r#"{{.Label "app"}}"#, "web"),
             ("{{.Label `app`}}", "web"),
@@ -1763,6 +1903,10 @@ mod tests {
         assert!(ps_matches(&f(&["publish=53/udp"]), &m, &created));
         assert!(ps_matches(&f(&["since=db"]), &m, &created));
         assert!(!ps_matches(&f(&["before=db"]), &m, &created));
+        // As FilterOpt: an empty one is none, one of blanks is no key=value.
+        let pairs = |p: &[&str]| p.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        assert!(crate::dockerapi::filters::Filters::from_pairs(&pairs(&[""])).is_ok());
+        assert!(crate::dockerapi::filters::Filters::from_pairs(&pairs(&[" "])).is_err());
     }
 
     #[test]
@@ -1778,10 +1922,10 @@ mod tests {
             .unwrap(),
         )]);
         assert_eq!(
-            ps_row(&m, 0)["Labels"],
+            ps_row(&m, 0, true)["Labels"],
             "com.docker.compose.project.config_files=/x/compose.yaml,com.docker.compose.project=demo"
         );
-        assert_eq!(ps_row(&m, 0)["CreatedAt"], "", "no record, no 1970");
+        assert_eq!(ps_row(&m, 0, true)["CreatedAt"], "", "no record, no 1970");
     }
 
     #[test]
@@ -1795,10 +1939,115 @@ mod tests {
             ]))
             .unwrap(),
         )]);
+        // As docker lists it (an argument with a space in single quotes), cut to 20
+        // columns unless --no-trunc, and quoted.
         assert_eq!(
-            ps_row(&m, 0)["Command"],
-            r#""sh -c echo \"a\"\nexec sleep infinity""#
+            ps_row(&m, 0, true)["Command"],
+            "\"sh -c 'echo \\\"a\\\"\\nexe\u{2026}\""
         );
+        assert_eq!(
+            ps_row(&m, 0, false)["Command"],
+            "\"sh -c 'echo \\\"a\\\"\\nexec sleep infinity'\""
+        );
+    }
+
+    #[test]
+    fn run_gives_its_create_the_flags_of_its_start() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::try_parse_from([
+            "nspawn",
+            "run",
+            "app",
+            "--entrypoint",
+            "/app",
+            "-v",
+            "data:/data",
+            "--tmpfs",
+            "/data",
+            "--",
+            "--serve",
+        ])
+        .unwrap();
+        let crate::cli::Command::Run(args) = cli.command else {
+            panic!("not run");
+        };
+        let start = start_options(args.options, args.command).unwrap();
+        let mut create = Options::new();
+        create.insert("force", Value::from(false));
+        let create = with_start_flags(create, &start);
+        assert_eq!(
+            String::try_from(create["entrypoint"].try_clone().unwrap()).unwrap(),
+            "/app"
+        );
+        assert_eq!(
+            Vec::<String>::try_from(create["command"].try_clone().unwrap()).unwrap(),
+            ["--serve"]
+        );
+        // The mounts too, which the service checks for a place taken twice.
+        assert_eq!(
+            Vec::<String>::try_from(create["volume"].try_clone().unwrap()).unwrap(),
+            ["data:/data"]
+        );
+        assert_eq!(
+            Vec::<String>::try_from(create["tmpfs"].try_clone().unwrap()).unwrap(),
+            ["/data"]
+        );
+        // What only a start takes stays out: CreateMachine refuses options it does not know.
+        assert!(create.contains_key("force") && !create.contains_key("wait"));
+        let mut start = start;
+        start.insert("remove", Value::from(true));
+        start.insert("image_command", Value::from(true));
+        let create = with_start_flags(Options::new(), &start);
+        assert!(!["wait", "remove", "image_command"]
+            .iter()
+            .any(|key| create.contains_key(key)));
+    }
+
+    #[test]
+    fn ended_runs_say_how_long_ago() {
+        assert_eq!(
+            ended_status("Exited", 3, 1_000, 1_006),
+            "Exited (3) 6 seconds ago"
+        );
+        assert_eq!(
+            ended_status("Restarting", 1, 1_000, 1_090),
+            "Restarting (1) About a minute ago"
+        );
+        assert_eq!(ended_status("Exited", 0, 0, 1_006), "Exited (0)");
+        // A clock that went back is less than a second ago.
+        assert_eq!(
+            ended_status("Exited", 137, 2_000, 1_000),
+            "Exited (137) Less than a second ago"
+        );
+    }
+
+    #[test]
+    fn ps_cuts_mounts_and_digests_as_docker_does() {
+        let value = |v: zbus::zvariant::Value<'_>| zbus::zvariant::OwnedValue::try_from(v).unwrap();
+        let m = Dict::from([
+            (
+                "reference".to_string(),
+                value(zbus::zvariant::Value::from(
+                    "docker.io/library/nginx:1.27@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                )),
+            ),
+            (
+                "volumes".to_string(),
+                value(zbus::zvariant::Value::from(vec![
+                    "/srv/www/static-files:/usr/share/nginx/html:ro",
+                    "data:/data",
+                ])),
+            ),
+        ]);
+        let cut = ps_row(&m, 0, true);
+        assert_eq!(cut["Image"], "nginx:1.27");
+        assert_eq!(cut["Mounts"], "/srv/www/stati\u{2026},data");
+        let whole = ps_row(&m, 0, false);
+        assert_eq!(
+            whole["Image"],
+            "nginx:1.27@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        assert_eq!(whole["Mounts"], "/srv/www/static-files,data");
     }
 
     #[test]
@@ -2014,13 +2263,16 @@ mod tests {
     #[test]
     fn run_reuses_a_local_image_and_asks_the_registry_otherwise() {
         let nginx = "docker.io/library/nginx:1.27";
+        let listed = |name: &str, reference: &str, image_only: bool, pulled: u64| Listed {
+            name: name.into(),
+            reference: reference.into(),
+            image_only,
+            pulled,
+        };
         let images = vec![
-            ("web".to_string(), nginx.to_string()),
-            (
-                "fedora-44".to_string(),
-                "hub.nspawn.org/fedora:44".to_string(),
-            ),
-            ("vm".to_string(), String::new()),
+            listed("web", nginx, true, 1),
+            listed("fedora-44", "hub.nspawn.org/fedora:44", true, 1),
+            listed("vm", "", false, 0),
         ];
         let source = |name: &str, force: bool, pull: PullPolicy, mode: bool| {
             run_source(&images, nginx, name, force, pull, mode)
@@ -2064,5 +2316,19 @@ mod tests {
             Source::Local("web".to_string())
         );
         assert!(source("web2", false, PullPolicy::Never, true).is_err());
+        // A machine that ran is no image: the newest image of the reference, or a pull.
+        let ran = vec![
+            listed("a", nginx, false, 5),
+            listed("old", nginx, true, 1),
+            listed("new", nginx, true, 3),
+        ];
+        assert_eq!(
+            run_source(&ran, nginx, "b", false, PullPolicy::Missing, false).unwrap(),
+            Source::Local("new".to_string())
+        );
+        assert_eq!(
+            run_source(&ran[..1], nginx, "b", false, PullPolicy::Missing, false).unwrap(),
+            Source::Registry
+        );
     }
 }

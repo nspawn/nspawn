@@ -58,10 +58,10 @@ pub async fn push(ctx: &Context, request: &PushRequest, report: Report<'_>) -> R
         .collect();
     // Held until the manifest is up: an rm or a prune meanwhile must not take the blobs
     // still to be uploaded.
-    let _hold = {
-        let _still = crate::store::holds_still();
-        store.hold_blobs(&digests)?
-    };
+    let _hold = tokio::task::block_in_place(|| {
+        let _still = store.holds_still()?;
+        store.hold_blobs(&digests)
+    })?;
     for descriptor in manifest
         .layers
         .iter()
@@ -121,8 +121,8 @@ pub async fn push(ctx: &Context, request: &PushRequest, report: Report<'_>) -> R
     let url = hub
         .push_manifest(&dest, &manifest_bytes, media_type)
         .await?;
-    crate::api::events::emit(
-        "machine",
+    crate::api::events::emit_machine(
+        store,
         "push",
         &record.name,
         &[

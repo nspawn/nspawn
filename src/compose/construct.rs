@@ -199,6 +199,8 @@ pub enum Stop {
     Yaml(LoadError),
     /// nspawn's cap on the values one document builds.
     TooLarge,
+    /// nspawn's cap on the text of its scalars, MAX_TEXT.
+    TooMuchText,
 }
 
 impl From<LoadError> for Stop {
@@ -487,7 +489,7 @@ pub struct Constructor<'d> {
 }
 
 /// The scalar text one document may build, aliases followed.
-const MAX_TEXT: usize = 256 << 20;
+pub(super) const MAX_TEXT: usize = 256 << 20;
 
 impl<'d> Constructor<'d> {
     /// `alias_check` for yaml.Unmarshal and Decoder.Decode; Node.Decode has none.
@@ -564,7 +566,7 @@ impl<'d> Constructor<'d> {
         if let Kind::Scalar(..) = &node.kind {
             self.text += node_value(node).len();
             if self.text > MAX_TEXT {
-                return Err(Stop::TooLarge);
+                return Err(Stop::TooMuchText);
             }
         }
         match &node.kind {

@@ -26,6 +26,20 @@ pub struct ImageSummary {
     pub signed_by: Option<String>,
     /// Pulled or built and never run: nothing of a machine is lost when it is replaced.
     pub image_only: bool,
+    /// When the image was made, as its config says (unix seconds).
+    pub created: Option<u64>,
+    /// When it was pulled or built here (unix seconds).
+    pub pulled: Option<u64>,
+}
+
+/// The `created` of a record's image config, what docker shows as an image's CREATED.
+fn config_created(store: &crate::store::Store, record: &crate::store::ImageRecord) -> Option<u64> {
+    let manifest: oci_client::manifest::OciImageManifest =
+        serde_json::from_slice(&store.load_manifest(&record.name).ok()?).ok()?;
+    let blob = std::fs::read(store.blob_path(&manifest.config.digest)).ok()?;
+    let config: serde_json::Value = serde_json::from_slice(&blob).ok()?;
+    let created = crate::compose::gotime::parse_rfc3339(config.get("created")?.as_str()?)?;
+    u64::try_from(created).ok()
 }
 
 pub async fn list(ctx: &Context) -> Result<Vec<ImageSummary>> {
@@ -49,6 +63,8 @@ pub async fn list(ctx: &Context) -> Result<Vec<ImageSummary>> {
                 reference: record.map(|r| r.reference.clone()),
                 signed_by: record.and_then(|r| r.signed_by.clone()),
                 image_only: record.is_some_and(|r| crate::api::disk::image_only(&ctx.store, r)),
+                created: record.and_then(|r| config_created(&ctx.store, r)),
+                pulled: record.map(|r| r.created),
                 name: i.name,
                 kind: i.kind,
                 size: i.usage,
@@ -276,6 +292,7 @@ pub async fn remove_machines_if(
                     // An update that was still deciding about it has nothing left to decide.
                     store.forget_rollback(name)?;
                     crate::install::take_off_boot(sd, name, report).await;
+                    crate::install::forget_unit_ending(sd, name).await;
                     // Named volumes outlive the machine.
                     for volume in rec.volumes.iter().filter(|v| v.is_named()) {
                         note(
@@ -297,6 +314,12 @@ pub async fn remove_machines_if(
                         found = true;
                     }
                     found |= crate::install::take_off_boot(sd, name, report).await;
+                    // An update cut short left only its rollback: rm lets it go too, or
+                    // the next recover would bring back what was removed.
+                    if store.rollback_dir(name).exists() {
+                        store.forget_rollback(name)?;
+                        found = true;
+                    }
                     if !found {
                         bail!("no machine or image named {name}");
                     }
@@ -329,11 +352,12 @@ pub async fn remove_machines_if(
     let tidy = async {
         bridge::write_hosts_files(store, &crate::api::network::all(store, &ctx.config)?)?;
         bridge::sync_ports(store, sd).await?;
-        let gone = store.gc_layers()?;
+        // Trees of any size: off the runtime's workers.
+        let gone = tokio::task::block_in_place(|| store.gc_layers())?;
         if !gone.is_empty() {
             line(report, format!("freed {} unused layer(s)", gone.len()));
         }
-        let blobs = store.gc_blobs()?;
+        let blobs = tokio::task::block_in_place(|| store.gc_blobs())?;
         if !blobs.is_empty() {
             line(report, format!("freed {} unused blob(s)", blobs.len()));
         }

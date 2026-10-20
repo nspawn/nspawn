@@ -17,18 +17,21 @@ image=docker:28.5.1-dind
 
 record() {
     out=$(mkdir -p "$1" && cd "$1" && pwd)
-    # A container of an earlier record writes where that one asked.
-    mounted=$(docker inspect $name --format '{{range .Mounts}}{{if eq .Destination "/out"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)
-    if [ -n "$mounted" ] && [ "$mounted" != "$out" ]; then
+    # A container of an earlier record writes where that one asked, and builds the cases
+    # of the tree it was made for. Its binds alone: the image's /var/lib/docker is a
+    # volume of its own.
+    mounts=$(docker inspect $name --format '{{range .Mounts}}{{if or (eq .Destination "/build") (eq .Destination "/out")}}{{.Destination}}={{.Source}} {{end}}{{end}}' 2>/dev/null || true)
+    if [ -n "$mounts" ] && [ "$mounts" != "/build=$here /out=$out " ] && [ "$mounts" != "/out=$out /build=$here " ]; then
         docker rm -f -v $name >/dev/null
-        mounted=
+        mounts=
     fi
-    if [ -z "$mounted" ]; then
+    if [ -z "$mounts" ]; then
         docker run -d --privileged --name $name --memory 2g --memory-swap 2g \
             -v "$here:/build:ro" -v "$out:/out" $image >/dev/null
     else
         docker start $name >/dev/null
     fi
+    trap 'docker stop $name >/dev/null 2>&1 || true' EXIT
     docker exec -e OUT=/out $name sh /build/scenario.sh
     docker exec $name chown -R "$(id -u):$(id -g)" /out
     rm -rf "$here/golden"
@@ -43,7 +46,6 @@ record() {
         [ -e "$err" ] && cp "$err" "$here/golden/"
     done
     cp "$out/docker-version.txt" "$here/"
-    docker stop $name >/dev/null
 }
 
 case "${1:-}" in

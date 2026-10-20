@@ -160,6 +160,50 @@ pub fn parse_memory_swap(text: &str) -> Result<i64> {
 /// --memory: a size of at least 4m, or 0 for none.
 /// --restart as docker takes it: no, on-failure[:N], always or unless-stopped. The
 /// count of on-failure is not kept: systemd restarts a unit on every failure.
+/// The stop timeout of a stop that waits for as long as the program takes, never killing
+/// it, as docker's negative ones do.
+pub const NO_STOP_TIMEOUT: u64 = u64::MAX;
+
+/// A stop timeout as docker takes it, in seconds: a negative one is none.
+pub fn stop_seconds(seconds: i64) -> u64 {
+    u64::try_from(seconds).unwrap_or(NO_STOP_TIMEOUT)
+}
+
+/// A stop timeout as docker shows it, -1 for none.
+pub fn shown_stop_timeout(seconds: u64) -> i64 {
+    i64::try_from(seconds).unwrap_or(-1)
+}
+
+/// `parse_restart` as clap's parser of --restart, with the four policies as its possible
+/// values, which the completion, --help and the manual page list.
+#[derive(Clone)]
+pub struct RestartParser;
+
+impl clap::builder::TypedValueParser for RestartParser {
+    type Value = Restart;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> std::result::Result<Restart, clap::Error> {
+        let parse: fn(&str) -> Result<Restart> = parse_restart;
+        clap::builder::TypedValueParser::parse_ref(&parse, cmd, arg, value)
+    }
+
+    fn possible_values(
+        &self,
+    ) -> Option<Box<dyn Iterator<Item = clap::builder::PossibleValue> + '_>> {
+        use clap::ValueEnum;
+        Some(Box::new(
+            Restart::value_variants()
+                .iter()
+                .filter_map(ValueEnum::to_possible_value),
+        ))
+    }
+}
+
 pub fn parse_restart(text: &str) -> Result<Restart> {
     let (policy, count) = match text.split_once(':') {
         Some((policy, count)) => (policy, Some(count)),
@@ -246,6 +290,16 @@ pub fn parse_cpus(text: &str) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_negative_stop_timeout_is_none_as_in_docker() {
+        assert_eq!(stop_seconds(10), 10);
+        assert_eq!(stop_seconds(0), 0);
+        assert_eq!(stop_seconds(-1), NO_STOP_TIMEOUT);
+        assert_eq!(stop_seconds(i64::MIN), NO_STOP_TIMEOUT);
+        assert_eq!(shown_stop_timeout(NO_STOP_TIMEOUT), -1);
+        assert_eq!(shown_stop_timeout(90), 90);
+    }
 
     #[test]
     fn restart_policies_are_spelled_the_same_everywhere() {

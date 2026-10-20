@@ -83,7 +83,15 @@ pub struct Hub {
     hub_name: String,
     /// For every other registry: the system's roots alone.
     public: Client,
+    /// The same for uploads, whose requests no read timeout bounds: it would count the
+    /// time a body takes to send and a registry takes to commit a large blob.
+    hub_upload: Client,
+    public_upload: Client,
 }
+
+/// How long an upload may go without the registry taking the next part of a blob before
+/// it is given up; the commit after the last part is the registry's to take.
+const UPLOAD_STALL_SECS: u64 = 600;
 
 impl Hub {
     pub fn new(config: &Config) -> Result<Self> {
@@ -107,20 +115,32 @@ impl Hub {
         // A registry that stops sending in the middle of a blob, the connection left
         // open, would hold the job, its blobs and the service for ever: a read that
         // waits this long ends the transfer.
-        let client_config = |extra_root_certificates| ClientConfig {
+        let client_config = |extra_root_certificates, read_timeout| ClientConfig {
             protocol: ClientProtocol::Https,
             extra_root_certificates,
             platform_resolver: Some(Box::new(oci_client::client::current_platform_resolver)),
             user_agent: concat!("nspawn/", env!("CARGO_PKG_VERSION")),
-            read_timeout: Some(std::time::Duration::from_secs(120)),
+            read_timeout,
             connect_timeout: Some(std::time::Duration::from_secs(30)),
             ..Default::default()
         };
+        let reads = Some(std::time::Duration::from_secs(120));
         Ok(Hub {
-            hub: Client::new(client_config(extra_root_certificates)),
+            hub: Client::new(client_config(extra_root_certificates.clone(), reads)),
             hub_name: config.registry.clone(),
-            public: Client::new(client_config(Vec::new())),
+            public: Client::new(client_config(Vec::new(), reads)),
+            hub_upload: Client::new(client_config(extra_root_certificates, None)),
+            public_upload: Client::new(client_config(Vec::new(), None)),
         })
+    }
+
+    /// The upload client for a registry, as `client` picks the other.
+    fn upload_client(&self, registry: &str) -> &Client {
+        if registry == self.hub_name {
+            &self.hub_upload
+        } else {
+            &self.public_upload
+        }
     }
 
     /// The client for a registry: the configured CA certificate is trusted for the
@@ -146,8 +166,14 @@ impl Hub {
     /// a registry that wants credentials rejects the push here, with a clear message.
     pub async fn authenticate_push(&self, image: &Reference) -> Result<()> {
         let auth = self.auth(image.registry());
-        for operation in [RegistryOperation::Pull, RegistryOperation::Push] {
-            self.client(image.registry())
+        let clients = [
+            self.client(image.registry()),
+            self.upload_client(image.registry()),
+        ];
+        for (client, operation) in clients.into_iter().flat_map(|client| {
+            [RegistryOperation::Pull, RegistryOperation::Push].map(|operation| (client, operation))
+        }) {
+            client
                 .auth(image, &auth, operation)
                 .await
                 .with_context(|| {
@@ -179,7 +205,13 @@ impl Hub {
                 .await
                 .with_context(|| format!("listing the catalog of {registry}"))?;
             let n = page.repositories.len();
-            all.extend(page.repositories);
+            // What no reference can name is no repository: a registry's text, which ends
+            // up on the bus and in tables.
+            all.extend(
+                page.repositories
+                    .into_iter()
+                    .filter(|r| crate::reference::valid_repository(r)),
+            );
             if !more_pages(n, all.last().map(String::as_str), last.as_deref()) {
                 break;
             }
@@ -206,7 +238,11 @@ impl Hub {
                 .await
                 .with_context(|| format!("listing tags of {}", image.repository()))?;
             let n = page.tags.len();
-            all.extend(page.tags);
+            all.extend(
+                page.tags
+                    .into_iter()
+                    .filter(|t| crate::reference::valid_tag(t)),
+            );
             if !more_pages(n, all.last().map(String::as_str), last.as_deref()) {
                 break;
             }
@@ -265,23 +301,48 @@ impl Hub {
             .manifests
             .iter()
             .filter(|e| e.artifact_type.as_deref() == Some(BUNDLE_ARTIFACT_TYPE))
+            .filter(|e| !attestation(e.annotations.as_ref()))
         {
-            validate_digest(&entry.digest)?;
-            let bytes = self.manifest_bytes(image, &entry.digest).await?;
-            // A referrer that is not a signature of this image is somebody else's business.
-            let Ok(manifest) = serde_json::from_slice::<OciImageManifest>(&bytes) else {
-                continue;
-            };
-            let Ok(layer) = signature_layer(&manifest, subject) else {
-                continue;
-            };
-            let json = self.small_blob(image, layer, BUNDLE_MAX_SIZE).await?;
-            bundles.push(Candidate {
-                manifest_digest: entry.digest.clone(),
-                json: String::from_utf8_lossy(&json).into_owned(),
-            });
+            // One that cannot be read is one that does not verify, not the end of the
+            // lookup: a valid signature beside it still counts.
+            match self.bundle(image, subject, &entry.digest).await {
+                Ok(Some(json)) => bundles.push(Candidate {
+                    manifest_digest: entry.digest.clone(),
+                    json,
+                    unreadable: None,
+                }),
+                Ok(None) => {}
+                Err(e) => bundles.push(Candidate {
+                    manifest_digest: entry.digest.clone(),
+                    json: String::new(),
+                    unreadable: Some(format!("{e:#}")),
+                }),
+            }
         }
         Ok(bundles)
+    }
+
+    /// The bundle of a referrer: none when it is no signature of this image (somebody
+    /// else's business, an attestation among them).
+    async fn bundle(
+        &self,
+        image: &Reference,
+        subject: &str,
+        digest: &str,
+    ) -> Result<Option<String>> {
+        validate_digest(digest)?;
+        let bytes = self.manifest_bytes(image, digest).await?;
+        let Ok(manifest) = serde_json::from_slice::<OciImageManifest>(&bytes) else {
+            return Ok(None);
+        };
+        if attestation(manifest.annotations.as_ref()) {
+            return Ok(None);
+        }
+        let Ok(layer) = signature_layer(&manifest, subject) else {
+            return Ok(None);
+        };
+        let json = self.small_blob(image, layer, BUNDLE_MAX_SIZE).await?;
+        Ok(Some(String::from_utf8_lossy(&json).into_owned()))
     }
 
     /// A blob small enough to hold in memory, checked against its digest; refused past `cap`.
@@ -411,6 +472,34 @@ pub struct Resolved {
     pub index_digest: Option<String>,
 }
 
+/// `stream`, setting `ended` once it is asked for an item past its last.
+fn marking_end<S: futures_util::Stream + Unpin>(
+    mut stream: S,
+    ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> impl futures_util::Stream<Item = S::Item> {
+    futures_util::stream::poll_fn(move |cx| {
+        let polled = std::pin::Pin::new(&mut stream).poll_next(cx);
+        if matches!(polled, std::task::Poll::Ready(None)) {
+            ended.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        polled
+    })
+}
+
+/// Whether an upload is given up: parts are left to send and the registry took none for
+/// `since` seconds.
+fn stalled_upload(all_sent: bool, since: u64) -> bool {
+    !all_sent && since >= UPLOAD_STALL_SECS
+}
+
+/// Whether a Sigstore bundle's annotations say it holds an attestation, which shares the
+/// signatures' artifact type and is no signature.
+fn attestation(annotations: Option<&std::collections::BTreeMap<String, String>>) -> bool {
+    annotations
+        .and_then(|a| a.get("dev.sigstore.bundle.predicateType"))
+        .is_some_and(|p| p != crate::verify::COSIGN_SIGN_PREDICATE)
+}
+
 /// The bundle layer of a manifest that is a signature of `subject`, or why it is not one:
 /// the artifact type, the subject, one layer of the bundle media type, a size a bundle has.
 pub fn signature_layer<'a>(
@@ -482,6 +571,31 @@ pub fn more_pages(page_len: usize, page_last: Option<&str>, previous: Option<&st
 #[cfg(test)]
 mod pagination_tests {
     use super::*;
+
+    #[test]
+    fn an_upload_waits_for_a_slow_commit_and_not_for_a_stall() {
+        assert!(
+            !stalled_upload(true, 10 * UPLOAD_STALL_SECS),
+            "the commit is the registry's"
+        );
+        assert!(!stalled_upload(false, UPLOAD_STALL_SECS - 1));
+        assert!(stalled_upload(false, UPLOAD_STALL_SECS));
+    }
+
+    #[test]
+    fn an_attestation_is_no_signature() {
+        let with = |p: &str| {
+            std::collections::BTreeMap::from([(
+                "dev.sigstore.bundle.predicateType".to_string(),
+                p.to_string(),
+            )])
+        };
+        assert!(attestation(Some(&with("https://slsa.dev/provenance/v1"))));
+        assert!(!attestation(Some(&with(
+            crate::verify::COSIGN_SIGN_PREDICATE
+        ))));
+        assert!(!attestation(None));
+    }
 
     #[test]
     fn pagination_stops_on_short_or_repeated_pages() {
@@ -604,27 +718,61 @@ impl Hub {
         // progress: each chunk sends its size over a channel, which closes with the
         // stream, and the counting side advances the progress from here.
         let (sent, mut counts) = tokio::sync::mpsc::unbounded_channel();
+        // When the registry last took a part, and whether it took them all.
+        let last = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(crate::store::now_unix()));
+        let all_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(size == 0));
+        let taken = last.clone();
         let stream = futures_util::TryStreamExt::map_err(
             futures_util::StreamExt::inspect(
                 ReaderStream::with_capacity(file, 1 << 20),
                 move |chunk| {
                     if let Ok(c) = chunk {
+                        taken.store(
+                            crate::store::now_unix(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         let _ = sent.send(c.len() as u64);
                     }
                 },
             ),
             |e| oci_client::errors::OciDistributionError::GenericError(Some(e.to_string())),
         );
-        let upload =
-            self.client(image.registry())
-                .push_blob_stream(image, stream, digest, Some(size));
+        // The client asks for a part once the registry answered the one before: asked
+        // past the last, every part was taken, and only the commit is left.
+        let stream = marking_end(stream, all_sent.clone());
+        let upload = self.upload_client(image.registry()).push_blob_stream(
+            image,
+            stream,
+            digest,
+            Some(size),
+        );
         let count = async {
             while let Some(bytes) = counts.recv().await {
                 progress.advance(bytes);
             }
         };
-        let (uploaded, ()) = tokio::join!(upload, count);
-        uploaded.with_context(|| format!("uploading blob {digest}"))?;
+        let work = async {
+            let (uploaded, ()) = tokio::join!(upload, count);
+            uploaded
+        };
+        let stalled = async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let since = crate::store::now_unix()
+                    .saturating_sub(last.load(std::sync::atomic::Ordering::Relaxed));
+                if stalled_upload(all_sent.load(std::sync::atomic::Ordering::Relaxed), since) {
+                    return;
+                }
+            }
+        };
+        tokio::select! {
+            uploaded = work => {
+                uploaded.with_context(|| format!("uploading blob {digest}"))?;
+            }
+            () = stalled => bail!(
+                "uploading blob {digest}: the registry took nothing of it for {UPLOAD_STALL_SECS} seconds"
+            ),
+        }
         progress.finish();
         Ok(())
     }
@@ -652,6 +800,22 @@ pub fn short_digest(digest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_upload_ends_once_asked_past_its_last_part() {
+        use futures_util::{FutureExt, StreamExt};
+        use std::sync::atomic::Ordering::Relaxed;
+        let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut parts = marking_end(futures_util::stream::iter([1, 2]), ended.clone());
+        assert_eq!(parts.next().now_or_never(), Some(Some(1)));
+        assert_eq!(parts.next().now_or_never(), Some(Some(2)));
+        assert!(
+            !ended.load(Relaxed),
+            "the last part is out, not answered yet"
+        );
+        assert_eq!(parts.next().now_or_never(), Some(None));
+        assert!(ended.load(Relaxed));
+    }
 
     #[test]
     fn a_ca_file_without_a_certificate_is_said() {

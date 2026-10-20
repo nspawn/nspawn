@@ -7,7 +7,8 @@ StartLimitIntervalSec=0
 [Service]
 ExecStart=/usr/bin/nspawn api-serve %i
 # What a machine's clients can make it take of the host. Two runtime threads,
-# whatever the host's CPUs: the rest of TasksMax is for journalctl and blocking reads.
+# whatever the host's CPUs, 16 log or event streams and 8 journal lookups at once
+# fit in TasksMax.
 Environment=TOKIO_WORKER_THREADS=2
 TasksMax=64
 MemoryMax=256M

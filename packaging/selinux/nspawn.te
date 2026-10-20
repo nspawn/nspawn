@@ -39,6 +39,7 @@ gen_require(`
 	type init_t, system_dbusd_t, journalctl_t, unconfined_service_t;
 	type systemd_machined_t, systemd_machined_var_lib_t, systemd_networkd_unit_file_t, tmpfs_t;
 	type root_t, ifconfig_t;
+	type init_var_run_t, systemd_conf_t, unlabeled_t;
 ')
 
 allow nspawn_t self:capability { chown dac_override dac_read_search fowner fsetid kill mknod net_admin setfcap setgid setpcap setuid sys_admin sys_chroot sys_ptrace sys_resource };
@@ -66,6 +67,11 @@ manage_chr_files_pattern(nspawn_t, nspawn_var_lib_t, nspawn_var_lib_t)
 manage_blk_files_pattern(nspawn_t, nspawn_var_lib_t, nspawn_var_lib_t)
 allow nspawn_t nspawn_var_lib_t:{ dir file lnk_file fifo_file sock_file chr_file blk_file } { relabelfrom relabelto };
 files_var_lib_filetrans(nspawn_t, nspawn_var_lib_t, dir, "nspawn")
+# A btrfs subvolume gets no label, nor what is made in it: one a machine's program or
+# an administrator made in a volume or a machine's tree goes with rm and volume rm.
+kernel_list_unlabeled(nspawn_t)
+kernel_delete_unlabeled(nspawn_t)
+allow nspawn_t unlabeled_t:dir del_entry_dir_perms;
 manage_dirs_pattern(nspawn_t, nspawn_etc_t, nspawn_etc_t)
 manage_files_pattern(nspawn_t, nspawn_etc_t, nspawn_etc_t)
 files_etc_filetrans(nspawn_t, nspawn_etc_t, dir, "nspawn")
@@ -96,12 +102,24 @@ init_stop(nspawn_t)
 allow nspawn_t init_t:system { reload status };
 systemd_config_generic_services(nspawn_t)
 systemd_start_all_unit_files(nspawn_t)
+# Fedora's systemd lists only the units whose status the caller may read, asking unit by
+# unit: the sweep at the service's start looks for the scopes of build steps.
+systemd_status_all_unit_files(nspawn_t)
+# rm takes what a start set at run time (the device rules of CDI nodes made anew), which
+# systemd writes under /run/systemd/system.control.
+init_delete_pid_dir_entry(nspawn_t)
+allow nspawn_t init_var_run_t:dir rmdir;
+allow nspawn_t systemd_conf_t:file unlink;
 allow nspawn_t systemd_networkd_unit_file_t:service { start status };
 systemd_dbus_chat_machined(nspawn_t)
 firewalld_dbus_chat(nspawn_t)
 policykit_dbus_chat(nspawn_t)
 # A machine's Docker API socket: systemd opens /run/nspawn/api/NAME.sock for
 # nspawn-api@NAME.socket before the machine starts and removes it after.
+# What a machine whose caller left still writes (--log-driver none) goes to a unit that
+# reads and drops it: systemd takes the read end of the pipe from the service.
+allow init_t nspawn_t:fd use;
+allow init_t nspawn_t:fifo_file { getattr ioctl read };
 files_pid_filetrans(init_t, nspawn_var_run_t, dir, "nspawn")
 manage_dirs_pattern(init_t, nspawn_var_run_t, nspawn_var_run_t)
 manage_sock_files_pattern(init_t, nspawn_var_run_t, nspawn_var_run_t)
@@ -160,6 +178,9 @@ sysnet_domtrans_ifconfig(nspawn_t)
 allow ifconfig_t self:cap_userns { net_admin sys_admin };
 iptables_domtrans(nspawn_t)
 kernel_rw_net_sysctls(nspawn_t)
+# The boot's ID, which a start marker and a claim of ports keep: one of another boot
+# was left by a crash. Every domain reads it while fips_mode is on, which may be off.
+kernel_read_kernel_sysctls(nspawn_t)
 sysnet_read_ifconfig_run_files(nspawn_t)
 # --network container: binds another machine's network namespace under /run/netns
 # itself, as ip netns attach would: the name file is made, mounted on and removed

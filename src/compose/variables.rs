@@ -194,12 +194,14 @@ struct TabWriter {
     lines: Vec<Vec<Cell>>,
     widths: Vec<usize>,
     out: Vec<u8>,
+    /// How wide a piece of a cell is.
+    measure: fn(&str) -> usize,
 }
 
 impl TabWriter {
     fn update_width(&mut self) {
         let text = super::gostr::from_bytes(&self.buf[self.pos..]);
-        self.cell.width += text.chars().count();
+        self.cell.width += (self.measure)(&text);
         self.pos = self.buf.len();
     }
 
@@ -332,8 +334,20 @@ fn tabwriter(text: &str) -> String {
     table(text, 20, 3)
 }
 
-/// Lines of tab-separated cells laid out by Go's tabwriter.
+/// Lines of tab-separated cells laid out by Go's tabwriter, which counts characters.
 pub fn table(text: &str, min_width: usize, padding: usize) -> String {
+    lay_out(text, min_width, padding, |piece| piece.chars().count())
+}
+
+/// The same through docker/cli's copy of the tabwriter, which counts terminal columns:
+/// compose writes ps and volumes with docker's formatter.
+pub fn docker_table(text: &str, min_width: usize, padding: usize) -> String {
+    lay_out(text, min_width, padding, |piece| {
+        crate::columns::string_width(&piece.chars().map(super::gostr::rune).collect::<String>())
+    })
+}
+
+fn lay_out(text: &str, min_width: usize, padding: usize, measure: fn(&str) -> usize) -> String {
     let mut w = TabWriter {
         min_width,
         padding,
@@ -344,6 +358,7 @@ pub fn table(text: &str, min_width: usize, padding: usize) -> String {
         lines: vec![Vec::new()],
         widths: Vec::new(),
         out: Vec::new(),
+        measure,
     };
     w.write(&super::gostr::to_bytes(text));
     w.flush();
@@ -366,6 +381,12 @@ mod tests {
             "N                   R                   D\n\
              A                   false               x                   y\n\
              B                   false               z\n"
+        );
+        // docker's copy counts terminal columns: a wide character takes two.
+        assert_eq!(table("A\tB\n\u{4e2d}\tx\n", 1, 1), "A B\n\u{4e2d} x\n");
+        assert_eq!(
+            docker_table("A\tB\n\u{4e2d}\tx\n", 1, 1),
+            "A  B\n\u{4e2d} x\n"
         );
     }
 

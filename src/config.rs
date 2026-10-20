@@ -137,6 +137,51 @@ impl Config {
         Ok(config)
     }
 
+    /// What the hooks that clean up after a machine go by when the file no longer loads:
+    /// each of its settings that is still valid, the directories above all, which say
+    /// where the machine's record and tree are, and the defaults for the rest.
+    pub fn load_leniently(
+        path: Option<&Path>,
+        registry: Option<String>,
+        ca_cert: Option<PathBuf>,
+    ) -> Self {
+        let text = fs::read_to_string(path.unwrap_or_else(|| Path::new(DEFAULT_CONFIG_PATH)));
+        let table: toml::Table = text
+            .ok()
+            .and_then(|text| toml::from_str(&text).ok())
+            .unwrap_or_default();
+        // Each key on its own: an unknown one, or a value of the wrong type, takes no
+        // other with it.
+        let valid: toml::Table = table
+            .into_iter()
+            .filter(|(key, value)| {
+                toml::Table::from_iter([(key.clone(), value.clone())])
+                    .try_into::<FileConfig>()
+                    .is_ok()
+            })
+            .collect();
+        let file: FileConfig = valid.try_into().unwrap_or_default();
+        let dirs = FileConfig {
+            machines_dir: file.machines_dir.clone(),
+            state_dir: file.state_dir.clone(),
+            ..Default::default()
+        };
+        let store = FileConfig {
+            state_dir: file.state_dir.clone(),
+            ..Default::default()
+        };
+        let mut config = [file, dirs, store, FileConfig::default()]
+            .into_iter()
+            .find_map(|file| Self::merge(file, registry.clone(), ca_cert.clone()).ok())
+            .unwrap_or_else(|| {
+                Self::merge(FileConfig::default(), None, None).expect("the defaults are valid")
+            });
+        // Passed on to the hooks it starts, even when it is gone: the default file may
+        // name another store.
+        config.config_path = path.map(|p| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
+        config
+    }
+
     fn read_file(path: &Path) -> Result<FileConfig> {
         let text =
             fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -190,12 +235,18 @@ impl Config {
                 MACHINED_DIRS.join(", ")
             );
         }
-        // One inside the other, a machinectl clean or an images rm takes the other's.
-        if state_dir.starts_with(&machines_dir) || machines_dir.starts_with(&state_dir) {
+        // Inside a directory machined lists images from, the store is an image to it (a
+        // hidden one if its name starts with a dot), which machinectl clean or remove
+        // deletes; holding one, the store's own directories are there.
+        if let Some(dir) = MACHINED_SEARCH
+            .iter()
+            .map(Path::new)
+            .find(|dir| state_dir.starts_with(dir) || dir.starts_with(&state_dir))
+        {
             anyhow::bail!(
-                "state_dir {} and machines_dir {} must not be one inside the other",
+                "state_dir {} and {}, where machined lists images, must not be one inside the other: machinectl clean or remove would delete what nspawn keeps",
                 state_dir.display(),
-                machines_dir.display()
+                dir.display()
             );
         }
         // The service reads it from its own working directory, /.
@@ -240,6 +291,17 @@ const MACHINED_DIRS: [&str; 5] = [
     "/var/lib/machines",
     "/etc/machines",
     "/run/machines",
+    "/usr/local/lib/machines",
+    "/usr/lib/machines",
+];
+
+/// Every directory machined lists images from: its old /var/lib/container too, which
+/// nspawn does not put machines in.
+const MACHINED_SEARCH: [&str; 6] = [
+    "/var/lib/machines",
+    "/etc/machines",
+    "/run/machines",
+    "/var/lib/container",
     "/usr/local/lib/machines",
     "/usr/lib/machines",
 ];
@@ -437,14 +499,60 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("finds machines in"), "{err}");
-        let err = merged("state_dir = \"/var/lib/machines/.nspawn\"\n")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("one inside the other"), "{err}");
+        // Wherever machined looks for images, whichever machines_dir nspawn uses.
+        for text in [
+            "state_dir = \"/var/lib/machines/.nspawn\"\n",
+            "state_dir = \"/etc/machines/.nspawn\"\n",
+            "state_dir = \"/run/machines/nspawn\"\n",
+            "state_dir = \"/var/lib/container/.nspawn\"\n",
+            "machines_dir = \"/etc/machines\"\nstate_dir = \"/var/lib/machines/.nspawn\"\n",
+            "state_dir = \"/var/lib\"\n",
+            "state_dir = \"/run\"\n",
+        ] {
+            let err = merged(text).unwrap_err().to_string();
+            assert!(err.contains("one inside the other"), "{text}: {err}");
+        }
+        for text in [
+            "state_dir = \"/srv/nspawn\"\n",
+            "state_dir = \"/var/lib/nspawn\"\n",
+        ] {
+            assert!(merged(text).is_ok(), "{text}");
+        }
         let err = merged("ca_cert = \"hub-ca.pem\"\n")
             .unwrap_err()
             .to_string();
         assert!(err.contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn a_broken_file_still_gives_the_cleanup_its_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nspawn.toml");
+        let lenient = |text: &str| {
+            fs::write(&path, text).unwrap();
+            assert!(Config::load(Some(&path), None, None).is_err(), "{text}");
+            Config::load_leniently(Some(&path), None, None)
+        };
+        // A key this release does not know: the rest of the file stands.
+        let c = lenient("state_dir = \"/srv/nspawn\"\nnew_key = 1\nbridge = \"br0\"\n");
+        assert_eq!(c.state_dir, Path::new("/srv/nspawn"));
+        assert_eq!(c.bridge, "br0");
+        // A value merge refuses: the directories stand.
+        let c = lenient("state_dir = \"/srv/nspawn\"\ndns = [\"127.0.0.1\"]\nbridge = \"br0\"\n");
+        assert_eq!(c.state_dir, Path::new("/srv/nspawn"));
+        assert_eq!(c.bridge, DEFAULT_BRIDGE);
+        // A machines_dir machined does not search: the state_dir alone.
+        let c = lenient("state_dir = \"/srv/nspawn\"\nmachines_dir = \"/srv/m\"\n");
+        assert_eq!(c.state_dir, Path::new("/srv/nspawn"));
+        assert_eq!(c.machines_dir, Path::new(DEFAULT_MACHINES_DIR));
+        // A file that does not parse, or is gone: the defaults, and its name kept for the
+        // hooks it starts.
+        let c = lenient("state_dir = \"/srv/nspawn\n");
+        assert_eq!(c.state_dir, Path::new(DEFAULT_STATE_DIR));
+        let gone = dir.path().join("gone.toml");
+        let c = Config::load_leniently(Some(&gone), None, None);
+        assert_eq!(c.config_path.as_deref(), Some(gone.as_path()));
+        assert_eq!(c.state_dir, Path::new(DEFAULT_STATE_DIR));
     }
 
     #[test]

@@ -103,7 +103,8 @@ pub fn generate(ctx: &Context, names: &[String]) -> Result<Script> {
         .filter_map(|r| r.network_container.as_deref())
         .collect();
     // An image built here, which another host can only pull once it is pushed: its
-    // record says build, the records of the machines made from it create.
+    // record says build, a machine made from it says it was built, its build's record
+    // gone or not.
     let built: BTreeSet<&str> = records
         .iter()
         .filter(|r| r.origin == "build")
@@ -134,7 +135,8 @@ pub fn generate(ctx: &Context, names: &[String]) -> Result<Script> {
         } else {
             runs.push(command);
         }
-        if built.contains(r.reference.as_str()) && pushed.insert(r.reference.as_str()) {
+        if (r.built || built.contains(r.reference.as_str())) && pushed.insert(r.reference.as_str())
+        {
             script.notes.push(format!(
                 "{} was built on this host: push it (nspawn push {}) before this script runs elsewhere",
                 r.reference, r.name
@@ -158,6 +160,7 @@ pub fn generate(ctx: &Context, names: &[String]) -> Result<Script> {
                 ));
             }
         }
+        script.notes.extend(health_note(r));
     }
     script.commands.extend(runs);
     Ok(script)
@@ -325,24 +328,24 @@ pub(crate) fn flags(r: &ImageRecord) -> (Vec<Vec<String>>, Vec<String>) {
     for port in &r.ports {
         flag(&mut out, "--publish", &publish_text(port));
     }
-    // An entrypoint of more than one word: the rest goes before the arguments, which
-    // the image's own then stand for.
+    // After an entrypoint given, every argument it runs with, the image's command too
+    // where the record keeps it: --entrypoint drops it. An entrypoint of more than one
+    // word: the rest goes before the arguments.
     let mut tail = Vec::new();
     match r.entrypoint.as_deref() {
-        None => {}
-        Some([]) => flag(&mut out, "--entrypoint", ""),
-        Some([program, rest @ ..]) => {
-            flag(&mut out, "--entrypoint", program);
-            if !rest.is_empty() {
-                tail.extend(rest.iter().cloned());
-                if r.cmd.is_none() {
-                    tail.extend(r.run.cmd().iter().cloned());
-                }
+        None => {
+            if let Some(cmd) = &r.cmd {
+                tail.extend(cmd.iter().cloned());
             }
         }
-    }
-    if let Some(cmd) = &r.cmd {
-        tail.extend(cmd.iter().cloned());
+        Some(entrypoint) => {
+            let (program, rest) = entrypoint
+                .split_first()
+                .map_or(("", &[][..]), |(p, rest)| (p.as_str(), rest));
+            flag(&mut out, "--entrypoint", program);
+            tail.extend(rest.iter().cloned());
+            tail.extend(r.effective_cmd().iter().cloned());
+        }
     }
     for var in &r.env {
         flag(&mut out, "--env", var);
@@ -380,12 +383,27 @@ pub(crate) fn flags(r: &ImageRecord) -> (Vec<Vec<String>>, Vec<String>) {
     (out, tail)
 }
 
+/// What the script cannot give of a healthcheck: the command line has no exec form of
+/// one, as docker's has none.
+fn health_note(r: &ImageRecord) -> Option<String> {
+    let hc = r.healthcheck.as_ref()?;
+    let image = r.run.healthcheck.as_ref().map_or(&[][..], |h| &h.test[..]);
+    (hc.test.first().map(String::as_str) == Some("CMD") && hc.test != image).then(|| {
+        format!(
+            "the healthcheck of {} runs without a shell; --health-cmd runs it through /bin/sh, which its image needs",
+            r.name
+        )
+    })
+}
+
 /// The --health-* flags that turn the image's healthcheck into the machine's.
 fn health_flags(r: &ImageRecord) -> Vec<Vec<String>> {
     let Some(hc) = &r.healthcheck else {
         return Vec::new();
     };
-    if hc.disabled() {
+    // Turned off, not merely without a test: timings given for an image that has no
+    // healthcheck are kept with an empty one.
+    if hc.test.first().map(String::as_str) == Some("NONE") {
         return vec![words(&["--no-healthcheck"])];
     }
     let base = r.run.healthcheck.clone().unwrap_or_default();
@@ -498,7 +516,11 @@ fn tuning_flags(t: &crate::tuning::Tuning) -> Vec<Vec<String>> {
         flag(&mut out, "--stop-signal", signal);
     }
     if let Some(timeout) = t.stop_timeout {
-        flag(&mut out, "--stop-timeout", &timeout.to_string());
+        flag(
+            &mut out,
+            "--stop-timeout",
+            &crate::policy::shown_stop_timeout(timeout).to_string(),
+        );
     }
     if let Some(mode) = &t.timezone {
         flag(&mut out, "--timezone", mode);
@@ -585,6 +607,40 @@ mod tests {
         assert_eq!(size_text(3 << 30), "3g");
         assert_eq!(size_text(1536 << 10), "1536k");
         assert_eq!(size_text(1000), "1000");
+    }
+
+    #[test]
+    fn healthchecks_come_back_as_they_were_given() {
+        use crate::health::Healthcheck;
+        // Timings for an image without a healthcheck: the timings, not a refusal.
+        let mut timed = record("web", "hub.example/alpine:3");
+        timed.healthcheck = Some(Healthcheck {
+            interval: 10_000_000,
+            retries: 5,
+            ..Healthcheck::default()
+        });
+        assert_eq!(
+            health_flags(&timed),
+            [
+                words(&["--health-interval", "10s"]),
+                words(&["--health-retries", "5"])
+            ]
+        );
+        assert_eq!(health_note(&timed), None);
+        let mut off = record("web", "hub.example/alpine:3");
+        off.healthcheck = Some(Healthcheck {
+            test: vec!["NONE".into()],
+            ..Healthcheck::default()
+        });
+        assert_eq!(health_flags(&off), [words(&["--no-healthcheck"])]);
+        // The exec form goes as a shell line, with a word of it.
+        let mut exec = record("app", "hub.example/distroless:1");
+        exec.healthcheck = Some(Healthcheck {
+            test: vec!["CMD".into(), "/app".into(), "health".into()],
+            ..Healthcheck::default()
+        });
+        assert_eq!(health_flags(&exec), [option("--health-cmd", "/app health")]);
+        assert!(health_note(&exec).unwrap().contains("runs without a shell"));
     }
 
     #[test]

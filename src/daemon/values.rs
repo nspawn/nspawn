@@ -22,20 +22,25 @@ pub fn bus_text(text: &str) -> String {
     text.replace('\0', "\u{FFFD}")
 }
 
-/// A value without file descriptors, which is every value here.
+/// A value without file descriptors, which is every value here; a string made bus
+/// text, whoever wrote it.
 pub fn v<'a, T: Into<Value<'a>>>(x: T) -> OwnedValue {
-    OwnedValue::try_from(x.into()).expect("plain values carry no file descriptor")
+    let value = match x.into() {
+        Value::Str(s) if s.as_str().contains('\0') => Value::from(bus_text(s.as_str())),
+        other => other,
+    };
+    OwnedValue::try_from(value).expect("plain values carry no file descriptor")
 }
 
 pub fn strings(items: &[String]) -> OwnedValue {
-    v(items.to_vec())
+    v(items.iter().map(|s| bus_text(s)).collect::<Vec<String>>())
 }
 
 /// A string map as a{ss}.
 pub fn map(items: &std::collections::BTreeMap<String, String>) -> OwnedValue {
     v(items
         .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
+        .map(|(k, v)| (bus_text(k), bus_text(v)))
         .collect::<HashMap<String, String>>())
 }
 
@@ -61,6 +66,8 @@ pub fn image(i: &ImageSummary) -> Dict {
         ("read_only".to_string(), v(i.read_only)),
         ("signed_by".to_string(), opt_string(i.signed_by.as_deref())),
         ("image_only".to_string(), v(i.image_only)),
+        ("created".to_string(), v(i.created.unwrap_or(0))),
+        ("pulled".to_string(), v(i.pulled.unwrap_or(0))),
     ])
 }
 
@@ -137,19 +144,10 @@ pub fn record(r: &ImageRecord) -> Dict {
             strings(&r.volumes.iter().map(|p| p.to_string()).collect::<Vec<_>>()),
         ),
         ("env".to_string(), strings(&r.env)),
-        (
-            "entrypoint".to_string(),
-            strings(
-                r.entrypoint
-                    .as_deref()
-                    .unwrap_or_else(|| r.run.entrypoint()),
-            ),
-        ),
-        (
-            "cmd".to_string(),
-            strings(r.cmd.as_deref().unwrap_or_else(|| r.run.cmd())),
-        ),
+        ("entrypoint".to_string(), strings(r.effective_entrypoint())),
+        ("cmd".to_string(), strings(r.effective_cmd())),
         ("command".to_string(), strings(&r.effective_command())),
+        ("image_cmd".to_string(), strings(r.run.cmd())),
         ("image_env".to_string(), strings(&r.run.env)),
         ("labels".to_string(), map(&r.effective_labels())),
         ("restart".to_string(), v(r.restart.name())),
@@ -298,6 +296,7 @@ pub fn machine(m: &MachineSummary) -> Dict {
     if let Some(code) = m.exit_code {
         dict.insert("exit_code".to_string(), v(code));
     }
+    dict.insert("finished".to_string(), v(m.finished.unwrap_or(0)));
     if let Some(health) = &m.health {
         dict.insert("health".to_string(), v(health.status.as_str()));
         dict.insert(
@@ -616,6 +615,18 @@ impl<'a> Options<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_nul_goes_on_the_bus() {
+        let text = |value: OwnedValue| String::try_from(value).unwrap();
+        assert_eq!(text(v("a\0b")), "a\u{FFFD}b");
+        assert_eq!(text(v(String::from("plain"))), "plain");
+        let list = Vec::<String>::try_from(strings(&["x\0".to_string()])).unwrap();
+        assert_eq!(list, ["x\u{FFFD}"]);
+        let pairs = std::collections::BTreeMap::from([("k\0".to_string(), "v\0".to_string())]);
+        let got = HashMap::<String, String>::try_from(map(&pairs)).unwrap();
+        assert_eq!(got.get("k\u{FFFD}").map(String::as_str), Some("v\u{FFFD}"));
+    }
 
     #[test]
     fn machined_paths_escape_like_systemd() {

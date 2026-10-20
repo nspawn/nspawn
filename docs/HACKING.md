@@ -130,13 +130,19 @@ the rpm, deb or Arch package), the suite leaves the package's service, bus and
 polkit files alone and tests them as shipped: a drop-in in
 `/etc/systemd/system/nspawn.service.d/` hands the service the configuration,
 and goes again at the end. That is the run that matters before a release, on
-every distribution of the matrix. With SELinux enforcing, the suite reads
+every distribution of the matrix. A binary of its own on a host where an nspawn
+package is installed is refused, since it would overwrite the package's files. With
+SELinux enforcing, the suite reads
 `/var/log/audit/audit.log` at the end and fails on any denial of `nspawn_t`
-since it started, grouped by permission, process and target, so a policy that
-lags behind the code shows up as a FAIL line.
+since it started, the kernel's and those systemd and the bus log (USER_AVC), grouped
+by permission, process and target, so a policy that lags behind the code shows up as
+a FAIL line.
 
 The suite cleans up before and after itself and ends with `ALL OK` or a
-failure count. Every FAIL line names the check. It runs from wherever it sits,
+failure count. What it makes is named `e2e-...`, except the images pulling by
+reference names (`busybox-1.36`, `busybox-1.37` and `busybox-1.37-...`, the test
+image's `fedora-44`): a run claims those names in `/var/tmp/nspawn-e2e-claim` and
+refuses to start where the host has one of them of its own. Every FAIL line names the check. It runs from wherever it sits,
 as long as `tests/build-context` and `tests/compose` sit next to it;
 `NSPAWN_BUILD_CONTEXT` points it at another mkosi definition.
 
@@ -177,8 +183,9 @@ tests complete whole command lines against made-up names). clap_complete keeps
 that call behind its `unstable-dynamic` feature.
 
 `daemon --install` writes some of the same paths, which belong to the
-packages: `/usr/share/dbus-1/system-services/org.nspawn.service` and
-`/usr/share/polkit-1/actions/org.nspawn.policy`. Installing a package over
+packages: `/usr/share/dbus-1/system-services/org.nspawn.service`,
+`/usr/share/polkit-1/actions/org.nspawn.policy` and
+`/usr/lib/systemd/journald@nspawn.conf`. Installing a package over
 them is refused on Arch (pacman does not take files it does not own) and
 silently overwrites them elsewhere, so remove what `--install` listed before
 going from a build to a package. The

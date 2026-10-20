@@ -367,7 +367,9 @@ fn year_day(days: i64) -> (i64, i64) {
 /// The days from 1970-01-01 to the first of January of a year.
 pub fn days_from_epoch(year: i64) -> i64 {
     let y = year - 1;
-    365 * (year - 1970) + (y / 4 - y / 100 + y / 400) - (1969 / 4 - 1969 / 100 + 1969 / 400)
+    // Floor division: the leap days before year 0 count down too.
+    365 * (year - 1970) + (y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400))
+        - (1969 / 4 - 1969 / 100 + 1969 / 400)
 }
 
 /// tzset: the offset a POSIX TZ rule gives at a moment.
@@ -409,6 +411,203 @@ fn tzset(s: &str, sec: i64) -> Option<(i64, String)> {
         dst_zone
     };
     Some((offset, name.to_string()))
+}
+
+/// docker's timetypes.GetTimestamp: a Go duration before `now`, an RFC 3339 time or
+/// date in one of the forms it tries (in the zone of `offset` when it names none), or
+/// Unix seconds; as `seconds[.nanoseconds]`.
+pub fn get_timestamp(value: &str, now: f64, offset: i64) -> Result<String, String> {
+    if value != "0" {
+        if let Ok(nanos) = super::golib::parse_duration(value) {
+            return Ok(format!("{}", (now - nanos as f64 / 1e9).floor() as i64));
+        }
+    }
+    let local = !value.contains(['z', 'Z', '+']) && value.matches('-').count() != 3;
+    // The time of day: none, the hour, hour and minute, or the whole with a fraction.
+    let parts = if value.contains('.') {
+        3
+    } else if value.contains('T') {
+        let mut colons = value.matches(':').count();
+        if !local && !value.contains(['z', 'Z']) && colons > 0 {
+            colons -= 1;
+        }
+        colons.min(2) + 1
+    } else {
+        0
+    };
+    match parse_layout(value, parts, value.contains('.'), local, offset) {
+        Some((unix, nanos)) => Ok(format!("{unix}.{nanos:09}")),
+        None if value.contains('-') => Err(format!("parsing time {value:?}: cannot parse")),
+        None => {
+            // Unix seconds, and a fraction of them, passed on as they are.
+            let (seconds, fraction) = match value.split_once('.') {
+                Some((s, f)) => (s, Some(f)),
+                None => (value, None),
+            };
+            let int = |s: &str| super::gostr::atoi(s).is_ok();
+            if int(seconds) && fraction.is_none_or(int) {
+                Ok(value.to_string())
+            } else {
+                Err(format!(
+                    "failed to parse value as time or duration: {}",
+                    super::golib::go_quote(value)
+                ))
+            }
+        }
+    }
+}
+
+/// `value` read with the layout GetTimestamp picks: a date, then `parts` of the time
+/// after a T (and a fraction), then a zone unless it is `local`.
+fn parse_layout(
+    value: &str,
+    parts: usize,
+    fraction: bool,
+    local: bool,
+    offset: i64,
+) -> Option<(i64, u32)> {
+    let b = value.as_bytes();
+    let num = |from: usize, len: usize| -> Option<i64> {
+        let part = b.get(from..from + len)?;
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| std::str::from_utf8(part).ok()?.parse().ok())
+            .flatten()
+    };
+    let (year, month, day) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    if b.get(4) != Some(&b'-') || b.get(7) != Some(&b'-') {
+        return None;
+    }
+    if !(1..=12).contains(&month) || day < 1 || day > days_in(month, year) {
+        return None;
+    }
+    let mut at = 10;
+    let (mut hour, mut min, mut sec, mut nanos) = (0, 0, 0, 0u32);
+    if parts > 0 {
+        if b.get(at) != Some(&b'T') {
+            return None;
+        }
+        hour = num(at + 1, 2)?;
+        at += 3;
+        if parts > 1 {
+            if b.get(at) != Some(&b':') {
+                return None;
+            }
+            min = num(at + 1, 2)?;
+            at += 3;
+        }
+        if parts > 2 {
+            if b.get(at) != Some(&b':') {
+                return None;
+            }
+            sec = num(at + 1, 2)?;
+            at += 3;
+        }
+        if fraction {
+            if b.get(at) != Some(&b'.') {
+                return None;
+            }
+            let digits = b[at + 1..]
+                .iter()
+                .take_while(|c| c.is_ascii_digit())
+                .count();
+            if digits == 0 || digits > 9 {
+                return None;
+            }
+            let text = std::str::from_utf8(&b[at + 1..at + 1 + digits]).ok()?;
+            nanos = text.parse::<u32>().ok()? * 10u32.pow(9 - digits as u32);
+            at += 1 + digits;
+        }
+        if hour > 23 || min > 59 || sec > 59 {
+            return None;
+        }
+    }
+    let zone = if local {
+        if at != b.len() {
+            return None;
+        }
+        offset
+    } else {
+        match b.get(at)? {
+            b'Z' if at + 1 == b.len() => 0,
+            sign @ (b'+' | b'-') if at + 6 == b.len() && b.get(at + 3) == Some(&b':') => {
+                let off = num(at + 1, 2)? * 3600 + num(at + 4, 2)? * 60;
+                if *sign == b'-' {
+                    -off
+                } else {
+                    off
+                }
+            }
+            _ => return None,
+        }
+    };
+    let mut days = days_from_epoch(year);
+    for m in 1..month {
+        days += days_in(m, year);
+    }
+    days += day - 1;
+    Some((
+        days * SECONDS_PER_DAY + hour * 3600 + min * 60 + sec - zone,
+        nanos,
+    ))
+}
+
+/// The Unix time of an RFC 3339 timestamp, as Go's time.Parse with RFC3339Nano reads it
+/// (its fraction left out): an image config's `created`.
+pub fn parse_rfc3339(text: &str) -> Option<i64> {
+    let b = text.as_bytes();
+    let num = |from: usize, len: usize| -> Option<i64> {
+        let part = b.get(from..from + len)?;
+        part.iter()
+            .all(u8::is_ascii_digit)
+            .then(|| std::str::from_utf8(part).ok()?.parse().ok())
+            .flatten()
+    };
+    let sep = |at: usize, c: u8| b.get(at) == Some(&c);
+    let (year, month, day) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    let (hour, min, sec) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    if !(sep(4, b'-') && sep(7, b'-') && matches!(b.get(10), Some(b'T' | b't')))
+        || !(sep(13, b':') && sep(16, b':'))
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in(month, year)
+        || hour > 23
+        || min > 59
+        || sec > 59
+    {
+        return None;
+    }
+    let mut at = 19;
+    if sep(at, b'.') {
+        at += 1;
+        let digits = b[at..].iter().take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 {
+            return None;
+        }
+        at += digits;
+    }
+    let offset = match b.get(at)? {
+        b'Z' | b'z' if at + 1 == b.len() => 0,
+        sign @ (b'+' | b'-') if at + 6 == b.len() && sep(at + 3, b':') => {
+            let (h, m) = (num(at + 1, 2)?, num(at + 4, 2)?);
+            if h > 23 || m > 59 {
+                return None;
+            }
+            let off = h * 3600 + m * 60;
+            if *sign == b'-' {
+                -off
+            } else {
+                off
+            }
+        }
+        _ => return None,
+    };
+    let mut days = days_from_epoch(year);
+    for m in 1..month {
+        days += days_in(m, year);
+    }
+    days += day - 1;
+    Some(days * SECONDS_PER_DAY + hour * 3600 + min * 60 + sec - offset)
 }
 
 /// A Unix time in RFC 3339 at an offset, as Go's time.RFC3339 layout writes it.
@@ -470,6 +669,72 @@ mod tests {
             "{text}"
         );
         assert_eq!(text.split(' ').count(), 4, "{text}");
+    }
+
+    #[test]
+    fn timestamps_are_read_as_docker_reads_them() {
+        let now = 1_729_771_200.0;
+        let at = |v: &str| get_timestamp(v, now, 7200);
+        assert_eq!(at("42m").unwrap(), "1729768680");
+        assert_eq!(at("1h30m").unwrap(), "1729765800");
+        assert_eq!(at("0").unwrap(), "0");
+        assert_eq!(at("1729771200").unwrap(), "1729771200");
+        assert_eq!(at("1729771200.5").unwrap(), "1729771200.5");
+        assert_eq!(at("2024-10-24T12:00:00Z").unwrap(), "1729771200.000000000");
+        assert_eq!(
+            at("2024-10-24T14:00:00+02:00").unwrap(),
+            "1729771200.000000000"
+        );
+        // Without a zone, the local one of now.
+        assert_eq!(at("2024-10-24T14:00:00").unwrap(), "1729771200.000000000");
+        assert_eq!(at("2024-10-24T14:00").unwrap(), "1729771200.000000000");
+        assert_eq!(at("2024-10-24T14").unwrap(), "1729771200.000000000");
+        assert_eq!(
+            at("2024-10-24T14:00:00.25").unwrap(),
+            "1729771200.250000000"
+        );
+        assert_eq!(at("2024-10-24").unwrap(), "1729720800.000000000");
+        assert_eq!(at("2024-10-24Z").unwrap(), "1729728000.000000000");
+        assert_eq!(
+            at("yesterday").unwrap_err(),
+            "failed to parse value as time or duration: \"yesterday\""
+        );
+        assert!(at("2024-13-01").is_err());
+        assert!(at("10 min ago").is_err());
+    }
+
+    #[test]
+    fn year_zero_is_a_leap_year_before_year_one() {
+        assert_eq!(days_from_epoch(1), -719_162);
+        assert_eq!(days_from_epoch(0), -719_528);
+        assert_eq!(days_from_epoch(1970), 0);
+        assert_eq!(days_from_epoch(2000), 10_957);
+    }
+
+    #[test]
+    fn rfc3339_reads_back() {
+        for unix in [0i64, 1_729_771_200, 951_782_400, -86_400 * 400] {
+            assert_eq!(parse_rfc3339(&rfc3339(unix, 0)), Some(unix), "{unix}");
+            assert_eq!(parse_rfc3339(&rfc3339(unix, 7200)), Some(unix), "{unix}");
+        }
+        assert_eq!(
+            parse_rfc3339("2024-10-24T12:00:00.123456789Z"),
+            Some(1_729_771_200)
+        );
+        assert_eq!(
+            parse_rfc3339("2024-10-24T14:00:00+02:00"),
+            Some(1_729_771_200)
+        );
+        for bad in [
+            "",
+            "2024-10-24",
+            "2024-13-01T00:00:00Z",
+            "2024-02-30T00:00:00Z",
+            "2024-10-24T12:00:00",
+            "2024-10-24T12:00:00.Z",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad}");
+        }
     }
 
     #[test]

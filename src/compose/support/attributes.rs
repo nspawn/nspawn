@@ -292,10 +292,14 @@ pub static ATTRIBUTES: &[Attribute] = &[
     full("services.*.env_file.[].format"),
     full("services.*.env_file.[].path"),
     full("services.*.env_file.[].required"),
-    partly("services.*.environment", BOOTED).and_below(),
+    partly(
+        "services.*.environment",
+        "refused for an image that boots, whose init runs as it is; a value with a newline or another control character but a tab is refused, as the settings file that carries it is read a line at a time",
+    )
+    .and_below(),
     full("services.*.expose"),
     full("services.*.extends"),
-    full("services.*.extends.file"),
+    partly("services.*.extends.file", crate::compose::paths::REMOTE),
     full("services.*.extends.service"),
     ignored(
         "services.*.external_links",
@@ -338,7 +342,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
     full("services.*.labels").and_below(),
     partly(
         "services.*.links",
-        "an alias on the default network and a dependency, nothing more",
+        "an alias of the linked service on the default network, which it is made anew to take, and a dependency, nothing more",
     ),
     partly(
         "services.*.logging",
@@ -626,7 +630,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
     ),
     partly(
         "volumes.*.driver_opts",
-        "type: none with o: bind and an absolute device binds that host directory, which down -v leaves; other options are refused",
+        "type: none with o: bind (ro or rw beside it) and an absolute device binds that host directory, which down -v leaves; other options are refused",
     )
     .and_below(),
     full("volumes.*.external"),

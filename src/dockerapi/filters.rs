@@ -6,54 +6,77 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
+/// Each key's values, and which of them the object form gave as false (or null): docker
+/// keeps that bool, and only its exact matches read it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Filters(BTreeMap<String, BTreeSet<String>>);
+pub struct Filters {
+    values: BTreeMap<String, BTreeSet<String>>,
+    off: BTreeSet<(String, String)>,
+}
 
 /// What a request gets back for a filter it cannot take, as docker words it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invalid(pub String);
 
 impl Filters {
+    /// As docker's FromJSON reads them: the object form, else the array form, and
+    /// "invalid filter" with no more said for anything neither of them is.
     pub fn parse(text: Option<&str>) -> Result<Filters, Invalid> {
         let Some(text) = text.filter(|t| !t.is_empty()) else {
             return Ok(Filters::default());
         };
-        let value: Value =
-            serde_json::from_str(text).map_err(|e| Invalid(format!("invalid filter: {e}")))?;
-        let Value::Object(map) = value else {
-            return Err(Invalid("invalid filter: not an object".to_string()));
+        let invalid = || Invalid("invalid filter".to_string());
+        let map = match serde_json::from_str(text).map_err(|_| invalid())? {
+            Value::Object(map) => map,
+            Value::Null => return Ok(Filters::default()),
+            _ => return Err(invalid()),
         };
-        let mut out = BTreeMap::new();
+        let mut out = Filters::default();
+        let (mut objects, mut arrays) = (false, false);
         for (key, values) in map {
-            // As docker's FromJSON: a key of the object form counts whatever its bool,
-            // null is no value, and anything else in either form is no filter.
-            let set: BTreeSet<String> = match values {
-                Value::Null => BTreeSet::new(),
-                Value::Array(list) => list
-                    .into_iter()
-                    .map(|v| match v {
-                        Value::String(s) => Ok(s),
-                        _ => Err(Invalid("invalid filter".to_string())),
-                    })
-                    .collect::<Result<_, _>>()?,
-                Value::Object(old) => {
-                    if old.values().any(|on| !on.is_boolean()) {
-                        return Err(Invalid("invalid filter".to_string()));
+            let set = out.values.entry(key.clone()).or_default();
+            match values {
+                // No values, in either form.
+                Value::Null => {}
+                Value::Array(list) => {
+                    arrays = true;
+                    for value in list {
+                        let Value::String(value) = value else {
+                            return Err(invalid());
+                        };
+                        set.insert(value);
                     }
-                    old.into_iter().map(|(k, _)| k).collect()
                 }
-                _ => return Err(Invalid(format!("invalid filter '{key}'"))),
-            };
-            out.insert(key, set);
+                Value::Object(old) => {
+                    objects = true;
+                    for (value, on) in old {
+                        match on {
+                            Value::Bool(true) => {}
+                            // Go leaves a null the bool's zero.
+                            Value::Bool(false) | Value::Null => {
+                                out.off.insert((key.clone(), value.clone()));
+                            }
+                            _ => return Err(invalid()),
+                        }
+                        set.insert(value);
+                    }
+                }
+                _ => return Err(invalid()),
+            }
         }
-        Ok(Filters(out))
+        // One form or the other: both at once is neither.
+        if objects && arrays {
+            return Err(invalid());
+        }
+        Ok(out)
     }
 
     /// From the command line's KEY=VALUE pairs (`--filter name=web`).
     pub fn from_pairs(pairs: &[String]) -> Result<Filters, Invalid> {
         let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        // docker's FilterOpt: an empty --filter is none, key and value are trimmed.
-        for pair in pairs.iter().filter(|p| !p.trim().is_empty()) {
+        // docker's FilterOpt: an empty --filter is none (one of blanks is no key=value),
+        // key and value are trimmed.
+        for pair in pairs.iter().filter(|p| !p.is_empty()) {
             let (key, value) = pair.split_once('=').ok_or_else(|| {
                 Invalid(format!(
                     "bad format of filter (expected name=value): {pair}"
@@ -63,15 +86,19 @@ impl Filters {
                 .or_default()
                 .insert(value.trim().to_string());
         }
-        Ok(Filters(out))
+        Ok(Filters {
+            values: out,
+            off: BTreeSet::new(),
+        })
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &String> {
-        self.0.keys()
+        self.values.keys()
     }
 
+    /// Every value of `key`, whatever its bool, as docker's Get gives them.
     pub fn values(&self, key: &str) -> Option<&BTreeSet<String>> {
-        self.0.get(key).filter(|v| !v.is_empty())
+        self.values.get(key).filter(|v| !v.is_empty())
     }
 
     /// Refuses a key outside `accepted`.
@@ -82,20 +109,30 @@ impl Filters {
         }
     }
 
-    /// No values for `key`, or one equal to `value`.
+    /// docker's ExactMatch: no values for `key`, or `value` among them, given as true.
     pub fn exact(&self, key: &str, value: &str) -> bool {
-        self.values(key).is_none_or(|v| v.contains(value))
+        self.values(key).is_none_or(|v| {
+            v.contains(value) && !self.off.contains(&(key.to_string(), value.to_string()))
+        })
     }
 
-    /// No values for `key`, or one of them equal to `value` or a regular expression
-    /// found in it.
+    /// docker's FuzzyMatch: an exact match, or a value, whatever its bool, that `value`
+    /// starts with.
+    pub fn fuzzy(&self, key: &str, value: &str) -> bool {
+        self.exact(key, value)
+            || self
+                .values(key)
+                .is_some_and(|v| v.iter().any(|prefix| value.starts_with(prefix.as_str())))
+    }
+
+    /// docker's Match: an exact match, or a value, whatever its bool, that is a regular
+    /// expression found in `value`.
     pub fn matches(&self, key: &str, value: &str) -> bool {
-        let Some(patterns) = self.values(key) else {
-            return true;
-        };
-        patterns
-            .iter()
-            .any(|p| p == value || regex::Regex::new(p).is_ok_and(|re| re.is_match(value)))
+        self.exact(key, value)
+            || self.values(key).is_some_and(|v| {
+                v.iter()
+                    .any(|p| regex::Regex::new(p).is_ok_and(|re| re.is_match(value)))
+            })
     }
 
     /// Labels: each value KEY or KEY=VALUE must hold.
@@ -122,17 +159,47 @@ mod tests {
             r#"{"label":{"caddy":true,"a=b":false},"status":{"running":true}}"#,
         ))
         .unwrap();
-        // A key of the object form counts whatever its bool, as docker reads it.
-        assert_eq!(new, old);
-        assert!(Filters::parse(Some("[1]")).is_err());
-        assert!(Filters::parse(Some(r#"{"label":"x"}"#)).is_err());
-        assert!(Filters::parse(Some(r#"{"name":["web",1]}"#)).is_err());
-        assert!(Filters::parse(Some(r#"{"label":{"a":"yes"}}"#)).is_err());
-        // null is no value: no filter.
+        // A value of the object form is there whatever its bool, as docker's Get gives it.
+        assert_eq!(new.values("label"), old.values("label"));
+        assert_eq!(new.values("status"), old.values("status"));
+        for bad in [
+            "[1]",
+            "true",
+            "{",
+            r#"{"label":"x"}"#,
+            r#"{"name":["web",1]}"#,
+            r#"{"label":{"a":"yes"}}"#,
+            r#"{"label":["a"],"status":{"running":true}}"#,
+        ] {
+            assert_eq!(
+                Filters::parse(Some(bad)),
+                Err(Invalid("invalid filter".to_string())),
+                "{bad}"
+            );
+        }
+        // null is no value: no filter; inside the object form, a value given as false.
         let null = Filters::parse(Some(r#"{"label":null}"#)).unwrap();
         assert!(null.values("label").is_none());
+        let label = Filters::parse(Some(r#"{"label":{"traefik.enable":null}}"#)).unwrap();
+        assert!(label.values("label").unwrap().contains("traefik.enable"));
+        assert_eq!(Filters::parse(Some("null")).unwrap(), Filters::default());
         assert_eq!(Filters::parse(None).unwrap(), Filters::default());
         assert_eq!(Filters::parse(Some("")).unwrap(), Filters::default());
+    }
+
+    #[test]
+    fn a_value_given_as_false_matches_only_by_more_than_its_name() {
+        let f = Filters::parse(Some(
+            r#"{"health":{"healthy":false},"name":{"web":false},"event":{"health_status":false}}"#,
+        ))
+        .unwrap();
+        // ExactMatch reads the bool; Match and FuzzyMatch also take every value.
+        assert!(!f.exact("health", "healthy") && !f.exact("health", "unhealthy"));
+        assert!(f.matches("name", "web") && f.matches("name", "/web-1"));
+        assert!(f.fuzzy("event", "health_status: healthy"));
+        assert!(!f.exact("event", "health_status"));
+        let on = Filters::parse(Some(r#"{"health":{"healthy":true}}"#)).unwrap();
+        assert!(on.exact("health", "healthy") && !on.exact("health", "unhealthy"));
     }
 
     #[test]

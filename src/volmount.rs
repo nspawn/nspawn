@@ -190,3 +190,55 @@ fn attach(mntns: &File, tree: &OwnedFd, target: &CStr) -> i32 {
     }
     0
 }
+
+/// The mount `name` in the directory `dir` is on, or `dir` itself's for an empty name:
+/// statx's mount ID, which tells a mount point from a btrfs subvolume, whose device
+/// number differs from its parent's on the same mount. None where the kernel gives no
+/// mount ID (before Linux 5.8).
+pub fn mount_id_at(dir: &impl AsRawFd, name: &CStr) -> io::Result<Option<u64>> {
+    let flags = if name.is_empty() {
+        libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW
+    } else {
+        libc::AT_SYMLINK_NOFOLLOW
+    };
+    let mut buf = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    let r = unsafe {
+        libc::statx(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            flags,
+            libc::STATX_MNT_ID,
+            buf.as_mut_ptr(),
+        )
+    };
+    if r != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // statx filled it, the fields it did not ask for zeroed.
+    let buf = unsafe { buf.assume_init() };
+    Ok((buf.stx_mask & libc::STATX_MNT_ID != 0).then_some(buf.stx_mnt_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mount_point_has_a_mount_of_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("child")).unwrap();
+        let dir = File::open(tmp.path()).unwrap();
+        let here = mount_id_at(&dir, c"").unwrap();
+        // A directory of the same file system is on the same mount.
+        assert_eq!(mount_id_at(&dir, c"child").unwrap(), here);
+        // /proc is a mount of its own wherever tests run.
+        let root = File::open("/").unwrap();
+        if let (Some(root_id), Some(proc_id)) = (
+            mount_id_at(&root, c"").unwrap(),
+            mount_id_at(&root, c"proc").unwrap(),
+        ) {
+            assert_ne!(root_id, proc_id);
+        }
+        assert!(mount_id_at(&dir, c"missing").is_err());
+    }
+}

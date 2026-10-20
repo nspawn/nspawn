@@ -182,11 +182,12 @@ pub async fn logs(e: &mut Engine<'_>, a: &LogsArgs) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-    if let Some(since) = &a.since {
-        options.insert("since", Bus::from(journal_time(since, now)));
-    }
-    if let Some(until) = &a.until {
-        options.insert("until", Bus::from(journal_time(until, now)));
+    for (key, given) in [("since", &a.since), ("until", &a.until)] {
+        if let Some(text) = given {
+            let time = journal_time(text, now)
+                .map_err(|e| anyhow::anyhow!("invalid value for {key:?}: {e}"))?;
+            options.insert(key, Bus::from(time));
+        }
     }
     options.insert("timestamps", Bus::from(a.timestamps));
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -194,6 +195,7 @@ pub async fn logs(e: &mut Engine<'_>, a: &LogsArgs) -> Result<()> {
     let mut followed = follow(e, &machines, &options, !a.no_log_prefix, color, &tx).await?;
     drop(tx);
     let mut tick = tokio::time::interval(Duration::from_millis(500));
+    let mut stopped = false;
     loop {
         tokio::select! {
             line = rx.recv() => match line {
@@ -220,36 +222,63 @@ pub async fn logs(e: &mut Engine<'_>, a: &LogsArgs) -> Result<()> {
                             print_line(&followed[i], err, &text);
                         }
                     }
+                    stopped = true;
                     break;
                 }
             }
-            _ = tokio::signal::ctrl_c() => break,
+            _ = tokio::signal::ctrl_c() => {
+                stopped = true;
+                break;
+            }
         }
     }
+    // Ended on their own, journalctl's statuses are the command's; stopped here, theirs
+    // say nothing.
+    let mut code = 0;
     for f in &mut followed {
         if let Some(ended) = f.ended.take() {
-            let _ = ended.signal(15).await;
+            if stopped {
+                let _ = ended.signal(15).await;
+            } else {
+                code = code.max(ended.status().await.unwrap_or(0));
+            }
         }
+    }
+    if code != 0 {
+        std::process::exit(code);
     }
     Ok(())
 }
 
-/// up without -d: the output of the services' machines until they are all down, or
-/// until Ctrl-C stops them; the exit code --exit-code-from and the abort flags ask for.
-/// A time of --since or --until as journalctl reads one, taken as the reference takes
-/// it: a duration ago (42m, 1h30m), unix seconds, or a date as it is.
-fn journal_time(text: &str, now: f64) -> String {
-    if let Ok(nanos) = crate::compose::golib::parse_duration(text) {
-        return format!("@{:.6}", now - nanos as f64 / 1e9);
+/// run's -e and --env-from-file as compose reads them (getEnvironment): dotenv files
+/// (quotes, export, comments), a bare KEY and ${KEY} taken from -e and the files before;
+/// -e wins over them, and of the files the first that sets a variable.
+fn env_from_files(
+    flags: BTreeMap<String, String>,
+    files: &[String],
+) -> Result<BTreeMap<String, String>> {
+    let mut given = flags;
+    for file in files {
+        let text = std::fs::read_to_string(file)
+            .map_err(|e| anyhow::anyhow!(crate::compose::gostr::path_error("open", file, &e)))?;
+        let mut vars = crate::compose::dotenv::Env::new();
+        {
+            let lookup = |k: &str| given.get(k).cloned();
+            crate::compose::dotenv::parse(&text, &mut vars, &lookup, &mut |_| {})
+                .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
+        }
+        for (k, v) in vars {
+            given.entry(k).or_insert(v);
+        }
     }
-    let (seconds, fraction) = text.split_once('.').unwrap_or((text, ""));
-    if !seconds.is_empty()
-        && seconds.bytes().all(|b| b.is_ascii_digit())
-        && fraction.bytes().all(|b| b.is_ascii_digit())
-    {
-        return format!("@{text}");
-    }
-    text.to_string()
+    Ok(given)
+}
+
+/// A time of --since or --until as journalctl reads one, taken as docker takes it: a
+/// duration ago (42m, 1h30m), unix seconds, or an RFC 3339 time or date.
+fn journal_time(text: &str, now: f64) -> Result<String, String> {
+    let offset = crate::compose::gotime::local_offset(now as i64);
+    crate::compose::gotime::get_timestamp(text, now, offset).map(|t| format!("@{t}"))
 }
 
 /// The lines logs asks for: --tail's number, or the whole log, which following alone
@@ -265,6 +294,8 @@ fn log_lines(tail: Option<&str>, follow: bool) -> Result<Option<u64>> {
     }
 }
 
+/// up without -d: the output of the services' machines until they are all down, or
+/// until Ctrl-C stops them; the exit code --exit-code-from and the abort flags ask for.
 pub async fn attach(
     e: &mut Engine<'_>,
     a: &UpArgs,
@@ -272,16 +303,18 @@ pub async fn attach(
     since: std::time::SystemTime,
 ) -> Result<()> {
     let project = e.project().clone();
+    // The services this up names, every one without a name: what an abort or a Ctrl+C
+    // stops and kills, as docker compose's stop and kill take Create.Services.
+    let named: Vec<String> = if a.service.is_empty() {
+        project.services.keys().cloned().collect()
+    } else {
+        a.service.clone()
+    };
     let deps: Vec<String> = if a.attach_dependencies || !a.attach.is_empty() {
         Vec::new()
     } else {
         // Without --attach-dependencies, the services named are attached, not those
         // they brought up.
-        let named: Vec<String> = if a.service.is_empty() {
-            project.services.keys().cloned().collect()
-        } else {
-            a.service.clone()
-        };
         project
             .services
             .keys()
@@ -395,7 +428,7 @@ pub async fn attach(
                             code = Some(exit);
                         }
                         e.progress.event("Compose", "Stopping", "Aborting on container exit...", Status::Working);
-                        stop_all(e, &project, a.timeout).await?;
+                        stop_all(e, &project, &named, a.timeout).await?;
                     }
                 }
                 if followed.iter().all(|f| f.done) {
@@ -404,23 +437,23 @@ pub async fn attach(
             }
             _ = interrupt.recv() => {
                 if stopping {
-                    kill_all(e, &project).await;
+                    kill_all(e, &named).await;
                     break;
                 }
                 stopping = true;
                 e.progress.event("Compose", "Stopping", "Gracefully Stopping... press Ctrl+C again to force", Status::Working);
                 // A second Ctrl+C while the machines stop kills them.
                 tokio::select! {
-                    stopped = stop_all(e, &project, a.timeout) => stopped?,
+                    stopped = stop_all(e, &project, &named, a.timeout) => stopped?,
                     _ = interrupt.recv() => {
-                        kill_all(e, &project).await;
+                        kill_all(e, &named).await;
                         break;
                     }
                 }
             }
             _ = term.recv() => {
                 stopping = true;
-                stop_all(e, &project, a.timeout).await?;
+                stop_all(e, &project, &named, a.timeout).await?;
             }
         }
     }
@@ -435,10 +468,11 @@ pub async fn attach(
     Ok(())
 }
 
-/// Stops every machine of the project's services, dependents first.
+/// Stops every machine of the services named, dependents first.
 async fn stop_all(
     e: &Engine<'_>,
     project: &crate::compose::project::Project,
+    named: &[String],
     timeout: Option<i64>,
 ) -> Result<()> {
     let order = up::order(project);
@@ -449,12 +483,12 @@ async fn stop_all(
     // The machines of this up's services, one waiting to be restarted among them.
     for m in machines
         .iter()
-        .filter(|m| !m.oneoff && project.services.contains_key(&m.service) && busy(m))
+        .filter(|m| !m.oneoff && named.contains(&m.service) && busy(m))
     {
         e.progress.container(&m.name, "Stopping", Status::Working);
         let mut options = Options::new();
         if let Some(t) = timeout {
-            options.insert("timeout", Bus::from(t.max(0) as u64));
+            options.insert("timeout", Bus::from(crate::policy::stop_seconds(t)));
         }
         e.client
             .manager
@@ -466,13 +500,13 @@ async fn stop_all(
     Ok(())
 }
 
-async fn kill_all(e: &Engine<'_>, project: &crate::compose::project::Project) {
+async fn kill_all(e: &Engine<'_>, named: &[String]) {
     let Ok(machines) = e.machines().await else {
         return;
     };
     for m in machines
         .iter()
-        .filter(|m| project.services.contains_key(&m.service) && busy(m))
+        .filter(|m| named.contains(&m.service) && busy(m))
     {
         let mut options = Options::new();
         options.insert("signal", Bus::from("SIGKILL".to_string()));
@@ -582,13 +616,22 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
     };
     let project = e.project().clone();
     let service = convert::service(&project, &service_name)?.clone();
-    // What nspawn cannot do for the service it runs, and the ones it brings up first.
-    up::check_refusals(
-        &project
-            .clone()
-            .with_selected_services(std::slice::from_ref(&service_name), a.no_deps)
-            .map_err(anyhow::Error::msg)?,
-    )?;
+    // What nspawn cannot do for the service it runs, and the ones it brings up first:
+    // a resource only other services use refuses nothing here.
+    let mut checked = project
+        .clone()
+        .with_selected_services(std::slice::from_ref(&service_name), a.no_deps)
+        .map_err(anyhow::Error::msg)?;
+    if !e.args.all_resources {
+        checked.without_unnecessary_resources();
+    }
+    up::check_refusals(&checked)?;
+    // The networks, volumes and secrets of the project as run loaded it, made as up makes
+    // them: docker compose's run makes them with what the service depends on, which may
+    // be nothing.
+    up::networks(e).await?;
+    up::volumes(e).await?;
+    up::secrets(e).await?;
     let flags = super::build::Flags {
         quiet: a.quiet_build,
         ..Default::default()
@@ -650,6 +693,7 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
         name: name.clone(),
         oneoff: true,
         image_digest: image.digest.clone(),
+        image_cmd: image.cmd.clone(),
         no_deps: true,
         env_files: e.args.env_file.clone(),
         scale: &BTreeMap::new(),
@@ -688,6 +732,11 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
         let words = crate::compose::golib::shell_words(entrypoint).map_err(anyhow::Error::msg)?;
         let mut argv = words;
         argv.extend(a.command.iter().cloned());
+        // --entrypoint "" alone keeps the image's command, as an empty entrypoint of the
+        // file does.
+        if argv.is_empty() {
+            argv.clone_from(&image.cmd);
+        }
         o.insert("entrypoint", Bus::from(String::new()));
         o.insert("command", Bus::from(argv));
     }
@@ -710,17 +759,7 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
                     .map(|(k, v)| (k.to_string(), v.to_string()))
             })
             .collect();
-        // As compose reads them: dotenv files (quotes, export, comments), a bare KEY and
-        // ${KEY} taken from -e; -e wins over them.
-        let mut from_files = crate::compose::dotenv::Env::new();
-        for file in &a.env_from_file {
-            let text = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
-            let lookup = |k: &str| flags.get(k).cloned();
-            crate::compose::dotenv::parse(&text, &mut from_files, &lookup, &mut |_| {})
-                .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
-        }
-        env.extend(from_files);
-        env.extend(flags);
+        env.extend(env_from_files(flags, &a.env_from_file)?);
         o.insert(
             "env",
             Bus::from(
@@ -756,7 +795,7 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
             _ => Vec::new(),
         };
         for volume in &a.volume {
-            volumes.push(run_volume(e.project(), volume)?);
+            volumes.push(run_volume(e.project(), &e.cwd, volume)?);
         }
         o.insert("volume", Bus::from(volumes));
     }
@@ -838,29 +877,24 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// A `run -v` as compose's buildMount takes it: a relative bind source from the
-/// project's directory, a volume of the project by its name.
-fn run_volume(project: &crate::compose::project::Project, text: &str) -> Result<String> {
+/// A `run -v` as compose's buildMount takes it: a relative bind source from the command
+/// line's working directory (filepath.Abs), a volume of the project by its name.
+fn run_volume(project: &crate::compose::project::Project, cwd: &str, text: &str) -> Result<String> {
     let spec = crate::compose::mount::parse(text).map_err(anyhow::Error::msg)?;
     if spec.source.is_empty() {
         bail!("{text}: a volume without a source is an anonymous one, which nspawn does not have: name it");
     }
     let ro = if spec.read_only { ":ro" } else { "" };
     let source = if spec.kind == "bind" {
-        if spec.source.starts_with('/') {
-            spec.source
-        } else {
-            // filepath.Join: cleaned, a ../ taken against the directory.
-            crate::api::copy::clean(
-                &std::path::Path::new(&project.working_dir).join(&spec.source),
-                false,
-            )
-            .to_string_lossy()
-            .into_owned()
-        }
+        crate::compose::paths::abs(&spec.source, cwd)
     } else if project.volumes.contains_key(&spec.source) {
         match convert::volume_device(project, &spec.source)? {
-            Some(device) => device,
+            Some(device) => {
+                if device.read_only {
+                    return Ok(format!("{}:{}:ro", device.path, spec.target));
+                }
+                device.path
+            }
             None => convert::volume_name(project, &spec.source),
         }
     } else {
@@ -935,12 +969,20 @@ mod tests {
             "runvol",
             "services:\n  web:\n    image: x\n    volumes: [data:/data]\nvolumes:\n  data: {}\n",
         );
-        let named = run_volume(&p, "data:/backup").unwrap();
+        let named = run_volume(&p, "/elsewhere", "data:/backup").unwrap();
         assert!(named.ends_with("_data:/backup"), "{named}");
-        assert_eq!(run_volume(&p, "other:/o:ro").unwrap(), "other:/o:ro");
-        let bind = run_volume(&p, "./conf/../site:/srv").unwrap();
-        assert_eq!(bind, format!("{}/site:/srv", p.working_dir));
-        assert!(run_volume(&p, "/x").is_err());
+        assert_eq!(
+            run_volume(&p, "/elsewhere", "other:/o:ro").unwrap(),
+            "other:/o:ro"
+        );
+        // From where the command runs, not the project's directory.
+        let bind = run_volume(&p, "/elsewhere", "./conf/../site:/srv").unwrap();
+        assert_eq!(bind, "/elsewhere/site:/srv");
+        assert_eq!(
+            run_volume(&p, "/elsewhere", "/abs//x/:/srv").unwrap(),
+            "/abs/x:/srv"
+        );
+        assert!(run_volume(&p, "/elsewhere", "/x").is_err());
     }
 
     #[test]
@@ -967,15 +1009,43 @@ mod tests {
     }
 
     #[test]
+    fn the_first_env_file_that_sets_a_variable_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.env");
+        let local = dir.path().join("local.env");
+        std::fs::write(&base, "DB_HOST=base\nPORT=1\n").unwrap();
+        std::fs::write(
+            &local,
+            "DB_HOST=local\nURL=${DB_HOST}:${PORT}\nTOKEN=file\n",
+        )
+        .unwrap();
+        let flags = BTreeMap::from([("TOKEN".to_string(), "flag".to_string())]);
+        let files = [base.display().to_string(), local.display().to_string()];
+        let env = env_from_files(flags, &files).unwrap();
+        assert_eq!(env["DB_HOST"], "base");
+        // compose-go's expansion asks the lookup (-e, the earlier files) before the file.
+        assert_eq!(env["URL"], "base:1");
+        assert_eq!(env["TOKEN"], "flag");
+        let missing = dir.path().join("none.env").display().to_string();
+        assert!(env_from_files(BTreeMap::new(), &[missing])
+            .unwrap_err()
+            .to_string()
+            .starts_with("open "));
+    }
+
+    #[test]
     fn times_are_read_as_the_reference_reads_them() {
-        assert_eq!(journal_time("42m", 10_000.0), "@7480.000000");
-        assert_eq!(journal_time("1h30m", 10_000.0), "@4600.000000");
-        assert_eq!(journal_time("1700000000", 0.0), "@1700000000");
-        assert_eq!(journal_time("1700000000.5", 0.0), "@1700000000.5");
+        assert_eq!(journal_time("42m", 10_000.0).unwrap(), "@7480");
+        assert_eq!(journal_time("1h30m", 10_000.0).unwrap(), "@4600");
+        assert_eq!(journal_time("1700000000", 0.0).unwrap(), "@1700000000");
+        assert_eq!(journal_time("1700000000.5", 0.0).unwrap(), "@1700000000.5");
         assert_eq!(
-            journal_time("2026-10-19 07:00:00", 0.0),
-            "2026-10-19 07:00:00"
+            journal_time("2026-10-19T07:00:00Z", 0.0).unwrap(),
+            "@1792393200.000000000"
         );
+        // What journalctl reads and docker does not is refused before it gets there.
+        assert!(journal_time("2026-10-19 07:00:00", 0.0).is_err());
+        assert!(journal_time("yesterday", 0.0).is_err());
     }
 
     #[test]

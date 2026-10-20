@@ -92,9 +92,16 @@ files, and the machine units call nspawn back through drop-in hooks.
   starting/NAME      a start in progress, until the machine is registered:
                      nothing removes or replaces the image meanwhile; the
                      service takes every marker left at its start
+  claims/NAME        the host ports of a machine whose ExecStartPre hook
+                     passed, until its ExecStartPost or ExecStopPost: the
+                     next unit's check sees them before machined does; a
+                     claim, like a start marker, holds for the boot that
+                     made it
   starts-kept-since  when records began to keep their first start (unix
                      seconds): a record made before it without one tells
-                     nothing of whether it ran, and counts as a machine
+                     nothing of whether it ran; a flat one counts as a
+                     machine, an overlay or mstack one ran when its
+                     writable layer has something in it
   rollback/NAME/     auto-update's copy of a machine's previous record,
                      manifest and upper/work, until its new image is up;
                      its layers and blobs stay meanwhile
@@ -102,6 +109,9 @@ files, and the machine units call nspawn back through drop-in hooks.
                      upper and work of each step, its network namespace's
                      address; removed at its end, and at the service's start
                      for builds a service that went away left
+  builds/mkosi-ID/   an mkosi build's output, removed at its end unless
+                     --keep-output keeps it, and at the service's start
+                     while it has the marker an unfinished build leaves
   cache/build/       the build cache: entries/ (a step's layer by its key),
                      bases/ (the base images builds pulled), mounts/ (RUN
                      --mount=type=cache); its layers and blobs stay until

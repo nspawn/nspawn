@@ -89,6 +89,9 @@ pub struct Options {
 pub struct Refusal {
     /// The service or job it is in, "" for the project's own resources.
     pub service: String,
+    /// The project's resource it is in, as its kind and its name: a name may hold dots,
+    /// which the path does not tell apart.
+    pub resource: Option<(String, String)>,
     /// Its path as the messages write it.
     pub path: String,
     /// The line to print.
@@ -435,6 +438,7 @@ fn check_support(model: &Map, warn: Warn) -> Vec<Refusal> {
         .iter()
         .map(|f| Refusal {
             service: f.0.clone(),
+            resource: f.3.clone(),
             path: f.1.clone(),
             line: f.line(),
         })
@@ -442,8 +446,8 @@ fn check_support(model: &Map, warn: Warn) -> Vec<Refusal> {
 }
 
 /// An attribute the table speaks of: its service, its path as the messages write it,
-/// and the table's text.
-struct Finding(String, String, &'static str);
+/// the table's text, and the project's resource it is in.
+struct Finding(String, String, &'static str, Option<(String, String)>);
 
 impl Finding {
     /// api.UnsupportedAttribute's String.
@@ -494,6 +498,11 @@ fn walk_support(
                 Value::Str(_) | Value::Bool(_) | Value::Int(_) | Value::Float(_) => {
                     support::value(pattern, &value.to_string())
                 }
+                // No schedule at all asks for nothing: docker compose refuses only a
+                // list with one in it.
+                Value::Seq(items) if items.is_empty() && pattern == "jobs.*.triggers.schedule" => {
+                    Some(support::Support::Full)
+                }
                 _ => Some(attribute.support),
             };
             match rule {
@@ -510,11 +519,12 @@ fn walk_support(
             }
         }
     }
-    // Below these the keys are names, an x- one among them, not extensions.
+    // Below these the keys are names, an x- one among them, not extensions: compose-go's
+    // userDefinedKeys, which jobs are not part of.
     let names = matches!(
         pattern,
-        "services" | "volumes" | "networks" | "secrets" | "configs" | "jobs"
-    ) || pattern.ends_with(".depends_on");
+        "services" | "volumes" | "networks" | "secrets" | "configs" | "services.*.depends_on"
+    );
     match value {
         Value::Map(map) => {
             for (key, entry) in map {
@@ -556,6 +566,17 @@ fn walk_support(
 /// a config by its source.
 fn finding(concrete: &[Step], pattern: &str, text: &'static str) -> Finding {
     let mut steps = concrete.to_vec();
+    let resource = match steps.as_slice() {
+        [Step::Key(kind), Step::Key(name), ..]
+            if matches!(
+                kind.as_str(),
+                "networks" | "volumes" | "secrets" | "configs" | "models"
+            ) =>
+        {
+            Some((kind.clone(), name.clone()))
+        }
+        _ => None,
+    };
     let service = match steps.as_slice() {
         [Step::Key(kind), Step::Key(name), ..] if kind == "services" || kind == "jobs" => {
             let name = name.clone();
@@ -599,7 +620,7 @@ fn finding(concrete: &[Step], pattern: &str, text: &'static str) -> Finding {
             .collect::<Vec<_>>()
             .join(".")
     });
-    Finding(service, path, text)
+    Finding(service, path, text, resource)
 }
 
 /// The variables of the environment a model reads, for the include of its files.

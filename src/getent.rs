@@ -131,11 +131,13 @@ pub fn shim(store: &Store, name: &str, record: &ImageRecord) -> Result<Vec<Bind>
         read_only: true,
     }];
     // A bind follows a symlink on the host, so only a program of the image itself is
-    // handed over.
+    // handed over, found through the image's links inside its root.
     if let (Some(real), BackendChoice::Overlay | BackendChoice::Flat | BackendChoice::Auto) =
         (placement.real, record.backend)
     {
-        let source = store.machines_dir.join(name).join(real);
+        let Some(source) = crate::backend::root_path(store, name, record.backend, real) else {
+            return Ok(binds);
+        };
         if source.symlink_metadata().is_ok_and(|m| m.is_file()) {
             binds.push(Bind {
                 source,
@@ -826,6 +828,28 @@ mod tests {
         nix::unistd::mkfifo(&root.join("etc/fifo"), nix::sys::stat::Mode::S_IRWXU).unwrap();
         assert_eq!(text("etc/fifo"), "");
         assert_eq!(text("etc/missing"), "");
+    }
+
+    #[test]
+    fn the_image_s_getent_is_bound_from_inside_its_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let root = store.machines_dir.join("m");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/sh"), "#!sh").unwrap();
+        fs::write(root.join("bin/getent"), "getent").unwrap();
+        // usr is the root itself: usr/bin/getent is the image's bin/getent, never the
+        // host's through the link.
+        std::os::unix::fs::symlink("/", root.join("usr")).unwrap();
+        let record: ImageRecord = serde_json::from_value(serde_json::json!({
+            "name": "m", "reference": "r", "manifest_digest": "sha256:a", "layers": [],
+            "backend": "flat", "created": 1, "mode": "app", "run": { "user": "nobody" },
+        }))
+        .unwrap();
+        let binds = shim(&store, "m", &record).unwrap();
+        let real: Vec<&Bind> = binds.iter().filter(|b| b.target == REAL).collect();
+        assert_eq!(real.len(), 1, "{binds:?}");
+        assert_eq!(real[0].source, root.join("bin/getent"));
     }
 
     #[test]

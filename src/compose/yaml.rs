@@ -41,6 +41,9 @@ pub struct Node {
     pub name: String,
     pub line: usize,
     pub column: usize,
+    /// How deep its value goes, its aliases followed: what building it takes of the
+    /// stack.
+    pub height: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +123,7 @@ impl<'a> Documents<'a> {
                     name,
                     line,
                     column,
+                    height: 1,
                 };
                 // go-yaml's Resolver stage: every node but an alias gets its tag.
                 node.tag = super::construct::resolver_tag(&node);
@@ -128,7 +132,18 @@ impl<'a> Documents<'a> {
             let (node, anchor, container) = match event.kind {
                 EventKind::DocumentEnd { .. } => break,
                 EventKind::SequenceEnd | EventKind::MappingEnd => {
-                    stack.pop();
+                    if let Some((id, _)) = stack.pop() {
+                        let nodes = &self.doc.nodes;
+                        let below = match &nodes[id].kind {
+                            Kind::Sequence(items) => items.iter().map(|c| nodes[*c].height).max(),
+                            Kind::Mapping(pairs) => pairs
+                                .iter()
+                                .map(|(k, v)| nodes[*k].height.max(nodes[*v].height))
+                                .max(),
+                            _ => None,
+                        };
+                        self.doc.nodes[id].height = 1 + below.unwrap_or(0);
+                    }
                     continue;
                 }
                 EventKind::StreamStart | EventKind::StreamEnd | EventKind::DocumentStart { .. } => {
@@ -146,7 +161,9 @@ impl<'a> Documents<'a> {
                             },
                         ));
                     };
-                    (new(Kind::Alias(target), "", anchor), None, false)
+                    let mut alias = new(Kind::Alias(target), "", anchor);
+                    alias.height = self.doc.nodes[target].height;
+                    (alias, None, false)
                 }
                 EventKind::Scalar {
                     anchor,
@@ -237,6 +254,14 @@ pub const MAX_NODE_VISITS: usize = 100_000;
 /// itself sets no limit where compose-go decodes.
 const MAX_VALUES: usize = 5_000_000;
 
+/// The cap on the text of the `!reset` and `!override` paths one document records,
+/// aliases followed. compose-go sets none and runs out of memory on a file whose nested
+/// aliases multiply long paths; the count of its node visits does not see them.
+pub const MAX_RESET_TEXT: usize = 256 << 20;
+/// What a recorded path takes besides its text, counted against MAX_RESET_TEXT so that
+/// many short paths are held to it as well.
+const PATH_COST: usize = 64;
+
 /// The root of a document whose root the reset pass took out.
 const NO_ROOT: NodeId = NodeId::MAX;
 
@@ -251,12 +276,19 @@ pub struct Resets {
 /// the path of every `!reset` and `!override` node, an alias counting at the path it
 /// stands at.
 pub fn take_resets(doc: &mut Document) -> Result<Resets, Error> {
+    take_resets_within(doc, MAX_RESET_TEXT)
+}
+
+/// `take_resets` with `cap` in place of MAX_RESET_TEXT.
+fn take_resets_within(doc: &mut Document, cap: usize) -> Result<Resets, Error> {
     let mut pass = ResetPass {
         doc,
         paths: Vec::new(),
         visited: HashMap::new(),
         resolved: HashMap::new(),
         visits: 0,
+        text: 0,
+        cap,
     };
     let root = pass.doc.root;
     pass.doc.root = pass.resolve(root, Path::root())?.unwrap_or(NO_ROOT);
@@ -278,9 +310,29 @@ struct ResetPass<'a> {
     visited: HashMap<NodeId, Vec<Path>>,
     resolved: HashMap<NodeId, (NodeId, Vec<Path>)>,
     visits: usize,
+    /// The bytes of the paths recorded so far, and how many they may come to.
+    text: usize,
+    cap: usize,
 }
 
 impl ResetPass<'_> {
+    fn record(&mut self, path: Path) -> Result<(), Error> {
+        self.spend(path.raw().len() + PATH_COST)?;
+        self.paths.push(path);
+        Ok(())
+    }
+
+    fn spend(&mut self, bytes: usize) -> Result<(), Error> {
+        self.text = self.text.saturating_add(bytes);
+        if self.text > self.cap {
+            return Err(error(format!(
+                "the !reset and !override paths of this file come to more than {} MiB once its aliases are followed",
+                self.cap >> 20
+            )));
+        }
+        Ok(())
+    }
+
     fn resolve(&mut self, id: NodeId, path: Path) -> Result<Option<NodeId>, Error> {
         self.visits += 1;
         if self.visits > MAX_NODE_VISITS {
@@ -291,11 +343,11 @@ impl ResetPass<'_> {
         let path = path.without_merge_key();
         match self.doc.nodes[id].tag.as_str() {
             "!reset" => {
-                self.paths.push(path);
+                self.record(path)?;
                 return Ok(None);
             }
             "!override" => {
-                self.paths.push(path);
+                self.record(path)?;
                 return Ok(Some(id));
             }
             _ => {}
@@ -305,11 +357,11 @@ impl ResetPass<'_> {
                 self.check_for_cycle(target, &path)?;
                 match self.doc.nodes[target].tag.as_str() {
                     "!reset" => {
-                        self.paths.push(path);
+                        self.record(path)?;
                         Ok(None)
                     }
                     "!override" => {
-                        self.paths.push(path);
+                        self.record(path)?;
                         Ok(Some(target))
                     }
                     _ => self.cached(target, path).map(Some),
@@ -321,16 +373,21 @@ impl ResetPass<'_> {
     }
 
     fn cached(&mut self, id: NodeId, path: Path) -> Result<NodeId, Error> {
-        if let Some((node, relative)) = self.resolved.get(&id).cloned() {
-            // Each path replayed counts as a visit: nested aliases multiply them.
-            self.visits += relative.len();
-            if self.visits > MAX_NODE_VISITS {
-                return Err(error(format!(
-                    "compose file exceeds maximum node visit limit ({MAX_NODE_VISITS})"
-                )));
-            }
-            for rel in relative {
-                self.paths.push(path.join(&rel));
+        // A node reached again replays the paths it recorded, which compose-go counts as
+        // no visits; their text is counted before any is made.
+        let hit = self.resolved.get(&id).map(|(node, relative)| {
+            let bytes: usize = relative
+                .iter()
+                .map(|rel| path.raw().len() + 1 + rel.raw().len() + PATH_COST)
+                .sum();
+            (*node, bytes)
+        });
+        if let Some((node, bytes)) = hit {
+            self.spend(bytes)?;
+            if let Some((_, relative)) = self.resolved.get(&id) {
+                for rel in relative {
+                    self.paths.push(path.join(rel));
+                }
             }
             return Ok(node);
         }
@@ -484,6 +541,7 @@ pub fn read(doc: &mut Document) -> Result<(Resets, Value), ReadError> {
         Ok(value) => value,
         Err(Stop::Yaml(e)) => return Err(wrap(&e)),
         Err(Stop::TooLarge) => return Err(ReadError::Yaml(too_large())),
+        Err(Stop::TooMuchText) => return Err(ReadError::Yaml(too_much_text())),
     };
     if !constructor.errors.is_empty() {
         return Err(ReadError::Yaml(type_errors(&constructor.errors)));
@@ -494,6 +552,13 @@ pub fn read(doc: &mut Document) -> Result<(Resets, Value), ReadError> {
 
 fn too_large() -> String {
     format!("compose file holds more than {MAX_VALUES} values once its aliases are followed")
+}
+
+fn too_much_text() -> String {
+    format!(
+        "compose file holds more than {} MiB of text once its aliases are followed",
+        super::construct::MAX_TEXT >> 20
+    )
 }
 
 /// LoadErrors: go-yaml's errors of type, each with its line.
@@ -525,6 +590,7 @@ pub fn decode_name(doc: &Document) -> Result<String, String> {
     match constructor.named(doc.root) {
         Err(Stop::Yaml(e)) => Err(e.to_string()),
         Err(Stop::TooLarge) => Err(too_large()),
+        Err(Stop::TooMuchText) => Err(too_much_text()),
         Ok(_) if !constructor.errors.is_empty() => Err(type_errors(&constructor.errors)),
         Ok(name) => Ok(name.unwrap_or_default()),
     }
@@ -762,18 +828,42 @@ mod tests {
             text += &format!("a{i}: &a{i} [{}]\n", vec![prev; 10].join(", "));
         }
         let err = load(&text).unwrap_err();
-        assert!(err.0.contains("once its aliases are followed"), "{err}");
+        assert!(
+            err.0.contains("MiB of text once its aliases are followed"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn replayed_resets_count_as_visits() {
+    fn replayed_resets_are_held_to_their_text() {
+        // Nested aliases multiply the paths a node recorded: a billion of them here,
+        // in a few hundred bytes.
         let mut text = format!("a0: &a0 [{}]\n", ["!reset 0"; 10].join(", "));
         for i in 1..9 {
             let prev = format!("*a{}", i - 1);
             text += &format!("a{i}: &a{i} [{}]\n", vec![prev; 10].join(", "));
         }
-        let err = load(&text).unwrap_err();
-        assert!(err.0.contains("maximum node visit limit"), "{err}");
+        let mut doc = parse(&text).unwrap().remove(0);
+        let err = take_resets_within(&mut doc, 1 << 20).unwrap_err();
+        assert!(
+            err.0.contains("paths of this file come to more than 1 MiB"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn replayed_resets_are_no_visits() {
+        // compose-go counts no visit for a path a node reached again replays: this file
+        // loads there, with its hundred thousand paths.
+        let keys: Vec<String> = (0..1000).map(|i| format!("k{i}: !reset 0")).collect();
+        let text = format!(
+            "x-a0: &a0 {{{}}}\nx-b: [{}]\nservices: {{}}\n",
+            keys.join(", "),
+            ["*a0"; 101].join(", ")
+        );
+        let mut doc = parse(&text).unwrap().remove(0);
+        let resets = take_resets(&mut doc).unwrap();
+        assert_eq!(resets.paths.len(), 1000 + 101 * 1000);
     }
 
     #[test]

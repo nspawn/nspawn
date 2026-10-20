@@ -168,6 +168,12 @@ impl RunSpec {
                 plain(field, value, false)?;
             }
         }
+        // Written up to its ':' only, where a backslash would end the line as well.
+        if let Some(user) = self.user.as_deref().filter(|u| u.contains('\\')) {
+            anyhow::bail!(
+                "the image config's User holds a backslash ({user:?}), which no user name has; refusing the image"
+            );
+        }
         Ok(())
     }
 
@@ -459,6 +465,12 @@ mod tests {
         }
         let quoted = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{"Cmd":["a\\"],"WorkingDir":"/a\\b"}}"#;
         assert!(RunSpec::from_config(quoted).is_ok());
+        // A user is written up to its ':', which may end in a backslash: none is taken.
+        let user = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{"User":"evil\\:0"}}"#;
+        assert!(RunSpec::from_config(user)
+            .unwrap_err()
+            .to_string()
+            .contains("backslash"));
         // SHELL, which a CMD-SHELL healthcheck runs in.
         let shell = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{"Shell":["/busybox/sh","-c"]}}"#;
         assert_eq!(

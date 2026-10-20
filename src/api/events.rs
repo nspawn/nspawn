@@ -51,6 +51,28 @@ pub fn emit(kind: &str, action: &str, name: &str, attributes: &[(&str, &str)]) {
     let _ = journal::send(&fields);
 }
 
+/// Logs one of nspawn's events of a machine, saying which machine of the name it was:
+/// the `created` of its record, as the journal keeps the event past the record.
+pub fn emit_machine(
+    store: &crate::store::Store,
+    action: &str,
+    name: &str,
+    attributes: &[(&str, &str)],
+) {
+    let created = store
+        .load_image(name)
+        .ok()
+        .flatten()
+        .map(|r| r.created.to_string());
+    let mut all: Vec<(&str, &str)> = attributes.to_vec();
+    if let Some(created) = created.as_deref() {
+        if !attributes.iter().any(|(k, _)| *k == "created") {
+            all.push(("created", created));
+        }
+    }
+    emit("machine", action, name, &all);
+}
+
 fn attribute_field(key: &str) -> String {
     let key: String = key
         .chars()
@@ -179,9 +201,15 @@ pub fn enrich(store: &crate::store::Store, event: &mut Event) {
         return;
     }
     if let Ok(Some(record)) = store.load_image(&event.name) {
-        // An event from before this machine was made is an earlier machine's of the
-        // name: what this one has is not its.
-        if event.time_usec / 1_000_000 < record.created {
+        // An event from before this machine was made, or one that says it was of
+        // another, is an earlier machine's of the name: what this one has is not its.
+        let created = record.created.to_string();
+        if event.time_usec / 1_000_000 < record.created
+            || event
+                .attributes
+                .get("created")
+                .is_some_and(|c| *c != created)
+        {
             return;
         }
         event
@@ -210,11 +238,12 @@ pub fn enrich(store: &crate::store::Store, event: &mut Event) {
                     status,
                     result: String::new(),
                 };
-                let code = crate::api::run::exit_code(
-                    &ending,
-                    store.last_signal(&event.name),
-                    record.under_stub_init(),
-                );
+                // What was sent to that run, not to the machine's latest.
+                let sent = event
+                    .run
+                    .as_deref()
+                    .and_then(|run| store.signal_of_run(&event.name, run));
+                let code = crate::api::run::exit_code(&ending, sent, record.under_stub_init());
                 event
                     .attributes
                     .insert("exit_code".into(), code.to_string());
@@ -233,6 +262,9 @@ pub struct Event {
     pub attributes: BTreeMap<String, String>,
     /// The machine's labels, when it still has a record.
     pub labels: BTreeMap<String, String>,
+    /// The run of the machine a systemd event is of, its unit's INVOCATION_ID: what was
+    /// sent to that run, not to a later one, makes its exit code.
+    pub run: Option<String>,
 }
 
 impl Event {
@@ -279,6 +311,7 @@ impl Mapper {
                 name: field("NSPAWN_NAME")?.to_string(),
                 attributes,
                 labels: BTreeMap::new(),
+                run: None,
             });
         }
         let name = field("UNIT")?
@@ -303,7 +336,7 @@ impl Mapper {
                     attributes.insert("signal".into(), status.to_string());
                     attributes.insert("exit_code".into(), (128 + status).to_string());
                 }
-                self.remember(invocation);
+                self.remember(invocation.clone());
                 "die"
             }
             UNIT_SUCCESS => {
@@ -312,7 +345,7 @@ impl Mapper {
                 }
                 attributes.insert("code".into(), "exited".into());
                 attributes.insert("exit_code".into(), "0".into());
-                self.remember(invocation);
+                self.remember(invocation.clone());
                 "die"
             }
             UNIT_STOPPED => "stop",
@@ -338,6 +371,7 @@ impl Mapper {
             name,
             attributes,
             labels: BTreeMap::new(),
+            run: Some(invocation).filter(|i| !i.is_empty()),
         })
     }
 
@@ -494,7 +528,8 @@ mod tests {
         .unwrap();
         store.record_image(&record).unwrap();
         // Stopped with SIGTERM under the stub init, systemd-nspawn says 255.
-        store.mark_signal("e2e-busybox", 15).unwrap();
+        let run = "b94ee618ff994385b17142a77fe6cdf8";
+        store.mark_signal("e2e-busybox", 15, Some(run)).unwrap();
         let killed = EXITED.replace(r#""EXIT_STATUS": "1""#, r#""EXIT_STATUS": "255""#);
         let mut event = Mapper::default().map(&entry(&killed)).unwrap();
         enrich(&store, &mut event);
@@ -503,6 +538,21 @@ mod tests {
         let mut event = Mapper::default().map(&entry(EXITED)).unwrap();
         enrich(&store, &mut event);
         assert_eq!(event.attributes["exit_code"], "1");
+        // A run before the one the signal went to keeps what systemd logged: read back
+        // later, a run that exited 1 of its own is not one that was killed.
+        store.mark_signal("e2e-busybox", 9, Some("later")).unwrap();
+        let mut event = Mapper::default().map(&entry(EXITED)).unwrap();
+        enrich(&store, &mut event);
+        assert_eq!(event.attributes["exit_code"], "1");
+        let mut event = Mapper::default().map(&entry(&killed)).unwrap();
+        enrich(&store, &mut event);
+        assert_eq!(event.attributes["exit_code"], "255");
+        assert_eq!(store.last_signal("e2e-busybox"), Some(9));
+        // An event that says which machine it was keeps to it.
+        let mut other = Mapper::default().map(&entry(EXITED)).unwrap();
+        other.attributes.insert("created".into(), "7".into());
+        enrich(&store, &mut other);
+        assert!(other.labels.is_empty() && !other.attributes.contains_key("image"));
         // A machine made after the event is another one of the name: nothing of its.
         let mut later = record.clone();
         later.created = 1_890_000_000;

@@ -163,7 +163,7 @@ fn is_opaque(dir: &Path) -> bool {
 fn remove_entry(path: &Path) -> Result<()> {
     match path.symlink_metadata() {
         Ok(meta) if meta.is_dir() => {
-            fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))
+            crate::store::remove_tree(path).with_context(|| format!("removing {}", path.display()))
         }
         Ok(_) => fs::remove_file(path).with_context(|| format!("removing {}", path.display())),
         Err(_) => Ok(()),
@@ -309,6 +309,13 @@ pub fn plain_inside_path(path: &str) -> bool {
     path.starts_with('/') && path.split('/').all(|c| c != "." && c != "..")
 }
 
+/// The place a path inside the machine mounts at, as systemd-nspawn compares mount
+/// points and docker cleans them: repeated and trailing slashes do not count.
+pub fn mount_point(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+    format!("/{}", parts.join("/"))
+}
+
 pub fn validate_volume_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.starts_with('.')
@@ -349,8 +356,9 @@ pub fn parse_volumes(values: &[String]) -> Result<Vec<Volume>> {
     let mut out: Vec<Volume> = Vec::new();
     for value in values {
         let volume: Volume = value.parse()?;
-        if out.iter().any(|v| v.target == volume.target) {
-            bail!("{} is mounted twice", volume.target);
+        let target = mount_point(&volume.target);
+        if out.iter().any(|v| mount_point(&v.target) == target) {
+            bail!("Duplicate mount point: {target}");
         }
         out.push(volume);
     }
@@ -525,6 +533,17 @@ mod tests {
         }
         assert!(parse_volumes(&["none".to_string()]).unwrap().is_empty());
         assert!(parse_volumes(&["/a:/x".to_string(), "/b:/x".to_string()]).is_err());
+        // The same place however it is spelled, as docker cleans the paths.
+        for (one, other) in [("/a:/x/y", "/b:/x//y"), ("/a:/x", "/b:/x/")] {
+            assert_eq!(
+                parse_volumes(&[one.to_string(), other.to_string()])
+                    .unwrap_err()
+                    .to_string(),
+                format!("Duplicate mount point: {}", mount_point(&one[3..])),
+            );
+        }
+        assert_eq!(mount_point("/var//lib/pg/"), "/var/lib/pg");
+        assert_eq!(mount_point("/"), "/");
     }
 
     #[test]

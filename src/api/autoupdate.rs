@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 
 use crate::api::machines::{StartRequest, StopRequest};
 use crate::api::pull::Fetched;
@@ -255,7 +255,7 @@ pub async fn run(ctx: &Context, request: &Request, report: Report<'_>) -> Result
                         ),
                     );
                     let recreated =
-                        crate::api::recreate::recreate(ctx, &record.name, fetched, report).await;
+                        crate::api::recreate::recreate(ctx, &record, fetched, report).await;
                     match recreated.result {
                         Ok(()) => outcome.updated = Updated::Yes,
                         Err(e) => {
@@ -279,8 +279,8 @@ pub async fn run(ctx: &Context, request: &Request, report: Report<'_>) -> Result
                 }
             }
         }
-        crate::api::events::emit(
-            "machine",
+        crate::api::events::emit_machine(
+            &ctx.store,
             "auto-update",
             &outcome.name,
             &[
@@ -457,6 +457,26 @@ async fn refresh_compose_image(
         }
         let refreshed = async {
             let _lock = ctx.store.lock().await?;
+            // Looked at again under the lock: started, updated or pulled again while the
+            // lock was waited for, it is no image to reinstall any more.
+            let current = ctx
+                .store
+                .load_image(&image.name)?
+                .context("it went meanwhile")?;
+            if current.manifest_digest != image.manifest_digest
+                || current.origin != "pull"
+                || current.labels.contains_key(COMPOSE_IMAGE)
+                || current.backend != BackendChoice::Overlay
+                || !crate::api::disk::image_only(&ctx.store, &current)
+                || ctx.store.is_starting(&image.name)
+                || sd.machine_exists(&image.name).await?
+            {
+                bail!(
+                    "it changed meanwhile; compose up makes {} anew from the old image",
+                    record.name
+                );
+            }
+            let image = &current;
             let backend = crate::backend::Backend::choose(BackendChoice::Overlay, sd).await?;
             crate::install::stage_layers(
                 &ctx.store,

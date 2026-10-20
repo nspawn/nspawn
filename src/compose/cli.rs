@@ -206,7 +206,7 @@ pub fn requested(args: &ComposeArgs) -> Vec<(&'static str, &'static str)> {
         }
         Some(ComposeCommand::Down(c)) => {
             let command = "down";
-            flag(command, "remove-orphans", c.remove_orphans);
+            flag(command, "remove-orphans", c.remove_orphans.is_some());
             flag(command, "rmi", c.rmi.is_some());
             flag(command, "timeout", c.timeout.is_some());
             flag(command, "volumes", c.volumes);
@@ -236,7 +236,7 @@ pub fn requested(args: &ComposeArgs) -> Vec<(&'static str, &'static str)> {
         }
         Some(ComposeCommand::Kill(c)) => {
             let command = "kill";
-            flag(command, "remove-orphans", c.remove_orphans);
+            flag(command, "remove-orphans", c.remove_orphans.is_some());
             flag(command, "signal", c.signal.is_some());
         }
         Some(ComposeCommand::Logs(c)) => {
@@ -612,6 +612,9 @@ pub struct CpArgs {
     pub source: Option<String>,
     #[arg(value_name = "DEST")]
     pub destination: Option<String>,
+    /// More than cp takes, for its count to be said as docker says it.
+    #[arg(hide = true)]
+    pub extra: Vec<String>,
 }
 
 #[derive(Args, Debug, Default)]
@@ -710,8 +713,8 @@ pub struct CreateArgs {
 #[derive(Args, Debug, Default)]
 pub struct DownArgs {
     /// Remove containers for services not defined in the Compose file.
-    #[arg(long)]
-    pub remove_orphans: bool,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub remove_orphans: Option<bool>,
     /// Remove images used by services. "local" remove only images that don't have a custom tag ("local"|"all").
     #[arg(long, value_name = "RMI")]
     pub rmi: Option<String>,
@@ -794,8 +797,8 @@ pub struct ImagesArgs {
 #[derive(Args, Debug, Default)]
 pub struct KillArgs {
     /// Remove containers for services not defined in the Compose file.
-    #[arg(long)]
-    pub remove_orphans: bool,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub remove_orphans: Option<bool>,
     /// SIGNAL to send to the container.
     #[arg(long, short = 's', value_name = "SIGNAL")]
     pub signal: Option<String>,
@@ -869,6 +872,9 @@ pub struct PortArgs {
     pub service: Option<String>,
     #[arg(value_name = "PRIVATE_PORT")]
     pub private_port: Option<String>,
+    /// More than port takes, for its count to be said as docker says it.
+    #[arg(hide = true)]
+    pub extra: Vec<String>,
 }
 
 #[derive(Args, Debug, Default)]
@@ -1060,7 +1066,7 @@ pub struct StartArgs {
     #[arg(long)]
     pub wait: bool,
     /// Maximum duration in seconds to wait for the project to be running|healthy.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", allow_negative_numbers = true)]
     pub wait_timeout: Option<i64>,
     #[arg(value_name = "SERVICE")]
     pub service: Vec<String>,
@@ -1186,7 +1192,7 @@ pub struct UpArgs {
     #[arg(long)]
     pub wait: bool,
     /// Maximum duration in seconds to wait for the project to be running|healthy.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", allow_negative_numbers = true)]
     pub wait_timeout: Option<i64>,
     /// Watch source code and rebuild/refresh containers when files are updated.
     #[arg(long, short = 'w')]

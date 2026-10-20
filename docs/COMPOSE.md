@@ -64,7 +64,9 @@ Beyond the rows that say so:
   keeps one order.
 - Where docker compose crashes or never ends (an include that comes back to the
   file including it through one of its override files, input that makes it
-  panic), nspawn compose gives an error.
+  panic), nspawn compose gives an error. So it does for a file whose aliases,
+  once followed, come to more than 5,000,000 values, 256 MiB of text, or 256 MiB
+  of `!reset` and `!override` paths, which docker compose runs out of memory on.
 - The options of the docker client that `docker-compose` passes on to it
   (`--debug`, `--host`, `--context`, `--log-level`, `--tls`...) are taken and
   left without effect: nspawn compose talks to no docker.
@@ -81,7 +83,10 @@ Beyond the rows that say so:
   block.
 - `ps` and `images` show what a machine has: its name where docker shows a
   container ID (`ps -q` too), the digest of its image's manifest as the image ID,
-  and `Exited (N)` without how long ago, which nspawn does not keep.
+  and `Exited (N)` without how long ago once the journal no longer has the end of
+  that run. `images`
+  gives an image's `Created` to the second, and its platform as `unknown` once the
+  image the machine was made from is no longer here.
 
 <!-- The support table: src/compose/support makes it, and NSPAWN_UPDATE_DOCS=1 cargo test writes it here. -->
 Decided on docker compose v5.6.0, whose Compose Specification is that of compose-go v2.16.1. An attribute of a job without a row of its own is the service attribute of the same name.
@@ -262,10 +267,10 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.env_file.[].format` | yes |  |
 | `services.*.env_file.[].path` | yes |  |
 | `services.*.env_file.[].required` | yes |  |
-| `services.*.environment` and below | partly | refused for an image that boots, whose init runs as it is |
+| `services.*.environment` and below | partly | refused for an image that boots, whose init runs as it is; a value with a newline or another control character but a tab is refused, as the settings file that carries it is read a line at a time |
 | `services.*.expose` | yes |  |
 | `services.*.extends` | yes |  |
-| `services.*.extends.file` | yes |  |
+| `services.*.extends.file` | partly | files on this host: a git or oci:// address is refused |
 | `services.*.extends.service` | yes |  |
 | `services.*.external_links` | ignored | a machine reaches others by their names on a shared network |
 | `services.*.extra_hosts` and below | yes |  |
@@ -291,7 +296,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.isolation` | ignored | isolation is for Windows containers |
 | `services.*.label_file` | yes |  |
 | `services.*.labels` and below | yes |  |
-| `services.*.links` | partly | an alias on the default network and a dependency, nothing more |
+| `services.*.links` | partly | an alias of the linked service on the default network, which it is made anew to take, and a dependency, nothing more |
 | `services.*.logging` | partly | the driver becomes nspawn's log driver |
 | `services.*.logging.driver` | ignored | the driver is docker's; the machine logs to nspawn's local log |
 | `services.*.logging.driver`: `json-file` | partly | nspawn's local log, which logs reads |
@@ -407,7 +412,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `volumes.*.driver` | no | nspawn volumes are directories of the host: only the local driver |
 | `volumes.*.driver`: `local` | yes |  |
 | `volumes.*.driver`: `` | yes |  |
-| `volumes.*.driver_opts` and below | partly | type: none with o: bind and an absolute device binds that host directory, which down -v leaves; other options are refused |
+| `volumes.*.driver_opts` and below | partly | type: none with o: bind (ro or rw beside it) and an absolute device binds that host directory, which down -v leaves; other options are refused |
 | `volumes.*.external` | yes |  |
 | `volumes.*.external.name` | yes |  |
 | `volumes.*.labels` and below | ignored | nspawn volumes have no labels |

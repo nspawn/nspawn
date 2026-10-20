@@ -121,10 +121,7 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
     let mut private_users = true;
     if s.managed_userns {
         out.push_str("PrivateUsers=managed\n");
-    } else if s.mode == Mode::App && s.network == Network::Bridge && s.bridge.is_some() {
-        // A user namespace cannot join the network namespace prepared on the host
-        // (EPERM: it belongs to the initial user namespace), so app machines on the
-        // bridge run without one.
+    } else if app_without_userns(s.mode, s.network, s.bridge.is_some()) {
         out.push_str("PrivateUsers=no\n");
         private_users = false;
     }
@@ -517,6 +514,13 @@ pub fn render_hooks(
 /// makes systemd-nspawn mount the machine's /sys inside the namespace, which the path
 /// alone does not. Without it both go, the settings file saying what the network is.
 /// Applied to its own output it gives the same lines.
+/// Whether a machine runs without a user namespace: an app in a network namespace prepared
+/// on the host, its own on the bridge or another machine's (`bridged`). A user namespace
+/// cannot join it (EPERM: it belongs to the initial user namespace).
+pub fn app_without_userns(mode: Mode, network: Network, bridged: bool) -> bool {
+    mode == Mode::App && network == Network::Bridge && bridged
+}
+
 pub fn exec_start_override(
     command: &str,
     argv: &[String],
@@ -623,6 +627,14 @@ pub fn check_plain(s: &MachineSettings) -> Result<()> {
         take("the working directory", dir);
     }
     for user in s.run.user.iter().chain(&s.tuning.user) {
+        // Written up to its ':' only, which a test of the whole value's end would miss;
+        // systemd-nspawn takes no backslash in User= anyway.
+        if user.contains('\\') {
+            anyhow::bail!(
+                "the user of {} holds a backslash ({user:?}), which no user name has",
+                s.name
+            );
+        }
         take("the user", user);
     }
     if let Some(hostname) = &s.tuning.hostname {
@@ -741,6 +753,18 @@ fn replaced_binary(exe: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_app_in_a_network_prepared_on_the_host_goes_without_a_user_namespace() {
+        use super::{app_without_userns, Mode, Network};
+        // On the bridge, or in another machine's network (container:).
+        assert!(app_without_userns(Mode::App, Network::Bridge, true));
+        // --network none, a booted machine, the host's network, veth.
+        assert!(!app_without_userns(Mode::App, Network::Bridge, false));
+        assert!(!app_without_userns(Mode::Boot, Network::Bridge, true));
+        assert!(!app_without_userns(Mode::App, Network::Host, false));
+        assert!(!app_without_userns(Mode::App, Network::Veth, false));
+    }
+
     #[test]
     fn a_replaced_binary_still_names_its_path() {
         assert_eq!(
@@ -1061,6 +1085,10 @@ mod tests {
         };
         assert!(!plain(&[], &run, &tuning));
         assert!(plain(&["ends\\".into()], &run, &none));
+        // A user is written up to its ':', which a backslash may end as well.
+        let mut bad = run.clone();
+        bad.user = Some("evil\\:0".into());
+        assert!(!plain(&[], &bad, &none));
         // A tab in a quoted value is a character like any other.
         let mut tabbed = run.clone();
         tabbed.env = vec!["DEPS=llvm21-dev \t\tclang21".into()];

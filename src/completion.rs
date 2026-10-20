@@ -267,6 +267,18 @@ mod tests {
                     "nspawn create old web --depends-on ",
                     &["db", "fedora-44", "old", "web"],
                 ),
+                (
+                    "nspawn run docker.io/library/nginx:1.27 --restart ",
+                    &["no", "on-failure", "always", "unless-stopped"],
+                ),
+                (
+                    "nspawn start old --restart ",
+                    &["no", "on-failure", "always", "unless-stopped"],
+                ),
+                (
+                    "nspawn update web --restart ",
+                    &["no", "on-failure", "always", "unless-stopped"],
+                ),
             ] {
                 assert_eq!(complete(line), expected, "{line:?}");
             }

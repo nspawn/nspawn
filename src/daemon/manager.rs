@@ -117,7 +117,7 @@ impl Notes {
     fn report(&self) -> impl Fn(api::Event) + '_ {
         move |event| {
             if let api::Event::Line(text) | api::Event::Note(text) = event {
-                self.0.lock().unwrap().push(text);
+                self.0.lock().unwrap().push(values::bus_text(&text));
             }
         }
     }
@@ -301,8 +301,11 @@ fn network_choice(one: Option<String>, several: Vec<String>) -> anyhow::Result<V
 
 #[zbus::interface(name = "org.nspawn.Manager")]
 impl Manager {
+    /// Read first by every command line: it counts as a call, so that the service does
+    /// not go idle between it and the call that follows.
     #[zbus(property)]
     fn version(&self) -> String {
+        let _busy = self.state.enter();
         env!("CARGO_PKG_VERSION").to_string()
     }
 
@@ -1189,7 +1192,14 @@ impl Manager {
         self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let labels = crate::volume::parse_labels(&options.strings("labels")?)?;
-        let replace = options.bool("replace", false)?;
+        let replace = match (
+            options.bool("replace", false)?,
+            options.bool("replace_if_changed", false)?,
+        ) {
+            (true, _) => api::secrets::Replace::Always,
+            (false, true) => api::secrets::Replace::IfChanged,
+            (false, false) => api::secrets::Replace::Refuse,
+        };
         options.finish()?;
         Ok(api::secrets::create(self.ctx(), &name, &content, labels, replace).await?)
     }
@@ -1484,7 +1494,11 @@ impl Manager {
         let mut options = Options::new(&options);
         let ctx = self.context_for(&mut options)?;
         options.finish()?;
-        Ok(api::hub::tags(&ctx, &repository).await?)
+        Ok(api::hub::tags(&ctx, &repository)
+            .await?
+            .iter()
+            .map(|t| values::bus_text(t))
+            .collect())
     }
 
     /// The digest a reference names on its registry now, an index's for a tag of
@@ -1627,9 +1641,18 @@ impl Manager {
         let caller_gone = caller_gone(self.state.connection().clone(), owner.name.clone());
         let wait = attached.finish(self.state.ctx.clone(), caller_gone, sent);
         let argv = vec!["run".to_string(), name.clone()];
-        let path =
-            processes::register_with(&self.state, owner, &name, &argv, pid, None, signals, wait)
-                .await?;
+        let path = processes::register_with(
+            &self.state,
+            owner,
+            &name,
+            &argv,
+            pid,
+            None,
+            signals,
+            false,
+            wait,
+        )
+        .await?;
         Ok((handed, path, notes.into_lines()))
     }
 
@@ -1650,7 +1673,11 @@ impl Manager {
             name,
             force: options.bool("force", false)?,
             wait: options.bool("wait", true)?,
-            timeout: options.maybe_u64("timeout")?.map(|t| t.min(86_400)),
+            // A day at most, or none at all.
+            timeout: options.maybe_u64("timeout")?.map(|t| match t {
+                crate::policy::NO_STOP_TIMEOUT => t,
+                t => t.min(86_400),
+            }),
         };
         options.finish()?;
         let notes = Notes::default();
@@ -1890,12 +1917,23 @@ impl Manager {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Inspect).await?;
         // Each stream is a journalctl and a few descriptors of the service's: a user who
-        // may only look holds a bounded number.
-        if owner.uid != 0 && self.state.processes.running_for(owner.uid) >= STREAMS_PER_USER {
-            return Err(Error::Failed(format!(
-                "{STREAMS_PER_USER} streams of yours are open; close one first"
-            )));
-        }
+        // may only look holds a bounded number, its place taken before it is set up.
+        let slot = if owner.uid == 0 {
+            None
+        } else {
+            match self
+                .state
+                .processes
+                .reserve_stream(owner.uid, STREAMS_PER_USER)
+            {
+                Some(slot) => Some(slot),
+                None => {
+                    return Err(Error::Failed(format!(
+                        "{STREAMS_PER_USER} streams of yours are open; close one first"
+                    )))
+                }
+            }
+        };
         let mut options = Options::new(&options);
         let since = options.string("since")?;
         let until = options.string("until")?;
@@ -1957,7 +1995,10 @@ impl Manager {
         };
         let mut command = vec!["journalctl".to_string()];
         command.extend(argv);
-        let path = processes::register(&self.state, owner, "", &command, pid, pidfd, wait).await?;
+        let path =
+            processes::register_stream(&self.state, owner, &command, pid, pidfd, wait).await?;
+        // Counted as a running stream from here on.
+        drop(slot);
         Ok((
             HashMap::from([
                 ("stdout".to_string(), zbus::zvariant::OwnedFd::from(out_r)),

@@ -411,8 +411,8 @@ enum Node {
     /// Branches, the first that matches taken.
     Alt(Vec<Vec<Node>>),
     Repeat(Box<Node>, RepeatKind),
-    /// A counted repetition written out.
-    Counted(Vec<Node>),
+    /// A counted repetition written out, with what Go's parser sizes it at.
+    Counted(Vec<Node>, usize),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -522,6 +522,10 @@ fn is_word_char(c: Option<char>) -> bool {
 struct RegexpParser<'a> {
     s: &'a [char],
     pos: usize,
+    /// What the counted repetitions so far come to, as Go's parser sizes them, and the
+    /// most they may.
+    written: usize,
+    limit: usize,
 }
 
 impl RegexpParser<'_> {
@@ -575,7 +579,7 @@ impl RegexpParser<'_> {
                             return Err(PatternError::BadPattern);
                         }
                         let last = match nodes.pop() {
-                            None | Some(Node::Repeat(..) | Node::Counted(_)) => {
+                            None | Some(Node::Repeat(..) | Node::Counted(..)) => {
                                 return Err(PatternError::BadPattern)
                             }
                             Some(last) => last,
@@ -583,7 +587,14 @@ impl RegexpParser<'_> {
                         if self.peek() == Some('?') {
                             self.pos += 1;
                         }
-                        nodes.push(counted(last, min, max)?);
+                        // Refused before it is written out, as Go refuses an expression
+                        // too large.
+                        let size = counted_size(&last, min, max);
+                        self.written = self.written.saturating_add(size);
+                        if self.written > self.limit {
+                            return Err(PatternError::BadPattern);
+                        }
+                        nodes.push(counted(last, min, max, size));
                     }
                     // A brace that makes no count is itself.
                     None => {
@@ -624,7 +635,7 @@ impl RegexpParser<'_> {
                         _ => RepeatKind::Quest,
                     };
                     let last = match nodes.pop() {
-                        None | Some(Node::Repeat(..) | Node::Counted(_)) => {
+                        None | Some(Node::Repeat(..) | Node::Counted(..)) => {
                             return Err(PatternError::BadPattern)
                         }
                         Some(last) => last,
@@ -654,7 +665,8 @@ impl RegexpParser<'_> {
             while self.s.get(*i).is_some_and(char::is_ascii_digit) {
                 *i += 1;
             }
-            if *i == from {
+            // Go's parseInt takes no leading zero: such a brace is itself.
+            if *i == from || (*i - from > 1 && self.s[from] == '0') {
                 return None;
             }
             // Past what any count may be, as the reference's own parse gives up.
@@ -862,27 +874,40 @@ impl RegexpParser<'_> {
 /// The largest count of a repetition, as the reference takes it.
 const MAX_REPEAT: u32 = 1000;
 
-/// How many nodes an expression is made of, as large as the program it gives.
-fn size(node: &Node) -> usize {
+/// The largest expression Go's regexp parser takes, in the units of its calcSize: a
+/// program of 128 MiB of instructions.
+const GO_MAX_SIZE: usize = (128 << 20) / 40;
+
+/// The size Go's parser gives a node (calcSize).
+fn go_size(node: &Node) -> usize {
+    let seq = |nodes: &[Node]| nodes.iter().map(go_size).sum::<usize>().max(1);
     match node {
         Node::Char(_) | Node::Assert(_) => 1,
-        Node::Group(inner) | Node::Counted(inner) => inner.iter().map(size).sum(),
-        Node::Alt(branches) => branches.iter().flatten().map(size).sum::<usize>() + branches.len(),
-        Node::Repeat(inner, _) => size(inner) + 1,
+        Node::Group(inner) => 2 + seq(inner),
+        Node::Alt(branches) => {
+            branches.iter().map(|b| seq(b)).sum::<usize>() + branches.len().saturating_sub(1)
+        }
+        Node::Repeat(inner, RepeatKind::Star) => 2 + go_size(inner),
+        Node::Repeat(inner, _) => 1 + go_size(inner),
+        Node::Counted(_, size) => *size,
     }
 }
 
-/// The most nodes a written-out repetition may come to, as the reference refuses an
-/// expression too large.
-const MAX_SIZE: usize = 100_000;
+/// What Go's parser sizes `node{min,max}` at.
+fn counted_size(node: &Node, min: u32, max: Option<u32>) -> usize {
+    let sub = go_size(node);
+    let (min, max) = (min as usize, max.map(|m| m as usize));
+    match max {
+        None if min == 0 => 2 + sub,
+        None => 1 + min * sub,
+        Some(max) => max * sub + (max - min),
+    }
+    .max(1)
+}
 
 /// `node` repeated `min` times and up to `max` (no bound without it), written out as the
 /// plain repetitions the program knows.
-fn counted(node: Node, min: u32, max: Option<u32>) -> Result<Node, PatternError> {
-    let copies = max.unwrap_or(min).max(min) as usize + 1;
-    if size(&node).saturating_mul(copies) > MAX_SIZE {
-        return Err(PatternError::BadPattern);
-    }
+fn counted(node: Node, min: u32, max: Option<u32>, size: usize) -> Node {
     let mut out: Vec<Node> = (0..min).map(|_| node.clone()).collect();
     match max {
         None => out.push(Node::Repeat(Box::new(node), RepeatKind::Star)),
@@ -900,7 +925,7 @@ fn counted(node: Node, min: u32, max: Option<u32>) -> Result<Node, PatternError>
             out.extend(tail);
         }
     }
-    Ok(Node::Counted(out))
+    Node::Counted(out, size)
 }
 
 fn emit(nodes: &[Node], prog: &mut Vec<Inst>) {
@@ -908,7 +933,7 @@ fn emit(nodes: &[Node], prog: &mut Vec<Inst>) {
         match node {
             Node::Char(test) => prog.push(Inst::Char(test.clone())),
             Node::Assert(a) => prog.push(Inst::Assert(*a)),
-            Node::Group(inner) | Node::Counted(inner) => emit(inner, prog),
+            Node::Group(inner) | Node::Counted(inner, _) => emit(inner, prog),
             Node::Alt(branches) => {
                 // Split to this branch or the next; each ends with a jump past them all.
                 let mut jumps = Vec::new();
@@ -958,9 +983,21 @@ fn emit(nodes: &[Node], prog: &mut Vec<Inst>) {
 
 impl Regexp {
     pub fn new(source: &str) -> Result<Regexp, PatternError> {
+        Regexp::within(source, GO_MAX_SIZE)
+    }
+
+    fn within(source: &str, limit: usize) -> Result<Regexp, PatternError> {
         let chars: Vec<char> = source.chars().collect();
-        let mut parser = RegexpParser { s: &chars, pos: 0 };
+        let mut parser = RegexpParser {
+            s: &chars,
+            pos: 0,
+            written: 0,
+            limit,
+        };
         let nodes = parser.seq(false)?;
+        if nodes.iter().map(go_size).sum::<usize>() > limit {
+            return Err(PatternError::BadPattern);
+        }
         let mut prog = Vec::new();
         emit(&nodes, &mut prog);
         prog.push(Inst::Match);
@@ -1535,6 +1572,41 @@ mod tests {
         for bad in ["a{1001}*", "a{3,2}*", "a{2}{3}*"] {
             assert!(matches("a", &[bad]).is_err(), "{bad}");
         }
+        // A count with a leading zero is no count to Go: the brace is itself.
+        assert!(!matches("aa", &["a{02}*"]).unwrap());
+        assert!(matches("a{02}", &["a{02}*"]).unwrap());
+        assert!(!matches("a", &["a{1,02}*"]).unwrap());
+        assert!(matches("a{1,02}", &["a{1,02}*"]).unwrap());
+        assert!(matches("b", &["a{0}b*"]).unwrap());
+        assert!(matches("ab", &["a{0,}b*"]).unwrap());
+    }
+
+    #[test]
+    fn an_expression_too_large_for_go_is_refused() {
+        assert_eq!(GO_MAX_SIZE, 3_355_443);
+        // a{1000} is 1000 to Go's parser, a{2,5} 5 * 1 + 3, a* 2 + 1.
+        let mut parser = RegexpParser {
+            s: &[],
+            pos: 0,
+            written: 0,
+            limit: usize::MAX,
+        };
+        assert_eq!(
+            counted_size(&Node::Char(CharTest::Lit('a')), 1000, Some(1000)),
+            1000
+        );
+        assert_eq!(counted_size(&Node::Char(CharTest::Lit('a')), 2, Some(5)), 8);
+        assert_eq!(counted_size(&Node::Char(CharTest::Lit('a')), 0, None), 3);
+        assert_eq!(counted_size(&Node::Char(CharTest::Lit('a')), 0, Some(0)), 1);
+        let source: Vec<char> = "^a{2}[^/]*$".chars().collect();
+        parser.s = &source;
+        let nodes = parser.seq(false).unwrap();
+        assert_eq!(nodes.iter().map(go_size).sum::<usize>(), 1 + 2 + 3 + 1);
+        // Past the limit, refused before what is past it is written out.
+        let ten = "a{1000}".repeat(10);
+        assert!(Regexp::within(&format!("^{ten}$"), 10_002).is_ok());
+        assert!(Regexp::within(&format!("^{ten}$"), 10_001).is_err());
+        assert!(Regexp::within(&format!("^{ten}a{{1000}}$"), 10_500).is_err());
     }
 
     #[test]

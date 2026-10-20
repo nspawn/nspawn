@@ -272,11 +272,18 @@ impl Assembler<'_> {
                 }
                 let unit_file = fs::remove_file(Path::new(UNIT_DIR).join(&unit)).is_ok();
                 // An upper layer that cannot go is an error, not an orphan to leave behind.
-                let private = remove_dir_if_exists(&self.store.machines_private_dir().join(name))?;
+                // Trees of any size go off the runtime's workers.
+                let private = tokio::task::block_in_place(|| {
+                    remove_dir_if_exists(&self.store.machines_private_dir().join(name))
+                })?;
                 remove_dir_if_exists(&mountpoint)? || unit_file || private
             }
-            BackendChoice::Flat => remove_dir_if_exists(&self.machine_dir(name))?,
-            BackendChoice::Mstack => remove_dir_if_exists(&self.mstack_dir(name))?,
+            BackendChoice::Flat => {
+                tokio::task::block_in_place(|| remove_dir_if_exists(&self.machine_dir(name)))?
+            }
+            BackendChoice::Mstack => {
+                tokio::task::block_in_place(|| remove_dir_if_exists(&self.mstack_dir(name)))?
+            }
             BackendChoice::Auto => bail!("image record for {name} has no concrete backend"),
         };
         // Every backend gets the unit hooks, overlay also a mount dependency.
@@ -310,8 +317,14 @@ impl Assembler<'_> {
             // The mount point of an overlay is empty once unmounted.
             found |= fs::remove_dir(&mountpoint).is_ok();
         }
-        found |= remove_dir_if_exists(&self.store.machines_private_dir().join(name))?;
-        found |= remove_dir_if_exists(&self.mstack_dir(name))?;
+        // Writable layers of any size go off the runtime's workers.
+        let private = self.store.machines_private_dir().join(name);
+        found |= tokio::task::block_in_place(|| remove_dir_if_exists(&private))?;
+        // NAME.mstack only as nspawn writes one; any other is machined's to remove.
+        let mstack = self.mstack_dir(name);
+        if mstack_is_ours(&mstack, self.store) {
+            found |= tokio::task::block_in_place(|| remove_dir_if_exists(&mstack))?;
+        }
         found |= remove_dropins(name);
         self.sd.reload().await?;
         let settings = crate::settings::path(name);
@@ -609,6 +622,11 @@ pub const DROPINS: [&str; 2] = ["nspawn-overlay.conf", "nspawn-hooks.conf"];
 /// Removes nspawn's own drop-ins, and the directory when nothing else is left in it, so
 /// that an administrator's drop-ins survive. Whether there was one to remove.
 pub fn remove_dropins(name: &str) -> bool {
+    // What a start set at run time (the device rules of CDI nodes made again) goes too.
+    let control =
+        Path::new("/run/systemd/system.control").join(format!("systemd-nspawn@{name}.service.d"));
+    let _ = fs::remove_file(control.join("50-DeviceAllow.conf"));
+    let _ = fs::remove_dir(&control);
     remove_dropins_in(&dropin_dir(name))
 }
 
@@ -623,7 +641,7 @@ fn remove_dropins_in(dir: &Path) -> bool {
 
 /// Whether the directory was there to remove.
 fn remove_dir_if_exists(path: &Path) -> Result<bool> {
-    match fs::remove_dir_all(path) {
+    match crate::store::remove_tree(path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
@@ -685,7 +703,7 @@ fn once_each(layer_dirs: &[PathBuf]) -> Vec<&Path> {
 /// Writes a systemd.mstack(7) directory: layer@N symlinks to the shared layers plus rw/.
 pub fn write_mstack(dir: &Path, layer_dirs: &[PathBuf]) -> Result<()> {
     if dir.exists() {
-        fs::remove_dir_all(dir).with_context(|| format!("removing {}", dir.display()))?;
+        crate::store::remove_tree(dir).with_context(|| format!("removing {}", dir.display()))?;
     }
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     for (i, layer) in once_each(layer_dirs).iter().enumerate() {
@@ -706,6 +724,31 @@ pub fn write_mstack(dir: &Path, layer_dirs: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// Whether an mstack directory is one write_mstack made: `rw` and `layer@N` links into the
+/// store's layers, nothing else.
+fn mstack_is_ours(dir: &Path, store: &Store) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    let layers = [
+        store.layers_dir(Ownership::Root),
+        store.layers_dir(Ownership::Foreign),
+    ];
+    entries.flatten().all(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let kind = entry.file_type().ok();
+        if name == "rw" {
+            return kind.is_some_and(|k| k.is_dir());
+        }
+        name.strip_prefix("layer@")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            && kind.is_some_and(|k| k.is_symlink())
+            && fs::read_link(entry.path())
+                .is_ok_and(|target| layers.iter().any(|l| target.starts_with(l)))
+    })
+}
+
 pub fn is_mountpoint(path: &Path) -> Result<bool> {
     let mounts = fs::read_to_string("/proc/self/mounts").context("reading /proc/self/mounts")?;
     let wanted = path.to_string_lossy().replace(' ', "\\040");
@@ -716,6 +759,27 @@ pub fn is_mountpoint(path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_mstack_nspawn_wrote_is_nspawn_s() {
+        use super::*;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let layer = store.layers_dir(Ownership::Foreign).join("sha256-a");
+        fs::create_dir_all(&layer).unwrap();
+        let ours = tmp.path().join("web.mstack");
+        write_mstack(&ours, &[layer]).unwrap();
+        assert!(mstack_is_ours(&ours, &store));
+        // An administrator's: a layer of its own, or anything beside the layers and rw.
+        let theirs = tmp.path().join("base.mstack");
+        let elsewhere = tmp.path().join("their-layer");
+        fs::create_dir_all(&elsewhere).unwrap();
+        write_mstack(&theirs, &[elsewhere]).unwrap();
+        assert!(!mstack_is_ours(&theirs, &store));
+        fs::write(ours.join("notes"), "x").unwrap();
+        assert!(!mstack_is_ours(&ours, &store));
+        assert!(!mstack_is_ours(&tmp.path().join("none.mstack"), &store));
+    }
+
     #[test]
     fn removals_say_whether_anything_was_there() {
         let tmp = tempfile::tempdir().unwrap();

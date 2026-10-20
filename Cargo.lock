@@ -1569,6 +1569,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "unicode-segmentation",
  "xattr",
  "zbus",
  "zbus_systemd",

@@ -203,7 +203,7 @@ pub fn from_model(
     Ok(project)
 }
 
-fn profiles_of(service: &Value) -> Vec<String> {
+pub(super) fn profiles_of(service: &Value) -> Vec<String> {
     service
         .get(&["profiles"])
         .and_then(Value::as_seq)
@@ -214,6 +214,18 @@ fn profiles_of(service: &Value) -> Vec<String> {
 fn has_profile(service: &Value, active: &[String]) -> bool {
     let declared = profiles_of(service);
     declared.is_empty() || active.iter().any(|p| p == "*" || declared.contains(p))
+}
+
+fn manual_off(job: &Value) -> bool {
+    job.get(&["triggers", "manual"]) == Some(&Value::Bool(false))
+}
+
+/// jobAsService: a job is a service but for its triggers.
+fn as_service(mut job: Value) -> Value {
+    if let Some(map) = job.as_map_mut() {
+        map.remove("triggers");
+    }
+    job
 }
 
 impl Project {
@@ -240,6 +252,59 @@ impl Project {
         }
         self.profiles = profiles.to_vec();
         self
+    }
+
+    /// materializeManualJob: the job `name` run as a one-off service, with the jobs it
+    /// depends on, each refused when declared manual: false.
+    pub fn materialize_job(&mut self, name: &str) -> Result<(), String> {
+        if self.services.contains_key(name) {
+            return Ok(());
+        }
+        let job = self
+            .jobs
+            .remove(name)
+            .or_else(|| self.disabled_jobs.remove(name))
+            .ok_or_else(|| format!("no such service: {name}"))?;
+        if manual_off(&job) {
+            return Err(format!(
+                "job {name:?} is declared with manual: false, it cannot be run manually"
+            ));
+        }
+        let mut seen = BTreeSet::from([name.to_string()]);
+        self.materialize_closure(&job, &mut seen)?;
+        self.services.insert(name.to_string(), as_service(job));
+        Ok(())
+    }
+
+    /// materializeJobClosure: the jobs a job depends on, and theirs, made services.
+    fn materialize_closure(
+        &mut self,
+        job: &Value,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<(), String> {
+        for (dep, _) in Self::depends_on(job) {
+            if !seen.insert(dep.clone()) {
+                continue;
+            }
+            let Some(dep_job) = self
+                .jobs
+                .get(&dep)
+                .or_else(|| self.disabled_jobs.get(&dep))
+                .cloned()
+            else {
+                continue;
+            };
+            if manual_off(&dep_job) {
+                return Err(format!(
+                    "job {dep:?} is declared with manual: false, it cannot be triggered even as a dependency of another job"
+                ));
+            }
+            self.materialize_closure(&dep_job, seen)?;
+            self.jobs.remove(&dep);
+            self.disabled_jobs.remove(&dep);
+            self.services.insert(dep, as_service(dep_job));
+        }
+        Ok(())
     }
 
     pub fn with_services_enabled(self, names: &[String]) -> Project {
@@ -1074,7 +1139,18 @@ fn stat(path: &str, cwd: &str) -> std::io::Result<std::fs::Metadata> {
     if path.is_empty() {
         return Err(std::io::Error::from_raw_os_error(nix::libc::ENOENT));
     }
-    std::fs::metadata(paths::abs(path, cwd))
+    std::fs::metadata(at_cwd(path, cwd))
+}
+
+/// A path as Go's os.Open takes it from a process in `cwd`: an absolute one as it is
+/// written, its trailing slash and `..` for the kernel to read; a relative one under
+/// `cwd`.
+fn at_cwd(path: &str, cwd: &str) -> String {
+    if path.is_empty() || paths::is_abs(path) {
+        path.to_string()
+    } else {
+        format!("{cwd}/{path}")
+    }
 }
 
 /// loadMappingFile: an env or label file read in its format, compose-go's `.env` or
@@ -1089,8 +1165,8 @@ fn load_mapping_file(
 ) -> Result<(), String> {
     use std::io::Read;
     // A directory opens, and fails as it is read.
-    let mut file = std::fs::File::open(paths::abs(path, cwd))
-        .map_err(|e| gostr::path_error("open", path, &e))?;
+    let mut file =
+        std::fs::File::open(at_cwd(path, cwd)).map_err(|e| gostr::path_error("open", path, &e))?;
     let read = |file: &mut std::fs::File| {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)

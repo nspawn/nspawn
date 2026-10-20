@@ -2,7 +2,6 @@
 //! unit bound to the machine's, its verdict in /run/nspawn/health/NAME.json for ps and
 //! inspect, and a journal event on every change.
 
-use std::io::Read;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -193,16 +192,20 @@ impl Overrides {
         if !hc.disabled() {
             hc.argv()?;
         }
-        for (given, field) in [
-            (self.interval, &mut hc.interval),
-            (self.timeout, &mut hc.timeout),
-            (self.start_period, &mut hc.start_period),
-            (self.start_interval, &mut hc.start_interval),
+        for (given, field, name) in [
+            (self.interval, &mut hc.interval, "Interval"),
+            (self.timeout, &mut hc.timeout, "Timeout"),
+            (self.start_period, &mut hc.start_period, "StartPeriod"),
+            (self.start_interval, &mut hc.start_interval, "StartInterval"),
         ] {
             if let Some(value) = given {
-                // What the bus brings as microseconds is held to Go's range too.
+                // What the bus brings as microseconds is held to Go's range too, and to
+                // the least docker's daemon takes.
                 if value > (i64::MAX / 1000) as u64 {
                     bail!("a healthcheck duration of {value} microseconds is past Go's range");
+                }
+                if value != 0 && value < 1000 {
+                    bail!("{name} in Healthcheck cannot be less than 1ms");
                 }
                 *field = value;
             }
@@ -303,7 +306,7 @@ fn go_duration(usec: u64) -> String {
         return "0s".to_string();
     }
     if usec < 1000 {
-        return format!("{usec}us");
+        return format!("{usec}\u{b5}s");
     }
     if usec < 1_000_000 {
         return format!("{}{}ms", usec / 1000, fraction(usec % 1000, 3));
@@ -436,6 +439,13 @@ pub async fn stop_runner(sd: &Systemd, name: &str) -> Result<()> {
     sd.stop_unit(&unit_name(name)).await
 }
 
+/// Queues the stop of a machine's runner, for its release hook: a machine whose program
+/// ended on its own takes no stop job its runner would follow (Requisite= passes on
+/// stops, not ends).
+pub async fn stop_runner_soon(sd: &Systemd, name: &str) -> Result<()> {
+    sd.queue_stop(&unit_name(name)).await
+}
+
 /// `nspawn health-run NAME`, from the transient unit: probes the machine until it is
 /// gone.
 pub async fn run(ctx: &Context, name: &str) -> Result<()> {
@@ -453,6 +463,14 @@ pub async fn run(ctx: &Context, name: &str) -> Result<()> {
     };
     let argv = hc.argv_in(&record.run.shell)?;
     let sd = ctx.sd().await?;
+    let unit = format!("systemd-nspawn@{name}.service");
+    // The run it probes: a later run of the machine, or a later machine of the name, has
+    // a runner of its own, and maybe another healthcheck or none.
+    let run = sd
+        .invocation_id(&unit)
+        .await
+        .ok()
+        .filter(|id| !id.is_empty());
     let started = Instant::now();
     let mut monitor = Monitor::new(hc.retries());
     write_status(name, &monitor.status)?;
@@ -474,8 +492,12 @@ pub async fn run(ctx: &Context, name: &str) -> Result<()> {
                 continue;
             }
         }
+        if let (Some(run), Ok(now)) = (&run, sd.invocation_id(&unit).await) {
+            if &now != run {
+                return Ok(());
+            }
+        }
         // A paused machine is not probed: nothing in it runs, and its verdict stays.
-        let unit = format!("systemd-nspawn@{name}.service");
         if sd.freezer_state(&unit).await.ok().as_deref() == Some("frozen") {
             continue;
         }
@@ -493,8 +515,8 @@ pub async fn run(ctx: &Context, name: &str) -> Result<()> {
             },
         };
         if let Some(status) = monitor.observe(probe, in_start_period) {
-            crate::api::events::emit(
-                "machine",
+            crate::api::events::emit_machine(
+                &ctx.store,
                 "health_status",
                 name,
                 &[("image", &record.reference), ("status", status)],
@@ -562,8 +584,10 @@ async fn probe(ctx: &Context, name: &str, argv: &[String], timeout: Duration) ->
         ..
     } = process;
     drop(stdin);
-    let out = tokio::task::spawn_blocking(move || read_capped(stdout));
-    let err = tokio::task::spawn_blocking(move || read_capped(stderr));
+    // Read by tasks that giving up on them ends, pipes closed with them: a blocking read
+    // would stay, and its thread, for as long as some child of the probe holds the pipe.
+    let out = tokio::spawn(read_capped(stdout));
+    let err = tokio::spawn(read_capped(stderr));
     let mut waited = tokio::task::spawn_blocking(move || nsenter::wait(helper));
     let exit_code = match tokio::time::timeout(timeout, &mut waited).await {
         Ok(joined) => joined.context("waiting for the probe")??,
@@ -603,15 +627,18 @@ async fn probe(ctx: &Context, name: &str, argv: &[String], timeout: Duration) ->
 
 /// The first OUTPUT_LIMIT bytes of a stream; the rest is read and dropped, so
 /// that a probe which says more never dies of SIGPIPE on a pipe closed early.
-fn read_capped(fd: Option<OwnedFd>) -> String {
+async fn read_capped(fd: Option<OwnedFd>) -> String {
+    use tokio::io::AsyncReadExt;
     let Some(fd) = fd else {
         return String::new();
     };
-    let mut file = std::fs::File::from(fd);
+    let Ok(mut pipe) = tokio::net::unix::pipe::Receiver::from_owned_fd(fd) else {
+        return String::new();
+    };
     let mut kept = Vec::new();
     let mut buf = [0u8; 8192];
     loop {
-        match file.read(&mut buf) {
+        match pipe.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
                 let room = OUTPUT_LIMIT.saturating_sub(kept.len());
@@ -630,6 +657,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn timings_under_a_millisecond_are_refused_as_docker_refuses_them() {
+        let given = |interval: u64| Overrides {
+            interval: Some(interval),
+            ..Overrides::default()
+        };
+        let e = given(500).apply(None).unwrap_err().to_string();
+        assert_eq!(e, "Interval in Healthcheck cannot be less than 1ms");
+        assert_eq!(given(1000).apply(None).unwrap().interval, 1000);
+        assert_eq!(given(0).apply(None).unwrap().interval, 0);
+    }
+
+    #[test]
     fn durations_past_go_s_range_are_refused() {
         assert!(parse_duration("6000000h").is_err());
         assert!(parse_duration("2000000h").is_ok());
@@ -643,6 +682,7 @@ mod tests {
         assert_eq!(go_duration(90_000_000), "1m30s");
         assert_eq!(go_duration(3_600_000_000), "1h0m0s");
         assert_eq!(go_duration(30_000_000), "30s");
+        assert_eq!(go_duration(500), "500\u{b5}s");
     }
 
     #[test]
@@ -773,10 +813,25 @@ mod tests {
         assert!(Overrides::default().is_empty() && !off.is_empty());
     }
 
-    #[test]
-    fn a_chatty_probe_is_drained_and_its_output_capped() {
+    #[tokio::test]
+    async fn giving_up_on_a_probe_s_output_closes_the_pipe() {
         use std::io::Write;
-        let (read, write) = nix::unistd::pipe().unwrap();
+        // A child of the probe that kept the pipe: the reader is let go of, and the
+        // pipe with it. Close-on-exec, as the probes' pipes are: a process another test
+        // starts meanwhile would hold the read end open.
+        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
+        let reader = tokio::spawn(read_capped(Some(read)));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        reader.abort();
+        assert!(reader.await.unwrap_err().is_cancelled());
+        let e = std::fs::File::from(write).write_all(b"x").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn a_chatty_probe_is_drained_and_its_output_capped() {
+        use std::io::Write;
+        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
         let writer = std::thread::spawn(move || {
             let mut pipe = std::fs::File::from(write);
             // Well past the pipe's buffer: a reader that stopped at the cap would leave
@@ -787,16 +842,16 @@ mod tests {
             }
             Ok::<(), std::io::Error>(())
         });
-        let output = read_capped(Some(read));
+        let output = read_capped(Some(read)).await;
         assert_eq!(output.len(), OUTPUT_LIMIT);
         writer
             .join()
             .unwrap()
             .expect("the probe's writes all went through");
-        let (read, write) = nix::unistd::pipe().unwrap();
+        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
         std::fs::File::from(write).write_all(b"ok\n").unwrap();
-        assert_eq!(read_capped(Some(read)), "ok\n");
-        assert_eq!(read_capped(None), "");
+        assert_eq!(read_capped(Some(read)).await, "ok\n");
+        assert_eq!(read_capped(None).await, "");
     }
 
     #[test]
