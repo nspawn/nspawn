@@ -131,7 +131,20 @@ pub async fn fetch(
         .chain(std::iter::once(&manifest.config))
         .map(|d| d.digest.clone())
         .collect();
-    let hold = store.hold_blobs(&digests)?;
+    // What is found present stays so: the collector cannot pass between the hold and
+    // the look.
+    let (hold, (wanted, present)) = {
+        let _still = crate::store::holds_still();
+        let hold = store.hold_blobs(&digests)?;
+        let found = missing_once(
+            manifest
+                .layers
+                .iter()
+                .chain(std::iter::once(&manifest.config)),
+            |digest| store.has_blob(digest),
+        );
+        (hold, found)
+    };
     let assembling = assembling.map_or(String::new(), |b| format!(", assembling as {b}"));
     line(
         report,
@@ -142,13 +155,6 @@ pub async fn fetch(
         ),
     );
 
-    let (wanted, present) = missing_once(
-        manifest
-            .layers
-            .iter()
-            .chain(std::iter::once(&manifest.config)),
-        |digest| store.has_blob(digest),
-    );
     for digest in present {
         line(
             report,
@@ -223,6 +229,9 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
     ensure_replaceable(store, sd, &name, request.force).await?;
     crate::install::stage_layers(store, backend, &fetched.manifest, request.mode, &name).await?;
     remove_existing(store, sd, &name, report).await?;
+    // An update that was deciding about the machine replaced has nothing left to decide:
+    // putting it back would take the new one away.
+    store.forget_rollback(&name)?;
     let signed = fetched.signed.as_ref();
     let mode = install(
         store,

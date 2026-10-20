@@ -47,12 +47,25 @@ pub(crate) async fn last_exit_code(
     store: &Store,
     record: &ImageRecord,
 ) -> Option<i32> {
+    // Only this machine's runs: the unit and its journal are those of every machine
+    // that had the name. A record of a release that did not keep the first start says
+    // nothing of it, and its runs are counted from its making.
+    let since = match record.started {
+        Some(started) => started,
+        None if store
+            .starts_kept_since()
+            .is_none_or(|kept| record.created < kept) =>
+        {
+            record.created
+        }
+        None => return None,
+    };
     let unit = format!("systemd-nspawn@{}.service", record.name);
     // The unit's own ExecMainCode= goes with it when it is unloaded; the journal keeps
     // what systemd logged when it reaped the process.
     let (code, status) = match sd.exec_main_exit(&unit).await {
         Ok(Some(exit)) => exit,
-        _ => crate::journal::last_main_exit(&unit).await?,
+        _ => crate::journal::last_main_exit(&unit, since).await?,
     };
     let ending = crate::api::run::Ending {
         code,
@@ -191,7 +204,8 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
             .unwrap_or("stopped")
             .to_string();
         if listed(all, &state) {
-            let exit_code = if state == "stopped" {
+            // Between two runs, the code of the run that ended, as docker shows it.
+            let exit_code = if state == "stopped" || state == "restarting" {
                 last_exit_code(sd, &ctx.store, r).await
             } else {
                 None
@@ -234,6 +248,13 @@ pub fn unit_word(state: &UnitState) -> &'static str {
 pub async fn unit_busy(sd: &Systemd, name: &str) -> Result<Option<String>> {
     let unit = format!("systemd-nspawn@{name}.service");
     let state = sd.unit_status(&unit).await?;
+    // Its release hook runs while it shuts down, reading the record and the files a
+    // removal or a replacement takes.
+    if state.shutting_down() {
+        return Ok(Some(format!(
+            "machine {name} is shutting down; wait for it or stop it first"
+        )));
+    }
     // A start held in systemd's queue behind the machines it depends on runs later
     // from what is loaded now, files gone or not.
     if !state.busy() && sd.unit_queued(&unit).await? {
@@ -433,6 +454,60 @@ pub enum Pass {
     Hook,
 }
 
+/// Writes a machine's unit drop-in from its record: what systemd reads when it starts the
+/// unit itself (machinectl, a dependent's Wants=, boot) before any hook rewrites it.
+pub async fn rewrite_hooks(ctx: &Context, sd: &Systemd, record: &ImageRecord) -> Result<()> {
+    let route =
+        settings::namespace_route(sd, &record.name, record.mode, bridge::namespaced(record))
+            .await?;
+    let app_argv =
+        settings::wrapped_argv(sd, &record.name, record.mode, &route, &record.tuning).await?;
+    let reload = settings::write_hooks(
+        &record.name,
+        &ctx.config,
+        &route,
+        app_argv.as_deref(),
+        &settings::HookSpec {
+            restart: record.restart,
+            limits: &record.limits,
+            remove_on_exit: record.remove_on_exit,
+            tuning: &record.tuning,
+            api_socket: record.takes_api_socket(),
+        },
+    )?;
+    if reload {
+        sd.reload().await?;
+    }
+    Ok(())
+}
+
+/// A path that both a volume and a tmpfs take: one would hide the other, which one
+/// depending on how systemd-nspawn orders them. docker refuses it as this does.
+fn duplicate_mount_points(record: &ImageRecord) -> Result<()> {
+    let clean = |path: &str| path.trim_end_matches('/').to_string();
+    let volumes: std::collections::HashSet<String> =
+        record.volumes.iter().map(|v| clean(&v.target)).collect();
+    for mount in &record.tuning.tmpfs {
+        let target = clean(mount.split_once(':').map_or(mount.as_str(), |(p, _)| p));
+        if volumes.contains(&target) {
+            bail!("Duplicate mount point: {target}");
+        }
+    }
+    Ok(())
+}
+
+/// Whether a volume is filled from the image: a named one made now, or one `volume create`
+/// or compose made ahead and still empty when a new machine first takes it, as docker
+/// fills a volume.
+fn seeds(
+    volume: &crate::volume::Volume,
+    made: bool,
+    first_start: bool,
+    empty: impl FnOnce() -> bool,
+) -> bool {
+    !volume.source.starts_with('/') && (made || (first_start && empty()))
+}
+
 /// Everything a machine needs before its unit starts. Shared by `start` and the
 /// ExecStartPre hook, so idempotent; the caller holds the store lock.
 pub async fn prepare(
@@ -449,8 +524,18 @@ pub async fn prepare(
         hostnet::ensure_networkd(sd, report).await?;
         return Ok(Network::Veth);
     };
+    // A start systemd makes (a dependent's Wants=, machinectl) while an update swaps the
+    // machine's image would run it from a half-made record.
+    if pass == Pass::Hook && store.rollback_dir(name).exists() {
+        use crate::api::recreate::Phase;
+        let phase = crate::api::recreate::progress(store, name).phase;
+        if matches!(phase, Phase::Saved | Phase::Aside | Phase::Restoring) {
+            bail!("{name} is being updated; it starts once the update is done");
+        }
+    }
     // From its first start on it is a machine, not an image only.
-    if record.started.is_none() {
+    let first_start = record.started.is_none();
+    if first_start {
         record.started = Some(now_unix());
     }
     // A new run: the marks `kill` and `stop` left for the last one go.
@@ -585,6 +670,7 @@ pub async fn prepare(
         bail!("{name} mounts docker's socket, which nspawn's Docker API cannot reach into an mstack machine yet; make it with --backend overlay");
     }
     let mut binds = Vec::new();
+    duplicate_mount_points(&record)?;
     for volume in &record.volumes {
         if volume.is_api_socket() {
             let socket = crate::dockerapi::socket_path(name);
@@ -611,7 +697,9 @@ pub async fn prepare(
             }
             // In a user namespace the socket is bound idmapped, which a tmpfs such as
             // /run takes from Linux 6.3 on.
-            let private_users = !(record.mode == Mode::App && record.network == Network::Bridge);
+            // As the settings file has it: only an app on a bridge runs without a user
+            // namespace; --network none and a shared network have one.
+            let private_users = !(record.mode == Mode::App && bridge::bridge_kind(&record));
             if private_users && !kernel_at_least(6, 3) {
                 bail!(
                     "{name} runs in a user namespace, where the Docker API socket is bound idmapped, which needs Linux 6.3 or later; run it as an app on a bridge network, or on a newer kernel"
@@ -625,7 +713,8 @@ pub async fn prepare(
             continue;
         }
         let source = volume.host_path(&store.volumes_dir());
-        if !source.exists() {
+        let made = !source.exists();
+        if made {
             if volume.source.starts_with('/') {
                 bail!(
                     "volume {volume}: {} does not exist on the host",
@@ -634,19 +723,36 @@ pub async fn prepare(
             }
             std::fs::create_dir_all(&source)
                 .with_context(|| format!("creating volume {}", source.display()))?;
+        }
+        let empty = || std::fs::read_dir(&source).is_ok_and(|mut d| d.next().is_none());
+        if seeds(volume, made, first_start, empty) {
             // What the image has there, owner included: from its layers, which earlier
             // runs have not touched, merged as the image shows them, or from the tree
             // itself where there are no layers.
             let target = volume.target.trim_start_matches('/');
             let layers = crate::backend::layer_dirs(store, &record.layers, record.backend);
-            if !layers.is_empty() {
-                crate::volume::seed_from_layers(&layers, target, &source)?;
+            let seeded = if !layers.is_empty() {
+                crate::volume::seed_from_layers(&layers, target, &source).map(|_| ())
             } else if let Some(path) = (record.backend == BackendChoice::Flat)
                 .then(|| crate::backend::root_path(store, name, record.backend, target))
                 .flatten()
             {
-                crate::volume::seed(&path, &source)?;
+                crate::volume::seed(&path, &source)
+            } else {
+                Ok(())
+            };
+            // A seed cut short is taken back, so that the next start seeds it whole
+            // instead of finding a volume that is there.
+            if let Err(e) = seeded {
+                if made {
+                    let _ = std::fs::remove_dir_all(&source);
+                } else {
+                    crate::volume::empty(&source);
+                }
+                return Err(e).with_context(|| format!("filling volume {volume}"));
             }
+        }
+        if made {
             crate::api::events::emit(
                 "volume",
                 "create",
@@ -730,6 +836,11 @@ pub async fn prepare(
         binds.extend(crate::getent::shim(store, name, &record)?);
         crate::backend::ensure_usr(store, name, record.backend)?;
     }
+    if record.tuning.read_only && record.backend == BackendChoice::Mstack {
+        // Its mount points would be made in the writable layer over the image's own
+        // entries, owned by an id the machine does not map.
+        bail!("{name} is an mstack machine, which cannot run read-only yet; start it with --read-only=false");
+    }
     if record.tuning.read_only {
         // systemd-nspawn makes mount points as it goes, which a read-only root refuses.
         let mut points: Vec<(String, bool)> = tuning
@@ -801,7 +912,7 @@ pub async fn prepare(
         &route,
     )?;
     let app_argv = settings::wrapped_argv(sd, name, record.mode, &route, &record.tuning).await?;
-    if settings::write_hooks(
+    let changed = settings::write_hooks(
         name,
         config,
         &route,
@@ -813,7 +924,16 @@ pub async fn prepare(
             tuning: &tuning,
             api_socket: record.takes_api_socket(),
         },
-    )? {
+    )?;
+    // A reload that failed after an earlier write left the unit on its old drop-in,
+    // which systemd says; before the start, not from inside it.
+    let stale = !changed
+        && pass == Pass::Ahead
+        && sd
+            .needs_reload(&format!("systemd-nspawn@{name}.service"))
+            .await
+            .unwrap_or(false);
+    if changed || stale {
         sd.reload().await?;
     }
     if record.backend == BackendChoice::Mstack {
@@ -956,8 +1076,14 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     if sd.machine_exists(&args.name).await? {
         bail!("machine {} is already running", args.name);
     }
+    // systemd may have begun it meanwhile (machinectl start, the Wants= of a machine
+    // that depends on it): its own hooks prepare it, and this pass would tear that down.
+    if sd.unit_status(&unit).await?.busy() || sd.unit_queued(&unit).await? {
+        bail!("machine {} is starting already", args.name);
+    }
     let _starting = store.mark_starting(&args.name)?;
     let mut record = store.load_image(&args.name)?;
+    let before = record.clone();
     let previous_policy = record.as_ref().map(|r| r.restart).unwrap_or_default();
     match record.as_mut() {
         Some(r) => {
@@ -1008,7 +1134,22 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
         .as_ref()
         .map(|r| r.tuning.depends_on.clone())
         .unwrap_or_default();
-    let network = prepare(sd, store, config, &args.name, record, Pass::Ahead, report).await?;
+    let network = match prepare(sd, store, config, &args.name, record, Pass::Ahead, report).await {
+        Ok(network) => network,
+        Err(e) => {
+            // Nothing runs, under the lock and the start mark: what the pass made for a
+            // run that never came goes (its namespace and veths, decrypted secrets), by
+            // the record it made them from.
+            let prepared = store.load_image(&args.name).ok().flatten();
+            let _ = release_machine(&args.name, prepared.as_ref().or(before.as_ref()));
+            // prepare writes the record with the start's flags before all of its checks:
+            // a start refused keeps what the machine had, its restart policy among them.
+            if let Some(before) = &before {
+                let _ = store.record_image(before);
+            }
+            return Err(e);
+        }
+    };
     // Read with the records under the lock, prepare's included.
     let patient = crate::api::dependencies::waits(&store.list_images()?, &args.name);
     // The unit's own hooks take the lock; it must be free while the unit starts.
@@ -1519,7 +1660,7 @@ pub fn latch(restart: Restart, force: bool, mode: Option<Mode>) -> Latch {
 /// For a machine machined does not list: nspawn's leaves files and a network behind, and
 /// anybody's unit may be restarting.
 fn stoppable_when_gone(recorded: bool, unit: &UnitState) -> bool {
-    recorded || unit.busy()
+    recorded || unit.busy() || unit.shutting_down()
 }
 
 /// After SIGKILL the stop job goes in for the latch, and whenever the kill failed, since
@@ -1536,6 +1677,15 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
     let record = store.load_image(&args.name)?;
     let unit = format!("systemd-nspawn@{}.service", args.name);
     let policy = record.as_ref().map(|r| r.restart).unwrap_or_default();
+    // A start nspawn is preparing is refused before anything about the machine changes.
+    if !sd.machine_exists(&args.name).await? && store.is_starting(&args.name) {
+        let records = store.list_images().unwrap_or_default();
+        let waiting = crate::api::dependencies::waits(&records, &args.name)
+            && (sd.unit_status(&unit).await?.busy() || sd.unit_queued(&unit).await?);
+        if !waiting {
+            bail!("machine {} is starting; stop it once it runs", args.name);
+        }
+    }
     // A paused machine cannot act on a signal.
     let _ = sd.thaw_unit(&unit).await;
     // unless-stopped: stopped by hand means not at boot either, until the next start.
@@ -1562,8 +1712,13 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
             bail!("machine {} is not running", args.name);
         }
         sd.stop_unit_job(&unit).await?.wait().await?;
-        hostnet::release_machine(sd, &args.name).await;
-        release_machine(&args.name, record.as_ref())?;
+        {
+            let _lock = store.lock().await?;
+            if still_down(sd, store, &args.name, &unit).await? {
+                hostnet::release_machine(sd, &args.name).await;
+                release_machine(&args.name, record.as_ref())?;
+            }
+        }
         sd.reset_failed(&unit).await?;
         // A start held in systemd's queue was going to run it: it stopped.
         return Ok(if state.busy() || queued {
@@ -1599,21 +1754,26 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         match mode {
             // The image's stop signal, then SIGKILL after the timeout.
             Some(Mode::App) => {
-                let signal = record
-                    .as_ref()
-                    .and_then(|r| r.effective_stop_signal().map(str::to_string))
-                    .unwrap_or_else(|| "SIGTERM".to_string());
+                // One nspawn cannot read is SIGTERM, as the settings make it.
+                let number = stop_signals(record.as_ref())?
+                    .first()
+                    .copied()
+                    .unwrap_or(libc::SIGTERM);
+                let signal =
+                    signal_name(&number.to_string()).unwrap_or_else(|_| number.to_string());
                 let timeout = args
                     .timeout
                     .or_else(|| record.as_ref().and_then(|r| r.tuning.stop_timeout))
                     .unwrap_or(10);
                 let pid1 = record.as_ref().is_some_and(ImageRecord::program_is_pid1);
                 let (leader, payload) = wait_for_payload(sd, &args.name, pid1).await?;
-                store.mark_signal(&args.name, signal_number(&signal)?)?;
+                store.mark_signal(&args.name, number)?;
                 match payload {
                     Some(payload) => {
-                        if let Err(e) = send_signal(payload, signal_number(&signal)?) {
-                            note(report, format!("note: could not send {signal} to PID {payload} of {}: {e}", args.name));
+                        if let Err(e) =
+                            signal_payload(sd, &args.name, leader, payload, pid1, number).await
+                        {
+                            note(report, format!("note: could not send {signal} to PID {payload} of {}: {e:#}", args.name));
                         }
                     }
                     None => note(
@@ -1629,9 +1789,9 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
                 }
                 if args.wait {
                     let gone = wait_gone(sd, &args.name, Duration::from_secs(timeout)).await?;
-                    if latch == Latch::AfterSignal {
-                        job = Some(sd.stop_unit_job(&unit).await?);
-                    }
+                    // SIGKILL first, as --force sends it: a stop job queued before would
+                    // have the stub init signal everything meanwhile. The job then
+                    // cancels the restart that the policy schedules after the kill.
                     if !gone {
                         note(
                             report,
@@ -1641,7 +1801,16 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
                             ),
                         );
                         store.mark_signal(&args.name, libc::SIGKILL)?;
-                        sd.kill_machine(&args.name, "all", libc::SIGKILL).await?;
+                        // It may have ended meanwhile; the stop job sees it go either way.
+                        if let Err(e) = sd.kill_machine(&args.name, "all", libc::SIGKILL).await {
+                            note(
+                                report,
+                                format!("note: {e:#}; waiting for {} to go", args.name),
+                            );
+                        }
+                    }
+                    if latch == Latch::AfterSignal {
+                        job = Some(sd.stop_unit_job(&unit).await?);
                     }
                 }
             }
@@ -1681,11 +1850,24 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
             None => sd.stop_unit(&unit).await?,
         }
         sd.reset_failed(&unit).await?;
-        hostnet::release_machine(sd, &args.name).await;
         let _lock = store.lock().await?;
-        release_machine(&args.name, record.as_ref())?;
+        // The unit's own release ran; this one only finishes what it left, unless a new
+        // run began meanwhile, whose network and secrets are its own.
+        if still_down(sd, store, &args.name, &unit).await? {
+            hostnet::release_machine(sd, &args.name).await;
+            release_machine(&args.name, record.as_ref())?;
+        }
     }
     Ok(StopOutcome::Stopped)
+}
+
+/// Whether a machine stopped is still down: not registered, no start preparing it, and
+/// its unit neither running nor about to.
+async fn still_down(sd: &Systemd, store: &Store, name: &str, unit: &str) -> Result<bool> {
+    Ok(!sd.machine_exists(name).await?
+        && !store.is_starting(name)
+        && !sd.unit_status(unit).await?.busy()
+        && !sd.unit_queued(unit).await?)
 }
 
 /// An app's program, which signals go to, never the whole cgroup: the stub init reboots
@@ -1760,7 +1942,8 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
     let record = ctx.store.load_image(&args.name)?;
     let mode = record.as_ref().map(|r| r.mode);
     let policy = record.as_ref().map(|r| r.restart).unwrap_or_default();
-    if policy != Restart::No && stop_signals(record.as_ref())?.contains(&signal) {
+    let stops = exits_on(record.as_ref(), signal)?;
+    if policy != Restart::No && stops {
         ctx.store.mark_exit_on_next(&args.name)?;
     }
     // Only nspawn's machines have a place for marks.
@@ -1777,9 +1960,11 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
                     args.name
                 )
             })?;
-            send_signal(payload, signal).with_context(|| {
-                format!("sending {} to PID {payload} of {}", args.signal, args.name)
-            })
+            signal_payload(sd, &args.name, leader, payload, pid1, signal)
+                .await
+                .with_context(|| {
+                    format!("sending {} to PID {payload} of {}", args.signal, args.name)
+                })
         } else {
             sd.kill_machine(&args.name, "leader", signal).await
         }
@@ -1793,6 +1978,12 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
             ctx.store.forget_signal(&args.name)?;
         }
         return Err(e);
+    }
+    // A paused machine acts on a signal that stops it, as docker unpauses it then.
+    if stops {
+        let _ = sd
+            .thaw_unit(&format!("systemd-nspawn@{}.service", args.name))
+            .await;
     }
     let image = record.as_ref().map(|r| r.reference.as_str()).unwrap_or("");
     crate::api::events::emit(
@@ -1912,7 +2103,11 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
         },
     )?;
     let running = state.active == "active";
-    let changed = if record.restart.enabled_at_boot() {
+    // An unless-stopped machine stopped by hand stays off the boot list until its next
+    // start, whatever else changes; a policy given now puts it back.
+    let stopped_by_hand =
+        record.restart == Restart::UnlessStopped && !running && args.restart.is_none();
+    let changed = if record.restart.enabled_at_boot() && !stopped_by_hand {
         sd.enable_unit(&unit).await?
     } else if args.restart.is_some() && previous_policy.enabled_at_boot() {
         sd.disable_unit(&unit).await?
@@ -1926,10 +2121,7 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     if running && !args.health.is_empty() {
         crate::health::stop_runner(sd, &args.name).await?;
         crate::health::clear_status(&args.name);
-        if record
-            .effective_healthcheck()
-            .is_some_and(|h| !h.disabled())
-        {
+        if record.effective_healthcheck().is_some_and(|h| h.active()) {
             crate::health::start_runner(ctx, &args.name).await?;
         }
     }
@@ -1944,11 +2136,19 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
 
 /// An app's stop signal (SIGTERM unless its image names one), or a booted init's halt and
 /// poweroff requests.
+/// Whether a signal ends the machine's restarts: SIGKILL and its stop signal (SIGTERM
+/// for an app that names none), not one its program may handle.
+fn exits_on(record: Option<&ImageRecord>, signal: i32) -> Result<bool> {
+    Ok(signal == libc::SIGKILL || stop_signals(record)?.contains(&signal))
+}
+
 fn stop_signals(record: Option<&ImageRecord>) -> Result<Vec<i32>> {
     match record {
-        Some(r) if r.mode == Mode::App => Ok(vec![signal_number(
-            r.effective_stop_signal().unwrap_or("SIGTERM"),
-        )?]),
+        // An image's stop signal nspawn cannot read is SIGTERM, as its settings make it.
+        Some(r) if r.mode == Mode::App => Ok(vec![r
+            .effective_stop_signal()
+            .and_then(|s| signal_number(s).ok())
+            .unwrap_or(libc::SIGTERM)]),
         _ => Ok(vec![libc::SIGRTMIN() + 3, libc::SIGRTMIN() + 4]),
     }
 }
@@ -2057,13 +2257,19 @@ pub fn signal_number(name: &str) -> Result<i32> {
                     .parse()
                     .map_err(|_| anyhow::anyhow!("unknown signal {name}"))?,
             };
-            let number = value + offset;
-            if number < libc::SIGRTMIN() || number > libc::SIGRTMAX() {
-                bail!("signal {name} is outside the realtime range");
-            }
-            return Ok(number);
+            return match value.checked_add(offset) {
+                Some(n) if (libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&n) => Ok(n),
+                _ => bail!("signal {name} is outside the realtime range"),
+            };
         }
     }
+    // The other names docker's signal map has for the same signals.
+    let full = match full.as_str() {
+        "SIGIOT" => "SIGABRT".to_string(),
+        "SIGCLD" => "SIGCHLD".to_string(),
+        "SIGPOLL" => "SIGIO".to_string(),
+        _ => full,
+    };
     let signal: nix::sys::signal::Signal = full
         .parse()
         .map_err(|_| anyhow::anyhow!("unknown signal {name}"))?;
@@ -2090,8 +2296,39 @@ pub async fn signal_program(sd: &Systemd, name: &str, pid1: bool, signal: i32) -
     let payload = payload.with_context(|| {
         format!("{name} has no program running under its init (leader PID {leader})")
     })?;
-    send_signal(payload, signal)
+    signal_payload(sd, name, leader, payload, pid1, signal)
+        .await
         .with_context(|| format!("sending signal {signal} to PID {payload} of {name}"))
+}
+
+/// Signals an app's program through a pidfd taken before its parentage is checked: the
+/// PID read a moment ago may belong to another process by now, a pidfd follows the one
+/// process it names.
+async fn signal_payload(
+    sd: &Systemd,
+    name: &str,
+    leader: u32,
+    payload: i32,
+    pid1: bool,
+    signal: i32,
+) -> Result<()> {
+    let fd = crate::nsenter::pidfd_open(nix::unistd::Pid::from_raw(payload))
+        .map_err(|e| anyhow::anyhow!("PID {payload}: {}", e.desc()))?;
+    let ours = if pid1 {
+        u32::try_from(payload).ok() == Some(leader)
+    } else {
+        parent_of(payload) == Some(leader)
+    };
+    if !ours || sd.machine_leader(name).await? != leader {
+        bail!("the program of {name} changed while it was signalled; try again");
+    }
+    crate::nsenter::pidfd_signal(&fd, signal).map_err(|e| anyhow::anyhow!("{}", e.desc()))
+}
+
+/// The parent of a process, from /proc.
+fn parent_of(pid: i32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat_ppid_and_start(&stat).map(|(ppid, _)| ppid)
 }
 
 /// The process of an app's program: the leader when it runs as PID 1, the stub init's
@@ -2175,8 +2412,10 @@ fn stat_ppid_and_start(stat: &str) -> Option<(u32, u64)> {
 }
 
 /// kill(2) with a raw number: nix's Signal has no realtime signals, which images use.
+#[cfg(test)]
 fn send_signal(pid: i32, signal: i32) -> nix::Result<()> {
-    nix::errno::Errno::result(unsafe { libc::kill(pid, signal) }).map(drop)
+    let fd = crate::nsenter::pidfd_open(nix::unistd::Pid::from_raw(pid))?;
+    crate::nsenter::pidfd_signal(&fd, signal)
 }
 
 /// Starts a command inside a machine without waiting for it. `extra_env` comes after the
@@ -2195,6 +2434,11 @@ pub async fn spawn_in_namespaces(
     refuse_foreign(sd, machine).await?;
     if !sd.machine_exists(machine).await? {
         bail!("machine {machine} is not running");
+    }
+    // A process cannot join a frozen cgroup and run: it would wait for the thaw.
+    let unit = format!("systemd-nspawn@{machine}.service");
+    if sd.freezer_state(&unit).await.ok().as_deref() == Some("frozen") {
+        bail!("machine {machine} is paused; unpause it before running a command in it");
     }
     let record = ctx.store.load_image(machine)?;
     let record = record.as_ref();
@@ -2290,7 +2534,19 @@ pub struct LogsRequest {
 /// is read as it is.
 pub async fn prepare_logs(ctx: &Context, request: &mut LogsRequest) -> Result<()> {
     let Some(record) = ctx.store.load_image(&request.machine)? else {
-        return Ok(());
+        // A machine nspawn keeps no record of has logs while machined has it, running
+        // or as an image; a name nothing has, removed machines of it included, has none.
+        let sd = ctx.sd().await?;
+        if sd.machine_exists(&request.machine).await?
+            || sd
+                .list_images()
+                .await?
+                .iter()
+                .any(|i| i.name == request.machine)
+        {
+            return Ok(());
+        }
+        bail!("no machine named {}", request.machine);
     };
     check_logs_kept(&record, request.inside)?;
     if let Some(namespace) = record.tuning.journal_namespace() {
@@ -2405,6 +2661,8 @@ pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
         }
     }
     match (args.lines, args.follow) {
+        // journalctl reads the count into an int and refuses more.
+        (Some(n), _) if n > i32::MAX as u32 => argv.push("--lines=all".to_string()),
         (Some(n), _) => argv.push(format!("--lines={n}")),
         (None, true) => argv.push(format!("--lines={FOLLOW_TAIL}")),
         (None, false) => {}
@@ -2424,6 +2682,44 @@ pub fn journalctl_arguments(args: &LogsRequest) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_takes_one_mount() {
+        let record = |volumes: serde_json::Value, tmpfs: serde_json::Value| -> ImageRecord {
+            serde_json::from_value(serde_json::json!({
+                "name": "db", "reference": "r", "manifest_digest": "sha256:a", "layers": [],
+                "backend": "overlay", "created": 1,
+                "volumes": volumes, "tuning": { "tmpfs": tmpfs },
+            }))
+            .unwrap()
+        };
+        let both = record(
+            serde_json::json!([{ "source": "pgdata", "target": "/var/lib/pg" }]),
+            serde_json::json!(["/var/lib/pg/:size=1m"]),
+        );
+        assert_eq!(
+            duplicate_mount_points(&both).unwrap_err().to_string(),
+            "Duplicate mount point: /var/lib/pg"
+        );
+        let apart = record(
+            serde_json::json!([{ "source": "pgdata", "target": "/var/lib/pg" }]),
+            serde_json::json!(["/tmp"]),
+        );
+        assert!(duplicate_mount_points(&apart).is_ok());
+    }
+
+    #[test]
+    fn volumes_are_seeded_as_docker_seeds_them() {
+        let named: crate::volume::Volume = "data:/var/lib/app".parse().unwrap();
+        let host: crate::volume::Volume = "/srv/data:/var/lib/app".parse().unwrap();
+        assert!(seeds(&named, true, false, || false));
+        // Made ahead by volume create or compose up: filled while still empty, by a new
+        // machine only.
+        assert!(seeds(&named, false, true, || true));
+        assert!(!seeds(&named, false, true, || false));
+        assert!(!seeds(&named, false, false, || true));
+        assert!(!seeds(&host, false, true, || true));
+    }
 
     #[test]
     fn kernel_releases_compare_by_major_and_minor() {
@@ -2546,6 +2842,31 @@ mod tests {
             "a restart loop of anybody's"
         );
         assert!(!stoppable_when_gone(false, &dead));
+        // Its stop hooks run: the stop job waits for them.
+        let stopping = state("deactivating", "stop-post");
+        assert!(stopping.shutting_down() && !stopping.busy());
+        assert!(stoppable_when_gone(false, &stopping));
+    }
+
+    #[test]
+    fn a_signal_ends_the_restarts_when_it_stops() {
+        let app = |stop: Option<&str>| {
+            let mut r: ImageRecord = serde_json::from_value(serde_json::json!({
+                "name": "web", "reference": "r", "manifest_digest": "d", "layers": [],
+                "backend": "overlay", "created": 0, "mode": "app",
+            }))
+            .unwrap();
+            r.tuning.stop_signal = stop.map(str::to_string);
+            r
+        };
+        // No stop signal of its own: SIGTERM, not one its program may handle.
+        assert!(exits_on(Some(&app(None)), libc::SIGTERM).unwrap());
+        assert!(!exits_on(Some(&app(None)), libc::SIGUSR1).unwrap());
+        // With one: that one, and SIGKILL.
+        let quit = app(Some("SIGQUIT"));
+        assert!(exits_on(Some(&quit), libc::SIGQUIT).unwrap());
+        assert!(exits_on(Some(&quit), libc::SIGKILL).unwrap());
+        assert!(!exits_on(Some(&quit), libc::SIGHUP).unwrap());
     }
 
     #[test]
@@ -2615,12 +2936,16 @@ mod tests {
     }
 
     #[test]
-    fn realtime_signals_reach_kill() {
-        // A PID that cannot exist: the kernel validates the signal number first, so a
-        // realtime number must come back as ESRCH, never EINVAL.
+    fn signals_go_through_a_pidfd() {
+        // A PID that cannot exist has no pidfd; a process that does takes signal 0, and
+        // a realtime number is one the kernel takes (EINVAL would say otherwise).
         let rt = libc::SIGRTMIN() + 3;
         assert_eq!(send_signal(i32::MAX, rt), Err(nix::errno::Errno::ESRCH));
         assert_eq!(send_signal(std::process::id() as i32, 0), Ok(()));
+        assert_eq!(
+            parent_of(std::process::id() as i32),
+            Some(std::os::unix::process::parent_id())
+        );
     }
 
     #[test]
@@ -2637,6 +2962,10 @@ mod tests {
         assert_eq!(signal_number("15").unwrap(), 15);
         assert_eq!(signal_number("SIGRTMIN").unwrap(), libc::SIGRTMIN());
         assert_eq!(signal_number("SIGRTMIN+3").unwrap(), libc::SIGRTMIN() + 3);
+        assert_eq!(signal_number("SIGIOT").unwrap(), libc::SIGABRT);
+        assert_eq!(signal_number("cld").unwrap(), libc::SIGCHLD);
+        assert_eq!(signal_number("POLL").unwrap(), libc::SIGIO);
+        assert!(signal_number("RTMIN+2147483647").is_err(), "no overflow");
         assert_eq!(signal_number("RTMAX-1").unwrap(), libc::SIGRTMAX() - 1);
         assert!(signal_number("SIGRTMIN+200").is_err());
         assert!(signal_number("0").is_err());
@@ -2780,6 +3109,12 @@ mod tests {
         };
         let argv = journalctl_arguments(&follow);
         assert!(argv.contains(&"--lines=10".to_string()) && argv.last().unwrap() == "--follow");
+        // Every line, which journalctl takes as all and not as a number past an int.
+        let every = LogsRequest {
+            lines: Some(u32::MAX),
+            ..follow.clone()
+        };
+        assert!(journalctl_arguments(&every).contains(&"--lines=all".to_string()));
         let full = LogsRequest {
             machine: "web".into(),
             follow: true,

@@ -33,6 +33,7 @@ fn image(cmd: &str, history: &[(&str, &str, bool)]) -> Config {
         .map(|(created_by, comment, empty_layer)| History {
             created: None,
             created_by: created_by.to_string(),
+            author: None,
             comment: comment.to_string(),
             empty_layer: *empty_layer,
         })
@@ -923,7 +924,9 @@ fn volumes_signals_users_maintainer() {
     for ok in ["9", "SIGRTMIN+3", "RTMAX-14", "-5", "rtmax"] {
         target(&format!("FROM busybox\nSTOPSIGNAL {ok}\n"));
     }
-    for bad in ["0", "SIGNOPE", "RTMIN+16", "RTMAX-15", "RTMIN+01"] {
+    for bad in [
+        "0", "SIGNOPE", "RTMIN+16", "RTMAX-15", "RTMIN+01", "RTMIN++5", "RTMAX-+2",
+    ] {
         assert_eq!(
             error(&format!("FROM busybox\nSTOPSIGNAL {bad}\n")),
             format!("invalid signal: {bad}")
@@ -1350,4 +1353,17 @@ fn base_image_workdir_and_user() {
     assert_eq!(runs(&d)[0].user, "app");
     assert_eq!(copies(&d)[0].dest, "/rel/rel/b");
     assert_eq!(copies(&d)[0].user, "app");
+}
+
+#[test]
+fn a_long_chain_of_stages_is_walked_without_the_stack() {
+    let n = 200_000;
+    let chain: Vec<Vec<usize>> = (0..n)
+        .map(|i| if i + 1 < n { vec![i + 1] } else { vec![] })
+        .collect();
+    assert_eq!(first_cycle(&chain), None);
+    let mut cycle = chain;
+    cycle[n - 1] = vec![3];
+    assert_eq!(first_cycle(&cycle), Some(0));
+    assert_eq!(first_cycle(&[vec![], vec![2], vec![1]]), Some(1));
 }

@@ -75,6 +75,8 @@ impl Endpoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     Directory,
+    /// A character or block device, which no copy replaces.
+    Device,
     Other,
 }
 
@@ -109,6 +111,10 @@ pub fn plan(
             .ok_or_else(|| anyhow!("{} cannot be the name of a copy", dst.display()))
     };
     match (source_is_dir, dst_kind) {
+        (_, Some(Kind::Device)) => bail!(
+            "invalid output path: {:?} must be a directory or a regular file: got a device",
+            dst.display().to_string()
+        ),
         (false, None) if trailing_slash => {
             bail!("{} does not exist and names a directory", dst.display())
         }
@@ -139,6 +145,79 @@ pub fn plan(
             dir: dst.to_path_buf(),
             top: Some(source_name.to_os_string()),
         }),
+    }
+}
+
+/// How many links a destination is followed through, as docker cp counts them.
+const DESTINATION_LINKS: usize = 10;
+
+/// docker cp's destination: a final link stands for what it names, so the copy is
+/// written there, whether that exists or not, and the link stays. `read_link` gives a
+/// path's link target, None for anything else; `rooted` paths are relative to a root
+/// that `..` never climbs above.
+pub fn follow_destination(
+    dst: &Path,
+    rooted: bool,
+    mut read_link: impl FnMut(&Path) -> Result<Option<PathBuf>>,
+) -> Result<PathBuf> {
+    let mut path = dst.to_path_buf();
+    for _ in 0..=DESTINATION_LINKS {
+        let Some(target) = read_link(&path)? else {
+            return Ok(path);
+        };
+        let joined = if target.is_absolute() {
+            target
+        } else {
+            path.parent().unwrap_or_else(|| Path::new("")).join(target)
+        };
+        path = clean(&joined, rooted);
+    }
+    bail!("too many symlinks in {}", dst.display())
+}
+
+/// A path without `.` and with each `..` taking the name before it, as Go's
+/// filepath.Clean; a rooted one loses its leading slash and any `..` above it.
+pub(crate) fn clean(path: &Path, rooted: bool) -> PathBuf {
+    let mut out: Vec<Component> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) if rooted => out.clear(),
+            Component::ParentDir => match out.last() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir) => {}
+                _ if rooted => {}
+                _ => out.push(component),
+            },
+            other => out.push(other),
+        }
+    }
+    let cleaned: PathBuf = out.iter().collect();
+    if cleaned.as_os_str().is_empty() && !rooted {
+        PathBuf::from(".")
+    } else {
+        cleaned
+    }
+}
+
+/// The target of a link at `path` beneath `root`, the root being where an absolute
+/// one starts; None for anything else, or for a path whose directory is not there.
+pub fn link_in(root: BorrowedFd<'_>, path: &Path) -> Result<Option<PathBuf>> {
+    let (parent, leaf) = split_leaf(path);
+    if leaf == "." || leaf == ".." {
+        return Ok(None);
+    }
+    let dir = match scoped_raw(root, &parent, OFlag::O_PATH | OFlag::O_DIRECTORY) {
+        Ok(dir) => dir,
+        Err(Errno::ENOENT | Errno::ENOTDIR) => return Ok(None),
+        Err(e) => return Err(nix_error(e, &parent)),
+    };
+    match readlinkat(&dir, leaf.as_os_str()) {
+        Ok(target) => Ok(Some(PathBuf::from(target))),
+        Err(Errno::EINVAL | Errno::ENOENT) => Ok(None),
+        Err(e) => Err(nix_error(e, path)),
     }
 }
 
@@ -244,6 +323,8 @@ pub fn kind_in(root: BorrowedFd<'_>, path: &Path) -> Result<Option<Kind>> {
             let st = fstat(&fd).map_err(|e| nix_error(e, path))?;
             Ok(Some(if is(st.st_mode, SFlag::S_IFDIR) {
                 Kind::Directory
+            } else if is(st.st_mode, SFlag::S_IFCHR) || is(st.st_mode, SFlag::S_IFBLK) {
+                Kind::Device
             } else {
                 Kind::Other
             }))
@@ -296,6 +377,9 @@ pub fn inside(path: &str) -> PathBuf {
 pub fn split_leaf(path: &Path) -> (PathBuf, OsString) {
     match (path.parent(), path.file_name()) {
         (Some(parent), Some(name)) => (parent.to_path_buf(), name.to_os_string()),
+        // A path that ends in .. names the directory it leads to, not the root: it is
+        // looked up whole, the leaf being the directory itself.
+        _ if path.ends_with("..") => (path.to_path_buf(), OsString::from(".")),
         _ => (PathBuf::new(), OsString::from(".")),
     }
 }
@@ -334,7 +418,12 @@ pub fn pack<W: Write>(
 ) -> Result<Stats> {
     let mut builder = tar::Builder::new(out);
     let mut stats = Stats::default();
-    pack_entry(&mut builder, parent, leaf, top, ids, &mut stats)?;
+    if let Err(e) = pack_entry(&mut builder, parent, leaf, top, ids, &mut stats) {
+        // The builder ends the archive when dropped, and the other end would take a
+        // clean end for the whole tree: a block that is no header breaks it instead.
+        let _ = builder.get_mut().write_all(&[0xff; 512]);
+        return Err(e);
+    }
     builder
         .into_inner()
         .and_then(|mut out| out.flush())
@@ -392,7 +481,15 @@ fn pack_entry<W: Write>(
         }
         names.sort();
         for name in names {
-            pack_entry(builder, dir.as_fd(), &name, &path.join(&name), ids, stats)?;
+            let child = path.join(&name);
+            // What goes or changes kind in a running machine between the listing and
+            // its turn is left out, as the reference leaves it; anything else fails.
+            if let Err(e) = pack_entry(builder, dir.as_fd(), &name, &child, ids, stats) {
+                if !went_meanwhile(&e) {
+                    return Err(e);
+                }
+                stats.skipped.push(child.display().to_string());
+            }
         }
     } else if is(st.st_mode, SFlag::S_IFREG) {
         // Without blocking, and checked again once open: what the machine swaps in
@@ -439,6 +536,20 @@ fn pack_entry<W: Write>(
     Ok(())
 }
 
+/// Whether an entry's error says it went or changed kind while the copy walked, as
+/// `nix_error` words it.
+fn went_meanwhile(e: &anyhow::Error) -> bool {
+    let text = e.to_string();
+    [
+        ": no such file or directory",
+        ": not a directory",
+        ": the path leaves the machine or loops through its links",
+        ": changed while it was being copied",
+    ]
+    .iter()
+    .any(|end| text.ends_with(end))
+}
+
 /// Where the stream goes, decided from its first entry: whether it is a directory and
 /// the name it carries.
 pub struct Target {
@@ -477,7 +588,9 @@ pub fn unpack<R: Read>(
     let mut decide = Some(decide);
     let mut target: Option<Target> = None;
     let mut stats = Stats::default();
-    let mut directories: Vec<(OwnedFd, u64)> = Vec::new();
+    // The directories made, by path: a descriptor held for each would run out of them on
+    // a tree of a few thousand.
+    let mut directories: Vec<(PathBuf, u64)> = Vec::new();
     for entry in archive.entries().context("reading the stream")? {
         let mut entry = entry.context("reading the stream")?;
         let raw = entry
@@ -535,7 +648,7 @@ pub fn unpack<R: Read>(
                             fchown(&dir, Some(uid), Some(gid)).map_err(|e| nix_error(e, &shown))?;
                         }
                         fchmod(&dir, mode).map_err(|e| nix_error(e, &shown))?;
-                        directories.push((dir, mtime));
+                        directories.push((shown.clone(), mtime));
                     }
                     // One that is there already keeps its owner and mode.
                     Err(Errno::EEXIST) => {
@@ -557,7 +670,7 @@ pub fn unpack<R: Read>(
                 }
                 // Written beside its name and renamed over it once complete, so that a
                 // copy cut short leaves the file that was there, not half of the new one.
-                let staged = staged_leaf(&leaf);
+                let staged = staged_leaf();
                 let file = openat(
                     &parent,
                     staged.as_os_str(),
@@ -570,9 +683,19 @@ pub fn unpack<R: Read>(
                 )
                 .map_err(|e| nix_error(e, &shown))?;
                 let mut file = File::from(file);
+                let size = entry.header().entry_size().unwrap_or(0);
                 let written: Result<u64> = (|| {
                     let bytes = io::copy(&mut entry, &mut file)
                         .with_context(|| format!("writing {}", shown.display()))?;
+                    // A stream cut short ends an entry early without an error: the file
+                    // that was there stays.
+                    if bytes != size {
+                        bail!(
+                            "{}: the stream ended {} bytes short",
+                            shown.display(),
+                            size - bytes.min(size)
+                        );
+                    }
                     if let Some((uid, gid)) = owner {
                         fchown(&file, Some(uid), Some(gid)).map_err(|e| nix_error(e, &shown))?;
                     }
@@ -624,23 +747,25 @@ pub fn unpack<R: Read>(
         }
         stats.entries += 1;
     }
-    if target.is_none() {
+    let Some(target) = target else {
         bail!("nothing arrived to copy");
-    }
+    };
     // Last: writing into a directory changes its time.
-    for (dir, mtime) in directories.iter().rev() {
-        let _ = futimens(dir, &timespec(*mtime), &timespec(*mtime));
+    for (path, mtime) in directories.iter().rev() {
+        let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW;
+        if let Ok(dir) = scoped_raw(target.root.as_fd(), path, flags) {
+            let _ = futimens(&dir, &timespec(*mtime), &timespec(*mtime));
+        }
     }
     Ok(stats)
 }
 
 /// The name a file is written under until it is complete: beside its own, never the
 /// name of anything the archive carries.
-fn staged_leaf(leaf: &OsStr) -> OsString {
-    let mut name = OsString::from(".");
-    name.push(leaf);
-    name.push(format!(".nspawn-cp-{}", crate::store::unique_suffix()));
-    name
+fn staged_leaf() -> OsString {
+    // Not built on the leaf: a name near the longest a file system takes would leave no
+    // room for the rest.
+    OsString::from(format!(".nspawn-cp-{}", crate::store::unique_suffix()))
 }
 
 /// Makes room for a link: what is there goes, unless it is a directory.
@@ -800,17 +925,45 @@ pub async fn copy_from(
     let (source, _) = split_source(path);
     let relative = inside(&source);
     let (parent_path, leaf) = split_leaf(&relative);
+    // The name the copy takes: the leaf, or for a path that ends in .. the directory it
+    // comes to, the machine's name for its root.
     let top = if leaf == "." {
-        OsString::from(name)
+        let mut parts: Vec<&OsStr> = Vec::new();
+        for component in relative.components() {
+            match component {
+                Component::Normal(part) => parts.push(part),
+                Component::ParentDir => {
+                    parts.pop();
+                }
+                _ => {}
+            }
+        }
+        parts
+            .last()
+            .map_or_else(|| OsString::from(name), |p| p.to_os_string())
     } else {
         leaf.clone()
     };
-    let parent = scoped(
-        root.fd.as_fd(),
-        &parent_path,
-        OFlag::O_PATH | OFlag::O_DIRECTORY,
-    )
-    .map_err(|e| anyhow!("{name}:{source}: {e:#}"))?;
+    // A source ending in / or /. names a directory, a link to one followed as path
+    // resolution follows it there: the directory is packed under the name given.
+    let trailing = path.ends_with('/') || path.ends_with("/.");
+    let (parent, leaf) = if trailing && leaf != "." {
+        let dir = scoped(
+            root.fd.as_fd(),
+            &relative,
+            OFlag::O_PATH | OFlag::O_DIRECTORY,
+        )
+        .map_err(|e| anyhow!("{name}:{source}: {e:#}"))?;
+        (dir, OsString::from("."))
+    } else {
+        let parent = scoped(
+            root.fd.as_fd(),
+            &parent_path,
+            OFlag::O_PATH | OFlag::O_DIRECTORY,
+        )
+        .map_err(|e| anyhow!("{name}:{source}: {e:#}"))?;
+        (parent, leaf)
+    };
     if let Err(e) = fstatat(&parent, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
         bail!("{}", nix_error(e, Path::new(&format!("{name}:{source}"))));
     }
@@ -845,7 +998,9 @@ pub async fn copy_to(
 ) -> Result<Stats> {
     let root = open_root(ctx, name, report).await?;
     let trailing_slash = path.len() > 1 && path.ends_with('/');
-    let relative = inside(path.trim_end_matches('/'));
+    let relative = follow_destination(&inside(path.trim_end_matches('/')), true, |p| {
+        link_in(root.fd.as_fd(), p)
+    })?;
     let dst_kind = kind_in(root.fd.as_fd(), &relative)?;
     if dst_kind.is_none() {
         let (parent, _) = split_leaf(&relative);
@@ -1015,6 +1170,23 @@ mod tests {
             plan(false, name, false, dst, Some(Other), false).unwrap(),
             p("/srv", Some("dst"))
         );
+        // A device is never replaced by the copy.
+        let err = plan(
+            false,
+            name,
+            false,
+            Path::new("/dev/null"),
+            Some(Device),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("got a device"), "{err}");
+        assert!(
+            kind_in(open_dir(Path::new("/")).as_fd(), Path::new("dev/null"))
+                .unwrap()
+                .is_some_and(|k| k == Device)
+        );
         assert!(plan(false, name, false, dst, Some(Other), true).is_err());
         assert_eq!(
             plan(false, name, false, dst, Some(Directory), false).unwrap(),
@@ -1054,6 +1226,11 @@ mod tests {
         assert_eq!(
             split_leaf(Path::new("")),
             (PathBuf::new(), OsString::from("."))
+        );
+        // A path that ends in .. is the directory it leads to, not the machine's root.
+        assert_eq!(
+            split_leaf(Path::new("srv/data/..")),
+            (PathBuf::from("srv/data/.."), OsString::from("."))
         );
     }
 
@@ -1102,6 +1279,79 @@ mod tests {
             Ids::Keep,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_stream_cut_short_leaves_the_file_that_was_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("f"), "old").unwrap();
+        let mut stream = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(1000);
+        stream
+            .append_data(&mut header, "f", io::repeat(b'x').take(1000))
+            .unwrap();
+        let mut bytes = stream.into_inner().unwrap();
+        // The header and half the data: the sender went away.
+        bytes.truncate(512 + 500);
+        let root = open_dir(tmp.path());
+        let result = unpack(
+            &bytes[..],
+            |_, _| {
+                Ok(Target {
+                    root: root.try_clone().unwrap(),
+                    base: PathBuf::new(),
+                    top: Some("f".into()),
+                })
+            },
+            Ids::Keep,
+        );
+        assert!(result.unwrap_err().to_string().contains("short"));
+        assert_eq!(fs::read_to_string(tmp.path().join("f")).unwrap(), "old");
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "no staged file left"
+        );
+    }
+
+    #[test]
+    fn many_directories_keep_their_times() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stream = tar::Builder::new(Vec::new());
+        for path in std::iter::once("top".to_string()).chain((0..1500).map(|i| format!("top/d{i}")))
+        {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_mode(0o755);
+            header.set_mtime(1_234_567);
+            header.set_size(0);
+            stream.append_data(&mut header, &path, io::empty()).unwrap();
+        }
+        let stream = stream.into_inner().unwrap();
+        let root = open_dir(tmp.path());
+        let stats = unpack(
+            &stream[..],
+            |_, _| {
+                Ok(Target {
+                    root: root.try_clone().unwrap(),
+                    base: PathBuf::new(),
+                    top: Some("top".into()),
+                })
+            },
+            Ids::Keep,
+        )
+        .unwrap();
+        assert_eq!(stats.entries, 1501);
+        for dir in ["top", "top/d0", "top/d1499"] {
+            assert_eq!(
+                fs::metadata(tmp.path().join(dir)).unwrap().mtime(),
+                1_234_567,
+                "{dir}"
+            );
+        }
     }
 
     #[test]
@@ -1278,6 +1528,63 @@ mod tests {
             "climbing stops at the root"
         );
         assert_eq!(kind_in(fd.as_fd(), Path::new("nope")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_destination_link_stands_for_what_it_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(root.join("etc")).unwrap();
+        fs::create_dir_all(root.join("run/systemd/resolve")).unwrap();
+        fs::write(root.join("run/systemd/resolve/stub-resolv.conf"), "stub").unwrap();
+        std::os::unix::fs::symlink(
+            "../run/systemd/resolve/stub-resolv.conf",
+            root.join("etc/resolv.conf"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/nowhere/new", root.join("etc/dangling")).unwrap();
+        std::os::unix::fs::symlink("loop", root.join("etc/loop")).unwrap();
+        std::os::unix::fs::symlink("../../../../etc/resolv.conf", root.join("etc/up")).unwrap();
+        let fd = open_dir(&root);
+        let follow = |p: &str| follow_destination(Path::new(p), true, |p| link_in(fd.as_fd(), p));
+        if matches!(follow("etc/resolv.conf"), Err(ref e) if e.to_string().contains("Linux 5.6")) {
+            return;
+        }
+        assert_eq!(
+            follow("etc/resolv.conf").unwrap(),
+            Path::new("run/systemd/resolve/stub-resolv.conf")
+        );
+        // Created where it points, as docker does.
+        assert_eq!(follow("etc/dangling").unwrap(), Path::new("nowhere/new"));
+        assert_eq!(
+            follow("etc/up").unwrap(),
+            Path::new("run/systemd/resolve/stub-resolv.conf"),
+            "climbing stops at the root"
+        );
+        assert_eq!(follow("etc").unwrap(), Path::new("etc"));
+        assert_eq!(follow("etc/absent").unwrap(), Path::new("etc/absent"));
+        assert_eq!(follow("no/dir/x").unwrap(), Path::new("no/dir/x"));
+        assert_eq!(follow("").unwrap(), Path::new(""));
+        assert!(follow("etc/loop")
+            .unwrap_err()
+            .to_string()
+            .contains("too many symlinks"));
+        // On the host a relative path keeps the .. that leads out of it.
+        let links = |p: &Path| {
+            Ok(match p.to_str() {
+                Some("a/link") => Some(PathBuf::from("../../b")),
+                Some("abs") => Some(PathBuf::from("/srv/x")),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            follow_destination(Path::new("a/link"), false, links).unwrap(),
+            Path::new("../b")
+        );
+        assert_eq!(
+            follow_destination(Path::new("abs"), false, links).unwrap(),
+            Path::new("/srv/x")
+        );
     }
 
     #[test]

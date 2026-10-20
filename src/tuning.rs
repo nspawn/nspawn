@@ -308,13 +308,23 @@ impl Tuning {
             out.push("ReadOnly=yes".to_string());
         }
         for mount in &self.tmpfs {
-            out.push(format!("TemporaryFileSystem={mount}"));
+            // systemd-nspawn makes a tmpfs given no options 0755 and root's; docker's, as
+            // the kernel's, is 1777, which a program of another user writes to.
+            if mount.contains(':') {
+                out.push(format!("TemporaryFileSystem={mount}"));
+            } else {
+                out.push(format!("TemporaryFileSystem={mount}:mode=1777"));
+            }
         }
         if let Some(size) = self.shm_size {
             out.push(format!("TemporaryFileSystem=/dev/shm:size={size}"));
         }
         for device in &self.devices {
-            out.push(format!("Bind={}:{}", device.host, device.container));
+            out.push(format!(
+                "Bind={}:{}",
+                crate::settings::bind_path(&device.host),
+                crate::settings::bind_path(&device.container)
+            ));
         }
         out
     }
@@ -1024,7 +1034,7 @@ mod tests {
             [
                 "ReadOnly=yes",
                 "TemporaryFileSystem=/run:size=64m",
-                "TemporaryFileSystem=/tmp",
+                "TemporaryFileSystem=/tmp:mode=1777",
                 "TemporaryFileSystem=/dev/shm:size=67108864",
                 "Bind=/dev/null:/dev/nullo",
                 "Bind=/dev/dri:/dev/dri",

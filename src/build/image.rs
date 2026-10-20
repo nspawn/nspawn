@@ -5,26 +5,66 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// What the history comment of a step names.
 pub const HISTORY_COMMENT: &str = "nspawn.dockerfile.v0";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Healthcheck {
-    #[serde(rename = "Test", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "Test",
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub test: Vec<String>,
     /// Nanoseconds, 0 for the default.
-    #[serde(rename = "Interval", default, skip_serializing_if = "is_zero")]
+    #[serde(
+        rename = "Interval",
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "is_zero"
+    )]
     pub interval: i64,
-    #[serde(rename = "Timeout", default, skip_serializing_if = "is_zero")]
+    #[serde(
+        rename = "Timeout",
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "is_zero"
+    )]
     pub timeout: i64,
-    #[serde(rename = "StartPeriod", default, skip_serializing_if = "is_zero")]
+    #[serde(
+        rename = "StartPeriod",
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "is_zero"
+    )]
     pub start_period: i64,
-    #[serde(rename = "StartInterval", default, skip_serializing_if = "is_zero")]
+    #[serde(
+        rename = "StartInterval",
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "is_zero"
+    )]
     pub start_interval: i64,
-    #[serde(rename = "Retries", default, skip_serializing_if = "is_zero")]
+    #[serde(
+        rename = "Retries",
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "is_zero"
+    )]
     pub retries: i64,
+}
+
+/// Go's decoder leaves the zero value where the JSON has null, and the configs of many
+/// images carry nulls (`"Volumes":null`, `"OnBuild":null`).
+fn or_zero<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
 // serde hands skip_serializing_if a reference.
@@ -36,15 +76,26 @@ fn is_zero(n: &i64) -> bool {
 /// The settings a container of the image starts with.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
-    #[serde(rename = "User", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "User",
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub user: String,
     #[serde(
         rename = "ExposedPorts",
         default,
+        deserialize_with = "or_zero",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub exposed_ports: BTreeMap<String, serde_json::Value>,
-    #[serde(rename = "Env", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "Env",
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub env: Vec<String>,
     #[serde(
         rename = "Entrypoint",
@@ -57,26 +108,35 @@ pub struct Settings {
     #[serde(
         rename = "Volumes",
         default,
+        deserialize_with = "or_zero",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub volumes: BTreeMap<String, serde_json::Value>,
     #[serde(
         rename = "WorkingDir",
         default,
+        deserialize_with = "or_zero",
         skip_serializing_if = "String::is_empty"
     )]
     pub working_dir: String,
-    #[serde(rename = "Labels", default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(
+        rename = "Labels",
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub labels: BTreeMap<String, String>,
     #[serde(
         rename = "StopSignal",
         default,
+        deserialize_with = "or_zero",
         skip_serializing_if = "String::is_empty"
     )]
     pub stop_signal: String,
     #[serde(
         rename = "ArgsEscaped",
         default,
+        deserialize_with = "or_zero",
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub args_escaped: bool,
@@ -86,9 +146,19 @@ pub struct Settings {
         skip_serializing_if = "Option::is_none"
     )]
     pub healthcheck: Option<Healthcheck>,
-    #[serde(rename = "OnBuild", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "OnBuild",
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub on_build: Vec<String>,
-    #[serde(rename = "Shell", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "Shell",
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub shell: Vec<String>,
 }
 
@@ -111,18 +181,35 @@ impl Settings {
 pub struct History {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created: Option<String>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub created_by: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// A base image's entries keep theirs (MAINTAINER of a classic build); in the
+    /// order of the OCI spec's History.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub comment: String,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub empty_layer: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RootFs {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default, deserialize_with = "or_zero")]
     pub kind: String,
+    #[serde(default, deserialize_with = "or_zero")]
     pub diff_ids: Vec<String>,
 }
 
@@ -133,14 +220,21 @@ pub struct Config {
     pub created: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    #[serde(default, deserialize_with = "or_zero")]
     pub architecture: String,
+    #[serde(default, deserialize_with = "or_zero")]
     pub os: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "or_zero")]
     pub config: Settings,
+    #[serde(default, deserialize_with = "or_zero")]
     pub rootfs: RootFs,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        default,
+        deserialize_with = "or_zero",
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub history: Vec<History>,
 }
 
@@ -168,6 +262,7 @@ impl Config {
         self.history.push(History {
             created: Some(created.to_string()),
             created_by,
+            author: None,
             comment: HISTORY_COMMENT.to_string(),
             empty_layer: true,
         });
@@ -179,6 +274,7 @@ impl Config {
         self.history.push(History {
             created: Some(created.to_string()),
             created_by,
+            author: None,
             comment: HISTORY_COMMENT.to_string(),
             empty_layer: false,
         });
@@ -249,6 +345,42 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_base_image_keeps_its_authors() {
+        let base = br#"{"author":"Jane <j@x>","architecture":"amd64","os":"linux","config":{},"rootfs":{"type":"layers","diff_ids":[]},"history":[{"created":"2020-01-01T00:00:00Z","created_by":"/bin/sh -c #(nop)  MAINTAINER Jane","author":"Jane <j@x>","empty_layer":true}]}"#;
+        let config: Config = serde_json::from_slice(base).unwrap();
+        assert_eq!(config.author.as_deref(), Some("Jane <j@x>"));
+        let text = String::from_utf8(config.to_bytes()).unwrap();
+        assert!(
+            text.contains(
+                r#""created_by":"/bin/sh -c #(nop)  MAINTAINER Jane","author":"Jane <j@x>""#
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn nulls_read_as_nothing() {
+        // The shape of ubuntu:24.04's config and of every image the classic builder made.
+        let json = br#"{"architecture":"amd64","os":"linux","config":{"Hostname":"",
+            "User":"","Env":["PATH=/bin"],"Cmd":["/bin/bash"],"Image":"sha256:1",
+            "Volumes":null,"WorkingDir":"","Entrypoint":null,"OnBuild":null,"Labels":null,
+            "ExposedPorts":null,"Shell":null,"StopSignal":null,"ArgsEscaped":null,
+            "Healthcheck":{"Test":null,"Retries":null}},
+            "rootfs":{"type":"layers","diff_ids":["sha256:2"]},
+            "history":[{"created":"2026-10-02T00:00:00Z","created_by":null,"comment":null,
+            "empty_layer":null}]}"#;
+        let c: Config = serde_json::from_slice(json).unwrap();
+        assert_eq!(c.config.env, ["PATH=/bin"]);
+        assert!(c.config.volumes.is_empty() && c.config.labels.is_empty());
+        assert!(c.config.on_build.is_empty() && c.config.entrypoint.is_none());
+        assert_eq!(c.config.healthcheck, Some(Healthcheck::default()));
+        assert_eq!(c.history.len(), 1);
+        assert_eq!(c.rootfs.diff_ids, ["sha256:2"]);
+        let c: Config = serde_json::from_slice(br#"{"config":null,"rootfs":null}"#).unwrap();
+        assert_eq!(c.config, Settings::default());
+    }
 
     #[test]
     fn configs_serialize_in_one_order() {

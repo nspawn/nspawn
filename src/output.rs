@@ -15,9 +15,17 @@ pub fn table(headers: &[&str], rows: Vec<Vec<String>>) -> String {
         })
         .set_header(headers.iter().map(Cell::new));
     for row in rows {
-        t.add_row(row.into_iter().map(Cell::new));
+        t.add_row(row.into_iter().map(|cell| Cell::new(printable(&cell))));
     }
     t.to_string()
+}
+
+/// A cell as the terminal should see it: control characters, which a machine puts in
+/// a process's arguments or its os-release as it likes, shown as '?', as procps does.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// Human readable byte count.
@@ -49,6 +57,15 @@ pub fn human_duration(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cells_carry_no_control_characters() {
+        let text = table(&["CMD"], vec![vec!["a\u{1b}[2Kb\nc".to_string()]]);
+        assert!(
+            !text.contains('\u{1b}') && text.contains("a?[2Kb?c"),
+            "{text}"
+        );
+    }
 
     #[test]
     fn durations() {

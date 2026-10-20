@@ -140,12 +140,14 @@ pub fn get(store: &Store, name: &str) -> Result<SecretInfo> {
 }
 
 /// secret create: the content, encrypted for this host, under the state directory.
-/// A name in use is refused.
+/// A name in use is refused unless `replace` says to put this content in its place,
+/// which the machines that name it read at their next start.
 pub async fn create(
     ctx: &Context,
     name: &str,
     content: &[u8],
     labels: BTreeMap<String, String>,
+    replace: bool,
 ) -> Result<()> {
     require_root("secret create")?;
     validate_secret_name(name)?;
@@ -157,7 +159,7 @@ pub async fn create(
     }
     let store = &ctx.store;
     let _lock = store.lock().await?;
-    if blob_path(store, name).exists() {
+    if blob_path(store, name).exists() && !replace {
         bail!("secret {name} exists already; remove it first");
     }
     let dir = store.secrets_dir();

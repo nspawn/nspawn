@@ -10,6 +10,34 @@ pub fn local_offset(unix: i64) -> i64 {
     local_zone().map_or(0, |zone| zone.offset(unix))
 }
 
+/// The local zone at a Unix time: its offset and the name Go prints for it (CET, UTC),
+/// empty where the zone has none.
+pub fn local_at(unix: i64) -> (i64, String) {
+    local_zone().map_or_else(|| (0, "UTC".to_string()), |zone| zone.at(unix))
+}
+
+/// Go's time.Time.String of a Unix time in the local zone, as docker prints a
+/// container's CreatedAt: `2006-01-02 15:04:05 -0700 MST`, the offset again where the
+/// zone has no name.
+pub fn time_string(unix: i64) -> String {
+    let (offset, name) = local_at(unix);
+    let rfc = rfc3339(unix, offset);
+    let (date, time) = rfc.split_at(10);
+    let minutes = offset / 60;
+    let numeric = format!(
+        "{}{:02}{:02}",
+        if minutes < 0 { '-' } else { '+' },
+        minutes.abs() / 60,
+        minutes.abs() % 60
+    );
+    let name = if name.is_empty() {
+        numeric.clone()
+    } else {
+        name
+    };
+    format!("{date} {} {numeric} {name}", &time[1..9])
+}
+
 /// Go's initLocal: TZ names a zone (a path, or a name under the zoneinfo directories,
 /// the first of which holds valid data), is empty or UTC for UTC; without TZ,
 /// /etc/localtime.
@@ -41,6 +69,7 @@ fn local_zone() -> Option<Location> {
 struct Zone {
     offset: i64,
     dst: bool,
+    name: String,
 }
 
 /// What Go keeps of a zoneinfo file.
@@ -128,10 +157,14 @@ impl Location {
         for _ in 0..typ {
             let offset = i64::from(zone_data.big4()? as i32);
             let dst = zone_data.read(1)?[0] != 0;
-            if usize::from(zone_data.read(1)?[0]) >= abbrev.len() {
+            let at = usize::from(zone_data.read(1)?[0]);
+            if at >= abbrev.len() {
                 return None;
             }
-            zones.push(Zone { offset, dst });
+            let name = &abbrev[at..];
+            let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            let name = String::from_utf8_lossy(&name[..end]).into_owned();
+            zones.push(Zone { offset, dst, name });
         }
         let mut tx = Vec::with_capacity(time);
         for &index in indexes {
@@ -154,16 +187,22 @@ impl Location {
 
     /// Location.lookup's offset at a moment.
     fn offset(&self, unix: i64) -> i64 {
+        self.at(unix).0
+    }
+
+    /// Location.lookup: the offset and the zone's name at a moment.
+    fn at(&self, unix: i64) -> (i64, String) {
+        let zone = |i: usize| (self.zones[i].offset, self.zones[i].name.clone());
         if unix < self.tx[0].0 {
-            return self.zones[first_zone(&self.zones, &self.tx)].offset;
+            return zone(first_zone(&self.zones, &self.tx));
         }
         let lo = self.tx.partition_point(|&(when, _)| when <= unix) - 1;
         if lo == self.tx.len() - 1 && !self.extend.is_empty() {
-            if let Some(offset) = tzset(&self.extend, unix) {
-                return offset;
+            if let Some(found) = tzset(&self.extend, unix) {
+                return found;
             }
         }
-        self.zones[self.tx[lo].1].offset
+        zone(self.tx[lo].1)
     }
 }
 
@@ -332,14 +371,14 @@ pub fn days_from_epoch(year: i64) -> i64 {
 }
 
 /// tzset: the offset a POSIX TZ rule gives at a moment.
-fn tzset(s: &str, sec: i64) -> Option<i64> {
-    let (_, s) = tzset_name(s)?;
+fn tzset(s: &str, sec: i64) -> Option<(i64, String)> {
+    let (std_name, s) = tzset_name(s)?;
     let (std_offset, s) = tzset_offset(s)?;
     let std_offset = -std_offset;
     if s.is_empty() || s.starts_with(',') {
-        return Some(std_offset);
+        return Some((std_offset, std_name.to_string()));
     }
-    let (_, s) = tzset_name(s)?;
+    let (dst_name, s) = tzset_name(s)?;
     let (dst_offset, s) = if s.is_empty() || s.starts_with(',') {
         (std_offset + 3600, s)
     } else {
@@ -359,16 +398,17 @@ fn tzset(s: &str, sec: i64) -> Option<i64> {
     let ysec = (yday - 1) * SECONDS_PER_DAY + sec % SECONDS_PER_DAY;
     let mut start_sec = rule_time(year, &start, start_time, std_offset);
     let mut end_sec = rule_time(year, &end, end_time, dst_offset);
-    let (mut std_off, mut dst_off) = (std_offset, dst_offset);
+    let (mut std_zone, mut dst_zone) = ((std_offset, std_name), (dst_offset, dst_name));
     if end_sec < start_sec {
         std::mem::swap(&mut start_sec, &mut end_sec);
-        std::mem::swap(&mut std_off, &mut dst_off);
+        std::mem::swap(&mut std_zone, &mut dst_zone);
     }
-    Some(if ysec < start_sec || ysec >= end_sec {
-        std_off
+    let (offset, name) = if ysec < start_sec || ysec >= end_sec {
+        std_zone
     } else {
-        dst_off
-    })
+        dst_zone
+    };
+    Some((offset, name.to_string()))
 }
 
 /// A Unix time in RFC 3339 at an offset, as Go's time.RFC3339 layout writes it.
@@ -407,15 +447,29 @@ mod tests {
     #[test]
     fn rules_give_go_s_offsets() {
         // New York: 2026-07-01 is in daylight time, 2026-01-15 is not.
+        let zone = |offset: i64, name: &str| Some((offset, name.to_string()));
         let rule = "EST5EDT,M3.2.0,M11.1.0";
-        assert_eq!(tzset(rule, 1_782_864_000), Some(-4 * 3600));
-        assert_eq!(tzset(rule, 1_768_435_200), Some(-5 * 3600));
+        assert_eq!(tzset(rule, 1_782_864_000), zone(-4 * 3600, "EDT"));
+        assert_eq!(tzset(rule, 1_768_435_200), zone(-5 * 3600, "EST"));
         // The southern hemisphere, where the rule's end comes first in the year.
         let sydney = "AEST-10AEDT,M10.1.0,M4.1.0/3";
-        assert_eq!(tzset(sydney, 1_768_435_200), Some(11 * 3600));
-        assert_eq!(tzset(sydney, 1_782_864_000), Some(10 * 3600));
-        assert_eq!(tzset("<-03>3", 0), Some(-3 * 3600));
-        assert_eq!(tzset("UTC0", 0), Some(0));
+        assert_eq!(tzset(sydney, 1_768_435_200), zone(11 * 3600, "AEDT"));
+        assert_eq!(tzset(sydney, 1_782_864_000), zone(10 * 3600, "AEST"));
+        assert_eq!(tzset("<-03>3", 0), zone(-3 * 3600, "-03"));
+        assert_eq!(tzset("UTC0", 0), zone(0, "UTC"));
+    }
+
+    #[test]
+    fn a_time_prints_as_go_prints_it() {
+        // Whatever zone the tests run in, the layout and the offset agree.
+        let text = time_string(1_782_864_000);
+        let (offset, _) = local_at(1_782_864_000);
+        let rfc = rfc3339(1_782_864_000, offset);
+        assert!(
+            text.starts_with(&format!("{} {}", &rfc[..10], &rfc[11..19])),
+            "{text}"
+        );
+        assert_eq!(text.split(' ').count(), 4, "{text}");
     }
 
     #[test]
@@ -450,6 +504,8 @@ mod tests {
         let zone = Location::parse(&file).unwrap();
         assert_eq!(zone.offset(1_782_864_000), -4 * 3600);
         assert_eq!(zone.offset(1_768_435_200), -5 * 3600);
+        assert_eq!(zone.at(1_768_435_200).1, "EST");
+        assert_eq!(zone.zones[0].name, "EST");
         // What Go finds bad is no zone: a version it does not know, data cut short.
         let mut v4 = file.clone();
         v4[4] = b'4';

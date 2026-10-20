@@ -25,6 +25,25 @@ pub type Dict = HashMap<String, OwnedValue>;
 /// not keep every job it ever ran.
 const ENDED_KEPT: usize = 100;
 
+/// A job that failed after doing part of its work: its Result still says what was done,
+/// as a removal's `removed`.
+#[derive(Debug)]
+pub struct Partly {
+    pub result: Dict,
+    pub error: String,
+}
+
+impl std::fmt::Display for Partly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
+impl std::error::Error for Partly {}
+
+/// How many lines of its output a job keeps for its Output property.
+const OUTPUT_KEPT: usize = 1000;
+
 /// What a job carries; served as org.nspawn.Job.
 pub struct JobState {
     pub path: OwnedObjectPath,
@@ -56,8 +75,18 @@ impl Jobs {
             .collect()
     }
 
-    /// Forgets the oldest ended jobs beyond `ENDED_KEPT`; their paths, for the object
-    /// server to drop.
+    /// Puts a job that ended after every other one: jobs are retired in the order they
+    /// ended, and the one just ended last, its client still to read its outcome.
+    fn ended(&self, path: &OwnedObjectPath) {
+        let mut all = self.all.lock().unwrap();
+        if let Some(i) = all.iter().position(|j| j.path == *path) {
+            let job = all.remove(i);
+            all.push(job);
+        }
+    }
+
+    /// Forgets the ended jobs that ended first beyond `ENDED_KEPT`; their paths, for the
+    /// object server to drop.
     fn retire(&self) -> Vec<OwnedObjectPath> {
         let mut all = self.all.lock().unwrap();
         let ended = |job: &JobState| *job.state.lock().unwrap() != "running";
@@ -101,15 +130,15 @@ impl Job {
 
 #[zbus::interface(name = "org.nspawn.Job")]
 impl Job {
-    /// "pull", "push", "build", "create" or "rm".
-    #[zbus(property)]
+    /// What it does: pull, create, push, build, rm, cp and the others DBUS.md lists.
+    #[zbus(property(emits_changed_signal = "const"))]
     async fn kind(&self, #[zbus(header)] hdr: Option<Header<'_>>) -> zbus::fdo::Result<String> {
         self.readable(hdr.as_ref()).await?;
         Ok(self.job.kind.clone())
     }
 
     /// The image or machine the job is about.
-    #[zbus(property)]
+    #[zbus(property(emits_changed_signal = "const"))]
     async fn target(&self, #[zbus(header)] hdr: Option<Header<'_>>) -> zbus::fdo::Result<String> {
         self.readable(hdr.as_ref()).await?;
         Ok(self.job.target.clone())
@@ -122,8 +151,9 @@ impl Job {
         Ok(self.job.state.lock().unwrap().clone())
     }
 
-    /// Every line the job said so far.
-    #[zbus(property)]
+    /// The last lines the job said: they go out as JobOutput as they come, not as
+    /// PropertiesChanged.
+    #[zbus(property(emits_changed_signal = "false"))]
     async fn output(
         &self,
         #[zbus(header)] hdr: Option<Header<'_>>,
@@ -139,7 +169,7 @@ impl Job {
         Ok(self.job.error.lock().unwrap().clone())
     }
 
-    /// What it produced, when it is done.
+    /// What it produced, when it is done; what a removal did before it failed.
     #[zbus(property)]
     async fn result(&self, #[zbus(header)] hdr: Option<Header<'_>>) -> zbus::fdo::Result<Dict> {
         self.readable(hdr.as_ref()).await?;
@@ -217,7 +247,16 @@ where
                         continue;
                     }
                 };
-                job.output.lock().unwrap().push(text.clone());
+                let text = crate::daemon::values::bus_text(&text);
+                {
+                    // The last lines only: the output went out as JobOutput, and a long
+                    // build would otherwise stay in memory as long as the job is kept.
+                    let mut output = job.output.lock().unwrap();
+                    if output.len() >= OUTPUT_KEPT {
+                        output.remove(0);
+                    }
+                    output.push(text.clone());
+                }
                 if let Ok(emitter) =
                     state.emitter_to(crate::daemon::manager_path(), job.client.as_deref())
                 {
@@ -241,7 +280,14 @@ where
                 "done"
             }
             Err(e) => {
-                *job.error.lock().unwrap() = format!("{e:#}");
+                let e = match e.downcast::<Partly>() {
+                    Ok(partly) => {
+                        *job.result.lock().unwrap() = partly.result;
+                        anyhow::anyhow!(partly.error)
+                    }
+                    Err(e) => e,
+                };
+                *job.error.lock().unwrap() = crate::daemon::values::bus_text(&format!("{e:#}"));
                 *job.state.lock().unwrap() = "failed".to_string();
                 "failed"
             }
@@ -253,13 +299,17 @@ where
             .await
         {
             if let Ok(emitter) = state.emitter_to(job.path.as_ref(), job.client.as_deref()) {
-                let _ = iface.get().await.state_changed(&emitter).await;
+                let job = iface.get().await;
+                let _ = job.state_changed(&emitter).await;
+                let _ = job.error_changed(&emitter).await;
+                let _ = job.result_changed(&emitter).await;
             }
         }
         if let Ok(emitter) = state.emitter_to(crate::daemon::manager_path(), job.client.as_deref())
         {
             let _ = Manager::job_removed(&emitter, job.path.as_ref(), result).await;
         }
+        state.jobs.ended(&job.path);
         for path in state.jobs.retire() {
             let _ = state
                 .connection()
@@ -330,6 +380,15 @@ mod tests {
             "the oldest running one"
         );
         assert!(kept.iter().any(|p| p.as_str() == path(total)));
+        // A job made first that ends last stays: retirement goes by the end.
+        jobs.all.lock().unwrap().insert(0, job(0, "running"));
+        *jobs.all.lock().unwrap()[0].state.lock().unwrap() = "done".to_string();
+        jobs.ended(&OwnedObjectPath::try_from(path(0)).unwrap());
+        let retired = jobs.retire();
+        assert!(
+            !retired.iter().any(|p| p.as_str() == path(0)),
+            "{retired:?}"
+        );
         assert!(jobs.retire().is_empty(), "nothing more to retire");
     }
 }

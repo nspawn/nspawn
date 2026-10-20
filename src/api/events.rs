@@ -155,8 +155,11 @@ impl Follow {
                 .or_else(|| status.signal().map(|s| 128 + s))
                 .unwrap_or(126)
         };
-        match self.child.try_wait() {
-            Ok(Some(status)) => code(status),
+        // Its output at an end, journalctl is about to exit on its own: a moment for its
+        // own status, which a failure of its own is, before it is stopped.
+        let ended = tokio::time::timeout(std::time::Duration::from_millis(500), self.child.wait());
+        match ended.await {
+            Ok(Ok(status)) => code(status),
             _ => {
                 let _ = self.child.kill().await;
                 match self.child.wait().await {
@@ -176,6 +179,11 @@ pub fn enrich(store: &crate::store::Store, event: &mut Event) {
         return;
     }
     if let Ok(Some(record)) = store.load_image(&event.name) {
+        // An event from before this machine was made is an earlier machine's of the
+        // name: what this one has is not its.
+        if event.time_usec / 1_000_000 < record.created {
+            return;
+        }
         event
             .attributes
             .entry("image".into())
@@ -186,6 +194,32 @@ pub fn enrich(store: &crate::store::Store, event: &mut Event) {
             .entry("created".into())
             .or_insert_with(|| record.created.to_string());
         event.labels = record.effective_labels();
+        // systemd logged systemd-nspawn's status: the machine's code is made of it as
+        // run and inspect make it, 128 plus the signal the program died of under the
+        // stub init.
+        if event.action == "die"
+            && event.attributes.get("code").map(String::as_str) == Some("exited")
+        {
+            if let Some(status) = event
+                .attributes
+                .get("exit_code")
+                .and_then(|s| s.parse().ok())
+            {
+                let ending = crate::api::run::Ending {
+                    code: crate::api::run::CLD_EXITED,
+                    status,
+                    result: String::new(),
+                };
+                let code = crate::api::run::exit_code(
+                    &ending,
+                    store.last_signal(&event.name),
+                    record.under_stub_init(),
+                );
+                event
+                    .attributes
+                    .insert("exit_code".into(), code.to_string());
+            }
+        }
     }
 }
 
@@ -440,6 +474,42 @@ mod tests {
         assert_eq!(a, "restart");
         assert_eq!(attrs["restarts"], "1");
         assert_eq!(action(&mut m, OOM).unwrap().0, "oom");
+    }
+
+    #[test]
+    fn a_die_says_the_code_run_and_inspect_say() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            crate::store::Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        store.init().unwrap();
+        let record: crate::store::ImageRecord = serde_json::from_value(serde_json::json!({
+            "name": "e2e-busybox",
+            "reference": "r",
+            "manifest_digest": "d",
+            "layers": [],
+            "backend": "overlay",
+            "mode": "app",
+            "created": 0,
+        }))
+        .unwrap();
+        store.record_image(&record).unwrap();
+        // Stopped with SIGTERM under the stub init, systemd-nspawn says 255.
+        store.mark_signal("e2e-busybox", 15).unwrap();
+        let killed = EXITED.replace(r#""EXIT_STATUS": "1""#, r#""EXIT_STATUS": "255""#);
+        let mut event = Mapper::default().map(&entry(&killed)).unwrap();
+        enrich(&store, &mut event);
+        assert_eq!(event.attributes["exit_code"], "143");
+        // The program's own code stays.
+        let mut event = Mapper::default().map(&entry(EXITED)).unwrap();
+        enrich(&store, &mut event);
+        assert_eq!(event.attributes["exit_code"], "1");
+        // A machine made after the event is another one of the name: nothing of its.
+        let mut later = record.clone();
+        later.created = 1_890_000_000;
+        store.record_image(&later).unwrap();
+        let mut event = Mapper::default().map(&entry(EXITED)).unwrap();
+        enrich(&store, &mut event);
+        assert!(!event.attributes.contains_key("created"));
     }
 
     #[test]

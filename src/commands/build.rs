@@ -34,7 +34,13 @@ pub fn kind(args: &BuildArgs) -> Result<Kind> {
     if dockerfile && mkosi {
         bail!("the flags of a Dockerfile build and of an mkosi build do not go together");
     }
-    if dockerfile || args.directory == Path::new("-") {
+    if args.directory == Path::new("-") {
+        if mkosi {
+            bail!("an mkosi build takes a directory, not standard input");
+        }
+        return Ok(Kind::Dockerfile);
+    }
+    if dockerfile {
         return Ok(Kind::Dockerfile);
     }
     if mkosi {
@@ -75,32 +81,42 @@ fn read_stdin() -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Whether bytes are a tar, compressed or not: what `build -` reads as a context.
-fn is_tar(bytes: &[u8]) -> bool {
-    let plain = |b: &[u8]| b.len() > 262 && &b[257..262] == b"ustar";
-    if bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut head = vec![0u8; 512];
-        let mut reader = flate2::read::GzDecoder::new(bytes);
-        let mut filled = 0;
-        while filled < head.len() {
-            match reader.read(&mut head[filled..]) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => filled += n,
-            }
-        }
-        return plain(&head[..filled]);
+/// Bytes as docker's DetectCompression finds them: gzip, bzip2, xz and zstd undone,
+/// anything else as it is, a Dockerfile among them.
+fn decompressed(bytes: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let undone = if bytes.starts_with(&[0x1f, 0x8b, 0x08]) {
+        flate2::read::MultiGzDecoder::new(bytes.as_slice())
+            .read_to_end(&mut out)
+            .is_ok()
+    } else if bytes.starts_with(b"BZh") {
+        bzip2::read::MultiBzDecoder::new(bytes.as_slice())
+            .read_to_end(&mut out)
+            .is_ok()
+    } else if bytes.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        lzma_rs::xz_decompress(&mut bytes.as_slice(), &mut out).is_ok()
+    } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        zstd::stream::read::Decoder::new(bytes.as_slice())
+            .and_then(|mut d| d.read_to_end(&mut out))
+            .is_ok()
+    } else {
+        false
+    };
+    if undone {
+        out
+    } else {
+        bytes
     }
-    plain(bytes)
+}
+
+/// Whether bytes are a tar: what `build -` reads as a context.
+fn is_tar(bytes: &[u8]) -> bool {
+    bytes.len() > 262 && &bytes[257..262] == b"ustar"
 }
 
 /// A file of a context tar.
 fn file_in_tar(tar: &[u8], name: &str) -> Result<Option<Vec<u8>>> {
-    let reader: Box<dyn Read> = if tar.starts_with(&[0x1f, 0x8b]) {
-        Box::new(flate2::read::GzDecoder::new(tar))
-    } else {
-        Box::new(tar)
-    };
-    let mut archive = tar::Archive::new(reader);
+    let mut archive = tar::Archive::new(tar);
     for entry in archive.entries().context("reading the context tar")? {
         let mut entry = entry.context("reading the context tar")?;
         let path = entry
@@ -120,7 +136,7 @@ fn file_in_tar(tar: &[u8], name: &str) -> Result<Option<Vec<u8>>> {
 fn source(args: &BuildArgs) -> Result<Source> {
     let file = args.dockerfile.file.as_deref();
     if args.directory == Path::new("-") {
-        let input = read_stdin()?;
+        let input = decompressed(read_stdin()?);
         if is_tar(&input) {
             let name = file.unwrap_or("Dockerfile");
             let dockerfile = file_in_tar(&input, name)?
@@ -130,6 +146,11 @@ fn source(args: &BuildArgs) -> Result<Source> {
                 dockerfile_path: None,
                 context: Context::Tar(input),
             });
+        }
+        // docker's GetContextFromReader: a Dockerfile on standard input is the
+        // Dockerfile, whatever -f says, but -f - has nothing left to read.
+        if file == Some("-") {
+            bail!("build context is not an archive");
         }
         return Ok(Source {
             dockerfile: input,
@@ -190,11 +211,11 @@ fn excludes(dir: &Path, dockerfile: Option<&Path>) -> Result<Vec<String>> {
 
 /// Packs the context into `out` as a tar, everything owned by root, modes and times
 /// kept, what the ignore patterns exclude left out.
-fn pack(dir: &Path, excludes: Vec<String>, out: File) -> Result<()> {
+fn pack(dir: &Path, excludes: Vec<String>, out: impl Write) -> Result<()> {
     use crate::build::walk::{walk, FilterOpt, Step};
     let mut builder = tar::Builder::new(BufWriter::new(out));
     builder.follow_symlinks(false);
-    walk(
+    let walked = walk(
         dir,
         FilterOpt {
             exclude_patterns: excludes,
@@ -224,48 +245,100 @@ fn pack(dir: &Path, excludes: Vec<String>, out: File) -> Result<()> {
                     builder.append_link(&mut header, &st.path, &st.linkname)?;
                 }
                 nix::libc::S_IFREG => {
-                    let file = File::open(dir.join(&st.path))
-                        .with_context(|| format!("reading {}", st.path.display()))?;
+                    // What cannot be opened (a socket, a file the user may not read) goes
+                    // as an empty file, as the reference sends it. The size is the one
+                    // read here: a file that grows or shrinks meanwhile is cut or padded
+                    // to it, or the stream would go out of step.
                     header.set_entry_type(tar::EntryType::Regular);
-                    header.set_size(file.metadata()?.len());
-                    builder.append_data(&mut header, &st.path, file)?;
+                    match File::open(dir.join(&st.path)) {
+                        Ok(file) => {
+                            let size = file.metadata()?.len();
+                            header.set_size(size);
+                            let data = file.take(size).chain(std::io::repeat(0)).take(size);
+                            builder.append_data(&mut header, &st.path, data)?;
+                        }
+                        Err(_) => {
+                            header.set_size(0);
+                            builder.append_data(&mut header, &st.path, std::io::empty())?;
+                        }
+                    }
                 }
                 _ => {}
             }
             Ok(Step::Continue)
         },
-    )?;
+    );
+    if let Err(e) = walked {
+        // The builder ends the archive when dropped, and a clean end would pass for the
+        // whole context: a block that is no header makes the service fail instead.
+        let _ = builder.get_mut().write_all(&[0xff; 512]);
+        return Err(e);
+    }
     builder.into_inner()?.flush()?;
     Ok(())
 }
 
 /// --secret id=ID[,src=PATH][,env=VAR][,type=file|env]: the secret's bytes, read here as
-/// the user; without src or env, the variable named ID.
+/// the user, as BuildKit's secrets provider reads them: an env wins over a file, and
+/// without either the variable named ID when it is set, else the file named ID.
 fn secret(spec: &str) -> Result<(String, Vec<u8>)> {
-    let (mut id, mut src, mut env, mut kind) = (None, None, None, None);
-    for field in spec.split(',') {
-        match field.split_once('=') {
-            Some(("id", v)) => id = Some(v.to_string()),
-            Some(("src" | "source", v)) => src = Some(v.to_string()),
-            Some(("env", v)) => env = Some(v.to_string()),
-            Some(("type", v)) => kind = Some(v.to_string()),
-            _ => bail!("--secret {spec}: id=ID[,src=PATH][,env=VAR]"),
+    secret_with(spec, &|var| std::env::var_os(var))
+}
+
+/// The largest secret BuildKit's provider takes.
+const MAX_SECRET: u64 = 500 * 1024;
+
+fn secret_with(
+    spec: &str,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<(String, Vec<u8>)> {
+    let (mut id, mut src, mut env, mut kind) = (String::new(), String::new(), String::new(), None);
+    for field in crate::mountopt::csv_fields(spec)? {
+        let Some((key, value)) = field.split_once('=') else {
+            bail!("invalid field '{field}' must be a key=value pair");
+        };
+        match key.to_lowercase().as_str() {
+            "type" => {
+                if value != "file" && value != "env" {
+                    bail!("unsupported secret type {value:?}");
+                }
+                kind = Some(value.to_string());
+            }
+            "id" => id = value.to_string(),
+            "source" | "src" => src = value.to_string(),
+            "env" => env = value.to_string(),
+            key => bail!("unexpected key '{key}' in '{field}'"),
         }
     }
-    let id = id.with_context(|| format!("--secret {spec}: id= is missing"))?;
-    let read_env = |var: &str| {
-        std::env::var_os(var)
-            .map(|v| v.into_encoded_bytes())
-            .with_context(|| format!("--secret {spec}: {var} is not set"))
-    };
-    let bytes = match (kind.as_deref(), src, env) {
-        (Some("env"), src, env) => read_env(env.or(src).as_deref().unwrap_or(&id))?,
-        (_, Some(path), _) => {
-            std::fs::read(&path).with_context(|| format!("--secret {spec}: reading {path}"))?
+    if kind.as_deref() == Some("env") && env.is_empty() {
+        env = std::mem::take(&mut src);
+    }
+    if id.is_empty() {
+        bail!("secret missing ID");
+    }
+    if env.is_empty() && src.is_empty() {
+        if var(&id).is_some() {
+            env.clone_from(&id);
+        } else {
+            src.clone_from(&id);
         }
-        (_, None, Some(var)) => read_env(&var)?,
-        (_, None, None) => read_env(&id)?,
-    };
+    }
+    if !env.is_empty() {
+        // An unset one is empty, as Go's os.Getenv gives it.
+        return Ok((
+            id,
+            var(&env)
+                .map(|v| v.into_encoded_bytes())
+                .unwrap_or_default(),
+        ));
+    }
+    let size = std::fs::metadata(&src)
+        .with_context(|| format!("failed to stat {src}"))?
+        .len();
+    if size > MAX_SECRET {
+        bail!("secret {id} too big. max size 500KB");
+    }
+    let bytes = std::fs::read(&src).with_context(|| format!("reading {src}"))?;
     Ok((id, bytes))
 }
 
@@ -293,12 +366,8 @@ pub async fn send(
             Context::Dir(dir) => pack(&dir, excludes(&dir, ignore_from.as_deref())?, out),
             Context::Tar(bytes) => {
                 let mut out = out;
-                if bytes.starts_with(&[0x1f, 0x8b]) {
-                    std::io::copy(
-                        &mut flate2::read::GzDecoder::new(bytes.as_slice()),
-                        &mut out,
-                    )?;
-                } else if bytes.is_empty() {
+                // Undone already by `source`.
+                if bytes.is_empty() {
                     tar::Builder::new(&mut out).finish()?;
                 } else {
                     out.write_all(&bytes)?;
@@ -311,17 +380,12 @@ pub async fn send(
     let local = packer
         .join()
         .map_err(|_| anyhow!("packing the context stopped"))?;
-    match (local, remote) {
-        (_, Ok(done)) => Ok(done),
-        (Err(local), Err(remote)) => {
-            let text = format!("{local:#}");
-            Err(if text.contains("Broken pipe") {
-                remote
-            } else {
-                local
-            })
-        }
-        (Ok(()), Err(e)) => Err(e),
+    // The service stopping its reads ends the packing with a broken pipe: its own
+    // outcome is the one to tell then.
+    match local {
+        Ok(()) => remote,
+        Err(local) if format!("{local:#}").contains("Broken pipe") => remote,
+        Err(local) => Err(local),
     }
 }
 
@@ -360,7 +424,20 @@ pub async fn dockerfile(args: BuildArgs, client: &Client, config: &Config) -> Re
             .collect(),
     );
     put_all("no_cache_filter", d.no_cache_filter.clone());
-    put_all("labels", d.label.clone());
+    // docker's ValidateLabel: a KEY alone is KEY with an empty value.
+    put_all(
+        "labels",
+        d.label
+            .iter()
+            .map(|l| {
+                if l.contains('=') {
+                    l.clone()
+                } else {
+                    format!("{l}=")
+                }
+            })
+            .collect(),
+    );
     put_all("add_hosts", d.add_host.clone());
     put_all("allow", d.allow.clone());
     put_all("ulimits", d.ulimit.clone());
@@ -445,7 +522,45 @@ pub async fn dockerfile(args: BuildArgs, client: &Client, config: &Config) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secrets_are_read_as_buildkit_reads_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("npmrc");
+        std::fs::write(&file, "from-file").unwrap();
+        let vars = |var: &str| match var {
+            "TOKEN" => Some(std::ffi::OsString::from("from-env")),
+            _ => None,
+        };
+        let read = |spec: &str| secret_with(spec, &vars);
+        let src = file.display().to_string();
+        // A file named as the ID when no variable is.
+        assert_eq!(read(&format!("id={src}")).unwrap().1, b"from-file");
+        // The variable named as the ID when it is set.
+        assert_eq!(read("id=TOKEN").unwrap().1, b"from-env");
+        // env wins over src.
+        assert_eq!(
+            read(&format!("id=t,src={src},env=TOKEN")).unwrap().1,
+            b"from-env"
+        );
+        assert_eq!(read("ID=t,TYPE=env,SRC=TOKEN").unwrap().1, b"from-env");
+        // An unset variable is empty.
+        assert!(read("id=t,env=NOPE").unwrap().1.is_empty());
+        assert!(read("id=t,type=other")
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
+        assert!(read("src=x")
+            .unwrap_err()
+            .to_string()
+            .contains("missing ID"));
+        assert!(read("id=t,bogus=1")
+            .unwrap_err()
+            .to_string()
+            .contains("unexpected key"));
+    }
     use clap::Parser;
+    use std::os::unix::fs::PermissionsExt;
 
     fn args(argv: &[&str]) -> BuildArgs {
         let mut full = vec!["nspawn", "build"];
@@ -499,14 +614,61 @@ mod tests {
                 "src/link"
             ]
         );
-        assert!(is_tar(&std::fs::read(&out).unwrap()));
+        let tar = std::fs::read(&out).unwrap();
+        assert!(is_tar(&tar));
         assert!(!is_tar(b"FROM scratch\n"));
+        // Whatever docker undoes is undone, a Dockerfile left as it is.
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &tar).unwrap();
+        let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        std::io::Write::write_all(&mut bz, &tar).unwrap();
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut tar.as_slice(), &mut xz).unwrap();
+        let zst = zstd::encode_all(tar.as_slice(), 1).unwrap();
+        for packed in [gz.finish().unwrap(), bz.finish().unwrap(), xz, zst] {
+            assert_eq!(decompressed(packed), tar);
+        }
+        assert_eq!(decompressed(b"FROM scratch\n".to_vec()), b"FROM scratch\n");
         assert_eq!(
             file_in_tar(&std::fs::read(&out).unwrap(), "Dockerfile")
                 .unwrap()
                 .as_deref(),
             Some(&b"FROM scratch\n"[..])
         );
+    }
+
+    #[test]
+    fn a_context_is_whole_or_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = dir.path().join("ctx");
+        std::fs::create_dir_all(ctx.join("tmp")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(ctx.join("tmp/app.sock")).unwrap();
+        std::fs::write(ctx.join("z"), "after").unwrap();
+        let mut out = Vec::new();
+        pack(&ctx, Vec::new(), &mut out).unwrap();
+        let mut seen = Vec::new();
+        for entry in tar::Archive::new(out.as_slice()).entries().unwrap() {
+            let entry = entry.unwrap();
+            seen.push((
+                entry.path().unwrap().to_string_lossy().into_owned(),
+                entry.header().size().unwrap(),
+            ));
+        }
+        // The socket goes as an empty file and what comes after it still goes.
+        assert!(seen.contains(&("tmp/app.sock".to_string(), 0)));
+        assert!(seen.contains(&("z".to_string(), 5)));
+        // A walk that fails leaves a stream a reader refuses, not a shorter context.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let closed = ctx.join("closed");
+        std::fs::create_dir(&closed).unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut out = Vec::new();
+        assert!(pack(&ctx, Vec::new(), &mut out).is_err());
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut archive = tar::Archive::new(out.as_slice());
+        assert!(archive.entries().unwrap().any(|e| e.is_err()));
     }
 
     #[test]
@@ -534,6 +696,7 @@ mod tests {
         assert_eq!(kind(&args(&[path, "-d", "fedora"])).unwrap(), Kind::Mkosi);
         assert!(kind(&args(&[path, "-d", "fedora", "--target", "x"])).is_err());
         assert_eq!(kind(&args(&["-"])).unwrap(), Kind::Dockerfile);
+        assert!(kind(&args(&["-", "-d", "fedora"])).is_err());
         let refused = kind(&args(&[path, "--ssh", "default"])).unwrap_err();
         assert!(refused.to_string().starts_with("--ssh:"), "{refused}");
         // -f is the Dockerfile; --force keeps its long form only.

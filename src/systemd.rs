@@ -51,6 +51,11 @@ impl UnitState {
         self.active == "activating" && self.sub.starts_with("auto-restart")
     }
 
+    /// On its way down, its stop hooks running.
+    pub fn shutting_down(&self) -> bool {
+        self.active == "deactivating"
+    }
+
     /// Running, or on its way up (a restart included).
     pub fn busy(&self) -> bool {
         matches!(self.active.as_str(), "active" | "activating" | "reloading")
@@ -677,6 +682,20 @@ impl Systemd {
     }
 
     /// The invocation ID of the unit's current or last run, in hex.
+    /// Whether the unit's files changed since systemd loaded them.
+    pub async fn needs_reload(&self, unit: &str) -> Result<bool> {
+        let proxy = systemd1::UnitProxy::builder(&self.conn)
+            .path(self.unit_path(unit).await?)?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .with_context(|| format!("connecting to {unit}"))?;
+        proxy
+            .need_daemon_reload()
+            .await
+            .with_context(|| format!("reading whether {unit} needs a reload"))
+    }
+
     pub async fn invocation_id(&self, unit: &str) -> Result<String> {
         let proxy = systemd1::UnitProxy::builder(&self.conn)
             .path(self.unit_path(unit).await?)?

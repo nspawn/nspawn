@@ -223,7 +223,11 @@ fn prune_in(store: &Store, report: Report<'_>) -> Result<Vec<String>> {
             );
             continue;
         }
-        remove_one(store, &volume.name, &users)?;
+        // One that cannot go is said and left; the others still go.
+        if let Err(e) = remove_one(store, &volume.name, &users) {
+            note(report, format!("warning: {} stays: {e:#}", volume.name));
+            continue;
+        }
         line(report, format!("removed {}", volume.name));
         crate::api::events::emit(
             "volume",
@@ -271,6 +275,7 @@ mod tests {
                 pid1: false,
                 started: None,
                 fixed_addresses: Default::default(),
+                built: false,
                 run: RunSpec::default(),
                 network: Network::Host,
                 network_name: None,

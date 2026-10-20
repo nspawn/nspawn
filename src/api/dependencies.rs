@@ -274,7 +274,7 @@ pub async fn observe(sd: &Systemd, store: &Store, dep: &Dependency) -> Result<Ob
     Ok(Observed {
         healthcheck: record
             .as_ref()
-            .map(|r| r.effective_healthcheck().is_some_and(|h| !h.disabled())),
+            .map(|r| r.effective_healthcheck().is_some_and(|h| h.active())),
         unit,
         health: crate::health::read_status(&dep.name).map(|s| s.status),
         exit_code,

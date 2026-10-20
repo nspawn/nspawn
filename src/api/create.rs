@@ -162,12 +162,18 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     // network kind is inherited (none included); ports are not (two machines cannot
     // publish the same one), nor a user-defined network or another machine's
     // namespace, which a machine joins only when told to.
+    // A source found by its reference that ran as a machine gives the image, not the
+    // network that machine was given.
+    let by_reference = store.load_image(&request.source)?.is_none();
+    let inherit_network = !by_reference || crate::api::disk::image_only(store, &source);
     let mut draft = ImageRecord {
         name: request.name.clone(),
         started: None,
         network_name: None,
         address: None,
         fixed_addresses: Default::default(),
+        // A machine of a built image keeps saying so once the build's record is gone.
+        built: source.built || source.origin == "build",
         extra_networks: Vec::new(),
         aliases: BTreeMap::new(),
         network_container: None,
@@ -175,9 +181,26 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         tuning: Default::default(),
         ..source.clone()
     };
+    if !inherit_network {
+        draft.network = crate::settings::Network::Bridge;
+        draft.no_network = false;
+    }
     match &network {
         Some(choice) => crate::api::network::apply(&mut draft, choice),
         None => draft.network_name = None,
+    }
+    // What its start would refuse at once is refused now: a network that does not exist,
+    // another machine's namespace that is no nspawn machine with a network to share.
+    if bridge::bridge_kind(&draft) {
+        crate::api::network::nets_of(store, config, &draft)?;
+    }
+    if let Some(owner) = bridge::shares_network(&draft) {
+        let owner_record = store.load_image(owner)?.with_context(|| {
+            format!("--network container:{owner}: {owner} is not a machine of nspawn's")
+        })?;
+        if !bridge::bridge_kind(&owner_record) {
+            bail!("--network container:{owner}: {owner} has no network of its own to share");
+        }
     }
     if !request.aliases.is_empty() {
         if !bridge::bridge_kind(&draft) {
@@ -240,6 +263,9 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     crate::install::stage_layers(store, backend, &manifest, Some(source.mode), &request.name)
         .await?;
     remove_existing(store, sd, &request.name, report).await?;
+    // An update that was deciding about the machine replaced has nothing left to decide:
+    // putting it back would take the new one away.
+    store.forget_rollback(&request.name)?;
     line(
         report,
         format!(
@@ -291,6 +317,9 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         ..draft
     };
     store.record_image(&record)?;
+    // install wrote the drop-in of an image; the machine's has its own dependencies,
+    // policy and limits.
+    crate::api::machines::rewrite_hooks(ctx, sd, &record).await?;
     crate::api::events::emit(
         "machine",
         "create",

@@ -38,7 +38,8 @@ impl Spec {
     pub(super) fn normalize(&self) -> Spec {
         let (architecture, variant) = normalize_arch(&self.architecture, &self.variant);
         Spec {
-            os: normalize_os(&self.os, ""),
+            // platforms.Normalize: no OS is the builder's.
+            os: normalize_os(&self.os, "linux"),
             os_version: self.os_version.clone(),
             architecture,
             variant,
@@ -338,6 +339,14 @@ mod tests {
         assert_eq!(parsed("linux/arm/v7"), "linux/arm/v7");
         assert_eq!(parsed("linux/armhf"), "linux/arm/v7");
         assert_eq!(parse("linux/arm", &host()).unwrap().variant, "");
+        // A base image that names no OS is the builder's.
+        let none = Spec {
+            os: String::new(),
+            os_version: String::new(),
+            architecture: "amd64".to_string(),
+            variant: String::new(),
+        };
+        assert_eq!(none.normalize().format(), "linux/amd64");
         assert_eq!(
             parse("nosuch", &host()).unwrap_err(),
             "\"nosuch\": unknown operating system or architecture: invalid argument"

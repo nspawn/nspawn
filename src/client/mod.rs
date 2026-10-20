@@ -18,42 +18,57 @@ pub type Options<'a> = HashMap<&'a str, Value<'a>>;
     default_path = "/org/nspawn",
     gen_blocking = false
 )]
+/// Every call may make polkit ask the user through an authentication agent: the D-Bus
+/// flag that allows it is set, as busctl and systemctl set it.
 pub trait Manager {
     #[zbus(property)]
     fn version(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn registry(&self) -> zbus::Result<String>;
 
+    #[zbus(allow_interactive_auth)]
     fn list_images(&self) -> zbus::Result<Vec<Dict>>;
+    #[zbus(allow_interactive_auth)]
     fn get_image(&self, name: &str) -> zbus::Result<Dict>;
+    #[zbus(allow_interactive_auth)]
     fn generate(&self, names: &[String], options: Options<'_>) -> zbus::Result<String>;
+    #[zbus(allow_interactive_auth)]
     fn pull_image(&self, reference: &str, options: Options<'_>) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn create_machine(
         &self,
         source: &str,
         name: &str,
         options: Options<'_>,
     ) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn push_image(&self, image: &str, options: Options<'_>) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn build_image(
         &self,
         directory: &str,
         tag: &str,
         options: Options<'_>,
     ) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn prune_build_cache(&self, options: Options<'_>) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn build_cache_usage(&self) -> zbus::Result<Vec<Dict>>;
+    #[zbus(allow_interactive_auth)]
     fn build_dockerfile(
         &self,
         context: zbus::zvariant::Fd<'_>,
         options: Options<'_>,
     ) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn remove_images(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn remove_machines(
         &self,
         names: &[String],
         options: Options<'_>,
     ) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn search_images(
         &self,
         term: &str,
@@ -61,23 +76,31 @@ pub trait Manager {
         limit: u32,
         options: Options<'_>,
     ) -> zbus::Result<(Vec<Dict>, Vec<String>)>;
+    #[zbus(allow_interactive_auth)]
     fn list_repositories(
         &self,
         filter: &str,
         with_tags: bool,
         options: Options<'_>,
     ) -> zbus::Result<Vec<Dict>>;
+    #[zbus(allow_interactive_auth)]
     fn list_tags(&self, repository: &str, options: Options<'_>) -> zbus::Result<Vec<String>>;
+    #[zbus(allow_interactive_auth)]
     fn image_digest(&self, reference: &str, options: Options<'_>) -> zbus::Result<String>;
+    #[zbus(allow_interactive_auth)]
     fn list_machines(&self, all: bool) -> zbus::Result<Vec<Dict>>;
+    #[zbus(allow_interactive_auth)]
     fn get_machine(&self, name: &str) -> zbus::Result<Dict>;
+    #[zbus(allow_interactive_auth)]
     fn machine_stats(&self, names: &[String]) -> zbus::Result<Vec<Dict>>;
+    #[zbus(allow_interactive_auth)]
     fn copy_from(
         &self,
         machine: &str,
         path: &str,
         options: Options<'_>,
     ) -> zbus::Result<(zbus::zvariant::OwnedFd, OwnedObjectPath)>;
+    #[zbus(allow_interactive_auth)]
     fn copy_to(
         &self,
         machine: &str,
@@ -85,22 +108,35 @@ pub trait Manager {
         stream: zbus::zvariant::Fd<'_>,
         options: Options<'_>,
     ) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn list_secrets(&self) -> zbus::Result<Vec<Dict>>;
+    #[zbus(allow_interactive_auth)]
     fn get_secret(&self, name: &str) -> zbus::Result<Dict>;
+    #[zbus(allow_interactive_auth)]
     fn create_secret(&self, name: &str, content: &[u8], options: Options<'_>) -> zbus::Result<()>;
+    #[zbus(allow_interactive_auth)]
     fn remove_secrets(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn list_volumes(&self) -> zbus::Result<Vec<Dict>>;
+    #[zbus(allow_interactive_auth)]
     fn create_volume(&self, name: &str) -> zbus::Result<String>;
+    #[zbus(allow_interactive_auth)]
     fn remove_volumes(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn prune_volumes(&self) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn auto_update(&self, names: &[String], options: Options<'_>) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn prune_images(&self, options: Options<'_>) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn disk_usage(&self) -> zbus::Result<Dict>;
+    #[zbus(allow_interactive_auth)]
     fn start_machine(
         &self,
         name: &str,
         options: Options<'_>,
     ) -> zbus::Result<(String, Vec<String>)>;
+    #[zbus(allow_interactive_auth)]
     fn run_machine(
         &self,
         name: &str,
@@ -111,13 +147,20 @@ pub trait Manager {
         OwnedObjectPath,
         Vec<String>,
     )>;
+    #[zbus(allow_interactive_auth)]
     fn stop_machine(&self, name: &str, options: Options<'_>)
         -> zbus::Result<(String, Vec<String>)>;
+    #[zbus(allow_interactive_auth)]
     fn kill_machine(&self, name: &str, options: Options<'_>) -> zbus::Result<Vec<String>>;
+    #[zbus(allow_interactive_auth)]
     fn pause_machine(&self, name: &str) -> zbus::Result<()>;
+    #[zbus(allow_interactive_auth)]
     fn unpause_machine(&self, name: &str) -> zbus::Result<()>;
+    #[zbus(allow_interactive_auth)]
     fn machine_processes(&self, name: &str) -> zbus::Result<Vec<Dict>>;
+    #[zbus(allow_interactive_auth)]
     fn update_machine(&self, name: &str, options: Options<'_>) -> zbus::Result<bool>;
+    #[zbus(allow_interactive_auth)]
     fn exec(
         &self,
         machine: &str,
@@ -125,39 +168,51 @@ pub trait Manager {
         user: &str,
         options: Options<'_>,
     ) -> zbus::Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)>;
+    #[zbus(allow_interactive_auth)]
     fn shell(
         &self,
         machine: &str,
         user: &str,
         options: Options<'_>,
     ) -> zbus::Result<(zbus::zvariant::OwnedFd, String)>;
+    #[zbus(allow_interactive_auth)]
     fn events(
         &self,
         options: Options<'_>,
     ) -> zbus::Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)>;
+    #[zbus(allow_interactive_auth)]
     fn logs(
         &self,
         machine: &str,
         options: Options<'_>,
     ) -> zbus::Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)>;
+    #[zbus(allow_interactive_auth)]
     fn list_networks(&self) -> zbus::Result<Vec<Dict>>;
+    #[zbus(allow_interactive_auth)]
     fn get_network(&self, name: &str) -> zbus::Result<(Dict, Vec<Dict>)>;
+    #[zbus(allow_interactive_auth)]
     fn create_network(&self, name: &str, options: Options<'_>) -> zbus::Result<Dict>;
+    #[zbus(allow_interactive_auth)]
     fn remove_networks(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn prune_networks(&self) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn connect_network(
         &self,
         network: &str,
         machine: &str,
         options: Options<'_>,
     ) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn disconnect_network(
         &self,
         network: &str,
         machine: &str,
         options: Options<'_>,
     ) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn network_up(&self) -> zbus::Result<Dict>;
+    #[zbus(allow_interactive_auth)]
     fn login(
         &self,
         registry: &str,
@@ -165,6 +220,7 @@ pub trait Manager {
         password: &str,
         options: Options<'_>,
     ) -> zbus::Result<Dict>;
+    #[zbus(allow_interactive_auth)]
     fn logout(&self, registry: &str) -> zbus::Result<bool>;
 
     #[zbus(signal)]
@@ -518,8 +574,42 @@ impl JobWatch {
         if result == "done" {
             Ok(proxy.result().await.map_err(error)?)
         } else {
-            Err(anyhow!("{}", proxy.error().await.map_err(error)?))
+            Err(JobFailed {
+                error: proxy.error().await.map_err(error)?,
+                result: proxy.result().await.unwrap_or_default(),
+            }
+            .into())
         }
+    }
+}
+
+/// A job that failed; its result says what it did before, as a removal's `removed`.
+#[derive(Debug)]
+pub struct JobFailed {
+    pub error: String,
+    pub result: Dict,
+}
+
+impl std::fmt::Display for JobFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.error)
+    }
+}
+
+impl std::error::Error for JobFailed {}
+
+/// A job's result, also when it failed after part of its work: the failure is said,
+/// and what was done still counts.
+pub fn partly(outcome: Result<Dict>) -> Result<Dict> {
+    match outcome {
+        Ok(result) => Ok(result),
+        Err(e) => match e.downcast::<JobFailed>() {
+            Ok(failed) => {
+                eprintln!("warning: {}", failed.error);
+                Ok(failed.result)
+            }
+            Err(e) => Err(e),
+        },
     }
 }
 
@@ -754,6 +844,21 @@ pub fn dash(text: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_job_that_failed_partly_still_says_what_it_did() {
+        let result = super::Dict::from([(
+            "removed".to_string(),
+            zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::from(vec!["a"])).unwrap(),
+        )]);
+        let failed = super::JobFailed {
+            error: "b is in use".to_string(),
+            result,
+        };
+        let kept = super::partly(Err(failed.into())).unwrap();
+        assert_eq!(super::strings(&kept, "removed"), ["a"]);
+        assert!(super::partly(Err(anyhow::anyhow!("the service went away"))).is_err());
+    }
+
     #[test]
     fn a_service_of_another_version_is_pointed_out() {
         assert_eq!(super::version_warning("1.5.1", "1.5.1"), None);

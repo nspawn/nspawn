@@ -663,6 +663,20 @@ impl Registry {
         } else if request.count < 0 {
             vec![format!("{kind}=all")]
         } else {
+            // No more names than the specs have devices of the kind: a count is anybody's
+            // number, and the names it makes are looked up one by one.
+            let prefix = format!("{kind}=");
+            let there = self
+                .devices
+                .keys()
+                .filter(|n| n.starts_with(&prefix))
+                .count();
+            if request.count as usize > there {
+                bail!(
+                    "{} GPUs asked for; the CDI specs have {there} devices of {kind}",
+                    request.count
+                );
+            }
             (0..request.count).map(|i| format!("{kind}={i}")).collect()
         })
     }
@@ -916,7 +930,8 @@ fn complete(d: &DeviceNode) -> Result<Node> {
             }
         }
     }
-    if matches!(node.kind.as_str(), "b" | "c") {
+    // An unbuffered character device ('u') is one to the kernel and to the cgroup.
+    if matches!(node.kind.as_str(), "b" | "c" | "u") {
         node.permissions = match d.permissions.as_str() {
             "" => "rwm".to_string(),
             "none" => String::new(),
@@ -949,8 +964,9 @@ pub fn plan_with(registry: &Registry, tuning: &Tuning) -> Result<Option<Plan>> {
         return Ok(None);
     }
     let mut names: Vec<String> = Vec::new();
-    let add = |name: String, names: &mut Vec<String>| {
-        if !names.contains(&name) {
+    let mut seen = std::collections::HashSet::new();
+    let mut add = |name: String, names: &mut Vec<String>| {
+        if seen.insert(name.clone()) {
             names.push(name);
         }
     };
@@ -1022,18 +1038,16 @@ pub fn plan_with(registry: &Registry, tuning: &Tuning) -> Result<Option<Plan>> {
     }
     let depth = |b: &Bind| b.target.split('/').filter(|c| !c.is_empty()).count();
     plan.mounts.sort_by_key(depth);
+    // The OCI runtime's order: every prestart hook, then createRuntime, createContainer
+    // and startContainer, each in the order of the specs.
     for stage in [
-        &["prestart", "createRuntime"][..],
-        &["createContainer"],
-        &["startContainer"],
+        "prestart",
+        "createRuntime",
+        "createContainer",
+        "startContainer",
     ] {
-        plan.hooks.extend(
-            edits
-                .hooks
-                .iter()
-                .filter(|h| stage.contains(&h.hook_name.as_str()))
-                .cloned(),
-        );
+        plan.hooks
+            .extend(edits.hooks.iter().filter(|h| h.hook_name == stage).cloned());
     }
     for hook in edits
         .hooks
@@ -1071,7 +1085,14 @@ pub fn plan(tuning: &Tuning) -> Result<Option<Plan>> {
     if tuning.cdi_devices.is_empty() && tuning.gpus.is_empty() {
         return Ok(None);
     }
-    plan_with(&Registry::load(), tuning)
+    // The specs' YAML goes a level down the stack per level of nesting, as compose's.
+    let registry = std::thread::Builder::new()
+        .stack_size(crate::compose::STACK)
+        .spawn(Registry::load)
+        .context("starting a thread")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("reading the CDI specs failed"))?;
+    plan_with(&registry, tuning)
 }
 
 /// The device nodes as --device gives them: the host's node where it is the one the
@@ -1083,7 +1104,9 @@ pub fn device_paths(plan: &Plan, dir: &Path) -> Vec<Device> {
         .enumerate()
         .map(|(i, node)| {
             let mut permissions = node.permissions.clone();
-            if !node.on_host && !permissions.is_empty() && !permissions.contains('m') {
+            // Even one the machine may not open: the unit's own pass makes it again
+            // under the unit's device policy.
+            if !node.on_host && node.kind != "p" && !permissions.contains('m') {
                 permissions.push('m');
             }
             Device {
@@ -1137,7 +1160,7 @@ pub fn devices(plan: &Plan, dir: &Path) -> Result<Vec<Device>> {
             } else {
                 ""
             };
-            kind == node.kind
+            (kind == node.kind || (kind == "c" && node.kind == "u"))
                 && (kind == "p"
                     || meta.rdev() == nix::sys::stat::makedev(node.major as u64, node.minor as u64))
         });
@@ -1215,8 +1238,21 @@ fn cstring(path: &Path) -> Result<CString> {
 /// The OCI bundle the hooks read the root from: config.json naming it, with the
 /// mounts, devices and process the machine gets.
 fn write_bundle(plan: &Plan, machine: &HookMachine) -> Result<()> {
-    std::fs::create_dir_all(machine.bundle)
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    // Root's alone: the configuration carries the machine's environment, -e secrets
+    // among it, and a flat machine's directory can be walked by anybody.
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(machine.bundle)
         .with_context(|| format!("creating {}", machine.bundle.display()))?;
+    for dir in [
+        machine.bundle,
+        machine.bundle.parent().unwrap_or(machine.bundle),
+    ] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting {}", dir.display()))?;
+    }
     let config = serde_json::json!({
         "ociVersion": "1.2.0",
         "root": { "path": machine.root, "readonly": false },
@@ -1246,7 +1282,13 @@ fn write_bundle(plan: &Plan, machine: &HookMachine) -> Result<()> {
         },
     });
     let path = machine.bundle.join("config.json");
-    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
+    let _ = std::fs::remove_file(&path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, &serde_json::to_vec_pretty(&config)?))
         .with_context(|| format!("writing {}", path.display()))
 }
 
@@ -1438,7 +1480,8 @@ mod tests {
         // A start may have to make it again, inside the unit's cgroup.
         assert_eq!(devices[1].host, dir.join("node1").to_string_lossy());
         assert_eq!(devices[1].permissions, "rwm");
-        assert_eq!(devices[2].permissions, "");
+        // One the machine may not open is still one the unit's pass may make again.
+        assert_eq!(devices[2].permissions, "m");
         assert_eq!(devices[3].permissions, "rwm");
         // A node outside /dev is allowed by its numbers.
         let tmp = tempfile::tempdir().unwrap();
@@ -1526,6 +1569,41 @@ containerEdits:
 "#;
 
     #[test]
+    fn hooks_run_in_the_runtime_s_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let etc = dir.path().join("etc");
+        write(
+            &etc,
+            "order.yaml",
+            r#"cdiVersion: 0.6.0
+kind: vendor.example/dev
+devices:
+- name: one
+  containerEdits:
+    deviceNodes:
+    - path: /dev/one
+      hostPath: /dev/null
+    hooks:
+    - hookName: prestart
+      path: /usr/bin/b
+containerEdits:
+  hooks:
+  - hookName: createRuntime
+    path: /usr/bin/a
+"#,
+        );
+        let registry = Registry::load_from(&[&etc]);
+        assert!(registry.errors.is_empty(), "{:?}", registry.errors);
+        let tuning = Tuning {
+            cdi_devices: vec!["vendor.example/dev=one".to_string()],
+            ..Tuning::default()
+        };
+        let plan = plan_with(&registry, &tuning).unwrap().unwrap();
+        let paths: Vec<&str> = plan.hooks.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, ["/usr/bin/b", "/usr/bin/a"], "prestart first");
+    }
+
+    #[test]
     fn specs_are_read_and_resolved() {
         let dir = tempfile::tempdir().unwrap();
         let (etc, run) = (dir.path().join("etc"), dir.path().join("run"));
@@ -1582,6 +1660,15 @@ containerEdits:
             plan_with(&registry, &two).unwrap_err().to_string(),
             "CDI device injection failed: unresolvable CDI devices nvidia.com/gpu=1"
         );
+        // A count past the devices there are is refused before any name is made.
+        let many = Tuning {
+            gpus: vec![parse_gpus("10000000").unwrap()],
+            ..Tuning::default()
+        };
+        assert!(plan_with(&registry, &many)
+            .unwrap_err()
+            .to_string()
+            .contains("10000000 GPUs asked for"));
         // No AMD spec, and no driver for a capability nobody has.
         for (request, error) in [
             (
@@ -1746,6 +1833,18 @@ containerEdits:
         .unwrap();
         assert!(!made.on_host);
         assert_eq!(made.permissions, "");
+        // An unbuffered character device is one to the cgroup.
+        let unbuffered = complete(&DeviceNode {
+            path: "/dev/u".into(),
+            host_path: "/nonexistent/node".into(),
+            kind: "u".into(),
+            major: 240,
+            minor: 0,
+            ..DeviceNode::default()
+        })
+        .unwrap();
+        assert!(!unbuffered.on_host);
+        assert_eq!(unbuffered.permissions, "rwm");
         assert!(complete(&DeviceNode {
             path: "/dev/z".into(),
             host_path: "/nonexistent/node".into(),

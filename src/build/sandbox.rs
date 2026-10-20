@@ -115,6 +115,8 @@ pub fn argv(step: &Step) -> Vec<String> {
             out.push(format!("--bind-ro={}:{target}", file.display()));
         }
     }
+    // A context file or a target may have a colon, where systemd-nspawn splits.
+    let path = crate::settings::bind_path;
     for mount in &step.mounts {
         match mount {
             Mount::Bind {
@@ -122,14 +124,15 @@ pub fn argv(step: &Step) -> Vec<String> {
                 target,
                 read_only,
             } => out.push(format!(
-                "--{}={}:{target}",
+                "--{}={}:{}",
                 if *read_only { "bind-ro" } else { "bind" },
-                source.display()
+                path(&source.to_string_lossy()),
+                path(target)
             )),
             Mount::Tmpfs { target, options } => out.push(if options.is_empty() {
-                format!("--tmpfs={target}")
+                format!("--tmpfs={}", path(target))
             } else {
-                format!("--tmpfs={target}:{options}")
+                format!("--tmpfs={}:{options}", path(target))
             }),
         }
     }
@@ -306,6 +309,11 @@ mod tests {
                     target: "/scratch".into(),
                     options: "size=1m".into(),
                 },
+                Mount::Bind {
+                    source: "/b/context/a:b".into(),
+                    target: "/x:rbind".into(),
+                    read_only: true,
+                },
             ],
             shm_size: Some(1 << 20),
             ulimits: [("nofile".to_string(), (64, 128))].into(),
@@ -321,6 +329,7 @@ mod tests {
             "--bind-ro=/b/hosts:/etc/hosts",
             "--bind=/c/x:/cache",
             "--tmpfs=/scratch:size=1m",
+            "--bind-ro=/b/context/a\\:b:/x\\:rbind",
             "--tmpfs=/dev/shm:size=1048576",
             "--rlimit=RLIMIT_NOFILE=64:128",
             "--system-call-filter=~kexec_load kexec_file_load",

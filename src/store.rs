@@ -43,6 +43,9 @@ pub struct ImageRecord {
     /// An app whose image wants its program to be PID 1 (s6-overlay), found at install.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pid1: bool,
+    /// Made from an image built on this host, which no registry has a newer one of.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub built: bool,
     /// When it first started, in unix seconds: a record that never did is an image only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started: Option<u64>,
@@ -177,13 +180,20 @@ impl ImageRecord {
 
 impl ImageRecord {
     /// What the machine runs: the overrides where given, the image's otherwise.
+    /// An entrypoint given drops the image's command, as docker's does: the arguments
+    /// given with it are all it gets.
     pub fn effective_command(&self) -> Vec<String> {
         let mut argv = self
             .entrypoint
             .as_deref()
             .unwrap_or_else(|| self.run.entrypoint())
             .to_vec();
-        argv.extend_from_slice(self.cmd.as_deref().unwrap_or_else(|| self.run.cmd()));
+        let cmd: &[String] = match (&self.entrypoint, &self.cmd) {
+            (_, Some(cmd)) => cmd,
+            (Some(_), None) => &[],
+            (None, None) => self.run.cmd(),
+        };
+        argv.extend_from_slice(cmd);
         argv
     }
 
@@ -254,6 +264,20 @@ pub struct StoreLock(#[allow(dead_code)] Flock<File>);
 /// listing the digests, gone with the guard.
 pub struct BlobHold(PathBuf);
 
+/// Read by a pull from writing its hold until it has seen which blobs are there, written
+/// by the collector from reading the holds until it has deleted: a hold made in between
+/// would keep nothing from a collector that read them before it.
+static HOLDS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Keeps the collector waiting while a hold is made and what it holds is looked at.
+pub fn holds_still() -> std::sync::RwLockReadGuard<'static, ()> {
+    HOLDS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn collecting() -> std::sync::RwLockWriteGuard<'static, ()> {
+    HOLDS.write().unwrap_or_else(|e| e.into_inner())
+}
+
 impl Drop for BlobHold {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
@@ -280,6 +304,9 @@ impl Drop for Starting {
 
 /// Holds and start markers older than this belong to a process that died.
 const STALE_MARKER: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The file that says since when records keep their first start.
+const STARTS_KEPT: &str = "starts-kept-since";
 
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -352,6 +379,25 @@ impl Store {
         self.root.join("builds")
     }
 
+    /// Since when records keep their first start, in unix seconds: one made earlier, by a
+    /// release that did not, says nothing by lacking it.
+    pub fn starts_kept_since(&self) -> Option<u64> {
+        std::fs::read_to_string(self.root.join(STARTS_KEPT))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Notes that records keep their first start from now on, once.
+    pub fn keep_starts(&self) -> Result<()> {
+        if self.starts_kept_since().is_some() {
+            return Ok(());
+        }
+        let path = self.root.join(STARTS_KEPT);
+        write_atomically(&path, format!("{}\n", now_unix()).as_bytes())
+    }
+
     /// The build cache: the layers of the steps builds made and the base images they
     /// pulled.
     pub fn build_cache_dir(&self) -> PathBuf {
@@ -410,11 +456,15 @@ impl Store {
     }
 
     /// The records a rollback keeps, whose layers and blobs stay until it is decided.
+    /// One cut short (a crash while it was written or removed) keeps nothing: it could
+    /// not be put back, and every collection would fail on it.
     fn rollback_records(&self) -> Result<Vec<(ImageRecord, Vec<u8>)>> {
         let mut out = Vec::new();
         for name in self.rollbacks() {
-            if let Some(kept) = self.load_rollback(&name)? {
-                out.push(kept);
+            match self.load_rollback(&name) {
+                Ok(Some(kept)) => out.push(kept),
+                Ok(None) => {}
+                Err(e) => eprintln!("warning: the rollback of {name} is left out: {e:#}"),
             }
         }
         Ok(out)
@@ -631,6 +681,19 @@ impl Store {
         Ok(BlobHold(path))
     }
 
+    /// Takes every hold: pulls and builds run only in the service, so at its own start
+    /// any left is one of a service that was killed, whose PID may run something else by
+    /// now and keep the hold alive for ever.
+    pub fn forget_holds(&self) {
+        if let Ok(entries) = fs::read_dir(self.blobs_dir()) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(".hold-") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
     /// The blob file names held by pulls in flight; stale holds are removed on the way.
     fn held_blobs(&self) -> HashSet<String> {
         let mut held = HashSet::new();
@@ -657,6 +720,16 @@ impl Store {
 
     fn starting_path(&self, name: &str) -> PathBuf {
         self.root.join("starting").join(name)
+    }
+
+    /// Takes every start marker: only the service makes them, so at its own start any
+    /// left is one a service that stopped or was killed during a start could not take.
+    pub fn forget_starts(&self) {
+        if let Ok(entries) = fs::read_dir(self.root.join("starting")) {
+            for entry in entries.flatten() {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
 
     /// Marks `name` as starting until the guard is dropped.
@@ -750,6 +823,7 @@ impl Store {
         if !self.blobs_dir().is_dir() {
             return Ok(removed);
         }
+        let _collecting = collecting();
         let held = self.held_blobs();
         let dir = self.blobs_dir();
         for entry in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
@@ -912,10 +986,15 @@ impl Store {
             Ok(r) => r.to_string(),
             Err(_) => return Ok(None),
         };
-        Ok(self
+        // By reference: the image itself before a machine that was made from it or ran,
+        // whose network and settings are its own.
+        let mut of: Vec<ImageRecord> = self
             .list_images()?
             .into_iter()
-            .find(|r| r.reference == wanted))
+            .filter(|r| r.reference == wanted)
+            .collect();
+        of.sort_by_key(|r| !crate::api::disk::image_only(self, r));
+        Ok(of.into_iter().next())
     }
 
     /// Deletes layers that no image record references, in each layer store separately:
@@ -943,6 +1022,7 @@ impl Store {
                 .map(|b| layer_dir_name(b)),
         );
         // A build or a pull in flight keeps what it holds.
+        let _collecting = collecting();
         let held = self.held_blobs();
         let mut removed = Vec::new();
         for ownership in [Ownership::Root, Ownership::Foreign] {
@@ -1042,8 +1122,23 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
     let tmp = path.with_file_name(format!(".tmp-{name}.{}", unique_suffix()));
-    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("moving {} into place", path.display()))
+    // On disk before the name: a record renamed into place but still in the page cache
+    // at a power loss comes back empty, and an empty record stops every start.
+    let written = File::create(&tmp).and_then(|mut file| {
+        io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+    }
+    fs::rename(&tmp, path).with_context(|| format!("moving {} into place", path.display()))?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Ok(dir) = File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// A suffix for temporary names that repeats neither inside this process (the service
@@ -1155,13 +1250,15 @@ enum Whiteout {
 }
 
 fn classify(path: &Path) -> Option<Whiteout> {
-    let name = path.file_name()?.to_str()?;
+    use std::os::unix::ffi::OsStrExt;
+    // On bytes: the whiteout of a name that is not UTF-8 is still one.
+    let name = path.file_name()?.as_bytes();
     let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    if name == ".wh..wh..opq" {
+    if name == b".wh..wh..opq" {
         return Some(Whiteout::Opaque(parent));
     }
-    name.strip_prefix(".wh.")
-        .map(|target| Whiteout::File(parent.join(target)))
+    name.strip_prefix(b".wh.")
+        .map(|target| Whiteout::File(parent.join(std::ffi::OsStr::from_bytes(target))))
 }
 
 fn is_safe_relative(path: &Path) -> bool {
@@ -1205,6 +1302,9 @@ pub fn extract_layer(
     archive.set_preserve_ownerships(root);
     archive.set_overwrite(true);
     let mut count = 0u64;
+    // Set once every entry is there: an entry made inside a directory changes its time,
+    // and a build's later layers carry the times of what they change.
+    let mut dir_times: Vec<(PathBuf, i64)> = Vec::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
@@ -1247,13 +1347,34 @@ pub fn extract_layer(
                 }
             }
         }
-        if !entry
+        if kind.is_hard_link() {
+            // The inode carries its metadata from the entry that made it.
+            if hard_link_in(target, &path, &entry)? {
+                count += 1;
+            }
+            continue;
+        }
+        let special = kind.is_fifo() || kind.is_character_special() || kind.is_block_special();
+        if special {
+            // tar writes these as empty regular files.
+            let Some(dest) = resolve_inside(target, &path, true)? else {
+                eprintln!(
+                    "warning: skipping {} in layer: a symlink on its path leads outside",
+                    path.display()
+                );
+                continue;
+            };
+            if !make_node(&dest, kind, file_mode, entry.header(), root)? {
+                continue;
+            }
+        } else if !entry
             .unpack_in(target)
             .with_context(|| format!("unpacking {}", path.display()))?
         {
             continue;
         }
         let unpacked = target.join(&path);
+        let mtime = entry.header().mtime().unwrap_or(0) as i64;
         apply_xattrs(&unpacked, &xattrs)?;
         if ownership == Ownership::Foreign {
             std::os::unix::fs::lchown(&unpacked, Some(foreign_id(uid)), Some(foreign_id(gid)))
@@ -1269,7 +1390,16 @@ pub fn extract_layer(
                 }
             }
         }
+        // The entry's own time, 0 included, which tar makes 1.
+        if kind.is_dir() {
+            dir_times.push((unpacked, mtime));
+        } else {
+            set_mtime(&unpacked, mtime);
+        }
         count += 1;
+    }
+    for (dir, mtime) in dir_times.iter().rev() {
+        set_mtime(dir, *mtime);
     }
     if ownership == Ownership::Foreign {
         // Directories tar created implicitly for entries without a parent entry, and the
@@ -1277,6 +1407,104 @@ pub fn extract_layer(
         shift_remaining(target)?;
     }
     Ok(count)
+}
+
+/// Sets a path's access and modification times, a symlink's own; best effort, as tar's.
+fn set_mtime(path: &Path, mtime: i64) {
+    let time = nix::sys::time::TimeSpec::new(mtime, 0);
+    let _ = nix::sys::stat::utimensat(
+        nix::fcntl::AT_FDCWD,
+        path,
+        &time,
+        &time,
+        nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+    );
+}
+
+/// A hard link of a layer, made to the name it gives: to a symlink itself when that
+/// name is one, as containerd links it, where tar's unpack follows the symlink and
+/// fails on one that leads outside the layer. Whether one was made.
+fn hard_link_in<R: Read>(target: &Path, path: &Path, entry: &tar::Entry<R>) -> Result<bool> {
+    let source = entry
+        .link_name()?
+        .with_context(|| format!("hard link {} names nothing", path.display()))?
+        .into_owned();
+    if source.components().any(|c| c == Component::ParentDir) {
+        eprintln!(
+            "warning: skipping hard link {} in layer: it names {}",
+            path.display(),
+            source.display()
+        );
+        return Ok(false);
+    }
+    let (Some(dest), Some(source)) = (
+        resolve_inside(target, path, true)?,
+        resolve_inside(target, &source, true)?,
+    ) else {
+        eprintln!(
+            "warning: skipping hard link {} in layer: a symlink on its path leads outside",
+            path.display()
+        );
+        return Ok(false);
+    };
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if fs::symlink_metadata(&dest).is_ok_and(|meta| !meta.is_dir()) {
+        fs::remove_file(&dest).with_context(|| format!("replacing {}", dest.display()))?;
+    }
+    // linkat without AT_SYMLINK_FOLLOW: a symlink source is linked, not its target.
+    fs::hard_link(&source, &dest)
+        .with_context(|| format!("linking {} to {}", dest.display(), source.display()))?;
+    Ok(true)
+}
+
+/// A FIFO or device node of a layer, made as it is, owned as the entry says when root
+/// makes it. Without root a device cannot be made: it is left out, as the reference
+/// leaves it out unprivileged. Whether one was made.
+fn make_node(
+    dest: &Path,
+    kind: tar::EntryType,
+    mode: u32,
+    header: &tar::Header,
+    root: bool,
+) -> Result<bool> {
+    use nix::sys::stat::{makedev, mknod, Mode, SFlag};
+    let flag = if kind.is_fifo() {
+        SFlag::S_IFIFO
+    } else if kind.is_character_special() {
+        SFlag::S_IFCHR
+    } else {
+        SFlag::S_IFBLK
+    };
+    if flag != SFlag::S_IFIFO && !root {
+        return Ok(false);
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if fs::symlink_metadata(dest).is_ok() {
+        remove_any(dest)?;
+    }
+    let major = u64::from(header.device_major().ok().flatten().unwrap_or(0));
+    let minor = u64::from(header.device_minor().ok().flatten().unwrap_or(0));
+    mknod(
+        dest,
+        flag,
+        Mode::from_bits_truncate(mode),
+        makedev(major, minor),
+    )
+    .with_context(|| format!("making {}", dest.display()))?;
+    if root {
+        let uid = header.uid().unwrap_or(0) as u32;
+        let gid = header.gid().unwrap_or(0) as u32;
+        std::os::unix::fs::lchown(dest, Some(uid), Some(gid))
+            .with_context(|| format!("owning {}", dest.display()))?;
+    }
+    // mknod takes the umask off the mode.
+    fs::set_permissions(dest, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("setting the mode of {}", dest.display()))?;
+    Ok(true)
 }
 
 /// Attributes an image does not get to set. overlayfs reads its own from the layers: a
@@ -1506,6 +1734,40 @@ fn lock_blocking(root: &Path, wait: Option<std::time::Duration>) -> Result<Store
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_entrypoint_given_drops_the_images_command() {
+        let record = |json: serde_json::Value| -> ImageRecord {
+            let mut base = serde_json::json!({
+                "name": "web", "reference": "r", "manifest_digest": "sha256:a", "layers": [],
+                "backend": "overlay", "created": 1,
+                "run": { "entrypoint": ["/docker-entrypoint.sh"], "cmd": ["nginx", "-g", "daemon off;"] },
+            });
+            for (k, v) in json.as_object().unwrap() {
+                base[k] = v.clone();
+            }
+            serde_json::from_value::<ImageRecord>(base)
+                .unwrap()
+                .normalize()
+        };
+        assert_eq!(
+            record(serde_json::json!({})).effective_command(),
+            ["/docker-entrypoint.sh", "nginx", "-g", "daemon off;"]
+        );
+        assert_eq!(
+            record(serde_json::json!({ "entrypoint": ["/bin/sh"] })).effective_command(),
+            ["/bin/sh"]
+        );
+        assert_eq!(
+            record(serde_json::json!({ "entrypoint": ["/bin/sh"], "cmd": ["-c", "id"] }))
+                .effective_command(),
+            ["/bin/sh", "-c", "id"]
+        );
+        assert_eq!(
+            record(serde_json::json!({ "cmd": ["nginx", "-t"] })).effective_command(),
+            ["/docker-entrypoint.sh", "nginx", "-t"]
+        );
+    }
     use std::io::Cursor;
 
     /// Real layers carry an owner in every header; a header built here would leave the
@@ -1635,6 +1897,97 @@ mod tests {
             Some(Whiteout::File(PathBuf::from("top")))
         );
         assert_eq!(classify(Path::new("a/normal")), None);
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            classify(Path::new(std::ffi::OsStr::from_bytes(
+                b"data/.wh.caf\xe9.txt"
+            ))),
+            Some(Whiteout::File(PathBuf::from(std::ffi::OsStr::from_bytes(
+                b"data/caf\xe9.txt"
+            ))))
+        );
+    }
+
+    #[test]
+    fn entries_keep_their_times() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut dir = tar::Header::new_gnu();
+        header_owner(&mut dir);
+        dir.set_mode(0o755);
+        dir.set_entry_type(tar::EntryType::Directory);
+        dir.set_size(0);
+        dir.set_mtime(1_000_000);
+        builder
+            .append_data(&mut dir, "usr/", std::io::empty())
+            .unwrap();
+        let mut file = tar::Header::new_gnu();
+        header_owner(&mut file);
+        file.set_mode(0o644);
+        file.set_entry_type(tar::EntryType::Regular);
+        file.set_size(2);
+        file.set_mtime(0);
+        builder
+            .append_data(&mut file, "usr/zero", Cursor::new(b"hi".as_slice()))
+            .unwrap();
+        let blob = tmp.path().join("layer.tar");
+        fs::write(&blob, builder.into_inner().unwrap()).unwrap();
+        let target = tmp.path().join("layer");
+        fs::create_dir(&target).unwrap();
+        extract_layer(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar",
+            &target,
+            WhiteoutMode::Apply,
+            Ownership::Root,
+        )
+        .unwrap();
+        let time = |p: &str| fs::symlink_metadata(target.join(p)).unwrap().mtime();
+        assert_eq!(time("usr"), 1_000_000, "made inside, it keeps its time");
+        assert_eq!(time("usr/zero"), 0, "0 stays 0");
+    }
+
+    #[test]
+    fn a_hard_link_to_a_symlink_links_the_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header_owner(&mut header);
+        header.set_mode(0o777);
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        builder
+            .append_link(&mut header, "usr/lib/libbar.so", "/usr/lib/libfoo.so.1")
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header_owner(&mut header);
+        header.set_mode(0o777);
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        builder
+            .append_link(&mut header, "usr/lib/libfoo.so", "usr/lib/libbar.so")
+            .unwrap();
+        let blob = tmp.path().join("layer.tar");
+        fs::write(&blob, builder.into_inner().unwrap()).unwrap();
+        let target = tmp.path().join("layer");
+        fs::create_dir(&target).unwrap();
+        let count = extract_layer(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar",
+            &target,
+            WhiteoutMode::Apply,
+            Ownership::Root,
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+        let link = target.join("usr/lib/libfoo.so");
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new("/usr/lib/libfoo.so.1")
+        );
+        let a = fs::symlink_metadata(&link).unwrap();
+        let b = fs::symlink_metadata(target.join("usr/lib/libbar.so")).unwrap();
+        assert_eq!((a.dev(), a.ino()), (b.dev(), b.ino()));
     }
 
     #[test]
@@ -1696,6 +2049,47 @@ mod tests {
         assert_eq!(fs::read_to_string(target.join("a/new")).unwrap(), "new");
         assert!(!target.join("b/wiped").exists());
         assert_eq!(fs::read_to_string(target.join("b/fresh")).unwrap(), "fresh");
+    }
+
+    #[test]
+    fn fifos_and_devices_come_out_as_they_are() {
+        use std::os::unix::fs::FileTypeExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("root");
+        fs::create_dir_all(&target).unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, kind) in [
+            ("run/pipe", tar::EntryType::Fifo),
+            ("dev/null2", tar::EntryType::Char),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(0o620);
+            header.set_size(0);
+            header.set_device_major(1).unwrap();
+            header.set_device_minor(3).unwrap();
+            builder.append_data(&mut header, path, io::empty()).unwrap();
+        }
+        let blob = tmp.path().join("layer.tar");
+        fs::write(&blob, builder.into_inner().unwrap()).unwrap();
+        extract_layer(
+            &blob,
+            "application/vnd.oci.image.layer.v1.tar",
+            &target,
+            WhiteoutMode::OverlayLower,
+            Ownership::Root,
+        )
+        .unwrap();
+        let pipe = fs::symlink_metadata(target.join("run/pipe")).unwrap();
+        assert!(pipe.file_type().is_fifo());
+        assert_eq!(pipe.mode() & 0o7777, 0o620);
+        // A device takes root; without it, it is left out rather than made a file.
+        let device = fs::symlink_metadata(target.join("dev/null2"));
+        if nix::unistd::geteuid().is_root() {
+            assert!(device.unwrap().file_type().is_char_device());
+        } else {
+            assert!(device.is_err());
+        }
     }
 
     #[test]
@@ -1803,6 +2197,7 @@ mod tests {
             pid1: false,
             started: None,
             fixed_addresses: BTreeSet::new(),
+            built: false,
             run: RunSpec::default(),
             network: Network::Veth,
             network_name: None,
@@ -1881,6 +2276,7 @@ mod tests {
             pid1: false,
             started: None,
             fixed_addresses: BTreeSet::new(),
+            built: false,
             run: RunSpec::default(),
             network: Network::Host,
             network_name: None,
@@ -1920,6 +2316,22 @@ mod tests {
                 .origin,
             "build"
         );
+        // A rollback cut short keeps nothing and stops no collection.
+        store.save_rollback(&rec, b"{}").unwrap();
+        fs::remove_file(store.rollback_dir("img").join("manifest.json")).unwrap();
+        fs::write(store.root.join("rollback").join("junk"), "x").unwrap();
+        store.gc_blobs().unwrap();
+        store.gc_layers().unwrap();
+        store.forget_rollback("img").unwrap();
+        fs::remove_file(store.root.join("rollback").join("junk")).unwrap();
+        // A machine of the same reference that ran, first by name, is not the image.
+        let mut image = rec.clone();
+        image.backend = BackendChoice::Overlay;
+        store.record_image(&image).unwrap();
+        let mut ran = rec.clone();
+        ran.name = "aaa".to_string();
+        ran.started = Some(1);
+        store.record_image(&ran).unwrap();
         assert_eq!(
             store
                 .find_image("img:1", "hub.example")
@@ -1928,6 +2340,7 @@ mod tests {
                 .name,
             "img"
         );
+        store.remove_record("aaa").unwrap();
         assert!(store
             .find_image("other:1", "hub.example")
             .unwrap()
@@ -2093,6 +2506,7 @@ mod tests {
             pid1: false,
             started: None,
             fixed_addresses: BTreeSet::new(),
+            built: false,
             run: RunSpec::default(),
             network: Network::Bridge,
             network_name: None,
@@ -2441,6 +2855,44 @@ mod tests {
     }
 
     #[test]
+    fn the_collector_waits_for_a_hold_being_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let digest = format!("sha256:{}", "e".repeat(64));
+        fs::create_dir_all(store.blobs_dir()).unwrap();
+        fs::write(store.blob_path(&digest), b"x").unwrap();
+        let still = holds_still();
+        let collector = {
+            let store = store.clone();
+            std::thread::spawn(move || store.gc_blobs().unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!collector.is_finished(), "it waits for the pull to look");
+        // The pull found the blob present and holds it.
+        let hold = store.hold_blobs(std::slice::from_ref(&digest)).unwrap();
+        assert!(store.has_blob(&digest));
+        drop(still);
+        assert!(collector.join().unwrap().is_empty());
+        assert!(store.has_blob(&digest));
+        drop(hold);
+    }
+
+    #[test]
+    fn a_new_service_forgets_the_holds_of_the_last_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let digest = format!("sha256:{}", "d".repeat(64));
+        fs::create_dir_all(store.blobs_dir()).unwrap();
+        fs::write(store.blob_path(&digest), b"x").unwrap();
+        // Left by a service that was killed, under a PID something else runs as now.
+        let left = store.hold_blobs(std::slice::from_ref(&digest)).unwrap();
+        std::mem::forget(left);
+        assert!(store.gc_blobs().unwrap().is_empty());
+        store.forget_holds();
+        assert_eq!(store.gc_blobs().unwrap(), vec![digest]);
+    }
+
+    #[test]
     fn a_long_download_keeps_its_hold() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
@@ -2480,6 +2932,15 @@ mod tests {
         assert!(!store.is_starting("web"));
         let mark = store.mark_starting("web").unwrap();
         assert!(store.is_starting("web"));
+        // A marker a service left when it went is gone at the next service's start.
+        let left = store.mark_starting("left").unwrap();
+        std::mem::forget(left);
+        store.forget_starts();
+        assert!(!store.is_starting("left") && !store.is_starting("web"));
+        let mark = {
+            drop(mark);
+            store.mark_starting("web").unwrap()
+        };
         drop(mark);
         assert!(!store.is_starting("web"));
         let stale = store.mark_starting("old").unwrap();

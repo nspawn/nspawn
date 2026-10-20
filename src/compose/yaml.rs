@@ -322,6 +322,13 @@ impl ResetPass<'_> {
 
     fn cached(&mut self, id: NodeId, path: Path) -> Result<NodeId, Error> {
         if let Some((node, relative)) = self.resolved.get(&id).cloned() {
+            // Each path replayed counts as a visit: nested aliases multiply them.
+            self.visits += relative.len();
+            if self.visits > MAX_NODE_VISITS {
+                return Err(error(format!(
+                    "compose file exceeds maximum node visit limit ({MAX_NODE_VISITS})"
+                )));
+            }
             for rel in relative {
                 self.paths.push(path.join(&rel));
             }
@@ -744,6 +751,29 @@ mod tests {
         }
         let err = load(&text).unwrap_err();
         assert!(err.0.contains("once its aliases are followed"), "{err}");
+        // Few values, each a long text: stopped by what the text comes to.
+        let mut text = format!(
+            "s: &s \"{}\"\na0: &a0 [{}]\n",
+            "A".repeat(4096),
+            ["*s"; 10].join(", ")
+        );
+        for i in 1..6 {
+            let prev = format!("*a{}", i - 1);
+            text += &format!("a{i}: &a{i} [{}]\n", vec![prev; 10].join(", "));
+        }
+        let err = load(&text).unwrap_err();
+        assert!(err.0.contains("once its aliases are followed"), "{err}");
+    }
+
+    #[test]
+    fn replayed_resets_count_as_visits() {
+        let mut text = format!("a0: &a0 [{}]\n", ["!reset 0"; 10].join(", "));
+        for i in 1..9 {
+            let prev = format!("*a{}", i - 1);
+            text += &format!("a{i}: &a{i} [{}]\n", vec![prev; 10].join(", "));
+        }
+        let err = load(&text).unwrap_err();
+        assert!(err.0.contains("maximum node visit limit"), "{err}");
     }
 
     #[test]

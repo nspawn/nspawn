@@ -70,6 +70,9 @@ pub struct RunSpec {
     /// reading the Docker API take as its port when nothing else names one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exposed_ports: Vec<String>,
+    /// SHELL of a Containerfile, which a CMD-SHELL healthcheck runs in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shell: Vec<String>,
 }
 
 impl RunSpec {
@@ -82,16 +85,33 @@ impl RunSpec {
         // A docker extension the typed config leaves out.
         let raw: serde_json::Value =
             serde_json::from_slice(bytes).context("parsing the OCI image config")?;
+        // Labels, volumes and the healthcheck reach the bus, which takes no NUL.
+        let text = |s: &String| s.replace('\0', "\u{FFFD}");
         let mut volumes: Vec<String> = raw
             .get("config")
             .and_then(|c| c.get("Volumes"))
             .and_then(serde_json::Value::as_object)
-            .map(|v| v.keys().cloned().collect())
+            .map(|v| v.keys().map(text).collect())
             .unwrap_or_default();
         volumes.sort();
+        let healthcheck = crate::health::Healthcheck::from_config(&raw).map(|mut h| {
+            h.test = h.test.iter().map(text).collect();
+            h
+        });
+        let shell: Vec<String> = raw
+            .get("config")
+            .and_then(|c| c.get("Shell"))
+            .and_then(serde_json::Value::as_array)
+            .map(|s| {
+                s.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
         let spec = RunSpec {
-            healthcheck: crate::health::Healthcheck::from_config(&raw),
+            healthcheck,
             volumes,
+            shell,
             exposed_ports: exposed_ports(&raw),
             entrypoint: config.entrypoint.unwrap_or_default(),
             cmd: config.cmd.unwrap_or_default(),
@@ -100,7 +120,12 @@ impl RunSpec {
             working_dir: config.working_dir.filter(|d| !d.is_empty()),
             user: config.user.filter(|u| !u.is_empty()),
             stop_signal: config.stop_signal.filter(|s| !s.is_empty()),
-            labels: config.labels.unwrap_or_default().into_iter().collect(),
+            labels: config
+                .labels
+                .unwrap_or_default()
+                .iter()
+                .map(|(k, v)| (text(k), text(v)))
+                .collect(),
         };
         spec.check_plain()?;
         Ok(spec)
@@ -124,6 +149,10 @@ impl RunSpec {
             ("Entrypoint", &self.entrypoint[..]),
             ("Cmd", &self.cmd[..]),
             ("Env", &self.env[..]),
+            // Not in the settings file, but in the notes of every start, which reach the
+            // operator's terminal.
+            ("Volumes", &self.volumes[..]),
+            ("Shell", &self.shell[..]),
         ];
         for (field, values) in fields {
             for value in values {
@@ -171,6 +200,13 @@ fn plain(field: &str, value: &str, quoted: bool) -> Result<()> {
     {
         anyhow::bail!(
             "the image config's {field} holds a control character ({value:?}); refusing the image"
+        );
+    }
+    // Written unquoted, a value that ends in a backslash would take the next line of the
+    // settings file, the operator's User= among them.
+    if !quoted && value.ends_with('\\') {
+        anyhow::bail!(
+            "the image config's {field} ends in a backslash ({value:?}); refusing the image"
         );
     }
     Ok(())
@@ -394,6 +430,8 @@ mod tests {
             ("Entrypoint", r#"["/bin/sh\nBind=/:/host"]"#),
             ("Cmd", r#"["a", "b\n"]"#),
             ("Env", r#"["A=1\nBind=/:/x"]"#),
+            // Printed in a note on every start.
+            ("Volumes", r#"{"/data\u001b]52;c;eA==\u0007": {}}"#),
         ] {
             let json = format!(
                 r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":[]}},"config":{{"{field}":{value}}}}}"#
@@ -411,6 +449,28 @@ mod tests {
         assert_eq!(spec.env, ["DEPS=llvm21-dev \tclang21"]);
         let tab = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{"WorkingDir":"/a\tb"}}"#;
         assert!(RunSpec::from_config(tab).is_err());
+        // A backslash at the end of an unquoted value would join the next line.
+        for field in ["WorkingDir", "User"] {
+            let json = format!(
+                r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":[]}},"config":{{"{field}":"/app\\"}}}}"#
+            );
+            let err = RunSpec::from_config(json.as_bytes()).unwrap_err();
+            assert!(err.to_string().contains("backslash"), "{field}: {err}");
+        }
+        let quoted = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{"Cmd":["a\\"],"WorkingDir":"/a\\b"}}"#;
+        assert!(RunSpec::from_config(quoted).is_ok());
+        // SHELL, which a CMD-SHELL healthcheck runs in.
+        let shell = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{"Shell":["/busybox/sh","-c"]}}"#;
+        assert_eq!(
+            RunSpec::from_config(shell).unwrap().shell,
+            ["/busybox/sh", "-c"]
+        );
+        // A NUL in what reaches the bus, which would drop the service, is replaced.
+        let nul = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{"Labels":{"x":"a\u0000b"},"Volumes":{"/d\u0000":{}},"Healthcheck":{"Test":["CMD","x\u0000"]}}}"#;
+        let spec = RunSpec::from_config(nul).unwrap();
+        assert_eq!(spec.labels["x"], "a\u{FFFD}b");
+        assert_eq!(spec.volumes, ["/d\u{FFFD}"]);
+        assert_eq!(spec.healthcheck.unwrap().test, ["CMD", "x\u{FFFD}"]);
     }
 
     #[test]

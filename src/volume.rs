@@ -117,11 +117,13 @@ fn merge_tree(from: &Path, to: &Path) -> Result<()> {
             continue;
         }
         if kind.is_dir() {
-            if is_opaque(&source) {
-                clear_dir(&target)?;
-            }
+            // A link a lower layer left there goes first: clearing through it would empty
+            // whatever it points at on the host.
             if target.symlink_metadata().is_ok_and(|m| !m.is_dir()) {
                 remove_entry(&target)?;
+            }
+            if is_opaque(&source) {
+                clear_dir(&target)?;
             }
             if !target.is_dir() {
                 fs::create_dir(&target)
@@ -168,8 +170,16 @@ fn remove_entry(path: &Path) -> Result<()> {
     }
 }
 
-/// Empties a directory, keeping the directory itself.
+/// Empties a volume a seed left half filled; best effort.
+pub fn empty(dir: &Path) {
+    let _ = clear_dir(dir);
+}
+
+/// Empties a directory, keeping the directory itself; a link is never followed.
 fn clear_dir(dir: &Path) -> Result<()> {
+    if !dir.symlink_metadata().is_ok_and(|m| m.is_dir()) {
+        return Ok(());
+    }
     let Ok(entries) = fs::read_dir(dir) else {
         return Ok(());
     };
@@ -412,11 +422,10 @@ pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
                 Err(_) => bail!("{value} has no value here; give it as {value}=VALUE"),
             },
         };
-        if name.is_empty()
-            || name.starts_with(|c: char| c.is_ascii_digit())
-            || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            bail!("{value}: {name:?} is not a valid variable name");
+        // Any name but an empty one, as docker takes them: Elasticsearch reads
+        // discovery.type, and the settings file carries such names as they are.
+        if name.is_empty() {
+            bail!("invalid environment variable: {value}");
         }
         out.retain(|v| v.split_once('=').map(|(n, _)| n) != Some(name));
         out.push(assignment);
@@ -524,7 +533,10 @@ mod tests {
         let env = parse_env(&["A=1".into(), "NSPAWN_TEST_VAR".into(), "A=2".into()]).unwrap();
         assert_eq!(env, vec!["NSPAWN_TEST_VAR=from-host", "A=2"]);
         assert!(parse_env(&["NSPAWN_TEST_UNSET_VAR".into()]).is_err());
-        assert!(parse_env(&["1A=x".into()]).is_err());
+        assert_eq!(
+            parse_env(&["discovery.type=single-node".into(), "1A=x".into()]).unwrap(),
+            ["discovery.type=single-node", "1A=x"]
+        );
         assert!(parse_env(&["=x".into()]).is_err());
         assert!(parse_env(&["none".into()]).unwrap().is_empty());
         assert_eq!(parse_env(&["X=a=b".into()]).unwrap(), vec!["X=a=b"]);
@@ -615,6 +627,35 @@ mod tests {
             assert!(seed_from_layers(&layers, "data", &opaque).unwrap());
             assert!(opaque.join("c").is_file() && !opaque.join("gone").exists());
         }
+    }
+
+    #[test]
+    fn an_opaque_directory_over_a_link_clears_nothing_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("keep"), "keep").unwrap();
+        let base = tmp.path().join("base");
+        let top = tmp.path().join("top");
+        fs::create_dir_all(base.join("data")).unwrap();
+        std::os::unix::fs::symlink(&victim, base.join("data/cache")).unwrap();
+        fs::create_dir_all(top.join("data/cache")).unwrap();
+        fs::write(top.join("data/cache/new"), "new").unwrap();
+        if xattr::set(top.join("data/cache"), "user.overlay.opaque", b"y").is_err() {
+            return;
+        }
+        let volume = tmp.path().join("volume");
+        fs::create_dir(&volume).unwrap();
+        assert!(seed_from_layers(&[base, top], "data", &volume).unwrap());
+        assert_eq!(fs::read_to_string(victim.join("keep")).unwrap(), "keep");
+        assert!(!victim.join("new").exists());
+        let cache = volume.join("cache");
+        assert!(cache.symlink_metadata().unwrap().is_dir());
+        assert_eq!(fs::read_to_string(cache.join("new")).unwrap(), "new");
+        // Clearing a link leaves its target alone.
+        std::os::unix::fs::symlink(&victim, tmp.path().join("link")).unwrap();
+        clear_dir(&tmp.path().join("link")).unwrap();
+        assert!(victim.join("keep").exists());
     }
 
     #[test]

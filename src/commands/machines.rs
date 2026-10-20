@@ -37,9 +37,33 @@ pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
         .list_machines(all)
         .await
         .map_err(client::error)?;
+    // before= and since= name any machine, a stopped one too, and one that does not
+    // exist is an error, as docker has it.
+    let references: Vec<&String> = ["before", "since"]
+        .iter()
+        .filter_map(|k| filters.values(k))
+        .flatten()
+        .collect();
+    let mut created: HashMap<String, u64> = HashMap::new();
+    if !references.is_empty() {
+        let every = client
+            .manager
+            .list_machines(true)
+            .await
+            .map_err(client::error)?;
+        for m in &every {
+            created.insert(client::string(m, "name"), client::u64(m, "created"));
+        }
+        if let Some(missing) = references
+            .iter()
+            .find(|r| !created.contains_key(r.as_str()))
+        {
+            bail!("No such container: {missing}");
+        }
+    }
     let machines: Vec<Dict> = listed
         .iter()
-        .filter(|m| ps_matches(&filters, m, &listed))
+        .filter(|m| ps_matches(&filters, m, &created))
         .map(|m| {
             m.iter()
                 .map(|(k, v)| {
@@ -60,12 +84,8 @@ pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
     }
     if let Some(format) = &args.format {
         let rows: Vec<serde_json::Value> = machines.iter().map(|m| ps_row(m, now)).collect();
-        // .Label "k" is a method of the rows formats are written for; here the labels
-        // are a map to index.
-        let label_call =
-            regex::Regex::new(r#"\.Label\s+("(?:[^"\\]|\\.)*")"#).expect("a valid expression");
-        let format = label_call.replace_all(format, r#"(or (index .LabelsMap $1) "")"#);
-        let text = crate::gotemplate::format_list(&format, PS_TABLE, &ps_headers(), &rows)
+        // .Label "k" is a method of the rows, which the template engine gives them.
+        let text = crate::gotemplate::format_list(format, PS_TABLE, &ps_headers(), &rows)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         print!("{text}");
         return Ok(());
@@ -140,7 +160,11 @@ fn exit_code(machine: &Dict) -> Option<i32> {
         .and_then(|v| i32::try_from(v.clone()).ok())
 }
 
-fn ps_matches(filters: &crate::dockerapi::filters::Filters, m: &Dict, all: &[Dict]) -> bool {
+fn ps_matches(
+    filters: &crate::dockerapi::filters::Filters,
+    m: &Dict,
+    created: &HashMap<String, u64>,
+) -> bool {
     let name = client::string(m, "name");
     let json = client::dict_to_json(m);
     let labels: std::collections::BTreeMap<String, String> = json["labels"]
@@ -154,11 +178,7 @@ fn ps_matches(filters: &crate::dockerapi::filters::Filters, m: &Dict, all: &[Dic
     let reference = client::string(m, "reference");
     let familiar = crate::dockerapi::util::familiar(&reference);
     let ports = client::strings(m, "ports");
-    let created_of = |n: &str| {
-        all.iter()
-            .find(|o| client::string(o, "name") == n)
-            .map(|o| client::u64(o, "created"))
-    };
+    let created_of = |n: &str| created.get(n).copied();
     let health = match client::string(m, "health").as_str() {
         "" => "none".to_string(),
         h => h.to_string(),
@@ -174,9 +194,11 @@ fn ps_matches(filters: &crate::dockerapi::filters::Filters, m: &Dict, all: &[Dic
             ps_state(m) == "exited" && codes.iter().any(|c| c.parse::<i32>().ok() == exit_code(m))
         })
         && filters.values("network").is_none_or(|nets| {
+            // A machine on the host's network or on none is under host or none.
             client::strings(m, "networks")
                 .iter()
                 .any(|n| nets.contains(n))
+                || matches!(client::string(m, "network").as_str(), n @ ("host" | "none") if nets.contains(n))
         })
         && filters.values("ancestor").is_none_or(|images| {
             images.iter().any(|i| {
@@ -193,14 +215,17 @@ fn ps_matches(filters: &crate::dockerapi::filters::Filters, m: &Dict, all: &[Dic
                 let host = p.split("->").next().unwrap_or_default();
                 let port = host.rsplit(':').next().unwrap_or(host);
                 let proto = p.rsplit('/').next().unwrap_or("tcp");
-                wanted.contains(port) || wanted.contains(&format!("{port}/{proto}"))
+                // A bare port is a tcp one, as docker reads it.
+                wanted.contains(&format!("{port}/{proto}"))
+                    || (proto == "tcp" && wanted.contains(port))
             })
         })
         && filters.values("expose").is_none_or(|wanted| {
             ports.iter().any(|p| {
                 let inside = p.split("->").nth(1).unwrap_or_default();
                 wanted.contains(inside)
-                    || wanted.contains(inside.split('/').next().unwrap_or_default())
+                    || (inside.ends_with("/tcp")
+                        && wanted.contains(inside.split('/').next().unwrap_or_default()))
             })
         })
         && !filters
@@ -223,20 +248,28 @@ fn ps_row(m: &Dict, now: u64) -> serde_json::Value {
     let json = client::dict_to_json(m);
     let created = client::u64(m, "created");
     let started = client::u64(m, "started");
-    let labels = json["labels"].clone();
+    // A machine nspawn has no record of has no labels: none, as docker's nil map reads.
+    let labels = match &json["labels"] {
+        v @ serde_json::Value::Object(_) => v.clone(),
+        _ => serde_json::json!({}),
+    };
+    // docker sorts the KEY=VALUE strings, not the keys: a.b=x comes after a=y.
     let label_text = labels
         .as_object()
         .map(|l| {
-            l.iter()
+            let mut pairs: Vec<String> = l
+                .iter()
                 .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default()))
-                .collect::<Vec<_>>()
-                .join(",")
+                .collect();
+            pairs.sort();
+            pairs.join(",")
         })
         .unwrap_or_default();
+    // Quoted as docker quotes it: a newline of a compose command keeps to its row.
     let command = if client::string(m, "mode") == "boot" {
         "\"/sbin/init\"".to_string()
     } else {
-        format!("\"{}\"", client::strings(m, "command").join(" "))
+        crate::gotemplate::go_quote(&client::strings(m, "command").join(" "))
     };
     let state = ps_state(m);
     let since = |t: u64| crate::dockerapi::util::human_duration(now.saturating_sub(t));
@@ -268,8 +301,10 @@ fn ps_row(m: &Dict, now: u64) -> serde_json::Value {
         "Names": client::string(m, "name"),
         "Image": crate::dockerapi::util::familiar(&client::string(m, "reference")),
         "Command": command,
-        "CreatedAt": crate::dockerapi::util::rfc3339_nano(created * 1_000_000, false),
-        "RunningFor": format!("{} ago", since(created)),
+        // Go's Time.String in the local zone, as docker prints it; nothing for a machine
+        // nspawn has no record of, rather than 1970.
+        "CreatedAt": if created > 0 { crate::compose::gotime::time_string(created as i64) } else { String::new() },
+        "RunningFor": if created > 0 { format!("{} ago", since(created)) } else { String::new() },
         "Ports": ports.join(", "),
         "State": state,
         "Status": status,
@@ -502,6 +537,10 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
     if args.detach && (args.tty || args.interactive) {
         bail!("-d runs the machine in the background; -i and -t are for a run that stays attached");
     }
+    // What the start takes is read before anything is pulled or made: a file or a
+    // variable that is not there must not leave a machine behind.
+    let network_given = !args.options.network.is_empty();
+    let options_of_start = start_options(args.options, args.command)?;
     let registry = super::registry_name(client, config).await;
     let image = ImageRef::parse(&args.reference, &registry)?;
     let name = match &args.name {
@@ -511,11 +550,11 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
         None if args.rm => run_name(&image.local_name())?,
         None => image.local_name(),
     };
-    let images: Vec<(String, String)> = client
-        .manager
-        .list_images()
-        .await
-        .map_err(client::error)?
+    // The images themselves before the machines that ran, so that the source found by
+    // reference is the image and not a machine with a network and settings of its own.
+    let mut listed = client.manager.list_images().await.map_err(client::error)?;
+    listed.sort_by_key(|i| !client::bool(i, "image_only"));
+    let images: Vec<(String, String)> = listed
         .iter()
         .map(|i| (client::string(i, "name"), client::string(i, "reference")))
         .collect();
@@ -548,6 +587,14 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
         && images.iter().all(|(n, _)| n != &base);
     match source {
         Source::Local(source) => {
+            // A machine that ran is no image of its own: a new one made from it joins
+            // the default network unless told, as with docker.
+            let ran = listed
+                .iter()
+                .any(|i| client::string(i, "name") == source && !client::bool(i, "image_only"));
+            if ran && !network_given {
+                options.insert("network", Value::from("bridge"));
+            }
             client
                 .run_job_to_stderr(|| manager.create_machine(&source, &name, options))
                 .await?;
@@ -588,7 +635,7 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
                 .await?;
         }
     }
-    let mut options = start_options(args.options, args.command)?;
+    let mut options = options_of_start;
     if args.rm {
         options.insert("remove", Value::from(true));
     }
@@ -602,14 +649,8 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
     let code = match started {
         Ok(code) => code,
         Err(e) => {
-            // run --rm leaves nothing behind when the start fails.
             if args.rm {
-                let mut options = Options::new();
-                options.insert("force", Value::from(true));
-                let names = [name.clone()];
-                let _ = client
-                    .run_job_to_stderr(|| client.manager.remove_machines(&names, options))
-                    .await;
+                remove_unless_running(client, &name).await;
             }
             return Err(e);
         }
@@ -666,8 +707,29 @@ pub(crate) async fn attached(
     }
     let stdin = io::stdin();
     let mut fds = HashMap::new();
+    // A terminal reaches the program through a pipe, as with docker: given the terminal
+    // itself, the program could read what is typed after a detach, or push input into
+    // the shell. A file or a pipe goes as it is.
+    let piped = if interactive && !tty && nix::unistd::isatty(&stdin).unwrap_or(false) {
+        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .context("making a pipe for the input")?;
+        thread::spawn(move || {
+            let mut set = SigSet::empty();
+            set.add(Signal::SIGPIPE);
+            let _ = pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&set), None);
+            let mut to_program = File::from(write);
+            let _ = io::copy(&mut io::stdin().lock(), &mut to_program);
+        });
+        Some(read)
+    } else {
+        None
+    };
     if interactive && !tty {
-        fds.insert("stdin", zbus::zvariant::Fd::from(stdin.as_fd()));
+        let fd = match &piped {
+            Some(read) => read.as_fd(),
+            None => stdin.as_fd(),
+        };
+        fds.insert("stdin", zbus::zvariant::Fd::from(fd));
     }
     let (mut handed, process, notes) = client
         .manager
@@ -770,7 +832,12 @@ async fn booted_shell(client: &Client, name: &str, options: Options<'_>) -> Resu
         "-c".to_string(),
         "if [ -x /bin/bash ]; then exec /bin/bash -l; else exec /bin/sh -l; fi".to_string(),
     ];
-    let code = run_command(client, name, &shell, "", ExecSpec::default()).await;
+    // -it asked for a terminal, whatever standard output is (run -it | tee).
+    let spec = ExecSpec {
+        tty: Some(true),
+        ..ExecSpec::default()
+    };
+    let code = run_command(client, name, &shell, "", spec).await;
     let mut stop = Options::new();
     stop.insert("wait", Value::from(true));
     let stopped = client.manager.stop_machine(name, stop).await;
@@ -779,9 +846,29 @@ async fn booted_shell(client: &Client, name: &str, options: Options<'_>) -> Resu
     Ok(code)
 }
 
+/// run --rm leaves nothing behind when the start fails. One that runs (the output's
+/// reader went, the service restarted) is removed by the service once it ends, as --rm
+/// asked.
+pub(crate) async fn remove_unless_running(client: &Client, name: &str) {
+    let runs = client.manager.get_machine(name).await.is_ok_and(|m| {
+        matches!(
+            client::string(&m, "state").as_str(),
+            "running" | "opening" | "paused" | "starting" | "restarting"
+        )
+    });
+    if !runs {
+        let mut options = Options::new();
+        options.insert("force", Value::from(true));
+        let names = [name.to_string()];
+        let _ = client
+            .run_job_to_stderr(|| client.manager.remove_machines(&names, options))
+            .await;
+    }
+}
+
 /// run --rm: the machine goes once its unit is down, in a unit of its own; returns once
 /// it is gone (or after a while).
-async fn removed(client: &Client, name: &str) {
+pub(crate) async fn removed(client: &Client, name: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     while client.manager.get_image(name).await.is_ok() {
         if std::time::Instant::now() > deadline {
@@ -982,18 +1069,44 @@ pub async fn wait(args: WaitArgs, client: &Client) -> Result<()> {
             println!("{}", exit_code_of(&machine));
             continue;
         }
-        // An end of this run, not of one before it.
+        // An end of this run, not of one before it: the times are whole seconds, so an
+        // end in the second this run started counts only once the run is gone. A run
+        // that ends without its program's (a failed start, a stop during a restart's
+        // wait) is seen by looking again now and then.
         let started = client::u64(&machine, "started");
+        let still_this_run = |m: &Dict| {
+            matches!(client::string(m, "state").as_str(), "running" | "opening")
+                && client::u64(m, "started") == started
+        };
+        let mut look = tokio::time::interval(std::time::Duration::from_secs(2));
+        look.tick().await;
         let code = loop {
             if let Some(i) = ends
                 .iter()
                 .position(|(n, time, _)| n == name && *time >= started)
             {
-                break ends.remove(i).2;
+                let (_, time, code) = ends.remove(i);
+                if time == started {
+                    if let Ok(m) = client.manager.get_machine(name).await {
+                        if still_this_run(&m) {
+                            continue;
+                        }
+                    }
+                }
+                break code;
             }
-            match rx.recv().await {
-                Some(end) => ends.push(end),
-                None => bail!("the service stopped reporting the ends of machines"),
+            tokio::select! {
+                end = rx.recv() => match end {
+                    Some(end) => ends.push(end),
+                    None => bail!("the service stopped reporting the ends of machines"),
+                },
+                _ = look.tick() => {
+                    if let Ok(m) = client.manager.get_machine(name).await {
+                        if client::string(&m, "state") == "stopped" {
+                            break exit_code_of(&m);
+                        }
+                    }
+                }
             }
         };
         // The record has the program's own code, when it is still there and done.
@@ -1072,7 +1185,7 @@ pub async fn port(args: PortArgs, client: &Client) -> Result<()> {
 }
 
 /// Digits compared as numbers: 8080/tcp after 443/tcp.
-fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
+pub(crate) fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
     let split = |s: &str| -> Vec<(bool, String)> {
         let mut parts: Vec<(bool, String)> = Vec::new();
         for c in s.chars() {
@@ -1224,6 +1337,11 @@ pub async fn update(args: UpdateArgs, client: &Client) -> Result<()> {
 /// over, a pseudo terminal when this is one, pipes otherwise; the exit status comes
 /// back through the process object.
 pub async fn exec(args: ExecArgs, client: &Client) -> Result<()> {
+    if args.privileged {
+        eprintln!(
+            "note: --privileged is not used: the command gets the machine's own capabilities"
+        );
+    }
     let spec = ExecSpec {
         env: crate::volume::expand_env(&args.env)?,
         workdir: args.workdir,
@@ -1235,6 +1353,7 @@ pub async fn exec(args: ExecArgs, client: &Client) -> Result<()> {
             None
         },
         detach: args.detach,
+        no_stdin: false,
     };
     let code = run_command(client, &args.machine, &args.command, &args.user, spec).await?;
     std::process::exit(code);
@@ -1248,6 +1367,8 @@ pub(crate) struct ExecSpec {
     /// None: a terminal when this is one.
     pub tty: Option<bool>,
     pub detach: bool,
+    /// The command gets no input: its stdin ends at once, and this one is not read.
+    pub no_stdin: bool,
 }
 
 /// A shell: the login session machined offers for a booted machine, the namespaces
@@ -1338,7 +1459,12 @@ pub(crate) async fn run_command(
         else {
             bail!("the service returned neither a terminal nor pipes");
         };
-        tokio::task::block_in_place(|| pump_pipes(stdin, stdout, stderr))?;
+        if spec.no_stdin {
+            drop(stdin);
+            tokio::task::block_in_place(|| pump_output(stdout, stderr))?;
+        } else {
+            tokio::task::block_in_place(|| pump_pipes(stdin, stdout, stderr))?;
+        }
     }
     // The streams end when the command (and whatever it left behind) closes them; the
     // exit status may take its time after that.
@@ -1564,6 +1690,116 @@ fn pump_prefixed(streams: Vec<(String, OwnedFd, OwnedFd)>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machine_without_a_record_has_no_labels_for_ps() {
+        let row = ps_row(&Dict::new(), 0);
+        let text = crate::gotemplate::format_list(
+            r#"{{.Names}}<{{or (index .LabelsMap "x") ""}}>"#,
+            PS_TABLE,
+            &ps_headers(),
+            &[row],
+        )
+        .unwrap();
+        assert_eq!(text, "<>\n");
+    }
+
+    #[test]
+    fn label_is_a_method_of_the_rows() {
+        let m = Dict::from([(
+            "labels".to_string(),
+            zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::from(
+                std::collections::HashMap::from([("app", "web")]),
+            ))
+            .unwrap(),
+        )]);
+        let row = ps_row(&m, 0);
+        for (format, want) in [
+            (r#"{{.Label "app"}}"#, "web"),
+            ("{{.Label `app`}}", "web"),
+            (r#"{{$c := .}}{{$c.Label "app"}}"#, "web"),
+            (r#"{{with .Names}}{{$.Label "app"}}{{end}}"#, ""),
+            (r#"{{"app" | .Label}}"#, "web"),
+            (r#"tag .Label "x" {{.Label "none"}}"#, "tag .Label \"x\" "),
+        ] {
+            let text = crate::gotemplate::format_list(
+                format,
+                PS_TABLE,
+                &ps_headers(),
+                std::slice::from_ref(&row),
+            )
+            .unwrap();
+            assert_eq!(text, format!("{want}\n"), "{format}");
+        }
+        assert!(
+            crate::gotemplate::format_list("{{.Label}}", PS_TABLE, &ps_headers(), &[row])
+                .unwrap_err()
+                .contains("wrong number of args for Label: want 1 got 0")
+        );
+    }
+
+    #[test]
+    fn ps_filters_match_as_docker_s() {
+        let value =
+            |v: zbus::zvariant::Value<'static>| zbus::zvariant::OwnedValue::try_from(v).unwrap();
+        let m = Dict::from([
+            ("name".to_string(), value("dns".into())),
+            ("network".to_string(), value("host".into())),
+            ("ports".to_string(), value(vec!["53->53/udp"].into())),
+            ("created".to_string(), value(20u64.into())),
+        ]);
+        let f = |pairs: &[&str]| {
+            crate::dockerapi::filters::Filters::from_pairs(
+                &pairs.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let created = HashMap::from([("db".to_string(), 10u64), ("dns".to_string(), 20)]);
+        assert!(ps_matches(&f(&["network=host"]), &m, &created));
+        assert!(
+            !ps_matches(&f(&["publish=53"]), &m, &created),
+            "a bare port is tcp"
+        );
+        assert!(ps_matches(&f(&["publish=53/udp"]), &m, &created));
+        assert!(ps_matches(&f(&["since=db"]), &m, &created));
+        assert!(!ps_matches(&f(&["before=db"]), &m, &created));
+    }
+
+    #[test]
+    fn labels_are_sorted_as_docker_sorts_them() {
+        let m = Dict::from([(
+            "labels".to_string(),
+            zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::from(
+                std::collections::HashMap::from([
+                    ("com.docker.compose.project", "demo"),
+                    ("com.docker.compose.project.config_files", "/x/compose.yaml"),
+                ]),
+            ))
+            .unwrap(),
+        )]);
+        assert_eq!(
+            ps_row(&m, 0)["Labels"],
+            "com.docker.compose.project.config_files=/x/compose.yaml,com.docker.compose.project=demo"
+        );
+        assert_eq!(ps_row(&m, 0)["CreatedAt"], "", "no record, no 1970");
+    }
+
+    #[test]
+    fn a_command_keeps_to_its_row() {
+        let m = Dict::from([(
+            "command".to_string(),
+            zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::from(vec![
+                "sh",
+                "-c",
+                "echo \"a\"\nexec sleep infinity",
+            ]))
+            .unwrap(),
+        )]);
+        assert_eq!(
+            ps_row(&m, 0)["Command"],
+            r#""sh -c echo \"a\"\nexec sleep infinity""#
+        );
+    }
 
     #[test]
     fn ports_in_natural_order() {

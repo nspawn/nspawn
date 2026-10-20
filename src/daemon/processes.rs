@@ -67,7 +67,27 @@ impl Processes {
             .collect()
     }
 
-    /// Forgets the oldest exited commands beyond `EXITED_KEPT`; their paths, for the
+    /// How many processes of `uid` run.
+    pub fn running_for(&self, uid: u32) -> usize {
+        self.all
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.owner == uid && *p.state.lock().unwrap() == "running")
+            .count()
+    }
+
+    /// Puts a command that exited after every other one, so that retirement goes by the
+    /// exit and the one just exited stays for its client.
+    fn exited(&self, path: &OwnedObjectPath) {
+        let mut all = self.all.lock().unwrap();
+        if let Some(i) = all.iter().position(|p| p.path == *path) {
+            let process = all.remove(i);
+            all.push(process);
+        }
+    }
+
+    /// Forgets the commands that exited first beyond `EXITED_KEPT`; their paths, for the
     /// object server to drop.
     fn retire(&self) -> Vec<OwnedObjectPath> {
         let mut all = self.all.lock().unwrap();
@@ -287,6 +307,7 @@ pub async fn register_with(
         if let Ok(emitter) = state.emitter_to(entry.path.as_ref(), entry.client.as_deref()) {
             let _ = Process::exited(&emitter, status).await;
         }
+        state.processes.exited(&entry.path);
         for path in state.processes.retire() {
             let _ = state
                 .connection()

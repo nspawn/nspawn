@@ -970,6 +970,9 @@ where
 
 type LineParse = Result<(Option<Box<Node>>, bool), Error>;
 
+/// How many ONBUILD wrappers a line may nest in the tree.
+const MAX_ONBUILD_LEVELS: usize = 64;
+
 /// Builds the node of one instruction line. ONBUILD wraps the instruction
 /// that follows it; nested ONBUILDs are unwound in a loop.
 fn new_node_from_line(line: &str, d: &Directives, comments: Vec<String>) -> Result<Node, Error> {
@@ -979,6 +982,13 @@ fn new_node_from_line(line: &str, d: &Directives, comments: Vec<String>) -> Resu
         let (cmd, flags, args) = split_command(&current, d.escape_token);
         let lower = to_lower(&cmd);
         if lower == "onbuild" && !args.is_empty() {
+            // Each level keeps the rest of the line, so their cost grows with the square
+            // of the depth; the instruction is refused past the second level anyway.
+            if levels.len() >= MAX_ONBUILD_LEVELS {
+                return Err(Error::new(
+                    "Chaining ONBUILD via `ONBUILD ONBUILD` isn't allowed".to_string(),
+                ));
+            }
             levels.push((cmd, flags, std::mem::replace(&mut current, args)));
             continue;
         }
@@ -1982,11 +1992,13 @@ RUN [\"<<'EOF'\"]
 
     #[test]
     fn deep_nesting_and_long_chains_do_not_recurse() {
-        let line = format!("{}RUN x\n", "ONBUILD ".repeat(8000));
+        let line = format!("{}RUN x\n", "ONBUILD ".repeat(MAX_ONBUILD_LEVELS));
         let parsed = parse(line.as_bytes()).unwrap();
         let copy = parsed.clone();
         assert_eq!(copy, parsed);
         drop(copy);
+        let line = format!("{}RUN x\n", "ONBUILD ".repeat(100_000));
+        assert!(parse(line.as_bytes()).is_err());
         let line = format!("EXPOSE {}\n", "1 ".repeat(30000));
         let parsed = parse(line.as_bytes()).unwrap();
         assert_eq!(parsed.ast.children[0].next_nodes().count(), 30000);

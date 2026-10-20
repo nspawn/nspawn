@@ -9,11 +9,13 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::api::{line, note, Context, Report};
+use crate::backend::BackendChoice;
 use crate::store::{ImageRecord, Ownership, Store};
 
 /// A record pulled or built and never run as a machine. Records of releases before the
 /// first start was kept say nothing of it: an address, options only start gives, or a
-/// writable layer with something in it say it ran.
+/// writable layer with something in it say it ran, and a flat one, which writes into the
+/// image's own tree, is taken for a machine.
 pub fn image_only(store: &Store, record: &ImageRecord) -> bool {
     if record.origin == "create" || record.started.is_some() || record.address.is_some() {
         return false;
@@ -31,11 +33,24 @@ pub fn image_only(store: &Store, record: &ImageRecord) -> bool {
     if given {
         return false;
     }
-    let upper = store
-        .machines_private_dir()
-        .join(&record.name)
-        .join("upper");
-    std::fs::read_dir(upper).map_or(true, |mut d| d.next().is_none())
+    if store
+        .starts_kept_since()
+        .is_some_and(|since| record.created >= since)
+    {
+        return true;
+    }
+    let writable = match record.backend {
+        BackendChoice::Overlay => store
+            .machines_private_dir()
+            .join(&record.name)
+            .join("upper"),
+        BackendChoice::Mstack => store
+            .machines_dir
+            .join(format!("{}.mstack", record.name))
+            .join("rw"),
+        BackendChoice::Flat | BackendChoice::Auto => return false,
+    };
+    std::fs::read_dir(writable).map_or(true, |mut d| d.next().is_none())
 }
 
 /// Bytes of the regular files under `path`, each file once however many links it has.
@@ -316,7 +331,14 @@ pub async fn prune_images(
         }
         own.insert(r.name.clone(), size);
     }
-    let removal = crate::api::images::remove_machines(ctx, &names, false, report).await?;
+    // Chosen without the lock: one that a machine was made from or that ran since, and
+    // so is no image only any more, stays.
+    let still = move |store: &Store, records: &[ImageRecord], name: &str| {
+        (!prunable(store, records, all).iter().any(|n| n == name))
+            .then(|| format!("{name} is in use by now"))
+    };
+    let removal =
+        crate::api::images::remove_machines_if(ctx, &names, false, report, &still).await?;
     for name in &removal.removed {
         line(report, format!("deleted: {name}"));
     }
@@ -341,24 +363,41 @@ pub async fn prune_build_cache(
     report: Report<'_>,
 ) -> Result<Pruned> {
     let store = &ctx.store;
-    let _lock = store.lock().await?;
+    // Measured before the lock, which machine starts wait for: the sizes only decide
+    // what goes, and a cache mount in use waits for its build below.
     let rows = crate::build::cache::usage(store)?;
-    // A build running now may have a cache mount bound in a step: those wait for it.
-    let building = std::fs::read_dir(store.builds_dir()).is_ok_and(|mut d| {
-        d.any(|e| e.is_ok_and(|e| e.file_name().to_string_lossy().starts_with("df-")))
-    });
-    let gone: Vec<_> = crate::build::cache::prunable(&rows, all, until, keep_storage)
-        .into_iter()
-        .filter(|r| !(building && r.kind == "mount"))
-        .collect();
-    crate::build::cache::remove(store, &gone)?;
-    store.gc_layers()?;
-    store.gc_blobs()?;
+    let trash = store
+        .build_cache_dir()
+        .join(format!(".trash-{}", crate::store::unique_suffix()));
+    let gone: Vec<_> = {
+        let _lock = store.lock().await?;
+        // A build running now may have a cache mount bound in a step: those wait for it.
+        // A Dockerfile build's directory, by its marker: an mkosi build of a name that
+        // starts with df- is none.
+        let building = std::fs::read_dir(store.builds_dir()).is_ok_and(|mut d| {
+            d.any(|e| {
+                e.is_ok_and(|e| {
+                    e.file_name().to_string_lossy().starts_with("df-")
+                        && e.path().join(crate::build::exec::MARKER).exists()
+                })
+            })
+        });
+        let gone: Vec<_> = crate::build::cache::prunable(&rows, all, until, keep_storage)
+            .into_iter()
+            .filter(|r| !(building && r.kind == "mount"))
+            .collect();
+        crate::build::cache::remove(store, &gone, &trash)?;
+        store.gc_layers()?;
+        store.gc_blobs()?;
+        gone
+    };
+    let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(trash)).await;
     for row in &gone {
         line(report, format!("deleted: {}", row.id));
     }
+    // What images take too stays on disk.
     Ok(Pruned {
-        reclaimed: gone.iter().map(|r| r.size).sum(),
+        reclaimed: gone.iter().filter(|r| !r.shared).map(|r| r.size).sum(),
         removed: gone.into_iter().map(|r| r.id).collect(),
     })
 }
@@ -412,6 +451,30 @@ mod tests {
             &store,
             &record(serde_json::json!({ "restart": "always" }))
         ));
+        // Flat and mstack records of older releases: a flat one is a machine, an mstack
+        // one ran when its writable layer has something.
+        let flat = record(serde_json::json!({ "name": "f", "backend": "flat" }));
+        assert!(!image_only(&store, &flat));
+        let mstack = record(serde_json::json!({ "name": "s", "backend": "mstack" }));
+        let rw = store.machines_dir.join("s.mstack/rw");
+        std::fs::create_dir_all(&rw).unwrap();
+        assert!(image_only(&store, &mstack));
+        std::fs::write(rw.join("f"), "x").unwrap();
+        assert!(!image_only(&store, &mstack));
+        // Records made once first starts are kept say it by lacking one.
+        std::fs::create_dir_all(dir.path().join("s")).unwrap();
+        store.keep_starts().unwrap();
+        let since = store.starts_kept_since().unwrap();
+        let new = |backend: &str| {
+            record(serde_json::json!({ "name": "n", "backend": backend, "created": since }))
+        };
+        assert!(image_only(&store, &new("flat")));
+        assert!(!image_only(
+            &store,
+            &record(serde_json::json!({ "name": "s", "backend": "mstack" }))
+        ));
+        store.keep_starts().unwrap();
+        assert_eq!(store.starts_kept_since(), Some(since));
     }
 
     #[test]

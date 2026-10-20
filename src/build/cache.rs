@@ -173,7 +173,11 @@ pub fn usage(store: &crate::store::Store) -> Result<Vec<Usage>> {
         });
     }
     if let Ok(mounts) = std::fs::read_dir(cache.dir.join("mounts")) {
-        for mount in mounts.flatten() {
+        // A mount being seeded (.new-*) is no cache yet.
+        for mount in mounts
+            .flatten()
+            .filter(|m| !m.file_name().to_string_lossy().starts_with('.'))
+        {
             let meta = mount.metadata().ok();
             out.push(Usage {
                 id: mount.file_name().to_string_lossy().into_owned(),
@@ -192,32 +196,40 @@ pub fn usage(store: &crate::store::Store) -> Result<Vec<Usage>> {
     Ok(out)
 }
 
-/// What `builder prune` takes: without `all`, what no image takes too; everything
-/// last used before `until`; and, with `keep_storage`, the least recently used beyond
-/// that many bytes.
+/// What `builder prune` takes, as BuildKit's prune: without `all`, what no image takes
+/// too; only what was last used before `until`; and with `keep_storage`, the least
+/// recently used first, until what the cache holds of its own fits in that many bytes.
 pub fn prunable(
     rows: &[Usage],
     all: bool,
     until: Option<u64>,
     keep_storage: Option<u64>,
 ) -> Vec<Usage> {
-    let mut kept = 0u64;
+    let eligible = |row: &&Usage| (all || !row.shared) && until.is_none_or(|t| row.used < t);
+    let Some(limit) = keep_storage else {
+        return rows.iter().filter(eligible).cloned().collect();
+    };
+    // What images take too is theirs: it counts against nothing.
+    let mut total: u64 = rows.iter().filter(|r| !r.shared).map(|r| r.size).sum();
+    let mut candidates: Vec<&Usage> = rows.iter().filter(eligible).collect();
+    candidates.sort_by(|a, b| a.used.cmp(&b.used).then(a.id.cmp(&b.id)));
     let mut out = Vec::new();
-    for row in rows {
-        let old = until.is_none_or(|t| row.used < t);
-        let fits = keep_storage.is_some_and(|limit| kept + row.size <= limit);
-        if (all || !row.shared) && old && !fits {
-            out.push(row.clone());
-        } else {
-            kept += row.size;
+    for row in candidates {
+        if total <= limit {
+            break;
         }
+        if !row.shared {
+            total -= row.size;
+        }
+        out.push(row.clone());
     }
     out
 }
 
 /// Removes `rows` from the cache; the store's gc then takes the blobs and layers nothing
-/// else keeps.
-pub fn remove(store: &crate::store::Store, rows: &[Usage]) -> Result<()> {
+/// else keeps. Cache mounts are moved into `trash`, for the caller to delete once it
+/// holds the store lock no more.
+pub fn remove(store: &crate::store::Store, rows: &[Usage], trash: &Path) -> Result<()> {
     let cache = Cache::new(&store.build_cache_dir());
     for row in rows {
         let path = match row.kind {
@@ -229,8 +241,13 @@ pub fn remove(store: &crate::store::Store, rows: &[Usage]) -> Result<()> {
                 .join(format!("{}.json", file_name(&row.id))),
             _ => {
                 let dir = cache.dir.join("mounts").join(&row.id);
-                std::fs::remove_dir_all(&dir)
-                    .with_context(|| format!("removing {}", dir.display()))?;
+                std::fs::create_dir_all(trash)
+                    .with_context(|| format!("creating {}", trash.display()))?;
+                match std::fs::rename(&dir, trash.join(&row.id)) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e).with_context(|| format!("removing {}", dir.display())),
+                }
                 continue;
             }
         };
@@ -284,7 +301,12 @@ mod tests {
         assert_eq!(ids(prunable(&rows, false, None, None)), ["a", "c"]);
         assert_eq!(ids(prunable(&rows, true, None, None)), ["a", "b", "c"]);
         assert_eq!(ids(prunable(&rows, true, Some(25), None)), ["b", "c"]);
-        assert_eq!(ids(prunable(&rows, true, None, Some(15))), ["b", "c"]);
+        // 20 bytes of the cache's own: within 25 nothing goes; within 15 the least
+        // recently used goes first.
+        assert!(prunable(&rows, true, None, Some(25)).is_empty());
+        assert_eq!(ids(prunable(&rows, true, None, Some(15))), ["c"]);
+        assert_eq!(ids(prunable(&rows, true, None, Some(5))), ["c", "b", "a"]);
+        assert_eq!(ids(prunable(&rows, false, None, Some(5))), ["c", "a"]);
     }
 
     #[test]

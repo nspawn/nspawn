@@ -36,23 +36,39 @@ pub async fn run(cli: Cli) -> Result<()> {
     {
         match crate::attach::exec(name, journal_namespace.as_deref(), argv)? {}
     }
-    let config = Config::load(
-        cli.config.as_deref(),
-        cli.registry.clone(),
-        cli.ca_cert.clone(),
-    )?;
-    match cli.command {
-        // What a shell and man(1) need, written from the command line's own definition
-        // so that they cannot drift from it. The packages generate them at build time.
+    // What a shell and man(1) need, written from the command line's own definition so
+    // that they cannot drift from it, and without a configuration: the packages
+    // generate them at build time.
+    match &cli.command {
         Command::Completions(a) => {
             let script = crate::completion::registration(a.shell)
                 .with_context(|| format!("writing the {} completions", a.shell))?;
-            std::io::Write::write_all(&mut std::io::stdout(), &script)
-                .context("writing the completions")
+            return std::io::Write::write_all(&mut std::io::stdout(), &script)
+                .context("writing the completions");
         }
-        Command::Manpage => clap_mangen::Man::new(Cli::command())
-            .render(&mut std::io::stdout())
-            .context("writing the manual page"),
+        Command::Manpage => {
+            return clap_mangen::Man::new(Cli::command())
+                .render(&mut std::io::stdout())
+                .context("writing the manual page");
+        }
+        _ => {}
+    }
+    let config = match Config::load(
+        cli.config.as_deref(),
+        cli.registry.clone(),
+        cli.ca_cert.clone(),
+    ) {
+        Ok(config) => config,
+        // The release hook cleans up after a machine that ended: a configuration broken
+        // since it started must not leave its namespace, its rules and its secrets.
+        Err(e) if releasing(&cli.command) => {
+            eprintln!("warning: {e:#}; releasing with the default configuration");
+            Config::merge(Default::default(), None, None)?
+        }
+        Err(e) => return Err(e),
+    };
+    match cli.command {
+        Command::Completions(_) | Command::Manpage => unreachable!("handled before"),
         // main hands nspawn compose its arguments before clap reads them: clap's
         // definition of it is for the help, the manual page and the completions.
         Command::Compose(_) => unreachable!("nspawn compose is read in main"),
@@ -560,7 +576,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 .map(|i| (client::string(i, "name"), client::string(i, "reference")))
                 .collect();
             let registry = registry_name(client, config).await;
-            let source = match create_source(&images, &a.source, &registry)? {
+            let source = match create_source(&images, &a.source, &a.name, &registry)? {
                 CreateSource::Local(source) => source,
                 CreateSource::Pull { reference, base } => {
                     let mut pull = client::registry_options(config);
@@ -787,26 +803,38 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             Ok(())
         }
         Command::Inspect(args) => {
+            // As docker inspect: what is found is printed, what is not said after it.
             let mut out = Vec::new();
+            let mut missing = Vec::new();
             for name in &args.names {
-                let machine = manager.get_machine(name).await.map_err(client::error)?;
-                out.push(client::dict_to_json(&machine));
+                match manager.get_machine(name).await {
+                    Ok(machine) => out.push(client::dict_to_json(&machine)),
+                    Err(e) => missing.push(client::error(e)),
+                }
             }
             match args.format.as_deref() {
-                // A template per object, a line each.
-                Some(format) if format != "json" => {
+                // A template per object, a line each; an empty one is no template.
+                Some(format) if !format.is_empty() && format != "json" => {
                     let template = crate::gotemplate::Template::parse(format)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        .map_err(|e| anyhow::anyhow!("template parsing error: {e}"))?;
                     for object in &out {
                         let text = template
                             .execute(object)
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            .map_err(|e| anyhow::anyhow!("template parsing error: {e}"))?;
                         println!("{text}");
                     }
                 }
                 _ => client::print_json(&serde_json::Value::Array(out)),
             }
-            Ok(())
+            match missing.pop() {
+                Some(last) => {
+                    for e in missing {
+                        eprintln!("error: {e:#}");
+                    }
+                    Err(last)
+                }
+                None => Ok(()),
+            }
         }
         Command::Start(args) => machines::start(args, client).await,
         Command::Run(args) => machines::run(args, client, config).await,
@@ -850,12 +878,22 @@ enum CreateSource {
     Pull { reference: String, base: String },
 }
 
+fn releasing(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Network(crate::cli::NetworkArgs {
+            command: NetworkCommand::Release { .. }
+        })
+    )
+}
+
 /// `images` are the local images as (name, reference). A reference is compared as the
 /// service records it (`fedora:44` is `hub.example/fedora:44` there), so that an image
 /// pulled by a short reference is not pulled again under a name it already has.
 fn create_source(
     images: &[(String, String)],
     source: &str,
+    name: &str,
     registry: &str,
 ) -> Result<CreateSource> {
     if images.iter().any(|(n, r)| n == source || r == source) {
@@ -873,6 +911,13 @@ fn create_source(
     if images.iter().any(|(n, r)| *n == base && *r != reference) {
         bail!(
             "{base} is an image of another reference; pull {image} under a name of your own first (nspawn pull --name)"
+        );
+    }
+    // Pulled under the machine's own name, it could not be made from it: said before the
+    // download.
+    if base == name {
+        bail!(
+            "{base} is the name {source} is pulled under; give the machine another name, or pull the image under a name of your own first (nspawn pull --name)"
         );
     }
     Ok(CreateSource::Pull {
@@ -917,6 +962,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_the_release_hook_goes_on_without_its_configuration() {
+        use clap::Parser;
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap().command;
+        assert!(releasing(&parse(&["nspawn", "network", "release", "web"])));
+        assert!(!releasing(&parse(&["nspawn", "network", "prepare", "web"])));
+        assert!(!releasing(&parse(&["nspawn", "ps"])));
+        assert!(Config::merge(Default::default(), None, None).is_ok());
+    }
+
+    #[test]
     fn create_pulls_only_what_is_not_local_by_any_spelling() {
         let images = vec![
             ("fedora-44".to_string(), "hub.example/fedora:44".to_string()),
@@ -926,7 +981,7 @@ mod tests {
             ),
             ("vm".to_string(), String::new()),
         ];
-        let source = |s: &str| create_source(&images, s, "hub.example");
+        let source = |s: &str| create_source(&images, s, "machine", "hub.example");
         assert_eq!(
             source("fedora-44").unwrap(),
             CreateSource::Local("fedora-44".to_string()),
@@ -961,8 +1016,14 @@ mod tests {
             "fedora-45".to_string(),
             "other.example/fedora:45".to_string(),
         )];
-        let clash = create_source(&taken, "fedora:45", "hub.example").unwrap_err();
+        let clash = create_source(&taken, "fedora:45", "machine", "hub.example").unwrap_err();
         assert!(clash.to_string().contains("nspawn pull --name"), "{clash}");
+        let own = create_source(&images, "fedora:45", "fedora-45", "hub.example").unwrap_err();
+        assert!(
+            own.to_string()
+                .starts_with("fedora-45 is the name fedora:45 is pulled under"),
+            "{own}"
+        );
         assert_eq!(
             source("not a reference").unwrap(),
             CreateSource::Local("not a reference".to_string()),

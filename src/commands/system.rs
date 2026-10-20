@@ -285,9 +285,11 @@ pub async fn networks_prune(client: &Client, filters: &[String]) -> Result<Vec<S
     if unused.is_empty() {
         return Ok(Vec::new());
     }
-    let result = client
-        .run_job_silent(|| client.manager.remove_networks(&unused), true)
-        .await?;
+    let result = client::partly(
+        client
+            .run_job_silent(|| client.manager.remove_networks(&unused), true)
+            .await,
+    )?;
     Ok(client::strings(&result, "removed"))
 }
 
@@ -391,18 +393,37 @@ pub async fn builder_du(args: BuilderDuArgs, client: &Client) -> Result<()> {
     Ok(())
 }
 
-pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
-    let (labels, until) = filters(&args.filters)?;
+/// docker system prune's question: what goes, and the filters that narrow it.
+fn prune_warning(all: bool, volumes: bool, filters: &[String]) -> String {
     let mut warning = String::from("WARNING! This will remove:\n  - all stopped containers\n  - all networks not used by at least one container\n");
-    if args.volumes {
+    if volumes {
         warning.push_str("  - all anonymous volumes not used by at least one container\n");
     }
-    warning.push_str(if args.all {
+    warning.push_str(if all {
         "  - all images without at least one container associated to them\n"
     } else {
         "  - all dangling images\n"
     });
-    warning.push_str("  - unused build cache\n");
+    // -a takes the cache that images use too.
+    warning.push_str(if all {
+        "  - all build cache\n"
+    } else {
+        "  - unused build cache\n"
+    });
+    if !filters.is_empty() {
+        let mut filters = filters.to_vec();
+        filters.sort_by(|a, b| super::machines::natural_order(a, b));
+        warning.push_str("\n  Items to be pruned will be filtered with:\n");
+        for filter in filters {
+            warning.push_str(&format!("  - {filter}\n"));
+        }
+    }
+    warning
+}
+
+pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
+    let (labels, until) = filters(&args.filters)?;
+    let warning = prune_warning(args.all, args.volumes, &args.filters);
     if !confirm(&warning, args.force)? {
         return Ok(());
     }
@@ -451,11 +472,13 @@ pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
     }
     // The service prunes every unused network; with filters, the ones they select.
     let networks = if args.filters.is_empty() {
-        client
-            .run_job_silent(|| manager.prune_networks(), true)
-            .await
-            .map(|r| client::strings(&r, "removed"))
-            .unwrap_or_default()
+        client::partly(
+            client
+                .run_job_silent(|| manager.prune_networks(), true)
+                .await,
+        )
+        .map(|r| client::strings(&r, "removed"))
+        .unwrap_or_default()
     } else {
         networks_prune(client, &args.filters)
             .await
@@ -510,6 +533,19 @@ mod tests {
         ] {
             assert_eq!(human_size(bytes), text, "{bytes}");
         }
+    }
+
+    #[test]
+    fn the_prune_question_says_what_goes() {
+        let plain = prune_warning(false, false, &[]);
+        assert!(plain.ends_with("  - all dangling images\n  - unused build cache\n"));
+        let all = prune_warning(
+            true,
+            true,
+            &["until=24h".to_string(), "label=team=a".to_string()],
+        );
+        assert!(all.contains("  - all anonymous volumes not used by at least one container\n"));
+        assert!(all.ends_with("  - all images without at least one container associated to them\n  - all build cache\n\n  Items to be pruned will be filtered with:\n  - label=team=a\n  - until=24h\n"));
     }
 
     #[test]

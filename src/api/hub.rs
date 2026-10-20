@@ -31,7 +31,8 @@ pub async fn repositories(
             }
         }
         let tags = if with_tags {
-            let reference = Reference::try_from(format!("{}/{name}", config.registry))?;
+            let reference =
+                Reference::with_tag(config.registry.clone(), name.clone(), "latest".to_string());
             Some(hub.tags(&reference).await?)
         } else {
             None
@@ -44,7 +45,12 @@ pub async fn repositories(
 pub async fn tags(ctx: &Context, repository: &str) -> Result<Vec<String>> {
     let config = &ctx.config;
     let hub = Hub::new(config)?;
-    let reference = Reference::try_from(format!("{}/{repository}", config.registry))?;
+    // From its parts, as the catalog: the configured registry may have no dot.
+    let reference = Reference::with_tag(
+        config.registry.clone(),
+        repository.to_string(),
+        "latest".to_string(),
+    );
     hub.tags(&reference).await
 }
 

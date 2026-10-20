@@ -74,7 +74,10 @@ async fn run() {
     let args = cli::Cli::parse();
     // The service writes into its clients' pipes (events, attached runs): a client that
     // leaves must cost it a write error, not its life.
-    if matches!(args.command, cli::Command::Daemon(_)) {
+    if matches!(
+        args.command,
+        cli::Command::Daemon(_) | cli::Command::ApiServe { .. }
+    ) {
         unsafe {
             let _ = nix::sys::signal::signal(
                 nix::sys::signal::Signal::SIGPIPE,

@@ -1,6 +1,7 @@
 //! `nspawn compose config`: the project parsed, resolved and written out in its
 //! canonical form.
 
+use std::collections::HashSet;
 use std::io::Write;
 
 use sha2::{Digest, Sha256};
@@ -144,7 +145,6 @@ enum Load {
 }
 
 fn prepared(
-    args: &ComposeArgs,
     flags: &Flags,
     config: &ConfigArgs,
     host: &Host,
@@ -166,8 +166,7 @@ fn prepared(
     let o = &mut prepared.options;
     o.skip_interpolation = config.no_interpolate;
     o.resolve_paths = !config.no_path_resolution;
-    // --compatibility skips normalization, as config's PreRunE sets it.
-    o.skip_normalization = config.no_normalize || args.compatibility;
+    o.skip_normalization = config.no_normalize;
     o.skip_consistency = config.no_consistency;
     o.discard_env_files = true;
     o.skip_resolve_environment = match load {
@@ -192,14 +191,7 @@ fn load_project(
     resolve_env: bool,
     warn: Warn,
 ) -> Result<Project, String> {
-    let mut prepared = prepared(
-        args,
-        flags,
-        config,
-        host,
-        Load::Project { resolve_env },
-        warn,
-    )?;
+    let mut prepared = prepared(flags, config, host, Load::Project { resolve_env }, warn)?;
     let model = loader::load_model(&mut prepared.details, &mut prepared.options, warn)?;
     let mut project = project::from_model(model, &prepared.options, &prepared.details.env, warn)?;
     // What nspawn would not run, said and shown all the same by config; the commands
@@ -253,19 +245,22 @@ pub fn project_for(
         false,
         warn,
     )?;
-    project.resolve_services_environment(true, warn)?;
+    // Only the commands that make machines read the services' env files: down, ps,
+    // pull and the rest work without them, as an env file may be gone by then.
+    use super::cli::ComposeCommand as C;
+    if args
+        .command
+        .as_ref()
+        .is_some_and(|c| matches!(c, C::Up(_) | C::Create(_) | C::Run(_) | C::Scale(_)))
+    {
+        project.resolve_services_environment(true, warn)?;
+    }
     Ok(project)
 }
 
 /// ToModel: the model as loaded, without its environment.
-fn load_raw(
-    args: &ComposeArgs,
-    flags: &Flags,
-    config: &ConfigArgs,
-    host: &Host,
-    warn: Warn,
-) -> Result<Map, String> {
-    let mut prepared = prepared(args, flags, config, host, Load::Model, warn)?;
+fn load_raw(flags: &Flags, config: &ConfigArgs, host: &Host, warn: Warn) -> Result<Map, String> {
+    let mut prepared = prepared(flags, config, host, Load::Model, warn)?;
     let model = loader::load_model(&mut prepared.details, &mut prepared.options, warn)?;
     for refusal in prepared.options.refused.borrow().iter() {
         warn(refusal.line.clone());
@@ -360,6 +355,11 @@ pub fn run(
     out: &mut dyn Write,
     warn: Warn,
 ) -> Result<(), String> {
+    // --compatibility skips normalization for config alone, as its PreRunE sets it.
+    let config = &ConfigArgs {
+        no_normalize: config.no_normalize || args.compatibility,
+        ..config.clone()
+    };
     let format = config.format.clone().unwrap_or_default();
     let mut write = |text: &str| {
         out.write_all(&super::gostr::to_bytes(text))
@@ -367,7 +367,7 @@ pub fn run(
     };
     if config.services {
         if config.no_interpolate {
-            let model = load_raw(args, flags, config, host, warn)?;
+            let model = load_raw(flags, config, host, warn)?;
             if let Some(Value::Map(services)) = model.get("services") {
                 for name in services.keys() {
                     write(&format!("{name}\n"))?;
@@ -479,7 +479,7 @@ pub fn run(
             no_env_resolution: config.no_env_resolution,
             ..Default::default()
         };
-        let mut prepared = prepared(args, flags, &raw_config, host, Load::Model, warn)?;
+        let mut prepared = prepared(flags, &raw_config, host, Load::Model, warn)?;
         prepared.options.skip_validation = true;
         let model = loader::load_model(&mut prepared.details, &mut prepared.options, warn)?;
         for refusal in prepared.options.refused.borrow().iter() {
@@ -519,7 +519,7 @@ pub fn run(
         if !config.service.is_empty() {
             warn("service filtering is not applied when --no-interpolate is set, the full model will be rendered".to_string());
         }
-        let mut model = load_raw(args, flags, config, host, warn)?;
+        let mut model = load_raw(flags, config, host, warn)?;
         if config.resolve_image_digests || config.lock_image_digests {
             let mut images = Images::new(host);
             for key in ["services", "jobs"] {
@@ -732,8 +732,10 @@ fn lock_model(model: &mut Map) {
 /// The services, each after the ones it depends on, as ForEachService visits them
 /// (alphabetically, where the order of a Go map is random).
 fn dependencies_first(project: &Project) -> Vec<String> {
-    fn visit(name: &str, project: &Project, order: &mut Vec<String>) {
-        if order.iter().any(|o| o == name) || !project.services.contains_key(name) {
+    // `seen` is marked before the dependencies: with --no-consistency a cycle reaches
+    // here, and each service is still listed once.
+    fn visit(name: &str, project: &Project, seen: &mut HashSet<String>, order: &mut Vec<String>) {
+        if !project.services.contains_key(name) || !seen.insert(name.to_string()) {
             return;
         }
         let deps = project.services[name]
@@ -742,13 +744,14 @@ fn dependencies_first(project: &Project) -> Vec<String> {
             .map(|d| d.keys().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
         for dep in deps {
-            visit(&dep, project, order);
+            visit(&dep, project, seen, order);
         }
         order.push(name.to_string());
     }
+    let mut seen = HashSet::new();
     let mut order = Vec::new();
     for name in project.services.keys() {
-        visit(name, project, &mut order);
+        visit(name, project, &mut seen, &mut order);
     }
     order
 }

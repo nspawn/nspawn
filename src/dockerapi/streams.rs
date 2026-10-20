@@ -103,18 +103,11 @@ pub async fn logs(query: LogsQuery, tx: Sender<Bytes>) {
     let _ = child.kill().await;
 }
 
-/// Total CPU time of the host in nanoseconds, from /proc/stat, as docker reports it.
+/// Total CPU time of the host in nanoseconds, from /proc/stat, as docker reports it:
+/// user, nice, system, idle, iowait, irq and softirq, steal left out.
 fn system_cpu_ns() -> u64 {
     let text = std::fs::read_to_string("/proc/stat").unwrap_or_default();
-    let ticks: u64 = text
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .split_whitespace()
-        .skip(1)
-        .take(8)
-        .filter_map(|t| t.parse::<u64>().ok())
-        .sum();
+    let ticks = first_seven(&text);
     let hz = nix::unistd::sysconf(nix::unistd::SysconfVar::CLK_TCK)
         .ok()
         .flatten()
@@ -123,8 +116,34 @@ fn system_cpu_ns() -> u64 {
     ticks * (1_000_000_000 / hz)
 }
 
+fn first_seven(stat: &str) -> u64 {
+    stat.lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .skip(1)
+        .take(7)
+        .filter_map(|t| t.parse::<u64>().ok())
+        .sum()
+}
+
+/// The host's CPUs as docker counts them: the cpuN lines of /proc/stat, whatever this
+/// process may run on.
 fn online_cpus() -> u64 {
-    std::thread::available_parallelism().map_or(1, |n| n.get() as u64)
+    let text = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+    match cpu_lines(&text) {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get() as u64),
+        n => n,
+    }
+}
+
+fn cpu_lines(stat: &str) -> u64 {
+    stat.lines()
+        .filter(|l| {
+            l.strip_prefix("cpu")
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        })
+        .count() as u64
 }
 
 fn now_usec() -> u64 {
@@ -260,6 +279,78 @@ pub async fn stats(
 /// A machine's attributes (created, image) and labels.
 type Known = (BTreeMap<String, String>, BTreeMap<String, String>);
 
+/// How long what is known of a removed machine stays: a die that comes after the
+/// removal (run --rm) comes within it.
+const KEPT_AFTER_REMOVAL_USEC: u64 = 5 * 60 * 1_000_000;
+
+/// Forgets, once a while has passed, what is known of the machines removed, so that a
+/// stream kept for weeks does not keep every name it saw: the removed machines, by
+/// name, created and when.
+fn forget_removed(
+    known: &mut BTreeMap<String, Known>,
+    removed: &mut std::collections::VecDeque<(String, String, u64)>,
+    event: &crate::api::events::Event,
+) {
+    if event.action == "remove" {
+        if let Some(created) = event.attributes.get("created") {
+            removed.push_back((event.name.clone(), created.clone(), event.time_usec));
+        }
+    }
+    while let Some((name, created, at)) = removed.front() {
+        if event.time_usec.saturating_sub(*at) < KEPT_AFTER_REMOVAL_USEC {
+            break;
+        }
+        // Not a machine made anew under the name since.
+        if known
+            .get(name)
+            .is_some_and(|(attributes, _)| attributes.get("created") == Some(created))
+        {
+            known.remove(name);
+        }
+        removed.pop_front();
+    }
+}
+
+/// A machine's event with what the stream knows of the machine: an event without its
+/// record (a die after run --rm took it) gets the attributes and labels the machine had,
+/// one that says which machine it was replaces what is known of the name.
+fn complete(known: &mut BTreeMap<String, Known>, event: &mut crate::api::events::Event) {
+    match event.attributes.get("created") {
+        Some(created) => {
+            // A remove carries which machine it was, but its record is gone with its
+            // labels: the ones known of that machine stay.
+            if event.labels.is_empty() {
+                if let Some((attributes, labels)) = known.get(&event.name) {
+                    if attributes.get("created") == Some(created) {
+                        event.labels.clone_from(labels);
+                    }
+                }
+            }
+            let attributes = BTreeMap::from([
+                ("created".to_string(), created.clone()),
+                (
+                    "image".to_string(),
+                    event.attributes.get("image").cloned().unwrap_or_default(),
+                ),
+            ]);
+            known.insert(event.name.clone(), (attributes, event.labels.clone()));
+        }
+        None => {
+            if let Some((attributes, labels)) = known.get(&event.name) {
+                for (k, v) in attributes {
+                    event
+                        .attributes
+                        .entry(k.clone())
+                        .or_insert_with(|| v.clone());
+                }
+                if event.labels.is_empty() {
+                    event.labels.clone_from(labels);
+                }
+            }
+        }
+    }
+}
+
 pub async fn events(
     ctx: Arc<Context>,
     since: Option<String>,
@@ -288,6 +379,7 @@ pub async fn events(
     tokio::pin!(ends);
     // What each machine's record said, for its events once the record is gone: the die
     // of a machine of run --rm comes after its removal more often than not.
+    let mut removed = std::collections::VecDeque::new();
     let mut known: BTreeMap<String, Known> = ctx
         .store
         .list_images()
@@ -307,28 +399,8 @@ pub async fn events(
             event = follow.next(&ctx.store) => {
                 let Some(mut event) = event else { break };
                 if event.kind == "machine" {
-                    match event.attributes.get("created") {
-                        Some(created) => {
-                            let attributes = BTreeMap::from([
-                                ("created".to_string(), created.clone()),
-                                (
-                                    "image".to_string(),
-                                    event.attributes.get("image").cloned().unwrap_or_default(),
-                                ),
-                            ]);
-                            known.insert(event.name.clone(), (attributes, event.labels.clone()));
-                        }
-                        None => {
-                            if let Some((attributes, labels)) = known.get(&event.name) {
-                                for (k, v) in attributes {
-                                    event.attributes.entry(k.clone()).or_insert_with(|| v.clone());
-                                }
-                                if event.labels.is_empty() {
-                                    event.labels.clone_from(labels);
-                                }
-                            }
-                        }
-                    }
+                    complete(&mut known, &mut event);
+                    forget_removed(&mut known, &mut removed, &event);
                 }
                 let networks = match Snapshot::networks_of(&ctx, &event.name) {
                     Some(nets) if event.kind == "machine" => nets,
@@ -353,6 +425,85 @@ pub async fn events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_counts_as_docker_counts_it() {
+        let stat = "cpu  10 1 5 100 2 0 1 7 0 0\ncpu0 5 0 2 50 1 0 0 3 0 0\ncpu1 5 1 3 50 1 0 1 4 0 0\nintr 1\n";
+        assert_eq!(first_seven(stat), 119, "steal left out");
+        assert_eq!(cpu_lines(stat), 2);
+    }
+
+    #[test]
+    fn a_removed_machine_keeps_its_labels() {
+        let event = |action: &str, created: Option<&str>| crate::api::events::Event {
+            time_usec: 0,
+            kind: "machine".into(),
+            action: action.into(),
+            name: "web".into(),
+            attributes: created
+                .map(|c| BTreeMap::from([("created".to_string(), c.to_string())]))
+                .unwrap_or_default(),
+            labels: BTreeMap::new(),
+        };
+        let mut known = BTreeMap::from([(
+            "web".to_string(),
+            (
+                BTreeMap::from([("created".to_string(), "5".to_string())]),
+                BTreeMap::from([("caddy".to_string(), "web.example".to_string())]),
+            ),
+        )]);
+        let mut remove = event("remove", Some("5"));
+        complete(&mut known, &mut remove);
+        assert_eq!(remove.labels["caddy"], "web.example");
+        // A later event of the name still has them.
+        let mut die = event("die", None);
+        complete(&mut known, &mut die);
+        assert_eq!(die.labels["caddy"], "web.example");
+        // Another machine of the name does not.
+        let mut other = event("remove", Some("9"));
+        complete(&mut known, &mut other);
+        assert!(other.labels.is_empty());
+    }
+
+    #[test]
+    fn a_removed_machine_is_forgotten_a_while_later() {
+        let event = |action: &str, created: &str, at: u64| crate::api::events::Event {
+            time_usec: at,
+            kind: "machine".into(),
+            action: action.into(),
+            name: "job".into(),
+            attributes: BTreeMap::from([("created".to_string(), created.to_string())]),
+            labels: BTreeMap::new(),
+        };
+        let mut known = BTreeMap::new();
+        let mut removed = std::collections::VecDeque::new();
+        for e in [event("create", "1", 0), event("remove", "1", 10)] {
+            let mut e = e;
+            complete(&mut known, &mut e);
+            forget_removed(&mut known, &mut removed, &e);
+        }
+        assert!(
+            known.contains_key("job"),
+            "kept for a die after the removal"
+        );
+        let mut later = event("start", "2", 10 + KEPT_AFTER_REMOVAL_USEC);
+        later.name = "other".into();
+        complete(&mut known, &mut later);
+        forget_removed(&mut known, &mut removed, &later);
+        assert!(!known.contains_key("job"));
+        assert!(removed.is_empty());
+        // A machine made anew under the name meanwhile stays.
+        for e in [
+            event("remove", "3", 0),
+            event("create", "4", 1),
+            event("start", "4", 1 + KEPT_AFTER_REMOVAL_USEC),
+        ] {
+            let mut e = e;
+            complete(&mut known, &mut e);
+            forget_removed(&mut known, &mut removed, &e);
+        }
+        assert!(known.contains_key("job"));
+    }
 
     #[test]
     fn frames_as_docker_writes_them() {

@@ -76,6 +76,24 @@ impl Healthcheck {
         self.test.is_empty() || self.test[0] == "NONE"
     }
 
+    /// Whether it probes: not disabled, and a test a probe can run. An image's that is
+    /// malformed is none, so that what waits for a verdict does not wait for ever.
+    pub fn active(&self) -> bool {
+        !self.disabled() && self.argv().is_ok()
+    }
+
+    /// The command the probe runs in an image whose SHELL is `shell`: CMD-SHELL goes
+    /// through it, as docker's getShell does, /bin/sh -c when the image names none.
+    pub fn argv_in(&self, shell: &[String]) -> Result<Vec<String>> {
+        let mut argv = self.argv()?;
+        if self.test.first().map(String::as_str) == Some("CMD-SHELL") && !shell.is_empty() {
+            let line = argv.pop().unwrap_or_default();
+            argv = shell.to_vec();
+            argv.push(line);
+        }
+        Ok(argv)
+    }
+
     /// The command the probe runs: CMD as it is, CMD-SHELL through /bin/sh -c.
     pub fn argv(&self) -> Result<Vec<String>> {
         match self.test.first().map(String::as_str) {
@@ -131,6 +149,8 @@ fn usec(value: u64) -> Duration {
 pub struct Overrides {
     /// --health-cmd: a shell line.
     pub cmd: Option<String>,
+    /// The whole test, as compose writes it: ["CMD", argv...] runs without a shell.
+    pub test: Option<Vec<String>>,
     pub interval: Option<u64>,
     pub timeout: Option<u64>,
     pub start_period: Option<u64>,
@@ -165,10 +185,14 @@ impl Overrides {
         if let Some(cmd) = &self.cmd {
             hc.test = vec!["CMD-SHELL".to_string(), cmd.clone()];
         }
-        if hc.disabled() {
-            bail!("the image has no healthcheck; --health-cmd gives the command to run");
+        if let Some(test) = &self.test {
+            hc.test.clone_from(test);
         }
-        hc.argv()?;
+        // Timings for an image without a healthcheck are taken and probe nothing, as
+        // docker takes them.
+        if !hc.disabled() {
+            hc.argv()?;
+        }
         for (given, field) in [
             (self.interval, &mut hc.interval),
             (self.timeout, &mut hc.timeout),
@@ -176,6 +200,10 @@ impl Overrides {
             (self.start_interval, &mut hc.start_interval),
         ] {
             if let Some(value) = given {
+                // What the bus brings as microseconds is held to Go's range too.
+                if value > (i64::MAX / 1000) as u64 {
+                    bail!("a healthcheck duration of {value} microseconds is past Go's range");
+                }
                 *field = value;
             }
         }
@@ -219,6 +247,12 @@ pub fn parse_duration(text: &str) -> Result<u64> {
         rest = &rest[unit..];
         total += number * scale;
     }
+    // Go's Duration holds nanoseconds in an int64: about 292 years, past which it
+    // refuses, and past which sums made of it would wrap.
+    const MAX_USEC: f64 = (i64::MAX / 1000) as f64;
+    if total > MAX_USEC {
+        bail!("{text}: a duration of more than about 292 years");
+    }
     let total = total.round() as u64;
     if total > 0 && total < 1000 {
         bail!("{text}: a duration of at least a millisecond");
@@ -251,6 +285,38 @@ pub fn format_duration(usec: u64) -> String {
     if s > 0 || out.is_empty() {
         out.push_str(&format!("{s}s"));
     }
+    out
+}
+
+/// Go's time.Duration.String of microseconds: 1.5s, 500ms, 1m30s, 1h0m0s.
+fn go_duration(usec: u64) -> String {
+    let fraction = |value: u64, digits: usize| -> String {
+        let text = format!("{value:0digits$}");
+        let text = text.trim_end_matches('0');
+        if text.is_empty() {
+            String::new()
+        } else {
+            format!(".{text}")
+        }
+    };
+    if usec == 0 {
+        return "0s".to_string();
+    }
+    if usec < 1000 {
+        return format!("{usec}us");
+    }
+    if usec < 1_000_000 {
+        return format!("{}{}ms", usec / 1000, fraction(usec % 1000, 3));
+    }
+    let seconds = usec / 1_000_000;
+    let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    let mut out = String::new();
+    if h > 0 {
+        out.push_str(&format!("{h}h{m}m"));
+    } else if m > 0 {
+        out.push_str(&format!("{m}m"));
+    }
+    out.push_str(&format!("{s}{}s", fraction(usec % 1_000_000, 6)));
     out
 }
 
@@ -351,10 +417,19 @@ pub async fn start_runner(ctx: &Context, name: &str) -> Result<()> {
     };
     let mut properties =
         crate::api::run::transient_service(&format!("Health probes of machine {name}"), &argv);
-    properties.push(("BindsTo".into(), value(vec![machine_unit.clone()].into())));
+    // Requisite, not BindsTo: the runner never pulls the machine in (an update of a
+    // machine that stopped meanwhile would start it again), and it leaves by itself
+    // once the machine is gone.
+    properties.push(("Requisite".into(), value(vec![machine_unit.clone()].into())));
     properties.push(("After".into(), value(vec![machine_unit].into())));
-    sd.start_transient(&unit_name(name), properties, "replace")
-        .await
+    properties.push(("CollectMode".into(), value("inactive-or-failed".into())));
+    // A runner of an earlier run goes first: a transient unit is made only where none
+    // is loaded, and a restart of the machine may leave one.
+    let unit = unit_name(name);
+    if sd.unit_status(&unit).await?.busy() || sd.unit_queued(&unit).await? {
+        sd.stop_unit(&unit).await?;
+    }
+    sd.start_transient(&unit, properties, "replace").await
 }
 
 pub async fn stop_runner(sd: &Systemd, name: &str) -> Result<()> {
@@ -371,12 +446,12 @@ pub async fn run(ctx: &Context, name: &str) -> Result<()> {
         .with_context(|| format!("{name} is not an image managed by nspawn"))?;
     let Some(hc) = record
         .effective_healthcheck()
-        .filter(|h| !h.disabled())
+        .filter(|h| h.active())
         .cloned()
     else {
         return Ok(());
     };
-    let argv = hc.argv()?;
+    let argv = hc.argv_in(&record.run.shell)?;
     let sd = ctx.sd().await?;
     let started = Instant::now();
     let mut monitor = Monitor::new(hc.retries());
@@ -389,18 +464,27 @@ pub async fn run(ctx: &Context, name: &str) -> Result<()> {
             hc.interval()
         };
         tokio::time::sleep(pause).await;
-        if !sd.machine_exists(name).await? {
-            return Ok(());
+        // machined restarting or a call that timed out is asked again at the next
+        // probe; only a machine that is gone ends the runner, whose unit goes with it.
+        match sd.machine_exists(name).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(e) => {
+                eprintln!("warning: {e:#}; probing again in {pause:?}");
+                continue;
+            }
+        }
+        // A paused machine is not probed: nothing in it runs, and its verdict stays.
+        let unit = format!("systemd-nspawn@{name}.service");
+        if sd.freezer_state(&unit).await.ok().as_deref() == Some("frozen") {
+            continue;
         }
         // A probe counts by when it started: one that ends past the start period still
         // belongs to it.
         let in_start_period = started.elapsed() < hc.start_period();
         let probe = match probe(ctx, name, &argv, hc.timeout()).await {
             Ok(probe) => probe,
-            Err(e) if !sd.machine_exists(name).await? => {
-                let _ = e;
-                return Ok(());
-            }
+            Err(_) if matches!(sd.machine_exists(name).await, Ok(false)) => return Ok(()),
             Err(e) => Probe {
                 start: now_unix(),
                 end: now_unix(),
@@ -416,7 +500,9 @@ pub async fn run(ctx: &Context, name: &str) -> Result<()> {
                 &[("image", &record.reference), ("status", status)],
             );
         }
-        write_status(name, &monitor.status)?;
+        if let Err(e) = write_status(name, &monitor.status) {
+            eprintln!("warning: {e:#}");
+        }
     }
 }
 
@@ -450,11 +536,17 @@ async fn drained(mut reader: tokio::task::JoinHandle<String>, pid: u32) -> Strin
 /// One run of the test inside the machine, killed at `timeout`.
 async fn probe(ctx: &Context, name: &str, argv: &[String], timeout: Duration) -> Result<Probe> {
     let start = now_unix();
+    // As the machine's user, as docker runs its probes: the test comes with the image.
+    let user = ctx
+        .store
+        .load_image(name)?
+        .and_then(|r| r.effective_user().map(str::to_string))
+        .unwrap_or_default();
     let process = crate::api::machines::spawn_in_namespaces(
         ctx,
         name,
         argv,
-        "root",
+        &user,
         &[],
         None,
         nsenter::Stdio::Pipes,
@@ -486,11 +578,14 @@ async fn probe(ctx: &Context, name: &str, argv: &[String], timeout: Duration) ->
     };
     let mut output = drained(out, pid).await;
     output.push_str(&drained(err, pid).await);
+    // As docker words it, what the probe said before it was stopped kept.
     if exit_code == -1 {
-        output = format!(
-            "Health check exceeded timeout ({})",
-            format_duration(timeout.as_micros() as u64)
-        );
+        let limit = go_duration(timeout.as_micros() as u64);
+        output = if output.is_empty() {
+            format!("Health check exceeded timeout ({limit})")
+        } else {
+            format!("Health check exceeded timeout ({limit}): {output}")
+        };
     }
     output.truncate(
         output
@@ -526,12 +621,29 @@ fn read_capped(fd: Option<OwnedFd>) -> String {
             Err(_) => break,
         }
     }
-    String::from_utf8_lossy(&kept).into_owned()
+    // What the machine prints goes on the bus, which takes no NUL.
+    String::from_utf8_lossy(&kept).replace('\0', "\u{FFFD}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations_past_go_s_range_are_refused() {
+        assert!(parse_duration("6000000h").is_err());
+        assert!(parse_duration("2000000h").is_ok());
+    }
+
+    #[test]
+    fn durations_print_as_go_prints_them() {
+        assert_eq!(go_duration(1_500_000), "1.5s");
+        assert_eq!(go_duration(500_000), "500ms");
+        assert_eq!(go_duration(1_500), "1.5ms");
+        assert_eq!(go_duration(90_000_000), "1m30s");
+        assert_eq!(go_duration(3_600_000_000), "1h0m0s");
+        assert_eq!(go_duration(30_000_000), "30s");
+    }
 
     #[test]
     fn durations_are_read_with_their_units() {
@@ -611,7 +723,41 @@ mod tests {
             ..Overrides::default()
         };
         assert_eq!(own.apply(None).unwrap().test, ["CMD-SHELL", "test -f /ok"]);
-        assert!(flags.apply(None).is_err(), "nothing to probe with");
+        let exec = Overrides {
+            test: Some(vec!["CMD".into(), "/app/check".into(), "a b".into()]),
+            ..Overrides::default()
+        };
+        let hc = exec.apply(None).unwrap();
+        assert_eq!(hc.argv().unwrap(), ["/app/check", "a b"]);
+        // Timings with nothing to probe are taken, as docker takes them, and probe
+        // nothing.
+        let bare = flags.apply(None).unwrap();
+        assert!(!bare.active() && bare.retries == 5);
+        // CMD-SHELL in the image's SHELL; CMD as it is.
+        let shell = vec!["/busybox/sh".to_string(), "-c".to_string()];
+        let line = Healthcheck {
+            test: vec!["CMD-SHELL".into(), "wget -q localhost".into()],
+            ..Healthcheck::default()
+        };
+        assert_eq!(
+            line.argv_in(&shell).unwrap(),
+            ["/busybox/sh", "-c", "wget -q localhost"]
+        );
+        assert_eq!(
+            line.argv_in(&[]).unwrap(),
+            ["/bin/sh", "-c", "wget -q localhost"]
+        );
+        let direct = Healthcheck {
+            test: vec!["CMD".into(), "/check".into()],
+            ..Healthcheck::default()
+        };
+        assert_eq!(direct.argv_in(&shell).unwrap(), ["/check"]);
+        // An image's test no probe can run is none.
+        let malformed = Healthcheck {
+            test: vec!["CMD".into()],
+            ..Healthcheck::default()
+        };
+        assert!(!malformed.disabled() && !malformed.active());
         let off = Overrides {
             disable: true,
             ..Overrides::default()

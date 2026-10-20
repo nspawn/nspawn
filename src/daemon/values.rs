@@ -15,6 +15,13 @@ use crate::daemon::jobs::Dict;
 use crate::search::Hit;
 use crate::store::ImageRecord;
 
+/// Text as D-Bus carries it: a string with a NUL in it is a corrupt message, for which
+/// the bus disconnects the service. Image labels, probe output and build lines are
+/// anyone's text.
+pub fn bus_text(text: &str) -> String {
+    text.replace('\0', "\u{FFFD}")
+}
+
 /// A value without file descriptors, which is every value here.
 pub fn v<'a, T: Into<Value<'a>>>(x: T) -> OwnedValue {
     OwnedValue::try_from(x.into()).expect("plain values carry no file descriptor")
@@ -53,6 +60,7 @@ pub fn image(i: &ImageSummary) -> Dict {
         ("size".to_string(), v(i.size.unwrap_or(0))),
         ("read_only".to_string(), v(i.read_only)),
         ("signed_by".to_string(), opt_string(i.signed_by.as_deref())),
+        ("image_only".to_string(), v(i.image_only)),
     ])
 }
 

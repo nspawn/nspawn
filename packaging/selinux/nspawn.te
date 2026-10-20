@@ -227,6 +227,11 @@ allow unconfined_service_t { nspawn_var_lib_t systemd_machined_var_lib_t }:file 
 fs_manage_tmpfs_dirs(nspawn_t)
 fs_manage_tmpfs_files(nspawn_t)
 fs_manage_tmpfs_symlinks(nspawn_t)
+# A copy onto a device node is refused, which takes the node's attributes: those
+# made on the machine's /dev tmpfs, or bound from the host's /dev.
+allow nspawn_t tmpfs_t:{ chr_file blk_file } getattr;
+dev_getattr_all_chr_files(nspawn_t)
+dev_getattr_all_blk_files(nspawn_t)
 
 # CDI specs: /etc/cdi and /var/run/cdi, read at every start of a machine that names
 # a CDI device.

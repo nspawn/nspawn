@@ -3,8 +3,8 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -16,16 +16,17 @@ use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal
 use nix::sys::termios::{self, LocalFlags, SetArg, Termios};
 use nix::unistd::{dup, isatty};
 
-/// The terminal's attributes before they were changed, for a signal to put back.
-static SAVED: OnceLock<libc::termios> = OnceLock::new();
+/// The terminal's attributes before the latest guard changed them, for a signal to put
+/// back: each guard's own, so that a later one does not restore an earlier one's.
+static SAVED: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
 static GUARDED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn restore_and_exit(signal: libc::c_int) {
     // Only calls the signal-safe list allows: tcsetattr and _exit.
-    if GUARDED.load(Ordering::SeqCst) {
-        if let Some(saved) = SAVED.get() {
-            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved) };
-        }
+    let saved = SAVED.load(Ordering::SeqCst);
+    if GUARDED.load(Ordering::SeqCst) && !saved.is_null() {
+        // SAFETY: a pointer of guard_terminal's, never freed.
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, saved) };
     }
     unsafe { libc::_exit(128 + signal) };
 }
@@ -39,7 +40,9 @@ pub struct TerminalGuard {
 }
 
 pub fn guard_terminal(original: &Termios) -> TerminalGuard {
-    let _ = SAVED.set(original.clone().into());
+    // Never freed: a handler may read it at any moment, and a run makes a guard or two.
+    let saved: libc::termios = original.clone().into();
+    SAVED.store(Box::into_raw(Box::new(saved)), Ordering::SeqCst);
     GUARDED.store(true, Ordering::SeqCst);
     let action = SigAction::new(
         SigHandler::Handler(restore_and_exit),

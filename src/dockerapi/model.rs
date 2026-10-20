@@ -218,7 +218,7 @@ impl Machine {
 
     /// What `HostConfig.NetworkMode` says: the primary network, host, none, or the
     /// machine whose namespace it shares.
-    fn network_mode(&self, snapshot: &Snapshot) -> String {
+    pub(super) fn network_mode(&self, snapshot: &Snapshot) -> String {
         let r = &self.record;
         if let Some(owner) = bridge::shares_network(r) {
             let id = snapshot
@@ -373,7 +373,8 @@ impl Machine {
             "ImageID": image.id,
             "Command": self.command_line(),
             "Created": self.record.created,
-            "Ports": self.port_list(&image.exposed_ports),
+            // docker lists the ports of a running container only.
+            "Ports": if self.running() { self.port_list(&image.exposed_ports) } else { Vec::new() },
             "Labels": self.record.effective_labels(),
             "State": self.state(),
             "Status": self.status(now_unix()),
@@ -399,9 +400,10 @@ impl Machine {
                 })).collect::<Vec<_>>(),
             })
         });
+        // docker's Running stays true between two runs of a restart policy.
         let mut state = json!({
             "Status": self.state(),
-            "Running": self.running(),
+            "Running": self.running() || self.state() == "restarting",
             "Paused": self.state() == "paused",
             "Restarting": self.state() == "restarting",
             "OOMKilled": false,
@@ -415,7 +417,7 @@ impl Machine {
         if let Some(health) = health {
             state["Health"] = health;
         }
-        let ports = self.port_bindings();
+        let ports = self.port_bindings(&image.exposed_ports);
         let hostname = r.tuning.hostname.clone().unwrap_or_else(|| r.name.clone());
         let env = crate::volume::merge_env(&r.run.env, &r.env);
         // Fields left at their default are not written, as docker leaves them out.
@@ -698,7 +700,7 @@ impl Machine {
 
     /// NetworkSettings.Ports: each published port with its binding, an exposed one with
     /// none, as long as the machine runs.
-    fn port_bindings(&self) -> Map<String, Value> {
+    fn port_bindings(&self, exposed: &[String]) -> Map<String, Value> {
         let mut out = Map::new();
         if !self.running() {
             return out;
@@ -713,7 +715,8 @@ impl Machine {
                 }));
             }
         }
-        for e in &self.record.run.exposed_ports {
+        // The image's, from its config for a record written before they were kept.
+        for e in exposed {
             out.entry(e.clone()).or_insert(Value::Null);
         }
         out
@@ -959,6 +962,44 @@ mod tests {
     }
 
     use crate::config::Config;
+
+    #[test]
+    fn a_machine_between_restarts_is_running_to_docker() {
+        let (ctx, mut snapshot) = fixture();
+        snapshot.machines[0].summary.state = "restarting".into();
+        snapshot.machines[0].summary.exit_code = Some(1);
+        let m = &snapshot.machines[0];
+        let image = ImageInfo::of(&ctx, &m.record);
+        let state = &m.inspect_json(&ctx, &snapshot, &image)["State"];
+        assert_eq!(state["Running"], true);
+        assert_eq!(state["Restarting"], true);
+        assert_eq!(state["ExitCode"], 1);
+        // A stopped one lists no ports.
+        let running = m.summary_json(&ctx, &snapshot, &image)["Ports"].clone();
+        assert!(
+            running.as_array().is_some_and(|p| p.is_empty()),
+            "{running}"
+        );
+    }
+
+    #[test]
+    fn host_machines_are_found_under_the_host_network() {
+        let (ctx, mut snapshot) = fixture();
+        let filter = |net: &str| {
+            crate::dockerapi::filters::Filters::parse(Some(&format!(r#"{{"network":["{net}"]}}"#)))
+                .unwrap()
+        };
+        let matches = |snapshot: &Snapshot, net: &str| {
+            crate::dockerapi::container_matches(&ctx, snapshot, &filter(net), &snapshot.machines[0])
+        };
+        assert!(matches(&snapshot, "front"));
+        assert!(!matches(&snapshot, "host"));
+        snapshot.machines[0].record.network = Network::Host;
+        assert!(matches(&snapshot, "host"));
+        assert!(!matches(&snapshot, "front"));
+        let host_id = snapshot.network("host").unwrap().id;
+        assert!(matches(&snapshot, &host_id[..12]));
+    }
 
     fn diff(ours: &Value, docker: &Value) -> (Vec<String>, Vec<String>) {
         let (mut a, mut b) = (BTreeSet::new(), BTreeSet::new());

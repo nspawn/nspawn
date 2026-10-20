@@ -626,7 +626,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
     ),
     partly(
         "volumes.*.driver_opts",
-        "type: none with o: bind mounts the device directory of the host; other options are refused",
+        "type: none with o: bind and an absolute device binds that host directory, which down -v leaves; other options are refused",
     )
     .and_below(),
     full("volumes.*.external"),
@@ -758,4 +758,12 @@ pub static VALUES: &[Value] = &[
     ),
     when("networks.*.ipam.driver", Is("default"), Full),
     when("volumes.*.driver", Is("local"), Full),
+    // The neutral values of what is refused: docker's default driver is the empty
+    // one, and false asks for nothing.
+    when("networks.*.driver", Is(""), Full),
+    when("networks.*.ipam.driver", Is(""), Full),
+    when("volumes.*.driver", Is(""), Full),
+    when("secrets.*.external", Is("false"), Full),
+    when("configs.*.external", Is("false"), Full),
+    when("services.*.build.privileged", Is("false"), Full),
 ];

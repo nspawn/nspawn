@@ -58,8 +58,15 @@ trait Authority {
 }
 
 /// Whether `sender` may do `action`. Root is allowed without asking, so the service
-/// keeps working on hosts with no polkit at all.
-pub async fn allows(connection: &Connection, sender: &str, action: Action) -> Result<(), String> {
+/// keeps working on hosts with no polkit at all. polkit asks the user through an agent
+/// only when the call allowed it (`interactive`, the call's
+/// ALLOW_INTERACTIVE_AUTHORIZATION flag); otherwise a challenge is a refusal at once.
+pub async fn allows(
+    connection: &Connection,
+    sender: &str,
+    action: Action,
+    interactive: bool,
+) -> Result<(), String> {
     if caller_uid(connection, sender).await == Some(0) {
         return Ok(());
     }
@@ -70,7 +77,13 @@ pub async fn allows(connection: &Connection, sender: &str, action: Action) -> Re
     name.insert("name", Value::from(sender));
     let subject = ("system-bus-name", name);
     let (authorized, challenge, _) = authority
-        .check_authorization(&subject, action.id(), HashMap::new(), 1, "")
+        .check_authorization(
+            &subject,
+            action.id(),
+            HashMap::new(),
+            u32::from(interactive),
+            "",
+        )
         .await
         .map_err(|e| {
             // Building the proxy asks nothing of the bus: polkit's absence shows here.
@@ -84,7 +97,12 @@ pub async fn allows(connection: &Connection, sender: &str, action: Action) -> Re
     if authorized {
         return Ok(());
     }
-    Err(if challenge {
+    Err(if challenge && !interactive {
+        format!(
+            "{} needs an administrator, and the call did not allow interactive authorization; run the command as root, or let your group through with a polkit rule (see docs/DBUS.md)",
+            action.id()
+        )
+    } else if challenge {
         format!(
             "{} needs an administrator; answer the authentication agent, run the command as root, or let your group through with a polkit rule (see docs/DBUS.md)",
             action.id()

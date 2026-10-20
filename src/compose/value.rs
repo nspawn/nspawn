@@ -405,7 +405,8 @@ fn zone_hours(offset: i32) -> String {
 }
 
 /// Go's time.Time.String: `2006-01-02 15:04:05.999999999 -0700 MST`, the zone of a
-/// time parsed with an offset named by the offset itself.
+/// time parsed with an offset named by the offset itself, unless time.Parse put it in
+/// the local zone, whose name it then has.
 impl fmt::Display for Time {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -423,7 +424,12 @@ impl fmt::Display for Time {
             None => f.write_str("+0000 UTC"),
             Some(offset) => {
                 let zone = format!("{}{:02}", zone_hours(offset), offset.abs() / 60 % 60);
-                write!(f, "{zone} {zone}")
+                let name = if self.is_local() {
+                    Some(super::gotime::local_at(self.unix()).1).filter(|n| !n.is_empty())
+                } else {
+                    None
+                };
+                write!(f, "{zone} {}", name.as_deref().unwrap_or(&zone))
             }
         }
     }

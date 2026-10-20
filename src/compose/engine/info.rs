@@ -79,11 +79,11 @@ pub fn short_image(reference: &str) -> String {
 /// The state names ps prints and filters on.
 fn state(m: &Machine) -> &'static str {
     match m.state.as_str() {
-        "running" | "opening" => "running",
+        // A machine shutting down still runs, as a container being stopped does.
+        "running" | "opening" | "closing" => "running",
         "paused" => "paused",
         "restarting" => "restarting",
         "starting" => "created",
-        "closing" => "removing",
         _ if m.exit_code.is_some() || m.started > 0 => "exited",
         _ => "created",
     }
@@ -106,7 +106,6 @@ fn status(m: &Machine, now: u64) -> String {
         }
         "restarting" => format!("Restarting ({})", m.exit_code.unwrap_or(0)),
         "exited" => format!("Exited ({})", m.exit_code.unwrap_or(0)),
-        "removing" => "Removal In Progress".to_string(),
         _ => "Created".to_string(),
     }
 }
@@ -171,48 +170,6 @@ fn json_line(fields: &[(&str, serde_json::Value)]) -> String {
     format!("{{{}}}", body.join(","))
 }
 
-/// A Go template of --format, `{{.Field}}` replaced; `table` at its start makes a table
-/// with the fields' names as headers.
-fn template(format: &str, rows: &[BTreeMap<&str, String>]) -> String {
-    let (table_mode, body) = match format.strip_prefix("table") {
-        Some(rest) => (true, rest.trim_start()),
-        None => (false, format),
-    };
-    let fill = |row: Option<&BTreeMap<&str, String>>| {
-        let mut out = String::new();
-        let mut rest = body;
-        while let Some(at) = rest.find("{{") {
-            out.push_str(&rest[..at]);
-            let Some(end) = rest[at..].find("}}") else {
-                out.push_str(&rest[at..]);
-                rest = "";
-                break;
-            };
-            let field = rest[at + 2..at + end].trim().trim_start_matches('.');
-            match row {
-                Some(row) => out.push_str(row.get(field).map(String::as_str).unwrap_or("")),
-                None => out.push_str(&field.to_uppercase()),
-            }
-            rest = &rest[at + end + 2..];
-        }
-        out.push_str(rest);
-        out.replace("\\t", "\t")
-    };
-    let mut lines = Vec::new();
-    if table_mode {
-        lines.push(fill(None));
-    }
-    for row in rows {
-        lines.push(fill(Some(row)));
-    }
-    let text = lines.join("\n") + "\n";
-    if table_mode {
-        table(&text, 10, 3)
-    } else {
-        text
-    }
-}
-
 pub async fn ps(e: &mut Engine<'_>, a: &PsArgs, out: &mut dyn Write) -> Result<()> {
     let now = now();
     let known: Option<BTreeSet<String>> = e.project.as_ref().map(|p| {
@@ -235,7 +192,12 @@ pub async fn ps(e: &mut Engine<'_>, a: &PsArgs, out: &mut dyn Write) -> Result<(
         .await?
         .into_iter()
         .filter(|m| a.service.is_empty() || a.service.contains(&m.service))
-        .filter(|m| a.all || !filters.is_empty() || m.running())
+        // Without -a: what runs or restarts, one-offs left out.
+        .filter(|m| {
+            a.all
+                || !filters.is_empty()
+                || (!m.oneoff && matches!(state(m), "running" | "paused" | "restarting"))
+        })
         .filter(|m| filters.is_empty() || filters.iter().any(|f| f == state(m)))
         .filter(|m| {
             a.orphans != Some(false) || known.as_ref().is_none_or(|k| k.contains(&m.service))
@@ -311,53 +273,82 @@ pub async fn ps(e: &mut Engine<'_>, a: &PsArgs, out: &mut dyn Write) -> Result<(
         }
         "json" => {
             for (m, r) in machines.iter().zip(&rows) {
-                let labels: Vec<String> =
-                    m.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                let publishers: Vec<serde_json::Value> = m
-                    .strings("ports")
-                    .iter()
-                    .filter_map(|p| publisher(p))
-                    .collect();
-                let fields = [
-                    ("Command", serde_json::Value::from(r["Command"].clone())),
-                    ("CreatedAt", serde_json::Value::from(created_at(m.created))),
-                    (
-                        "ExitCode",
-                        serde_json::Value::from(m.exit_code.unwrap_or(0)),
-                    ),
-                    ("Health", serde_json::Value::from(m.health.clone())),
-                    ("ID", serde_json::Value::from(m.name.clone())),
-                    ("Image", serde_json::Value::from(r["Image"].clone())),
-                    ("Labels", serde_json::Value::from(labels.join(","))),
-                    (
-                        "LocalVolumes",
-                        serde_json::Value::from(m.strings("volumes").len().to_string()),
-                    ),
-                    (
-                        "Mounts",
-                        serde_json::Value::from(m.strings("volumes").join(",")),
-                    ),
-                    ("Name", serde_json::Value::from(m.name.clone())),
-                    ("Names", serde_json::Value::from(m.name.clone())),
-                    ("Networks", serde_json::Value::from(r["Networks"].clone())),
-                    ("Ports", serde_json::Value::from(r["Ports"].clone())),
-                    ("Project", serde_json::Value::from(r["Project"].clone())),
-                    ("Publishers", serde_json::Value::Array(publishers)),
-                    (
-                        "RunningFor",
-                        serde_json::Value::from(r["RunningFor"].clone()),
-                    ),
-                    ("Service", serde_json::Value::from(m.service.clone())),
-                    ("Size", serde_json::Value::from("0B")),
-                    ("State", serde_json::Value::from(r["State"].clone())),
-                    ("Status", serde_json::Value::from(r["Status"].clone())),
-                ];
-                writeln!(out, "{}", json_line(&fields))?;
+                writeln!(out, "{}", json_line(&ps_fields(m, r)))?;
             }
         }
-        other => out.write_all(template(other, &rows).as_bytes())?,
+        other => {
+            let objects: Vec<serde_json::Value> = machines
+                .iter()
+                .zip(&rows)
+                .map(|(m, r)| {
+                    serde_json::Value::Object(
+                        ps_fields(m, r)
+                            .into_iter()
+                            .map(|(k, v)| (k.to_string(), v))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let headers = serde_json::json!({
+                "ID": "CONTAINER ID", "Name": "NAME", "Project": "PROJECT", "Service": "SERVICE",
+                "Image": "IMAGE", "Command": "COMMAND", "CreatedAt": "CREATED AT",
+                "RunningFor": "CREATED", "Status": "STATUS", "Size": "SIZE", "Labels": "LABELS",
+                "State": "STATE", "Ports": "PORTS",
+            });
+            let text = crate::gotemplate::format_list(other, PS_TABLE, &headers, &objects)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            out.write_all(text.as_bytes())?;
+        }
     }
     Ok(())
+}
+
+/// The default table of ps, as docker compose has it.
+const PS_TABLE: &str =
+    "table {{.Name}}\t{{.Image}}\t{{.Command}}\t{{.Service}}\t{{.RunningFor}}\t{{.Status}}\t{{.Ports}}";
+
+/// A machine as ps --format sees it, the fields in docker compose's order.
+fn ps_fields(m: &Machine, r: &BTreeMap<&str, String>) -> Vec<(&'static str, serde_json::Value)> {
+    let labels: Vec<String> = m.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let publishers: Vec<serde_json::Value> = m
+        .strings("ports")
+        .iter()
+        .filter_map(|p| publisher(p))
+        .collect();
+    vec![
+        ("Command", serde_json::Value::from(r["Command"].clone())),
+        ("CreatedAt", serde_json::Value::from(created_at(m.created))),
+        (
+            "ExitCode",
+            serde_json::Value::from(m.exit_code.unwrap_or(0)),
+        ),
+        ("Health", serde_json::Value::from(m.health.clone())),
+        ("ID", serde_json::Value::from(m.name.clone())),
+        ("Image", serde_json::Value::from(r["Image"].clone())),
+        ("Labels", serde_json::Value::from(labels.join(","))),
+        (
+            "LocalVolumes",
+            serde_json::Value::from(m.strings("volumes").len().to_string()),
+        ),
+        (
+            "Mounts",
+            serde_json::Value::from(m.strings("volumes").join(",")),
+        ),
+        ("Name", serde_json::Value::from(m.name.clone())),
+        ("Names", serde_json::Value::from(m.name.clone())),
+        ("Networks", serde_json::Value::from(r["Networks"].clone())),
+        ("Ports", serde_json::Value::from(r["Ports"].clone())),
+        ("Project", serde_json::Value::from(r["Project"].clone())),
+        ("Publishers", serde_json::Value::Array(publishers)),
+        (
+            "RunningFor",
+            serde_json::Value::from(r["RunningFor"].clone()),
+        ),
+        ("Service", serde_json::Value::from(m.service.clone())),
+        ("Size", serde_json::Value::from("0B")),
+        ("State", serde_json::Value::from(r["State"].clone())),
+        ("Status", serde_json::Value::from(r["Status"].clone())),
+    ]
 }
 
 /// A published port of the record ("[IP:]HOST->CONTAINER/PROTO") as a Publisher of ps.
@@ -419,14 +410,31 @@ pub async fn ls(e: &mut Engine<'_>, a: &LsArgs, out: &mut dyn Write) -> Result<(
         let Some(project) = m.labels.get(label::PROJECT).cloned() else {
             continue;
         };
-        if client::string(&m.dict, "origin") != "create" {
+        if client::string(&m.dict, "origin") != "create"
+            || !m.labels.contains_key(label::CONFIG_HASH)
+        {
+            continue;
+        }
+        // Without --all, as docker lists containers: running, paused or restarting.
+        let state = state(&m).to_string();
+        if !a.all && !matches!(state.as_str(), "running" | "paused" | "restarting") {
             continue;
         }
         let entry = projects.entry(project).or_default();
-        entry.0.push(state(&m).to_string());
-        if entry.1.is_empty() {
-            entry.1 = m.label(label::CONFIG_FILES).to_string();
+        entry.0.push(state);
+        // combinedConfigFiles: every machine's, each once, in order.
+        let mut files: Vec<String> = entry
+            .1
+            .split(',')
+            .filter(|f| !f.is_empty())
+            .map(str::to_string)
+            .collect();
+        for file in m.label(label::CONFIG_FILES).split(',') {
+            if !file.is_empty() && !files.iter().any(|f| f == file) {
+                files.push(file.to_string());
+            }
         }
+        entry.1 = files.join(",");
     }
     let mut names: Vec<String> = Vec::new();
     for filter in &a.filter {
@@ -435,10 +443,16 @@ pub async fn ls(e: &mut Engine<'_>, a: &LsArgs, out: &mut dyn Write) -> Result<(
             _ => bail!("invalid filter {filter:?}"),
         }
     }
+    // filters.Match: each value a regular expression, one that does not compile no
+    // match.
+    let names: Vec<regex::Regex> = names
+        .iter()
+        .filter_map(|n| regex::Regex::new(n).ok())
+        .collect();
+    let filtered = !a.filter.is_empty();
     let rows: Vec<(String, String, String)> = projects
         .into_iter()
-        .filter(|(_, (states, _))| a.all || states.iter().any(|s| s == "running"))
-        .filter(|(name, _)| names.is_empty() || names.iter().any(|n| name.contains(n.as_str())))
+        .filter(|(name, _)| !filtered || names.iter().any(|n| n.is_match(name)))
         .map(|(name, (states, files))| {
             let mut counts: BTreeMap<String, usize> = BTreeMap::new();
             for s in states {
@@ -492,45 +506,63 @@ pub async fn images(e: &mut Engine<'_>, a: &ImagesArgs, out: &mut dyn Write) -> 
         .list_images()
         .await
         .map_err(client::error)?;
-    let size_of = |reference: &str| {
-        images
-            .iter()
-            .find(|i| {
-                client::string(i, "reference") == reference
-                    && matches!(client::string(i, "origin").as_str(), "pull" | "build")
-            })
-            .map(|i| client::u64(i, "size"))
-            .unwrap_or(0)
+    let image_of = |reference: &str| {
+        images.iter().find(|i| {
+            client::string(i, "reference") == reference
+                && matches!(client::string(i, "origin").as_str(), "pull" | "build")
+        })
+    };
+    let size_of = |reference: &str| image_of(reference).map_or(0, |i| client::u64(i, "size"));
+    // The image's own time, the machine's when its image record is gone.
+    let created_of = |m: &Machine| {
+        image_of(&m.string("reference"))
+            .map(|i| client::u64(i, "created"))
+            .filter(|t| *t > 0)
+            .unwrap_or(m.created)
     };
     let now = now();
     let platform = format!("linux/{}", go_arch());
     let mut rows = Vec::new();
+    let mut full_ids = Vec::new();
+    let mut details = Vec::new();
     for m in &machines {
         let reference = short_image(&m.string("reference"));
-        let (repository, tag) = match reference.rsplit_once(':') {
-            Some((r, t)) if !t.contains('/') => (r.to_string(), t.to_string()),
-            _ => (reference.clone(), "latest".to_string()),
+        // A digest is no tag: NAME[:TAG]@DIGEST is the repository and its tag or <none>.
+        let (named, digest) = match reference.split_once('@') {
+            Some((named, digest)) => (named, Some(digest)),
+            None => (reference.as_str(), None),
         };
-        let id: String = m
-            .string("digest")
+        let (repository, tag) = match named.rsplit_once(':') {
+            Some((r, t)) if !t.contains('/') => (r.to_string(), t.to_string()),
+            _ if digest.is_some() => (named.to_string(), "<none>".to_string()),
+            _ => (named.to_string(), "latest".to_string()),
+        };
+        let full = m.string("digest");
+        let id: String = full
             .trim_start_matches("sha256:")
             .chars()
             .take(12)
             .collect();
+        let size = size_of(&m.string("reference"));
+        let created = created_of(m);
         rows.push((
             m.name.clone(),
             repository,
             tag,
             id,
-            human_size(size_of(&m.string("reference"))),
-            format!("{} ago", human_duration(now.saturating_sub(m.created))),
+            human_size(size),
+            format!("{} ago", human_duration(now.saturating_sub(created))),
         ));
+        full_ids.push(full);
+        details.push((size, created));
     }
     if a.quiet {
+        // Whole IDs without their algorithm, each once.
         let mut seen = BTreeSet::new();
-        for r in &rows {
-            if seen.insert(r.3.clone()) {
-                writeln!(out, "{}", r.3)?;
+        for id in &full_ids {
+            let id = id.split_once(':').map_or(id.as_str(), |(_, hex)| hex);
+            if seen.insert(id.to_string()) {
+                writeln!(out, "{id}")?;
             }
         }
         return Ok(());
@@ -538,13 +570,22 @@ pub async fn images(e: &mut Engine<'_>, a: &ImagesArgs, out: &mut dyn Write) -> 
     if a.format.as_deref() == Some("json") {
         let items: Vec<String> = rows
             .iter()
-            .map(|r| {
+            .zip(&full_ids)
+            .zip(&details)
+            .map(|((r, full), (size, created))| {
+                let created = crate::compose::gotime::rfc3339(
+                    *created as i64,
+                    crate::compose::gotime::local_offset(*created as i64),
+                );
                 json_line(&[
                     ("ContainerName", serde_json::Value::from(r.0.clone())),
+                    ("ID", serde_json::Value::from(full.clone())),
                     ("Repository", serde_json::Value::from(r.1.clone())),
                     ("Tag", serde_json::Value::from(r.2.clone())),
                     ("Platform", serde_json::Value::from(platform.clone())),
-                    ("ID", serde_json::Value::from(r.3.clone())),
+                    ("Size", serde_json::Value::from(*size)),
+                    ("Created", serde_json::Value::from(created.clone())),
+                    ("LastTagTime", serde_json::Value::from(created)),
                 ])
             })
             .collect();
@@ -563,7 +604,7 @@ pub async fn images(e: &mut Engine<'_>, a: &ImagesArgs, out: &mut dyn Write) -> 
 }
 
 /// GOARCH of this host, the name its platform goes by in images.
-fn go_arch() -> &'static str {
+pub(super) fn go_arch() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "amd64",
         "aarch64" => "arm64",
@@ -614,17 +655,28 @@ pub async fn port(e: &mut Engine<'_>, a: &PortArgs, out: &mut dyn Write) -> Resu
     let Some(service) = &a.service else {
         bail!("accepts between 1 and 2 arg(s), received {count}");
     };
-    if !e.project().services.contains_key(service) {
+    if e.project
+        .as_ref()
+        .is_some_and(|p| !p.services.contains_key(service))
+    {
         bail!("no such service: {service}");
     }
-    let index = a.index.unwrap_or(1).max(1) as u32;
+    // getSpecifiedContainer: running machines of the service, the one of --index, else
+    // the lowest number, one-offs last.
+    let index = a.index.filter(|i| *i > 0).map(|i| i as u32);
     let protocol = a.protocol.clone().unwrap_or_else(|| "tcp".to_string());
     let machines = e.machines().await?;
-    let Some(m) = machines
+    let mut candidates: Vec<&Machine> = machines
         .iter()
-        .find(|m| m.service == *service && !m.oneoff && m.number == index)
-    else {
-        bail!("service {service:?} is not running");
+        .filter(|m| m.service == *service && m.running())
+        .filter(|m| index.is_none_or(|i| m.number == i))
+        .collect();
+    candidates.sort_by_key(|m| (m.oneoff, m.number));
+    let Some(m) = candidates.first() else {
+        match index {
+            Some(i) => bail!("service {service:?} is not running container #{i}"),
+            None => bail!("service {service:?} is not running"),
+        }
     };
     let published = m.strings("ports");
     match &a.private_port {
@@ -649,6 +701,10 @@ pub async fn port(e: &mut Engine<'_>, a: &PortArgs, out: &mut dyn Write) -> Resu
         None => {
             for p in &published {
                 if let Some((host, rest)) = p.split_once("->") {
+                    // --protocol narrows the listing.
+                    if a.protocol.is_some() && !rest.ends_with(&format!("/{protocol}")) {
+                        continue;
+                    }
                     let host = if host.contains(':') {
                         host.to_string()
                     } else {
@@ -678,7 +734,7 @@ pub async fn volumes(e: &mut Engine<'_>, a: &VolumesArgs, out: &mut dyn Write) -
         .filter(|m| a.service.is_empty() || a.service.contains(&m.service))
         .map(|m| m.name)
         .collect();
-    let volumes: Vec<String> = e
+    let listed: Vec<(String, String)> = e
         .client
         .manager
         .list_volumes()
@@ -692,32 +748,69 @@ pub async fn volumes(e: &mut Engine<'_>, a: &VolumesArgs, out: &mut dyn Write) -
                     .iter()
                     .any(|u| machines.contains(u))
         })
-        .map(|v| client::string(v, "name"))
+        .map(|v| (client::string(v, "name"), client::string(v, "path")))
         .collect();
     if a.quiet {
-        for v in &volumes {
+        for (v, _) in &listed {
             writeln!(out, "{v}")?;
         }
         return Ok(());
     }
-    if a.format.as_deref() == Some("json") {
-        for v in &volumes {
-            writeln!(
-                out,
-                "{}",
-                json_line(&[
-                    ("Driver", serde_json::Value::from("local")),
-                    ("Name", serde_json::Value::from(v.clone())),
-                ])
-            )?;
+    // A volume as docker compose's --format sees one.
+    let fields = |name: &str, path: &str| {
+        let na = || serde_json::Value::from("N/A");
+        vec![
+            ("Availability", na()),
+            ("Driver", serde_json::Value::from("local")),
+            ("Group", na()),
+            ("Labels", serde_json::Value::from("")),
+            ("Links", na()),
+            ("Mountpoint", serde_json::Value::from(path)),
+            ("Name", serde_json::Value::from(name)),
+            ("Scope", serde_json::Value::from("local")),
+            ("Size", na()),
+            ("Status", na()),
+        ]
+    };
+    match a.format.as_deref() {
+        Some("json") => {
+            for (name, path) in &listed {
+                writeln!(out, "{}", json_line(&fields(name, path)))?;
+            }
         }
-        return Ok(());
+        None | Some("table") => {
+            let mut text = String::from("DRIVER\tVOLUME NAME\n");
+            for (v, _) in &listed {
+                text.push_str(&format!("local\t{v}\n"));
+            }
+            out.write_all(table(&text, 10, 3).as_bytes())?;
+        }
+        Some(format) => {
+            let objects: Vec<serde_json::Value> = listed
+                .iter()
+                .map(|(name, path)| {
+                    serde_json::Value::Object(
+                        fields(name, path)
+                            .into_iter()
+                            .map(|(k, v)| (k.to_string(), v))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let headers = serde_json::json!({
+                "Name": "VOLUME NAME", "Driver": "DRIVER", "Scope": "SCOPE",
+                "Mountpoint": "MOUNTPOINT", "Labels": "LABELS", "Links": "LINKS", "Size": "SIZE",
+            });
+            let text = crate::gotemplate::format_list(
+                format,
+                "table {{.Driver}}\t{{.Name}}",
+                &headers,
+                &objects,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            out.write_all(text.as_bytes())?;
+        }
     }
-    let mut text = String::from("DRIVER\tVOLUME NAME\n");
-    for v in &volumes {
-        text.push_str(&format!("local\t{v}\n"));
-    }
-    out.write_all(table(&text, 10, 3).as_bytes())?;
     Ok(())
 }
 
@@ -732,6 +825,13 @@ pub async fn stats(e: &mut Engine<'_>, a: &StatsArgs, _out: &mut dyn Write) -> R
         .collect();
     if names.is_empty() {
         return Ok(());
+    }
+    if let Some(format) = a
+        .format
+        .as_deref()
+        .filter(|f| !matches!(*f, "json" | "table"))
+    {
+        bail!("stats --format {format:?}: nspawn compose prints the table or json");
     }
     let args = crate::cli::StatsArgs {
         names,
@@ -789,6 +889,10 @@ pub async fn events(e: &mut Engine<'_>, a: &EventsArgs, out: &mut dyn Write) -> 
                 .and_then(|v| v.as_object())
                 .cloned()
                 .unwrap_or_default();
+            // One-off machines are not the project's services to compose's events.
+            if labels.get(label::ONEOFF).and_then(|v| v.as_str()) == Some("True") {
+                continue;
+            }
             let service = labels
                 .get(label::SERVICE)
                 .and_then(|v| v.as_str())
@@ -806,6 +910,15 @@ pub async fn events(e: &mut Engine<'_>, a: &EventsArgs, out: &mut dyn Write) -> 
                         .collect()
                 })
                 .unwrap_or_default();
+            // The machine's labels, as docker's container events carry them, compose's
+            // own left out as compose leaves them.
+            for (k, v) in &labels {
+                if !k.starts_with("com.docker.compose.") {
+                    attributes
+                        .entry(k.clone())
+                        .or_insert_with(|| v.as_str().unwrap_or("").to_string());
+                }
+            }
             attributes.insert("name".to_string(), text("name"));
             let mut action = text("action");
             if action == "health_status" {
@@ -881,15 +994,69 @@ mod tests {
     }
 
     #[test]
-    fn templates_fill_the_fields_named() {
-        let rows = vec![BTreeMap::from([
-            ("Name", "a".to_string()),
+    fn a_machine_shutting_down_still_runs() {
+        let m = |state: &str| Machine {
+            name: "m".to_string(),
+            service: "s".to_string(),
+            number: 1,
+            oneoff: false,
+            state: state.to_string(),
+            health: String::new(),
+            exit_code: None,
+            labels: BTreeMap::new(),
+            created: 0,
+            started: 1,
+            dict: crate::client::Dict::new(),
+        };
+        assert_eq!(state(&m("closing")), "running");
+        assert_eq!(state(&m("restarting")), "restarting");
+        assert_eq!(state(&m("stopped")), "exited");
+    }
+
+    #[test]
+    fn ps_formats_are_go_templates_with_docker_composes_headers() {
+        let m = Machine {
+            name: "p-web-1".to_string(),
+            service: "web".to_string(),
+            number: 1,
+            oneoff: false,
+            state: "running".to_string(),
+            health: "healthy".to_string(),
+            exit_code: None,
+            labels: BTreeMap::new(),
+            created: 0,
+            started: 0,
+            dict: crate::client::Dict::new(),
+        };
+        let r = BTreeMap::from([
+            ("Command", "\"sleep\"".to_string()),
+            ("Image", "busybox".to_string()),
+            ("Networks", String::new()),
+            ("Ports", String::new()),
+            ("Project", "p".to_string()),
+            ("RunningFor", "1 second ago".to_string()),
             ("State", "running".to_string()),
-        ])];
-        assert_eq!(template("{{.Name}} {{.State}}", &rows), "a running\n");
-        assert_eq!(
-            template("table {{.Name}}\\t{{.State}}", &rows),
-            "NAME      STATE\na         running\n"
+            ("Status", "Up".to_string()),
+        ]);
+        let row = serde_json::Value::Object(
+            ps_fields(&m, &r)
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        );
+        let headers = serde_json::json!({"Name": "NAME", "RunningFor": "CREATED"});
+        let text = crate::gotemplate::format_list(
+            "table {{.Name}}\t{{.RunningFor}}\t{{.Health | upper}}",
+            PS_TABLE,
+            &headers,
+            &[row],
+        )
+        .unwrap();
+        assert!(text.starts_with("NAME"), "{text}");
+        assert!(text.contains("CREATED"), "{text}");
+        assert!(
+            text.contains("p-web-1") && text.contains("HEALTHY"),
+            "{text}"
         );
     }
 }

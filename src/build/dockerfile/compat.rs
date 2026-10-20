@@ -667,6 +667,17 @@ pub(crate) fn csv_fields(input: &str) -> Result<Vec<String>, String> {
     Ok(dst)
 }
 
+/// Go's int64(x) of a float64 on amd64: what does not fit, NaN too, is the smallest
+/// int64, which a size then reads as none.
+fn go_i64(x: f64) -> i64 {
+    const TWO63: f64 = 9_223_372_036_854_775_808.0;
+    if (-TWO63..TWO63).contains(&x) {
+        x as i64
+    } else {
+        i64::MIN
+    }
+}
+
 /// units.RAMInBytes: a size with an optional binary suffix (k, m, g, t, p,
 /// with an optional b or ib), case-insensitive.
 pub(crate) fn ram_in_bytes(size: &str) -> Result<i64, String> {
@@ -688,7 +699,7 @@ pub(crate) fn ram_in_bytes(size: &str) -> Result<i64, String> {
         return Err(format!("invalid size: '{size}'"));
     }
     if sfx.is_empty() {
-        return Ok(value as i64);
+        return Ok(go_i64(value));
     }
     if sfx.len() > 3 {
         return Err(format!("invalid suffix: '{sfx}'"));
@@ -700,7 +711,7 @@ pub(crate) fn ram_in_bytes(size: &str) -> Result<i64, String> {
         if b.len() > 1 {
             return bad();
         }
-        return Ok(value as i64);
+        return Ok(go_i64(value));
     }
     let mul: i64 = match b[0] {
         b'k' => 1 << 10,
@@ -714,7 +725,7 @@ pub(crate) fn ram_in_bytes(size: &str) -> Result<i64, String> {
     if (b.len() == 2 && b[1] != b'b') || (b.len() == 3 && &b[1..] != b"ib") {
         return bad();
     }
-    Ok(value as i64)
+    Ok(go_i64(value))
 }
 
 #[cfg(test)]
@@ -891,6 +902,9 @@ mod tests {
         assert_eq!(ram_in_bytes("1.5m"), Ok(3 << 19));
         assert_eq!(ram_in_bytes("64 MB"), Ok(64 << 20));
         assert_eq!(ram_in_bytes("1g"), Ok(1 << 30));
+        // Out of range, as Go converts it on amd64: no size at all, not the largest.
+        assert_eq!(ram_in_bytes("1e19"), Ok(i64::MIN));
+        assert_eq!(ram_in_bytes("16777216t"), Ok(i64::MIN));
         assert!(ram_in_bytes("").is_err());
         assert!(ram_in_bytes("m").is_err());
         assert!(ram_in_bytes("-1").is_err());

@@ -43,6 +43,9 @@ pub enum Stdio {
     Pty { rows: u16, cols: u16 },
     /// Three pipes; the caller's ends come back in `Process`.
     Pipes,
+    /// /dev/null for all three: nobody reads the command, and nothing has to stay to
+    /// read it.
+    Null,
 }
 
 /// A command started inside a machine and not waited for yet.
@@ -482,6 +485,21 @@ pub fn spawn(
                 stderr: stderr_w,
             }
         }
+        Stdio::Null => {
+            let null = || {
+                nix::fcntl::open(
+                    "/dev/null",
+                    OFlag::O_RDWR | OFlag::O_CLOEXEC,
+                    nix::sys::stat::Mode::empty(),
+                )
+                .context("opening /dev/null")
+            };
+            ChildIo::Pipes {
+                stdin: null()?,
+                stdout: null()?,
+                stderr: null()?,
+            }
+        }
     };
     // The helper reports through here, once.
     let (report_r, report_w) = socketpair(
@@ -891,12 +909,17 @@ fn grandchild(
         complain("error: cannot become root inside the machine");
         return 126;
     }
-    // The capabilities of the machine's own processes and no more:
-    // the service's bounding set is the host's whole one, and the command is theirs to
-    // trace once it runs. Best effort: a security module that refuses (an SELinux
-    // policy without the rule) must not stop the command.
+    // The capabilities of the machine's own processes and no more: the service's
+    // bounding set is the host's whole one, and a machine without a user namespace of
+    // its own would get it through the command. One that cannot be limited does not run.
     if let Some(bounding) = bounding {
-        let _ = limit_bounding_set(bounding);
+        if let Err(e) = limit_bounding_set(bounding) {
+            complain(&format!(
+                "error: cannot limit the command to the machine's capabilities: {}",
+                e.desc()
+            ));
+            return 126;
+        }
     }
     let mut env: Vec<CString> = env.to_vec();
     match user {
@@ -913,7 +936,14 @@ fn grandchild(
                 ));
                 return 126;
             }
-            env.push(CString::new(format!("HOME={home}")).expect("no NUL"));
+            // A home with a NUL, from the image's passwd, is no home to give.
+            let Ok(home) = CString::new(format!("HOME={home}")) else {
+                complain(&format!(
+                    "error: the home of {user} inside the machine is not a path"
+                ));
+                return 126;
+            };
+            env.push(home);
         }
     }
     // With SELinux the command belongs to the machine's domain, not to the domain of

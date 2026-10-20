@@ -24,6 +24,8 @@ pub struct ImageSummary {
     pub read_only: bool,
     /// Who signed it, when the pull verified a signature.
     pub signed_by: Option<String>,
+    /// Pulled or built and never run: nothing of a machine is lost when it is replaced.
+    pub image_only: bool,
 }
 
 pub async fn list(ctx: &Context) -> Result<Vec<ImageSummary>> {
@@ -46,6 +48,7 @@ pub async fn list(ctx: &Context) -> Result<Vec<ImageSummary>> {
                 origin: record.map(|r| r.origin.clone()),
                 reference: record.map(|r| r.reference.clone()),
                 signed_by: record.and_then(|r| r.signed_by.clone()),
+                image_only: record.is_some_and(|r| crate::api::disk::image_only(&ctx.store, r)),
                 name: i.name,
                 kind: i.kind,
                 size: i.usage,
@@ -53,6 +56,45 @@ pub async fn list(ctx: &Context) -> Result<Vec<ImageSummary>> {
             }
         })
         .collect())
+}
+
+/// The machines of `names` that another machine needs, with why: one takes its network
+/// (--network container:) or depends on it (--depends-on), and does not go too.
+fn still_needed(
+    records: &[crate::store::ImageRecord],
+    names: &[String],
+    skip: &std::collections::HashSet<String>,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for name in names.iter().filter(|n| !skip.contains(*n)) {
+        let sharing: Vec<&str> = records
+            .iter()
+            .filter(|r| r.network_container.as_deref() == Some(name.as_str()))
+            .filter(|r| !names.contains(&r.name))
+            .map(|r| r.name.as_str())
+            .collect();
+        if !sharing.is_empty() {
+            let sharing = sharing.join(", ");
+            out.push((
+                name.clone(),
+                format!("{name} is the network of {sharing} (--network container:{name}); remove them or give them a network of their own first"),
+            ));
+            continue;
+        }
+        let dependents = crate::api::dependencies::dependents(records, name, names);
+        if !dependents.is_empty() {
+            let (verb, them, their) = if dependents.len() == 1 {
+                ("depends", "it", "its")
+            } else {
+                ("depend", "them", "their")
+            };
+            out.push((
+                name.clone(),
+                format!("{} {verb} on {name} (--depends-on); remove {them} too, or drop the dependency with --depends-on none at {their} next start", dependents.join(", ")),
+            ));
+        }
+    }
+    out
 }
 
 /// Removes images and whatever they alone kept: layers, blobs, network files. A running
@@ -100,6 +142,23 @@ pub async fn remove_machines(
     force: bool,
     report: Report<'_>,
 ) -> Result<Removal> {
+    remove_machines_if(ctx, names, force, report, &|_, _, _| None).await
+}
+
+/// Why a name of a removal stays, said under the lock from the records as they are
+/// then; None for one that goes.
+pub type Keep =
+    dyn Fn(&crate::store::Store, &[crate::store::ImageRecord], &str) -> Option<String> + Sync;
+
+/// `remove_machines`, `keep` saying under the lock, from the records as they are then,
+/// why a name now stays: what a prune chose may have become a machine's source.
+pub async fn remove_machines_if(
+    ctx: &Context,
+    names: &[String],
+    force: bool,
+    report: Report<'_>,
+    keep: &Keep,
+) -> Result<Removal> {
     require_root(if force { "rm --force" } else { "rm" })?;
     let sd = ctx.sd().await?;
     let store = &ctx.store;
@@ -114,51 +173,12 @@ pub async fn remove_machines(
             skip.insert(name.clone());
         }
     }
-    // A machine another one takes its network from stays, running or not, unless that
-    // one goes too: the other could not start again without it.
+    // Machines others need stay: checked now, to know what to stop, and again under the
+    // lock, as a machine may have come to need one meanwhile.
     let records = store.list_images()?;
-    let shared: Vec<(String, String)> = names
-        .iter()
-        .filter(|n| !skip.contains(*n))
-        .map(|name| {
-            let sharing: Vec<&str> = records
-                .iter()
-                .filter(|r| r.network_container.as_deref() == Some(name.as_str()))
-                .filter(|r| !names.contains(&r.name))
-                .map(|r| r.name.as_str())
-                .collect();
-            (name.clone(), sharing.join(", "))
-        })
-        .filter(|(_, sharing)| !sharing.is_empty())
-        .collect();
-    for (name, sharing) in shared {
-        removal.failed.push((
-            name.clone(),
-            format!("{name} is the network of {sharing} (--network container:{name}); remove them or give them a network of their own first"),
-        ));
+    for (name, why) in still_needed(&records, names, &skip) {
+        removal.failed.push((name.clone(), why));
         skip.insert(name);
-    }
-    // Nor one another machine depends on, unless that one goes too: systemd would start
-    // a machine that is not there before it.
-    for name in names
-        .iter()
-        .filter(|n| !skip.contains(*n))
-        .cloned()
-        .collect::<Vec<_>>()
-    {
-        let dependents = crate::api::dependencies::dependents(&records, &name, names);
-        if !dependents.is_empty() {
-            let (verb, them, their) = if dependents.len() == 1 {
-                ("depends", "it", "its")
-            } else {
-                ("depend", "them", "their")
-            };
-            removal.failed.push((
-                name.clone(),
-                format!("{} {verb} on {name} (--depends-on); remove {them} too, or drop the dependency with --depends-on none at {their} next start", dependents.join(", ")),
-            ));
-            skip.insert(name);
-        }
     }
     if force {
         // Each machine before the ones it depends on: one that a refused machine depends
@@ -202,6 +222,20 @@ pub async fn remove_machines(
         }
     }
     let _lock = store.lock().await?;
+    let records = store.list_images()?;
+    for (name, why) in still_needed(&records, names, &skip) {
+        removal.failed.push((name.clone(), why));
+        skip.insert(name);
+    }
+    for name in names {
+        if skip.contains(name) {
+            continue;
+        }
+        if let Some(why) = keep(store, &records, name) {
+            removal.failed.push((name.clone(), why));
+            skip.insert(name.clone());
+        }
+    }
     let hint = if force {
         ""
     } else {
@@ -290,15 +324,23 @@ pub async fn remove_machines(
     }
     // Whatever happened above, what was removed must not pin anything, and a machine that
     // died on its own must not keep its ports.
-    bridge::write_hosts_files(store, &crate::api::network::all(store, &ctx.config)?)?;
-    bridge::sync_ports(store, sd).await?;
-    let gone = store.gc_layers()?;
-    if !gone.is_empty() {
-        line(report, format!("freed {} unused layer(s)", gone.len()));
-    }
-    let blobs = store.gc_blobs()?;
-    if !blobs.is_empty() {
-        line(report, format!("freed {} unused blob(s)", blobs.len()));
+    // A problem here belongs to other images and the next collection: the removals
+    // happened, and say so.
+    let tidy = async {
+        bridge::write_hosts_files(store, &crate::api::network::all(store, &ctx.config)?)?;
+        bridge::sync_ports(store, sd).await?;
+        let gone = store.gc_layers()?;
+        if !gone.is_empty() {
+            line(report, format!("freed {} unused layer(s)", gone.len()));
+        }
+        let blobs = store.gc_blobs()?;
+        if !blobs.is_empty() {
+            line(report, format!("freed {} unused blob(s)", blobs.len()));
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    if let Err(e) = tidy.await {
+        note(report, format!("warning: {e:#}"));
     }
     Ok(removal)
 }
@@ -306,6 +348,37 @@ pub async fn remove_machines(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machines_others_need_stay() {
+        let record = |json: serde_json::Value| -> crate::store::ImageRecord {
+            let mut base = serde_json::json!({
+                "name": "x", "reference": "r", "manifest_digest": "sha256:a", "layers": [],
+                "backend": "overlay", "created": 1, "origin": "create",
+            });
+            for (k, v) in json.as_object().unwrap() {
+                base[k] = v.clone();
+            }
+            serde_json::from_value(base).unwrap()
+        };
+        let records = [
+            record(serde_json::json!({ "name": "db" })),
+            record(serde_json::json!({ "name": "vpn" })),
+            record(serde_json::json!({
+                "name": "web",
+                "tuning": { "depends_on": [{ "name": "db", "condition": "started" }] },
+            })),
+            record(serde_json::json!({ "name": "torrent", "network_container": "vpn" })),
+        ];
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let none = std::collections::HashSet::new();
+        let needed = still_needed(&records, &names(&["db", "vpn"]), &none);
+        assert_eq!(needed.len(), 2, "{needed:?}");
+        assert!(needed[0].1.contains("web depends on db"));
+        assert!(needed[1].1.contains("network of torrent"));
+        // Going together, nothing stays behind them.
+        assert!(still_needed(&records, &names(&["db", "web"]), &none).is_empty());
+    }
 
     #[test]
     fn removal_failures_read_as_one_message() {

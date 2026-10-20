@@ -28,7 +28,7 @@ pub struct Ending {
     pub result: String,
 }
 
-const CLD_EXITED: i32 = 1;
+pub const CLD_EXITED: i32 = 1;
 const CLD_KILLED: i32 = 2;
 const CLD_DUMPED: i32 = 3;
 /// What systemd-nspawn exits with when the machine asked for a reboot.
@@ -48,6 +48,17 @@ pub fn exit_code(ending: &Ending, sent: Option<i32>, stub: bool) -> i32 {
         CLD_EXITED => ending.status,
         CLD_KILLED | CLD_DUMPED => 128 + ending.status,
         _ => 125,
+    }
+}
+
+/// A task aborted when this goes.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
     }
 }
 
@@ -440,7 +451,9 @@ pub async fn attach(
     } else {
         Duration::from_secs(120)
     };
-    let handover = match mode {
+    // Ended with this call whichever way it goes: left listening, it would hold the
+    // socket of the name and the client's descriptors for as long as it waits.
+    let mut handover = AbortOnDrop(match mode {
         Some(mode) => {
             let listener = crate::attach::Listener::bind(&name)?;
             Some(tokio::spawn(async move {
@@ -448,7 +461,7 @@ pub async fn attach(
             }))
         }
         None => None,
-    };
+    });
     let drain = match &straight {
         Some(read) => Some(read.try_clone().context("keeping the output's pipe")?),
         None => None,
@@ -469,13 +482,8 @@ pub async fn attach(
         (None, None)
     };
     let mut watch = UnitWatch::new(sd, &unit).await?;
-    if let Err(e) = crate::api::machines::start(ctx, &request.start, report).await {
-        if let Some(task) = handover {
-            task.abort();
-        }
-        return Err(e);
-    }
-    if let Some(task) = handover {
+    crate::api::machines::start(ctx, &request.start, report).await?;
+    if let Some(task) = handover.0.as_mut() {
         let handed = tokio::time::timeout(Duration::from_secs(10), task).await;
         if !matches!(handed, Ok(Ok(Ok(())))) {
             let reason = match handed {
@@ -591,6 +599,18 @@ pub fn transient_service(description: &str, argv: &[String]) -> Vec<(String, Own
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_hand_over_goes_with_the_run_that_failed() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let guard = AbortOnDrop(Some(tokio::spawn(async move {
+            // Holds what a hand-over holds until it is ended.
+            let _held = tx;
+            std::future::pending::<()>().await
+        })));
+        drop(guard);
+        assert!(rx.await.is_err(), "the task and what it held are gone");
+    }
 
     fn ending(code: i32, status: i32, result: &str) -> Ending {
         Ending {

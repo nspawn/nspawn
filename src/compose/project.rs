@@ -889,7 +889,7 @@ impl Project {
                 let format = string(file, "format");
                 // Only a file that is not there is missing; any other error comes from
                 // reading it.
-                if let Err(e) = std::fs::metadata(paths::abs(&path, &cwd)) {
+                if let Err(e) = stat(&path, &cwd) {
                     if e.kind() == std::io::ErrorKind::NotFound {
                         if required {
                             return Err(format!(
@@ -944,7 +944,7 @@ impl Project {
                 .unwrap_or_default();
             let mut labels = Env::new();
             for file in files {
-                if let Err(e) = std::fs::metadata(paths::abs(&file, &cwd)) {
+                if let Err(e) = stat(&file, &cwd) {
                     if e.kind() == std::io::ErrorKind::NotFound {
                         return Err(format!(
                             "label file {file} not found: {}",
@@ -1035,7 +1035,7 @@ impl Project {
             .iter()
             .map(|(k, v)| (k.clone(), model::any(v)))
             .collect();
-        extensions.sort_by(|a, b| emit::natural_order(&a.0, &b.0));
+        emit::sort_natural(&mut extensions, |e| &e.0);
         fields.extend(extensions);
         emit::yaml(&Out::Struct(fields))
     }
@@ -1068,6 +1068,15 @@ impl Project {
 }
 
 /// A name machined takes for a machine: letters, digits and hyphens, up to 64.
+/// os.Stat of a path relative to `cwd`: an empty one is not there, as Go has it, where
+/// joining it to the directory would name the directory.
+fn stat(path: &str, cwd: &str) -> std::io::Result<std::fs::Metadata> {
+    if path.is_empty() {
+        return Err(std::io::Error::from_raw_os_error(nix::libc::ENOENT));
+    }
+    std::fs::metadata(paths::abs(path, cwd))
+}
+
 /// loadMappingFile: an env or label file read in its format, compose-go's `.env` or
 /// `raw`, into `vars`; a relative path is relative to `cwd`.
 fn load_mapping_file(

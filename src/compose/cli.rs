@@ -394,7 +394,7 @@ pub fn requested(args: &ComposeArgs) -> Vec<(&'static str, &'static str)> {
             flag(command, "pull", c.pull.is_some());
             flag(command, "quiet-build", c.quiet_build);
             flag(command, "quiet-pull", c.quiet_pull);
-            flag(command, "remove-orphans", c.remove_orphans);
+            flag(command, "remove-orphans", c.remove_orphans.is_some());
             flag(command, "renew-anon-volumes", c.renew_anon_volumes);
             flag(command, "scale", !c.scale.is_empty());
             flag(command, "timeout", c.timeout.is_some());
@@ -530,7 +530,7 @@ mod tests {
     }
 }
 
-#[derive(Args, Debug, Default)]
+#[derive(Args, Clone, Debug, Default)]
 pub struct ConfigArgs {
     /// Format the output. Values: [yaml | json].
     #[arg(long, value_name = "FORMAT")]
@@ -1168,8 +1168,8 @@ pub struct UpArgs {
     #[arg(long)]
     pub quiet_pull: bool,
     /// Remove containers for services not defined in the Compose file.
-    #[arg(long)]
-    pub remove_orphans: bool,
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub remove_orphans: Option<bool>,
     /// Recreate anonymous volumes instead of retrieving data from the previous containers.
     #[arg(long, short = 'V')]
     pub renew_anon_volumes: bool,

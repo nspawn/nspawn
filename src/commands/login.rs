@@ -53,7 +53,11 @@ pub async fn login(args: LoginArgs, client: &Client, config: &Config) -> Result<
 }
 
 pub async fn logout(args: LogoutArgs, client: &Client, config: &Config) -> Result<()> {
-    let registry = args.registry.unwrap_or_else(|| config.registry.clone());
+    // The registry login would have used: the one given, else the service's own.
+    let registry = match args.registry {
+        Some(registry) => registry,
+        None => super::registry_name(client, config).await,
+    };
     let removed = client
         .manager
         .logout(&registry)

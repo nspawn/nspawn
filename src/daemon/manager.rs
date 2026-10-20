@@ -36,7 +36,7 @@ pub enum Error {
 
 impl From<anyhow::Error> for Error {
     fn from(e: anyhow::Error) -> Self {
-        Error::Failed(format!("{e:#}"))
+        Error::Failed(crate::daemon::values::bus_text(&format!("{e:#}")))
     }
 }
 
@@ -45,6 +45,9 @@ type Result<T> = std::result::Result<T, Error>;
 pub struct Manager {
     state: Arc<State>,
 }
+
+/// How many Events streams a user other than root holds at once.
+const STREAMS_PER_USER: usize = 64;
 
 /// What a copy did, as the job's result.
 fn copy_result(stats: &api::copy::Stats) -> HashMap<String, OwnedValue> {
@@ -70,7 +73,11 @@ impl Manager {
             .sender()
             .map(|s| s.to_string())
             .ok_or_else(|| Error::NotAuthorized("the call carries no sender".to_string()))?;
-        polkit::allows(self.state.connection(), &sender, action)
+        let interactive = header
+            .primary()
+            .flags()
+            .contains(zbus::message::Flags::AllowInteractiveAuth);
+        polkit::allows(self.state.connection(), &sender, action, interactive)
             .await
             .map_err(Error::NotAuthorized)?;
         let uid = polkit::caller_uid(self.state.connection(), &sender)
@@ -212,12 +219,14 @@ pub(crate) fn start_request(
     })
 }
 
-/// The --health-* flags: health_cmd (s), health_interval, health_timeout,
-/// health_start_period, health_start_interval (t, microseconds), health_retries (u),
-/// no_healthcheck (b).
+/// The --health-* flags: health_cmd (s), health_test (as, the whole test as compose
+/// writes it), health_interval, health_timeout, health_start_period,
+/// health_start_interval (t, microseconds), health_retries (u), no_healthcheck (b).
 fn health_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::health::Overrides> {
+    let test = options.strings("health_test")?;
     Ok(crate::health::Overrides {
         cmd: options.string("health_cmd")?,
+        test: (!test.is_empty()).then_some(test),
         interval: options.maybe_u64("health_interval")?,
         timeout: options.maybe_u64("health_timeout")?,
         start_period: options.maybe_u64("health_start_period")?,
@@ -313,14 +322,15 @@ impl Manager {
         self.ctx().config.subnet.to_string()
     }
 
-    /// Jobs running, and the last ones that ended.
-    #[zbus(property)]
+    /// Jobs running, and the last ones that ended; read when needed: a method's reply
+    /// names a job it starts, JobRemoved its end.
+    #[zbus(property(emits_changed_signal = "false"))]
     fn jobs(&self) -> Vec<OwnedObjectPath> {
         self.state.jobs.paths()
     }
 
-    /// Commands running, and the last ones that exited.
-    #[zbus(property)]
+    /// Commands running, and the last ones that exited; read when needed.
+    #[zbus(property(emits_changed_signal = "false"))]
     fn processes(&self) -> Vec<OwnedObjectPath> {
         self.state.processes.paths()
     }
@@ -734,13 +744,12 @@ impl Manager {
                         let _ = Manager::image_removed(&emitter, name).await;
                     }
                 }
+                let result =
+                    HashMap::from([("removed".to_string(), values::v(removal.removed.clone()))]);
                 if let Some(error) = removal.error() {
-                    anyhow::bail!("{error}");
+                    return Err(jobs::Partly { result, error }.into());
                 }
-                Ok(HashMap::from([(
-                    "removed".to_string(),
-                    values::v(removal.removed),
-                )]))
+                Ok(result)
             },
         )
         .await?)
@@ -776,13 +785,12 @@ impl Manager {
                         let _ = Manager::image_removed(&emitter, name).await;
                     }
                 }
+                let result =
+                    HashMap::from([("removed".to_string(), values::v(removal.removed.clone()))]);
                 if let Some(error) = removal.error() {
-                    anyhow::bail!("{error}");
+                    return Err(jobs::Partly { result, error }.into());
                 }
-                Ok(HashMap::from([(
-                    "removed".to_string(),
-                    values::v(removal.removed),
-                )]))
+                Ok(result)
             },
         )
         .await?)
@@ -898,13 +906,12 @@ impl Manager {
             &target,
             move |ctx, reporter| async move {
                 let removal = api::volumes::remove(&ctx, &names, jobs::report(&reporter)).await?;
+                let result =
+                    HashMap::from([("removed".to_string(), values::v(removal.removed.clone()))]);
                 if let Some(error) = removal.error() {
-                    anyhow::bail!("{error}");
+                    return Err(jobs::Partly { result, error }.into());
                 }
-                Ok(HashMap::from([(
-                    "removed".to_string(),
-                    values::v(removal.removed),
-                )]))
+                Ok(result)
             },
         )
         .await?)
@@ -980,6 +987,7 @@ impl Manager {
         let labels = options.strings("labels")?;
         let until = options.maybe_u64("until")?;
         options.finish()?;
+        let state = self.state.clone();
         Ok(jobs::spawn(
             &self.state,
             owner,
@@ -990,6 +998,12 @@ impl Manager {
                 let pruned =
                     api::disk::prune_images(&ctx, all, &labels, until, jobs::report(&reporter))
                         .await?;
+                // As rm says it: a client following the images learns of these too.
+                for name in &pruned.removed {
+                    if let Ok(emitter) = state.emitter() {
+                        let _ = Manager::image_removed(&emitter, name).await;
+                    }
+                }
                 Ok(HashMap::from([
                     ("removed".to_string(), values::v(pruned.removed)),
                     ("reclaimed".to_string(), values::v(pruned.reclaimed)),
@@ -1175,8 +1189,9 @@ impl Manager {
         self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let labels = crate::volume::parse_labels(&options.strings("labels")?)?;
+        let replace = options.bool("replace", false)?;
         options.finish()?;
-        Ok(api::secrets::create(self.ctx(), &name, &content, labels).await?)
+        Ok(api::secrets::create(self.ctx(), &name, &content, labels, replace).await?)
     }
 
     /// Like `secret rm`: a job; every name is tried, the result lists the ones removed,
@@ -1197,13 +1212,12 @@ impl Manager {
             &target,
             move |ctx, reporter| async move {
                 let removal = api::secrets::remove(&ctx, &names, jobs::report(&reporter)).await?;
+                let result =
+                    HashMap::from([("removed".to_string(), values::v(removal.removed.clone()))]);
                 if let Some(error) = removal.error() {
-                    anyhow::bail!("{error}");
+                    return Err(jobs::Partly { result, error }.into());
                 }
-                Ok(HashMap::from([(
-                    "removed".to_string(),
-                    values::v(removal.removed),
-                )]))
+                Ok(result)
             },
         )
         .await?)
@@ -1284,13 +1298,12 @@ impl Manager {
             &target,
             move |ctx, reporter| async move {
                 let removal = api::network::remove(&ctx, &names, jobs::report(&reporter)).await?;
+                let result =
+                    HashMap::from([("removed".to_string(), values::v(removal.removed.clone()))]);
                 if let Some(error) = removal.error() {
-                    anyhow::bail!("{error}");
+                    return Err(jobs::Partly { result, error }.into());
                 }
-                Ok(HashMap::from([(
-                    "removed".to_string(),
-                    values::v(removal.removed),
-                )]))
+                Ok(result)
             },
         )
         .await?)
@@ -1381,8 +1394,13 @@ impl Manager {
             "network-prune",
             "",
             move |ctx, reporter| async move {
-                let removed = api::network::prune(&ctx, jobs::report(&reporter)).await?;
-                Ok(HashMap::from([("removed".to_string(), values::v(removed))]))
+                let removal = api::network::prune(&ctx, jobs::report(&reporter)).await?;
+                let result =
+                    HashMap::from([("removed".to_string(), values::v(removal.removed.clone()))]);
+                if let Some(error) = removal.error() {
+                    return Err(jobs::Partly { result, error }.into());
+                }
+                Ok(result)
             },
         )
         .await?)
@@ -1871,6 +1889,13 @@ impl Manager {
     ) -> Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Inspect).await?;
+        // Each stream is a journalctl and a few descriptors of the service's: a user who
+        // may only look holds a bounded number.
+        if owner.uid != 0 && self.state.processes.running_for(owner.uid) >= STREAMS_PER_USER {
+            return Err(Error::Failed(format!(
+                "{STREAMS_PER_USER} streams of yours are open; close one first"
+            )));
+        }
         let mut options = Options::new(&options);
         let since = options.string("since")?;
         let until = options.string("until")?;
@@ -1970,6 +1995,8 @@ impl Manager {
                 rows: rows.clamp(1, u16::MAX as u64) as u16,
                 cols: cols.clamp(1, u16::MAX as u64) as u16,
             }
+        } else if detach {
+            crate::nsenter::Stdio::Null
         } else {
             crate::nsenter::Stdio::Pipes
         };
@@ -2014,17 +2041,9 @@ impl Manager {
                 }
             };
         let mut fds = HashMap::new();
+        // A detached command writes to /dev/null: nothing in the service has to stay to
+        // read it, which a restart of the service would end.
         if detach {
-            // Nobody reads the command: its output is drained here and discarded, so
-            // that it never blocks on a full pipe. On threads of their
-            // own: a child of the command that keeps the pipe open outlives the command,
-            // and a blocking task of the runtime would keep the service from exiting.
-            drop(stdin);
-            for fd in [stdout, stderr].into_iter().flatten() {
-                std::thread::spawn(move || {
-                    let _ = std::io::copy(&mut std::fs::File::from(fd), &mut std::io::sink());
-                });
-            }
             return Ok((fds, path));
         }
         for (name, fd) in [

@@ -92,6 +92,8 @@ struct DockerHubResult {
 pub async fn search_docker_hub(term: &str, limit: usize) -> Result<Vec<Hit>> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("nspawn/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(60))
         .build()?;
     let body = client
         .get(DOCKER_HUB_SEARCH)

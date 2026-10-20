@@ -12,7 +12,8 @@ use nix::sys::stat::Mode;
 use zbus::zvariant::Value;
 
 use crate::api::copy::{
-    block_sigpipe, pack, plan, split_source, unpack, Endpoint, Ids, Kind, Stats, Target,
+    block_sigpipe, follow_destination, pack, plan, split_source, unpack, Endpoint, Ids, Kind,
+    Stats, Target,
 };
 use crate::cli::CpArgs;
 use crate::client::{self, Client, Options};
@@ -49,6 +50,12 @@ fn open_dir(path: &Path) -> Result<OwnedFd> {
 fn local_kind(path: &Path) -> Result<Option<Kind>> {
     match fs::metadata(path) {
         Ok(meta) if meta.is_dir() => Ok(Some(Kind::Directory)),
+        Ok(meta)
+            if std::os::unix::fs::FileTypeExt::is_char_device(&meta.file_type())
+                || std::os::unix::fs::FileTypeExt::is_block_device(&meta.file_type()) =>
+        {
+            Ok(Some(Kind::Device))
+        }
         Ok(_) => Ok(Some(Kind::Other)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
@@ -83,6 +90,12 @@ async fn copy_out(client: &Client, name: &str, path: &str, destination: &str) ->
     } else {
         destination
     });
+    let dst = follow_destination(&dst, false, |p| match fs::symlink_metadata(p) {
+        Ok(meta) if meta.file_type().is_symlink() => fs::read_link(p)
+            .map(Some)
+            .with_context(|| format!("reading {}", p.display())),
+        _ => Ok(None),
+    })?;
     let dst_kind = local_kind(&dst)?;
     if dst_kind.is_none() {
         if let Some(parent) = dst.parent().filter(|p| !p.as_os_str().is_empty()) {

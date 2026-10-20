@@ -159,6 +159,7 @@ pub fn apply(record: &mut ImageRecord, choice: &NetworkChoice) {
         record.address = None;
         record.extra_networks.clear();
         record.aliases.clear();
+        record.fixed_addresses.clear();
         return;
     }
     let had: BTreeMap<String, Ipv4Addr> = bridge::networks_of(record)
@@ -182,6 +183,12 @@ pub fn apply(record: &mut ImageRecord, choice: &NetworkChoice) {
         .map(str::to_string)
         .collect();
     record.aliases.retain(|network, _| joined.contains(network));
+    // An address asked for on a network left is no longer one: back there, the machine
+    // takes whatever it gets.
+    let bridged = bridge::bridge_kind(record);
+    record
+        .fixed_addresses
+        .retain(|network| bridged && joined.contains(network));
 }
 
 /// --network-alias values: NAME on the primary network, or NETWORK=NAME on one of
@@ -292,9 +299,10 @@ pub async fn connect(
 ) -> Result<()> {
     require_root("network connect")?;
     let (store, config, sd) = (&ctx.store, &ctx.config, ctx.sd().await?);
+    let _lock = store.lock().await?;
+    // Looked up under the lock: a network rm may have gone first.
     let net =
         find(store, config, network).map_err(|_| anyhow::anyhow!("network {network} not found"))?;
-    let _lock = store.lock().await?;
     let mut record = store
         .load_image(machine)?
         .ok_or_else(|| anyhow::anyhow!("No such container: {machine}"))?;
@@ -348,10 +356,16 @@ pub async fn connect(
         // with: a new one takes a name none of them matches.
         let first = if app { 1 } else { bound_network_files(machine) };
         let inside = bridge::connect_live(machine, leader, app, &net, addr, first)?;
-        line(report, format!("{machine}: {inside} on {network}, {addr}"));
         if !net.internal {
-            bridge::ensure_default_route(machine, leader, app, net.subnet.gateway())?;
+            // The record does not list the network yet: an interface it would not know
+            // of does not stay.
+            if let Err(e) = bridge::ensure_default_route(machine, leader, app, net.subnet.gateway())
+            {
+                let _ = bridge::disconnect_live(machine, &net, (!app).then_some(leader));
+                return Err(e);
+            }
         }
+        line(report, format!("{machine}: {inside} on {network}, {addr}"));
     }
     store.record_image(&record)?;
     bridge::write_hosts_files(store, &all(store, config)?)?;
@@ -384,9 +398,9 @@ pub async fn disconnect(
 ) -> Result<()> {
     require_root("network disconnect")?;
     let (store, config, sd) = (&ctx.store, &ctx.config, ctx.sd().await?);
+    let _lock = store.lock().await?;
     let net =
         find(store, config, network).map_err(|_| anyhow::anyhow!("network {network} not found"))?;
-    let _lock = store.lock().await?;
     let Some(mut record) = store.load_image(machine)? else {
         if force {
             return Ok(());
@@ -417,7 +431,7 @@ pub async fn disconnect(
             line(
                 report,
                 format!(
-                    "note: the ports of {machine} go to its address on {} from its next start",
+                    "note: the ports of {machine} go to its address on {} now",
                     next.network
                 ),
             );
@@ -427,30 +441,50 @@ pub async fn disconnect(
     }
     record.aliases.remove(network);
     record.fixed_addresses.remove(network);
-    if sd.machine_exists(machine).await? && bridge::disconnect_live(machine, &net)? {
-        line(report, format!("{machine}: left {network}"));
-        // Its default route may have gone with the network: the next that leads out
-        // takes it.
-        let all = all(store, config)?;
-        let left: Vec<&NetSpec> = bridge::networks_of(&record)
-            .iter()
-            .filter_map(|n| all.iter().find(|s| s.name == *n))
-            .collect();
-        if let Some(next) = left.get(bridge::gateway_index(left.iter().copied())) {
-            if !next.internal {
-                let leader = sd.machine_leader(machine).await?;
-                bridge::ensure_default_route(
-                    machine,
-                    leader,
-                    record.mode == Mode::App,
-                    next.subnet.gateway(),
-                )?;
+    // The record first: what follows changes a running machine, and a failure there
+    // leaves it as the record says it is from its next start.
+    store.record_image(&record)?;
+    let all = all(store, config)?;
+    bridge::write_hosts_files(store, &all)?;
+    emit_membership("disconnect", &net, &record);
+    if sd.machine_exists(machine).await? {
+        let live = async {
+            let booted = if record.mode == Mode::Boot {
+                Some(sd.machine_leader(machine).await?)
+            } else {
+                None
+            };
+            if !bridge::disconnect_live(machine, &net, booted)? {
+                return Ok::<(), anyhow::Error>(());
             }
+            line(report, format!("{machine}: left {network}"));
+            // Its default route may have gone with the network: the next that leads out
+            // takes it.
+            let left: Vec<&NetSpec> = bridge::networks_of(&record)
+                .iter()
+                .filter_map(|n| all.iter().find(|s| s.name == *n))
+                .collect();
+            if let Some(next) = left.get(bridge::gateway_index(left.iter().copied())) {
+                if !next.internal {
+                    let leader = sd.machine_leader(machine).await?;
+                    bridge::ensure_default_route(
+                        machine,
+                        leader,
+                        record.mode == Mode::App,
+                        next.subnet.gateway(),
+                    )?;
+                }
+            }
+            // The published ports follow the primary address, which may have changed.
+            bridge::sync_ports(store, sd).await
+        };
+        if let Err(e) = live.await {
+            line(
+                report,
+                format!("warning: {machine} left {network} in its record, not yet live: {e:#}"),
+            );
         }
     }
-    store.record_image(&record)?;
-    bridge::write_hosts_files(store, &all(store, config)?)?;
-    emit_membership("disconnect", &net, &record);
     Ok(())
 }
 
@@ -461,10 +495,18 @@ pub async fn up(ctx: &Context, report: Report<'_>) -> Result<(BridgeInfo, Vec<St
     let store = &ctx.store;
     let _lock = store.lock_for(Duration::from_secs(60)).await?;
     let all = all(store, &ctx.config)?;
+    // One network that cannot come up keeps neither the others down nor the published
+    // ports out; it is said at the end.
+    let mut failed = Vec::new();
     for net in &all {
-        bridge::up(net, &all, sd, report).await?;
+        if let Err(e) = bridge::up(net, &all, sd, report).await {
+            failed.push(format!("{}: {e:#}", net.name));
+        }
     }
     bridge::sync_ports(store, sd).await?;
+    if !failed.is_empty() {
+        bail!("{}", failed.join("; "));
+    }
     Ok((bridge_info(ctx), all.into_iter().map(|n| n.name).collect()))
 }
 
@@ -635,7 +677,7 @@ fn users(records: &[ImageRecord], network: &str) -> Vec<String> {
     users
 }
 
-pub async fn prune(ctx: &Context, report: Report<'_>) -> Result<Vec<String>> {
+pub async fn prune(ctx: &Context, report: Report<'_>) -> Result<Removal> {
     require_root("network prune")?;
     let unused: Vec<String> = {
         let records = ctx.store.list_images_strict()?;
@@ -646,11 +688,7 @@ pub async fn prune(ctx: &Context, report: Report<'_>) -> Result<Vec<String>> {
             .map(|n| n.name)
             .collect()
     };
-    let removal = remove(ctx, &unused, report).await?;
-    if let Some(error) = removal.error() {
-        bail!("{error}");
-    }
-    Ok(removal.removed)
+    remove(ctx, &unused, report).await
 }
 
 /// ExecStartPre: what `start` prepares, so that machinectl, boot and restarts get it too.
@@ -673,9 +711,24 @@ pub async fn prepare(ctx: &Context, name: &str) -> Result<()> {
     .map(|_| ())
 }
 
+/// A hook's notes go to the journal by its native protocol: under the unit, as journald
+/// tells by the writer, but not as the machine's output, which logs reads from what came
+/// on its standard output.
 fn to_journal(event: Event) {
     if let Event::Line(text) | Event::Note(text) = event {
-        eprintln!("{text}");
+        let priority = if text.starts_with("warning:") {
+            "4"
+        } else {
+            "5"
+        };
+        let sent = crate::journal::send(&[
+            ("MESSAGE", text.as_str()),
+            ("PRIORITY", priority),
+            ("SYSLOG_IDENTIFIER", "nspawn"),
+        ]);
+        if sent.is_err() {
+            eprintln!("{text}");
+        }
     }
 }
 
@@ -690,9 +743,22 @@ pub async fn publish(ctx: &Context, name: &str) -> Result<()> {
     };
     if record.backend == BackendChoice::Mstack {
         let leader = sd.machine_leader(name).await?;
+        // A pidfd of the leader, then machined asked again: the process it holds is the
+        // one machined names, not one that took a PID left free.
+        let alive = crate::nsenter::pidfd_open(nix::unistd::Pid::from_raw(leader as i32))
+            .map_err(|e| anyhow::anyhow!("the leader of {name}: {}", e.desc()))?;
+        if sd.machine_leader(name).await? != leader {
+            bail!("{name} restarted while its volumes were attached");
+        }
         for volume in &record.volumes {
             let source = volume.host_path(&store.volumes_dir());
-            volmount::mount_into_machine(leader, &source, &volume.target, volume.read_only)?;
+            volmount::mount_into_machine(
+                leader,
+                &alive,
+                &source,
+                &volume.target,
+                volume.read_only,
+            )?;
         }
         // nspawn does not put the veths of a managed user namespace on the bridges.
         if bridge::bridge_kind(&record) && record.mode == Mode::Boot {
@@ -718,10 +784,7 @@ pub async fn publish(ctx: &Context, name: &str) -> Result<()> {
         }
         _ => {}
     }
-    if record
-        .effective_healthcheck()
-        .is_some_and(|h| !h.disabled())
-    {
+    if record.effective_healthcheck().is_some_and(|h| h.active()) {
         crate::health::start_runner(ctx, name).await?;
     }
     Ok(())
@@ -791,8 +854,9 @@ pub async fn remove_after_exit(ctx: &Context, name: &str, invocation: &str) -> R
     let unit = format!("systemd-nspawn@{name}.service");
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
+        // Down: its stop hooks done too, which still read the record and its files.
         let state = sd.unit_status(&unit).await?;
-        if !state.busy() {
+        if !state.busy() && !state.shutting_down() {
             break;
         }
         if !invocation.is_empty() && sd.invocation_id(&unit).await? != invocation {
@@ -830,7 +894,8 @@ pub async fn remove_ended(ctx: &Context) -> Result<()> {
                 continue;
             }
             let unit = format!("systemd-nspawn@{}.service", r.name);
-            if !sd.unit_status(&unit).await?.busy() && !sd.machine_exists(&r.name).await? {
+            let state = sd.unit_status(&unit).await?;
+            if !state.busy() && !state.shutting_down() && !sd.machine_exists(&r.name).await? {
                 ended.push(r.name);
             }
         }
@@ -936,7 +1001,10 @@ mod tests {
         });
         r.aliases.insert("back".into(), vec!["api".into()]);
         r.aliases.insert("front".into(), vec!["www".into()]);
+        r.fixed_addresses = ["front".to_string(), "back".to_string()].into();
         apply(&mut r, &choices(&["back".into(), "bridge".into()]).unwrap());
+        // Asked for on front, which it left: back there it takes what it gets.
+        assert_eq!(r.fixed_addresses.iter().collect::<Vec<_>>(), ["back"]);
         assert_eq!(r.network_name.as_deref(), Some("back"));
         assert_eq!(r.address, Some("10.99.2.2".parse().unwrap()));
         assert_eq!(
@@ -951,6 +1019,7 @@ mod tests {
         assert!(bridge::joins(&r, "bridge") && !bridge::joins(&r, "front"));
         apply(&mut r, &choices(&["none".into()]).unwrap());
         assert!(r.no_network && r.extra_networks.is_empty() && r.aliases.is_empty());
+        assert!(r.fixed_addresses.is_empty());
         assert!(!bridge::joins(&r, "bridge"));
         apply(&mut r, &choices(&["host".into()]).unwrap());
         assert_eq!(r.network, Network::Host);

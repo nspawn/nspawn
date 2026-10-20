@@ -1410,7 +1410,14 @@ impl Parser<'_> {
         let token = self.next_non_space();
         let name = self.parse_template_name(&token, context)?;
         let pipe = self.pipeline(context, It::RightDelim)?;
-        let saved = std::mem::replace(&mut self.t, TreeState::new());
+        // A block's body is a tree of its own, but it nests in this one: the depth goes
+        // with it, or blocks inside blocks would recurse past every limit.
+        if self.t.control_depth >= MAX_CONTROL_DEPTH {
+            return Err(self.errorf("max nesting depth exceeded"));
+        }
+        let mut body = TreeState::new();
+        body.control_depth = self.t.control_depth + 1;
+        let saved = std::mem::replace(&mut self.t, body);
         let r = self.item_list();
         let block = std::mem::replace(&mut self.t, saved);
         let (list, end) = r?;
@@ -1995,6 +2002,11 @@ fn is_print(c: char) -> bool {
         | 0xFFF9..=0xFFFB | 0xFFFE | 0xFFFF | 0x110BD | 0x110CD | 0x13430..=0x1343F
         | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F
         | 0xF0000..=0x10FFFF)
+}
+
+/// Go's strconv.Quote.
+pub fn go_quote(s: &str) -> String {
+    quote_with(s, '"', false)
 }
 
 /// strconv.Quote, QuoteToASCII and their single-rune forms.
@@ -4187,7 +4199,7 @@ impl<'t> Exec<'t> {
                 self.not_a_function(&cmd.args, fin)?;
                 return self.eval_pipeline(dot, Some(p));
             }
-            Arg::Var(v) => return self.eval_variable_node(first, v, &cmd.args, fin),
+            Arg::Var(v) => return self.eval_variable_node(dot, first, v, &cmd.args, fin),
             _ => {}
         }
         self.at(NodeRef::Arg(first));
@@ -4237,7 +4249,7 @@ impl<'t> Exec<'t> {
         fin: Option<&Val>,
     ) -> EResult<Val> {
         self.at(NodeRef::Arg(node));
-        self.eval_field_chain(dot.clone(), ident, args, fin)
+        self.eval_field_chain(dot, dot.clone(), ident, args, fin)
     }
 
     fn eval_chain_node(
@@ -4260,11 +4272,12 @@ impl<'t> Exec<'t> {
             return Err(self.errorf(&format!("indirection through explicit nil in {}", s)));
         }
         let receiver = self.eval_arg(dot, Pt::Untyped, inner)?;
-        self.eval_field_chain(receiver, fields, args, fin)
+        self.eval_field_chain(dot, receiver, fields, args, fin)
     }
 
     fn eval_variable_node(
         &mut self,
+        dot: &Val,
         node: &'t Arg,
         var: &'t Var,
         args: &'t [Arg],
@@ -4276,11 +4289,12 @@ impl<'t> Exec<'t> {
             self.not_a_function(args, fin)?;
             return Ok(value);
         }
-        self.eval_field_chain(value, &var.ident[1..], args, fin)
+        self.eval_field_chain(dot, value, &var.ident[1..], args, fin)
     }
 
     fn eval_field_chain(
         &mut self,
+        dot: &Val,
         receiver: Val,
         ident: &'t [String],
         args: &'t [Arg],
@@ -4289,18 +4303,19 @@ impl<'t> Exec<'t> {
         let mut receiver = receiver;
         let n = ident.len();
         for name in &ident[..n.saturating_sub(1)] {
-            receiver = self.eval_field(name, &[], None, receiver)?;
+            receiver = self.eval_field(dot, name, &[], None, receiver)?;
         }
         match ident.last() {
-            Some(name) => self.eval_field(name, args, fin, receiver),
+            Some(name) => self.eval_field(dot, name, args, fin, receiver),
             None => Ok(receiver),
         }
     }
 
     fn eval_field(
         &mut self,
+        dot: &Val,
         name: &str,
-        args: &[Arg],
+        args: &'t [Arg],
         fin: Option<&Val>,
         receiver: Val,
     ) -> EResult<Val> {
@@ -4312,6 +4327,34 @@ impl<'t> Exec<'t> {
             return Err(self.errorf(&format!("nil pointer evaluating {}.{}", typ, name)));
         }
         if let V::Map(m, strmap) = &receiver.v {
+            // The rows of docker's formats have a Label method: one label's value, ""
+            // for a label the row has not.
+            if name == "Label" && !strmap && m.contains_key("LabelsMap") {
+                let got = args.len().saturating_sub(1) + usize::from(fin.is_some());
+                if got != 1 {
+                    return Err(
+                        self.errorf(&format!("wrong number of args for Label: want 1 got {got}"))
+                    );
+                }
+                let key = match fin {
+                    Some(value) => value.clone(),
+                    None => self.eval_arg(dot, Pt::Str, &args[1])?,
+                };
+                let V::Str(key) = &key.v else {
+                    return Err(self.errorf(&format!(
+                        "wrong type for value; expected string; got {}",
+                        key.type_name()
+                    )));
+                };
+                let value = match m.get("LabelsMap") {
+                    Some(V::Map(labels, _)) => match labels.get(key.as_str()) {
+                        Some(V::Str(value)) => value.clone(),
+                        _ => String::new(),
+                    },
+                    _ => String::new(),
+                };
+                return Ok(Val::plain(V::Str(value)));
+            }
             if args.len() > 1 || fin.is_some() {
                 return Err(self.errorf(&format!("{} is not a method but has arguments", name)));
             }
@@ -4492,7 +4535,7 @@ impl<'t> Exec<'t> {
             Arg::Field { ident, .. } => {
                 self.eval_field_node(dot, n, ident, std::slice::from_ref(n), None)?
             }
-            Arg::Var(v) => self.eval_variable_node(n, v, &[], None)?,
+            Arg::Var(v) => self.eval_variable_node(dot, n, v, &[], None)?,
             Arg::Pipe(p) => self.eval_pipeline(dot, Some(p))?,
             Arg::Ident { name, .. } => {
                 self.eval_function(dot, n, name, NodeRef::Arg(n), None, None)?
@@ -5353,6 +5396,25 @@ mod tests {
         );
         assert_eq!(
             Template::parse(&ifs(4000)).unwrap_err(),
+            "template: :1: max nesting depth exceeded"
+        );
+        // Blocks opened inside blocks count too.
+        let blocks = |n: usize| {
+            (0..n)
+                .map(|i| format!("{{{{block \"b{i}\" .}}}}"))
+                .collect::<String>()
+                + "x"
+                + &"{{end}}".repeat(n)
+        };
+        assert_eq!(
+            Template::parse(&blocks(MAX_CONTROL_DEPTH))
+                .unwrap()
+                .execute(&Json::Null)
+                .unwrap(),
+            "x"
+        );
+        assert_eq!(
+            Template::parse(&blocks(4000)).unwrap_err(),
             "template: :1: max nesting depth exceeded"
         );
         let deep = format!(

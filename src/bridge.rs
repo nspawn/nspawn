@@ -708,10 +708,17 @@ pub fn withdraw_ports(record: &ImageRecord) -> Result<()> {
     if !table_exists() {
         return Ok(());
     }
-    let Some(address) = record.address else {
+    // Any of its addresses: the ports were published to the primary one of their
+    // time, which a network connect or disconnect may have changed since.
+    let addresses: Vec<Ipv4Addr> = record
+        .address
+        .into_iter()
+        .chain(record.extra_networks.iter().filter_map(|a| a.address))
+        .collect();
+    if addresses.is_empty() {
         return Ok(());
-    };
-    for (map, key) in ports_to_withdraw(&record.ports, address, |map| {
+    }
+    for (map, key) in ports_to_withdraw(&record.ports, &addresses, |map| {
         output("nft", &["list", "map", "ip", TABLE, map]).unwrap_or_default()
     }) {
         // One script per element: a missing one fails the whole transaction.
@@ -724,7 +731,7 @@ pub fn withdraw_ports(record: &ImageRecord) -> Result<()> {
 /// says of each map.
 fn ports_to_withdraw(
     ports: &[PortMap],
-    address: Ipv4Addr,
+    addresses: &[Ipv4Addr],
     list: impl Fn(&str) -> String,
 ) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
@@ -736,9 +743,12 @@ fn ports_to_withdraw(
                 ("addr_ports", Some(ip)) => format!("{ip} . {} . {}", p.protocol.name(), p.host),
                 _ => continue,
             };
-            let ours = elements
-                .iter()
-                .any(|(k, v)| *k == key && v.starts_with(&format!("{address} . ")));
+            let ours = elements.iter().any(|(k, v)| {
+                *k == key
+                    && addresses
+                        .iter()
+                        .any(|address| v.starts_with(&format!("{address} . ")))
+            });
             if ours {
                 out.push((map, key));
             }
@@ -995,17 +1005,49 @@ pub fn ensure_default_route(name: &str, leader: u32, app: bool, gateway: Ipv4Add
 }
 
 /// The veth of `net` goes, and its peer inside the machine with it. Whether there was
-/// one.
-pub fn disconnect_live(name: &str, net: &NetSpec) -> Result<bool> {
+/// one. A booted machine's first veth is systemd-nspawn's, named by its own shortening:
+/// it is found by the peers of the machine's interfaces, as the kernel gives them inside
+/// its namespace (`booted` is its leader).
+pub fn disconnect_live(name: &str, net: &NetSpec, booted: Option<u32>) -> Result<bool> {
+    let on_net = |host_end: &str| {
+        fs::read_link(Path::new(SYS_NET).join(host_end).join("master"))
+            .is_ok_and(|m| m.file_name().is_some_and(|f| f == net.interface.as_str()))
+    };
     for index in 0..MAX_ATTACHMENTS {
         let host_end = host_end_name_at(name, index);
-        let master = fs::read_link(Path::new(SYS_NET).join(&host_end).join("master"));
-        if master.is_ok_and(|m| m.file_name().is_some_and(|f| f == net.interface.as_str())) {
+        if on_net(&host_end) {
             run("ip", &["link", "del", &host_end])?;
             return Ok(true);
         }
     }
+    let Some(leader) = booted else {
+        return Ok(false);
+    };
+    attach_netns(name, leader)?;
+    let links = output("ip", &["-n", &netns_name(name), "-j", "link", "show"]);
+    delete_netns(name);
+    for index in peer_indexes(&links?) {
+        if let Some(host_end) = interface_by_index(Path::new(SYS_NET), index) {
+            if on_net(&host_end) {
+                run("ip", &["link", "del", &host_end])?;
+                return Ok(true);
+            }
+        }
+    }
     Ok(false)
+}
+
+/// The host indexes of the peers of a namespace's veths, from `ip -j link show` in it.
+fn peer_indexes(json: &str) -> Vec<u32> {
+    let Ok(serde_json::Value::Array(links)) = serde_json::from_str(json) else {
+        return Vec::new();
+    };
+    links
+        .iter()
+        .filter(|l| l.get("link_netnsid").is_some())
+        .filter_map(|l| l.get("link_index").and_then(serde_json::Value::as_u64))
+        .filter_map(|i| u32::try_from(i).ok())
+        .collect()
 }
 
 /// An address asked for on `net` (--ip): on a network made with network create only,
@@ -1055,7 +1097,25 @@ pub fn adopt_managed_veth(bridge: &str, leader: u32, interface: &str) -> Result<
     let name = interface_by_index(Path::new("/sys/class/net"), index).with_context(|| {
         format!("no host interface with index {index} is the peer of the machine's {interface}")
     })?;
+    // The index comes from the machine's own /sys, which it can make say anything: only
+    // the host end of a veth whose peer is in another namespace is taken, never a
+    // physical interface of the host.
+    let details = output("ip", &["-d", "-j", "link", "show", "dev", &name])?;
+    if !is_veth_to_elsewhere(&details) {
+        bail!("{name}, which the machine names as the peer of its {interface}, is no veth of a machine");
+    }
     attach_to_bridge(&name, bridge)
+}
+
+/// Whether `ip -d -j link show` describes a veth whose peer is in another namespace.
+fn is_veth_to_elsewhere(json: &str) -> bool {
+    let Ok(serde_json::Value::Array(links)) = serde_json::from_str(json) else {
+        return false;
+    };
+    links.first().is_some_and(|link| {
+        link.pointer("/linkinfo/info_kind").and_then(|k| k.as_str()) == Some("veth")
+            && link.get("link_netnsid").is_some()
+    })
 }
 
 /// Puts a veth's host end on a bridge and up; one on another bridge is an error, not
@@ -1551,8 +1611,10 @@ pub fn gateway_index<'a>(nets: impl IntoIterator<Item = &'a NetSpec>) -> usize {
 /// each with the members of the machine's own networks and their names there. An alias
 /// several members share goes to the first of them by name.
 pub fn write_hosts_files(store: &Store, all: &[NetSpec]) -> Result<()> {
+    // One record that cannot be read costs its own lines, said as a warning, not the
+    // start of every machine on a bridge.
     let records: Vec<ImageRecord> = store
-        .list_images_strict()?
+        .list_images()?
         .into_iter()
         .filter(bridge_kind)
         .collect();
@@ -1738,9 +1800,20 @@ pub async fn sync_ports_except(store: &Store, sd: &Systemd, except: &str) -> Res
     if !table_exists() {
         return Ok(());
     }
+    nft(&ports_script(&ports_in_use(store, sd, except).await?))
+}
+
+/// The nft script of the published ports. A port two machines publish (both started by
+/// systemd, which checks no ports) goes to the first: a key given twice would fail the
+/// whole transaction, and every machine's publish with it.
+fn ports_script(in_use: &[PortInUse]) -> String {
     let mut script = format!("flush map ip {TABLE} ports\nflush map ip {TABLE} addr_ports\n");
-    for used in ports_in_use(store, sd, except).await? {
-        let (p, addr) = (used.port, used.address);
+    let mut taken = std::collections::HashSet::new();
+    for used in in_use {
+        let (p, addr) = (&used.port, used.address);
+        if !taken.insert((p.host_ip, p.protocol.name(), p.host)) {
+            continue;
+        }
         script.push_str(&match p.host_ip {
             Some(ip) => format!(
                 "add element ip {TABLE} addr_ports {{ {ip} . {} . {} : {addr} . {} }}\n",
@@ -1756,12 +1829,45 @@ pub async fn sync_ports_except(store: &Store, sd: &Systemd, except: &str) -> Res
             ),
         });
     }
-    nft(&script)
+    script
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_peers_of_a_machines_veths_are_read() {
+        let links = r#"[{"ifindex":1,"ifname":"lo"},
+            {"ifindex":2,"link_index":41,"ifname":"host0","link_netnsid":0},
+            {"ifindex":3,"link_index":7,"ifname":"eth1"}]"#;
+        assert_eq!(peer_indexes(links), [41]);
+        assert!(peer_indexes("").is_empty());
+    }
+
+    #[test]
+    fn a_port_published_twice_goes_to_the_first() {
+        let used = |machine: &str, address: &str| PortInUse {
+            port: "80:80".parse().unwrap(),
+            machine: machine.to_string(),
+            address: address.parse().unwrap(),
+        };
+        let script = ports_script(&[used("a", "10.99.0.2"), used("b", "10.99.0.3")]);
+        assert_eq!(script.matches("add element").count(), 1, "{script}");
+        assert!(script.contains("10.99.0.2"));
+    }
+
+    #[test]
+    fn only_a_machines_veth_is_adopted() {
+        let veth =
+            r#"[{"ifindex":7,"ifname":"vb-x","link_netnsid":2,"linkinfo":{"info_kind":"veth"}}]"#;
+        assert!(is_veth_to_elsewhere(veth));
+        let nic = r#"[{"ifindex":2,"ifname":"enp1s0","linkinfo":null}]"#;
+        assert!(!is_veth_to_elsewhere(nic));
+        let both_here = r#"[{"ifindex":8,"ifname":"v0","linkinfo":{"info_kind":"veth"}}]"#;
+        assert!(!is_veth_to_elsewhere(both_here));
+        assert!(!is_veth_to_elsewhere("not json"));
+    }
 
     #[test]
     fn only_a_port_in_use_or_an_address_elsewhere_refuses_a_publish() {
@@ -1995,6 +2101,32 @@ mod tests {
     }
 
     #[test]
+    fn a_record_that_cannot_be_read_costs_only_its_own_hosts_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        store.init().unwrap();
+        let record: ImageRecord = serde_json::from_value(serde_json::json!({
+            "name": "web",
+            "reference": "r",
+            "manifest_digest": "d",
+            "layers": [],
+            "backend": "overlay",
+            "created": 0,
+            "network": "bridge",
+            "address": "10.99.0.2",
+        }))
+        .unwrap();
+        store.record_image(&record).unwrap();
+        fs::create_dir_all(store.machine_files_dir("web")).unwrap();
+        // Empty after a power loss.
+        fs::write(store.images_dir().join("lost.json"), "").unwrap();
+        let default = net(DEFAULT_NETWORK, "nspawn0", "10.99.0.0/24", false);
+        write_hosts_files(&store, &[default]).unwrap();
+        let hosts = fs::read_to_string(store.machine_files_dir("web").join("hosts")).unwrap();
+        assert!(hosts.contains("10.99.0.2"), "{hosts}");
+    }
+
+    #[test]
     fn networks_are_kept_apart_in_one_table() {
         let default = net("bridge", "nspawn0", "10.99.0.0/24", false);
         let web = net("web", "nsbr-web", "10.99.1.0/24", false);
@@ -2152,14 +2284,18 @@ mod tests {
             .map(|p| p.parse().unwrap())
             .collect();
         // 8080 belongs to another machine by now: it stays.
+        let at = |a: &str| vec![a.parse::<Ipv4Addr>().unwrap()];
         assert_eq!(
-            ports_to_withdraw(&ports, "10.99.0.2".parse().unwrap(), listing),
+            ports_to_withdraw(&ports, &at("10.99.0.2"), listing),
             [
                 ("ports", "udp . 53".to_string()),
                 ("addr_ports", "127.0.0.1 . tcp . 8081".to_string())
             ]
         );
-        assert!(ports_to_withdraw(&ports, "10.99.0.9".parse().unwrap(), listing).is_empty());
+        assert!(ports_to_withdraw(&ports, &at("10.99.0.9"), listing).is_empty());
+        // Published to the primary address of an earlier time, still the machine's.
+        let both = vec!["10.99.1.5".parse().unwrap(), "10.99.0.2".parse().unwrap()];
+        assert_eq!(ports_to_withdraw(&ports, &both, listing).len(), 2);
     }
 
     #[test]

@@ -81,24 +81,67 @@ fn start_order(e: &Engine<'_>, mut machines: Vec<Machine>) -> Vec<Machine> {
     machines
 }
 
+/// Whether down removes a machine. One-offs count only with --remove-orphans. A
+/// service's machines go when it is selected; with --remove-orphans so do one-offs that
+/// ended and machines of services the file lacks, but not those of a profile not
+/// enabled.
+fn down_takes(
+    m: &Machine,
+    services: &[String],
+    remove_orphans: bool,
+    known: Option<&BTreeSet<String>>,
+    disabled: &BTreeSet<String>,
+) -> bool {
+    if m.oneoff && !remove_orphans {
+        return false;
+    }
+    let in_project = known.is_none_or(|k| k.contains(&m.service));
+    if in_project && (services.is_empty() || services.contains(&m.service)) {
+        return true;
+    }
+    if !remove_orphans {
+        return false;
+    }
+    if m.oneoff {
+        return !m.running();
+    }
+    !in_project && !disabled.contains(&m.service)
+}
+
+/// down's and kill's --remove-orphans, whose default is COMPOSE_REMOVE_ORPHANS of the
+/// process's environment, as compose makes it the flag's default.
+fn orphans_too(flag: bool) -> bool {
+    flag || std::env::var("COMPOSE_REMOVE_ORPHANS").is_ok_and(|v| up::string_to_bool(&v))
+}
+
 pub async fn down(e: &mut Engine<'_>, a: &DownArgs) -> Result<()> {
+    let remove_orphans = orphans_too(a.remove_orphans);
+    // Checked before anything goes.
+    if let Some(rmi) = &a.rmi {
+        if !matches!(rmi.as_str(), "all" | "local") {
+            bail!("invalid --rmi option {rmi:?}: must be one of \"all\" or \"local\"");
+        }
+    }
     let machines = e.machines().await?;
-    let known: Option<BTreeSet<String>> = e.project.as_ref().map(|p| {
-        p.services
-            .keys()
-            .chain(p.disabled_services.keys())
-            .chain(p.jobs.keys())
-            .cloned()
-            .collect()
-    });
+    if let Some(project) = &e.project {
+        if let Some(name) = a
+            .service
+            .iter()
+            .find(|s| !project.services.contains_key(*s) && !project.jobs.contains_key(*s))
+        {
+            bail!("no such service: {name}");
+        }
+    }
+    let (known, disabled): (Option<BTreeSet<String>>, BTreeSet<String>) = match &e.project {
+        Some(p) => (
+            Some(p.services.keys().chain(p.jobs.keys()).cloned().collect()),
+            p.disabled_services.keys().cloned().collect(),
+        ),
+        None => (None, BTreeSet::new()),
+    };
     let mut going: Vec<Machine> = machines
         .into_iter()
-        .filter(|m| a.service.is_empty() || a.service.contains(&m.service))
-        .filter(|m| {
-            // Orphans and one-offs go with --remove-orphans only.
-            let orphan = known.as_ref().is_some_and(|k| !k.contains(&m.service));
-            (!orphan && !m.oneoff) || a.remove_orphans
-        })
+        .filter(|m| down_takes(m, &a.service, remove_orphans, known.as_ref(), &disabled))
         .collect();
     going = start_order(e, going);
     going.reverse();
@@ -116,7 +159,7 @@ pub async fn down(e: &mut Engine<'_>, a: &DownArgs) -> Result<()> {
     }
     secrets_down(e).await?;
     if let Some(rmi) = &a.rmi {
-        images_down(e, rmi, a.remove_orphans).await?;
+        images_down(e, rmi, remove_orphans).await?;
     }
     Ok(())
 }
@@ -179,7 +222,10 @@ async fn volumes_down(e: &Engine<'_>) -> Result<()> {
         .map(|v| client::string(v, "name"))
         .collect();
     for (key, def) in &project.volumes {
-        if def.get(&["external"]) == Some(&Value::Bool(true)) {
+        // The host directory a volume binds stays, as with docker.
+        if def.get(&["external"]) == Some(&Value::Bool(true))
+            || !matches!(super::convert::volume_device(project, key), Ok(None))
+        {
             continue;
         }
         let name = super::convert::volume_name(project, key);
@@ -258,12 +304,13 @@ async fn images_down(e: &Engine<'_>, rmi: &str, orphans: bool) -> Result<()> {
         .filter(|m| client::string(m, "origin") == "create")
         .map(|m| (client::string(m, "digest"), client::string(m, "name")))
         .collect();
-    let records: Vec<(String, String, String)> = e
+    let listed = e
         .client
         .manager
         .list_images()
         .await
-        .map_err(client::error)?
+        .map_err(client::error)?;
+    let records: Vec<(String, String, String)> = listed
         .iter()
         .filter(|i| matches!(client::string(i, "origin").as_str(), "pull" | "build"))
         .map(|i| {
@@ -273,6 +320,12 @@ async fn images_down(e: &Engine<'_>, rmi: &str, orphans: bool) -> Result<()> {
                 client::string(i, "origin"),
             )
         })
+        .collect();
+    // A record that ran is a machine of its own, whatever image it is.
+    let ran: BTreeSet<String> = listed
+        .iter()
+        .filter(|i| !client::bool(i, "image_only"))
+        .map(|i| client::string(i, "name"))
         .collect();
     let find = |image: &str| {
         let reference = super::image_reference(image).ok()?.to_string();
@@ -326,6 +379,10 @@ async fn images_down(e: &Engine<'_>, rmi: &str, orphans: bool) -> Result<()> {
             ));
             continue;
         }
+        if ran.contains(&name) {
+            e.warn(format!("image {image} is kept: {name} ran as a machine"));
+            continue;
+        }
         let id = format!("Image {image}");
         e.progress.event(&id, "Removing", "", Status::Working);
         let list = [name];
@@ -348,7 +405,8 @@ async fn images_down(e: &Engine<'_>, rmi: &str, orphans: bool) -> Result<()> {
 /// The pre_stop hooks of a machine's service, run inside it before it stops; a failure
 /// is a warning, as the machine goes all the same.
 async fn pre_stop(e: &Engine<'_>, m: &Machine) {
-    if !m.running() {
+    // A paused machine runs nothing, its hooks included: the stop goes on without them.
+    if !m.running() || m.state == "paused" {
         return;
     }
     let Some(project) = &e.project else { return };
@@ -410,7 +468,9 @@ pub async fn stop(e: &mut Engine<'_>, a: &StopArgs) -> Result<()> {
 /// Stops a machine, said for one that is down already too.
 async fn stop_one(e: &Engine<'_>, m: &Machine, timeout: Option<u64>) -> Result<()> {
     e.progress.container(&m.name, "Stopping", Status::Working);
-    if !m.running() && m.state != "restarting" {
+    // One that waits in its start for what it depends on is stopped too: the stop job
+    // ends the start.
+    if !m.running() && !matches!(m.state.as_str(), "restarting" | "starting") {
         e.progress.container(&m.name, "Stopped", Status::Done);
         return Ok(());
     }
@@ -427,8 +487,38 @@ async fn stop_one(e: &Engine<'_>, m: &Machine, timeout: Option<u64>) -> Result<(
     Ok(())
 }
 
+/// compose restart's services: those named, and the ones that depend on them with
+/// `restart: true`, unless --no-deps; every service when none is named.
+fn restart_services(
+    project: &crate::compose::project::Project,
+    named: &[String],
+    no_deps: bool,
+) -> Vec<String> {
+    let mut out = named.to_vec();
+    if named.is_empty() || no_deps {
+        return out;
+    }
+    let mut i = 0;
+    while i < out.len() {
+        let current = out[i].clone();
+        for (name, service) in &project.services {
+            let restarts =
+                service.get(&["depends_on", &current, "restart"]) == Some(&Value::Bool(true));
+            if restarts && !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 pub async fn restart(e: &mut Engine<'_>, a: &RestartArgs) -> Result<()> {
-    let machines = selected(e, e.machines().await?, &a.service)?;
+    let services = match &e.project {
+        Some(project) => restart_services(project, &a.service, a.no_deps),
+        None => a.service.clone(),
+    };
+    let machines = selected(e, e.machines().await?, &services)?;
     let machines: Vec<Machine> = start_order(e, machines)
         .into_iter()
         .filter(|m| !m.oneoff)
@@ -438,6 +528,17 @@ pub async fn restart(e: &mut Engine<'_>, a: &RestartArgs) -> Result<()> {
         e.progress.container(&m.name, "Restarting", Status::Working);
     }
     for m in &machines {
+        // Only the dependencies a restart concerns are waited for: those with
+        // restart: true.
+        if let Some(project) = &e.project {
+            if let Ok(service) = super::convert::service(project, &m.service) {
+                let mut service = service.clone();
+                if let Some(Value::Map(deps)) = service.get_mut("depends_on") {
+                    deps.retain(|_, d| d.get(&["restart"]) == Some(&Value::Bool(true)));
+                }
+                up::wait_dependencies(e, project, &service, &m.service).await?;
+            }
+        }
         if m.running() {
             pre_stop(e, m).await;
             let mut options = Options::new();
@@ -458,6 +559,7 @@ pub async fn restart(e: &mut Engine<'_>, a: &RestartArgs) -> Result<()> {
             .await
             .map_err(client::error)?;
         e.progress.container(&m.name, "Started", Status::Done);
+        up::post_start(e, m).await?;
     }
     Ok(())
 }
@@ -465,7 +567,16 @@ pub async fn restart(e: &mut Engine<'_>, a: &RestartArgs) -> Result<()> {
 pub async fn kill(e: &mut Engine<'_>, a: &KillArgs) -> Result<()> {
     let machines = selected(e, e.machines().await?, &a.service)?;
     let signal = a.signal.clone().unwrap_or_else(|| "SIGKILL".to_string());
-    for m in machines.iter().filter(|m| m.running()) {
+    // Machines of services the file no longer has are left alone unless asked for.
+    let orphan = |m: &Machine| {
+        e.project
+            .as_ref()
+            .is_some_and(|p| !p.services.contains_key(&m.service))
+    };
+    for m in machines
+        .iter()
+        .filter(|m| m.running() && (orphans_too(a.remove_orphans) || !orphan(m)))
+    {
         e.progress.container(&m.name, "Killing", Status::Working);
         let mut options = Options::new();
         options.insert("signal", Bus::from(signal.clone()));
@@ -509,9 +620,16 @@ pub async fn rm(e: &mut Engine<'_>, a: &RmArgs) -> Result<()> {
         self::stop(e, &stop).await?;
     }
     let machines = selected(e, e.machines().await?, &a.service)?;
+    // Only what is stopped: a machine waiting to be restarted, starting or shutting down
+    // runs. One-offs stay, -a or not, and so do machines of services the file lacks.
     let stopped: Vec<Machine> = machines
         .into_iter()
-        .filter(|m| !m.running() && (a.all || !m.oneoff))
+        .filter(|m| m.state == "stopped" && !m.oneoff)
+        .filter(|m| {
+            e.project
+                .as_ref()
+                .is_none_or(|p| p.services.contains_key(&m.service))
+        })
         .collect();
     if stopped.is_empty() {
         eprintln!("No stopped containers");
@@ -526,8 +644,7 @@ pub async fn rm(e: &mut Engine<'_>, a: &RmArgs) -> Result<()> {
     }
     for m in &stopped {
         e.progress.container(&m.name, "Removing", Status::Working);
-        let mut options = Options::new();
-        options.insert("force", Bus::from(true));
+        let options = Options::new();
         let list = [m.name.clone()];
         let manager = &e.client.manager;
         e.client
@@ -614,4 +731,67 @@ pub async fn wait(e: &mut Engine<'_>, a: &WaitArgs) -> Result<()> {
         std::process::exit(code);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_restart_takes_the_services_that_restart_with_it() {
+        let p = crate::compose::engine::convert::tests::project(
+            "restart",
+            "services:\n  db:\n    image: x\n  web:\n    image: x\n    depends_on:\n      db: {condition: service_started, restart: true}\n  proxy:\n    image: x\n    depends_on:\n      web: {condition: service_started, restart: true}\n  cron:\n    image: x\n    depends_on: [db]\n",
+        );
+        let named = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            restart_services(&p, &named(&["db"]), false),
+            named(&["db", "web", "proxy"])
+        );
+        assert_eq!(restart_services(&p, &named(&["db"]), true), named(&["db"]));
+        assert!(restart_services(&p, &[], false).is_empty());
+    }
+
+    #[test]
+    fn down_takes_what_docker_compose_takes() {
+        let m = |service: &str, oneoff: bool, state: &str| Machine {
+            name: format!("p-{service}"),
+            service: service.to_string(),
+            number: 1,
+            oneoff,
+            state: state.to_string(),
+            health: String::new(),
+            exit_code: None,
+            labels: BTreeMap::new(),
+            created: 0,
+            started: 0,
+            dict: crate::client::Dict::new(),
+        };
+        let known: BTreeSet<String> = ["db", "web"].map(String::from).into();
+        let disabled: BTreeSet<String> = ["extra"].map(String::from).into();
+        let takes = |m: &Machine, services: &[&str], orphans: bool| {
+            let services: Vec<String> = services.iter().map(|s| s.to_string()).collect();
+            down_takes(m, &services, orphans, Some(&known), &disabled)
+        };
+        assert!(takes(&m("db", false, "running"), &[], false));
+        assert!(!takes(&m("db", false, "running"), &["web"], false));
+        // A profile not enabled is left alone, orphans or not.
+        assert!(!takes(&m("extra", false, "running"), &[], true));
+        // Orphans go with --remove-orphans only.
+        assert!(!takes(&m("gone", false, "running"), &[], false));
+        assert!(takes(&m("gone", false, "running"), &[], true));
+        // One-offs: of a selected service with --remove-orphans, or ended.
+        assert!(!takes(&m("db", true, "stopped"), &[], false));
+        assert!(takes(&m("db", true, "running"), &[], true));
+        assert!(takes(&m("gone", true, "stopped"), &[], true));
+        assert!(!takes(&m("gone", true, "running"), &[], true));
+        // Without the files, every service counts as the project's.
+        assert!(down_takes(
+            &m("any", false, "stopped"),
+            &[],
+            false,
+            None,
+            &BTreeSet::new()
+        ));
+    }
 }

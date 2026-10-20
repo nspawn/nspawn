@@ -510,10 +510,15 @@ fn walk_support(
             }
         }
     }
+    // Below these the keys are names, an x- one among them, not extensions.
+    let names = matches!(
+        pattern,
+        "services" | "volumes" | "networks" | "secrets" | "configs" | "jobs"
+    ) || pattern.ends_with(".depends_on");
     match value {
         Value::Map(map) => {
             for (key, entry) in map {
-                if key.starts_with("x-") || key == super::model::EXTENSIONS {
+                if (key.starts_with("x-") && !names) || key == super::model::EXTENSIONS {
                     continue;
                 }
                 let literal = if pattern.is_empty() {

@@ -1,0 +1,9 @@
+services:
+  a:
+    image: busybox
+    depends_on: [b]
+  b:
+    image: busybox
+    depends_on: [a]
+  c:
+    image: busybox

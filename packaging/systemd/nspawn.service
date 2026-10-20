@@ -6,3 +6,5 @@ Documentation=https://github.com/nspawn/nspawn
 Type=dbus
 BusName=org.nspawn
 ExecStart=/usr/bin/nspawn daemon
+# Every copy, log and event stream holds descriptors; 1024 is soon reached.
+LimitNOFILE=65536

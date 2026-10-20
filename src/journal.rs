@@ -16,7 +16,7 @@ const UNIT_SUCCESS: &str = "7ad2d189f7e94e70a38c781354912448";
 /// How a unit's main process last ended, from what systemd logged when it reaped it:
 /// (CLD_EXITED, CLD_KILLED or CLD_DUMPED, status). Outlives the unit's own ExecMainCode=,
 /// which goes when the unit is unloaded.
-pub async fn last_main_exit(unit: &str) -> Option<(i32, i32)> {
+pub async fn last_main_exit(unit: &str, since: u64) -> Option<(i32, i32)> {
     let output = tokio::process::Command::new("journalctl")
         .args([
             "--no-pager",
@@ -25,6 +25,7 @@ pub async fn last_main_exit(unit: &str) -> Option<(i32, i32)> {
             "--lines=10",
             "--reverse",
         ])
+        .arg(format!("--since=@{since}"))
         .arg(format!("--unit={unit}"))
         .arg("_PID=1")
         .arg(format!("MESSAGE_ID={UNIT_PROCESS_EXIT}"))

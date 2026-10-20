@@ -158,6 +158,29 @@ pub fn parse_memory_swap(text: &str) -> Result<i64> {
 }
 
 /// --memory: a size of at least 4m, or 0 for none.
+/// --restart as docker takes it: no, on-failure[:N], always or unless-stopped. The
+/// count of on-failure is not kept: systemd restarts a unit on every failure.
+pub fn parse_restart(text: &str) -> Result<Restart> {
+    let (policy, count) = match text.split_once(':') {
+        Some((policy, count)) => (policy, Some(count)),
+        None => (text, None),
+    };
+    let restart = match policy {
+        "no" => Restart::No,
+        "on-failure" => Restart::OnFailure,
+        "always" => Restart::Always,
+        "unless-stopped" => Restart::UnlessStopped,
+        _ => anyhow::bail!(
+            "{text}: a restart policy is no, on-failure[:N], always or unless-stopped"
+        ),
+    };
+    match count {
+        None => Ok(restart),
+        Some(n) if restart == Restart::OnFailure && n.parse::<u32>().is_ok() => Ok(restart),
+        Some(_) => anyhow::bail!("{text}: only on-failure takes a count of restarts"),
+    }
+}
+
 pub fn parse_memory(text: &str) -> Result<u64> {
     let bytes = parse_size(text)?;
     if bytes > 0 && bytes < MIN_MEMORY {

@@ -108,10 +108,21 @@ impl Config {
             Some(p) => Self::read_file(p)?,
             None => {
                 let default = Path::new(DEFAULT_CONFIG_PATH);
-                if default.exists() {
-                    Self::read_file(default)?
-                } else {
-                    FileConfig::default()
+                match fs::read_to_string(default) {
+                    Ok(text) => toml::from_str(&text)
+                        .with_context(|| format!("parsing {}", default.display()))?,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileConfig::default(),
+                    // Closed to a user who drives the service: the service reads it as
+                    // root, and the command line goes by the defaults.
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::PermissionDenied
+                            && !nix::unistd::geteuid().is_root() =>
+                    {
+                        FileConfig::default()
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| format!("reading {}", default.display()))
+                    }
                 }
             }
         };
@@ -170,6 +181,30 @@ impl Config {
                 );
             }
         }
+        // systemd-nspawn@.service finds a machine's tree by its name in machined's
+        // image directories, and nowhere else.
+        if !MACHINED_DIRS.iter().any(|d| machines_dir == Path::new(d)) {
+            anyhow::bail!(
+                "machines_dir {}: systemd-nspawn finds machines in {} only",
+                machines_dir.display(),
+                MACHINED_DIRS.join(", ")
+            );
+        }
+        // One inside the other, a machinectl clean or an images rm takes the other's.
+        if state_dir.starts_with(&machines_dir) || machines_dir.starts_with(&state_dir) {
+            anyhow::bail!(
+                "state_dir {} and machines_dir {} must not be one inside the other",
+                state_dir.display(),
+                machines_dir.display()
+            );
+        }
+        // The service reads it from its own working directory, /.
+        if let Some(ca) = file.ca_cert.as_ref().filter(|c| !c.is_absolute()) {
+            anyhow::bail!(
+                "ca_cert in the configuration must be an absolute path: {}",
+                ca.display()
+            );
+        }
         let bridge = file.bridge.unwrap_or_else(|| DEFAULT_BRIDGE.to_string());
         if bridge.is_empty()
             || bridge.len() > 15
@@ -199,6 +234,15 @@ impl Config {
         })
     }
 }
+
+/// machined's image search path, where systemd-nspawn@.service looks for a machine.
+const MACHINED_DIRS: [&str; 5] = [
+    "/var/lib/machines",
+    "/etc/machines",
+    "/run/machines",
+    "/usr/local/lib/machines",
+    "/usr/lib/machines",
+];
 
 /// The `[registries."host"]` tables, checked without reading a file: the command line
 /// loads the configuration too, and must not fail on a key only the service may read.
@@ -371,7 +415,7 @@ mod tests {
     #[test]
     fn command_line_wins_over_file() {
         let file: FileConfig = toml::from_str(
-            "registry = \"file.example\"\nca_cert = \"/a.pem\"\nbackend = \"overlay\"\nmachines_dir = \"/srv/m\"\nstate_dir = \"/srv/s\"\nbridge = \"br-lab\"\nsubnet = \"172.30.5.0/24\"\ndns = [\"10.0.0.53\"]\n",
+            "registry = \"file.example\"\nca_cert = \"/a.pem\"\nbackend = \"overlay\"\nmachines_dir = \"/usr/local/lib/machines\"\nstate_dir = \"/srv/s\"\nbridge = \"br-lab\"\nsubnet = \"172.30.5.0/24\"\ndns = [\"10.0.0.53\"]\n",
         )
         .unwrap();
         let c = Config::merge(file, Some("cli.example".into()), None).unwrap();
@@ -382,8 +426,25 @@ mod tests {
         assert!(c.registry_set);
         assert_eq!(c.ca_cert, Some(PathBuf::from("/a.pem")));
         assert_eq!(c.backend, BackendChoice::Overlay);
-        assert_eq!(c.machines_dir, PathBuf::from("/srv/m"));
+        assert_eq!(c.machines_dir, PathBuf::from("/usr/local/lib/machines"));
         assert_eq!(c.state_dir, PathBuf::from("/srv/s"));
+    }
+
+    #[test]
+    fn directories_the_rest_cannot_work_with_are_refused() {
+        let merged = |text: &str| Config::merge(toml::from_str(text).unwrap(), None, None);
+        let err = merged("machines_dir = \"/srv/m\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("finds machines in"), "{err}");
+        let err = merged("state_dir = \"/var/lib/machines/.nspawn\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("one inside the other"), "{err}");
+        let err = merged("ca_cert = \"hub-ca.pem\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("absolute"), "{err}");
     }
 
     #[test]

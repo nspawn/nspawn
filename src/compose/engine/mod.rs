@@ -129,9 +129,11 @@ impl Engine<'_> {
             .map_err(client::error)?
             .into_iter()
             .map(Machine::from_dict)
-            // An image the project built carries its labels too, and is no machine.
+            // An image the project built carries its labels too, and is no machine; nor
+            // is one made by hand from that image, as only compose gives the config hash.
             .filter(|m| client::string(&m.dict, "origin") == "create")
             .filter(|m| m.labels.get(label::PROJECT) == Some(&self.name))
+            .filter(|m| m.labels.contains_key(label::CONFIG_HASH))
             .collect();
         machines.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(machines)
@@ -207,7 +209,6 @@ fn named(command: &ComposeCommand) -> Vec<String> {
         C::Ps(c) => c.service.clone(),
         C::Pull(c) => c.service.clone(),
         C::Build(c) => c.service.clone(),
-        C::Restart(c) => c.service.clone(),
         C::Rm(c) => c.service.clone(),
         C::Start(c) => c.service.clone(),
         C::Stats(c) => c.service.clone(),
@@ -216,10 +217,21 @@ fn named(command: &ComposeCommand) -> Vec<String> {
         C::Unpause(c) => c.service.clone(),
         C::Up(c) => c.service.clone(),
         C::Volumes(c) => c.service.clone(),
-        C::Wait(c) => c.service.clone(),
         C::Exec(c) => c.service.iter().cloned().collect(),
         C::Port(c) => c.service.iter().cloned().collect(),
         C::Run(c) => c.service.iter().cloned().collect(),
+        // SERVICE=REPLICAS: the services it scales, whose environment is resolved.
+        C::Scale(c) => c
+            .service
+            .iter()
+            .map(|s| {
+                s.split_once('=')
+                    .map_or(s.as_str(), |(name, _)| name)
+                    .to_string()
+            })
+            .collect(),
+        // restart and wait load the whole project: restart also restarts the services
+        // that depend on the ones it names.
         _ => Vec::new(),
     }
 }
@@ -236,18 +248,11 @@ enum Wants {
 fn wants(command: &ComposeCommand) -> Wants {
     use ComposeCommand as C;
     match command {
-        C::Up(_)
-        | C::Create(_)
-        | C::Run(_)
-        | C::Pull(_)
-        | C::Build(_)
-        | C::Scale(_)
-        | C::Exec(_)
-        | C::Port(_)
-        | C::Cp(_)
-        | C::Images(_)
-        | C::Top(_)
-        | C::Stats(_) => Wants::Project,
+        // exec, port, cp, images, top and stats find their project by -p NAME alone,
+        // as down and ps do.
+        C::Up(_) | C::Create(_) | C::Run(_) | C::Pull(_) | C::Build(_) | C::Scale(_) => {
+            Wants::Project
+        }
         C::Ls(_) => Wants::Nothing,
         _ => Wants::ProjectOrName,
     }
@@ -261,6 +266,7 @@ async fn dispatch(
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
     let command = args.command.as_ref().expect("a command");
+    check_arguments(command)?;
     let services = named(command);
     let mut warnings = Vec::new();
     let (name, project) = {
@@ -268,8 +274,24 @@ async fn dispatch(
         match wants(command) {
             Wants::Nothing => (String::new(), None),
             Wants::Project => {
-                let project = super::config::project_for(args, flags, host, &services, &mut warn)
-                    .map_err(anyhow::Error::msg)?;
+                let project =
+                    match super::config::project_for(args, flags, host, &services, &mut warn) {
+                        // run takes a job as a one-off service of its own.
+                        Err(e)
+                            if matches!(command, ComposeCommand::Run(_))
+                                && e.starts_with("no such service") =>
+                        {
+                            let mut whole =
+                                super::config::project_for(args, flags, host, &[], &mut warn)
+                                    .map_err(anyhow::Error::msg)?;
+                            materialize_job(&mut whole, &services[0])
+                                .map_err(anyhow::Error::msg)?;
+                            whole
+                                .with_selected_services(&services, false)
+                                .map_err(anyhow::Error::msg)?
+                        }
+                        other => other.map_err(anyhow::Error::msg)?,
+                    };
                 (project.name.clone(), Some(project))
             }
             Wants::ProjectOrName => {
@@ -290,6 +312,11 @@ async fn dispatch(
     };
     for w in warnings {
         log.warn(w);
+    }
+    if args.dry_run {
+        if let Some(name) = changes_state(command) {
+            bail!("{name} does not run with --dry-run: nspawn compose does not simulate the changes it makes, and nothing was done");
+        }
     }
     let client = Client::connect().await?;
     let mut engine = Engine {
@@ -332,9 +359,142 @@ async fn dispatch(
     }
 }
 
+/// The counts of arguments the reference's commands check before anything is loaded.
+fn check_arguments(command: &ComposeCommand) -> Result<()> {
+    use ComposeCommand as C;
+    match command {
+        C::Scale(c) if c.service.is_empty() => {
+            bail!("requires at least 1 arg(s), only received 0")
+        }
+        C::Wait(c) if c.service.is_empty() => {
+            bail!("requires at least 1 arg(s), only received 0")
+        }
+        C::Stats(c) if c.service.len() > 1 => {
+            bail!("accepts at most 1 arg(s), received {}", c.service.len())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A job as the service run makes of it, unless the file keeps it from being run by hand.
+fn materialize_job(project: &mut Project, name: &str) -> Result<(), String> {
+    let job = project
+        .jobs
+        .remove(name)
+        .or_else(|| project.disabled_jobs.remove(name))
+        .ok_or_else(|| format!("no such service: {name}"))?;
+    if job.get(&["triggers", "manual"]) == Some(&crate::compose::value::Value::Bool(false)) {
+        return Err(format!(
+            "job {name:?} is declared with manual: false, it cannot be run manually"
+        ));
+    }
+    project.services.insert(name.to_string(), job);
+    Ok(())
+}
+
+/// The name of a command that changes machines, images, networks or volumes; docker
+/// compose simulates those under --dry-run, nspawn compose refuses them.
+fn changes_state(command: &ComposeCommand) -> Option<&'static str> {
+    use ComposeCommand as C;
+    Some(match command {
+        C::Up(_) => "up",
+        C::Create(_) => "create",
+        C::Pull(_) => "pull",
+        C::Build(_) => "build",
+        C::Scale(_) => "scale",
+        C::Run(_) => "run",
+        C::Down(_) => "down",
+        C::Start(_) => "start",
+        C::Stop(_) => "stop",
+        C::Restart(_) => "restart",
+        C::Kill(_) => "kill",
+        C::Pause(_) => "pause",
+        C::Unpause(_) => "unpause",
+        C::Rm(_) => "rm",
+        C::Exec(_) => "exec",
+        C::Cp(_) => "cp",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scale_names_the_services_it_scales() {
+        let scale = ComposeCommand::Scale(crate::compose::cli::ScaleArgs {
+            no_deps: false,
+            service: vec!["web=3".to_string(), "worker=0".to_string()],
+        });
+        assert_eq!(named(&scale), ["web", "worker"]);
+    }
+
+    #[test]
+    fn restart_and_wait_load_the_whole_project() {
+        use clap::Parser;
+        for argv in [["restart", "db"], ["wait", "db"]] {
+            let mut full = vec!["nspawn", "compose"];
+            full.extend_from_slice(&argv);
+            match crate::cli::Cli::try_parse_from(full).unwrap().command {
+                crate::cli::Command::Compose(c) => {
+                    assert!(named(&c.command.unwrap()).is_empty(), "{argv:?}")
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn argument_counts_are_checked_first() {
+        use clap::Parser;
+        let check = |argv: &[&str]| {
+            let mut full = vec!["nspawn", "compose"];
+            full.extend_from_slice(argv);
+            match crate::cli::Cli::try_parse_from(full).unwrap().command {
+                crate::cli::Command::Compose(c) => check_arguments(&c.command.unwrap()),
+                _ => unreachable!(),
+            }
+        };
+        assert!(check(&["scale"]).is_err());
+        assert!(check(&["scale", "web=2"]).is_ok());
+        assert!(check(&["wait"]).is_err());
+        assert_eq!(
+            check(&["stats", "a", "b"]).unwrap_err().to_string(),
+            "accepts at most 1 arg(s), received 2"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_changes_nothing() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| -> ComposeCommand {
+            let mut full = vec!["nspawn", "compose", "--dry-run"];
+            full.extend_from_slice(argv);
+            match crate::cli::Cli::try_parse_from(full).unwrap().command {
+                crate::cli::Command::Compose(c) => c.command.unwrap(),
+                _ => unreachable!(),
+            }
+        };
+        for argv in [
+            &["up", "-d"][..],
+            &["down", "-v"],
+            &["rm", "-f"],
+            &["pull"],
+            &["exec", "web", "true"],
+        ] {
+            assert!(changes_state(&parse(argv)).is_some(), "{argv:?}");
+        }
+        for argv in [
+            &["ps"][..],
+            &["logs"],
+            &["images"],
+            &["ls"],
+            &["port", "web", "80"],
+        ] {
+            assert!(changes_state(&parse(argv)).is_none(), "{argv:?}");
+        }
+    }
 
     #[test]
     fn machines_are_named_as_docker_compose_names_containers() {

@@ -95,6 +95,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `configs.*.content` | yes |  |
 | `configs.*.environment` | yes |  |
 | `configs.*.external` and below | no | an external config is a Swarm config, which nspawn cannot read |
+| `configs.*.external`: `false` | yes |  |
 | `configs.*.file` | yes |  |
 | `configs.*.labels` and below | ignored | configs[].labels are only applied to Swarm config objects |
 | `configs.*.name` | yes |  |
@@ -115,6 +116,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `networks.*.attachable` | yes |  |
 | `networks.*.driver` | no | nspawn networks are bridges: no other driver |
 | `networks.*.driver`: `bridge` | yes |  |
+| `networks.*.driver`: `` | yes |  |
 | `networks.*.driver_opts` and below | ignored | driver options are docker's bridge settings; nspawn makes its own bridge |
 | `networks.*.enable_ipv4` | yes |  |
 | `networks.*.enable_ipv4`: `false` | no | nspawn networks always carry IPv4 |
@@ -131,6 +133,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `networks.*.ipam.config.[].subnet` | yes |  |
 | `networks.*.ipam.driver` | no | nspawn allocates the addresses itself: only the default driver |
 | `networks.*.ipam.driver`: `default` | yes |  |
+| `networks.*.ipam.driver`: `` | yes |  |
 | `networks.*.ipam.options` and below | ignored | IPAM options are those of docker's drivers |
 | `networks.*.labels` and below | yes |  |
 | `networks.*.name` | yes |  |
@@ -140,6 +143,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `secrets.*.driver_opts` and below | ignored | secrets[].driver_opts is only honored by Swarm secret drivers |
 | `secrets.*.environment` | yes |  |
 | `secrets.*.external` and below | no | an external secret is a Swarm secret, which nspawn cannot read |
+| `secrets.*.external`: `false` | yes |  |
 | `secrets.*.file` | yes |  |
 | `secrets.*.labels` and below | ignored | secrets[].labels are only applied to Swarm secret objects |
 | `secrets.*.name` | yes |  |
@@ -169,6 +173,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.build.no_cache_filter` | yes |  |
 | `services.*.build.platforms` | partly | this host's platform only; another is refused |
 | `services.*.build.privileged` | no | build steps run with the confinement of an app machine |
+| `services.*.build.privileged`: `false` | yes |  |
 | `services.*.build.provenance` | ignored | nspawn's builder writes no attestations |
 | `services.*.build.pull` | yes |  |
 | `services.*.build.sbom` | ignored | nspawn's builder writes no attestations |
@@ -401,7 +406,8 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `volumes.*` | yes |  |
 | `volumes.*.driver` | no | nspawn volumes are directories of the host: only the local driver |
 | `volumes.*.driver`: `local` | yes |  |
-| `volumes.*.driver_opts` and below | partly | type: none with o: bind mounts the device directory of the host; other options are refused |
+| `volumes.*.driver`: `` | yes |  |
+| `volumes.*.driver_opts` and below | partly | type: none with o: bind and an absolute device binds that host directory, which down -v leaves; other options are refused |
 | `volumes.*.external` | yes |  |
 | `volumes.*.external.name` | yes |  |
 | `volumes.*.labels` and below | ignored | nspawn volumes have no labels |
@@ -414,7 +420,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `docker compose --all-resources` | yes |  |
 | `docker compose --ansi` | yes |  |
 | `docker compose --compatibility` | partly | config takes it as docker compose does; machine names join their parts with `-`, as machined takes no `_` |
-| `docker compose --dry-run` | yes |  |
+| `docker compose --dry-run` | partly | commands that only read take it; the ones that change something refuse it, as nothing simulates their changes |
 | `docker compose --env-file` | yes |  |
 | `docker compose --file` | partly | files on this host: a git or oci:// address is refused |
 | `docker compose --insecure-registry` | ignored | nspawn.toml says how each registry is reached |
@@ -501,7 +507,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `exec --interactive` | yes |  |
 | `exec --no-tty` | yes |  |
 | `exec --privileged` | ignored | a command runs with the capabilities of its machine |
-| `exec --tty` | yes |  |
+| `exec --tty` | ignored | as in docker compose, -T decides |
 | `exec --user` | yes |  |
 | `exec --workdir` | yes |  |
 | `export` | no | export is not supported by nspawn compose |
@@ -543,8 +549,8 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `pull --ignore-buildable` | yes |  |
 | `pull --ignore-pull-failures` | yes |  |
 | `pull --include-deps` | yes |  |
-| `pull --no-parallel` | yes |  |
-| `pull --parallel` | yes |  |
+| `pull --no-parallel` | ignored | deprecated; images are pulled one after another |
+| `pull --parallel` | ignored | deprecated; images are pulled one after another |
 | `pull --policy` | yes |  |
 | `pull --quiet` | yes |  |
 | `push` | no | push is not supported by nspawn compose; compose build --push or nspawn push sends an image |
@@ -552,7 +558,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `restart --no-deps` | yes |  |
 | `restart --timeout` | yes |  |
 | `rm` | yes |  |
-| `rm --all` | yes |  |
+| `rm --all` | ignored | deprecated, as in docker compose: one-off machines stay |
 | `rm --force` | yes |  |
 | `rm --stop` | yes |  |
 | `rm --volumes` | partly | nspawn has no anonymous volumes |
@@ -571,14 +577,14 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `run --no-tty` | yes |  |
 | `run --publish` | yes |  |
 | `run --pull` | yes |  |
-| `run --quiet` | yes |  |
+| `run --quiet` | ignored | pulls print through the service's job |
 | `run --quiet-build` | yes |  |
 | `run --quiet-pull` | yes |  |
-| `run --remove-orphans` | yes |  |
+| `run --remove-orphans` | ignored | orphans are removed by up and down |
 | `run --rm` | yes |  |
 | `run --service-ports` | yes |  |
 | `run --tty` | yes |  |
-| `run --use-aliases` | yes |  |
+| `run --use-aliases` | ignored | a one-off machine gets no network aliases |
 | `run --user` | yes |  |
 | `run --volume` | yes |  |
 | `run --workdir` | yes |  |
@@ -589,7 +595,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `start --wait-timeout` | yes |  |
 | `stats` | yes |  |
 | `stats --all` | yes |  |
-| `stats --format` | yes |  |
+| `stats --format` | partly | table and json; a template is refused |
 | `stats --no-stream` | yes |  |
 | `stats --no-trunc` | yes |  |
 | `stop` | yes |  |

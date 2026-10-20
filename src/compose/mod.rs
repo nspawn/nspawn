@@ -15,7 +15,7 @@ mod engine;
 mod extends;
 mod golib;
 pub(crate) mod gostr;
-mod gotime;
+pub(crate) mod gotime;
 mod include;
 mod interpolate;
 mod libyaml;
@@ -223,16 +223,24 @@ pub fn arguments(argv: &[std::ffi::OsString]) -> Option<Vec<String>> {
     use std::os::unix::ffi::OsStrExt;
     const GLOBAL: [&str; 3] = ["--registry", "--ca-cert", "--config"];
     let mut i = 1;
-    while let Some(arg) = argv.get(i) {
-        let arg = arg.to_str()?;
-        if GLOBAL.contains(&arg) {
+    let mut given = Vec::new();
+    // On bytes: a value that is not UTF-8 is a value all the same.
+    while let Some(arg) = argv.get(i).map(|a| a.as_bytes()) {
+        if let Some(g) = GLOBAL.iter().find(|g| arg == g.as_bytes()) {
+            given.push(*g);
             i += 2;
-        } else if GLOBAL
-            .iter()
-            .any(|g| arg.strip_prefix(g).is_some_and(|r| r.starts_with('=')))
-        {
+        } else if let Some(g) = GLOBAL.iter().find(|g| {
+            arg.strip_prefix(g.as_bytes())
+                .is_some_and(|r| r.starts_with(b"="))
+        }) {
+            given.push(*g);
             i += 1;
-        } else if arg == "compose" {
+        } else if arg == b"compose" {
+            // compose pulls through the service with its own configuration: said rather
+            // than dropped in silence.
+            for g in given {
+                eprintln!("warning: {g} is not used by nspawn compose, whose pulls take the service's configuration");
+            }
             return Some(
                 argv[i + 1..]
                     .iter()
@@ -309,11 +317,22 @@ pub const STACK: usize = 1 << 30;
 /// stderr.
 pub fn main(args: &[String]) -> i32 {
     let args = args.to_vec();
-    std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("compose".to_string())
         .stack_size(STACK)
         .spawn(move || run(&args))
-        .map_or(1, |thread| thread.join().unwrap_or(101))
+    {
+        Ok(thread) => thread.join().unwrap_or(101),
+        // The stack is address space, which a limit (ulimit -v, strict overcommit) may
+        // not leave.
+        Err(e) => {
+            eprintln!(
+                "nspawn compose: cannot start its thread with a stack of {} MiB: {e}",
+                STACK >> 20
+            );
+            1
+        }
+    }
 }
 
 fn run(args: &[String]) -> i32 {
@@ -542,6 +561,45 @@ fn version(format: Option<&str>, short: bool, out: &mut dyn Write) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn global_options_before_compose_are_passed_over() {
+        use std::os::unix::ffi::OsStringExt;
+        let argv = |words: Vec<Vec<u8>>| -> Vec<std::ffi::OsString> {
+            words
+                .into_iter()
+                .map(std::ffi::OsString::from_vec)
+                .collect()
+        };
+        let got = arguments(&argv(vec![
+            b"nspawn".to_vec(),
+            b"--ca-cert=/tmp/\xff.pem".to_vec(),
+            b"compose".to_vec(),
+            b"ps".to_vec(),
+        ]));
+        assert_eq!(got, Some(vec!["ps".to_string()]));
+        assert_eq!(
+            arguments(&argv(vec![b"nspawn".to_vec(), b"ps".to_vec()])),
+            None
+        );
+    }
+
+    #[test]
+    fn remove_orphans_given_false_is_kept() {
+        let up = |words: &[&str]| {
+            let args: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+            let Line::Run(args) = read(&args) else {
+                panic!("{words:?} is no run")
+            };
+            match args.command {
+                Some(crate::compose::cli::ComposeCommand::Up(up)) => up.remove_orphans,
+                _ => panic!("{words:?} is no up"),
+            }
+        };
+        assert_eq!(up(&["up"]), None);
+        assert_eq!(up(&["up", "--remove-orphans"]), Some(true));
+        assert_eq!(up(&["up", "--remove-orphans=false"]), Some(false));
+    }
 
     #[test]
     fn warnings_are_written_as_logrus_writes_them() {

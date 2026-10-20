@@ -90,7 +90,7 @@ pub fn skip_reason(record: &ImageRecord, built: &BTreeSet<&str>) -> Option<Strin
             ))
         }
     }
-    if record.origin == "build" || built.contains(record.reference.as_str()) {
+    if record.origin == "build" || record.built || built.contains(record.reference.as_str()) {
         return Some("its image was built on this host".to_string());
     }
     if record.reference.contains('@') {
@@ -189,7 +189,10 @@ enum Remote {
 
 pub async fn run(ctx: &Context, request: &Request, report: Report<'_>) -> Result<Vec<Outcome>> {
     let _one = RUNNING.lock().await;
-    recover(ctx, report).await;
+    // A dry run only looks: what an earlier run left halfway waits for a real one.
+    if !request.dry_run {
+        recover(ctx, report).await;
+    }
     let store = &ctx.store;
     let records = store.list_images()?;
     let built: BTreeSet<&str> = records
@@ -256,15 +259,15 @@ pub async fn run(ctx: &Context, request: &Request, report: Report<'_>) -> Result
                     match recreated.result {
                         Ok(()) => outcome.updated = Updated::Yes,
                         Err(e) => {
-                            let text = format!("{e:#}");
-                            outcome.updated = if text.contains("rolled back")
-                                || text.contains("back as it was")
+                            outcome.updated = if e
+                                .downcast_ref::<crate::api::recreate::RolledBack>()
+                                .is_some()
                             {
                                 Updated::RolledBack
                             } else {
                                 Updated::Failed
                             };
-                            outcome.reason = text;
+                            outcome.reason = format!("{e:#}");
                         }
                     }
                     if recreated.restarted {
@@ -344,8 +347,17 @@ async fn look_up(
                 crate::api::pull::fetch(ctx, &image, true, Some("overlay"), report).await?;
             answer.fetched = Some(Arc::new(fetched));
         }
+        // What is installed is what the fetch brought, which resolved the tag on its own:
+        // that is the digest compared and told.
+        let digest = match &answer.fetched {
+            Some(fetched) => fetched.manifest_digest.clone(),
+            None => resolved.digest.clone(),
+        };
+        if digest == record.manifest_digest {
+            return Ok(Remote::Same);
+        }
         Ok::<Remote, anyhow::Error>(Remote::Newer {
-            digest: resolved.digest.clone(),
+            digest,
             fetched: answer.fetched.clone(),
         })
     };
@@ -429,12 +441,9 @@ async fn refresh_compose_image(
             && r.manifest_digest != fetched.manifest_digest
             && !r.labels.contains_key(COMPOSE_IMAGE)
     }) {
-        let upper = ctx
-            .store
-            .machines_private_dir()
-            .join(&image.name)
-            .join("upper");
-        let unused = std::fs::read_dir(&upper).is_ok_and(|mut d| d.next().is_none());
+        // Only an image nothing ran from: a pulled record started as a machine has its
+        // own options and data, which a reinstall would take.
+        let unused = crate::api::disk::image_only(&ctx.store, image);
         let running = sd.machine_exists(&image.name).await.unwrap_or(true);
         if running || !unused || image.backend != BackendChoice::Overlay {
             note(
@@ -499,16 +508,30 @@ async fn recover(ctx: &Context, report: Report<'_>) {
     let Ok(sd) = ctx.sd().await else { return };
     for name in ctx.store.rollbacks() {
         let progress = crate::api::recreate::progress(&ctx.store, &name);
-        let runs = ctx.store.is_starting(&name) || sd.machine_exists(&name).await.unwrap_or(true);
+        // What cannot be told now is decided at the next run: the rollback is what an
+        // update promised to keep.
+        let Ok(runs) = sd.machine_exists(&name).await else {
+            continue;
+        };
+        if ctx.store.is_starting(&name) {
+            continue;
+        }
         if runs {
-            if progress.phase == Phase::Aside {
+            // Running on its new image after the update itself went through: the
+            // rollback only had its cleanup left. Anything else is put back once it
+            // stops, a restore that failed included.
+            let renewed = matches!(
+                (ctx.store.load_image(&name), ctx.store.load_rollback(&name)),
+                (Ok(Some(now)), Ok(Some((old, _)))) if now.manifest_digest != old.manifest_digest
+            );
+            if progress.phase == Phase::Saved || (progress.phase == Phase::Installed && renewed) {
+                let _lock = ctx.store.lock().await;
+                let _ = ctx.store.forget_rollback(&name);
+            } else {
                 note(
                     report,
                     format!("warning: {name} runs while an earlier update of it was cut short; it is put back once it stops"),
                 );
-            } else {
-                let _lock = ctx.store.lock().await;
-                let _ = ctx.store.forget_rollback(&name);
             }
             continue;
         }
@@ -579,6 +602,12 @@ mod tests {
             .unwrap()
             .contains("unsupported policy"));
         assert!(skip_reason(&record(serde_json::json!({ "origin": "build" })), &none).is_some());
+        // A machine of a built image, its build's record gone.
+        assert!(skip_reason(
+            &record(serde_json::json!({ "origin": "create", "built": true })),
+            &none
+        )
+        .is_some());
         let built = BTreeSet::from(["docker.io/library/nginx:1"]);
         assert!(skip_reason(&record(serde_json::json!({ "origin": "create" })), &built).is_some());
         assert!(skip_reason(

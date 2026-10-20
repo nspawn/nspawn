@@ -192,6 +192,7 @@ pub async fn install(
         pid1,
         started: None,
         fixed_addresses: Default::default(),
+        built: false,
         run,
         network,
         network_name: None,

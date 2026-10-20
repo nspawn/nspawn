@@ -1,0 +1,11 @@
+name: envfile-empty
+services:
+  web:
+    environment:
+      A: b
+    image: x
+    networks:
+      default: null
+networks:
+  default:
+    name: envfile-empty_default

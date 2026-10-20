@@ -1,0 +1,4 @@
+-f f1.yaml config
+-f f2.yaml config
+-f f3.yaml config
+-f f4.yaml --no-path-resolution config

@@ -175,17 +175,18 @@ pub async fn logs(e: &mut Engine<'_>, a: &LogsArgs) -> Result<()> {
     }
     let mut options = Options::new();
     options.insert("follow", Bus::from(a.follow));
-    if let Some(tail) = a.tail.as_deref().filter(|t| *t != "all") {
-        let n: u64 = tail
-            .parse()
-            .with_context(|| format!("invalid --tail {tail:?}: a number or all"))?;
+    if let Some(n) = log_lines(a.tail.as_deref(), a.follow)? {
         options.insert("lines", Bus::from(n));
     }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
     if let Some(since) = &a.since {
-        options.insert("since", Bus::from(since.clone()));
+        options.insert("since", Bus::from(journal_time(since, now)));
     }
     if let Some(until) = &a.until {
-        options.insert("until", Bus::from(until.clone()));
+        options.insert("until", Bus::from(journal_time(until, now)));
     }
     options.insert("timestamps", Bus::from(a.timestamps));
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -235,7 +236,41 @@ pub async fn logs(e: &mut Engine<'_>, a: &LogsArgs) -> Result<()> {
 
 /// up without -d: the output of the services' machines until they are all down, or
 /// until Ctrl-C stops them; the exit code --exit-code-from and the abort flags ask for.
-pub async fn attach(e: &mut Engine<'_>, a: &UpArgs, started: &[Machine]) -> Result<()> {
+/// A time of --since or --until as journalctl reads one, taken as the reference takes
+/// it: a duration ago (42m, 1h30m), unix seconds, or a date as it is.
+fn journal_time(text: &str, now: f64) -> String {
+    if let Ok(nanos) = crate::compose::golib::parse_duration(text) {
+        return format!("@{:.6}", now - nanos as f64 / 1e9);
+    }
+    let (seconds, fraction) = text.split_once('.').unwrap_or((text, ""));
+    if !seconds.is_empty()
+        && seconds.bytes().all(|b| b.is_ascii_digit())
+        && fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return format!("@{text}");
+    }
+    text.to_string()
+}
+
+/// The lines logs asks for: --tail's number, or the whole log, which following alone
+/// would cut to the last ten.
+fn log_lines(tail: Option<&str>, follow: bool) -> Result<Option<u64>> {
+    match tail.filter(|t| *t != "all") {
+        Some(tail) => tail
+            .parse()
+            .map(Some)
+            .with_context(|| format!("invalid --tail {tail:?}: a number or all")),
+        None if follow => Ok(Some(u64::from(u32::MAX))),
+        None => Ok(None),
+    }
+}
+
+pub async fn attach(
+    e: &mut Engine<'_>,
+    a: &UpArgs,
+    started: &[Machine],
+    since: std::time::SystemTime,
+) -> Result<()> {
     let project = e.project().clone();
     let deps: Vec<String> = if a.attach_dependencies || !a.attach.is_empty() {
         Vec::new()
@@ -270,12 +305,14 @@ pub async fn attach(e: &mut Engine<'_>, a: &UpArgs, started: &[Machine]) -> Resu
     let mut names: Vec<String> = attached.iter().map(|m| display_name(&e.name, m)).collect();
     names.sort();
     println!("Attaching to {}", names.join(", "));
-    // From now on, to the microsecond: a run of a moment ago said its own lines.
-    let since = std::time::SystemTime::now()
+    // From before the machines started, to the microsecond, and every line since: a run
+    // of a moment ago said its own lines.
+    let since = since
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let mut options = Options::new();
     options.insert("follow", Bus::from(true));
+    options.insert("lines", Bus::from(u64::from(u32::MAX)));
     options.insert(
         "since",
         Bus::from(format!("@{}.{:06}", since.as_secs(), since.subsec_micros())),
@@ -291,6 +328,8 @@ pub async fn attach(e: &mut Engine<'_>, a: &UpArgs, started: &[Machine]) -> Resu
     let mut stopping = false;
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // Made once: an interrupt during the graceful stop still counts.
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     loop {
         tokio::select! {
             line = rx.recv() => match line {
@@ -338,7 +377,10 @@ pub async fn attach(e: &mut Engine<'_>, a: &UpArgs, started: &[Machine]) -> Resu
                     if let Some(ended) = f.ended.take() {
                         let _ = ended.signal(15).await;
                     }
-                    if first_exit.is_none() {
+                    // The first exit, or under --abort-on-container-failure the first
+                    // that failed, wherever it is in the batch.
+                    let counts = !a.abort_on_container_failure || exit != 0;
+                    if first_exit.is_none() && counts {
                         first_exit = Some(exit);
                     }
                     if a.exit_code_from.as_deref() == Some(f.machine.service.as_str()) {
@@ -346,7 +388,7 @@ pub async fn attach(e: &mut Engine<'_>, a: &UpArgs, started: &[Machine]) -> Resu
                     }
                 }
                 if let Some(exit) = first_exit {
-                    let triggers = if a.abort_on_container_failure { exit != 0 } else { abort };
+                    let triggers = abort;
                     if triggers && !stopping {
                         stopping = true;
                         if code.is_none() && a.exit_code_from.is_none() {
@@ -360,14 +402,21 @@ pub async fn attach(e: &mut Engine<'_>, a: &UpArgs, started: &[Machine]) -> Resu
                     break;
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = interrupt.recv() => {
                 if stopping {
-                    kill_all(e).await;
+                    kill_all(e, &project).await;
                     break;
                 }
                 stopping = true;
                 e.progress.event("Compose", "Stopping", "Gracefully Stopping... press Ctrl+C again to force", Status::Working);
-                stop_all(e, &project, a.timeout).await?;
+                // A second Ctrl+C while the machines stop kills them.
+                tokio::select! {
+                    stopped = stop_all(e, &project, a.timeout) => stopped?,
+                    _ = interrupt.recv() => {
+                        kill_all(e, &project).await;
+                        break;
+                    }
+                }
             }
             _ = term.recv() => {
                 stopping = true;
@@ -397,7 +446,11 @@ async fn stop_all(
     machines.sort_by_key(|m| {
         std::cmp::Reverse(order.iter().position(|s| *s == m.service).unwrap_or(0))
     });
-    for m in machines.iter().filter(|m| m.running() && !m.oneoff) {
+    // The machines of this up's services, one waiting to be restarted among them.
+    for m in machines
+        .iter()
+        .filter(|m| !m.oneoff && project.services.contains_key(&m.service) && busy(m))
+    {
         e.progress.container(&m.name, "Stopping", Status::Working);
         let mut options = Options::new();
         if let Some(t) = timeout {
@@ -413,15 +466,23 @@ async fn stop_all(
     Ok(())
 }
 
-async fn kill_all(e: &Engine<'_>) {
+async fn kill_all(e: &Engine<'_>, project: &crate::compose::project::Project) {
     let Ok(machines) = e.machines().await else {
         return;
     };
-    for m in machines.iter().filter(|m| m.running()) {
+    for m in machines
+        .iter()
+        .filter(|m| project.services.contains_key(&m.service) && busy(m))
+    {
         let mut options = Options::new();
         options.insert("signal", Bus::from("SIGKILL".to_string()));
         let _ = e.client.manager.kill_machine(&m.name, options).await;
     }
+}
+
+/// Whether a machine runs, or is about to: stopping it cancels a pending restart.
+fn busy(m: &Machine) -> bool {
+    m.running() || matches!(m.state.as_str(), "restarting" | "starting")
 }
 
 /// The machine of a service's replica that is running, or why there is none.
@@ -451,18 +512,15 @@ pub async fn exec(e: &mut Engine<'_>, a: &ExecArgs) -> Result<()> {
         bail!("requires at least 2 arg(s), only received {received}");
     }
     let m = running_replica(e, service, a.index).await?;
-    let tty = if a.no_tty == Some(true) || a.tty == Some(false) {
-        Some(false)
-    } else if a.tty == Some(true) {
-        Some(true)
-    } else {
-        None
-    };
+    // -t is taken and does nothing, as in the reference: -T alone decides, and without
+    // it a terminal is given when the output is one.
+    let tty = a.no_tty.map(|no| !no);
     let spec = crate::commands::machines::ExecSpec {
         env: crate::volume::expand_env(&a.env)?,
         workdir: a.workdir.clone(),
         tty,
         detach: a.detach,
+        no_stdin: a.interactive == Some(false),
     };
     let user = a.user.clone().unwrap_or_default();
     let code =
@@ -502,6 +560,8 @@ pub async fn hook(e: &Engine<'_>, machine: &str, hook: &Map, kind: &str) -> Resu
             .map(String::from),
         tty: Some(false),
         detach: false,
+        // A hook reads nothing: what comes on stdin is the command's own.
+        no_stdin: true,
     };
     let user = hook
         .get("user")
@@ -555,6 +615,8 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
             let result = up::converge_project(e, &converge).await;
             e.project = saved;
             result?;
+            // And the one-off starts once they are as its depends_on asks.
+            up::wait_dependencies(e, &project, &service, &service_name).await?;
         }
     }
     let pulls = up::Pulls {
@@ -590,6 +652,7 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
         image_digest: image.digest.clone(),
         no_deps: true,
         env_files: e.args.env_file.clone(),
+        scale: &BTreeMap::new(),
     };
     let mut made = convert::options(&spec)?;
     let o = &mut made.options;
@@ -640,22 +703,24 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
                 .collect(),
             _ => BTreeMap::new(),
         };
+        let flags: BTreeMap<String, String> = crate::volume::expand_env(&a.env)?
+            .iter()
+            .filter_map(|item| {
+                item.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
+            .collect();
+        // As compose reads them: dotenv files (quotes, export, comments), a bare KEY and
+        // ${KEY} taken from -e; -e wins over them.
+        let mut from_files = crate::compose::dotenv::Env::new();
         for file in &a.env_from_file {
             let text = std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?;
-            for line in text
-                .lines()
-                .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
-            {
-                if let Some((k, v)) = line.split_once('=') {
-                    env.insert(k.trim().to_string(), v.to_string());
-                }
-            }
+            let lookup = |k: &str| flags.get(k).cloned();
+            crate::compose::dotenv::parse(&text, &mut from_files, &lookup, &mut |_| {})
+                .map_err(|e| anyhow::anyhow!("reading {file}: {e}"))?;
         }
-        for item in crate::volume::expand_env(&a.env)? {
-            if let Some((k, v)) = item.split_once('=') {
-                env.insert(k.to_string(), v.to_string());
-            }
-        }
+        env.extend(from_files);
+        env.extend(flags);
         o.insert(
             "env",
             Bus::from(
@@ -690,12 +755,26 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
                 .collect(),
             _ => Vec::new(),
         };
-        volumes.extend(a.volume.iter().cloned());
+        for volume in &a.volume {
+            volumes.push(run_volume(e.project(), volume)?);
+        }
         o.insert("volume", Bus::from(volumes));
     }
-    for (flag, key) in [(&a.cap_add, "cap_add"), (&a.cap_drop, "cap_drop")] {
-        if !flag.is_empty() {
-            o.insert(key, Bus::from(flag.clone()));
+    if !a.cap_add.is_empty() || !a.cap_drop.is_empty() {
+        let mut taken = |key: &str| -> Vec<String> {
+            match o.remove(key) {
+                Some(Bus::Array(items)) => items
+                    .iter()
+                    .filter_map(|v| String::try_from(v.clone()).ok())
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        let (add, drop) = merge_caps(taken("cap_add"), taken("cap_drop"), &a.cap_add, &a.cap_drop);
+        for (key, list) in [("cap_add", add), ("cap_drop", drop)] {
+            if !list.is_empty() {
+                o.insert(key, Bus::from(list));
+            }
         }
     }
     e.progress.container(&name, "Creating", Status::Working);
@@ -715,11 +794,18 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
     }
     if a.detach {
         start.insert("wait", Bus::from(true));
-        e.client
+        let started = e
+            .client
             .manager
             .start_machine(&name, start)
             .await
-            .map_err(client::error)?;
+            .map_err(client::error);
+        if let Err(err) = started {
+            if a.rm {
+                crate::commands::machines::remove_unless_running(&e.client, &name).await;
+            }
+            return Err(err);
+        }
         println!("{name}");
         return Ok(());
     }
@@ -730,12 +816,76 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
         _ => terminal && service.get("tty") != Some(&Value::Bool(false)),
     };
     let interactive = a.interactive.unwrap_or(true);
-    let code =
-        crate::commands::machines::attached(&e.client, &name, start, tty, interactive).await?;
+    let code = match crate::commands::machines::attached(&e.client, &name, start, tty, interactive)
+        .await
+    {
+        Ok(code) => code,
+        Err(err) => {
+            if a.rm {
+                crate::commands::machines::remove_unless_running(&e.client, &name).await;
+            }
+            return Err(err);
+        }
+    };
+    // As docker compose's CLI waits for the removal: a down right after finds the
+    // project's networks free.
+    if a.rm {
+        crate::commands::machines::removed(&e.client, &name).await;
+    }
     if code != 0 {
         std::process::exit(code);
     }
     Ok(())
+}
+
+/// A `run -v` as compose's buildMount takes it: a relative bind source from the
+/// project's directory, a volume of the project by its name.
+fn run_volume(project: &crate::compose::project::Project, text: &str) -> Result<String> {
+    let spec = crate::compose::mount::parse(text).map_err(anyhow::Error::msg)?;
+    if spec.source.is_empty() {
+        bail!("{text}: a volume without a source is an anonymous one, which nspawn does not have: name it");
+    }
+    let ro = if spec.read_only { ":ro" } else { "" };
+    let source = if spec.kind == "bind" {
+        if spec.source.starts_with('/') {
+            spec.source
+        } else {
+            // filepath.Join: cleaned, a ../ taken against the directory.
+            crate::api::copy::clean(
+                &std::path::Path::new(&project.working_dir).join(&spec.source),
+                false,
+            )
+            .to_string_lossy()
+            .into_owned()
+        }
+    } else if project.volumes.contains_key(&spec.source) {
+        match convert::volume_device(project, &spec.source)? {
+            Some(device) => device,
+            None => convert::volume_name(project, &spec.source),
+        }
+    } else {
+        spec.source
+    };
+    Ok(format!("{source}:{}{ro}", spec.target))
+}
+
+/// applyRunOptions: run's --cap-add goes after the service's and takes the cap out of
+/// its cap_drop, --cap-drop the other way round.
+fn merge_caps(
+    mut add: Vec<String>,
+    mut drop: Vec<String>,
+    run_add: &[String],
+    run_drop: &[String],
+) -> (Vec<String>, Vec<String>) {
+    if !run_add.is_empty() {
+        add.extend(run_add.iter().cloned());
+        drop.retain(|c| !run_add.contains(c));
+    }
+    if !run_drop.is_empty() {
+        drop.extend(run_drop.iter().cloned());
+        add.retain(|c| !run_drop.contains(c));
+    }
+    (add, drop)
 }
 
 pub async fn cp(e: &mut Engine<'_>, a: &CpArgs) -> Result<()> {
@@ -773,4 +923,70 @@ pub async fn cp(e: &mut Engine<'_>, a: &CpArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_run_volume_is_read_as_compose_reads_it() {
+        let p = crate::compose::engine::convert::tests::project(
+            "runvol",
+            "services:\n  web:\n    image: x\n    volumes: [data:/data]\nvolumes:\n  data: {}\n",
+        );
+        let named = run_volume(&p, "data:/backup").unwrap();
+        assert!(named.ends_with("_data:/backup"), "{named}");
+        assert_eq!(run_volume(&p, "other:/o:ro").unwrap(), "other:/o:ro");
+        let bind = run_volume(&p, "./conf/../site:/srv").unwrap();
+        assert_eq!(bind, format!("{}/site:/srv", p.working_dir));
+        assert!(run_volume(&p, "/x").is_err());
+    }
+
+    #[test]
+    fn run_caps_are_merged_as_compose_merges_them() {
+        let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            merge_caps(
+                v(&["SYS_PTRACE"]),
+                v(&["NET_RAW", "CHOWN"]),
+                &v(&["NET_RAW"]),
+                &[]
+            ),
+            (v(&["SYS_PTRACE", "NET_RAW"]), v(&["CHOWN"]))
+        );
+        assert_eq!(
+            merge_caps(
+                v(&["SYS_PTRACE", "NET_ADMIN"]),
+                v(&[]),
+                &[],
+                &v(&["NET_ADMIN"])
+            ),
+            (v(&["SYS_PTRACE"]), v(&["NET_ADMIN"]))
+        );
+    }
+
+    #[test]
+    fn times_are_read_as_the_reference_reads_them() {
+        assert_eq!(journal_time("42m", 10_000.0), "@7480.000000");
+        assert_eq!(journal_time("1h30m", 10_000.0), "@4600.000000");
+        assert_eq!(journal_time("1700000000", 0.0), "@1700000000");
+        assert_eq!(journal_time("1700000000.5", 0.0), "@1700000000.5");
+        assert_eq!(
+            journal_time("2026-10-19 07:00:00", 0.0),
+            "2026-10-19 07:00:00"
+        );
+    }
+
+    #[test]
+    fn logs_take_the_whole_log_unless_told() {
+        assert_eq!(log_lines(None, false).unwrap(), None);
+        assert_eq!(log_lines(None, true).unwrap(), Some(u64::from(u32::MAX)));
+        assert_eq!(
+            log_lines(Some("all"), true).unwrap(),
+            Some(u64::from(u32::MAX))
+        );
+        assert_eq!(log_lines(Some("5"), true).unwrap(), Some(5));
+        assert!(log_lines(Some("x"), false).is_err());
+    }
 }

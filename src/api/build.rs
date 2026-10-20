@@ -103,16 +103,22 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
     line(report, format!("running: mkosi {}", argv.join(" ")));
     let status = run_mkosi(&mkosi, &argv, report).await;
     let _ = fs::remove_dir_all(&workspace_dir);
-    let status = status?;
-    if !status.success() {
+    // The output goes on every way out but success, unless it is to be kept.
+    let drop_output = || {
         if !request.keep_output {
             let _ = fs::remove_dir_all(&output_dir);
         }
+    };
+    let status = status.inspect_err(|_| drop_output())?;
+    if !status.success() {
+        drop_output();
         bail!("mkosi failed with {status}");
     }
-    let _lock = store.lock().await?;
+    let _lock = store.lock().await.inspect_err(|_| drop_output())?;
     // The name may have been taken while mkosi ran.
-    ensure_replaceable(store, sd, &name, request.force).await?;
+    ensure_replaceable(store, sd, &name, request.force)
+        .await
+        .inspect_err(|_| drop_output())?;
     let outcome: Result<Mode> = async {
         let layout = Layout::find_below(&output_dir)?;
         let mut manifest = layout.manifest.clone();
@@ -164,6 +170,9 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
         );
         crate::install::stage_layers(store, backend, &manifest, request.mode, &name).await?;
         remove_existing(store, sd, &name, report).await?;
+        // An update that was deciding about the machine replaced has nothing left to
+        // decide: putting it back would take the new one away.
+        store.forget_rollback(&name)?;
         install(
             store,
             sd,

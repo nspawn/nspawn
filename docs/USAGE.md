@@ -61,7 +61,8 @@ with a builder of nspawn's own: every stage the target needs (`--target`, the la
 otherwise), multi-stage builds, `COPY --from`, `ARG` and `--build-arg`, `ONBUILD`,
 heredocs, `COPY --chown --chmod --parents --exclude --link`, `ADD` of local archives
 (gzip, bzip2, xz, zstd or plain tar, unpacked) and of http(s) URLs (`--checksum`), `RUN --mount`
-of the cache, bind, tmpfs and secret kinds (`--secret id=ID,src=PATH`, or `env=VAR`, read
+of the cache, bind, tmpfs and secret kinds (`--secret id=ID,src=PATH`, or `env=VAR`, which
+wins over a file; with neither, the variable named ID when it is set, else the file; read
 by the command line as the user), `RUN --network=none|host` (host with `--allow
 network.host`), `--network`, `--add-host`, `--label`, `--shm-size`, `--ulimit`, `--pull`
 (the registry is asked for base images even when one with the reference is here),
@@ -94,7 +95,14 @@ systemd-nspawn adds `container=systemd-nspawn` to a step's environment; the moun
 points systemd-nspawn makes for a step (an empty `/etc/machine-id`, `/bin` and the like
 as links into `/usr` where the base had none) are taken out of its layer, even when the
 step made them itself; the layers' gzip blobs differ from BuildKit's while their
-contents and diff IDs are the same.
+contents and diff IDs are the same. Each step starts from the layers as the image
+keeps them, so what a layer does not carry (ACLs and extended attributes other than
+file capabilities) is gone for the next step, where BuildKit keeps it until the image
+is written. FIFOs and device nodes of the context are left out of it. A Dockerfile is
+read as UTF-8: bytes that are not (Latin-1 text in a heredoc) become U+FFFD. A
+`.dockerignore` pattern with a Unicode class of Go's regular expressions (`\p`, `\P`)
+is refused. `ONBUILD` triggers of a base image that copy from a stage of this
+Dockerfile need that stage to be one the target needs already.
 
 ### mkosi
 
@@ -118,7 +126,8 @@ under docker, so `stop` kills it after its timeout when it does not handle its s
 signal. The arguments given to `create` or `start` after `--`
 replace the image's cmd and follow its entrypoint, exactly as with docker (`nspawn start
 web -- nginx -T` still runs `/docker-entrypoint.sh` first); `--entrypoint PROGRAM` replaces
-the entrypoint and `--entrypoint ""` drops it. Both are remembered, like the command of a
+the entrypoint and drops the image's cmd, so only the arguments given after it follow it
+(`--entrypoint /bin/sh` alone is a shell), and `--entrypoint ""` drops it. Both are remembered, like the command of a
 docker container; `start --image-command` goes back to the image's own. `-e VAR=value`
 adds environment on top of the image's (`-e VAR` copies it from your shell), and
 `-v SOURCE:TARGET[:ro]` mounts a host directory (which has to exist), or a named volume
@@ -177,7 +186,9 @@ turns the image's off), run a probe inside the machine at the interval; `ps` sho
 `(healthy)`, `(unhealthy)` or `(health: starting)` next to the state, `inspect` the last
 probes with their output, and `events` a `health_status` on every change. The probes run
 from a unit of their own (`nspawn-health-NAME.service`) bound to the machine's, so they
-go with it.
+go with it. Timings without a command on an image that has no healthcheck are kept and
+probe nothing, as with docker; an image's test that no probe can run (`["CMD"]` alone)
+counts as none, so a `:healthy` dependency on it fails at once instead of waiting.
 
 ### Dependencies
 
@@ -243,7 +254,9 @@ the stub init, which reaps orphans and turns a poweroff into SIGTERM, or as PID 
 "Machines and apps"), `--sysctl` (`net.*` keys, set in an app machine's network
 namespace) and `--interface IFACE`, which has no docker counterpart: a network
 interface of the host moved into the machine while it runs (see "Physical
-interfaces" under Networking). A `--tmpfs` that lands on `/run` (`/var/run` in most images) is left out
+interfaces" under Networking). A `--tmpfs` without a `mode=` is 1777, as docker's, so a
+program of any user writes to it; unlike docker's it is not mounted `noexec,nosuid`,
+which systemd-nspawn cannot ask for. A `--tmpfs` that lands on `/run` (`/var/run` in most images) is left out
 with a note: `/run` is a tmpfs of every machine already. `--hostname` reaches a booted
 machine as its `/etc/hostname`. Each becomes a line of the machine's settings file or of its unit; `inspect`
 shows them all. A path inside the machine, the target of a volume or a secret, a
@@ -332,6 +345,9 @@ connection. A container ID is derived from the machine's name and creation time,
 stays across restarts and updates, and the tools that look for their own container in
 `/proc/self/mountinfo` find it, as nspawn binds the machine's `/etc/hostname` from a
 directory named after it, as docker does. mstack machines cannot take the socket yet.
+What one machine's clients hold at once is bounded: 64 connections, of which 16 may
+be logs or events streams (each runs a `journalctl`); more get 503. Stats streams count
+as connections only.
 
 ### Updates of the image a tag names
 

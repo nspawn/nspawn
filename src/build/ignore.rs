@@ -355,7 +355,10 @@ fn compile(pattern: &str, sl: char) -> Result<(MatchType, Option<Regexp>), Patte
         } else if ch == '?' {
             re.push_str(&format!("[^{esc_sl}]"));
             detected = MatchType::Regexp;
-        } else if ".+()|{}$".contains(ch) {
+        // The reference's escape set loses the bits of `{`, `|` and `}` (their byte
+        // over eight does not fit its table), so those reach the regular expression as
+        // they are: an alternation and a counted repetition.
+        } else if ".+()$".contains(ch) {
             re.push('\\');
             re.push(ch);
         } else if ch == '\\' {
@@ -405,7 +408,11 @@ enum Node {
     Char(CharTest),
     Assert(Assertion),
     Group(Vec<Node>),
+    /// Branches, the first that matches taken.
+    Alt(Vec<Vec<Node>>),
     Repeat(Box<Node>, RepeatKind),
+    /// A counted repetition written out.
+    Counted(Vec<Node>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -532,14 +539,23 @@ impl RegexpParser<'_> {
         Ok(c)
     }
 
+    /// Branches separated by `|` up to the end of the group or of the expression.
     fn seq(&mut self, in_group: bool) -> Result<Vec<Node>, PatternError> {
+        let mut branches: Vec<Vec<Node>> = Vec::new();
         let mut nodes: Vec<Node> = Vec::new();
+        let end = |mut branches: Vec<Vec<Node>>, nodes: Vec<Node>| {
+            if branches.is_empty() {
+                return nodes;
+            }
+            branches.push(nodes);
+            vec![Node::Alt(branches)]
+        };
         loop {
             let Some(c) = self.peek() else {
                 if in_group {
                     return Err(PatternError::BadPattern);
                 }
-                return Ok(nodes);
+                return Ok(end(branches, nodes));
             };
             match c {
                 ')' => {
@@ -547,8 +563,34 @@ impl RegexpParser<'_> {
                         return Err(PatternError::BadPattern);
                     }
                     self.pos += 1;
-                    return Ok(nodes);
+                    return Ok(end(branches, nodes));
                 }
+                '|' => {
+                    self.pos += 1;
+                    branches.push(std::mem::take(&mut nodes));
+                }
+                '{' => match self.repeat_count() {
+                    Some((min, max)) => {
+                        if min > MAX_REPEAT || max.is_some_and(|m| m > MAX_REPEAT || m < min) {
+                            return Err(PatternError::BadPattern);
+                        }
+                        let last = match nodes.pop() {
+                            None | Some(Node::Repeat(..) | Node::Counted(_)) => {
+                                return Err(PatternError::BadPattern)
+                            }
+                            Some(last) => last,
+                        };
+                        if self.peek() == Some('?') {
+                            self.pos += 1;
+                        }
+                        nodes.push(counted(last, min, max)?);
+                    }
+                    // A brace that makes no count is itself.
+                    None => {
+                        self.pos += 1;
+                        nodes.push(Node::Char(CharTest::Lit('{')));
+                    }
+                },
                 '(' => {
                     self.pos += 1;
                     if self.peek() == Some('?') {
@@ -558,8 +600,6 @@ impl RegexpParser<'_> {
                     let inner = self.seq(true)?;
                     nodes.push(Node::Group(inner));
                 }
-                // Neither does an alternation: `compile` escapes every `|`.
-                '|' => return Err(PatternError::BadPattern),
                 '[' => {
                     let class = self.class()?;
                     nodes.push(Node::Char(CharTest::Class(class)));
@@ -584,7 +624,9 @@ impl RegexpParser<'_> {
                         _ => RepeatKind::Quest,
                     };
                     let last = match nodes.pop() {
-                        None | Some(Node::Repeat(..)) => return Err(PatternError::BadPattern),
+                        None | Some(Node::Repeat(..) | Node::Counted(_)) => {
+                            return Err(PatternError::BadPattern)
+                        }
                         Some(last) => last,
                     };
                     // A non-greedy marker changes nothing for a yes or no answer.
@@ -600,6 +642,42 @@ impl RegexpParser<'_> {
                 }
             }
         }
+    }
+
+    /// `{n}`, `{n,}` or `{n,m}` at the position, consumed; None, and nothing consumed,
+    /// when the brace starts no count.
+    fn repeat_count(&mut self) -> Option<(u32, Option<u32>)> {
+        let start = self.pos;
+        let mut i = start + 1;
+        let number = |i: &mut usize| -> Option<u32> {
+            let from = *i;
+            while self.s.get(*i).is_some_and(char::is_ascii_digit) {
+                *i += 1;
+            }
+            if *i == from {
+                return None;
+            }
+            // Past what any count may be, as the reference's own parse gives up.
+            let text: String = self.s[from..*i].iter().collect();
+            Some(text.parse().unwrap_or(u32::MAX))
+        };
+        let min = number(&mut i)?;
+        let max = match self.s.get(i) {
+            Some(',') => {
+                i += 1;
+                if self.s.get(i) == Some(&'}') {
+                    None
+                } else {
+                    Some(number(&mut i)?)
+                }
+            }
+            _ => Some(min),
+        };
+        if self.s.get(i) != Some(&'}') {
+            return None;
+        }
+        self.pos = i + 1;
+        Some((min, max))
     }
 
     fn escape(&mut self, nodes: &mut Vec<Node>) -> Result<(), PatternError> {
@@ -781,12 +859,76 @@ impl RegexpParser<'_> {
     }
 }
 
+/// The largest count of a repetition, as the reference takes it.
+const MAX_REPEAT: u32 = 1000;
+
+/// How many nodes an expression is made of, as large as the program it gives.
+fn size(node: &Node) -> usize {
+    match node {
+        Node::Char(_) | Node::Assert(_) => 1,
+        Node::Group(inner) | Node::Counted(inner) => inner.iter().map(size).sum(),
+        Node::Alt(branches) => branches.iter().flatten().map(size).sum::<usize>() + branches.len(),
+        Node::Repeat(inner, _) => size(inner) + 1,
+    }
+}
+
+/// The most nodes a written-out repetition may come to, as the reference refuses an
+/// expression too large.
+const MAX_SIZE: usize = 100_000;
+
+/// `node` repeated `min` times and up to `max` (no bound without it), written out as the
+/// plain repetitions the program knows.
+fn counted(node: Node, min: u32, max: Option<u32>) -> Result<Node, PatternError> {
+    let copies = max.unwrap_or(min).max(min) as usize + 1;
+    if size(&node).saturating_mul(copies) > MAX_SIZE {
+        return Err(PatternError::BadPattern);
+    }
+    let mut out: Vec<Node> = (0..min).map(|_| node.clone()).collect();
+    match max {
+        None => out.push(Node::Repeat(Box::new(node), RepeatKind::Star)),
+        Some(max) => {
+            // x{2,4} is xx(x(x)?)?: each optional copy inside the one before.
+            let mut tail: Option<Node> = None;
+            for _ in min..max {
+                let mut inner = vec![node.clone()];
+                inner.extend(tail.take());
+                tail = Some(Node::Repeat(
+                    Box::new(Node::Group(inner)),
+                    RepeatKind::Quest,
+                ));
+            }
+            out.extend(tail);
+        }
+    }
+    Ok(Node::Counted(out))
+}
+
 fn emit(nodes: &[Node], prog: &mut Vec<Inst>) {
     for node in nodes {
         match node {
             Node::Char(test) => prog.push(Inst::Char(test.clone())),
             Node::Assert(a) => prog.push(Inst::Assert(*a)),
-            Node::Group(inner) => emit(inner, prog),
+            Node::Group(inner) | Node::Counted(inner) => emit(inner, prog),
+            Node::Alt(branches) => {
+                // Split to this branch or the next; each ends with a jump past them all.
+                let mut jumps = Vec::new();
+                for (i, branch) in branches.iter().enumerate() {
+                    if i + 1 == branches.len() {
+                        emit(branch, prog);
+                        break;
+                    }
+                    let split = prog.len();
+                    prog.push(Inst::Split(0, 0));
+                    emit(branch, prog);
+                    jumps.push(prog.len());
+                    prog.push(Inst::Jmp(0));
+                    prog[split] = Inst::Split(split + 1, prog.len());
+                }
+                let end = prog.len();
+                for j in jumps {
+                    prog[j] = Inst::Jmp(end);
+                }
+            }
             Node::Repeat(inner, kind) => {
                 let start = prog.len();
                 match kind {
@@ -905,8 +1047,9 @@ impl Regexp {
 }
 
 /// The reference's single-path glob (Go's filepath.Match): `*` and `?` do not match a
-/// slash, `[...]` and `[^...]` are classes with ranges, `\` escapes. The whole pattern
-/// is checked for syntax even when the name already failed to match.
+/// slash, `[...]` and `[^...]` are classes with ranges, `\` escapes. What follows the
+/// chunk where the name failed is not looked at, as filepath.Match does not (path.Match
+/// does): `obj/*\` is no error against ".".
 pub fn glob_match(pattern: &str, name: &str) -> Result<bool, PatternError> {
     glob_match_bytes(pattern.as_bytes(), name.as_bytes())
 }
@@ -952,11 +1095,6 @@ pub(crate) fn glob_match_bytes(pattern: &[u8], name: &[u8]) -> Result<bool, Patt
                 }
                 i += 1;
             }
-        }
-        while !pattern.is_empty() {
-            let (_, chunk, rest) = scan_chunk(pattern);
-            pattern = rest;
-            match_chunk(chunk, b"")?;
         }
         return Ok(false);
     }
@@ -1374,6 +1512,32 @@ mod tests {
     }
 
     #[test]
+    fn braces_and_bars_reach_the_expression_as_the_reference_has_it() {
+        // `^[^/]*\.pem|[^/]*\.key$`: a top-level name that starts like a .pem, or a
+        // .key anywhere.
+        let keys = ["*.pem|*.key"];
+        assert!(matches("server.pem", &keys).unwrap());
+        assert!(matches("certs/server.key", &keys).unwrap());
+        assert!(matches("id.pemx", &keys).unwrap());
+        assert!(!matches("certs/server.pem", &keys).unwrap());
+        assert!(!matches("notes.txt", &keys).unwrap());
+        // In a pattern that is an expression (one with a wildcard), a count repeats and
+        // a brace that makes none is itself; without a wildcard all of it is literal.
+        assert!(matches("aa", &["a{2}*"]).unwrap());
+        assert!(matches("aab", &["a{2}*"]).unwrap());
+        assert!(!matches("ab", &["a{2}*"]).unwrap());
+        assert!(matches("abbbc", &["ab{2,3}c*"]).unwrap());
+        assert!(!matches("abbbbc", &["ab{2,3}c*"]).unwrap());
+        assert!(matches("x{y}z", &["x{y}*"]).unwrap());
+        assert!(matches("x{,2}", &["x{,2}*"]).unwrap());
+        assert!(matches("a|b", &["a|b"]).unwrap());
+        // Counts the reference refuses.
+        for bad in ["a{1001}*", "a{3,2}*", "a{2}{3}*"] {
+            assert!(matches("a", &[bad]).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn exclusion_pattern_matches_pattern_before() {
         assert!(matches("fileutils.go", &["!fileutils.go", "*.go"]).unwrap());
     }
@@ -1422,6 +1586,11 @@ mod tests {
             matches("/any/path/there", &["["]),
             Err(PatternError::BadPattern)
         );
+        // filepath.Match does not look past where "." failed: these lines are taken
+        // and match nothing, as a .dockerignore written on Windows may have them.
+        for pattern in ["obj/*\\", "x*\\"] {
+            assert_eq!(matches("obj/x", &[pattern]), Ok(false), "{pattern}");
+        }
     }
 
     const MATCH_CASES: &[(&str, &str, bool)] = &[

@@ -1,0 +1,8 @@
+services:
+  web:
+    image: x
+    env_file:
+      - path: ${EXTRA_ENV:-}
+        required: false
+    environment:
+      A: b

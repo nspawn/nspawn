@@ -976,12 +976,9 @@ fn copy_xattrs(dst: &Path, src: &Path, handler: Option<XattrErrorHandler<'_>>) -
 /// matched against every path below it, a matched directory not being entered. Without
 /// glob characters the result is `src` cleaned.
 pub fn resolve_wildcards(root: &Path, src: &str, follow_links: bool) -> Result<Vec<PathBuf>> {
-    Ok(
-        resolve_wildcards_bytes(path_bytes(root), src.as_bytes(), follow_links)?
-            .iter()
-            .map(|m| bytes_path(m))
-            .collect(),
-    )
+    let found =
+        super::deep(|| resolve_wildcards_bytes(path_bytes(root), src.as_bytes(), follow_links))?;
+    Ok(found.iter().map(|m| bytes_path(m)).collect())
 }
 
 fn resolve_wildcards_bytes(root: &[u8], src: &[u8], follow_links: bool) -> Result<Vec<Vec<u8>>> {
@@ -1060,7 +1057,7 @@ fn match_below(
 /// is an archive and says so with `Ok(true)`, which skips the copy of that source.
 /// Paths in the request are as the copy sees them; the hook resolves them inside their
 /// roots with `root_path`.
-pub type UnpackFn<'a> = &'a dyn Fn(&UnpackRequest<'_>) -> Result<bool>;
+pub type UnpackFn<'a> = &'a (dyn Fn(&UnpackRequest<'_>) -> Result<bool> + Sync);
 
 pub struct UnpackRequest<'r> {
     pub src_root: &'r Path,
@@ -1109,7 +1106,7 @@ pub struct CopyAction<'a> {
     pub unpack: Option<UnpackFn<'a>>,
     /// Where xattrs that cannot be copied are reported; to stderr without it. They
     /// never fail the copy.
-    pub xattr_errors: Option<&'a dyn Fn(&anyhow::Error)>,
+    pub xattr_errors: Option<&'a (dyn Fn(&anyhow::Error) + Sync)>,
 }
 
 impl CopyAction<'_> {
@@ -1158,6 +1155,11 @@ fn clean_path(s: &str) -> Vec<u8> {
 /// Runs one copy action from `src_root` to `dest_root`. Errors name paths inside the
 /// roots, not on the host, wherever the reference does.
 pub fn docopy(src_root: &Path, dest_root: &Path, action: &CopyAction<'_>) -> Result<()> {
+    // The copy goes down a level of the stack per directory level.
+    super::deep(|| docopy_here(src_root, dest_root, action))
+}
+
+fn docopy_here(src_root: &Path, dest_root: &Path, action: &CopyAction<'_>) -> Result<()> {
     let src = path_bytes(src_root);
     let dest = path_bytes(dest_root);
     for required in &action.required_paths {
@@ -2953,13 +2955,14 @@ mod tests {
         );
         assert_eq!(mtime(&dst.path().join("no")), (1_500_000_000, 123_456_789));
         // The unpack hook sees every source and can take it over.
-        let seen = std::cell::RefCell::new(Vec::new());
+        let seen = std::sync::Mutex::new(Vec::new());
         let hook = |r: &UnpackRequest<'_>| -> Result<bool> {
             assert_eq!(r.src_root, src.path());
             assert_eq!(r.dest_root, dst.path());
             assert_eq!(r.owner, None);
             assert_eq!(r.timestamp, Some(1_500_000_000_123_456_789));
-            seen.borrow_mut()
+            seen.lock()
+                .unwrap()
                 .push((r.src.to_path_buf(), r.dest.to_path_buf()));
             Ok(true)
         };
@@ -2968,7 +2971,7 @@ mod tests {
         docopy(src.path(), dst.path(), &action).unwrap();
         assert!(!dst.path().join("unpacked").exists());
         assert_eq!(
-            seen.borrow().as_slice(),
+            seen.lock().unwrap().as_slice(),
             [(PathBuf::from("/a.txt"), PathBuf::from("/unpacked/"))]
         );
     }

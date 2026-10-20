@@ -1000,7 +1000,7 @@ fn write_members(map: &Map, def: &'static Def, format: Format, entries: &mut Vec
                 if let (Format::Yaml, Some(Value::Map(ext))) = (format, map.get(EXTENSIONS)) {
                     let mut items: Vec<(String, Out)> =
                         ext.iter().map(|(k, v)| (k.clone(), any(v))).collect();
-                    items.sort_by(|a, b| super::emit::natural_order(&a.0, &b.0));
+                    super::emit::sort_natural(&mut items, |e| &e.0);
                     entries.extend(items);
                 }
             }

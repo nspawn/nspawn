@@ -25,16 +25,23 @@ impl Filters {
         };
         let mut out = BTreeMap::new();
         for (key, values) in map {
+            // As docker's FromJSON: a key of the object form counts whatever its bool,
+            // null is no value, and anything else in either form is no filter.
             let set: BTreeSet<String> = match values {
+                Value::Null => BTreeSet::new(),
                 Value::Array(list) => list
                     .into_iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect(),
-                Value::Object(old) => old
-                    .into_iter()
-                    .filter(|(_, on)| on.as_bool() == Some(true))
-                    .map(|(k, _)| k)
-                    .collect(),
+                    .map(|v| match v {
+                        Value::String(s) => Ok(s),
+                        _ => Err(Invalid("invalid filter".to_string())),
+                    })
+                    .collect::<Result<_, _>>()?,
+                Value::Object(old) => {
+                    if old.values().any(|on| !on.is_boolean()) {
+                        return Err(Invalid("invalid filter".to_string()));
+                    }
+                    old.into_iter().map(|(k, _)| k).collect()
+                }
                 _ => return Err(Invalid(format!("invalid filter '{key}'"))),
             };
             out.insert(key, set);
@@ -45,7 +52,8 @@ impl Filters {
     /// From the command line's KEY=VALUE pairs (`--filter name=web`).
     pub fn from_pairs(pairs: &[String]) -> Result<Filters, Invalid> {
         let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for pair in pairs {
+        // docker's FilterOpt: an empty --filter is none, key and value are trimmed.
+        for pair in pairs.iter().filter(|p| !p.trim().is_empty()) {
             let (key, value) = pair.split_once('=').ok_or_else(|| {
                 Invalid(format!(
                     "bad format of filter (expected name=value): {pair}"
@@ -53,7 +61,7 @@ impl Filters {
             })?;
             out.entry(key.trim().to_lowercase())
                 .or_default()
-                .insert(value.to_string());
+                .insert(value.trim().to_string());
         }
         Ok(Filters(out))
     }
@@ -111,12 +119,18 @@ mod tests {
         let new =
             Filters::parse(Some(r#"{"label":["caddy","a=b"],"status":["running"]}"#)).unwrap();
         let old = Filters::parse(Some(
-            r#"{"label":{"caddy":true,"a=b":true,"off":false},"status":{"running":true}}"#,
+            r#"{"label":{"caddy":true,"a=b":false},"status":{"running":true}}"#,
         ))
         .unwrap();
+        // A key of the object form counts whatever its bool, as docker reads it.
         assert_eq!(new, old);
         assert!(Filters::parse(Some("[1]")).is_err());
         assert!(Filters::parse(Some(r#"{"label":"x"}"#)).is_err());
+        assert!(Filters::parse(Some(r#"{"name":["web",1]}"#)).is_err());
+        assert!(Filters::parse(Some(r#"{"label":{"a":"yes"}}"#)).is_err());
+        // null is no value: no filter.
+        let null = Filters::parse(Some(r#"{"label":null}"#)).unwrap();
+        assert!(null.values("label").is_none());
         assert_eq!(Filters::parse(None).unwrap(), Filters::default());
         assert_eq!(Filters::parse(Some("")).unwrap(), Filters::default());
     }

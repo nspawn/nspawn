@@ -24,6 +24,8 @@ pub struct Spec<'a> {
     pub no_deps: bool,
     /// The env files the project was given, for its label.
     pub env_files: Vec<String>,
+    /// The replicas --scale asks for, by service, over the file's.
+    pub scale: &'a BTreeMap<String, u32>,
 }
 
 /// What a machine takes: the options, and what to see to first.
@@ -125,6 +127,33 @@ pub fn volume_name(project: &Project, key: &str) -> String {
         .unwrap_or_else(|| format!("{}_{key}", project.name))
 }
 
+/// The host directory a volume of the project binds, as the local driver's `type: none`
+/// with `o: bind` and a `device` does; None for one nspawn makes, and an error for
+/// driver options nothing here honours.
+pub fn volume_device(project: &Project, key: &str) -> Result<Option<String>> {
+    let Some(opts) = project
+        .volumes
+        .get(key)
+        .and_then(Value::as_map)
+        .and_then(|v| v.get("driver_opts"))
+        .and_then(Value::as_map)
+        .filter(|o| !o.is_empty())
+    else {
+        return Ok(None);
+    };
+    let device = s(opts, "device");
+    let bind = s(opts, "o")
+        .split(',')
+        .any(|o| matches!(o, "bind" | "rbind"));
+    if s(opts, "type") != "none" || !bind || device.is_empty() {
+        bail!("volume {key:?}: driver_opts are taken only as type: none, o: bind and a device, which binds that host directory");
+    }
+    if !device.starts_with('/') {
+        bail!("volume {key:?}: device {device:?} is no absolute path of the host");
+    }
+    Ok(Some(device.to_string()))
+}
+
 /// The nspawn secret that carries a secret or config of the project with no file
 /// behind it (environment or content).
 pub fn secret_name(project: &str, kind: &str, key: &str) -> String {
@@ -212,6 +241,7 @@ pub fn options(spec: &Spec) -> Result<Made> {
         ephemeral: Vec::new(),
     };
     network(spec, service, &mut made)?;
+    platform(spec, service, &mut made);
     ports(spec, service, &mut made)?;
     volumes(spec, service, &mut made)?;
     secrets(spec, service, &mut made);
@@ -232,7 +262,16 @@ fn network(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
             "host" | "none" | "bridge" => mode.to_string(),
             m if m.starts_with("service:") => {
                 let owner = &m["service:".len()..];
-                let other = self::service(project, owner)?;
+                // With --no-deps the owner is left out of the selection, not out of the
+                // project: its machine is there all the same.
+                let other = match self::service(project, owner) {
+                    Ok(other) => other,
+                    Err(e) => project
+                        .disabled_services
+                        .get(owner)
+                        .and_then(Value::as_map)
+                        .ok_or(e)?,
+                };
                 format!(
                     "container:{}",
                     super::machine_name(&project.name, owner, s(other, "container_name"), 1)
@@ -276,7 +315,21 @@ fn network(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
         if let Some(opts) = &opts {
             own.extend(strings(seq(opts, "aliases")));
         }
-        own.dedup();
+        // links: SERVICE:ALIAS of the services that link to this one, an alias on the
+        // default network.
+        if key == "default" && !spec.oneoff {
+            for other in project.services.values().filter_map(Value::as_map) {
+                for link in strings(seq(other, "links")) {
+                    if let Some((linked, alias)) = link.split_once(':') {
+                        if linked == spec.service && !alias.is_empty() {
+                            own.push(alias.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        own.retain(|alias| seen.insert(alias.clone()));
         for alias in own {
             if alias != spec.name {
                 aliases.push(format!("{name}={alias}"));
@@ -288,6 +341,20 @@ fn network(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
     put_list(&mut made.options, "aliases", aliases);
     put_list(&mut made.options, "addresses", addresses);
     Ok(())
+}
+
+/// platform: this host's image is pulled whatever it names; another architecture is
+/// said.
+fn platform(spec: &Spec, service: &Map, made: &mut Made) {
+    let platform = s(service, "platform");
+    let arch = platform.split('/').nth(1).unwrap_or_default();
+    let host = super::info::go_arch();
+    if !arch.is_empty() && arch != host {
+        made.notes.push(format!(
+            "service {:?}: platform {platform}: the image for this host's {host} is used",
+            spec.service
+        ));
+    }
 }
 
 fn ports(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
@@ -389,7 +456,10 @@ fn volumes(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
                     ));
                     continue;
                 }
-                binds.push(format!("{}:{target}{ro}", volume_name(project, source)));
+                match volume_device(project, source)? {
+                    Some(device) => binds.push(format!("{device}:{target}{ro}")),
+                    None => binds.push(format!("{}:{target}{ro}", volume_name(project, source))),
+                }
             }
             "tmpfs" => {
                 let mut opts = Vec::new();
@@ -555,8 +625,9 @@ fn health(service: &Map, made: &mut Made) {
         Some("CMD-SHELL") => {
             put(&mut made.options, "health_cmd", test[1..].join(" "));
         }
+        // The exec form runs without a shell, which an image may not have.
         Some("CMD") => {
-            put(&mut made.options, "health_cmd", shell_join(&test[1..]));
+            put_list(&mut made.options, "health_test", test.clone());
         }
         _ => {}
     }
@@ -576,23 +647,6 @@ fn health(service: &Map, made: &mut Made) {
     }
 }
 
-/// Arguments as one line /bin/sh -c runs as they were.
-fn shell_join(argv: &[String]) -> String {
-    argv.iter()
-        .map(|a| {
-            if !a.is_empty()
-                && a.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_./=:,@%+".contains(&b))
-            {
-                a.clone()
-            } else {
-                format!("'{}'", a.replace('\'', "'\\''"))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn settings(spec: &Spec, service: &Map, made: &mut Made) {
     let o = &mut made.options;
     for (key, option) in [
@@ -606,15 +660,30 @@ fn settings(spec: &Spec, service: &Map, made: &mut Made) {
             put(o, option, value.to_string());
         }
     }
-    let restart = match sub(service, "deploy")
-        .and_then(|d| sub(d, "restart_policy"))
-        .map(|r| s(r, "condition"))
-        .unwrap_or("")
-    {
-        "none" | "no" => "no".to_string(),
-        "any" => "always".to_string(),
-        "on-failure" => "on-failure".to_string(),
-        _ => s(service, "restart").to_string(),
+    // getRestartPolicy: deploy.restart_policy, when there is one, decides alone, its
+    // condition mapped as the engine's words (an empty one is no policy); else restart.
+    let condition = |c: &str| -> String {
+        match c {
+            "none" | "no" => "no".to_string(),
+            "any" | "always" => "always".to_string(),
+            other => other.to_string(),
+        }
+    };
+    let restart = match sub(service, "deploy").and_then(|d| sub(d, "restart_policy")) {
+        Some(policy) => {
+            let mapped = condition(s(policy, "condition"));
+            match int(policy.get("max_attempts")) {
+                Some(n) if n > 0 && mapped == "on-failure" => format!("on-failure:{n}"),
+                _ => mapped,
+            }
+        }
+        None => {
+            let given = s(service, "restart");
+            match given.split_once(':') {
+                Some((mode, count)) => format!("{}:{count}", condition(mode)),
+                None => condition(given),
+            }
+        }
     };
     let restart = match restart.as_str() {
         "" => String::new(),
@@ -766,7 +835,8 @@ fn dependencies(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
             } else {
                 ""
             };
-            for n in 1..=replicas(other, &BTreeMap::new(), name).max(1) {
+            // The replicas there will be: none of a service scaled to zero.
+            for n in 1..=replicas(other, spec.scale, name) {
                 let machine =
                     super::machine_name(&project.name, name, s(other, "container_name"), n);
                 deps.push(format!("{machine}{condition}{optional}"));
@@ -829,12 +899,12 @@ fn labels(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use clap::Parser;
 
     /// The project of a compose file, as up loads it.
-    fn project(name: &str, yaml: &str) -> Project {
+    pub(crate) fn project(name: &str, yaml: &str) -> Project {
         let dir =
             std::env::temp_dir().join(format!("nspawn-convert-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -875,6 +945,7 @@ mod tests {
             image_digest: "sha256:abc".to_string(),
             no_deps: false,
             env_files: Vec::new(),
+            scale: &BTreeMap::new(),
         })
         .unwrap()
     }
@@ -897,6 +968,65 @@ mod tests {
         made.options
             .get(key)
             .and_then(|v| String::try_from(v.clone()).ok())
+    }
+
+    #[test]
+    fn restart_policies_as_compose_maps_them() {
+        let p = project(
+            "restarts",
+            "services:\n  a:\n    image: x\n    deploy:\n      restart_policy:\n        condition: unless-stopped\n  b:\n    image: x\n    restart: always\n    deploy:\n      restart_policy:\n        max_attempts: 3\n  c:\n    image: x\n    restart: any\n",
+        );
+        assert_eq!(
+            text(&made(&p, "a", 1), "restart").as_deref(),
+            Some("unless-stopped")
+        );
+        assert_eq!(
+            text(&made(&p, "b", 1), "restart"),
+            None,
+            "deploy's policy decides alone"
+        );
+        assert_eq!(
+            text(&made(&p, "c", 1), "restart").as_deref(),
+            Some("always")
+        );
+    }
+
+    #[test]
+    fn a_link_alias_names_the_linked_service() {
+        let p = project(
+            "links",
+            "services:\n  db:\n    image: postgres\n  web:\n    image: nginx\n    links: [\"db:database\"]\n",
+        );
+        let db = made(&p, "db", 1);
+        assert!(
+            list(&db, "aliases")
+                .iter()
+                .any(|a| a.ends_with("=database")),
+            "{:?}",
+            list(&db, "aliases")
+        );
+        assert!(!list(&made(&p, "web", 1), "aliases")
+            .iter()
+            .any(|a| a.ends_with("=database")));
+    }
+
+    #[test]
+    fn another_platform_is_said() {
+        let other = if super::super::info::go_arch() == "arm64" {
+            "amd64"
+        } else {
+            "arm64"
+        };
+        let p = project(
+            "platform",
+            &format!("services:\n  web:\n    image: nginx\n    platform: linux/{other}\n"),
+        );
+        let web = made(&p, "web", 1);
+        assert!(
+            web.notes.iter().any(|n| n.contains("platform")),
+            "{:?}",
+            web.notes
+        );
     }
 
     const DEMO: &str = r#"
@@ -992,6 +1122,198 @@ volumes:
     }
 
     #[test]
+    fn run_makes_a_job_a_service() {
+        let mut p = project(
+            "jobs",
+            "services:\n  db:\n    image: postgres\n\
+             jobs:\n  migrate:\n    image: app\n    depends_on: [db]\n    triggers: {manual: true}\n\
+             \x20 nightly:\n    image: app\n    triggers: {manual: false}\n",
+        );
+        super::super::materialize_job(&mut p, "migrate").unwrap();
+        assert!(p.services.contains_key("migrate") && !p.jobs.contains_key("migrate"));
+        let err = super::super::materialize_job(&mut p, "nightly").unwrap_err();
+        assert_eq!(
+            err,
+            "job \"nightly\" is declared with manual: false, it cannot be run manually"
+        );
+        assert_eq!(
+            super::super::materialize_job(&mut p, "nope").unwrap_err(),
+            "no such service: nope"
+        );
+    }
+
+    #[test]
+    fn only_commands_that_make_machines_read_env_files() {
+        let dir = std::env::temp_dir().join(format!("nspawn-envfiles-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("compose.yaml"),
+            "services:\n  web:\n    image: nginx\n    env_file: gone.env\n",
+        )
+        .unwrap();
+        let load = |command: &str| {
+            let cli = crate::cli::Cli::try_parse_from(["nspawn", "compose", command]).unwrap();
+            let crate::cli::Command::Compose(args) = cli.command else {
+                unreachable!()
+            };
+            let host = crate::compose::config::Host::new(
+                crate::compose::dotenv::Env::from([("HOME".to_string(), "/nowhere".to_string())]),
+                dir.to_string_lossy().into_owned(),
+                crate::compose::config::Stdin::Process,
+            );
+            let flags = crate::compose::options::Flags::default();
+            crate::compose::config::project_for(&args, &flags, &host, &[], &mut |_| {})
+        };
+        assert!(load("down").is_ok());
+        assert!(load("up").unwrap_err().contains("gone.env"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compatibility_leaves_the_project_normalized() {
+        let dir = std::env::temp_dir().join(format!("nspawn-compat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("compose.yaml"),
+            "services:\n  web:\n    image: nginx\n",
+        )
+        .unwrap();
+        let cli = crate::cli::Cli::try_parse_from(["nspawn", "compose", "--compatibility", "up"])
+            .unwrap();
+        let crate::cli::Command::Compose(args) = cli.command else {
+            unreachable!()
+        };
+        let host = crate::compose::config::Host::new(
+            crate::compose::dotenv::Env::from([("HOME".to_string(), "/nowhere".to_string())]),
+            dir.to_string_lossy().into_owned(),
+            crate::compose::config::Stdin::Process,
+        );
+        let flags = crate::compose::options::Flags::default();
+        let p =
+            crate::compose::config::project_for(&args, &flags, &host, &[], &mut |_| {}).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(p.networks.contains_key("default"), "{:?}", p.networks);
+    }
+
+    #[test]
+    fn the_owner_of_a_network_is_found_without_its_dependencies() {
+        let p = project(
+            "owner",
+            "services:\n  vpn:\n    image: gluetun\n  torrent:\n    image: qb\n    network_mode: service:vpn\n",
+        )
+        .with_selected_services(&["torrent".to_string()], true)
+        .unwrap();
+        let torrent = made(&p, "torrent", 1);
+        let network = text(&torrent, "network").unwrap();
+        assert!(
+            network.starts_with("container:") && network.ends_with("-vpn-1"),
+            "{network}"
+        );
+    }
+
+    #[test]
+    fn a_named_service_has_one_replica() {
+        let p = project(
+            "named",
+            "services:\n  api:\n    image: nginx\n    container_name: api\n",
+        );
+        assert!(super::super::up::unique_names(&p, &BTreeMap::new()).is_ok());
+        let two = BTreeMap::from([("api".to_string(), 2)]);
+        assert!(super::super::up::unique_names(&p, &two).is_err());
+        let p = project(
+            "named",
+            "services:\n  my_db:\n    image: postgres\n  my-db:\n    image: postgres\n",
+        );
+        let err = super::super::up::unique_names(&p, &BTreeMap::new()).unwrap_err();
+        assert!(err.to_string().contains("-my-db-1: machine names"), "{err}");
+        let p = project(
+            "named",
+            "services:\n  a:\n    image: x\n    container_name: app_db\n  b:\n    image: x\n    container_name: app-db\n",
+        );
+        assert!(super::super::up::unique_names(&p, &BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn neutral_values_are_not_refused() {
+        let p = project(
+            "neutral",
+            "services:\n  web:\n    image: nginx\n    secrets: [s]\n    networks: [n]\n    volumes: [v:/v]\n\
+             secrets:\n  s: {file: ./s.txt, external: false}\n\
+             networks:\n  n: {driver: \"\"}\n\
+             volumes:\n  v: {driver: \"\"}\n",
+        );
+        super::super::up::check_refusals(&p).unwrap();
+    }
+
+    #[test]
+    fn refusals_reach_x_named_and_dotted_resources() {
+        let p = project(
+            "refusals",
+            "services:\n  x-app:\n    image: alpine\n    volumes: [{type: volume, source: shared, target: /d, volume: {subpath: a}}]\n\
+             \x20 db:\n    image: postgres\n    volumes: [app.data:/x]\n\
+             volumes:\n  shared: {}\n  app.data:\n    driver: nfs\n",
+        );
+        let err = super::super::up::check_refusals(&p)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("subpath"), "{err}");
+        assert!(err.contains("app.data.driver"), "{err}");
+    }
+
+    #[test]
+    fn dependencies_name_the_replicas_there_will_be() {
+        let p = project(
+            "replicas",
+            "services:\n  db:\n    image: postgres\n    deploy: {replicas: 0}\n\
+             \x20 web:\n    image: nginx\n    depends_on: [db]\n",
+        );
+        let depends = |scale: &BTreeMap<String, u32>| {
+            let made = options(&Spec {
+                project: &p,
+                service: "web",
+                number: 1,
+                name: "web".to_string(),
+                oneoff: false,
+                image_digest: String::new(),
+                no_deps: false,
+                env_files: Vec::new(),
+                scale,
+            })
+            .unwrap();
+            list(&made, "depends_on")
+        };
+        assert!(depends(&BTreeMap::new()).is_empty());
+        let two = BTreeMap::from([("db".to_string(), 2)]);
+        let db = |n: u32| super::super::machine_name(&p.name, "db", "", n);
+        assert_eq!(depends(&two), [db(1), db(2)]);
+    }
+
+    #[test]
+    fn a_volume_of_the_local_driver_binds_its_device() {
+        let local = project(
+            "devices",
+            "services:\n  db:\n    image: postgres\n    volumes: [pg:/data, plain:/plain]\n\
+             volumes:\n  pg:\n    driver: local\n    driver_opts: {type: none, o: bind, device: /srv/pg}\n\
+             \x20 plain: {}\n",
+        );
+        assert_eq!(
+            volume_device(&local, "pg").unwrap().as_deref(),
+            Some("/srv/pg")
+        );
+        assert_eq!(volume_device(&local, "plain").unwrap(), None);
+        let db = made(&local, "db", 1);
+        let plain = format!("{}_plain:/plain", local.name);
+        assert_eq!(list(&db, "volume"), ["/srv/pg:/data", plain.as_str()]);
+        // Options nothing honours are refused, not taken for a directory of nspawn's.
+        let nfs = project(
+            "nfs",
+            "services:\n  db:\n    image: postgres\n    volumes: [nfs:/nfs]\n\
+             volumes:\n  nfs:\n    driver_opts: {type: nfs, o: addr=10.0.0.5, device: ':/x'}\n",
+        );
+        assert!(volume_device(&nfs, "nfs").is_err());
+    }
+
+    #[test]
     fn names_health_and_shared_networks_follow_docker_compose() {
         let project = project("names", DEMO);
         let db = made(&project, "db", 1);
@@ -1001,10 +1323,7 @@ volumes:
             list(&db, "aliases"),
             ["demo_default=db", "demo_default=demo_db"]
         );
-        assert_eq!(
-            text(&db, "health_cmd").as_deref(),
-            Some("pg_isready -U app")
-        );
+        assert_eq!(list(&db, "health_test"), ["CMD", "pg_isready", "-U", "app"]);
         assert_eq!(
             db.options.get("health_interval"),
             Some(&Bus::from(5_000_000u64))
@@ -1065,14 +1384,13 @@ services:
 
     #[test]
     fn health_commands_keep_their_words() {
-        assert_eq!(
-            shell_join(&["pg_isready".into(), "-U".into(), "a b".into()]),
-            "pg_isready -U 'a b'"
+        let p = project(
+            "health",
+            "services:\n  web:\n    image: distroless\n    healthcheck:\n      test: [CMD, /app/check, a b]\n",
         );
-        assert_eq!(
-            shell_join(&["echo".into(), "it's".into()]),
-            "echo 'it'\\''s'"
-        );
+        let web = made(&p, "web", 1);
+        assert_eq!(list(&web, "health_test"), ["CMD", "/app/check", "a b"]);
+        assert!(!web.options.contains_key("health_cmd"));
     }
 
     #[test]

@@ -450,23 +450,39 @@ fn check_later_sources(
 /// The first stage, in order, from which the COPY and mount dependencies lead to a cycle
 /// (validateCircularDependency).
 fn first_cycle(deps: &[Vec<usize>]) -> Option<usize> {
-    fn visit(s: usize, deps: &[Vec<usize>], visited: &mut [bool], path: &mut [bool]) -> bool {
-        if visited[s] {
-            return false;
-        }
-        visited[s] = true;
-        path[s] = true;
-        for &d in &deps[s] {
-            if path[d] || visit(d, deps, visited, path) {
-                return true;
-            }
-        }
-        path[s] = false;
-        false
-    }
+    // A depth-first walk with a stack of its own: a chain of stages is as long as the
+    // Dockerfile makes it.
     let mut visited = vec![false; deps.len()];
     let mut path = vec![false; deps.len()];
-    (0..deps.len()).find(|&s| visit(s, deps, &mut visited, &mut path))
+    for start in 0..deps.len() {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        path[start] = true;
+        let mut stack = vec![(start, 0usize)];
+        while let Some((s, next)) = stack.last_mut() {
+            let s = *s;
+            match deps[s].get(*next) {
+                Some(&d) => {
+                    *next += 1;
+                    if path[d] {
+                        return Some(start);
+                    }
+                    if !visited[d] {
+                        visited[d] = true;
+                        path[d] = true;
+                        stack.push((d, 0));
+                    }
+                }
+                None => {
+                    path[s] = false;
+                    stack.pop();
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The stages `target` needs, itself included, in Dockerfile order.

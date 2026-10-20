@@ -40,8 +40,9 @@ pub fn socket_path(machine: &str) -> std::path::PathBuf {
 /// How long the server stays without a connection before it leaves.
 const IDLE: Duration = Duration::from_secs(60);
 
-/// What a machine may hold of the host at once: connections, and streams (logs that
-/// follow, events, stats), each of which reads the journal or the cgroup as it goes.
+/// What a machine may hold of the host at once: connections, and streams that run a
+/// journalctl (logs, events). A stats stream reads the cgroup once a second and is
+/// bounded by the connections alone: a dashboard keeps one per running machine.
 static CONNECTIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
 static STREAMS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
 
@@ -205,8 +206,9 @@ impl Query {
     fn flag(&self, key: &str, default: bool) -> bool {
         match self.get(key) {
             None => default,
+            // httputils.BoolValue: trimmed, then anything but these is true.
             Some(v) => !matches!(
-                v.to_ascii_lowercase().as_str(),
+                v.trim().to_ascii_lowercase().as_str(),
                 "" | "0" | "no" | "false" | "none"
             ),
         }
@@ -566,7 +568,7 @@ async fn list_containers(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
         {
             return error(
                 StatusCode::BAD_REQUEST,
-                format!("Unrecognised filter value for health: {bad}"),
+                format!("invalid filter 'health={bad}': invalid value for health ({bad}): must be one of none, starting, healthy, unhealthy"),
             );
         }
     }
@@ -574,12 +576,17 @@ async fn list_containers(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
         Ok(s) => s,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
-    let all = query.flag("all", false) || filters.values("status").is_some();
+    let limit = query
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .filter(|l| *l > 0);
+    // As docker: a limit takes stopped containers too (docker ps -l).
+    let all = query.flag("all", false) || filters.values("status").is_some() || limit.is_some();
     let mut machines: Vec<&model::Machine> = snapshot
         .machines
         .iter()
         .filter(|m| all || matches!(m.state(), "running" | "paused" | "restarting"))
-        .filter(|m| container_matches(&snapshot, &filters, m))
+        .filter(|m| container_matches(ctx, &snapshot, &filters, m))
         .collect();
     machines.sort_by(|a, b| {
         b.record
@@ -587,11 +594,7 @@ async fn list_containers(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
             .cmp(&a.record.created)
             .then(a.name().cmp(b.name()))
     });
-    if let Some(limit) = query
-        .get("limit")
-        .and_then(|l| l.parse::<usize>().ok())
-        .filter(|l| *l > 0)
-    {
+    if let Some(limit) = limit {
         machines.truncate(limit);
     }
     let list: Vec<Value> = machines
@@ -601,7 +604,12 @@ async fn list_containers(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
     json_response(StatusCode::OK, &Value::Array(list))
 }
 
-fn container_matches(snapshot: &Snapshot, filters: &Filters, m: &model::Machine) -> bool {
+fn container_matches(
+    ctx: &Context,
+    snapshot: &Snapshot,
+    filters: &Filters,
+    m: &model::Machine,
+) -> bool {
     if !filters.exact("status", m.state()) {
         return false;
     }
@@ -637,13 +645,22 @@ fn container_matches(snapshot: &Snapshot, filters: &Filters, m: &model::Machine)
         }
     }
     if let Some(nets) = filters.values("network") {
-        let joined = crate::bridge::bridge_kind(&m.record)
-            && crate::bridge::networks_of(&m.record).iter().any(|n| {
-                nets.contains(*n)
-                    || snapshot
-                        .network(n)
-                        .is_some_and(|v| nets.iter().any(|w| v.id.starts_with(w.as_str())))
-            });
+        let named = |n: &str| {
+            nets.contains(n)
+                || snapshot
+                    .network(n)
+                    .is_some_and(|v| nets.iter().any(|w| v.id.starts_with(w.as_str())))
+        };
+        // A machine on the host's network or on none is listed under host or none, as
+        // its NetworkSettings say.
+        let joined = if crate::bridge::bridge_kind(&m.record) {
+            crate::bridge::networks_of(&m.record)
+                .iter()
+                .any(|n| named(n))
+        } else {
+            let mode = m.network_mode(snapshot);
+            matches!(mode.as_str(), "host" | "none") && named(&mode)
+        };
         if !joined {
             return false;
         }
@@ -680,9 +697,7 @@ fn container_matches(snapshot: &Snapshot, filters: &Filters, m: &model::Machine)
         if !m.record.ports.iter().any(|p| {
             ports.contains(&p.container.to_string())
                 || ports.contains(&format!("{}/{}", p.container, p.protocol.name()))
-        }) && !m
-            .record
-            .run
+        }) && !ImageInfo::of(ctx, &m.record)
             .exposed_ports
             .iter()
             .any(|e| ports.contains(e) || ports.contains(e.split('/').next().unwrap_or_default()))
@@ -812,16 +827,14 @@ async fn stats(ctx: &Arc<Context>, machine: &model::Machine, query: &Query) -> R
     let pids_limit = machine.record.limits.pids;
     if query.flag("stream", true) {
         let (response, tx) = streaming("application/json");
-        return spawn_stream(
-            streams::stats(
-                ctx.clone(),
-                machine.name().to_string(),
-                machine.id.clone(),
-                pids_limit,
-                tx,
-            ),
-            response,
-        );
+        tokio::spawn(streams::stats(
+            ctx.clone(),
+            machine.name().to_string(),
+            machine.id.clone(),
+            pids_limit,
+            tx,
+        ));
+        return response;
     }
     let name = machine.name();
     let before = if query.flag("one-shot", false) {
@@ -885,9 +898,7 @@ fn events(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
         Ok(f) => f,
         Err(filters::Invalid(message)) => return error(StatusCode::BAD_REQUEST, message),
     };
-    if let Err(filters::Invalid(message)) = filters.only(events::ACCEPTED) {
-        return error(StatusCode::BAD_REQUEST, message);
-    }
+    // docker takes any key here, and uses those it knows.
     let since = journal_time(query.get("since"));
     // An end still to come is waited for while the events follow; one gone by ends a
     // window of the past, which without a start has nothing in it.
@@ -915,6 +926,20 @@ fn events(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
 /// `nspawn kill` sends it, which acme-companion and docker-gen use to have nginx read
 /// new certificates and configuration.
 async fn kill(ctx: &Arc<Context>, id: &str, query: &Query) -> Response<Body> {
+    // The signal first, as docker checks it before the container.
+    let signal = query
+        .get("signal")
+        .filter(|s| !s.is_empty())
+        .unwrap_or("KILL");
+    let number = match crate::api::machines::signal_number(signal) {
+        Ok(number) => number,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                format!("cannot kill container: {id}: Invalid signal: {signal}"),
+            )
+        }
+    };
     let snapshot = match Snapshot::take(ctx).await {
         Ok(s) => s,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
@@ -922,7 +947,8 @@ async fn kill(ctx: &Arc<Context>, id: &str, query: &Query) -> Response<Body> {
     let Some(machine) = snapshot.find(id) else {
         return error(StatusCode::NOT_FOUND, format!("No such container: {id}"));
     };
-    if !machine.running() {
+    let restarting = machine.state() == "restarting";
+    if !machine.running() && !restarting {
         return error(
             StatusCode::CONFLICT,
             format!(
@@ -931,22 +957,43 @@ async fn kill(ctx: &Arc<Context>, id: &str, query: &Query) -> Response<Body> {
             ),
         );
     }
-    let signal = query
-        .get("signal")
-        .filter(|s| !s.is_empty())
-        .unwrap_or("KILL");
-    if let Err(e) = crate::api::machines::signal_number(signal) {
-        return error(StatusCode::BAD_REQUEST, format!("{e:#}"));
-    }
+    // Between two runs of its restart policy no process gets the signal: as docker,
+    // SIGKILL or the stop signal ends the loop, any signal does without a stop signal of
+    // its own, and the rest is answered without doing anything.
+    let signal = if restarting {
+        if !ends_restarts(machine.record.effective_stop_signal(), number) {
+            return respond(StatusCode::NO_CONTENT, "", Bytes::new());
+        }
+        "KILL"
+    } else {
+        signal
+    };
     match crate::client::kill_machine(machine.name(), signal).await {
         Ok(()) => respond(StatusCode::NO_CONTENT, "", Bytes::new()),
-        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        Err(e) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("cannot kill container: {id}: {e:#}"),
+        ),
     }
+}
+
+/// docker's killWithSignal: whether `signal` keeps a container from being restarted.
+fn ends_restarts(stop_signal: Option<&str>, signal: i32) -> bool {
+    signal == nix::libc::SIGKILL
+        || stop_signal.is_none_or(|s| crate::api::machines::signal_number(s).ok() == Some(signal))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_signal_between_restarts_ends_them_as_docker_says() {
+        assert!(ends_restarts(None, nix::libc::SIGHUP));
+        assert!(ends_restarts(Some("SIGQUIT"), nix::libc::SIGKILL));
+        assert!(ends_restarts(Some("SIGQUIT"), nix::libc::SIGQUIT));
+        assert!(!ends_restarts(Some("SIGQUIT"), nix::libc::SIGHUP));
+    }
 
     /// Every request the tools made of docker's API, as recorded by
     /// tests/dockerapi/oracle.sh, is one this API answers.

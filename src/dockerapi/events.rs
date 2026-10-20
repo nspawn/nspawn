@@ -6,24 +6,6 @@ use super::filters::Filters;
 use super::util::{container_id, familiar, network_id};
 use crate::api::events::Event;
 
-/// The keys GET /events takes.
-pub const ACCEPTED: &[&str] = &[
-    "config",
-    "container",
-    "daemon",
-    "event",
-    "image",
-    "label",
-    "network",
-    "node",
-    "plugin",
-    "scope",
-    "secret",
-    "service",
-    "type",
-    "volume",
-];
-
 /// docker's events for one of nspawn's: none for what docker has no word for, more for a
 /// start or an end on bridge networks (the machine's own and a network connect or
 /// disconnect for each network, given as name and ID).

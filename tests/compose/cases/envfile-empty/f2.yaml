@@ -1,0 +1,4 @@
+services:
+  web:
+    image: x
+    env_file: ${EXTRA_ENV:-}

@@ -117,8 +117,11 @@ pub fn parse(text: &str) -> Result<Mount> {
             "source" | "src" => {
                 source = value.to_string();
                 if value.starts_with('.') {
+                    // filepath.Abs: joined and cleaned, ../ taken against the directory.
                     if let Ok(cwd) = std::env::current_dir() {
-                        source = cwd.join(value).to_string_lossy().into_owned();
+                        source = crate::api::copy::clean(&cwd.join(value), false)
+                            .to_string_lossy()
+                            .into_owned();
                     }
                 }
             }
@@ -132,7 +135,14 @@ pub fn parse(text: &str) -> Result<Mount> {
                 bail!("bind-nonrecursive is deprecated, use bind-recursive=disabled instead")
             }
             "bind-recursive" => {
-                bind_options = true;
+                // A bool stands for enabled or disabled; enabled is no bind option of
+                // its own, as docker's CLI has it.
+                let value = match value {
+                    "1" | "true" => "enabled",
+                    "0" | "false" => "disabled",
+                    other => other,
+                };
+                bind_options |= value != "enabled";
                 match value {
                     "enabled" => {}
                     "disabled" | "writable" | "readonly" => bail!(
@@ -151,7 +161,11 @@ pub fn parse(text: &str) -> Result<Mount> {
             "volume-subpath" => bail!("volume-subpath is not supported: a volume is mounted whole"),
             // A new volume is filled from the image all the same; nspawn volumes carry no
             // labels.
-            "volume-nocopy" | "volume-label" => volume_options = true,
+            "volume-nocopy" => {
+                volume_options = true;
+                bool_value(&key, value, given)?;
+            }
+            "volume-label" => volume_options = true,
             "volume-driver" => {
                 volume_options = true;
                 if value != "local" {
@@ -162,19 +176,22 @@ pub fn parse(text: &str) -> Result<Mount> {
                 bail!("volume-opt is not supported: nspawn volumes are directories of the host")
             }
             "image-subpath" => bail!("an image is not mounted as a volume"),
+            // 0 is no size and no mode, as the engine takes them: the tmpfs default.
             "tmpfs-size" => {
                 tmpfs_options = true;
                 size = Some(
                     crate::policy::parse_size(value)
                         .map_err(|_| anyhow::anyhow!("invalid value for {key}: {value}"))?,
-                );
+                )
+                .filter(|s| *s > 0);
             }
             "tmpfs-mode" => {
                 tmpfs_options = true;
                 mode = Some(
                     u32::from_str_radix(value, 8)
                         .map_err(|_| anyhow::anyhow!("invalid value for {key}: {value}"))?,
-                );
+                )
+                .filter(|m| *m > 0);
             }
             _ => bail!("unknown option '{key}' in '{field}'"),
         }
@@ -191,6 +208,10 @@ pub fn parse(text: &str) -> Result<Mount> {
     if target.is_empty() {
         bail!("invalid mount config for type \"{kind}\": field Target must not be empty");
     }
+    // The mount travels on as -v and --tmpfs write it, where a colon separates.
+    if let Some(path) = [&source, &target].into_iter().find(|p| p.contains(':')) {
+        bail!("a mount path with ':' is not supported: {path}");
+    }
     let ro = if read_only { ":ro" } else { "" };
     match kind.as_str() {
         "bind" => {
@@ -200,11 +221,14 @@ pub fn parse(text: &str) -> Result<Mount> {
             if !source.starts_with('/') {
                 bail!("invalid mount config for type \"bind\": invalid mount path: '{source}' mount path must be absolute");
             }
+            let spec = format!("{source}:{target}{ro}");
+            // Made only for a mount the service will take.
+            spec.parse::<crate::volume::Volume>()?;
             if create_source {
                 std::fs::create_dir_all(&source)
                     .with_context(|| format!("creating {source} (bind-create-src)"))?;
             }
-            Ok(Mount::Volume(format!("{source}:{target}{ro}")))
+            Ok(Mount::Volume(spec))
         }
         "volume" => {
             if source.is_empty() {
@@ -312,8 +336,15 @@ mod tests {
             ok("\"type=bind\",\"source=/a,b\",target=/c"),
             Mount::Volume("/a,b:/c".into())
         );
-        assert!(
-            matches!(ok("type=bind,source=./here,target=/c"), Mount::Volume(v) if v.starts_with('/') && v.ends_with("/./here:/c"))
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            ok("type=bind,source=./here,target=/c"),
+            Mount::Volume(format!("{}/here:/c", cwd.display()))
+        );
+        // ../ is taken against the directory, as filepath.Abs cleans it.
+        assert_eq!(
+            ok("type=bind,source=../shared,target=/s"),
+            Mount::Volume(format!("{}/shared:/s", cwd.parent().unwrap().display()))
         );
     }
 
@@ -385,6 +416,41 @@ mod tests {
         );
         assert!(parse(&text).is_err());
         assert!(!refused.exists(), "nothing is made for a refused mount");
+        // Nor for one the service would refuse.
+        let climbing = dir.path().join("up");
+        let text = format!(
+            "type=bind,bind-create-src,source={}/../x,target=/x",
+            climbing.display()
+        );
+        assert!(parse(&text).is_err());
+        assert!(!climbing.exists());
+    }
+
+    #[test]
+    fn keys_read_as_docker_s_cli_reads_them() {
+        // enabled is no bind option: a volume takes it.
+        assert!(parse("type=volume,src=v,dst=/d,bind-recursive=enabled").is_ok());
+        assert!(parse("type=volume,src=v,dst=/d,bind-recursive=true").is_ok());
+        assert!(err("type=bind,src=/a,dst=/d,bind-recursive=false").contains("recursive"));
+        assert!(err("type=volume,src=v,dst=/d,volume-nocopy=maybe").contains("boolean"));
+        // 0 is the tmpfs default, not an unbounded size or a mode nobody can use.
+        assert_eq!(
+            ok("type=tmpfs,dst=/cache,tmpfs-size=0,tmpfs-mode=0"),
+            Mount::Tmpfs("/cache".into())
+        );
+    }
+
+    #[test]
+    fn a_colon_in_a_mount_path_is_refused() {
+        assert_eq!(
+            err("type=bind,src=/backups/2026-10-18T10:00,dst=/restore"),
+            "a mount path with ':' is not supported: /backups/2026-10-18T10:00"
+        );
+        assert_eq!(
+            err("type=bind,src=/srv/x,dst=/data:ro"),
+            "a mount path with ':' is not supported: /data:ro"
+        );
+        assert!(err("type=tmpfs,dst=/a:b").contains("':'"));
     }
 
     #[test]

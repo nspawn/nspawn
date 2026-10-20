@@ -33,9 +33,11 @@ pub const GZIP_LEVEL: u32 = 6;
 const CAPABILITY: &str = "security.capability";
 const OPAQUE: [&str; 2] = ["trusted.overlay.opaque", "user.overlay.opaque"];
 // The reference only looks at the trusted name of redirect and not at all at metacopy;
-// both make the upper directory an incomplete record of the changes.
-const REDIRECT: [&str; 2] = ["trusted.overlay.redirect", "user.overlay.redirect"];
-const METACOPY: [&str; 2] = ["trusted.overlay.metacopy", "user.overlay.metacopy"];
+// both make the upper directory an incomplete record of the changes. A step's mount is
+// no userxattr one: the user names are a step's own attributes, which the kernel does
+// not read, and no reason to refuse its layer.
+const REDIRECT: [&str; 1] = ["trusted.overlay.redirect"];
+const METACOPY: [&str; 1] = ["trusted.overlay.metacopy"];
 
 const S_IFMT: u32 = 0o170_000;
 const S_IFSOCK: u32 = 0o140_000;
@@ -3501,6 +3503,22 @@ lower2 o/k file data=k
     fn metacopy_files_are_refused() {
         let err = layer_error("upper f file data=x metacopy=y");
         assert!(err.contains("metacopy"), "{err}");
+    }
+
+    #[test]
+    fn a_step_s_own_overlay_named_attributes_are_no_overlay_state() {
+        for spec in [
+            "upper f file data=x xattr=user.overlay.metacopy:y",
+            "upper d dir xattr=user.overlay.redirect:/x",
+        ] {
+            let t = trees(spec);
+            let lowers: Vec<&dyn Tree> = t
+                .iter()
+                .filter(|(name, _)| name.as_str() != "upper")
+                .map(|(_, tree)| tree as &dyn Tree)
+                .collect();
+            write_layer(&t["upper"], &lowers, io::sink()).unwrap();
+        }
     }
 
     #[test]

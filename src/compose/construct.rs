@@ -479,10 +479,15 @@ pub struct Constructor<'d> {
     alias_depth: usize,
     alias_count: usize,
     count: usize,
+    /// Bytes of scalar text built: an alias of a long scalar copies it.
+    text: usize,
     alias_check: bool,
     merged: Option<Merged>,
     limit: usize,
 }
+
+/// The scalar text one document may build, aliases followed.
+const MAX_TEXT: usize = 256 << 20;
 
 impl<'d> Constructor<'d> {
     /// `alias_check` for yaml.Unmarshal and Decoder.Decode; Node.Decode has none.
@@ -495,6 +500,7 @@ impl<'d> Constructor<'d> {
             alias_depth: 0,
             alias_count: 0,
             count: 0,
+            text: 0,
             alias_check,
             merged: None,
             limit,
@@ -554,6 +560,12 @@ impl<'d> Constructor<'d> {
         }
         if self.count > self.limit {
             return Err(Stop::TooLarge);
+        }
+        if let Kind::Scalar(..) = &node.kind {
+            self.text += node_value(node).len();
+            if self.text > MAX_TEXT {
+                return Err(Stop::TooLarge);
+            }
         }
         match &node.kind {
             Kind::Alias(target) => {

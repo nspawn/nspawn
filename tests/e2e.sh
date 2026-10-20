@@ -142,6 +142,23 @@ cleanup_machines() {
   fi
   $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || true
   rm -rf /tmp/e2e-cp /tmp/e2e-cp-* /tmp/e2e-bind /tmp/e2e-boot-vol /var/lib/nspawn/volumes/e2evol /var/lib/nspawn/volumes/e2evol2 /var/lib/nspawn/volumes/e2evol-free /var/lib/nspawn/volumes/e2evol-home /var/lib/nspawn/volumes/e2evol-etc /var/lib/nspawn/volumes/e2evol-events /var/lib/nspawn/volumes/e2evol-gen /var/lib/nspawn/volumes/e2e-bootvol /var/lib/nspawn/volumes/.e2e-hidden
+  # The review steps' machines, images, projects and files; the configuration one of
+  # them breaks for a moment is put back first.
+  [ -f /tmp/e2e-rv/e2e.toml ] && cp /tmp/e2e-rv/e2e.toml /etc/nspawn/e2e.toml
+  for m in $($NSPAWN ps -a 2>/dev/null | awk '$1 ~ /^e2e-rv/ {print $1}'); do
+    $NSPAWN rm -f "$m" >/dev/null 2>&1 || true
+  done
+  for m in $($NSPAWN images ls 2>/dev/null | awk '$1 ~ /^e2e-rv/ {print $1}'); do
+    $NSPAWN images rm "$m" >/dev/null 2>&1 || true
+  done
+  for n in $($NSPAWN network ls 2>/dev/null | awk '$1 ~ /^e2e-rv/ {print $1}'); do
+    $NSPAWN network rm "$n" >/dev/null 2>&1 || true
+  done
+  $NSPAWN volume rm e2e-rvr_data >/dev/null 2>&1 || true
+  $NSPAWN secret rm e2e-rv-pw >/dev/null 2>&1 || true
+  rm -rf /tmp/e2e-rv
+  # The build cache the steps made, when the host had none before them.
+  [ "${cache_before:-}" = 0 ] && { $NSPAWN builder prune -a -f >/dev/null 2>&1 || true; }
   kill "${listener_pid:-}" 2>/dev/null || true
   if [ "$networkd_was" != active ]; then
     systemctl stop systemd-networkd.service systemd-networkd.socket systemd-networkd-varlink.socket systemd-networkd-resolve-hook.socket >/dev/null 2>&1 || true
@@ -3244,7 +3261,7 @@ $NSPAWN build --allow network.host -t e2e-build-sandbox --build-arg BUSYBOX="$bu
 # A failed build leaves no mount, namespace or directory behind.
 grep -q '/var/lib/nspawn/builds/df-' /proc/self/mountinfo && fail "a build left a mount: $(grep /var/lib/nspawn/builds/ /proc/self/mountinfo)"
 ls /var/lib/nspawn/builds/ 2>/dev/null | grep_q '^df-' && fail "a build left its directory: $(ls /var/lib/nspawn/builds/)"
-ip netns list | grep_q 'nspawn-build_' && fail "a build left its network namespace: $(ip netns list)"
+ip netns list | grep_q -F 'nspawn-.build-' && fail "a build left its network namespace: $(ip netns list)"
 rm -rf $work
 # Two builds at once, each with its own steps, both whole.
 work=/tmp/e2e-build-two && rm -rf $work && mkdir -p $work/a $work/b
@@ -3269,7 +3286,7 @@ pgrep -af "cancel-$nonce" && fail "the step of a cancelled build still runs"
 for i in $(seq 1 10); do ls /var/lib/nspawn/builds/ 2>/dev/null | grep_q '^df-' || break; sleep 1; done
 ls /var/lib/nspawn/builds/ 2>/dev/null | grep_q '^df-' && fail "a cancelled build left its directory: $(ls /var/lib/nspawn/builds/)"
 grep -q '/var/lib/nspawn/builds/df-' /proc/self/mountinfo && fail "a cancelled build left a mount"
-ip netns list | grep_q 'nspawn-build_' && fail "a cancelled build left its network namespace"
+ip netns list | grep_q -F 'nspawn-.build-' && fail "a cancelled build left its network namespace"
 $NSPAWN images ls | grep_q '^ *e2e-build-cancel ' && fail "a cancelled build made an image"
 rm -rf $work
 # compose: a service without an image is built by up as PROJECT-SERVICE, from the
@@ -3340,6 +3357,239 @@ else
   echo "the host's build cache had entries before: builder prune -a not run"
 fi
 for i in $($NSPAWN images ls | awk '$1 ~ /^e2e-case-|^e2e-build-/ {print $1}'); do $NSPAWN images rm $i >/dev/null 2>&1; done
+
+# What the review of the code found, checked where it shows: machines, networks, builds,
+# compose and the service.
+rv=$busybox137_ref
+rm -rf /tmp/e2e-rv && mkdir -p /tmp/e2e-rv
+
+step "review: names that do not exist are refused before anything is made"
+out=$($NSPAWN create $rv e2e-rv-nonet --network e2e-rv-fronted 2>&1) && fail "create with a network that does not exist: $out"
+echo "$out" | grep_q "e2e-rv-fronted" || fail "create did not name the missing network: $out"
+$NSPAWN images ls | grep_q "^ *e2e-rv-nonet " && fail "a refused create left a machine"
+out=$($NSPAWN create $rv e2e-rv-side --network container:e2e-rv-ghost 2>&1) && fail "create in the namespace of no machine: $out"
+echo "$out" | grep_q "not a machine of nspawn's" || fail "create container: of no machine said: $out"
+out=$($NSPAWN logs e2e-rv-nope 2>&1) && fail "logs of a name nothing has: $out"
+echo "$out" | grep_q "no machine named e2e-rv-nope" || fail "logs of a name nothing has said: $out"
+
+step "review: inspect prints what it finds, ps formats a row's Label through a variable"
+$NSPAWN run -d --name e2e-rv-web -l rvkey=rvval $rv -- sleep 600 >/dev/null || fail "run e2e-rv-web"
+$NSPAWN inspect e2e-rv-web e2e-rv-nope > /tmp/e2e-rv/inspect.txt 2>/tmp/e2e-rv/inspect.err && fail "inspect of a name nothing has succeeded"
+python3 -c 'import json; d = json.load(open("/tmp/e2e-rv/inspect.txt")); assert [m["name"] for m in d] == ["e2e-rv-web"], d' || fail "inspect did not print the machine it found: $(cat /tmp/e2e-rv/inspect.txt)"
+grep_q e2e-rv-nope /tmp/e2e-rv/inspect.err || fail "inspect did not say which name it did not find"
+$NSPAWN inspect -f '' e2e-rv-web | python3 -c 'import json,sys; json.load(sys.stdin)' || fail "inspect -f '' does not print the JSON"
+out=$($NSPAWN inspect -f '{{.x' e2e-rv-web 2>&1) && fail "a template that does not parse was taken"
+echo "$out" | grep_q "template parsing error:" || fail "inspect's template error lacks docker's words: $out"
+[ "$($NSPAWN ps --filter name=e2e-rv-web --format '{{$c := .}}{{$c.Label "rvkey"}}')" = rvval ] || fail "ps --format took no Label through a variable"
+
+step "review: cp writes where a destination link points and keeps the link; a device is refused"
+$NSPAWN exec e2e-rv-web -- sh -c 'echo old > /var/target; ln -s /var/target /etc/rvlink' </dev/null || fail "make a link in e2e-rv-web"
+echo new > /tmp/e2e-rv/cpf
+$NSPAWN cp /tmp/e2e-rv/cpf e2e-rv-web:/etc/rvlink || fail "cp onto a link"
+[ "$($NSPAWN exec e2e-rv-web -- cat /var/target </dev/null)" = new ] || fail "cp did not write where the link points"
+$NSPAWN exec e2e-rv-web -- test -L /etc/rvlink </dev/null || fail "cp replaced the link in the machine"
+echo old > /tmp/e2e-rv/hosttarget && ln -sf /tmp/e2e-rv/hosttarget /tmp/e2e-rv/hostlink
+$NSPAWN cp e2e-rv-web:/var/target /tmp/e2e-rv/hostlink || fail "cp onto a host link"
+{ [ "$(cat /tmp/e2e-rv/hosttarget)" = new ] && [ -L /tmp/e2e-rv/hostlink ]; } || fail "cp on the host did not write where the link points"
+out=$($NSPAWN cp /tmp/e2e-rv/cpf e2e-rv-web:/dev/null 2>&1) && fail "cp onto a device succeeded"
+echo "$out" | grep_q "device" || fail "cp onto a device said: $out"
+
+step "review: a machine made anew under the name of one that ended is created, not exited"
+$NSPAWN run -d --name e2e-rv-ex $rv -- sh -c 'exit 3' >/dev/null || fail "run e2e-rv-ex"
+retry 15 bash -c "$NSPAWN ps -a --format '{{.Names}} {{.Status}}' | grep_q '^e2e-rv-ex Exited (3)'" || fail "e2e-rv-ex did not end with 3: $($NSPAWN ps -a)"
+$NSPAWN rm e2e-rv-ex >/dev/null || fail "rm e2e-rv-ex"
+$NSPAWN create $rv e2e-rv-ex >/dev/null || fail "create e2e-rv-ex anew"
+[ "$($NSPAWN ps -a --format '{{.Names}} {{.State}}' | awk '$1 == "e2e-rv-ex" {print $2}')" = created ] || fail "a machine made anew shows the end of the one before: $($NSPAWN ps -a)"
+
+step "review: a start refused in its preparation leaves no secret decrypted and no namespace"
+printf 'rv-secret' | $NSPAWN secret create e2e-rv-pw >/dev/null || fail "secret create e2e-rv-pw"
+$NSPAWN create $rv e2e-rv-sec --secret e2e-rv-pw -u "root:e2e-nogroup-$nonce" -- sleep 600 >/dev/null || fail "create e2e-rv-sec"
+$NSPAWN start e2e-rv-sec >/dev/null 2>&1 && fail "a start with a group the image lacks succeeded"
+[ -e /run/nspawn/secrets/e2e-rv-sec ] && fail "a refused start left its secrets decrypted"
+ip netns list | grep_q "nspawn-e2e-rv-sec" && fail "a refused start left its network namespace"
+
+step "review: run of what docker takes: variables with dots and digits, a tmpfs a user writes, a probe as the user"
+out=$($NSPAWN run --rm -e discovery.type=single-node -e 1A=x $rv -- env 2>&1)
+echo "$out" | grep_q '^discovery.type=single-node$' || fail "a variable with a dot did not reach the program: $out"
+echo "$out" | grep_q '^1A=x$' || fail "a variable starting with a digit did not reach the program: $out"
+$NSPAWN run --rm --tmpfs /scratch -u 1000 $rv -- touch /scratch/x || fail "a user cannot write to a bare --tmpfs"
+$NSPAWN run -d --name e2e-rv-hc -u 1000 --health-cmd 'id -u > /tmp/hc' --health-interval 1s $rv -- sleep 600 >/dev/null || fail "run e2e-rv-hc"
+retry 15 bash -c "[ \"\$($NSPAWN exec e2e-rv-hc -- cat /tmp/hc </dev/null 2>/dev/null)\" = 1000 ]" || fail "the probe did not run as the machine's user"
+$NSPAWN rm -f e2e-rv-hc >/dev/null 2>&1
+
+step "review: a refused start keeps the restart policy; exec into a paused machine fails at once"
+$NSPAWN create $rv e2e-rv-pol --restart always -- sleep 600 >/dev/null || fail "create e2e-rv-pol"
+$NSPAWN start e2e-rv-pol --restart no -v /nonexistent-$nonce:/x >/dev/null 2>&1 && fail "a start with a volume that does not exist succeeded"
+[ "$($NSPAWN inspect -f '{{.restart}}' e2e-rv-pol)" = always ] || fail "a refused start changed the restart policy: $($NSPAWN inspect -f '{{.restart}}' e2e-rv-pol)"
+$NSPAWN pause e2e-rv-web >/dev/null || fail "pause e2e-rv-web"
+out=$(timeout 15 $NSPAWN exec e2e-rv-web -- true </dev/null 2>&1) && fail "exec into a paused machine succeeded"
+echo "$out" | grep_q -i "pause" || fail "exec into a paused machine said: $out"
+$NSPAWN unpause e2e-rv-web >/dev/null || fail "unpause e2e-rv-web"
+
+step "review: run -i hands the program a pipe, not the terminal it was typed on"
+out=$(pyrun $NSPAWN run -i --rm $rv -- readlink /proc/self/fd/0 </dev/null 2>&1 | tr -d '\r')
+echo "$out" | grep_q "pipe:" || fail "run -i gave the program something else than a pipe: $out"
+
+step "review: a call that allows no interactive authorization is refused at once"
+if command -v busctl >/dev/null 2>&1 && id nobody >/dev/null 2>&1; then
+  out=$(timeout 20 runuser -u nobody -- busctl --system --allow-interactive-authorization=no call org.nspawn /org/nspawn org.nspawn.Manager ListImages 2>&1) && fail "an unprivileged call was allowed: $out"
+  # Without polkit on the bus only root is authorized, whatever the call allows.
+  why="did not allow interactive authorization"
+  { busctl --system call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ListNames
+    busctl --system call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ListActivatableNames; } 2>/dev/null \
+    | grep_q '"org.freedesktop.PolicyKit1"' || why="polkit is not on this bus"
+  echo "$out" | grep_q "$why" || fail "the refusal does not say why: $out"
+fi
+
+step "review: the release hook cleans up with a configuration broken since the start"
+$NSPAWN run -d --name e2e-rv-rel -p 18197:80 --secret e2e-rv-pw $rv -- httpd -f -p 80 >/dev/null || fail "run e2e-rv-rel"
+retry 10 bash -c "[ -d /run/nspawn/secrets/e2e-rv-rel ]" || fail "e2e-rv-rel has no secrets decrypted"
+cp /etc/nspawn/e2e.toml /tmp/e2e-rv/e2e.toml
+echo "e2e_bogus_key = 1" >> /etc/nspawn/e2e.toml
+since=$(date +%s)
+systemctl stop systemd-nspawn@e2e-rv-rel.service
+cp /tmp/e2e-rv/e2e.toml /etc/nspawn/e2e.toml
+journalctl -u systemd-nspawn@e2e-rv-rel.service --since "@$since" | grep_q "releasing with the default configuration" || fail "the release hook did not fall back to the defaults"
+[ -e /run/nspawn/secrets/e2e-rv-rel ] && fail "the release hook left the secrets decrypted"
+ip netns list | grep_q "nspawn-e2e-rv-rel" && fail "the release hook left the network namespace"
+nft list map ip nspawn ports 2>/dev/null | grep_q " 18197 " && fail "the release hook left the published port"
+
+step "review: builds: a hard link of a symlink, a label without a value, bad tags and heredoc paths before any step"
+mkdir -p /tmp/e2e-rv/build
+printf 'FROM %s\nRUN ln -s /bin/busybox /var/s && ln /var/s /var/h\n' "$rv" > /tmp/e2e-rv/build/Dockerfile
+$NSPAWN build -t e2e-rv-hl:1 --label rvflag /tmp/e2e-rv/build > /tmp/e2e-rv/build.txt 2>&1 || fail "build of a hard link to a symlink: $(tail -20 /tmp/e2e-rv/build.txt)"
+[ "$($NSPAWN run --rm e2e-rv-hl:1 -- sh -c 'test -L /var/h && echo link' 2>/dev/null)" = link ] || fail "the hard link of a symlink is not a symlink in the image"
+$NSPAWN inspect e2e-rv-hl-1 | python3 -c 'import json,sys; assert json.load(sys.stdin)[0]["labels"]["rvflag"] == ""' || fail "a label without a value is not on the image"
+out=$($NSPAWN build -t e2e-rv-ok:1 -t E2E-Bad:2 /tmp/e2e-rv/build 2>&1) && fail "a build with a bad tag succeeded"
+echo "$out" | grep_q "lowercase" || fail "the bad tag was not named: $out"
+$NSPAWN images ls | grep_q "^ *e2e-rv-ok-1 " && fail "a refused build made an image"
+printf 'FROM %s\nCOPY <</etc/e2e-rv-%s /dest\nnot here\n/etc/e2e-rv-%s\n' "$rv" "$nonce" "$nonce" > /tmp/e2e-rv/build/Dockerfile.heredoc
+$NSPAWN build -f /tmp/e2e-rv/build/Dockerfile.heredoc -t e2e-rv-hd:1 /tmp/e2e-rv/build >/dev/null 2>&1 && fail "a heredoc named by a path was taken"
+[ -e "/etc/e2e-rv-$nonce" ] && fail "a heredoc wrote on the host"
+# A socket in the context goes as an empty file, and what follows it still arrives.
+python3 -c "import socket; s = socket.socket(socket.AF_UNIX); s.bind('/tmp/e2e-rv/build/a.sock')"
+echo after > /tmp/e2e-rv/build/z
+printf 'FROM %s\nCOPY . /ctx\nRUN test -f /ctx/a.sock && test -f /ctx/z\nRUN true\nRUN true\nRUN printf "a\\0b\\n"\n' "$rv" > /tmp/e2e-rv/build/Dockerfile.ctx
+$NSPAWN build -f /tmp/e2e-rv/build/Dockerfile.ctx -t e2e-rv-ctx:1 /tmp/e2e-rv/build > /tmp/e2e-rv/build.txt 2>&1 || fail "a context with a socket, steps that change nothing, a NUL in the output: $(tail -20 /tmp/e2e-rv/build.txt)"
+$NSPAWN run --rm e2e-rv-ctx:1 -- true || fail "an image of repeated empty layers does not run"
+$NSPAWN ps >/dev/null || fail "the service is gone after the build"
+
+step "review: builds: two cache mounts of one id locked, host-gateway, URLs by name and checksum"
+mkdir -p /tmp/e2e-rv/http && echo url-content > "/tmp/e2e-rv/http/a b"
+python3 -m http.server 18199 --bind 127.0.0.1 --directory /tmp/e2e-rv/http >/dev/null 2>&1 &
+http_pid=$!
+sleep 1
+sum=$(sha256sum "/tmp/e2e-rv/http/a b" | cut -d' ' -f1)
+cat > /tmp/e2e-rv/build/Dockerfile.url <<DOCKERFILE
+FROM $rv
+RUN --mount=type=cache,id=e2e-rv-c,target=/a,sharing=locked --mount=type=cache,id=e2e-rv-c,target=/b,sharing=locked true
+RUN grep -q gw /etc/hosts
+ADD --checksum=sha256:$sum http://127.0.0.1:18199/a%20b /x/
+DOCKERFILE
+$NSPAWN build -f /tmp/e2e-rv/build/Dockerfile.url --add-host gw:host-gateway -t e2e-rv-url:1 /tmp/e2e-rv/build > /tmp/e2e-rv/build.txt 2>&1 || fail "cache mounts, host-gateway and ADD of a URL: $(tail -20 /tmp/e2e-rv/build.txt)"
+[ "$($NSPAWN run --rm e2e-rv-url:1 -- cat '/x/a b' 2>/dev/null)" = url-content ] || fail "ADD of a URL did not name the file by the URL's path"
+printf 'FROM %s\nADD http://127.0.0.1:18199/a%%20b /one\nADD --checksum=sha256:%064d http://127.0.0.1:18199/a%%20b /two\n' "$rv" 0 > /tmp/e2e-rv/build/Dockerfile.sum
+out=$($NSPAWN build -f /tmp/e2e-rv/build/Dockerfile.sum -t e2e-rv-sum:1 /tmp/e2e-rv/build 2>&1) && fail "a wrong checksum was taken"
+echo "$out" | grep_q -i "digest\|checksum" || fail "the wrong checksum was not said: $(echo "$out" | tail -5)"
+kill $http_pid 2>/dev/null
+
+step "review: compose: a restart takes what depends on it with restart: true, runs post_start, and run leaves nothing"
+mkdir -p /tmp/e2e-rv/rvr
+cat > /tmp/e2e-rv/rvr/compose.yaml <<COMPOSE
+name: e2e-rvr
+services:
+  db:
+    image: $rv
+    command: ["sleep", "600"]
+    volumes: ["data:/data"]
+  web:
+    image: $rv
+    command: ["sleep", "600"]
+    depends_on:
+      db: {condition: service_started, restart: true}
+    post_start:
+      - command: ["sh", "-c", "echo started >> /var/started"]
+  job:
+    image: $rv
+    command: ["true"]
+    cap_add: [SYS_PTRACE]
+    volumes: ["data:/data"]
+volumes:
+  data: {}
+COMPOSE
+$NSPAWN compose -f /tmp/e2e-rv/rvr/compose.yaml up -d > /tmp/e2e-rv/rvr.txt 2>&1 || fail "compose up of e2e-rvr: $(cat /tmp/e2e-rv/rvr.txt)"
+started() { $NSPAWN exec e2e-rvr-web-1 -- cat /var/started </dev/null 2>/dev/null | wc -l; }
+retry 10 bash -c "[ \"\$($NSPAWN exec e2e-rvr-web-1 -- cat /var/started </dev/null 2>/dev/null | wc -l)\" = 1 ]" || fail "post_start did not run at up: $(started)"
+$NSPAWN compose -f /tmp/e2e-rv/rvr/compose.yaml restart db >/dev/null 2>&1 || fail "compose restart db"
+[ "$(started)" = 2 ] || fail "restart of db did not restart web with its post_start: $(started)"
+$NSPAWN compose -f /tmp/e2e-rv/rvr/compose.yaml restart --no-deps db >/dev/null 2>&1 || fail "compose restart --no-deps db"
+[ "$(started)" = 2 ] || fail "restart --no-deps of db restarted web: $(started)"
+# ls: running ones without -a, exited too with it; the name filter a regular expression.
+$NSPAWN compose ls --filter 'name=^e2e-rvr$' > /tmp/e2e-rv/ls.txt || fail "compose ls --filter"
+grep_q '^e2e-rvr  *running(2) ' /tmp/e2e-rv/ls.txt || fail "compose ls counts what does not run: $(cat /tmp/e2e-rv/ls.txt)"
+$NSPAWN compose ls -a --filter 'name=^e2e-rvr$' | grep_q 'exited(1)' || fail "compose ls -a leaves the job out"
+# run: -v of a volume of the project (one the service uses: the others are left out
+# of a run's project), dotenv files, caps added to the service's.
+$NSPAWN compose -f /tmp/e2e-rv/rvr/compose.yaml run --rm -v data:/backup job sh -c 'echo rv > /backup/f' >/dev/null 2>&1 || fail "compose run -v data:/backup"
+[ "$($NSPAWN exec e2e-rvr-db-1 -- cat /data/f </dev/null 2>/dev/null)" = rv ] || fail "run -v data:/backup did not write into the project's volume"
+printf 'export A="x y"\n# a comment\nB=2\n' > /tmp/e2e-rv/rvr/env.txt
+out=$($NSPAWN compose -f /tmp/e2e-rv/rvr/compose.yaml run --rm --env-from-file /tmp/e2e-rv/rvr/env.txt job sh -c 'echo "$A|$B"' 2>/dev/null)
+[ "$out" = "x y|2" ] || fail "run --env-from-file was not read as a dotenv file: $out"
+caps=$($NSPAWN compose -f /tmp/e2e-rv/rvr/compose.yaml run --rm --cap-add NET_ADMIN job grep CapEff /proc/self/status 2>/dev/null | awk '{print $2}')
+python3 -c "c = int('$caps', 16); assert c >> 12 & 1 and c >> 19 & 1, hex(c)" || fail "run --cap-add did not keep the service's cap_add: $caps"
+$NSPAWN compose -f /tmp/e2e-rv/rvr/compose.yaml run --rm job true >/dev/null 2>&1 || fail "compose run --rm job"
+$NSPAWN compose -f /tmp/e2e-rv/rvr/compose.yaml down -v >/dev/null 2>&1 || fail "compose down right after run --rm"
+$NSPAWN ps -a | grep_q 'e2e-rvr-job-run' && fail "compose run --rm left its one-off"
+$NSPAWN network ls | grep_q e2e-rvr_default && fail "compose down right after run --rm left the network"
+
+step "review: compose: one image written twice is pulled once; network labels; links; a second IPv4 subnet"
+mkdir -p /tmp/e2e-rv/rvn
+# A repository of this run's own: compose pull keeps the image it pulls, as docker does.
+rvn_repo=e2e-rvn-$nonce
+$NSPAWN pull "$rv" --name e2e-rvn-src --force >/dev/null 2>&1 && $NSPAWN push e2e-rvn-src --to "$NSPAWN_REGISTRY/$rvn_repo:latest" >/dev/null 2>&1 || fail "push $rvn_repo"
+$NSPAWN images rm e2e-rvn-src >/dev/null 2>&1
+cat > /tmp/e2e-rv/rvn/compose.yaml <<COMPOSE
+name: e2e-rvn
+services:
+  a:
+    image: $NSPAWN_REGISTRY/$rvn_repo
+    command: ["sleep", "600"]
+    pull_policy: always
+  b:
+    image: $NSPAWN_REGISTRY/$rvn_repo:latest
+    command: ["sleep", "600"]
+    pull_policy: always
+    links: ["a:alpha"]
+networks:
+  default:
+    labels:
+      rvnet: "yes"
+COMPOSE
+out=$($NSPAWN compose -f /tmp/e2e-rv/rvn/compose.yaml pull 2>&1) || fail "compose pull of one image written twice: $out"
+[ "$(echo "$out" | grep -c 'Pulled')" = 1 ] || fail "one image written twice was pulled more than once: $out"
+$NSPAWN compose -f /tmp/e2e-rv/rvn/compose.yaml up -d >/dev/null 2>&1 || fail "compose up of e2e-rvn"
+$NSPAWN network inspect e2e-rvn_default | python3 -c 'import json,sys; d = json.load(sys.stdin)[0]; assert d["labels"]["rvnet"] == "yes", d' || fail "the network has not the file's labels"
+$NSPAWN exec e2e-rvn-b-1 -- grep -q alpha /etc/hosts </dev/null || fail "the alias of links does not name the linked service"
+$NSPAWN compose -f /tmp/e2e-rv/rvn/compose.yaml images -q | grep_q -E '^[0-9a-f]{64}$' || fail "compose images -q does not print whole IDs"
+$NSPAWN compose -f /tmp/e2e-rv/rvn/compose.yaml down >/dev/null 2>&1 || fail "compose down of e2e-rvn"
+$NSPAWN images rm "$rvn_repo" >/dev/null 2>&1 || fail "images rm $rvn_repo"
+cat > /tmp/e2e-rv/rvn/two.yaml <<COMPOSE
+name: e2e-rvn2
+services:
+  a: {image: $rv, command: ["sleep", "600"]}
+networks:
+  default:
+    ipam:
+      config: [{subnet: 10.231.1.0/24}, {subnet: 10.231.2.0/24}]
+COMPOSE
+out=$($NSPAWN compose -f /tmp/e2e-rv/rvn/two.yaml up -d 2>&1) && fail "a network of two IPv4 subnets was made: $out"
+echo "$out" | grep_q "second IPv4 subnet" || fail "the second subnet was not said: $out"
+$NSPAWN network ls | grep_q e2e-rvn2_default && fail "a refused project made its network"
+
+$NSPAWN rm -f e2e-rv-web e2e-rv-ex e2e-rv-sec e2e-rv-pol e2e-rv-rel >/dev/null 2>&1
+for i in e2e-rv-hl-1 e2e-rv-ctx-1 e2e-rv-url-1; do $NSPAWN images rm $i >/dev/null 2>&1; done
+$NSPAWN secret rm e2e-rv-pw >/dev/null 2>&1
+rm -rf /tmp/e2e-rv
 
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"

@@ -109,13 +109,22 @@ pub fn check_refusals(project: &Project) -> Result<()> {
     let mut lines = Vec::new();
     for refusal in &project.refused {
         let applies = if refusal.service.is_empty() {
-            let mut parts = refusal.path.splitn(3, '.');
-            let (kind, key) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+            // The name may hold dots itself: a resource applies when the path goes on
+            // from its whole name.
+            let (kind, rest) = refusal.path.split_once('.').unwrap_or((&refusal.path, ""));
+            let named = |map: &Map| {
+                map.keys().any(|k| {
+                    rest == k
+                        || rest
+                            .strip_prefix(k.as_str())
+                            .is_some_and(|r| r.starts_with('.'))
+                })
+            };
             match kind {
-                "networks" => project.networks.contains_key(key),
-                "volumes" => project.volumes.contains_key(key),
-                "secrets" => project.secrets.contains_key(key),
-                "configs" => project.configs.contains_key(key),
+                "networks" => named(&project.networks),
+                "volumes" => named(&project.volumes),
+                "secrets" => named(&project.secrets),
+                "configs" => named(&project.configs),
                 _ => true,
             }
         } else {
@@ -144,6 +153,13 @@ pub async fn up(e: &mut Engine<'_>, a: &UpArgs) -> Result<()> {
     if a.build && a.no_build {
         bail!("--build and --no-build are incompatible");
     }
+    let jobs: Vec<&str> = e.project().jobs.keys().map(String::as_str).collect();
+    if !jobs.is_empty() {
+        e.warn(format!(
+            "jobs are not started by up; trigger them with `nspawn compose run`: {}",
+            jobs.join(", ")
+        ));
+    }
     let flags = super::build::Flags {
         quiet: a.quiet_build,
         ..Default::default()
@@ -153,11 +169,13 @@ pub async fn up(e: &mut Engine<'_>, a: &UpArgs) -> Result<()> {
         force_recreate: a.force_recreate,
         no_recreate: a.no_recreate,
         always_recreate_deps: a.always_recreate_deps,
-        remove_orphans: a.remove_orphans
-            || e.project()
+        // COMPOSE_REMOVE_ORPHANS only when the flag was not given, false included.
+        remove_orphans: a.remove_orphans.unwrap_or_else(|| {
+            e.project()
                 .environment
                 .get("COMPOSE_REMOVE_ORPHANS")
-                .is_some_and(|v| v == "1" || v == "true"),
+                .is_some_and(|v| string_to_bool(v))
+        }),
         scale: scale_overrides(&a.scale)?,
         pull: a.pull.clone(),
         quiet_pull: a.quiet_pull,
@@ -172,11 +190,13 @@ pub async fn up(e: &mut Engine<'_>, a: &UpArgs) -> Result<()> {
         build: (!a.no_build).then_some(flags),
         force_build: a.build,
     };
+    // Attached output starts before anything starts, as docker compose attaches first.
+    let since = std::time::SystemTime::now();
     let machines = converge_project(e, &converge).await?;
     if a.detach || a.no_start || a.wait {
         return Ok(());
     }
-    super::logs::attach(e, a, &machines).await
+    super::logs::attach(e, a, &machines, since).await
 }
 
 pub async fn create(e: &mut Engine<'_>, a: &CreateArgs) -> Result<()> {
@@ -312,6 +332,41 @@ pub struct Pulls<'a> {
     pub pull_only: bool,
 }
 
+/// A pulled or built record of the store.
+struct Local {
+    reference: String,
+    name: String,
+    image_only: bool,
+}
+
+/// The record of a reference: an image only before one that ran as a machine.
+fn found<'a>(local: &'a [Local], full: &str) -> Option<&'a Local> {
+    let mut of = local.iter().filter(|l| l.reference == full);
+    let first = of.next()?;
+    Some(if first.image_only {
+        first
+    } else {
+        of.find(|l| l.image_only).unwrap_or(first)
+    })
+}
+
+/// compose's utils.StringToBool: strconv.ParseBool of the lowered text, false when it
+/// is none.
+pub(super) fn string_to_bool(text: &str) -> bool {
+    matches!(text.to_lowercase().as_str(), "1" | "t" | "true")
+}
+
+/// `base`, or `base-2`, `base-3`... when a record has it.
+fn free_name(base: &str, taken: &BTreeSet<String>) -> String {
+    if !taken.contains(base) {
+        return base.to_string();
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|name| !taken.contains(name))
+        .expect("a free name")
+}
+
 /// The local image of each service, pulled or built where compose would: an image a
 /// service names is pulled as its policy says, its failure only a warning when a
 /// service of the project builds that image; then each image a build section makes is
@@ -323,25 +378,28 @@ pub async fn images(
     p: &Pulls<'_>,
 ) -> Result<BTreeMap<String, Image>> {
     let project = e.project();
+    // Each record by reference and name, and whether it is an image only; the names of
+    // all of them, machines too.
     let list = || async {
-        Ok::<Vec<(String, String)>, anyhow::Error>(
-            e.client
-                .manager
-                .list_images()
-                .await
-                .map_err(client::error)?
-                .iter()
-                .filter(|i| matches!(client::string(i, "origin").as_str(), "pull" | "build"))
-                .map(|i| (client::string(i, "reference"), client::string(i, "name")))
-                .collect(),
-        )
-    };
-    let find = |local: &[(String, String)], full: &str| {
-        local
+        let all = e
+            .client
+            .manager
+            .list_images()
+            .await
+            .map_err(client::error)?;
+        let names: BTreeSet<String> = all.iter().map(|i| client::string(i, "name")).collect();
+        let local: Vec<Local> = all
             .iter()
-            .find(|(r, _)| r == full)
-            .map(|(_, n)| n.clone())
+            .filter(|i| matches!(client::string(i, "origin").as_str(), "pull" | "build"))
+            .map(|i| Local {
+                reference: client::string(i, "reference"),
+                name: client::string(i, "name"),
+                image_only: client::bool(i, "image_only"),
+            })
+            .collect();
+        Ok::<_, anyhow::Error>((local, names))
     };
+    let find = |local: &[Local], full: &str| found(local, full).map(|l| l.name.clone());
     let unset = if p.pull_only { "always" } else { "missing" };
     // The service that builds each image, the first one of the project to.
     let mut builders: BTreeMap<String, String> = BTreeMap::new();
@@ -355,7 +413,7 @@ pub async fn images(
                 .or_insert_with(|| name.clone());
         }
     }
-    let mut local = list().await?;
+    let (mut local, mut names) = list().await?;
     // The pulls.
     let mut pulled = BTreeSet::new();
     let mut failed = Vec::new();
@@ -363,25 +421,33 @@ pub async fn images(
     for name in services {
         let service = convert::service(project, name)?;
         let named = s(service, "image");
-        if named.is_empty() || pulled.contains(named) {
+        if named.is_empty() {
             continue;
         }
         let reference = super::image_reference(named)?;
         let full = reference.to_string();
-        let existing = find(&local, &full);
+        // Once per image, however it is written (redis, redis:latest, docker.io/redis).
+        if pulled.contains(&full) {
+            continue;
+        }
+        let existing = found(&local, &full);
         let policy = policy(service, p.flag, unset);
         if !pulls(&policy, true, existing.is_some()).with_context(|| format!("service {name:?}"))? {
             continue;
         }
-        pulled.insert(named.to_string());
+        pulled.insert(full.clone());
         let id = format!("Image {named}");
         e.progress.event(&id, "Pulling", "", Status::Working);
+        // A pull replaces only a record nothing ran from: one the user ran as a machine
+        // stays, and the image comes under a name of its own.
+        let (into, force) = match existing {
+            Some(l) if l.image_only => (l.name.clone(), true),
+            _ => (free_name(&reference.local_name(), &names), false),
+        };
+        names.insert(into.clone());
         let mut options = Options::new();
-        options.insert(
-            "name",
-            Bus::from(existing.clone().unwrap_or_else(|| reference.local_name())),
-        );
-        options.insert("force", Bus::from(existing.is_some()));
+        options.insert("name", Bus::from(into));
+        options.insert("force", Bus::from(force));
         let manager = &e.client.manager;
         let result = e
             .client
@@ -410,7 +476,7 @@ pub async fn images(
             }
         }
     }
-    local = list().await?;
+    (local, _) = list().await?;
     // The builds, each image once.
     if let Some(flags) = p.build {
         let mut built = BTreeSet::new();
@@ -433,7 +499,7 @@ pub async fn images(
                 built.insert(image);
             }
         }
-        local = list().await?;
+        (local, _) = list().await?;
     }
     // What each service runs.
     let mut out = BTreeMap::new();
@@ -499,6 +565,24 @@ async fn networks(e: &Engine<'_>) -> Result<()> {
         .iter()
         .map(|n| client::string(n, "name"))
         .collect();
+    // An nspawn network has one subnet: a second IPv4 one is refused before any is made.
+    for (key, def) in &project.networks {
+        let v4: Vec<&str> = def
+            .get(&["ipam", "config"])
+            .and_then(Value::as_seq)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_map)
+            .map(|c| s(c, "subnet"))
+            .filter(|s| !s.is_empty() && !s.contains(':'))
+            .collect();
+        if v4.len() > 1 {
+            bail!(
+                "network {key:?}: a second IPv4 subnet ({}): an nspawn network has one",
+                v4[1]
+            );
+        }
+    }
     for (key, def) in &project.networks {
         let def = def.as_map().cloned().unwrap_or_default();
         let name = convert::network_name(project, key);
@@ -513,14 +597,18 @@ async fn networks(e: &Engine<'_>) -> Result<()> {
         }
         e.progress.network(&name, "Creating", Status::Working);
         let mut options = Options::new();
-        options.insert(
-            "labels",
-            Bus::from(vec![
-                format!("{}={}", label::PROJECT, project.name),
-                format!("{}={key}", label::NETWORK),
-                format!("{}={}", label::VERSION, super::compose_version()),
-            ]),
-        );
+        // The file's labels, then compose's own, which win as compose adds them last.
+        let mut labels: Vec<String> = match def.get("labels") {
+            Some(Value::Map(map)) => map.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+            Some(Value::Seq(list)) => list.iter().map(|v| v.to_string()).collect(),
+            _ => Vec::new(),
+        };
+        labels.extend([
+            format!("{}={}", label::PROJECT, project.name),
+            format!("{}={key}", label::NETWORK),
+            format!("{}={}", label::VERSION, super::compose_version()),
+        ]);
+        options.insert("labels", Bus::from(labels));
         if def.get("internal") == Some(&Value::Bool(true)) {
             options.insert("internal", Bus::from(true));
         }
@@ -567,7 +655,8 @@ async fn volumes(e: &Engine<'_>) -> Result<()> {
             }
             continue;
         }
-        if existing.contains(&name) {
+        // One that binds a host directory is no volume of nspawn's.
+        if existing.contains(&name) || convert::volume_device(project, key)?.is_some() {
             continue;
         }
         e.progress.volume(&name, "Creating", Status::Working);
@@ -583,16 +672,27 @@ async fn volumes(e: &Engine<'_>) -> Result<()> {
 }
 
 /// The secrets and configs with no file behind them, made as nspawn secrets.
+/// The label of a project's secret that says what content it holds.
+const CONTENT_LABEL: &str = "org.nspawn.compose.content";
+
 async fn secrets(e: &Engine<'_>) -> Result<()> {
     let project = e.project();
-    let existing: BTreeSet<String> = e
+    // Each secret there, with the digest of its content when compose made it.
+    let existing: BTreeMap<String, String> = e
         .client
         .manager
         .list_secrets()
         .await
         .map_err(client::error)?
         .iter()
-        .map(|n| client::string(n, "name"))
+        .map(|n| {
+            let digest = n
+                .get("labels")
+                .and_then(|l| std::collections::HashMap::<String, String>::try_from(l.clone()).ok())
+                .and_then(|l| l.get(CONTENT_LABEL).cloned())
+                .unwrap_or_default();
+            (client::string(n, "name"), digest)
+        })
         .collect();
     for (kind, defs) in [("secret", &project.secrets), ("config", &project.configs)] {
         for (key, def) in defs {
@@ -603,23 +703,30 @@ async fn secrets(e: &Engine<'_>) -> Result<()> {
             let content = if def.contains_key("content") {
                 s(&def, "content").to_string()
             } else if !s(&def, "environment").is_empty() {
-                project
-                    .environment
-                    .get(s(&def, "environment"))
-                    .cloned()
-                    .unwrap_or_default()
+                let var = s(&def, "environment");
+                project.environment.get(var).cloned().with_context(|| {
+                    format!("environment variable {var:?} required by {kind} {key:?} is not set")
+                })?
             } else {
                 continue;
             };
+            // The content changes with the file or the environment: a secret made from
+            // other content is replaced, and machines read the new one at their next
+            // start, as the content is given to containers at theirs.
+            let digest = crate::layout::sha256_digest(content.as_bytes());
             let name = convert::secret_name(&project.name, kind, key);
-            if existing.contains(&name) {
+            if existing.get(&name).is_some_and(|d| *d == digest) {
                 continue;
             }
             let mut options = Options::new();
             options.insert(
                 "labels",
-                Bus::from(vec![format!("{}={}", label::PROJECT, project.name)]),
+                Bus::from(vec![
+                    format!("{}={}", label::PROJECT, project.name),
+                    format!("{CONTENT_LABEL}={digest}"),
+                ]),
             );
+            options.insert("replace", Bus::from(existing.contains_key(&name)));
             e.client
                 .manager
                 .create_secret(&name, content.as_bytes(), options)
@@ -629,6 +736,43 @@ async fn secrets(e: &Engine<'_>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Before anything is made: replicas of a service with a name of its own cannot be,
+/// and two services cannot have one machine name, which they would when they differ by
+/// a '_' and a '-' alone.
+pub(super) fn unique_names(project: &Project, scale: &BTreeMap<String, u32>) -> Result<()> {
+    let mut taken: BTreeMap<String, &str> = BTreeMap::new();
+    for (name, service) in &project.services {
+        let Some(service) = service.as_map() else {
+            continue;
+        };
+        let custom = s(service, "container_name");
+        let replicas = convert::replicas(service, scale, name);
+        if !custom.is_empty() && replicas > 1 {
+            bail!("the {name:?} service is using the custom container name {custom:?}; each machine needs a name of its own: remove the custom name to scale the service");
+        }
+        for number in 1..=replicas.max(1) {
+            let machine = super::machine_name(&project.name, name, custom, number);
+            if let Some(other) = taken.insert(machine.clone(), name) {
+                bail!("the services {other:?} and {name:?} would both make the machine {machine}: machine names take no '_', which is written '-'; rename one of them or its container_name");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a machine is made again: the services named as --force-recreate says, the
+/// others, there as their dependencies, as --always-recreate-deps does; any of them when
+/// it changed, unless --no-recreate.
+fn recreates(c: &Converge, service: &str, stale: bool) -> bool {
+    let targeted = c.services.is_empty() || c.services.iter().any(|s| s == service);
+    let force = if targeted {
+        c.force_recreate
+    } else {
+        c.always_recreate_deps
+    };
+    !c.no_recreate && (force || stale)
 }
 
 /// Makes everything the project needs and its services' machines, and starts them when
@@ -650,6 +794,7 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
             bail!("no such service: {name}");
         }
     }
+    unique_names(&project, &c.scale)?;
     let order = order(&project);
     let pulls = Pulls {
         flag: c.pull.as_deref(),
@@ -673,7 +818,6 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
         .iter()
         .map(|m| client::string(m, "name"))
         .collect();
-    let mut recreated: BTreeSet<String> = BTreeSet::new();
     for name in &order {
         let service = convert::service(&project, name)?.clone();
         let Some(image) = images.get(name) else {
@@ -690,7 +834,6 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
         for extra in existing.iter().rev().filter(|m| m.number > want) {
             stop_and_remove(e, extra, c.timeout).await?;
         }
-        let deps_recreated = dependencies(&service).iter().any(|d| recreated.contains(d));
         for number in 1..=want {
             let machine = machine_name(&project.name, name, s(&service, "container_name"), number);
             if !valid_machine_name(&machine) {
@@ -707,6 +850,7 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
                 image_digest: image.digest.clone(),
                 no_deps: c.no_deps,
                 env_files: e.args.env_file.clone(),
+                scale: &c.scale,
             };
             let made = convert::options(&spec)?;
             let found = existing
@@ -717,17 +861,21 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
                     let hash = labels_of(&made).get(label::CONFIG_HASH).cloned();
                     let stale = current.labels.get(label::CONFIG_HASH) != hash.as_ref()
                         || current.label(label::IMAGE) != image.digest;
-                    let recreate = !c.no_recreate
-                        && (c.force_recreate
-                            || stale
-                            || (c.always_recreate_deps && deps_recreated));
+                    let recreate = recreates(c, name, stale);
                     if recreate {
                         e.progress
                             .container(&current.name, "Recreate", Status::Working);
-                        stop_and_remove(e, current, c.timeout).await?;
-                        make(e, image, &machine, made).await?;
+                        // Made anew in its place, which the service checks before the
+                        // old one goes, and which keeps the machines that depend on it
+                        // pointing at it; under another name, the old one goes first.
+                        if current.name == machine {
+                            stop_only(e, current, c.timeout).await?;
+                            make(e, image, &machine, made, true).await?;
+                        } else {
+                            stop_and_remove(e, current, c.timeout).await?;
+                            make(e, image, &machine, made, false).await?;
+                        }
                         e.progress.container(&machine, "Recreated", Status::Done);
-                        recreated.insert(name.clone());
                     }
                 }
                 None => {
@@ -738,7 +886,7 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
                         );
                     }
                     e.progress.container(&machine, "Creating", Status::Working);
-                    make(e, image, &machine, made).await?;
+                    make(e, image, &machine, made, false).await?;
                     e.progress.container(&machine, "Created", Status::Done);
                 }
             }
@@ -770,7 +918,13 @@ fn labels_of(made: &convert::Made) -> BTreeMap<String, String> {
 }
 
 /// CreateMachine for one replica, with what has to be there first.
-async fn make(e: &Engine<'_>, image: &Image, machine: &str, made: convert::Made) -> Result<()> {
+async fn make(
+    e: &Engine<'_>,
+    image: &Image,
+    machine: &str,
+    made: convert::Made,
+    replace: bool,
+) -> Result<()> {
     for note in &made.notes {
         e.warn(note.clone());
     }
@@ -778,7 +932,10 @@ async fn make(e: &Engine<'_>, image: &Image, machine: &str, made: convert::Made)
         std::fs::create_dir_all(path).with_context(|| format!("creating {path}"))?;
     }
     let manager = &e.client.manager;
-    let options = made.options;
+    let mut options = made.options;
+    if replace {
+        options.insert("force", Bus::from(true));
+    }
     e.client
         .run_job_silent(
             || manager.create_machine(&image.name, machine, options),
@@ -791,6 +948,21 @@ async fn make(e: &Engine<'_>, image: &Image, machine: &str, made: convert::Made)
 
 /// Stops a machine and removes it.
 pub async fn stop_and_remove(e: &Engine<'_>, m: &Machine, timeout: Option<u64>) -> Result<()> {
+    stop_only(e, m, timeout).await?;
+    e.progress.container(&m.name, "Removing", Status::Working);
+    let mut options = Options::new();
+    options.insert("force", Bus::from(true));
+    let names = [m.name.clone()];
+    let manager = &e.client.manager;
+    e.client
+        .run_job_silent(|| manager.remove_machines(&names, options), true)
+        .await?;
+    e.progress.container(&m.name, "Removed", Status::Done);
+    Ok(())
+}
+
+/// Stops a machine that runs.
+async fn stop_only(e: &Engine<'_>, m: &Machine, timeout: Option<u64>) -> Result<()> {
     e.progress.container(&m.name, "Stopping", Status::Working);
     if m.running() || m.state == "restarting" || m.state == "starting" {
         let mut options = Options::new();
@@ -804,15 +976,6 @@ pub async fn stop_and_remove(e: &Engine<'_>, m: &Machine, timeout: Option<u64>) 
             .map_err(client::error)?;
     }
     e.progress.container(&m.name, "Stopped", Status::Done);
-    e.progress.container(&m.name, "Removing", Status::Working);
-    let mut options = Options::new();
-    options.insert("force", Bus::from(true));
-    let names = [m.name.clone()];
-    let manager = &e.client.manager;
-    e.client
-        .run_job_silent(|| manager.remove_machines(&names, options), true)
-        .await?;
-    e.progress.container(&m.name, "Removed", Status::Done);
     Ok(())
 }
 
@@ -912,7 +1075,7 @@ pub async fn start_one(e: &Engine<'_>, m: &Machine) -> Result<()> {
 }
 
 /// The post_start hooks of a machine's service, run inside it once it is up.
-async fn post_start(e: &Engine<'_>, m: &Machine) -> Result<()> {
+pub(super) async fn post_start(e: &Engine<'_>, m: &Machine) -> Result<()> {
     let Some(project) = &e.project else {
         return Ok(());
     };
@@ -933,7 +1096,7 @@ async fn post_start(e: &Engine<'_>, m: &Machine) -> Result<()> {
 
 /// Waits for what a service asks of the services it depends on, saying so: Waiting,
 /// then Healthy or Exited.
-async fn wait_dependencies(
+pub async fn wait_dependencies(
     e: &Engine<'_>,
     project: &Project,
     service: &Map,
@@ -996,14 +1159,7 @@ async fn await_condition(
                 match m.health.as_str() {
                     "healthy" => return Ok("Healthy"),
                     "unhealthy" => return Err(format!("container {machine} is unhealthy")),
-                    "" if m.dict.get("healthcheck").is_none_or(|h| {
-                        std::collections::HashMap::<String, zbus::zvariant::OwnedValue>::try_from(
-                            h.clone(),
-                        )
-                        .map(|h| h.is_empty())
-                        .unwrap_or(true)
-                    }) =>
-                    {
+                    "" if !checks_health(&m) => {
                         return Err(format!("container {machine} has no healthcheck configured"))
                     }
                     _ => {}
@@ -1025,6 +1181,37 @@ async fn await_condition(
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Whether a service of the project depends on `service` completing successfully.
+fn awaited_to_complete(e: &Engine<'_>, service: &str) -> bool {
+    e.project.as_ref().is_some_and(|p| {
+        p.services.values().filter_map(Value::as_map).any(|s| {
+            s.get("depends_on")
+                .and_then(Value::as_map)
+                .and_then(|d| d.get(service))
+                .and_then(Value::as_map)
+                .is_some_and(|d| {
+                    d.get("condition").and_then(Value::as_str)
+                        == Some("service_completed_successfully")
+                })
+        })
+    })
+}
+
+/// Whether a machine has a healthcheck that runs: one disabled (NONE) gives no verdict.
+fn checks_health(m: &Machine) -> bool {
+    m.dict
+        .get("healthcheck")
+        .and_then(|h| {
+            std::collections::HashMap::<String, zbus::zvariant::OwnedValue>::try_from(h.clone())
+                .ok()
+        })
+        .and_then(|h| {
+            h.get("test")
+                .and_then(|t| Vec::<String>::try_from(t.clone()).ok())
+        })
+        .is_some_and(|test| test.first().is_some_and(|t| t != "NONE"))
 }
 
 /// --wait: every machine running, and healthy when it has a healthcheck.
@@ -1053,7 +1240,9 @@ pub async fn wait_running(
                 .map_err(client::error)?;
             let now = Machine::from_dict(dict);
             if now.state == "stopped" {
-                if now.exit_code.unwrap_or(0) == 0 {
+                // Ending is what a service others wait to complete does; any other
+                // was to keep running.
+                if now.exit_code.unwrap_or(0) == 0 && awaited_to_complete(e, &m.service) {
                     e.progress.container(&m.name, "Exited", Status::Done);
                     break;
                 }
@@ -1063,7 +1252,10 @@ pub async fn wait_running(
                     now.exit_code.unwrap_or(0)
                 );
             }
-            if now.running() && (now.health.is_empty() || now.health == "healthy") {
+            // A machine with a healthcheck has no verdict until its first probe.
+            if now.running()
+                && (now.health == "healthy" || (now.health.is_empty() && !checks_health(&now)))
+            {
                 e.progress.container(
                     &m.name,
                     if now.health.is_empty() {
@@ -1087,6 +1279,94 @@ pub async fn wait_running(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn booleans_of_the_environment_as_compose_reads_them() {
+        assert!(string_to_bool("TRUE") && string_to_bool("1") && string_to_bool("t"));
+        assert!(!string_to_bool("yes") && !string_to_bool(""));
+    }
+
+    #[test]
+    fn a_disabled_healthcheck_is_none() {
+        let machine = |test: &[&str]| {
+            let check: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
+                std::collections::HashMap::from([(
+                    "test".to_string(),
+                    crate::daemon::values::v(
+                        test.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                    ),
+                )]);
+            let mut dict = crate::client::Dict::new();
+            dict.insert("healthcheck".to_string(), crate::daemon::values::v(check));
+            Machine {
+                name: "m".to_string(),
+                service: "s".to_string(),
+                number: 1,
+                oneoff: false,
+                state: "running".to_string(),
+                health: String::new(),
+                exit_code: None,
+                labels: BTreeMap::new(),
+                created: 0,
+                started: 0,
+                dict,
+            }
+        };
+        assert!(checks_health(&machine(&["CMD", "true"])));
+        assert!(!checks_health(&machine(&["NONE"])));
+        assert!(!checks_health(&machine(&[])));
+    }
+
+    #[test]
+    fn recreation_follows_the_services_named() {
+        let c = Converge {
+            services: vec!["web".to_string()],
+            force_recreate: true,
+            ..Default::default()
+        };
+        assert!(recreates(&c, "web", false));
+        assert!(!recreates(&c, "db", false));
+        assert!(recreates(&c, "db", true));
+        let deps = Converge {
+            services: vec!["web".to_string()],
+            always_recreate_deps: true,
+            ..Default::default()
+        };
+        assert!(!recreates(&deps, "web", false));
+        assert!(recreates(&deps, "db", false));
+        let all = Converge {
+            force_recreate: true,
+            ..Default::default()
+        };
+        assert!(recreates(&all, "db", false));
+        let never = Converge {
+            force_recreate: true,
+            no_recreate: true,
+            ..Default::default()
+        };
+        assert!(!recreates(&never, "web", true));
+    }
+
+    #[test]
+    fn a_pull_never_replaces_a_machine() {
+        let local = |name: &str, image_only: bool| Local {
+            reference: "docker.io/library/postgres:16".to_string(),
+            name: name.to_string(),
+            image_only,
+        };
+        let full = "docker.io/library/postgres:16";
+        // The user's machine comes first by name; the image only is the one taken.
+        let both = [local("db", false), local("postgres-16-2", true)];
+        assert_eq!(found(&both, full).unwrap().name, "postgres-16-2");
+        let machine = [local("db", false)];
+        assert!(!found(&machine, full).unwrap().image_only);
+        assert!(found(&machine, "docker.io/library/redis:7").is_none());
+        let taken: BTreeSet<String> = ["postgres-16".to_string(), "postgres-16-2".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(free_name("postgres-16", &taken), "postgres-16-3");
+        assert_eq!(free_name("redis-7", &taken), "redis-7");
+    }
 
     #[test]
     fn images_are_pulled_and_built_as_compose_decides() {

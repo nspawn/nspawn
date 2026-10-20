@@ -475,10 +475,11 @@ pub struct CreateArgs {
     /// underneath. Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'l', value_name = "KEY=VALUE")]
     pub label: Vec<String>,
-    /// Restart policy, like docker --restart: no, on-failure, always (also starts it at
+    /// Restart policy, like docker --restart: no, on-failure[:N] (the count is not kept),
+    /// always (also starts it at
     /// boot) or unless-stopped (like always, until nspawn stop). Remembered; applied at
     /// the next start.
-    #[arg(long, value_enum, value_name = "POLICY")]
+    #[arg(long, value_name = "POLICY", value_parser = crate::policy::parse_restart)]
     pub restart: Option<crate::policy::Restart>,
     /// Memory limit of the whole machine, like docker -m: 512m, 2g, and as much swap
     /// again unless --memory-swap says otherwise; 0 removes it. Remembered; applied at the
@@ -531,10 +532,10 @@ pub struct TuningArgs {
     #[arg(long, value_name = "CAP")]
     pub cap_drop: Vec<String>,
     /// Every capability, like docker --privileged (--privileged=false takes it back).
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", value_name = "BOOL")]
     pub privileged: Option<bool>,
     /// Mount the machine's root read-only (--read-only=false takes it back).
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", value_name = "BOOL")]
     pub read_only: Option<bool>,
     /// An empty tmpfs at a path inside, PATH[:OPTIONS] (size=64m,mode=1777). Repeatable;
     /// "none" forgets them.
@@ -597,7 +598,7 @@ pub struct TuningArgs {
     /// SIGTERM (systemd-nspawn's stub init), like docker --init; --init=false makes the
     /// program PID 1 of the machine, as docker runs it. Without it, PID 1 only for images
     /// that ask for it (s6-overlay). Remembered.
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", value_name = "BOOL")]
     pub init: Option<bool>,
     /// A net.* sysctl for an app machine's network namespace, KEY=VALUE. Repeatable;
     /// "none" forgets them.
@@ -752,12 +753,18 @@ pub struct DockerfileArgs {
     pub check: Option<String>,
     #[arg(long, hide = true)]
     pub call: Option<String>,
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide = true)]
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", hide = true)]
     pub sbom: Option<String>,
-    #[arg(long, num_args = 0..=1, default_missing_value = "true", hide = true)]
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", hide = true)]
     pub provenance: Option<String>,
     #[arg(long, hide = true)]
     pub attest: Vec<String>,
+    /// docker build's (buildx's) compatibility flags, which Makefiles still give:
+    /// accepted and ignored, as buildx ignores them.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", hide = true)]
+    pub rm: Option<bool>,
+    #[arg(long, hide = true)]
+    pub force_rm: bool,
 }
 
 impl DockerfileArgs {
@@ -1023,8 +1030,9 @@ pub struct UpdateArgs {
     /// Machine names.
     #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
-    /// Restart policy: no, on-failure, always (also starts it at boot) or unless-stopped.
-    #[arg(long, value_enum, value_name = "POLICY")]
+    /// Restart policy: no, on-failure[:N] (the count is not kept), always (also starts it
+    /// at boot) or unless-stopped.
+    #[arg(long, value_name = "POLICY", value_parser = crate::policy::parse_restart)]
     pub restart: Option<crate::policy::Restart>,
     /// Memory limit of the whole machine: 512m, 2g, and as much swap again unless
     /// --memory-swap says otherwise; 0 removes it.
@@ -1297,10 +1305,11 @@ pub struct StartOptions {
     /// underneath. Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'l', value_name = "KEY=VALUE")]
     pub label: Vec<String>,
-    /// Restart policy, like docker --restart: no, on-failure, always (also starts it at
+    /// Restart policy, like docker --restart: no, on-failure[:N] (the count is not kept),
+    /// always (also starts it at
     /// boot) or unless-stopped (like always, until nspawn stop). Remembered; applied at
     /// the next start.
-    #[arg(long, value_enum, value_name = "POLICY")]
+    #[arg(long, value_name = "POLICY", value_parser = crate::policy::parse_restart)]
     pub restart: Option<crate::policy::Restart>,
     /// Memory limit of the whole machine, like docker -m: 512m, 2g, and as much swap
     /// again unless --memory-swap says otherwise; 0 removes it. Remembered; applied at the
@@ -1416,6 +1425,9 @@ pub struct ExecArgs {
     /// Accepted and ignored: exec always enters the machine's namespaces.
     #[arg(long, hide = true)]
     pub nsenter: bool,
+    /// docker's: accepted with a note; the command gets the machine's capabilities.
+    #[arg(long, hide = true)]
+    pub privileged: bool,
     /// Command and arguments.
     #[arg(required = true, trailing_var_arg = true)]
     pub command: Vec<String>,
@@ -1517,6 +1529,19 @@ mod tests {
     }
 
     #[test]
+    fn flags_with_an_optional_value_take_no_word_after_them() {
+        for argv in [
+            &["nspawn", "run", "--privileged", "ubuntu"][..],
+            &["nspawn", "run", "-d", "--read-only", "nginx"],
+            &["nspawn", "run", "--init", "alpine", "sleep", "10"],
+            &["nspawn", "create", "--read-only", "img", "web"],
+            &["nspawn", "run", "--privileged=false", "ubuntu"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
+        }
+    }
+
+    #[test]
     fn restart_and_limits_are_parsed() {
         let cli = Cli::try_parse_from([
             "nspawn",
@@ -1539,6 +1564,25 @@ mod tests {
         };
         let start = start.options;
         assert_eq!(start.restart, Some(crate::policy::Restart::UnlessStopped));
+        // docker's on-failure with a count, the count not kept.
+        let counted =
+            Cli::try_parse_from(["nspawn", "start", "web", "--restart", "on-failure:3"]).unwrap();
+        let Command::Start(counted) = counted.command else {
+            panic!("not start");
+        };
+        assert_eq!(
+            counted.options.restart,
+            Some(crate::policy::Restart::OnFailure)
+        );
+        assert!(Cli::try_parse_from(["nspawn", "start", "web", "--restart", "always:3"]).is_err());
+        assert!(Cli::try_parse_from(["nspawn", "start", "web", "--restart", "sometimes"]).is_err());
+        // What Makefiles and docker habits give.
+        assert!(
+            Cli::try_parse_from(["nspawn", "build", "--rm", "--force-rm", "-t", "app", "."])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["nspawn", "build", "--rm=false", "-t", "app", "."]).is_ok());
+        assert!(Cli::try_parse_from(["nspawn", "exec", "--privileged", "web", "true"]).is_ok());
         assert_eq!(start.memory, Some(64 << 20));
         assert_eq!(start.cpus, Some(0.5));
         assert_eq!(start.pids_limit, Some(100));

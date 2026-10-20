@@ -97,20 +97,37 @@ fn natural_less(a: &str, b: &str) -> bool {
     ar.len() < br.len()
 }
 
-/// go-yaml's order of two map keys.
-pub fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
-    if natural_less(a, b) {
-        std::cmp::Ordering::Less
-    } else if natural_less(b, a) {
-        std::cmp::Ordering::Greater
-    } else {
-        std::cmp::Ordering::Equal
+/// Sorts in go-yaml's order of map keys, keys equal in it kept as they came. Past an
+/// int64 a digit run wraps as it does in the reference, and the order is then no total
+/// one, on which the standard sort may panic; a merge sort takes it as it is.
+pub fn sort_natural<T>(items: &mut Vec<T>, key: impl Fn(&T) -> &str + Copy) {
+    fn merged<T>(items: Vec<T>, key: impl Fn(&T) -> &str + Copy) -> Vec<T> {
+        if items.len() < 2 {
+            return items;
+        }
+        let mut left = items;
+        let right = left.split_off(left.len() / 2);
+        let mut left = merged(left, key).into_iter().peekable();
+        let mut right = merged(right, key).into_iter().peekable();
+        let mut out = Vec::with_capacity(left.len() + right.len());
+        while let (Some(a), Some(b)) = (left.peek(), right.peek()) {
+            let next = if natural_less(key(b), key(a)) {
+                right.next()
+            } else {
+                left.next()
+            };
+            out.extend(next);
+        }
+        out.extend(left);
+        out.extend(right);
+        out
     }
+    *items = merged(std::mem::take(items), key);
 }
 
 fn yaml_sorted(entries: &[(String, Out)]) -> Vec<&(String, Out)> {
     let mut sorted: Vec<&(String, Out)> = entries.iter().collect();
-    sorted.sort_by(|a, b| natural_order(&a.0, &b.0));
+    sort_natural(&mut sorted, |e| &e.0);
     sorted
 }
 
@@ -776,5 +793,24 @@ mod tests {
         assert!(natural_less("a", "b"));
         assert!(natural_less("a", "ab"));
         assert!(!natural_less("web10", "web2"));
+        // Digit runs past an int64 make the order no total one; sorting them must not
+        // panic.
+        let mut keys: Vec<String> = (0..40u64)
+            .map(|i| {
+                if i % 2 == 0 {
+                    format!(
+                        "id-{}",
+                        10_000_000_000_000_000_000u128 + u128::from(i) * 7_919_000_000_000_000_001
+                    )
+                } else {
+                    format!("id-{}", i * 104_729)
+                }
+            })
+            .collect();
+        sort_natural(&mut keys, |k| k.as_str());
+        assert_eq!(keys.len(), 40);
+        let mut plain = vec!["web10".to_string(), "web2".to_string(), "a".to_string()];
+        sort_natural(&mut plain, |k| k.as_str());
+        assert_eq!(plain, ["a", "web2", "web10"]);
     }
 }

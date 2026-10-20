@@ -78,7 +78,11 @@ impl<'a> Progress<'a> {
 }
 
 pub struct Hub {
-    client: Client,
+    /// For the configured registry, which the configured CA certificate is for.
+    hub: Client,
+    hub_name: String,
+    /// For every other registry: the system's roots alone.
+    public: Client,
 }
 
 impl Hub {
@@ -87,21 +91,46 @@ impl Hub {
         if let Some(path) = &config.ca_cert {
             let data = fs::read(path)
                 .with_context(|| format!("reading CA certificate {}", path.display()))?;
+            // The registry client drops a file it cannot read without a word, and the
+            // pull then fails on an unknown issuer that names no file.
+            if !reqwest::Certificate::from_pem_bundle(&data).is_ok_and(|c| !c.is_empty()) {
+                bail!(
+                    "CA certificate {}: no PEM certificate in it",
+                    path.display()
+                );
+            }
             extra_root_certificates.push(Certificate {
                 encoding: CertificateEncoding::Pem,
                 data,
             });
         }
-        let client_config = ClientConfig {
+        // A registry that stops sending in the middle of a blob, the connection left
+        // open, would hold the job, its blobs and the service for ever: a read that
+        // waits this long ends the transfer.
+        let client_config = |extra_root_certificates| ClientConfig {
             protocol: ClientProtocol::Https,
             extra_root_certificates,
             platform_resolver: Some(Box::new(oci_client::client::current_platform_resolver)),
             user_agent: concat!("nspawn/", env!("CARGO_PKG_VERSION")),
+            read_timeout: Some(std::time::Duration::from_secs(120)),
+            connect_timeout: Some(std::time::Duration::from_secs(30)),
             ..Default::default()
         };
         Ok(Hub {
-            client: Client::new(client_config),
+            hub: Client::new(client_config(extra_root_certificates)),
+            hub_name: config.registry.clone(),
+            public: Client::new(client_config(Vec::new())),
         })
+    }
+
+    /// The client for a registry: the configured CA certificate is trusted for the
+    /// configured registry only, as nspawn login trusts it.
+    fn client(&self, registry: &str) -> &Client {
+        if registry == self.hub_name {
+            &self.hub
+        } else {
+            &self.public
+        }
     }
 
     /// The credentials nspawn login left for a registry, else anonymous. Chosen per
@@ -118,7 +147,7 @@ impl Hub {
     pub async fn authenticate_push(&self, image: &Reference) -> Result<()> {
         let auth = self.auth(image.registry());
         for operation in [RegistryOperation::Pull, RegistryOperation::Push] {
-            self.client
+            self.client(image.registry())
                 .auth(image, &auth, operation)
                 .await
                 .with_context(|| {
@@ -134,12 +163,18 @@ impl Hub {
 
     /// All repositories of a registry (follows pagination).
     pub async fn catalog(&self, registry: &str) -> Result<Vec<String>> {
-        let probe = Reference::try_from(format!("{registry}/catalog"))?;
+        // From its parts: parsed from text, a registry without a dot or a port would be
+        // a namespace of Docker Hub, and its credentials would go there.
+        let probe = Reference::with_tag(
+            registry.to_string(),
+            "catalog".to_string(),
+            "latest".to_string(),
+        );
         let mut all = Vec::new();
         let mut last: Option<String> = None;
         loop {
             let page = self
-                .client
+                .client(registry)
                 .catalog(&probe, &self.auth(registry), Some(100), last.as_deref())
                 .await
                 .with_context(|| format!("listing the catalog of {registry}"))?;
@@ -161,7 +196,7 @@ impl Hub {
         let mut last: Option<String> = None;
         loop {
             let page = self
-                .client
+                .client(image.registry())
                 .list_tags(
                     image,
                     &self.auth(image.registry()),
@@ -185,7 +220,7 @@ impl Hub {
     /// The digest a reference names on its registry now, as the registry gives it without
     /// a download: an index's for a tag of several platforms.
     pub async fn digest(&self, image: &Reference) -> Result<String> {
-        self.client
+        self.client(image.registry())
             .fetch_manifest_digest(image, &self.auth(image.registry()))
             .await
             .with_context(|| format!("fetching the digest of {image}"))
@@ -195,7 +230,7 @@ impl Hub {
     /// and returns it with its digest, and the index's when the reference named one.
     pub async fn resolve(&self, image: &Reference) -> Result<Resolved> {
         let (manifest, digest, index_digest) = self
-            .client
+            .client(image.registry())
             .pull_image_manifest_and_list_digest(image, &self.auth(image.registry()))
             .await
             .with_context(|| format!("fetching the manifest of {image}"))?;
@@ -221,7 +256,7 @@ impl Hub {
             subject.to_string(),
         );
         let index = self
-            .client
+            .client(by_digest.registry())
             .pull_referrers(&by_digest, Some(BUNDLE_ARTIFACT_TYPE))
             .await
             .with_context(|| format!("fetching the signatures of {image}"))?;
@@ -261,7 +296,7 @@ impl Hub {
             .strip_prefix("sha256:")
             .with_context(|| format!("blob digest {} is not sha256", layer.digest))?;
         let sized = self
-            .client
+            .client(image.registry())
             .pull_blob_stream(image, layer)
             .await
             .with_context(|| format!("fetching blob {}", layer.digest))?;
@@ -301,7 +336,7 @@ impl Hub {
             .with_context(|| format!("layer digest {} is not sha256", layer.digest))?
             .to_string();
         let sized = self
-            .client
+            .client(image.registry())
             .pull_blob_stream(image, layer)
             .await
             .with_context(|| format!("fetching layer {}", layer.digest))?;
@@ -535,7 +570,7 @@ impl Hub {
             oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE,
         ];
         let (bytes, fetched_digest) = self
-            .client
+            .client(by_digest.registry())
             .pull_manifest_raw(&by_digest, &self.auth(by_digest.registry()), &accepted)
             .await
             .with_context(|| format!("fetching manifest {digest}"))?;
@@ -546,7 +581,7 @@ impl Hub {
     }
 
     pub async fn blob_exists(&self, image: &Reference, digest: &str) -> Result<bool> {
-        self.client
+        self.client(image.registry())
             .blob_exists(image, digest)
             .await
             .with_context(|| format!("checking blob {digest} on {}", image.registry()))
@@ -580,9 +615,9 @@ impl Hub {
             ),
             |e| oci_client::errors::OciDistributionError::GenericError(Some(e.to_string())),
         );
-        let upload = self
-            .client
-            .push_blob_stream(image, stream, digest, Some(size));
+        let upload =
+            self.client(image.registry())
+                .push_blob_stream(image, stream, digest, Some(size));
         let count = async {
             while let Some(bytes) = counts.recv().await {
                 progress.advance(bytes);
@@ -602,7 +637,7 @@ impl Hub {
         media_type: &str,
     ) -> Result<String> {
         let content_type = media_type.parse().context("invalid manifest media type")?;
-        self.client
+        self.client(image.registry())
             .push_manifest_raw(image, Bytes::copy_from_slice(bytes), content_type)
             .await
             .with_context(|| format!("pushing the manifest of {image}"))
@@ -617,6 +652,17 @@ pub fn short_digest(digest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_ca_file_without_a_certificate_is_said() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("ca.pem");
+        fs::write(&bad, "not a certificate\n").unwrap();
+        let config =
+            crate::config::Config::merge(Default::default(), None, Some(bad.clone())).unwrap();
+        let err = Hub::new(&config).err().unwrap().to_string();
+        assert!(err.contains("no PEM certificate"), "{err}");
+    }
 
     const KALI_DIGEST: &str =
         "sha256:24a0bba642e3ed90b94428a0bf8e9cfaac49d46f4844fc1801a0267a9b9d693a";

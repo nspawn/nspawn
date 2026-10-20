@@ -57,7 +57,9 @@ files, and the machine units call nspawn back through drop-in hooks.
   layers/            root-owned extracted layers (overlay backend)
   layers-foreign/    layers shifted into the foreign UID range (mstack)
   blobs/             compressed blobs, kept for push; .hold-* lists the blobs
-                     of a pull in flight, which the collector leaves alone
+                     of a pull, push or build in flight, which the collector
+                     leaves alone; the service takes every hold left at its
+                     start, since only it makes them
   images/NAME.json   the record: reference, index_digest (the index a tag
                      named at the pull), backend, mode, pid1, started (its
                      first start), fixed_addresses (the networks whose
@@ -88,7 +90,11 @@ files, and the machine units call nspawn back through drop-in hooks.
   networks/NAME.json user-defined networks: interface, subnet, internal,
                      labels
   starting/NAME      a start in progress, until the machine is registered:
-                     nothing removes or replaces the image meanwhile
+                     nothing removes or replaces the image meanwhile; the
+                     service takes every marker left at its start
+  starts-kept-since  when records began to keep their first start (unix
+                     seconds): a record made before it without one tells
+                     nothing of whether it ran, and counts as a machine
   rollback/NAME/     auto-update's copy of a machine's previous record,
                      manifest and upper/work, until its new image is up;
                      its layers and blobs stay meanwhile
@@ -116,6 +122,9 @@ files, and the machine units call nspawn back through drop-in hooks.
 /etc/systemd/system/machines.target.wants/systemd-nspawn@NAME.service
                         --restart always or unless-stopped: started at boot
 /etc/nspawn/auth.json  registry credentials, 0600
+/run/nspawn/service.lock     flock the service holds while it runs: a second one
+                        exits at once, as it would take the first one's builds,
+                        sockets and updates
 /run/nspawn/attach/NAME.sock  where an attached run waits for its machine's
                         systemd-nspawn (0700 directory)
 /run/nspawn/api/NAME.sock     a machine's Docker API, opened by
@@ -138,8 +147,9 @@ publish ports and attach mstack volumes once it runs (`network publish`) and
 release everything however it ends (`network release`), so `machinectl start`,
 enabled units and programs that exit on their own behave the same. When the
 machine has a healthcheck, `network publish` also starts
-`nspawn-health-NAME.service`, a transient unit with `BindsTo=` the machine's
-that runs `nspawn health-run NAME`: the test through `nsenter` at its interval
+`nspawn-health-NAME.service`, a transient unit with `Requisite=` the machine's
+(it never starts the machine, and leaves once the machine is gone) that runs
+`nspawn health-run NAME`: the test through `nsenter` at its interval
 (the start interval during the start period), docker's rule for the verdict
 (a success is healthy, `retries` failures in a row are unhealthy, failures
 during the start period of a machine never healthy do not count), the verdict

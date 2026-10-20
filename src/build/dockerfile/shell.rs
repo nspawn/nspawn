@@ -205,7 +205,13 @@ struct ShellWord<'a> {
     matches: BTreeSet<String>,
     nonmatches: BTreeSet<String>,
     words_buffer: String,
+    /// How many substitutions and quotes the position is inside.
+    depth: usize,
 }
+
+/// How deep substitutions and quotes may nest: each level is a level of the stack,
+/// which the reference grows as far as a goroutine's and nspawn's service cannot.
+const MAX_NESTING: usize = 10_000;
 
 impl<'a> ShellWord<'a> {
     fn new(lex: &'a Lex, word: &str, envs: &'a dyn EnvGetter, capture: bool) -> ShellWord<'a> {
@@ -222,7 +228,21 @@ impl<'a> ShellWord<'a> {
             matches: BTreeSet::new(),
             nonmatches: BTreeSet::new(),
             words_buffer: String::new(),
+            depth: 0,
         }
+    }
+
+    /// Runs `f` a level deeper, refused past the limit.
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, Error>) -> Result<T, Error> {
+        if self.depth >= MAX_NESTING {
+            return Err(Error::new(format!(
+                "substitutions and quotes nest deeper than {MAX_NESTING} levels"
+            )));
+        }
+        self.depth += 1;
+        let out = f(self);
+        self.depth -= 1;
+        out
     }
 
     fn peek(&self) -> Option<char> {
@@ -246,7 +266,7 @@ impl<'a> ShellWord<'a> {
     ) -> Result<(String, Vec<String>), Error> {
         let saved = self.raw_escapes;
         self.raw_escapes = raw_escapes;
-        let out = self.process_stop_on_inner(stop);
+        let out = self.nested(|w| w.process_stop_on_inner(stop));
         self.raw_escapes = saved;
         out
     }
@@ -335,6 +355,10 @@ impl<'a> ShellWord<'a> {
     }
 
     fn process_double_quote(&mut self) -> Result<String, Error> {
+        self.nested(Self::process_double_quote_here)
+    }
+
+    fn process_double_quote_here(&mut self) -> Result<String, Error> {
         // Variables expand; the escape token only escapes ", $ and itself.
         let mut result = String::new();
         let escape = self.lex.escape_token;
@@ -695,8 +719,11 @@ impl ShellPattern {
     fn first_ends(&self, text: &[char]) -> Vec<Option<usize>> {
         let n = text.len();
         let mut row: Vec<Option<usize>> = (0..=n).map(Some).collect();
+        // Two rows for the whole pattern: one per token would be a value's worth of
+        // memory per character of the pattern.
+        let mut cur: Vec<Option<usize>> = vec![None; n + 1];
         for tok in self.tokens.iter().rev() {
-            let mut cur = vec![None; n + 1];
+            cur.fill(None);
             match tok {
                 PatternToken::Literal(c) => {
                     for t in 0..n {
@@ -728,7 +755,11 @@ impl ShellPattern {
                     }
                 }
             }
-            row = cur;
+            std::mem::swap(&mut row, &mut cur);
+            // Matching nowhere, the tokens before cannot match either.
+            if row.iter().all(Option::is_none) {
+                break;
+            }
         }
         row
     }
@@ -899,6 +930,29 @@ mod tests {
 
     fn set(items: &[&str]) -> BTreeSet<String> {
         items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn nesting_past_the_limit_is_an_error_not_an_overflow() {
+        let lex = Lex::new('\\');
+        let env = envs_from_map(&[]);
+        let nest = |n: usize| format!("{}x{}", "${a:-".repeat(n), "}".repeat(n));
+        assert_eq!(lex.process_word(&nest(100), &env).unwrap().0, "x");
+        // On the stack the service gives it, as the build does.
+        crate::build::deep(|| {
+            assert_eq!(
+                lex.process_word(&nest(MAX_NESTING - 1), &env).unwrap().0,
+                "x"
+            );
+            let err = lex.process_word(&nest(MAX_NESTING + 1), &env).unwrap_err();
+            assert!(err.to_string().contains("nest deeper"), "{err}");
+            let quoted = format!(
+                "{}x{}",
+                "\"${a:-".repeat(MAX_NESTING),
+                "}\"".repeat(MAX_NESTING)
+            );
+            assert!(lex.process_word(&quoted, &env).is_err());
+        });
     }
 
     #[test]

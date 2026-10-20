@@ -21,8 +21,15 @@ use nix::unistd::{fork, ForkResult};
 const MOVE_MOUNT_T_SYMLINKS: libc::c_uint = 0x10;
 
 /// Mounts `source` at `target` inside the running machine whose leader is `leader`, with
-/// the machine's root owning it.
-pub fn mount_into_machine(leader: u32, source: &Path, target: &str, read_only: bool) -> Result<()> {
+/// the machine's root owning it. `alive` is a pidfd of the leader: the namespaces opened
+/// by its PID are its own only while it still runs.
+pub fn mount_into_machine(
+    leader: u32,
+    alive: &OwnedFd,
+    source: &Path,
+    target: &str,
+    read_only: bool,
+) -> Result<()> {
     let c_source = CString::new(source.as_os_str().as_bytes())?;
     // A detached, recursive copy of the source tree.
     let flags =
@@ -90,6 +97,9 @@ pub fn mount_into_machine(leader: u32, source: &Path, target: &str, read_only: b
     }
     let mntns = File::open(format!("/proc/{leader}/ns/mnt"))
         .with_context(|| format!("opening the mount namespace of PID {leader}"))?;
+    if crate::nsenter::pidfd_signal(alive, 0).is_err() {
+        bail!("the machine's leader (PID {leader}) went while its volumes were attached");
+    }
     let c_target = CString::new(target)?;
     // Two helpers, since setns() into a mount namespace needs a single-threaded process:
     // one becomes the machine's root to create the mount point (the host's uid 0 is not

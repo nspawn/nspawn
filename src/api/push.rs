@@ -50,6 +50,18 @@ pub async fn push(ctx: &Context, request: &PushRequest, report: Report<'_>) -> R
     })?;
     let manifest: OciImageManifest = serde_json::from_slice(&manifest_bytes)
         .with_context(|| format!("parsing the stored manifest of {}", record.name))?;
+    let digests: Vec<String> = manifest
+        .layers
+        .iter()
+        .chain(std::iter::once(&manifest.config))
+        .map(|d| d.digest.clone())
+        .collect();
+    // Held until the manifest is up: an rm or a prune meanwhile must not take the blobs
+    // still to be uploaded.
+    let _hold = {
+        let _still = crate::store::holds_still();
+        store.hold_blobs(&digests)?
+    };
     for descriptor in manifest
         .layers
         .iter()

@@ -104,10 +104,18 @@ impl Drop for Busy {
 /// serves forever.
 pub async fn run(config: Config, idle_exit: Option<Duration>) -> Result<()> {
     require_root("daemon")?;
+    // One service at a time, before anything is swept: a second one would take away
+    // the first one's builds, sockets and updates, and its bus name.
+    let _alone = alone()?;
     let state = Arc::new(State::new(Context::new(config)));
     if let Err(e) = state.ctx.store.protect() {
         eprintln!("warning: {e:#}");
     }
+    if let Err(e) = state.ctx.store.keep_starts() {
+        eprintln!("warning: {e:#}");
+    }
+    state.ctx.store.forget_starts();
+    state.ctx.store.forget_holds();
     for warning in crate::verify::check_configuration(&state.ctx.config) {
         eprintln!("warning: {warning}");
     }
@@ -146,7 +154,7 @@ pub async fn run(config: Config, idle_exit: Option<Duration>) -> Result<()> {
     // The name comes last: nobody can call before it exists, and by then the objects
     // have their connection.
     connection
-        .request_name(BUS_NAME)
+        .request_name_with_flags(BUS_NAME, zbus::fdo::RequestNameFlags::DoNotQueue.into())
         .await
         .with_context(|| format!("claiming {BUS_NAME} on the system bus"))?;
     tokio::spawn(relay_machine_signals(state.clone()));
@@ -163,6 +171,18 @@ pub async fn run(config: Config, idle_exit: Option<Duration>) -> Result<()> {
     // the next client calls.
     drop(connection);
     Ok(())
+}
+
+/// The lock of the one service, held while it lives.
+fn alone() -> Result<nix::fcntl::Flock<std::fs::File>> {
+    let dir = std::path::Path::new("/run/nspawn");
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join("service.lock");
+    let file =
+        std::fs::File::create(&path).with_context(|| format!("opening {}", path.display()))?;
+    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock).map_err(|_| {
+        anyhow::anyhow!("another nspawn service runs already (see systemctl status nspawn)")
+    })
 }
 
 /// machined announces every machine; only the ones nspawn installed are relayed, so that

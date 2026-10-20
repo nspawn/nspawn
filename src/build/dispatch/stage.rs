@@ -268,7 +268,9 @@ fn check_signal(raw: &str) -> Result<(), Error> {
         name.strip_prefix(prefix).is_some_and(|rest| {
             rest.is_empty()
                 || rest.strip_prefix(sign).is_some_and(|n| {
+                    // Digits alone: Rust's parse would take a second sign (RTMIN++5).
                     !n.starts_with('0')
+                        && n.bytes().all(|b| b.is_ascii_digit())
                         && n.parse::<u32>()
                             .is_ok_and(|n| (1..=if sign == '+' { 15 } else { 14 }).contains(&n))
                 })

@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use tokio::io::AsyncBufReadExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{line, note, Context, Report};
@@ -22,8 +21,14 @@ use crate::oci::Mode;
 use crate::reference::ImageRef;
 use crate::store::{now_unix, ImageRecord, Ownership};
 
-/// The names of the network namespaces of builds.
-const NETNS_PREFIX: &str = "build_";
+/// The names of the network namespaces of builds: a machine's name never starts with a
+/// dot, so none is taken for one.
+const NETNS_PREFIX: &str = ".build-";
+
+/// The network namespace of the build `id`.
+fn netns_of(id: &str) -> String {
+    format!("{NETNS_PREFIX}{}", short(&cache::key(&[id.as_bytes()])))
+}
 
 /// The media type of the layers a build makes.
 pub const LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
@@ -117,7 +122,7 @@ const HOST_NETWORK_REFUSED: &str =
     "network.host is not allowed: --allow network.host lets a step use it";
 
 /// In the work directory of a Dockerfile build, for the sweep at the service's start.
-const MARKER: &str = ".nspawn-dockerfile-build";
+pub(crate) const MARKER: &str = ".nspawn-dockerfile-build";
 
 fn timestamp_now() -> String {
     let nanos = std::time::SystemTime::now()
@@ -180,7 +185,18 @@ impl<'a> Builder<'a> {
         url: &str,
         checksum: Option<&str>,
     ) -> Result<(PathBuf, String, String)> {
+        // Each ADD checks its own --checksum, the URL fetched before included.
+        let check = |found: &(PathBuf, String, String)| -> Result<()> {
+            match checksum {
+                Some(checksum) if found.2 != checksum => bail!(
+                    "digest mismatch for {url}: expected {checksum}, got {}",
+                    found.2
+                ),
+                _ => Ok(()),
+            }
+        };
         if let Some(found) = self.downloads.get(url) {
+            check(found)?;
             return Ok(found.clone());
         }
         let dir = self.work.join(format!("url-{}", self.downloads.len()));
@@ -188,16 +204,9 @@ impl<'a> Builder<'a> {
             fetched = fetch_url(url, &dir) => fetched?,
             () = self.cancel.cancelled() => bail!(CANCELLED),
         };
-        if let Some(checksum) = checksum {
-            if fetched.1 != checksum {
-                bail!(
-                    "digest mismatch for {url}: expected {checksum}, got {}",
-                    fetched.1
-                );
-            }
-        }
         let found = (dir, fetched.0, fetched.1);
         self.downloads.insert(url.to_string(), found.clone());
+        check(&found)?;
         Ok(found)
     }
 
@@ -261,8 +270,15 @@ impl<'a> Builder<'a> {
 
     async fn build(&mut self) -> Result<Built> {
         let req = self.req;
-        let prepared =
-            crate::build::dispatch::prepare(&req.dockerfile, &req.options, &self.platform)?;
+        // The parse and the expansions go a level down the stack per level of nesting,
+        // and take as long as a Dockerfile makes them: the runtime's other tasks go on
+        // meanwhile.
+        let platform = self.platform.clone();
+        let prepared = tokio::task::block_in_place(|| {
+            crate::build::deep(|| {
+                crate::build::dispatch::prepare(&req.dockerfile, &req.options, &platform)
+            })
+        })?;
         for &index in &prepared.order {
             let info = prepared.stages[index].clone();
             let state = match &info.base {
@@ -284,13 +300,17 @@ impl<'a> Builder<'a> {
             };
             let mut settings = state.config.clone();
             settings.history.clear();
-            let dispatched = crate::build::dispatch::dispatch(
-                &prepared,
-                index,
-                &settings,
-                &req.options,
-                &self.platform,
-            )?;
+            let dispatched = tokio::task::block_in_place(|| {
+                crate::build::deep(|| {
+                    crate::build::dispatch::dispatch(
+                        &prepared,
+                        index,
+                        &settings,
+                        &req.options,
+                        &platform,
+                    )
+                })
+            })?;
             let label = if info.name.is_empty() {
                 format!("stage-{index}")
             } else {
@@ -404,14 +424,19 @@ impl<'a> Builder<'a> {
             state
                 .config
                 .add_layer(entry.diff_id.clone(), step.created_by.clone(), &created);
-            state.key = key;
+            // What follows chains on what the step made, not on what it was asked: a step
+            // that ran again and made something else is no cache hit for the ones after it.
+            state.key = cache::key(&[key.as_bytes(), entry.diff_id.as_bytes()]);
         }
         let history = std::mem::take(&mut state.config.history);
         let rootfs = std::mem::take(&mut state.config.rootfs);
+        // The base image's author stays unless MAINTAINER names another, as BuildKit
+        // keeps it.
+        let base_author = state.config.author.take();
         state.config = dispatched.config.clone();
         state.config.history = history;
         state.config.rootfs = rootfs;
-        state.config.author.clone_from(&dispatched.author);
+        state.config.author = dispatched.author.clone().or(base_author);
         Ok(state)
     }
 
@@ -458,8 +483,12 @@ impl<'a> Builder<'a> {
         let from = |from: &From, paths: &[String], parts: &mut Vec<String>| -> Result<()> {
             match from {
                 From::Context => {
+                    // A large context takes a while to hash: the runtime's other tasks go
+                    // on meanwhile.
                     for path in paths {
-                        parts.push(content_hash(&self.req.context, path)?);
+                        parts.push(tokio::task::block_in_place(|| {
+                            content_hash(&self.req.context, path)
+                        })?);
                     }
                 }
                 From::Stage(i) => parts.push(
@@ -528,13 +557,17 @@ impl<'a> Builder<'a> {
         let store = &ctx.store;
         let image = ImageRef::docker(reference)?;
         let wanted = image.to_string();
+        // `build -t NAME` records NAME under the configured registry: an image built
+        // here is taken by that name too, as docker takes its own tags, but nothing
+        // pulled from that registry stands in for a Docker Hub image.
+        let built = ImageRef::parse(reference, &ctx.config.registry)
+            .map(|r| r.to_string())
+            .ok()
+            .filter(|b| *b != wanted);
         let local = if self.req.pull {
             None
         } else {
-            store
-                .list_images()?
-                .into_iter()
-                .find(|r| r.reference == wanted && r.origin != "create")
+            local_base(&store.list_images()?, &wanted, built.as_deref()).cloned()
         };
         let (manifest_bytes, manifest_digest) = match local {
             Some(record) => {
@@ -767,21 +800,18 @@ impl<'a> Builder<'a> {
         let ctx = self.ctx;
         let store = &ctx.store;
         let sd = ctx.sd().await?;
-        let all = crate::api::network::all(store, &ctx.config)?;
-        let net = all
-            .iter()
-            .find(|n| n.name == crate::bridge::DEFAULT_NETWORK)
-            .cloned()
-            .context("no default network")?;
-        crate::bridge::up(&net, &all, sd, self.report).await?;
-        // An underscore keeps it apart from the namespaces of machines, whose names
-        // have none.
-        let name = format!(
-            "{NETNS_PREFIX}{}",
-            short(&cache::key(&[self.id.as_bytes()]))
-        );
-        let addr = {
+        let name = netns_of(&self.id);
+        // Under the lock, as every start brings its networks up: the bridge is made
+        // once, and the firewall table written from the networks as they are.
+        let (net, addr) = {
             let _lock = store.lock().await?;
+            let all = crate::api::network::all(store, &ctx.config)?;
+            let net = all
+                .iter()
+                .find(|n| n.name == crate::bridge::DEFAULT_NETWORK)
+                .cloned()
+                .context("no default network")?;
+            crate::bridge::up(&net, &all, sd, self.report).await?;
             let mut used: Vec<std::net::Ipv4Addr> = store
                 .list_images_strict()?
                 .iter()
@@ -791,7 +821,7 @@ impl<'a> Builder<'a> {
             let addr = net.subnet.allocate(&used)?;
             std::fs::write(self.work.join("address"), format!("{} {addr}\n", net.name))
                 .context("reserving the build's address")?;
-            addr
+            (net, addr)
         };
         crate::bridge::create_netns(
             &[(&net, addr)],
@@ -809,7 +839,22 @@ impl<'a> Builder<'a> {
         let mut text = String::from(
             "127.0.0.1\tlocalhost buildkitsandbox\n::1\tlocalhost ip6-localhost ip6-loopback\n",
         );
+        // host-gateway is the host as the build's network reaches it: the gateway of the
+        // default network, which the host has on its bridge whatever the step's network.
+        let gateway = || -> Result<String> {
+            let all = crate::api::network::all(&self.ctx.store, &self.ctx.config)?;
+            let net = all
+                .iter()
+                .find(|n| n.name == crate::bridge::DEFAULT_NETWORK)
+                .context("no default network")?;
+            Ok(net.subnet.gateway().to_string())
+        };
         for (host, ip) in &self.req.add_hosts {
+            let ip = if ip == "host-gateway" {
+                gateway()?
+            } else {
+                ip.clone()
+            };
             text.push_str(&format!("{ip}\t{host}\n"));
         }
         std::fs::write(&hosts, text).context("writing the build's hosts file")?;
@@ -831,6 +876,7 @@ impl<'a> Builder<'a> {
         let mut secret_env: Vec<(String, Vec<u8>)> = Vec::new();
         let mut targets: Vec<String> = Vec::new();
         let mut locks = Vec::new();
+        let mut locked = std::collections::HashSet::new();
         for (i, mount) in run.mounts.iter().enumerate() {
             match mount {
                 RunMount::Bind {
@@ -882,30 +928,62 @@ impl<'a> Builder<'a> {
                         .join("mounts")
                         .join(short(&cache::key(&[id.as_bytes()])));
                     if !cache_dir.exists() {
-                        std::fs::create_dir_all(&cache_dir)?;
-                        if let Some((f, source)) = from {
-                            let src_root = self.source_root(f).await?;
-                            copy::docopy(
-                                &src_root,
-                                &cache_dir,
-                                &copy::CopyAction {
-                                    src: source.clone(),
-                                    dest: "/".to_string(),
-                                    follow_symlink: true,
-                                    dir_copy_contents: true,
-                                    create_dest_path: true,
-                                    ..Default::default()
-                                },
+                        // Made beside its name and renamed into place once seeded: a seed
+                        // cut short is made again by the next build.
+                        let staged = cache_dir
+                            .with_file_name(format!(".new-{}", crate::store::unique_suffix()));
+                        std::fs::create_dir_all(&staged)?;
+                        let seeded: Result<()> = async {
+                            if let Some((f, source)) = from {
+                                let src_root = self.source_root(f).await?;
+                                copy::docopy(
+                                    &src_root,
+                                    &staged,
+                                    &copy::CopyAction {
+                                        src: source.clone(),
+                                        dest: "/".to_string(),
+                                        follow_symlink: true,
+                                        dir_copy_contents: true,
+                                        create_dest_path: true,
+                                        ..Default::default()
+                                    },
+                                )?;
+                            }
+                            std::fs::set_permissions(
+                                &staged,
+                                std::fs::Permissions::from_mode(*mode),
                             )?;
+                            std::os::unix::fs::chown(&staged, Some(*uid), Some(*gid))?;
+                            Ok(())
                         }
-                        std::fs::set_permissions(
-                            &cache_dir,
-                            std::fs::Permissions::from_mode(*mode),
-                        )?;
-                        std::os::unix::fs::chown(&cache_dir, Some(*uid), Some(*gid))?;
+                        .await;
+                        // Another build may have made it meanwhile: its copy stays.
+                        if seeded.is_err() || std::fs::rename(&staged, &cache_dir).is_err() {
+                            let _ = std::fs::remove_dir_all(&staged);
+                        }
+                        seeded?;
                     }
-                    if sharing == "locked" {
-                        locks.push(lock_dir(&cache_dir)?);
+                    // Its last use, which builder prune goes by: nothing inside need
+                    // change for it.
+                    let now = nix::sys::time::TimeSpec::UTIME_NOW;
+                    let _ = nix::sys::stat::utimensat(
+                        nix::fcntl::AT_FDCWD,
+                        &cache_dir,
+                        &now,
+                        &now,
+                        nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+                    );
+                    // Waited for off the runtime's threads, and once per directory: a
+                    // second lock of the same one would wait for itself.
+                    if sharing == "locked" && locked.insert(cache_dir.clone()) {
+                        let dir = cache_dir.clone();
+                        let lock = tokio::select! {
+                            lock = tokio::task::spawn_blocking(move || lock_dir(&dir)) => {
+                                lock.context("locking a cache mount")??
+                            }
+                            () = self.cancel.cancelled() => bail!(CANCELLED),
+                        };
+                        locks.push(lock);
                     }
                     targets.push(target.clone());
                     mounts.push(sandbox::Mount::Bind {
@@ -960,12 +1038,13 @@ impl<'a> Builder<'a> {
         if let Some(script) = &run.script {
             let scripts = dir.join("pipes");
             std::fs::create_dir_all(&scripts)?;
-            let file = scripts.join(&script.name);
+            let name = heredoc_file(&script.name)?;
+            let file = scripts.join(&name);
             std::fs::write(&file, &script.data)?;
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))?;
             mounts.push(sandbox::Mount::Bind {
                 source: file,
-                target: format!("/dev/pipes/{}", script.name),
+                target: format!("/dev/pipes/{name}"),
                 read_only: true,
             });
         }
@@ -1053,10 +1132,25 @@ impl<'a> Builder<'a> {
         let stdout = child.stdout.take().context("no output of the step")?;
         let stderr = child.stderr.take().context("no output of the step")?;
         let report = self.report;
-        let mut out = tokio::io::BufReader::new(stdout).lines();
-        let mut err = tokio::io::BufReader::new(stderr).lines();
-        let (mut out_open, mut err_open) = (true, true);
-        while out_open || err_open {
+        // Each stream read to its end by a task of its own, as bytes: a line that is no
+        // UTF-8 is still a line, and a stream nobody reads would hold the step forever
+        // once its pipe filled.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let readers: [Box<dyn tokio::io::AsyncRead + Send + Unpin>; 2] =
+            [Box::new(stdout), Box::new(stderr)];
+        for stream in readers {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut reader = tokio::io::BufReader::new(stream);
+                while let Ok(Some(text)) = step_line(&mut reader).await {
+                    if tx.send(text).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        loop {
             tokio::select! {
                 () = self.cancel.cancelled() => {
                     // The step's processes end with systemd-nspawn, the init of their
@@ -1064,13 +1158,9 @@ impl<'a> Builder<'a> {
                     let _ = child.kill().await;
                     bail!(CANCELLED);
                 }
-                l = out.next_line(), if out_open => match l {
-                    Ok(Some(text)) => line(report, format!("#{n} {:.3} {text}", started.elapsed().as_secs_f64())),
-                    _ => out_open = false,
-                },
-                l = err.next_line(), if err_open => match l {
-                    Ok(Some(text)) => line(report, format!("#{n} {:.3} {text}", started.elapsed().as_secs_f64())),
-                    _ => err_open = false,
+                text = rx.recv() => match text {
+                    Some(text) => line(report, format!("#{n} {:.3} {text}", started.elapsed().as_secs_f64())),
+                    None => break,
                 },
             }
         }
@@ -1096,29 +1186,27 @@ impl<'a> Builder<'a> {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let owner = c.chown.as_ref().map(|chown| resolve_chown(merged, chown));
         let chmod = c.chmod.as_deref().map(copy::parse_chmod).transpose()?;
-        let mut sources: Vec<(PathBuf, String)> = Vec::new();
-        if !c.inline.is_empty() {
-            let inline = dir.join("inline");
+        // Each source with whether it is a heredoc: those are taken by their name as it
+        // is, never as a pattern or an archive.
+        let mut sources: Vec<(PathBuf, String, bool)> = Vec::new();
+        for (i, file) in c.inline.iter().enumerate() {
+            let inline = dir.join(format!("inline-{i}"));
             std::fs::create_dir_all(&inline)?;
-            for file in &c.inline {
-                std::fs::write(inline.join(&file.name), &file.data)?;
-                std::fs::set_permissions(
-                    inline.join(&file.name),
-                    std::fs::Permissions::from_mode(0o644),
-                )?;
-                sources.push((inline.clone(), file.name.clone()));
-            }
+            let name = heredoc_file(&file.name)?;
+            std::fs::write(inline.join(&name), &file.data)?;
+            std::fs::set_permissions(inline.join(&name), std::fs::Permissions::from_mode(0o644))?;
+            sources.push((inline, name, true));
         }
         for source in &c.sources {
             if c.add && is_url(source) {
                 let (fetched, name, _) = self.download(source, c.checksum.as_deref()).await?;
-                sources.push((fetched, name));
+                sources.push((fetched, name, false));
                 continue;
             }
             if c.add && source.contains("://") {
                 bail!("ADD of {source}: only local files and http or https URLs are taken");
             }
-            sources.push((self.source_root(&c.from).await?, source.clone()));
+            sources.push((self.source_root(&c.from).await?, source.clone(), false));
         }
         // A URL is copied as it came unless --unpack says otherwise, a local archive
         // unpacked unless --unpack=false says so.
@@ -1129,18 +1217,20 @@ impl<'a> Builder<'a> {
             }
             unpack_archive(r, &dir)
         };
-        for (src_root, source) in &sources {
-            let src = copy::copy_source(source, c.parents);
+        for (src_root, source, inline) in &sources {
+            let src = copy::copy_source(source, c.parents && !inline);
             let mut action = copy::CopyAction::for_instruction(&src, &c.dest);
+            action.allow_wildcard &= !inline;
             action.owner = owner;
             if let Some(chmod) = chmod.clone() {
                 action.set_chmod(chmod);
             }
             action.exclude_patterns.clone_from(&c.exclude);
-            if c.add {
+            if c.add && !inline {
                 action.unpack = Some(&unpack);
             }
-            copy::docopy(src_root, merged, &action)?;
+            // Off the runtime's worker while it copies, which takes as long as the files.
+            tokio::task::block_in_place(|| copy::docopy(src_root, merged, &action))?;
         }
         Ok(())
     }
@@ -1171,50 +1261,32 @@ impl<'a> Builder<'a> {
             serde_json::from_slice(&manifest_bytes).context("the image's manifest")?;
         let mut names = Vec::new();
         let sd = ctx.sd().await?;
-        for tag in &self.req.tags {
-            let image = ImageRef::parse(tag, &ctx.config.registry)?;
-            if image.digest.is_some() {
-                bail!("a build tag cannot carry a digest: {tag}");
-            }
-            let name = image.local_name();
-            crate::reference::validate_machine_name(&name)?;
-            let reference = image.to_string();
-            let choice = if self.req.backend == BackendChoice::Auto {
-                ctx.config.backend
-            } else {
-                self.req.backend
-            };
-            let backend = Backend::choose(choice, sd).await?;
-            let _lock = store.lock().await?;
-            // A tag built again replaces the image of that reference it built or pulled
-            // before, as long as nothing ran from it: a machine goes only with --force.
+        let tags = tag_names(&self.req.tags, &ctx.config.registry)?;
+        // Every name is looked at before one is replaced: a refused tag leaves the others
+        // as they were. What changes between the look and the install is said by name.
+        for (name, reference) in &tags {
             let rebuilt = store
-                .load_image(&name)?
-                .is_some_and(|r| replaced_by_build(store, &r, &reference));
-            crate::install::ensure_replaceable(store, sd, &name, self.req.force || rebuilt).await?;
-            crate::install::stage_layers(store, backend, &manifest, self.req.mode, &name).await?;
-            crate::install::remove_existing(store, sd, &name, self.report).await?;
-            crate::install::install(
-                store,
-                sd,
-                &ctx.config,
-                backend,
-                crate::install::Install {
-                    name: &name,
-                    reference: &reference,
-                    manifest_bytes: &manifest_bytes,
-                    manifest: &manifest,
-                    manifest_digest: &manifest_digest,
-                    index_digest: None,
-                    origin: "build",
-                    mode: self.req.mode,
-                    signed_by: None,
-                    signed_at: None,
-                },
-                self.report,
-            )
-            .await?;
-            crate::api::events::emit("machine", "build", &name, &[("image", reference.as_str())]);
+                .load_image(name)?
+                .is_some_and(|r| replaced_by_build(store, &r, reference));
+            crate::install::ensure_replaceable(store, sd, name, self.req.force || rebuilt).await?;
+        }
+        for (name, reference) in tags {
+            let installed = self
+                .install_tag(
+                    sd,
+                    &manifest,
+                    &manifest_bytes,
+                    &manifest_digest,
+                    &name,
+                    &reference,
+                )
+                .await;
+            if let Err(e) = installed {
+                if names.is_empty() {
+                    return Err(e);
+                }
+                return Err(e.context(format!("{} installed already", names.join(", "))));
+            }
             names.push(name);
         }
         if names.is_empty() {
@@ -1229,6 +1301,81 @@ impl<'a> Builder<'a> {
             names,
         })
     }
+
+    /// One tag's image installed under the store lock, replacing what had the name.
+    async fn install_tag(
+        &self,
+        sd: &crate::systemd::Systemd,
+        manifest: &oci_client::manifest::OciImageManifest,
+        manifest_bytes: &[u8],
+        manifest_digest: &str,
+        name: &str,
+        reference: &str,
+    ) -> Result<()> {
+        let ctx = self.ctx;
+        let store = &ctx.store;
+        let choice = if self.req.backend == BackendChoice::Auto {
+            ctx.config.backend
+        } else {
+            self.req.backend
+        };
+        let backend = Backend::choose(choice, sd).await?;
+        let _lock = store.lock().await?;
+        // A tag built again replaces the image of that reference it built or pulled
+        // before, as long as nothing ran from it: a machine goes only with --force.
+        let rebuilt = store
+            .load_image(name)?
+            .is_some_and(|r| replaced_by_build(store, &r, reference));
+        crate::install::ensure_replaceable(store, sd, name, self.req.force || rebuilt).await?;
+        crate::install::stage_layers(store, backend, manifest, self.req.mode, name).await?;
+        crate::install::remove_existing(store, sd, name, self.report).await?;
+        store.forget_rollback(name)?;
+        crate::install::install(
+            store,
+            sd,
+            &ctx.config,
+            backend,
+            crate::install::Install {
+                name,
+                reference,
+                manifest_bytes,
+                manifest,
+                manifest_digest,
+                index_digest: None,
+                origin: "build",
+                mode: self.req.mode,
+                signed_by: None,
+                signed_at: None,
+            },
+            self.report,
+        )
+        .await?;
+        crate::api::events::emit("machine", "build", name, &[("image", reference)]);
+        Ok(())
+    }
+}
+
+/// The local name and the reference of each tag, refused before anything is built when
+/// one is no tag docker takes, carries a digest, or names an image another tag names.
+pub fn tag_names(tags: &[String], registry: &str) -> Result<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for tag in tags {
+        let image = ImageRef::parse(tag, registry)?;
+        if image.digest.is_some() {
+            bail!("a build tag cannot carry a digest: {tag}");
+        }
+        let name = image.local_name();
+        crate::reference::validate_machine_name(&name)?;
+        let reference = image.to_string();
+        if let Some((_, other)) = out.iter().find(|(n, _)| *n == name) {
+            if *other == reference {
+                continue;
+            }
+            bail!("the tags {other} and {reference} would both be the local image {name}");
+        }
+        out.push((name, reference));
+    }
+    Ok(out)
 }
 
 /// Whether a build tagged `reference` replaces `record` without --force: an image of
@@ -1399,6 +1546,65 @@ fn is_url_download(src_root: &Path, dir: &Path) -> bool {
         .is_some_and(|r| r.starts_with("url-"))
 }
 
+/// The local record a FROM takes: the image of its reference, or one built here under
+/// the name `build -t` gave it.
+fn local_base<'a>(
+    records: &'a [ImageRecord],
+    wanted: &str,
+    built: Option<&str>,
+) -> Option<&'a ImageRecord> {
+    records
+        .iter()
+        .find(|r| r.reference == wanted && r.origin != "create")
+        .or_else(|| {
+            records
+                .iter()
+                .find(|r| Some(r.reference.as_str()) == built && r.origin == "build")
+        })
+}
+
+/// The longest line of a step's output taken as one; a longer one comes in pieces.
+const STEP_LINE: u64 = 64 * 1024;
+
+/// The next line of a step's output, whatever its bytes, without its newline.
+async fn step_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<String>> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut bytes = Vec::new();
+    if (&mut *reader)
+        .take(STEP_LINE)
+        .read_until(b'\n', &mut bytes)
+        .await?
+        == 0
+    {
+        return Ok(None);
+    }
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// The file a heredoc becomes: its name cleaned against `/`, as the reference makes it in an
+/// empty root, where anything but one plain name has no directory to land in.
+fn heredoc_file(name: &str) -> Result<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in name.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    match parts.as_slice() {
+        [one] => Ok(one.to_string()),
+        _ => bail!("the heredoc {name:?} names no file in an empty root"),
+    }
+}
+
 fn is_url(source: &str) -> bool {
     source.starts_with("http://") || source.starts_with("https://")
 }
@@ -1423,12 +1629,12 @@ async fn fetch_url(url: &str, dir: &Path) -> Result<(String, String)> {
         .with_context(|| format!("fetching {url}"))?
         .error_for_status()
         .with_context(|| format!("fetching {url}"))?;
-    let name = response
-        .url()
-        .path_segments()
-        .and_then(|mut s| s.next_back().map(str::to_string))
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "__unnamed__".to_string());
+    // Named after the URL asked for, decoded, as the reference names it: not after
+    // where a redirect led.
+    let name = crate::build::dispatch::url_file_name(url);
+    if name == ".." {
+        bail!("ADD of {url}: the URL names no file");
+    }
     let path = dir.join(&name);
     let mut file = std::fs::File::options()
         .write(true)
@@ -1561,6 +1767,8 @@ pub async fn build(
     cancel: CancellationToken,
 ) -> Result<Built> {
     crate::api::require_root("build")?;
+    // A tag that cannot be installed is said before the steps run, as docker says it.
+    tag_names(&request.tags, &ctx.config.registry)?;
     ctx.store.init()?;
     let id = format!(
         "{:x}-{}",
@@ -1605,6 +1813,30 @@ pub async fn sweep(ctx: &Context) {
         .map(|d| d.flatten().collect::<Vec<_>>())
         .unwrap_or_default();
     let sd = ctx.sd().await.ok();
+    // The workspace of an mkosi build the service's end cut short: no build runs yet.
+    if let Ok(spaces) =
+        std::fs::read_dir(ctx.config.state_dir.join("cache").join("mkosi-workspace"))
+    {
+        for space in spaces.flatten() {
+            let _ = std::fs::remove_dir_all(space.path());
+        }
+    }
+    // A cache mount a build was seeding when it went.
+    if let Ok(mounts) = std::fs::read_dir(ctx.store.build_cache_dir().join("mounts")) {
+        for mount in mounts.flatten() {
+            if mount.file_name().to_string_lossy().starts_with(".new-") {
+                let _ = std::fs::remove_dir_all(mount.path());
+            }
+        }
+    }
+    // Cache mounts a prune took and had not deleted yet.
+    if let Ok(entries) = std::fs::read_dir(ctx.store.build_cache_dir()) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(".trash-") {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
     if let Ok(blobs) = std::fs::read_dir(ctx.store.blobs_dir()) {
         for blob in blobs.flatten() {
             if blob
@@ -1629,21 +1861,19 @@ pub async fn sweep(ctx: &Context) {
                 let _ = sd.stop_unit(&unit).await;
             }
         }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    if let Ok(namespaces) = std::fs::read_dir("/run/netns") {
-        for ns in namespaces.flatten() {
-            let file = ns.file_name().to_string_lossy().into_owned();
-            if let Some(name) = file
-                .strip_prefix("nspawn-")
-                .filter(|n| n.starts_with(NETNS_PREFIX))
-            {
-                crate::bridge::delete_netns(name);
-                let _ = std::process::Command::new("ip")
-                    .args(["link", "del", &crate::bridge::host_end_name_at(name, 0)])
-                    .output();
-            }
+        // Only the namespace of a build being swept: the build's own cleanup removes
+        // its namespace before its directory.
+        let ns = netns_of(&name["df-".len()..]);
+        if Path::new("/run/netns")
+            .join(format!("nspawn-{ns}"))
+            .exists()
+        {
+            crate::bridge::delete_netns(&ns);
+            let _ = std::process::Command::new("ip")
+                .args(["link", "del", &crate::bridge::host_end_name_at(&ns, 0)])
+                .output();
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -1669,7 +1899,114 @@ fn mounted_below(dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_tag_is_checked_before_the_build() {
+        let tags = |list: &[&str]| {
+            tag_names(
+                &list.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                "hub.example",
+            )
+        };
+        assert_eq!(
+            tags(&["app:1", "app:1", "team/app:2"]).unwrap(),
+            [
+                ("app-1".to_string(), "hub.example/app:1".to_string()),
+                (
+                    "team-app-2".to_string(),
+                    "hub.example/team/app:2".to_string()
+                ),
+            ]
+        );
+        assert!(tags(&["app:1", "App:2"])
+            .unwrap_err()
+            .to_string()
+            .contains("lowercase"));
+        let digest = format!("app@sha256:{}", "a".repeat(64));
+        assert!(tags(&[&digest]).unwrap_err().to_string().contains("digest"));
+        assert!(tags(&["app:1", "other.example/app:1"])
+            .unwrap_err()
+            .to_string()
+            .contains("both be the local image app-1"));
+    }
     use std::io::Write as _;
+
+    #[test]
+    fn from_takes_a_tag_built_here() {
+        let record = |name: &str, reference: &str, origin: &str| -> ImageRecord {
+            serde_json::from_value(serde_json::json!({
+                "name": name, "reference": reference, "manifest_digest": "sha256:a",
+                "layers": [], "backend": "overlay", "created": 1, "origin": origin,
+            }))
+            .unwrap()
+        };
+        let records = [
+            record("base", "hub.nspawn.org/mybase:1", "build"),
+            record("pulled", "hub.nspawn.org/alpine:latest", "pull"),
+        ];
+        let hub = |r: &str| ImageRef::parse(r, "hub.nspawn.org").unwrap().to_string();
+        let found = local_base(
+            &records,
+            "docker.io/library/mybase:1",
+            Some(&hub("mybase:1")),
+        );
+        assert_eq!(found.unwrap().name, "base");
+        // A pull from the configured registry is no stand-in for Docker Hub's image.
+        assert!(local_base(
+            &records,
+            "docker.io/library/alpine:latest",
+            Some(&hub("alpine"))
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn no_machine_has_the_namespace_of_a_build() {
+        let ns = netns_of("1-2");
+        assert_eq!(ns, netns_of("1-2"));
+        assert_ne!(ns, netns_of("1-3"));
+        assert!(crate::reference::validate_machine_name(&ns).is_err());
+        assert!(crate::bridge::host_end_name_at(&ns, 0).len() <= 15);
+    }
+
+    #[tokio::test]
+    async fn step_output_is_read_whatever_its_bytes() {
+        let input: &[u8] = b"ok\n\xff\xfe\nlast";
+        let mut reader = tokio::io::BufReader::new(input);
+        assert_eq!(step_line(&mut reader).await.unwrap().unwrap(), "ok");
+        assert_eq!(
+            step_line(&mut reader).await.unwrap().unwrap(),
+            "\u{FFFD}\u{FFFD}"
+        );
+        assert_eq!(step_line(&mut reader).await.unwrap().unwrap(), "last");
+        assert!(step_line(&mut reader).await.unwrap().is_none());
+        let long = vec![b'x'; STEP_LINE as usize + 10];
+        let mut reader = tokio::io::BufReader::new(&long[..]);
+        assert_eq!(
+            step_line(&mut reader).await.unwrap().unwrap().len(),
+            STEP_LINE as usize
+        );
+        assert_eq!(step_line(&mut reader).await.unwrap().unwrap().len(), 10);
+    }
+
+    #[test]
+    fn a_heredoc_is_one_file_name() {
+        assert_eq!(heredoc_file("EOF").unwrap(), "EOF");
+        assert_eq!(heredoc_file("./run.sh").unwrap(), "run.sh");
+        assert_eq!(heredoc_file("/run.sh").unwrap(), "run.sh");
+        assert_eq!(heredoc_file("../../run.sh").unwrap(), "run.sh");
+        assert_eq!(heredoc_file("a/../b").unwrap(), "b");
+        for name in [
+            "/etc/cron.d/pwn",
+            "../../etc/crontab",
+            "a/b",
+            "..",
+            ".",
+            "/",
+        ] {
+            assert!(heredoc_file(name).is_err(), "{name}");
+        }
+    }
 
     #[test]
     fn a_tag_built_again_replaces_only_an_image_nothing_ran_from() {

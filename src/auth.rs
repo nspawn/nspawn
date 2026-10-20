@@ -214,8 +214,11 @@ pub async fn verify(
     credentials: &Credentials,
     ca_cert: Option<&Path>,
 ) -> Result<bool> {
-    let mut builder =
-        reqwest::Client::builder().user_agent(concat!("nspawn/", env!("CARGO_PKG_VERSION")));
+    // A registry that never answers holds no job for ever.
+    let mut builder = reqwest::Client::builder()
+        .user_agent(concat!("nspawn/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(120));
     if let Some(path) = ca_cert {
         let pem = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         builder = builder.add_root_certificate(reqwest::Certificate::from_pem(&pem)?);

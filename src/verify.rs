@@ -261,7 +261,9 @@ pub async fn check(
     policy: &Policy,
     report: Report<'_>,
 ) -> Result<Option<Signed>> {
-    let mut found = None;
+    // The first subject whose bundles verify; an index's that carry none that do (an
+    // attestation has the same artifact type) leave the manifest's to try.
+    let mut failed = None;
     for subject in resolved
         .index_digest
         .iter()
@@ -282,31 +284,35 @@ pub async fn check(
                 continue;
             }
         };
-        if !bundles.is_empty() {
-            found = Some((subject, bundles));
-            break;
+        if bundles.is_empty() {
+            continue;
+        }
+        match verify_bundles(policy, subject, &bundles) {
+            Ok(verified) => {
+                line(report, verified_line(image, &verified));
+                return Ok(Some(Signed::from_verified(&verified)));
+            }
+            Err(e) => failed = Some(e),
         }
     }
-    let Some((subject, bundles)) = found else {
-        if policy.required {
-            bail!(
-                "{image} ({}) carries no signature on {}; the policy requires one (--no-verify pulls it anyway)",
-                short_digest(&resolved.digest),
-                policy.registry
-            );
-        }
-        note(
-            report,
-            format!(
-                "note: {image} carries no signature; the policy for {} does not require one",
-                policy.registry
-            ),
+    if let Some(e) = failed {
+        return Err(e.context(image.to_string()));
+    }
+    if policy.required {
+        bail!(
+            "{image} ({}) carries no signature on {}; the policy requires one (--no-verify pulls it anyway)",
+            short_digest(&resolved.digest),
+            policy.registry
         );
-        return Ok(None);
-    };
-    let verified = verify_bundles(policy, subject, &bundles).with_context(|| image.to_string())?;
-    line(report, verified_line(image, &verified));
-    Ok(Some(Signed::from_verified(&verified)))
+    }
+    note(
+        report,
+        format!(
+            "note: {image} carries no signature; the policy for {} does not require one",
+            policy.registry
+        ),
+    );
+    Ok(None)
 }
 
 /// The hint cosign writes into a bundle signed with `key`.

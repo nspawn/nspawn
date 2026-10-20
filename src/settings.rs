@@ -280,8 +280,8 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
             } else {
                 "Bind"
             },
-            bind.source.display(),
-            bind.target
+            bind_path(&bind.source.to_string_lossy()),
+            bind_path(&bind.target)
         ));
     }
     if !files.is_empty() {
@@ -292,6 +292,12 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
         }
     }
     out
+}
+
+/// A path of a Bind= line, where systemd-nspawn splits at ':' and reads backslash
+/// escapes: a CDI path names PCI addresses (pci-0000:01:00.0).
+pub fn bind_path(path: &str) -> String {
+    path.replace('\\', "\\\\").replace(':', "\\:")
 }
 
 /// The units mounted into a booted machine so that its boot waits for its volumes:
@@ -349,7 +355,7 @@ pub fn write_hooks(
 fn hook_command(config: &crate::config::Config) -> Result<String> {
     Ok(hook_argv(config)?
         .iter()
-        .map(|arg| quote(arg))
+        .map(|arg| exec_word(arg))
         .collect::<Vec<_>>()
         .join(" "))
 }
@@ -565,6 +571,12 @@ fn unwrapped(argv: &[String]) -> &[String] {
     }
 }
 
+/// A word of an Exec line nspawn writes itself (its binary, its configuration file):
+/// `unit_quote`'s, with `$` doubled too, so that systemd expands no variable in it.
+pub fn exec_word(arg: &str) -> String {
+    unit_quote(arg).replace('$', "$$")
+}
+
 /// One ExecStart= argument: `%` doubled, anything unusual double-quoted with escapes.
 pub fn unit_quote(arg: &str) -> String {
     let plain = !arg.is_empty()
@@ -644,6 +656,13 @@ pub fn check_plain(s: &MachineSettings) -> Result<()> {
         {
             anyhow::bail!(
                 "{what} of {} holds a control character ({value:?}), which the settings file cannot carry",
+                s.name
+            );
+        }
+        // A line that ends in a backslash goes on in the next one, which it would take.
+        if !in_quotes && value.ends_with('\\') {
+            anyhow::bail!(
+                "{what} of {} ends in a backslash ({value:?}), which would join the next line of the settings file",
                 s.name
             );
         }
@@ -733,6 +752,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn bind_paths_keep_their_colons_and_backslashes() {
+        // systemd.nspawn(5): "\:" embeds a colon, and backslashes escape.
+        assert_eq!(
+            bind_path("/dev/dri/by-path/pci-0000:01:00.0-render"),
+            "/dev/dri/by-path/pci-0000\\:01\\:00.0-render"
+        );
+        assert_eq!(bind_path("/srv/a\\b"), "/srv/a\\\\b");
+        assert_eq!(bind_path("/srv/plain"), "/srv/plain");
+    }
 
     #[test]
     fn settings_are_root_s_alone() {
@@ -839,6 +869,11 @@ mod tests {
         assert_eq!(unit_quote("with space"), "\"with space\"");
         assert_eq!(unit_quote("q\"b\\"), "\"q\\\"b\\\\\"");
         assert_eq!(unit_quote(""), "\"\"");
+        assert_eq!(
+            exec_word("/etc/nspawn/lab net%i$X.toml"),
+            "\"/etc/nspawn/lab net%%i$$X.toml\""
+        );
+        assert_eq!(exec_word("/usr/bin/nspawn"), "/usr/bin/nspawn");
     }
 
     #[test]
@@ -1016,6 +1051,16 @@ mod tests {
             ..Tuning::default()
         };
         assert!(!plain(&[], &run, &tuning));
+        // A backslash ending an unquoted value would take the next line, User= among them.
+        let mut bad = run.clone();
+        bad.working_dir = Some("/exploit\\".into());
+        assert!(!plain(&[], &bad, &none));
+        let tuning = Tuning {
+            user: Some("app\\".into()),
+            ..Tuning::default()
+        };
+        assert!(!plain(&[], &run, &tuning));
+        assert!(plain(&["ends\\".into()], &run, &none));
         // A tab in a quoted value is a character like any other.
         let mut tabbed = run.clone();
         tabbed.env = vec!["DEPS=llvm21-dev \t\tclang21".into()];
@@ -1225,6 +1270,7 @@ mod tests {
             stop_signal: Some("SIGQUIT".into()),
             labels: Default::default(),
             exposed_ports: Vec::new(),
+            shell: Vec::new(),
         };
         let app = render(&MachineSettings {
             name: "web",
