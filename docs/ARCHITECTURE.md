@@ -112,7 +112,10 @@ files, and the machine units call nspawn back through drop-in hooks.
   builds/mkosi-ID/   an mkosi build's output, removed at its end unless
                      --keep-output keeps it, and at the service's start
                      while it has the marker an unfinished build leaves
-  cache/build/       the build cache: entries/ (a step's layer by its key),
+  cache/build/       the build cache: entries/ (a step's layer by its key,
+                     with the layers it was made on; keys follow what the
+                     steps are, as BuildKit's do, so a step another build
+                     ran again leaves the cache of the steps after it),
                      bases/ (the base images builds pulled), mounts/ (RUN
                      --mount=type=cache); its layers and blobs stay until
                      `builder prune`

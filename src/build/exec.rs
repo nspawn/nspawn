@@ -80,8 +80,64 @@ struct LayerRef {
 struct State {
     config: Config,
     layers: Vec<LayerRef>,
-    /// The cache key of everything so far.
+    /// The cache key of everything so far: what the steps are, not what they made.
     key: String,
+}
+
+impl State {
+    /// What the stage holds, for the keys of steps that take files from it: its layers'
+    /// contents, as BuildKit keys a copy from a stage by the files it copies.
+    fn made(&self) -> String {
+        let parts: Vec<&[u8]> = self
+            .config
+            .rootfs
+            .diff_ids
+            .iter()
+            .map(|d| d.as_bytes())
+            .collect();
+        cache::key(&parts)
+    }
+
+    /// The stage of a cached step: what that step ran on and made, whatever the steps
+    /// before it make now.
+    fn take(&mut self, stage: &cache::Stage) {
+        self.layers = stage
+            .layers
+            .iter()
+            .map(|l| LayerRef {
+                digest: l.digest.clone(),
+                media_type: l.media_type.clone(),
+                size: l.size,
+            })
+            .collect();
+        self.config.rootfs.diff_ids = stage.layers.iter().map(|l| l.diff_id.clone()).collect();
+        self.config.history.clone_from(&stage.history);
+    }
+
+    /// The stage once a step that ran added its layer, for the step's cache entry.
+    fn add(&mut self, entry: &cache::Entry, created_by: String) -> cache::Stage {
+        self.layers.push(LayerRef {
+            digest: entry.layer.clone(),
+            media_type: LAYER_MEDIA_TYPE.to_string(),
+            size: entry.size,
+        });
+        self.config
+            .add_layer(entry.diff_id.clone(), created_by, &entry.created);
+        cache::Stage {
+            layers: self
+                .layers
+                .iter()
+                .zip(&self.config.rootfs.diff_ids)
+                .map(|(l, diff_id)| cache::StageLayer {
+                    digest: l.digest.clone(),
+                    media_type: l.media_type.clone(),
+                    size: l.size,
+                    diff_id: diff_id.clone(),
+                })
+                .collect(),
+            history: self.config.history.clone(),
+        }
+    }
 }
 
 /// A read-only overlay of an image's layers, for a stage or image a step takes files
@@ -393,43 +449,42 @@ impl<'a> Builder<'a> {
                 // Under the lock, so that a prune does not take it before it is kept.
                 let _lock = self.ctx.store.lock().await?;
                 match self.cache.get(&key) {
-                    Some(entry) if self.ctx.store.has_blob(&entry.layer) => {
-                        self.keep([entry.layer.clone()])?;
-                        Some(entry)
+                    Some(cache::Entry {
+                        stage: Some(stage),
+                        created,
+                        ..
+                    }) if stage
+                        .layers
+                        .iter()
+                        .all(|l| self.ctx.store.has_blob(&l.digest)) =>
+                    {
+                        self.keep(stage.layers.iter().map(|l| l.digest.clone()))?;
+                        Some((stage, created))
                     }
                     _ => None,
                 }
             };
-            let entry = match cached {
-                Some(entry) => {
+            match cached {
+                Some((stage, at)) => {
                     self.say(format!("#{n} CACHED"));
-                    entry
+                    state.take(&stage);
+                    created = at;
                 }
-                _ => {
-                    let entry = self
+                None => {
+                    let mut entry = self
                         .execute(n, &state, action, &step.description)
                         .await
                         .map_err(|e| {
                             self.say(format!("#{n} ERROR: {e:#}"));
                             e
                         })?;
+                    entry.stage = Some(state.add(&entry, step.created_by.clone()));
+                    created.clone_from(&entry.created);
                     self.cache.put(&key, &entry)?;
                     self.say(format!("#{n} DONE {:.1}s", start.elapsed().as_secs_f64()));
-                    entry
                 }
-            };
-            created.clone_from(&entry.created);
-            state.layers.push(LayerRef {
-                digest: entry.layer.clone(),
-                media_type: LAYER_MEDIA_TYPE.to_string(),
-                size: entry.size,
-            });
-            state
-                .config
-                .add_layer(entry.diff_id.clone(), step.created_by.clone(), &created);
-            // What follows chains on what the step made, not on what it was asked: a step
-            // that ran again and made something else is no cache hit for the ones after it.
-            state.key = cache::key(&[key.as_bytes(), entry.diff_id.as_bytes()]);
+            }
+            state.key = key;
         }
         let history = std::mem::take(&mut state.config.history);
         let rootfs = std::mem::take(&mut state.config.rootfs);
@@ -497,7 +552,7 @@ impl<'a> Builder<'a> {
                 From::Stage(i) => parts.push(
                     self.states
                         .get(i)
-                        .map(|s| s.key.clone())
+                        .map(State::made)
                         .with_context(|| format!("stage {i} is not built"))?,
                 ),
                 From::Image(reference) => parts.push(
@@ -743,6 +798,7 @@ impl<'a> Builder<'a> {
             created,
             used: now_unix(),
             description: description.to_string(),
+            stage: None,
         })
     }
 
@@ -1204,7 +1260,7 @@ impl<'a> Builder<'a> {
             From::Stage(i) => self
                 .states
                 .get(i)
-                .map(|s| s.key.clone())
+                .map(State::made)
                 .with_context(|| format!("stage {i} is not built"))?,
             From::Image(reference) => self.base(reference).await?.key,
             From::Scratch => "scratch".to_string(),
@@ -2199,6 +2255,54 @@ mod tests {
         assert!(!mkosi_left(&name, &path));
         let (name, path) = dir("app-1-1792344103-4242.4", Some(MKOSI_MARKER));
         assert!(!mkosi_left(&name, &path));
+    }
+
+    #[test]
+    fn a_cached_step_brings_the_stage_it_was_made_on() {
+        let entry = |layer: &str, created: &str| cache::Entry {
+            layer: layer.into(),
+            diff_id: format!("diff-{layer}"),
+            size: 1,
+            created: created.into(),
+            used: 0,
+            description: String::new(),
+            stage: None,
+        };
+        let base = State {
+            config: Config::scratch(),
+            layers: Vec::new(),
+            key: "base".into(),
+        };
+        // A build: COPY made l1, RUN made l2 on it.
+        let mut first = base.clone();
+        first.add(&entry("l1", "t1"), "COPY".into());
+        let copied = first.made();
+        let run = first.add(&entry("l2", "t2"), "RUN".into());
+        // Another build ran the COPY again and made l1b: a third takes the RUN from the
+        // cache with the l1 it ran on, its history as it was.
+        let mut again = base.clone();
+        again.add(&entry("l1b", "t3"), "COPY".into());
+        assert_ne!(again.made(), copied);
+        again.take(&run);
+        assert_eq!(
+            again
+                .layers
+                .iter()
+                .map(|l| l.digest.as_str())
+                .collect::<Vec<_>>(),
+            ["l1", "l2"]
+        );
+        assert_eq!(again.config.rootfs.diff_ids, ["diff-l1", "diff-l2"]);
+        assert_eq!(
+            again
+                .config
+                .history
+                .iter()
+                .map(|h| h.created.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["t1", "t2"]
+        );
+        assert_eq!(again.config, first.config);
     }
 
     #[test]

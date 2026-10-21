@@ -24,6 +24,27 @@ pub struct Entry {
     /// The stage it was made in, for --no-cache-filter and the listing.
     #[serde(default)]
     pub description: String,
+    /// The stage as the step left it. A build that takes the entry goes on from there,
+    /// though a step before it ran again since and made something else: keys follow
+    /// what the steps are, as BuildKit's do, and an entry without one is taken by no
+    /// build.
+    #[serde(default)]
+    pub stage: Option<Stage>,
+}
+
+/// A stage's layers, bottom first and the step's own last, and its history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Stage {
+    pub layers: Vec<StageLayer>,
+    pub history: Vec<crate::build::image::History>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageLayer {
+    pub digest: String,
+    pub media_type: String,
+    pub size: u64,
+    pub diff_id: String,
 }
 
 /// A base image a build pulled: its config and layers, kept with the cache.
@@ -113,9 +134,20 @@ impl Cache {
         read_all(&self.bases_dir())
     }
 
-    /// The blobs the cache keeps: its layers, and the configs and layers of its bases.
+    /// The blobs the cache keeps: its layers and those of the stages they were made in,
+    /// and the configs and layers of its bases.
     pub fn blobs(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.entries().into_iter().map(|(_, e)| e.layer).collect();
+        let mut out = Vec::new();
+        for (_, entry) in self.entries() {
+            out.push(entry.layer);
+            out.extend(
+                entry
+                    .stage
+                    .into_iter()
+                    .flat_map(|s| s.layers)
+                    .map(|l| l.digest),
+            );
+        }
         for (_, base) in self.bases() {
             out.push(base.config);
             out.extend(base.layers);
@@ -338,6 +370,52 @@ mod tests {
     }
 
     #[test]
+    fn the_layers_a_step_was_made_on_stay_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path());
+        let layer = |d: &str| StageLayer {
+            digest: d.into(),
+            media_type: String::new(),
+            size: 1,
+            diff_id: format!("diff-{d}"),
+        };
+        let entry = |own: &str, stage: Option<Vec<StageLayer>>| Entry {
+            layer: own.into(),
+            diff_id: format!("diff-{own}"),
+            size: 1,
+            created: String::new(),
+            used: 0,
+            description: String::new(),
+            stage: stage.map(|layers| Stage {
+                layers,
+                history: Vec::new(),
+            }),
+        };
+        // The step below ran again and its entry names another layer now: the one this
+        // step was made on stays in the store for it.
+        cache
+            .put(
+                "k2",
+                &entry("l2", Some(vec![layer("base"), layer("l1"), layer("l2")])),
+            )
+            .unwrap();
+        cache
+            .put("k1", &entry("l1b", Some(vec![layer("base"), layer("l1b")])))
+            .unwrap();
+        let mut blobs = cache.blobs();
+        blobs.sort();
+        blobs.dedup();
+        assert_eq!(blobs, ["base", "l1", "l1b", "l2"]);
+        // An entry without a stage reads, and is taken by no build.
+        std::fs::write(
+            dir.path().join("entries").join("sha256-old.json"),
+            r#"{"layer":"l0","diff_id":"d","size":1,"created":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(cache.get("sha256:old").unwrap().stage, None);
+    }
+
+    #[test]
     fn keys_tell_lists_of_parts_apart() {
         assert_ne!(key(&[b"ab", b"c"]), key(&[b"a", b"bc"]));
         assert_eq!(key(&[b"x"]), key(&[b"x"]));
@@ -355,6 +433,7 @@ mod tests {
             created: "2026-10-18T00:00:00.000000000Z".into(),
             used: 0,
             description: "RUN true".into(),
+            stage: None,
         };
         cache.put("sha256:k", &entry).unwrap();
         let got = cache.get("sha256:k").unwrap();

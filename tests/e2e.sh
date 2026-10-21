@@ -97,7 +97,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -4482,6 +4482,24 @@ $NSPAWN rm -f e2e-rv-web e2e-rv-ex e2e-rv-sec e2e-rv-pol e2e-rv-rel >/dev/null 2
 for i in e2e-rv-hl-1 e2e-rv-ctx-1 e2e-rv-url-1; do $NSPAWN images rm $i >/dev/null 2>&1; done
 $NSPAWN secret rm e2e-rv-pw >/dev/null 2>&1
 rm -rf /tmp/e2e-rv
+
+step "build: a step another build ran again leaves this build's steps after it cached"
+# Two Dockerfiles share a step whose result differs each time it runs. After one of them
+# runs it again with --no-cache, the other is still taken whole from the cache, as with
+# BuildKit: what it was made on comes with it.
+d=/tmp/e2e-rv/share && mkdir -p $d
+for n in a b; do
+  printf 'FROM %s\nRUN date +%%s%%N > /stamp\nRUN echo %s-%s > /%s\n' "$rv" "$n" "$nonce" "$n" > $d/Dockerfile.$n
+done
+$NSPAWN build -q -f $d/Dockerfile.a -t e2e-share-a:1 $d >/dev/null 2>&1 || fail "build of the first Dockerfile"
+idb=$($NSPAWN build -q -f $d/Dockerfile.b -t e2e-share-b:1 $d 2>/dev/null) || fail "build of the second Dockerfile"
+stamp=$($NSPAWN run --rm e2e-share-b:1 -- cat /stamp 2>/dev/null)
+$NSPAWN build -q --no-cache -f $d/Dockerfile.a -t e2e-share-a:1 $d >/dev/null 2>&1 || fail "--no-cache build of the first Dockerfile"
+out=$($NSPAWN build --progress plain -f $d/Dockerfile.b -t e2e-share-b:1 $d 2>&1) || fail "build of the second Dockerfile again: $out"
+[ "$(echo "$out" | grep -c CACHED)" = 2 ] || fail "the second Dockerfile was not taken from the cache: $out"
+[ "$($NSPAWN build -q -f $d/Dockerfile.b -t e2e-share-b:1 $d 2>/dev/null)" = "$idb" ] || fail "the second Dockerfile gave another image"
+[ -n "$stamp" ] && [ "$($NSPAWN run --rm e2e-share-b:1 -- cat /stamp 2>/dev/null)" = "$stamp" ] || fail "the second image lost the step it was made on: $stamp"
+$NSPAWN images rm e2e-share-a-1 e2e-share-b-1 >/dev/null 2>&1
 
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"
