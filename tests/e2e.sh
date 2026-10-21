@@ -1648,7 +1648,8 @@ printf '#!/bin/sh\necho e2e-s6-cont-init-%s\n' "$nonce" > $s6dir/10-marker
 chmod 0755 $s6dir/10-marker
 pid1_of() { $NSPAWN exec "$1" -- cat /proc/1/comm </dev/null 2>/dev/null | tr -d '\r'; }
 field_of() { $NSPAWN inspect "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)[0].get('$2'))"; }
-$NSPAWN run -d --name e2e-s6 -e PUID=1234 -e PGID=1234 -v $s6dir:/custom-cont-init.d:ro lscr.io/linuxserver/baseimage-alpine:3.22 >/dev/null || fail "run of a linuxserver image"
+# lscr.io answers 429 now and then when the VMs pull at once; a refused pull makes nothing.
+retry 3 $NSPAWN run -d --name e2e-s6 -e PUID=1234 -e PGID=1234 -v $s6dir:/custom-cont-init.d:ro lscr.io/linuxserver/baseimage-alpine:3.22 >/dev/null || fail "run of a linuxserver image"
 $NSPAWN ps | grep -q "^ *e2e-s6 .* app " || fail "a linuxserver image was not taken for an app: $($NSPAWN ps)"
 grep -q '^ProcessTwo' /etc/systemd/nspawn/e2e-s6.nspawn && fail "an s6-overlay image runs under the stub init"
 grep -q '^KillSignal=SIGTERM$' /etc/systemd/nspawn/e2e-s6.nspawn || fail "a PID 1 program does not get SIGTERM when its unit stops: $(cat /etc/systemd/nspawn/e2e-s6.nspawn)"
@@ -1674,7 +1675,7 @@ $NSPAWN start e2e-s6 --init=false >/dev/null || fail "start --init=false"
 retry 15 bash -c "[ \"\$($NSPAWN exec e2e-s6 -- cat /proc/1/comm </dev/null 2>/dev/null | tr -d '\r')\" = s6-svscan ]" || fail "--init=false did not make s6 PID 1 again"
 $NSPAWN generate e2e-s6 | grep_q -- '--init=false' || fail "generate does not keep --init=false: $($NSPAWN generate e2e-s6)"
 $NSPAWN stop e2e-s6 >/dev/null || fail "stop after --init=false"
-$NSPAWN run -d --name e2e-s6u lscr.io/linuxserver/baseimage-ubuntu:noble >/dev/null || fail "run of the Ubuntu linuxserver base"
+retry 3 $NSPAWN run -d --name e2e-s6u lscr.io/linuxserver/baseimage-ubuntu:noble >/dev/null || fail "run of the Ubuntu linuxserver base"
 retry 15 bash -c "[ \"\$($NSPAWN exec e2e-s6u -- cat /proc/1/comm </dev/null 2>/dev/null | tr -d '\r')\" = s6-svscan ]" || fail "s6-svscan is not PID 1 in the Ubuntu base: $($NSPAWN logs e2e-s6u 2>&1 | tail -5)"
 out=$($NSPAWN stop e2e-s6u 2>&1) || fail "stop of the Ubuntu s6 machine: $out"
 echo "$out" | grep_q "ignored" && fail "s6 of the Ubuntu base did not end on its stop signal: $out"
