@@ -1402,7 +1402,6 @@ fn hook_root(plan: &Plan, root: &Path, nodes_dir: &Path) -> Result<crate::nsente
 /// CDI device nodes, a /proc. What they write to the root stays in the machine; what
 /// they mount goes with their namespace.
 pub async fn run_hooks(plan: &Plan, machine: &HookMachine<'_>) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
     if plan.hooks.is_empty() {
         return Ok(());
     }
@@ -1423,21 +1422,17 @@ pub async fn run_hooks(plan: &Plan, machine: &HookMachine<'_>) -> Result<()> {
         cmd.env_clear()
             .envs(hook.env.iter().filter_map(|v| v.split_once('=')))
             .current_dir(machine.bundle)
-            .stdin(std::process::Stdio::piped())
+            .stdin(filled_pipe(&state)?)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         crate::nsenter::in_hook_root(&mut cmd, root.clone());
-        let mut child = cmd.spawn().with_context(|| {
+        let child = cmd.spawn().with_context(|| {
             format!(
                 "running the {} hook {} of the CDI specs",
                 hook.hook_name, hook.path
             )
         })?;
-        if let Some(mut stdin) = child.stdin.take() {
-            // A hook that does not read its state closes the pipe early.
-            let _ = stdin.write_all(&state).await;
-        }
         // The start holds the store while hooks run: one without a timeout of its own
         // gets the time other starts wait for the store.
         let seconds = hook
@@ -1482,9 +1477,39 @@ pub async fn run_hooks(plan: &Plan, machine: &HookMachine<'_>) -> Result<()> {
     Ok(())
 }
 
+/// A pipe that already holds `bytes` and has no writer left: a hook that ends without
+/// reading its state leaves nothing to write into a closed pipe, which would be SIGPIPE
+/// for the start's hook pass. The state is a few hundred bytes, under the page any pipe
+/// holds.
+fn filled_pipe(bytes: &[u8]) -> Result<std::process::Stdio> {
+    use std::io::Write;
+    let (reader, mut writer) = std::io::pipe().context("creating a pipe for a CDI hook")?;
+    writer
+        .write_all(bytes)
+        .context("writing the state of a CDI hook")?;
+    Ok(reader.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hook_reads_its_state_from_a_pipe_written_before_it_starts() {
+        let state = br#"{"ociVersion":"1.2.0","id":"m"}"#;
+        let out = std::process::Command::new("cat")
+            .stdin(filled_pipe(state).unwrap())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, state);
+        // One that never reads it ends as it would, with nothing written after it.
+        let status = std::process::Command::new("true")
+            .stdin(filled_pipe(state).unwrap())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn a_spec_nested_deeper_than_any_is_refused_on_a_small_stack() {
