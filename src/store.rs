@@ -404,7 +404,7 @@ impl Store {
     /// Root's alone: layers hold setuid programs and device nodes that would work for any
     /// local user reaching them, records hold the machines' environment, volumes and
     /// builds their data.
-    fn private_dirs(&self) -> [PathBuf; 12] {
+    fn private_dirs(&self) -> [PathBuf; 13] {
         [
             self.layers_dir(Ownership::Root),
             self.layers_dir(Ownership::Foreign),
@@ -415,6 +415,7 @@ impl Store {
             self.root.join("builds"),
             self.root.join("cache"),
             self.root.join("starting"),
+            self.root.join("claims"),
             self.networks_dir(),
             self.secrets_dir(),
             self.root.join("rollback"),
@@ -3206,7 +3207,14 @@ mod tests {
         fs::create_dir_all(state.join("layers")).unwrap();
         fs::create_dir_all(state.join("machines/web/upper")).unwrap();
         fs::create_dir_all(state.join("machines/db")).unwrap();
-        for dir in ["layers", "machines", "machines/web", "machines/db"] {
+        fs::create_dir_all(state.join("claims")).unwrap();
+        for dir in [
+            "layers",
+            "machines",
+            "machines/web",
+            "machines/db",
+            "claims",
+        ] {
             fs::set_permissions(state.join(dir), fs::Permissions::from_mode(0o755)).unwrap();
         }
         let store = Store::new(&tmp.path().join("new/machines"), &state);
@@ -3224,6 +3232,7 @@ mod tests {
             "images",
             "manifests",
             "volumes",
+            "claims",
         ] {
             assert_eq!(mode(&state.join(private)), 0o700, "{private}");
         }
