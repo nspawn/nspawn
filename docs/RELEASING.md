@@ -8,22 +8,25 @@ version and the documentation; the AUR packages are the maintainer's.
 ## Before the tag
 
 1. `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and `cargo test`
-   pass on every commit, and `tests/e2e.sh` passes on every host of the matrix
-   (see [HACKING](HACKING.md)): the oldest supported systemd, a host with
-   SELinux enforcing, and one with the mstack backend. It runs against the
-   packages of the last commit that changed what the binary or the packages
-   do (the code, the tests, the unit, bus, polkit and SELinux files, the
-   recipes beyond their version), each built on its distribution (the rpm
-   with `nspawn-selinux`, the deb, the Arch package) and installed there, with
-   `NSPAWN=/usr/bin/nspawn`, and against a registry of our own: the suite logs
-   in and pushes, which a public registry is not for. A commit that only
-   touches documentation, or only the version and the changelogs, as the
-   release commit does, is covered by that run and does not need one of its
-   own.
+   pass on every commit, and `tests/e2e.sh` passes on every host of the matrix:
+   Ubuntu 24.04 (systemd 255, the oldest supported), Fedora 44 (SELinux
+   enforcing) and Arch Linux (systemd 262). The mstack pass needs systemd 261 or a
+   release after 262, which no host of the matrix has.
+
+   The suite runs against the packages of the last commit that changed what the
+   binary or the packages do (the code, the tests, the unit, bus, polkit and
+   SELinux files, the recipes beyond their version). Each package is built on its
+   distribution (the rpm with `nspawn-selinux`, the deb, the Arch package) and
+   installed there, and the suite runs with `NSPAWN=/usr/bin/nspawn` against a
+   private test registry: it logs in and pushes, which a public registry is not
+   for. A commit that only touches documentation, or only the version and the
+   changelogs, as the release commit does, is covered by that run and does not
+   need one of its own.
 2. The documentation in this repository says what the code does. The pages that
    go stale first are the ones that quote paths, flags or defaults: README.md,
-   docs/USAGE.md, docs/ARCHITECTURE.md, docs/DBUS.md and the `--help` texts in
-   `src/cli.rs`.
+   docs/USAGE.md, docs/ARCHITECTURE.md, docs/DBUS.md, docs/HACKING.md, the prose
+   of docs/COMPOSE.md, and the `--help` texts in `src/cli.rs` and
+   `src/compose/cli.rs`.
 3. The website follows, in the same pass. It is a separate repository
    (`github.com/nspawn/nspawn.org`), maintained from here because this is where
    the change was made:
@@ -35,7 +38,9 @@ version and the documentation; the AUR packages are the maintainer's.
    | `docs/getting-started.md` | the packaging, `src/daemon/install.rs`, the requirements |
    | `docs/overview.md` | `src/daemon/`, the polkit actions, the architecture |
    | `docs/images.md`, `docs/machines.md`, `docs/networking.md` | `src/api/`, `src/store.rs`, `src/bridge.rs`, `src/settings.rs` |
-   | `docs/building.md` | `src/api/build.rs` and the mkosi arguments it passes |
+   | `docs/building.md` | `src/build/`, `src/commands/build.rs` and the Dockerfile flags in `src/cli.rs`; `src/api/build.rs` and the mkosi arguments it passes |
+   | `docs/compose.md` | docs/COMPOSE.md, `src/compose/` |
+   | `docs/docker-api.md` | `src/dockerapi/`, `src/api/autoupdate.rs`, `packaging/systemd/` |
 
    Its examples are checked against a real run, not from memory: the tables and
    the lines nspawn prints are easy to get subtly wrong.
@@ -52,7 +57,7 @@ version and the documentation; the AUR packages are the maintainer's.
    `packaging/debian/debian/changelog`, and `pkgver` (with `pkgrel=1`) in
    `packaging/arch/PKGBUILD`. The files under `packaging/arch` are copies of
    the maintainer's AUR recipes (`nspawn`, and `nspawn-git` in its own
-   directory), which are the format; their checksum stays `SKIP` here, since
+   directory), which set the format; their checksum stays `SKIP` here, since
    the tarball of the tag does not exist yet, and the workflow builds with
    `--skipchecksums`.
 6. Commit that as the last commit, subject `Release X.Y.Z`.
