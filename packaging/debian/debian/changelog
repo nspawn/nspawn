@@ -1,3 +1,9 @@
+nspawn (2.0.1-1) unstable; urgency=medium
+
+  * The unit tests pass in a clean build root without /etc/hostname, as pkgctl build makes.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Wed, 21 Oct 2026 04:08:54 -0500
+
 nspawn (2.0.0-1) unstable; urgency=medium
 
   * nspawn compose: the files and commands of docker compose on nspawn's machines; docs/COMPOSE.md lists what is supported.
