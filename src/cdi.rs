@@ -1650,7 +1650,7 @@ containerEdits:
     hostPath: /dev/full
     permissions: rw
   mounts:
-  - hostPath: /etc/hostname
+  - hostPath: LIBCUDA
     containerPath: /usr/lib/libcuda.so.1
     options: [ro, nosuid, nodev, bind]
   hooks:
@@ -1700,7 +1700,11 @@ containerEdits:
     fn specs_are_read_and_resolved() {
         let dir = tempfile::tempdir().unwrap();
         let (etc, run) = (dir.path().join("etc"), dir.path().join("run"));
-        write(&etc, "nvidia.yaml", NVIDIA);
+        // A file of its own: a clean build root has no /etc/hostname or the like.
+        let lib = dir.path().join("libcuda.so.1");
+        std::fs::write(&lib, "").unwrap();
+        let lib = lib.to_str().unwrap();
+        write(&etc, "nvidia.yaml", &NVIDIA.replace("LIBCUDA", lib));
         // Not a spec file: neither .yaml nor .json.
         write(&etc, "notes.yml", "nonsense");
         let registry = Registry::load_from(&[&etc, &run]);
@@ -1736,7 +1740,7 @@ containerEdits:
         assert_eq!(
             plan.mounts,
             [Bind {
-                source: "/etc/hostname".into(),
+                source: lib.into(),
                 target: "/usr/lib/libcuda.so.1".into(),
                 read_only: true,
             }]
