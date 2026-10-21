@@ -920,7 +920,8 @@ fn create_source(
         return Ok(CreateSource::Local(source.to_string()));
     };
     let reference = image.to_string();
-    for spelled in [source, reference.as_str()] {
+    let spellings = machines::local_spellings(source, registry)?;
+    for spelled in std::iter::once(source).chain(spellings.iter().map(String::as_str)) {
         if let Some(found) = machines::Listed::image_of(images, spelled, name) {
             return Ok(CreateSource::Local(found.name.clone()));
         }
@@ -1054,7 +1055,14 @@ mod tests {
                 reference: "nginx:1.27".to_string(),
                 base: "nginx-1.27".to_string()
             },
-            "the hub's nginx is not Docker Hub's"
+            "a machine of Docker Hub's nginx that ran is no image"
+        );
+        // An image of Docker Hub's that compose pulled is taken when the registry's own is
+        // not here.
+        let docker_hub = vec![listed("nginx-1.27", "docker.io/library/nginx:1.27", true)];
+        assert_eq!(
+            create_source(&docker_hub, "nginx:1.27", "machine", "hub.example", false).unwrap(),
+            CreateSource::Local("nginx-1.27".to_string())
         );
         assert_eq!(
             source("fedora:45").unwrap(),

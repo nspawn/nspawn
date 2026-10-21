@@ -44,7 +44,11 @@ the networks, volumes, secrets and configs those use.
   every machine of it is made from that image. `config --resolve-image-digests`
   and `--lock-image-digests` ask each registry for the digest a tag names now
   through nspawn's service, with the credentials of `nspawn login`, where docker
-  compose asks the docker daemon.
+  compose asks the docker daemon. An image the project builds whose name has no
+  registry and no namespace (`app`, or `PROJECT-SERVICE` when it names none) is
+  nspawn's own, under nspawn's configured registry as `nspawn build -t` puts it,
+  so `nspawn run app` takes it; `user/app` stays Docker Hub's, where `build
+  --push` sends it.
 - **Networks, volumes, secrets.** A network of the project is an nspawn network,
   `PROJECT_KEY`, a volume an nspawn volume of the same name. A secret or config
   from a file is bound read-only where the service reads it, as docker binds it;

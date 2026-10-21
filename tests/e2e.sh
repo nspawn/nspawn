@@ -97,7 +97,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -3436,6 +3436,12 @@ $NSPAWN logs $cb-web-1 2>&1 | grep_q from-context || fail "the built service doe
 $NSPAWN logs $cb-web-1 2>&1 | grep_q hello-build || fail "the build args of the service were not given"
 [ "$($NSPAWN inspect -f '{{index .labels "e2e.build"}}' $cb-web)" = yes ] || fail "the build labels are not on the image"
 [ "$($NSPAWN inspect -f '{{index .labels "com.docker.compose.project"}}' $cb-web)" = $cb ] || fail "the image has no project label"
+# An image the project built under a name of its own is nspawn's, under the configured
+# registry: nspawn run takes it by that name, and compose shows the name the file gives.
+[ "$($NSPAWN inspect -f '{{.reference}}' $cb-web)" = "$NSPAWN_REGISTRY/$cb-web:latest" ] || fail "the built image is not under the registry: $($NSPAWN inspect -f '{{.reference}}' $cb-web)"
+[ "$($NSPAWN run --rm --pull never $cb-web -- cat /greeting 2>/dev/null | tr -d '\r')" = hello-build ] || fail "nspawn run does not take the image compose built by its name"
+[ "$($NSPAWN compose -f $work/compose.yaml ps --format '{{.Image}}' web)" = $cb-web ] || fail "compose ps does not show the built image as the project names it: $($NSPAWN compose -f $work/compose.yaml ps --format '{{.Image}}' web)"
+$NSPAWN compose -f $work/compose.yaml images web | grep_q "^$cb-web-1 *$cb-web *latest " || fail "compose images does not show the built image as the project names it: $($NSPAWN compose -f $work/compose.yaml images web)"
 for i in $(seq 1 20); do $NSPAWN logs $cb-tagged-1 2>/dev/null | grep_q inline && break; sleep 1; done
 $NSPAWN logs $cb-tagged-1 2>&1 | grep_q inline || fail "dockerfile_inline was not built"
 created=$($NSPAWN inspect -f '{{.created}}' $cb-web-1)
@@ -4500,6 +4506,20 @@ out=$($NSPAWN build --progress plain -f $d/Dockerfile.b -t e2e-share-b:1 $d 2>&1
 [ "$($NSPAWN build -q -f $d/Dockerfile.b -t e2e-share-b:1 $d 2>/dev/null)" = "$idb" ] || fail "the second Dockerfile gave another image"
 [ -n "$stamp" ] && [ "$($NSPAWN run --rm e2e-share-b:1 -- cat /stamp 2>/dev/null)" = "$stamp" ] || fail "the second image lost the step it was made on: $stamp"
 $NSPAWN images rm e2e-share-a-1 e2e-share-b-1 >/dev/null 2>&1
+
+step "run and create take a local image of a name as docker reads it when the registry's is not here"
+# Which of the two goes first, both being here, the unit tests say: their local names
+# would be the same.
+d=/tmp/e2e-rv/names && mkdir -p $d
+printf 'FROM %s\nRUN echo docker-%s > /which\n' "$rv" "$nonce" > $d/Dockerfile.docker
+$NSPAWN build -q -f $d/Dockerfile.docker -t docker.io/library/e2e-names-$nonce:1 $d >/dev/null 2>&1 || fail "build of the Docker Hub named image"
+[ "$($NSPAWN run --rm --pull never e2e-names-$nonce:1 -- cat /which 2>/dev/null | tr -d '\r')" = docker-$nonce ] || fail "run did not take the local image of Docker Hub's name"
+$NSPAWN create e2e-names-$nonce:1 e2e-names-m >/dev/null 2>&1 || fail "create did not take the local image of Docker Hub's name"
+[ "$($NSPAWN inspect -f '{{.reference}}' e2e-names-m)" = "docker.io/library/e2e-names-$nonce:1" ] || fail "create took another image: $($NSPAWN inspect -f '{{.reference}}' e2e-names-m)"
+$NSPAWN rm -f e2e-names-m >/dev/null 2>&1
+out=$($NSPAWN run --rm --pull never e2e-names-none-$nonce:1 -- true 2>&1) && fail "run --pull never of a name nothing has: $out"
+echo "$out" | grep_q "no local image of $NSPAWN_REGISTRY/e2e-names-none-$nonce:1" || fail "run --pull never of a missing image was not explained: $out"
+for m in $($NSPAWN images ls | awk -v n="e2e-names-$nonce" '$1 ~ n {print $1}'); do $NSPAWN images rm "$m" >/dev/null 2>&1; done
 
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"

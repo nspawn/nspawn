@@ -525,7 +525,7 @@ pub async fn images(
         if named.is_empty() {
             continue;
         }
-        let reference = super::image_reference(named)?;
+        let reference = e.reference(named)?;
         let full = reference.to_string();
         // Once per image, however it is written (redis, redis:latest, docker.io/redis).
         if pulled.contains(&full) {
@@ -590,7 +590,7 @@ pub async fn images(
             if built.contains(&image) {
                 continue;
             }
-            let full = super::image_reference(&image)?.to_string();
+            let full = e.reference(&image)?.to_string();
             let mut policy = policy(service, p.flag, unset);
             if p.force_build {
                 policy = "build".to_string();
@@ -612,7 +612,7 @@ pub async fn images(
             continue;
         }
         let image = super::build::image_of(&project.name, name, service);
-        let full = super::image_reference(&image)?.to_string();
+        let full = e.reference(&image)?.to_string();
         let Some(local_name) = find(&local, &full) else {
             if p.pull_only || (p.ignore_failures && !named.is_empty()) {
                 continue;

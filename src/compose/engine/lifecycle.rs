@@ -357,7 +357,7 @@ async fn images_down(e: &Engine<'_>, rmi: &str, orphans: bool) -> Result<()> {
         .map(|i| client::string(i, "name"))
         .collect();
     let find = |image: &str| -> Vec<String> {
-        match super::image_reference(image) {
+        match e.reference(image) {
             Ok(reference) => records_of(&records, &ran, &reference.to_string()),
             Err(_) => Vec::new(),
         }

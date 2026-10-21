@@ -146,7 +146,7 @@ pub async fn build(
         }
         inline => (inline.as_bytes().to_vec(), None),
     };
-    let reference = super::image_reference(image)?;
+    let reference = super::built_reference(image, &e.registry)?;
     let mut tags = vec![reference.to_string()];
     for tag in build
         .get("tags")
@@ -155,7 +155,7 @@ pub async fn build(
         .unwrap_or(&[])
     {
         if let Some(tag) = tag.as_str() {
-            tags.push(super::image_reference(tag)?.to_string());
+            tags.push(super::built_reference(tag, &e.registry)?.to_string());
         }
     }
     let mut labels: Vec<String> = build
@@ -322,7 +322,7 @@ pub async fn run(e: &mut Engine<'_>, a: &crate::compose::cli::BuildArgs) -> Resu
                     .map(str::to_string),
             );
             for tag in tags {
-                let local = super::image_reference(&tag)?.local_name();
+                let local = super::built_reference(&tag, &e.registry)?.local_name();
                 let manager = &e.client.manager;
                 e.client
                     .run_job_silent(|| manager.push_image(&local, Options::new()), a.quiet)

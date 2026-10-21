@@ -19,7 +19,10 @@ guides: [getting started](https://nspawn.org/docs/getting-started/),
 
 `run` is `pull` (or `create` from a local image with the same reference, as docker's
 `--pull missing` has it) followed by `start`, with the flags of both; `--pull always` asks
-the registry every time and `--pull never` never. Made from a local image, the machine
+the registry every time and `--pull never` never. A name without a registry is looked
+for here under the configured registry first, then as docker reads it (`app` is
+`docker.io/library/app`, an image compose pulled), and only then pulled from the
+configured registry; `create` looks for its source the same way. Made from a local image, the machine
 is checked against the start's flags as it is made, so that what docker refuses before
 it makes a container (a mount point given twice, an app with nothing to run) leaves no
 machine behind. A name that is taken is refused unless
@@ -615,7 +618,9 @@ A service with a `build` section is built by nspawn's builder (see
 here (an image it names is pulled first, and built when the pull fails), every time
 with `pull_policy: build`, and always with `up --build` or `compose build`;
 `--no-build` builds nothing. Its image is the one it names or `PROJECT-SERVICE`, with
-the section's `tags`, `labels` and compose's project labels; `build --push` sends the
+the section's `tags`, `labels` and compose's project labels; a name without a registry
+or a namespace is nspawn's own, under the configured registry as `nspawn build -t`
+puts it, so `nspawn run NAME` takes it, while one like `user/app` stays Docker Hub's; `build --push` sends the
 named ones, and `down --rmi local` removes the images the project built.
 
 What nspawn cannot do, remote build contexts, SSH forwarding into a build and the

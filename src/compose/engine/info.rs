@@ -67,13 +67,26 @@ pub fn human_size(size: u64) -> String {
 }
 
 /// An image written short: Docker Hub's without its registry, its official ones
-/// without library/.
-pub fn short_image(reference: &str) -> String {
+/// without library/, and one a project built as compose files name it, without the
+/// `registry` it is under.
+pub fn short_image(reference: &str, registry: &str) -> String {
+    if let Some(own) = built_name(reference, registry) {
+        return own.to_string();
+    }
     reference
         .strip_prefix("docker.io/library/")
         .or_else(|| reference.strip_prefix("docker.io/"))
         .unwrap_or(reference)
         .to_string()
+}
+
+/// The name a project gave an image it built, which `built_reference` put under
+/// `registry`.
+fn built_name<'a>(reference: &'a str, registry: &str) -> Option<&'a str> {
+    reference
+        .strip_prefix(registry)
+        .and_then(|r| r.strip_prefix('/'))
+        .filter(|r| !r.contains('/'))
 }
 
 /// The state names ps prints and filters on.
@@ -141,22 +154,25 @@ fn command(m: &Machine, trunc: bool) -> String {
     crate::gotemplate::go_quote(&text)
 }
 
-/// The image a machine was made from: as the file names it while that is the image, as
-/// its reference reads otherwise (the file names another one now, or none).
+/// The image a machine was made from: as the file names it while that is the image
+/// (PROJECT-SERVICE for one it builds and names none), as its reference reads otherwise
+/// (the file names another one now, or none).
 fn image_of(e: &Engine<'_>, m: &Machine) -> String {
     let reference = m.string("reference");
     if let Some(project) = &e.project {
         if let Ok(service) = super::convert::service(project, &m.service) {
-            if let Some(image) = service.get("image").and_then(|v| v.as_str()) {
-                if crate::reference::ImageRef::normalized(image)
+            let named = service.get("image").and_then(|v| v.as_str()).is_some();
+            let built = service.get("build").and_then(|v| v.as_map()).is_some();
+            let image = super::build::image_of(&project.name, &m.service, service);
+            if (named || built)
+                && e.reference(&image)
                     .is_ok_and(|r| r.to_string() == reference)
-                {
-                    return image.to_string();
-                }
+            {
+                return image;
             }
         }
     }
-    short_image(&reference)
+    short_image(&reference, &e.registry)
 }
 
 fn json_line(fields: &[(&str, serde_json::Value)]) -> String {
@@ -507,7 +523,7 @@ pub async fn images(e: &mut Engine<'_>, a: &ImagesArgs, out: &mut dyn Write) -> 
         .iter()
         .map(|m| {
             let reference = m.string("reference");
-            let (repository, tag) = repository_and_tag(&reference);
+            let (repository, tag) = repository_and_tag(&reference, &e.registry);
             let image = image_of(&reference);
             ImageRow {
                 container: m.name.clone(),
@@ -695,12 +711,16 @@ fn images_map(rows: &[ImageRow]) -> String {
     out
 }
 
-/// The repository and tag of a machine's image as docker compose reads them from the
-/// image it was made from: its familiar name, and no tag for one by digest.
-fn repository_and_tag(reference: &str) -> (String, String) {
+/// The repository and tag of a machine's image, from the image it was made from: its
+/// familiar name, or the name a project built it under, and no tag for one by digest.
+fn repository_and_tag(reference: &str, registry: &str) -> (String, String) {
     match crate::reference::ImageRef::normalized(reference) {
         Ok(r) => (
-            crate::dockerapi::util::familiar(&format!("{}/{}", r.registry, r.repository)),
+            if r.registry == registry && !r.repository.contains('/') {
+                r.repository.clone()
+            } else {
+                crate::dockerapi::util::familiar(&format!("{}/{}", r.registry, r.repository))
+            },
             if r.digest.is_some() {
                 String::new()
             } else {
@@ -1125,20 +1145,34 @@ mod tests {
             "strconv.ParseUint: parsing \"+5\": invalid syntax"
         );
         // Repository and tag of the image a machine was made from.
+        let hub = "hub.nspawn.org";
         assert_eq!(
-            repository_and_tag("docker.io/library/nginx:1.27"),
+            repository_and_tag("docker.io/library/nginx:1.27", hub),
             ("nginx".to_string(), "1.27".to_string())
         );
         let digest = format!("ghcr.io/o/app@sha256:{}", "a".repeat(64));
         assert_eq!(
-            repository_and_tag(&digest),
+            repository_and_tag(&digest, hub),
             ("ghcr.io/o/app".to_string(), String::new())
         );
         assert_eq!(
-            short_image("docker.io/library/nginx:alpine"),
+            short_image("docker.io/library/nginx:alpine", hub),
             "nginx:alpine"
         );
-        assert_eq!(short_image("ghcr.io/a/b:1"), "ghcr.io/a/b:1");
+        assert_eq!(short_image("ghcr.io/a/b:1", hub), "ghcr.io/a/b:1");
+        // What a project built reads as the file names it.
+        assert_eq!(
+            repository_and_tag("hub.nspawn.org/demo-web:latest", hub),
+            ("demo-web".to_string(), "latest".to_string())
+        );
+        assert_eq!(
+            short_image("hub.nspawn.org/demo-web:latest", hub),
+            "demo-web:latest"
+        );
+        assert_eq!(
+            short_image("hub.nspawn.org/user/x:1", hub),
+            "hub.nspawn.org/user/x:1"
+        );
     }
 
     #[test]

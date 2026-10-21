@@ -55,6 +55,8 @@ pub struct Engine<'a> {
     pub log: &'a dyn Log,
     /// The command line's working directory, as Go's os.Getwd gives it.
     pub cwd: String,
+    /// The service's registry, which the images a project builds are named under.
+    pub registry: String,
 }
 
 /// A machine of the project, as ListMachines has it.
@@ -148,6 +150,24 @@ impl Engine<'_> {
             .expect("the commands that make machines load their project")
     }
 
+    /// The reference of `image` in the project: as `built_reference` names it when a
+    /// service builds it, as compose files read images otherwise.
+    pub fn reference(&self, image: &str) -> Result<crate::reference::ImageRef> {
+        let built = self.project.as_ref().is_some_and(|project| {
+            project.services.iter().any(|(name, service)| {
+                service.as_map().is_some_and(|service| {
+                    service.get("build").and_then(|b| b.as_map()).is_some()
+                        && build::image_of(&project.name, name, service) == image
+                })
+            })
+        });
+        if built {
+            built_reference(image, &self.registry)
+        } else {
+            image_reference(image)
+        }
+    }
+
     pub fn warn(&self, text: String) {
         self.log.warn(text);
     }
@@ -178,6 +198,17 @@ pub fn valid_machine_name(name: &str) -> bool {
 /// registry comes from Docker Hub, an official one under library/.
 pub fn image_reference(image: &str) -> Result<crate::reference::ImageRef> {
     crate::reference::ImageRef::normalized(image)
+}
+
+/// An image a project builds: one that names neither a registry nor a namespace is
+/// nspawn's own, under `registry`, as `nspawn build -t` names it, and found by that name
+/// with nspawn run; one like user/app stays Docker Hub's, where compose push sends it.
+pub fn built_reference(image: &str, registry: &str) -> Result<crate::reference::ImageRef> {
+    if image.contains('/') {
+        return image_reference(image);
+    }
+    crate::reference::ImageRef::parse(image, registry)
+        .map_err(|e| anyhow::anyhow!("image {image}: {e:#}"))
 }
 
 /// Runs a command that drives machines; the error is the line to print.
@@ -341,6 +372,11 @@ async fn dispatch(
         }
     }
     let client = Client::connect().await?;
+    let registry = client
+        .manager
+        .registry()
+        .await
+        .unwrap_or_else(|_| crate::config::DEFAULT_REGISTRY.to_string());
     let mut engine = Engine {
         client,
         name,
@@ -349,6 +385,7 @@ async fn dispatch(
         args,
         log,
         cwd: host.cwd.clone(),
+        registry,
     };
     use ComposeCommand as C;
     match command {
@@ -631,5 +668,30 @@ mod tests {
         assert_eq!(r.to_string(), "ghcr.io/processone/ejabberd:latest");
         let r = image_reference("localhost/x:1").unwrap();
         assert_eq!(r.registry, "localhost");
+    }
+
+    #[test]
+    fn an_image_a_project_builds_is_nspawn_s_unless_it_names_a_namespace() {
+        let r = built_reference("demo-web", "hub.nspawn.org").unwrap();
+        assert_eq!(r.to_string(), "hub.nspawn.org/demo-web:latest");
+        assert_eq!(r.local_name(), "demo-web");
+        assert_eq!(
+            built_reference("app:1", "hub.nspawn.test:8443")
+                .unwrap()
+                .to_string(),
+            "hub.nspawn.test:8443/app:1"
+        );
+        assert_eq!(
+            built_reference("user/app", "hub.nspawn.org")
+                .unwrap()
+                .to_string(),
+            "docker.io/user/app:latest"
+        );
+        assert_eq!(
+            built_reference("ghcr.io/x/app:2", "hub.nspawn.org")
+                .unwrap()
+                .to_string(),
+            "ghcr.io/x/app:2"
+        );
     }
 }
