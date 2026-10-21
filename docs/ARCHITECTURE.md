@@ -206,11 +206,12 @@ longer lists gets the stop job too, which ends a pending restart and waits for
 the release hook of its last run. `kill` with SIGKILL is `stop --force`; any
 other signal goes to the program of an app (the stub init's child, or the leader
 when the program is PID 1, once it no longer bears systemd-nspawn's name, which
-it keeps until it executes the program) or the init of a booted machine and
-leaves the policy to decide should the machine end, except the machine's own
-stop signal, which docker counts as a stop: `kill` then leaves `exit-on-next`
-in the machine's directory, and the release hook, finding it, queues the stop
-job while the unit is still winding down. `prepare` removes a mark an earlier
+it keeps until it executes the program) or the init of a booted machine. As
+with docker's kill, the signal counts as a stop, unless the app has a stop signal
+of its own and this is another one, or the booted machine's init gets no halt or
+poweroff request; those leave it to the policy should the machine end. A stop
+leaves `exit-on-next` in the machine's directory, and the release hook, finding
+it, queues the stop job while the unit is still winding down. `prepare` removes a mark an earlier
 run left. The policy and the limits go into the hooks
 drop-in, since the settings file has no keys for them; `always` and
 `unless-stopped` enable the unit the way `machinectl enable` does, `stop`

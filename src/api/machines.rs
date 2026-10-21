@@ -2340,14 +2340,21 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     Ok(running)
 }
 
-/// An app's stop signal (SIGTERM unless its image names one), or a booted init's halt and
-/// poweroff requests.
-/// Whether a signal ends the machine's restarts: SIGKILL and its stop signal (SIGTERM
-/// for an app that names none), not one its program may handle.
+/// Whether a signal ends the machine's restarts: any signal to an app without a stop
+/// signal of its own (its image's or --stop-signal), that one and SIGKILL to an app with
+/// one; SIGKILL and the halt and poweroff requests to a booted init.
 fn exits_on(record: Option<&ImageRecord>, signal: i32) -> Result<bool> {
-    Ok(signal == libc::SIGKILL || stop_signals(record)?.contains(&signal))
+    if signal == libc::SIGKILL {
+        return Ok(true);
+    }
+    match record {
+        Some(r) if r.mode == Mode::App && r.effective_stop_signal().is_none() => Ok(true),
+        _ => Ok(stop_signals(record)?.contains(&signal)),
+    }
 }
 
+/// An app's stop signal (SIGTERM unless its image names one), or a booted init's halt and
+/// poweroff requests.
 fn stop_signals(record: Option<&ImageRecord>) -> Result<Vec<i32>> {
     match record {
         // An image's stop signal nspawn cannot read is SIGTERM, as its settings make it.
@@ -3181,14 +3188,24 @@ mod tests {
             r.tuning.stop_signal = stop.map(str::to_string);
             r
         };
-        // No stop signal of its own: SIGTERM, not one its program may handle.
-        assert!(exits_on(Some(&app(None)), libc::SIGTERM).unwrap());
-        assert!(!exits_on(Some(&app(None)), libc::SIGUSR1).unwrap());
-        // With one: that one, and SIGKILL.
+        // No stop signal of its own: any signal.
+        for signal in [libc::SIGTERM, libc::SIGUSR1, libc::SIGHUP, libc::SIGINT] {
+            assert!(exits_on(Some(&app(None)), signal).unwrap(), "{signal}");
+        }
+        // With one, the image's or --stop-signal: that one, and SIGKILL.
         let quit = app(Some("SIGQUIT"));
         assert!(exits_on(Some(&quit), libc::SIGQUIT).unwrap());
         assert!(exits_on(Some(&quit), libc::SIGKILL).unwrap());
         assert!(!exits_on(Some(&quit), libc::SIGHUP).unwrap());
+        let mut image = app(None);
+        image.run.stop_signal = Some("SIGINT".to_string());
+        assert!(exits_on(Some(&image), libc::SIGINT).unwrap());
+        assert!(!exits_on(Some(&image), libc::SIGUSR1).unwrap());
+        // A booted init: its halt and poweroff requests, and SIGKILL.
+        let mut booted = app(None);
+        booted.mode = Mode::Boot;
+        assert!(exits_on(Some(&booted), libc::SIGRTMIN() + 4).unwrap());
+        assert!(!exits_on(Some(&booted), libc::SIGUSR1).unwrap());
     }
 
     #[test]

@@ -1598,24 +1598,36 @@ child=$(cut -d' ' -f1 /proc/$leader/task/$leader/children)
 $NSPAWN kill -s CONT $app >/dev/null || fail "kill -s CONT"
 $NSPAWN stop $app >/dev/null || fail "stop the app signalled at once"
 # The program says when its trap is set: a signal before that would end it.
-$NSPAWN start $app --restart always -p none -- /bin/sh -c "trap 'echo e2e-got-hup-$nonce' HUP; echo e2e-trap-$nonce; while :; do sleep 1; done" >/dev/null || fail "start an app that traps SIGHUP"
+trapper="trap 'echo e2e-got-hup-$nonce' HUP; echo e2e-trap-$nonce; while :; do sleep 1; done"
+$NSPAWN start $app --restart always -p none -- /bin/sh -c "$trapper" >/dev/null || fail "start an app that traps SIGHUP"
 retry 10 bash -c "$NSPAWN logs $app | grep_q e2e-trap-$nonce" || fail "the program did not set its trap"
 [ "$($NSPAWN kill -s HUP $app)" = "$app" ] || fail "kill -s HUP does not print the machine's name"
 retry 5 bash -c "$NSPAWN logs $app | grep_q e2e-got-hup-$nonce" || fail "the program did not get SIGHUP"
 $NSPAWN ps | grep_q "^ *$app " || fail "SIGHUP, which the program handles, ended the machine"
-restarts=$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)
+# As docker's kill: without a stop signal of its own, any signal counts as a stop, so
+# the program that SIGUSR1 ends is not brought back by --restart always.
 $NSPAWN kill -s USR1 $app >/dev/null || fail "kill -s USR1"
-retry 15 bash -c "[ \"\$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)\" -gt $restarts ]" || fail "a program ended by kill -s USR1 was not restarted by its policy"
-retry 15 bash -c "$NSPAWN ps | grep_q '^ *$app '" || fail "the app did not come back after SIGUSR1"
-# The stop signal sent by kill ends the machine for good.
-$NSPAWN kill -s TERM $app >/dev/null || fail "kill with the stop signal"
 sleep 5
 # The program died of the signal, so the unit may end failed; it must not come back.
+case "$(systemctl is-active systemd-nspawn@$app.service)" in
+  active|activating) fail "kill -s USR1 of a machine without a stop signal did not end it for good" ;;
+esac
+[ -e /var/lib/nspawn/machines/$app/exit-on-next ] && fail "the release hook left the exit-on-next mark behind"
+# With a stop signal of its own, another signal leaves it to the policy, and that one
+# ends the machine for good.
+$NSPAWN start $app --restart always --stop-signal SIGTERM -p none -- /bin/sh -c "$trapper" >/dev/null || fail "start an app with a stop signal of its own"
+retry 10 bash -c "$NSPAWN logs $app | grep_q e2e-trap-$nonce" || fail "the program did not set its trap again"
+restarts=$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)
+$NSPAWN kill -s USR1 $app >/dev/null || fail "kill -s USR1 with a stop signal"
+retry 15 bash -c "[ \"\$(systemctl show -p NRestarts --value systemd-nspawn@$app.service)\" -gt $restarts ]" || fail "a program ended by kill -s USR1 was not restarted by its policy"
+retry 15 bash -c "$NSPAWN ps | grep_q '^ *$app '" || fail "the app did not come back after SIGUSR1"
+$NSPAWN kill -s TERM $app >/dev/null || fail "kill with the stop signal"
+sleep 5
 case "$(systemctl is-active systemd-nspawn@$app.service)" in
   active|activating) fail "the stop signal sent by kill did not end the machine for good" ;;
 esac
 [ -e /var/lib/nspawn/machines/$app/exit-on-next ] && fail "the release hook left the exit-on-next mark behind"
-$NSPAWN start $app >/dev/null || fail "start after kill -s TERM"
+$NSPAWN start $app --stop-signal "" >/dev/null || fail "start after kill -s TERM"
 $NSPAWN kill $app >/dev/null || fail "kill (SIGKILL)"
 sleep 3
 [ "$(systemctl is-active systemd-nspawn@$app.service)" = inactive ] || fail "kill did not end a machine with --restart always"

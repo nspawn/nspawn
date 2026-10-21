@@ -188,9 +188,12 @@ minute, for as long as they keep failing, and `ps` shows such a machine as
 `always` machine still starts at the next boot); `machinectl stop` does too but does not
 take an `unless-stopped` machine off the boot list, and a `poweroff` from inside counts as
 ending under `always`. `kill` works as docker's: SIGKILL, its default, stops the machine
-for good; any other signal goes to the program (or the init of a booted machine), and
-should it end the machine the policy decides, unless it was the machine's stop signal,
-which counts as a stop. Right after a start, `kill` waits a few seconds at most for the
+for good; any other signal goes to the program (or the init of a booted machine) and,
+as with docker, counts as a stop that keeps the policy from bringing the machine back,
+unless the machine has a stop signal of its own (its image's `STOPSIGNAL` or
+`--stop-signal`) and this is another one: then the policy decides, should the signal end
+it. A booted machine's halt and poweroff requests count as a stop, other signals leave it
+to the policy. Right after a start, `kill` waits a few seconds at most for the
 program to be running, so that the signal is not taken by systemd-nspawn's child, which
 would end the machine before the program ran. `-m/--memory`, `--cpus` and `--pids-limit`
 bound the whole machine (its unit's MemoryMax=, CPUQuota= and TasksMax=), which is why
