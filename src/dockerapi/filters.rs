@@ -14,12 +14,12 @@ pub struct Filters {
     off: BTreeSet<(String, String)>,
 }
 
-/// What a request gets back for a filter it cannot take, as docker words it.
+/// What a request gets back for a filter it cannot take, in the API's words.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invalid(pub String);
 
 impl Filters {
-    /// As docker's FromJSON reads them: the object form, else the array form, and
+    /// As FromJSON reads them: the object form, else the array form, and
     /// "invalid filter" with no more said for anything neither of them is.
     pub fn parse(text: Option<&str>) -> Result<Filters, Invalid> {
         let Some(text) = text.filter(|t| !t.is_empty()) else {
@@ -74,7 +74,7 @@ impl Filters {
     /// From the command line's KEY=VALUE pairs (`--filter name=web`).
     pub fn from_pairs(pairs: &[String]) -> Result<Filters, Invalid> {
         let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        // docker's FilterOpt: an empty --filter is none (one of blanks is no key=value),
+        // As FilterOpt has it: an empty --filter is none (one of blanks is no key=value),
         // key and value are trimmed.
         for pair in pairs.iter().filter(|p| !p.is_empty()) {
             let (key, value) = pair.split_once('=').ok_or_else(|| {
@@ -96,7 +96,7 @@ impl Filters {
         self.values.keys()
     }
 
-    /// Every value of `key`, whatever its bool, as docker's Get gives them.
+    /// Every value of `key`, whatever its bool, as Get gives them.
     pub fn values(&self, key: &str) -> Option<&BTreeSet<String>> {
         self.values.get(key).filter(|v| !v.is_empty())
     }
@@ -109,14 +109,14 @@ impl Filters {
         }
     }
 
-    /// docker's ExactMatch: no values for `key`, or `value` among them, given as true.
+    /// ExactMatch: no values for `key`, or `value` among them, given as true.
     pub fn exact(&self, key: &str, value: &str) -> bool {
         self.values(key).is_none_or(|v| {
             v.contains(value) && !self.off.contains(&(key.to_string(), value.to_string()))
         })
     }
 
-    /// docker's FuzzyMatch: an exact match, or a value, whatever its bool, that `value`
+    /// FuzzyMatch: an exact match, or a value, whatever its bool, that `value`
     /// starts with.
     pub fn fuzzy(&self, key: &str, value: &str) -> bool {
         self.exact(key, value)
@@ -125,7 +125,7 @@ impl Filters {
                 .is_some_and(|v| v.iter().any(|prefix| value.starts_with(prefix.as_str())))
     }
 
-    /// docker's Match: an exact match, or a value, whatever its bool, that is a regular
+    /// Match: an exact match, or a value, whatever its bool, that is a regular
     /// expression found in `value`.
     pub fn matches(&self, key: &str, value: &str) -> bool {
         self.exact(key, value)
@@ -159,7 +159,7 @@ mod tests {
             r#"{"label":{"caddy":true,"a=b":false},"status":{"running":true}}"#,
         ))
         .unwrap();
-        // A value of the object form is there whatever its bool, as docker's Get gives it.
+        // A value of the object form is there whatever its bool, as Get gives it.
         assert_eq!(new.values("label"), old.values("label"));
         assert_eq!(new.values("status"), old.values("status"));
         for bad in [

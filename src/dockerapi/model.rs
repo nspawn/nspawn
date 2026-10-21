@@ -34,7 +34,7 @@ pub struct Snapshot {
     pub networks: Vec<NetSpec>,
 }
 
-/// Whether a machine in `state` has a run that ended, whose end docker shows: one
+/// Whether a machine in `state` has a run that ended, whose end the API shows: one
 /// stopped, or between two runs of its restart policy.
 fn ended(state: &str) -> bool {
     matches!(state, "stopped" | "restarting")
@@ -67,9 +67,9 @@ impl Snapshot {
         Ok(Snapshot { machines, networks })
     }
 
-    /// By ID, by name with or without docker's leading slash, or by a unique prefix of
-    /// the ID, in that order, as docker looks one up.
-    /// A container by its ID, its name or a prefix of its ID, as docker's GetContainer
+    /// By ID, by name with or without the API's leading slash, or by a unique prefix of
+    /// the ID, in that order.
+    /// A container by its ID, its name or a prefix of its ID, as GetContainer
     /// finds it, and its words when there is none.
     pub fn find(&self, key: &str) -> Result<&Machine, String> {
         if let Some(m) = self.machines.iter().find(|m| m.id == key) {
@@ -101,7 +101,7 @@ impl Snapshot {
         unique_prefix(all.iter(), key, |n| &n.id).cloned()
     }
 
-    /// nspawn's bridge networks, then the host's and none, which docker lists too.
+    /// nspawn's bridge networks, then the host's and none, which the API lists too.
     pub fn network_views(&self) -> Vec<NetworkView<'_>> {
         let mut views: Vec<NetworkView> = self
             .networks
@@ -175,7 +175,7 @@ impl Machine {
         )
     }
 
-    /// docker's state word: created, running, paused, restarting or exited.
+    /// The API's state word: created, running, paused, restarting or exited.
     pub fn state(&self) -> &'static str {
         match self.summary.state.as_str() {
             "running" | "opening" | "closing" => "running",
@@ -186,7 +186,7 @@ impl Machine {
         }
     }
 
-    /// docker's status line: "Up 3 minutes (healthy)", "Exited (1) 2 hours ago".
+    /// The API's status line: "Up 3 minutes (healthy)", "Exited (1) 2 hours ago".
     pub fn status(&self, now: u64) -> String {
         let health = match self.summary.health.as_ref().map(|h| h.status.as_str()) {
             Some("healthy") => " (healthy)",
@@ -389,7 +389,7 @@ impl Machine {
             "ImageID": image.id,
             "Command": self.command_line(),
             "Created": self.record.created,
-            // docker lists the ports of a running container only.
+            // The ports of a running container only.
             "Ports": if self.running() { self.port_list(&image.exposed_ports) } else { Vec::new() },
             "Labels": self.record.effective_labels(),
             "State": self.state(),
@@ -416,7 +416,7 @@ impl Machine {
                 })).collect::<Vec<_>>(),
             })
         });
-        // docker's Running stays true between two runs of a restart policy.
+        // Running stays true between two runs of a restart policy.
         let mut state = json!({
             "Status": self.state(),
             "Running": self.running() || self.state() == "restarting",
@@ -436,7 +436,7 @@ impl Machine {
         let ports = self.port_bindings(&image.exposed_ports);
         let hostname = r.tuning.hostname.clone().unwrap_or_else(|| r.name.clone());
         let env = crate::volume::merge_env(&r.run.env, &r.env);
-        // Fields left at their default are not written, as docker leaves them out.
+        // Fields left at their default are not written.
         let healthcheck = r.effective_healthcheck().map(|h| {
             let mut check = json!({ "Test": h.test });
             for (key, usec) in [
@@ -465,7 +465,7 @@ impl Machine {
             .iter()
             .map(|v| (v.clone(), json!({})))
             .collect();
-        // null for none, as docker writes a nil list.
+        // null for none, as a nil list is written.
         let list = |words: &[String]| match words {
             [] => Value::Null,
             words => json!(words),
@@ -575,7 +575,7 @@ impl Machine {
             })).collect::<Vec<_>>(),
             "Ulimits": [],
         });
-        // What docker writes for the settings nspawn has no counterpart of.
+        // What the API writes for the settings nspawn has no counterpart of.
         let unset = json!({
             "BlkioWeight": 0,
             "BlkioWeightDevice": [],
@@ -984,7 +984,7 @@ mod tests {
         };
         assert_eq!(config(&snapshot)["Cmd"], json!(["httpd", "-f", "-p", "80"]));
         assert_eq!(config(&snapshot)["Entrypoint"], Value::Null);
-        // An entrypoint given alone: docker's Cmd is null, not the image's.
+        // An entrypoint given alone: Cmd is null, not the image's.
         snapshot.machines[0].record.entrypoint = Some(vec!["/bin/sh".into()]);
         snapshot.machines[0].record.cmd = Some(Vec::new());
         assert_eq!(config(&snapshot)["Cmd"], Value::Null);
@@ -994,7 +994,7 @@ mod tests {
             m.summary_json(&ctx, &snapshot, &image)["Command"],
             "/bin/sh"
         );
-        // The arguments with a space in quotes, as docker lists a command.
+        // The arguments with a space in quotes.
         snapshot.machines[0].record.cmd = Some(vec!["-c".into(), "echo a; sleep 1".into()]);
         let m = &snapshot.machines[0];
         assert_eq!(

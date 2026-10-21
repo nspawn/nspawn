@@ -37,7 +37,8 @@ pub struct Converge {
     /// --build: every service with a build section is built.
     pub force_build: bool,
     /// When the machines were about to start, made and pulled and built: the output an
-    /// attached up shows begins there, as docker compose attaches before it starts them.
+    /// attached up shows begins there: it attaches before they start, so nothing they
+    /// print is missed.
     pub starting_at: std::cell::Cell<Option<std::time::SystemTime>>,
 }
 
@@ -114,7 +115,7 @@ pub fn check_refusals(project: &Project) -> Result<()> {
     let mut lines = Vec::new();
     for refusal in &project.refused {
         // A job's triggers say when it runs, not what it runs as: run takes a scheduled
-        // job as docker compose does, and up refuses one with reject_scheduled_jobs.
+        // job, and up refuses one with reject_scheduled_jobs.
         if refusal.path == "triggers" || refusal.path.starts_with("triggers.") {
             continue;
         }
@@ -853,8 +854,8 @@ fn recreates(c: &Converge, service: &str, stale: bool) -> bool {
 /// Makes everything the project needs and its services' machines, and starts them when
 /// asked; the machines of the services, in the order they started.
 pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Machine>> {
-    // --scale names any service of the project loaded, as docker compose applies it before
-    // --no-deps narrows the selection.
+    // --scale names any service of the project loaded: it applies before --no-deps
+    // narrows the selection.
     for name in c.scale.keys() {
         if !e.project().services.contains_key(name) {
             bail!("no such service: {name}");
@@ -1278,8 +1279,8 @@ async fn await_condition(
 }
 
 /// Whether a service of the project depends on `service` completing successfully: by
-/// the file when one is loaded, by the depends_on labels of `machines` otherwise, as
-/// docker compose rebuilds a project from its containers.
+/// the file when one is loaded, by the depends_on labels of `machines` otherwise: the
+/// project as its machines tell it.
 fn awaited_to_complete(e: &Engine<'_>, machines: &[Machine], service: &str) -> bool {
     match &e.project {
         Some(p) => p.services.values().filter_map(Value::as_map).any(|s| {

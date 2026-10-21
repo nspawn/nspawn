@@ -78,10 +78,10 @@ impl ImageRef {
         })
     }
 
-    /// An image reference as Dockerfiles and compose files write them: one that names no
-    /// registry comes from Docker Hub, and a first component with an uppercase letter is
-    /// a registry, as the reference's splitDockerDomain has it.
-    pub fn docker(image: &str) -> Result<Self> {
+    /// An image reference as Dockerfiles and compose files write them, normalized as
+    /// ParseNormalizedNamed does: one that names no registry comes from Docker Hub, and a
+    /// first component with an uppercase letter is a registry, as splitDockerDomain has it.
+    pub fn normalized(image: &str) -> Result<Self> {
         let parsed = match image.split_once('/') {
             Some((first, _)) if looks_like_registry(first) => ImageRef::parse(image, "docker.io"),
             // A host by its case alone, which parse would take for a repository's first
@@ -306,19 +306,19 @@ mod tests {
             ("localhost:5000/app", "localhost:5000/app:latest"),
         ] {
             assert_eq!(
-                ImageRef::docker(image).unwrap().to_string(),
+                ImageRef::normalized(image).unwrap().to_string(),
                 want,
                 "{image}"
             );
         }
         // An upper-case first part is a registry, as splitDockerDomain takes it.
-        let host = ImageRef::docker("MyReg/app:1").unwrap();
+        let host = ImageRef::normalized("MyReg/app:1").unwrap();
         assert_eq!(
             (host.registry.as_str(), host.repository.as_str()),
             ("MyReg", "app")
         );
         assert_eq!(host.to_string(), "MyReg/app:1");
-        assert!(ImageRef::docker("MyReg/App:1").is_err());
+        assert!(ImageRef::normalized("MyReg/App:1").is_err());
         // The command line reads Docker Hub's names the same way.
         for (image, want) in [
             ("docker.io/alpine", "docker.io/library/alpine:latest"),

@@ -1,5 +1,5 @@
-//! Columns text takes on a terminal, as docker's command line counts them where it
-//! lines text up or cuts it. docker/cli v29.8.2 cuts with formatter.Ellipsis, whose
+//! Columns text takes on a terminal, counted where text is lined up or cut by the
+//! formats --format takes. docker/cli v29.8.2 cuts with formatter.Ellipsis, whose
 //! widths are the East Asian Width of golang.org/x/text/width v0.42.0 (Unicode 15.0.0
 //! under Go 1.26), and lines up tables with its fork of text/tabwriter, which measures
 //! cells with go-runewidth v0.0.29: per grapheme cluster, the widths of its characters

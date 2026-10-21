@@ -4331,8 +4331,8 @@ impl<'t> Exec<'t> {
             return Err(self.errorf(&format!("nil pointer evaluating {}.{}", typ, name)));
         }
         if let V::Map(m, strmap) = &receiver.v {
-            // The rows of docker's formats have a Label method: one label's value, ""
-            // for a label the row has not.
+            // A row of the ps formats has a Label method: one label's value, "" for a
+            // label the row has not.
             if name == "Label" && !strmap && m.contains_key("LabelsMap") {
                 let got = args.len().saturating_sub(1) + usize::from(fin.is_some());
                 if got != 1 {
@@ -4922,7 +4922,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ellipsis_cuts_as_docker_cuts() {
+    fn ellipsis_cuts_as_the_reference_cuts() {
         // formatter.Ellipsis of docker/cli v29.8.2, run on these.
         for (text, max, cut) in [
             (
@@ -6462,7 +6462,7 @@ mod tests {
     }
 
     #[test]
-    fn format_list_like_docker() {
+    fn tables_and_lists_print_as_the_reference_prints_them() {
         check_list(&[
             ("table", ROWS, "ok:CONTAINER ID   IMAGE          NAMES                STATUS\n3f4e8a1b2c3d   nginx:latest   web                  Up 2 hours\n9a8b7c6d5e4f   fedora         a-much-longer-name   Exited (0) 3 days ago\n"),
             ("table {{.Names}}\\t{{.Status}}", ROWS, "ok:NAMES                STATUS\nweb                  Up 2 hours\na-much-longer-name   Exited (0) 3 days ago\n"),

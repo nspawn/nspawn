@@ -96,7 +96,7 @@ pub struct ImageRecord {
     pub entrypoint: Option<Vec<String>>,
     /// Cmd override (the arguments after --); None keeps the image's. An empty list
     /// after an entrypoint given is none: an entrypoint given without arguments runs
-    /// alone, as docker runs it. Also read from a "command" key.
+    /// alone. Also read from a "command" key.
     #[serde(default, alias = "command")]
     pub cmd: Option<Vec<String>>,
     /// Environment on top of the image's (-e).
@@ -207,7 +207,7 @@ impl ImageRecord {
     /// An empty cmd override means none, and a run config with only `command` has it as
     /// its cmd.
     fn normalize(mut self) -> Self {
-        // Without an entrypoint of its own an empty cmd is none, as docker merges them.
+        // Without an entrypoint of its own an empty cmd overrides nothing.
         if self.entrypoint.is_none() && self.cmd.as_ref().is_some_and(|c| c.is_empty()) {
             self.cmd = None;
         }
@@ -1087,9 +1087,9 @@ impl Store {
             Err(_) => return Ok(None),
         };
         // By reference: the image itself before a machine that was made from it or ran,
-        // whose network and settings are its own; of several, the last one pulled, as
-        // docker's tag names the last pull. A reference recorded before Docker Hub's names
-        // were read as docker reads them is read again.
+        // whose network and settings are its own; of several, the last one pulled, as a
+        // tag names the last pull. A reference recorded in another spelling of Docker
+        // Hub's names is read again.
         let same = |recorded: &str| {
             recorded == wanted
                 || crate::reference::ImageRef::parse(recorded, default_registry)
@@ -2104,16 +2104,15 @@ mod tests {
             record(serde_json::json!({ "cmd": ["nginx", "-t"] })).effective_command(),
             ["/docker-entrypoint.sh", "nginx", "-t"]
         );
-        // Its parts, as docker's inspect has them: Cmd is none after an entrypoint given
-        // alone, not the image's.
+        // Its parts: Cmd is none after an entrypoint given alone, not the image's.
         let alone = record(serde_json::json!({ "entrypoint": ["/bin/sh"], "cmd": [] }));
         assert_eq!(alone.effective_entrypoint(), ["/bin/sh"]);
         assert!(alone.effective_cmd().is_empty());
         // --entrypoint "" alone: nothing to run, which create and start refuse.
         let nothing = record(serde_json::json!({ "entrypoint": [], "cmd": [] }));
         assert!(nothing.effective_command().is_empty());
-        // Records that keep an entrypoint without a cmd at all, as 1.10.0 wrote one given
-        // alone, run the image's command after it still.
+        // A record with an entrypoint and no cmd at all runs the image's command after
+        // it.
         assert_eq!(
             record(serde_json::json!({ "entrypoint": ["/bin/sh"] })).effective_command(),
             ["/bin/sh", "nginx", "-g", "daemon off;"]

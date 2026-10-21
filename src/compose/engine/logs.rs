@@ -274,7 +274,7 @@ fn env_from_files(
     Ok(given)
 }
 
-/// A time of --since or --until as journalctl reads one, taken as docker takes it: a
+/// A time of --since or --until as journalctl reads one, from what the flags take: a
 /// duration ago (42m, 1h30m), unix seconds, or an RFC 3339 time or date.
 fn journal_time(text: &str, now: f64) -> Result<String, String> {
     let offset = crate::compose::gotime::local_offset(now as i64);
@@ -304,7 +304,7 @@ pub async fn attach(
 ) -> Result<()> {
     let project = e.project().clone();
     // The services this up names, every one without a name: what an abort or a Ctrl+C
-    // stops and kills, as docker compose's stop and kill take Create.Services.
+    // stops and kills, as stop and kill take Create.Services.
     let named: Vec<String> = if a.service.is_empty() {
         project.services.keys().cloned().collect()
     } else {
@@ -627,8 +627,7 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
     }
     up::check_refusals(&checked)?;
     // The networks, volumes and secrets of the project as run loaded it, made as up makes
-    // them: docker compose's run makes them with what the service depends on, which may
-    // be nothing.
+    // them: run's come with what the service depends on, which may be nothing.
     up::networks(e).await?;
     up::volumes(e).await?;
     up::secrets(e).await?;
@@ -866,8 +865,7 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
             return Err(err);
         }
     };
-    // As docker compose's CLI waits for the removal: a down right after finds the
-    // project's networks free.
+    // The removal is waited for: a down right after finds the project's networks free.
     if a.rm {
         crate::commands::machines::removed(&e.client, &name).await;
     }
@@ -1043,7 +1041,8 @@ mod tests {
             journal_time("2026-10-19T07:00:00Z", 0.0).unwrap(),
             "@1792393200.000000000"
         );
-        // What journalctl reads and docker does not is refused before it gets there.
+        // What journalctl reads but the flags do not take is refused before it gets
+        // there.
         assert!(journal_time("2026-10-19 07:00:00", 0.0).is_err());
         assert!(journal_time("yesterday", 0.0).is_err());
     }

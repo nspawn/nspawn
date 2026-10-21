@@ -38,7 +38,7 @@ pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
         .await
         .map_err(client::error)?;
     // before= and since= name any machine, a stopped one too, and one that does not
-    // exist is an error, as docker has it.
+    // exist is an error.
     let references: Vec<&String> = ["before", "since"]
         .iter()
         .filter_map(|k| filters.values(k))
@@ -157,8 +157,8 @@ fn ps_state(machine: &Dict) -> &'static str {
     }
 }
 
-/// docker's status of a container that ran, `Exited (N) X ago` or `Restarting (N) X
-/// ago`, where `word` is Exited or Restarting; without the time when the end of the run
+/// The status of a machine that ran, `Exited (N) X ago` or `Restarting (N) X ago`,
+/// where `word` is Exited or Restarting; without the time when the end of the run
 /// is not known (`finished` 0).
 pub(crate) fn ended_status(word: &str, code: i32, finished: u64, now: u64) -> String {
     if finished == 0 {
@@ -231,7 +231,7 @@ fn ps_matches(
                 let host = p.split("->").next().unwrap_or_default();
                 let port = host.rsplit(':').next().unwrap_or(host);
                 let proto = p.rsplit('/').next().unwrap_or("tcp");
-                // A bare port is a tcp one, as docker reads it.
+                // A bare port is a tcp one.
                 wanted.contains(&format!("{port}/{proto}"))
                     || (proto == "tcp" && wanted.contains(port))
             })
@@ -259,19 +259,18 @@ fn ps_matches(
         })
 }
 
-/// A machine with the fields --format templates are written for, and nspawn's own.
-/// A machine as docker ps's fields have it; `trunc` cuts what docker cuts without
-/// --no-trunc.
+/// A machine with the fields --format templates are written for, and nspawn's own;
+/// `trunc` cuts what --no-trunc keeps whole.
 fn ps_row(m: &Dict, now: u64, trunc: bool) -> serde_json::Value {
     let json = client::dict_to_json(m);
     let created = client::u64(m, "created");
     let started = client::u64(m, "started");
-    // A machine nspawn has no record of has no labels: none, as docker's nil map reads.
+    // A machine nspawn has no record of has no labels: an empty map, not null.
     let labels = match &json["labels"] {
         v @ serde_json::Value::Object(_) => v.clone(),
         _ => serde_json::json!({}),
     };
-    // docker sorts the KEY=VALUE strings, not the keys: a.b=x comes after a=y.
+    // The KEY=VALUE strings are sorted, not the keys: a.b=x comes after a=y.
     let label_text = labels
         .as_object()
         .map(|l| {
@@ -283,7 +282,7 @@ fn ps_row(m: &Dict, now: u64, trunc: bool) -> serde_json::Value {
             pairs.join(",")
         })
         .unwrap_or_default();
-    // Quoted as docker does it: a newline of a compose command keeps to its row.
+    // Quoted, so that a newline of a compose command keeps to its row.
     let command = match client::string(m, "mode").as_str() {
         "boot" => "/sbin/init".to_string(),
         _ => crate::dockerapi::util::command_line(&client::strings(m, "command")),
@@ -293,7 +292,7 @@ fn ps_row(m: &Dict, now: u64, trunc: bool) -> serde_json::Value {
         false => text,
     };
     let command = crate::gotemplate::go_quote(&cut(command, 20));
-    // docker keeps the tag of a reference pinned to a digest and drops the digest.
+    // A reference pinned to a digest shows its tag, without the digest.
     let reference = client::string(m, "reference");
     let image = match reference.split_once('@') {
         Some((named, _)) if trunc => named,
@@ -340,8 +339,8 @@ fn ps_row(m: &Dict, now: u64, trunc: bool) -> serde_json::Value {
         "Names": client::string(m, "name"),
         "Image": crate::dockerapi::util::familiar(image),
         "Command": command,
-        // Go's Time.String in the local zone, as docker prints it; nothing for a machine
-        // nspawn has no record of, rather than 1970.
+        // Go's Time.String in the local zone; nothing for a machine nspawn has no record
+        // of, rather than 1970.
         "CreatedAt": if created > 0 { crate::compose::gotime::time_string(created as i64) } else { String::new() },
         "RunningFor": if created > 0 { format!("{} ago", since(created)) } else { String::new() },
         "Ports": ports.join(", "),
@@ -441,8 +440,8 @@ pub async fn start(args: StartArgs, client: &Client) -> Result<()> {
 }
 
 /// `options` of a CreateMachine call with the flags of the start that follows it: the
-/// service checks them as it makes the machine, so that what docker refuses when it
-/// creates a container (a mount point twice, nothing to run) leaves no machine behind.
+/// service checks them as it makes the machine, so that a start that would be refused (a
+/// mount point twice, nothing to run) leaves no machine behind.
 fn with_start_flags<'a>(mut options: Options<'a>, start: &Options<'static>) -> Options<'a> {
     for (key, value) in start {
         // What only a start takes.
@@ -570,7 +569,7 @@ impl Listed {
     }
 
     /// The image of `reference` a new machine is made from: one never run, the last
-    /// pulled of several, as docker's tag names the last pull; never `but`.
+    /// pulled of several, as a tag names the last pull; never `but`.
     pub(crate) fn image_of<'a>(
         images: &'a [Listed],
         reference: &str,
@@ -786,9 +785,9 @@ pub(crate) async fn attached(
     }
     let stdin = io::stdin();
     let mut fds = HashMap::new();
-    // A terminal reaches the program through a pipe, as with docker: given the terminal
-    // itself, the program could read what is typed after a detach, or push input into
-    // the shell. A file or a pipe goes as it is.
+    // A terminal reaches the program through a pipe: given the terminal itself, the
+    // program could read what is typed after a detach, or push input into the shell. A
+    // file or a pipe goes as it is.
     let piped = if interactive && !tty && nix::unistd::isatty(&stdin).unwrap_or(false) {
         let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
             .context("making a pipe for the input")?;
@@ -1879,7 +1878,7 @@ mod tests {
     }
 
     #[test]
-    fn ps_filters_match_as_docker_s() {
+    fn ps_filters_match_by_kind_and_key() {
         let value =
             |v: zbus::zvariant::Value<'static>| zbus::zvariant::OwnedValue::try_from(v).unwrap();
         let m = Dict::from([
@@ -1910,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn labels_are_sorted_as_docker_sorts_them() {
+    fn labels_are_sorted_as_key_value_strings() {
         let m = Dict::from([(
             "labels".to_string(),
             zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::from(
@@ -1939,8 +1938,8 @@ mod tests {
             ]))
             .unwrap(),
         )]);
-        // As docker lists it (an argument with a space in single quotes), cut to 20
-        // columns unless --no-trunc, and quoted.
+        // An argument with a space in single quotes, cut to 20 columns unless
+        // --no-trunc, and quoted.
         assert_eq!(
             ps_row(&m, 0, true)["Command"],
             "\"sh -c 'echo \\\"a\\\"\\nexe\u{2026}\""
@@ -2022,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn ps_cuts_mounts_and_digests_as_docker_does() {
+    fn ps_cuts_mounts_and_digests() {
         let value = |v: zbus::zvariant::Value<'_>| zbus::zvariant::OwnedValue::try_from(v).unwrap();
         let m = Dict::from([
             (

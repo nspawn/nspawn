@@ -88,7 +88,7 @@ struct DockerHubResult {
     is_official: Option<bool>,
 }
 
-/// What docker search itself queries.
+/// Docker Hub's search endpoint.
 pub async fn search_docker_hub(term: &str, limit: usize) -> Result<Vec<Hit>> {
     let client = reqwest::Client::builder()
         .user_agent(concat!("nspawn/", env!("CARGO_PKG_VERSION")))

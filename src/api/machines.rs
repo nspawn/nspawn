@@ -226,7 +226,7 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
             .unwrap_or("stopped")
             .to_string();
         if listed(all, &state) {
-            // Between two runs, the code of the run that ended, as docker shows it.
+            // Between two runs, the code of the run that ended.
             let (exit_code, finished) = if state == "stopped" || state == "restarting" {
                 match last_exit(sd, &ctx.store, r).await {
                     Some((code, finished)) => (Some(code), finished),
@@ -494,7 +494,7 @@ pub async fn rewrite_hooks(ctx: &Context, sd: &Systemd, record: &ImageRecord) ->
             .await?;
     // The CDI nodes' rules, for a first start systemd makes itself: its hook pass makes
     // them under the unit's device policy. Specs that do not resolve now are the start's
-    // to report, as docker reports them at the start.
+    // to report.
     let mut tuning = record.tuning.clone();
     if let Some(plan) = crate::cdi::plan(&record.tuning).ok().flatten() {
         tuning.devices.extend(crate::cdi::device_paths(
@@ -527,7 +527,7 @@ pub async fn rewrite_hooks(ctx: &Context, sd: &Systemd, record: &ImageRecord) ->
 
 /// Whether an update leaves an unless-stopped machine off the boot list: stopped by hand,
 /// it stays so until its next start, whatever else changes, unless-stopped given again
-/// too, as docker keeps a container stopped by hand through an update.
+/// too.
 fn stopped_by_hand(now: Restart, before: Restart, running: bool) -> bool {
     now == Restart::UnlessStopped && before == Restart::UnlessStopped && !running
 }
@@ -542,8 +542,8 @@ async fn reload_if_needed(sd: &Systemd, unit: &str, written: bool) -> Result<()>
 }
 
 /// A path that two mounts take, one of them a volume, a secret or a device: one would
-/// hide the other, which one depending on how systemd-nspawn orders them. docker refuses
-/// a volume on the path of another or of a tmpfs; two tmpfs on one path are one tmpfs.
+/// hide the other, which one depending on how systemd-nspawn orders them. A volume on
+/// the path of another or of a tmpfs is refused; two tmpfs on one path are one tmpfs.
 pub(crate) fn duplicate_mount_points(record: &ImageRecord) -> Result<()> {
     let mut taken: std::collections::HashSet<String> = record
         .tuning
@@ -567,8 +567,7 @@ pub(crate) fn duplicate_mount_points(record: &ImageRecord) -> Result<()> {
 }
 
 /// Whether a volume is filled from the image: a named one made now, or one `volume create`
-/// or compose made ahead and still empty when a new machine first takes it, as docker
-/// fills a volume.
+/// or compose made ahead and still empty when a new machine first takes it.
 fn seeds(
     volume: &crate::volume::Volume,
     made: bool,
@@ -937,9 +936,9 @@ pub async fn prepare(
     // mountinfo.
     let hostname_file = if record.takes_api_socket() {
         let id = crate::dockerapi::util::container_id(name, record.created);
-        let docker = store.machine_files_dir(name).join("docker");
-        let _ = crate::store::remove_tree(&docker);
-        let dir = docker.join("containers").join(id);
+        let ids = store.machine_files_dir(name).join("docker");
+        let _ = crate::store::remove_tree(&ids);
+        let dir = ids.join("containers").join(id);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let path = dir.join("hostname");
         let hostname = record.tuning.hostname.as_deref().unwrap_or(name);
@@ -1523,8 +1522,7 @@ pub fn apply_flags(r: &mut ImageRecord, args: &StartRequest) -> Result<()> {
     Ok(())
 }
 
-/// docker's refusal of an app with nothing to run, which systemd-nspawn would give a
-/// shell.
+/// The refusal of an app with nothing to run, which systemd-nspawn would give a shell.
 pub(crate) fn no_command(name: &str) -> String {
     format!("no command specified: {name} has neither an entrypoint nor a command to run; give one after the image")
 }
@@ -2107,7 +2105,7 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
             timeout: Some(0),
         };
         stop(ctx, &request, report).await?;
-        // Between two runs no process got it, and docker says nothing then.
+        // Between two runs no process got it, and nothing is said.
         if registered {
             let image = ctx
                 .store
@@ -2163,7 +2161,8 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
         }
         return Err(e);
     }
-    // A paused machine acts on a signal that stops it, as docker unpauses it then.
+    // A paused machine is thawed for a signal that stops it, which it could not act on
+    // frozen.
     if stops {
         let _ = sd
             .thaw_unit(&format!("systemd-nspawn@{}.service", args.name))
@@ -2452,7 +2451,7 @@ pub fn signal_number(name: &str) -> Result<i32> {
             };
         }
     }
-    // The other names docker's signal map has for the same signals.
+    // The other names of the same signals.
     let full = match full.as_str() {
         "SIGIOT" => "SIGABRT".to_string(),
         "SIGCLD" => "SIGCHLD".to_string(),
@@ -2761,8 +2760,8 @@ const FOLLOW_TAIL: u32 = 10;
 /// journalctl's arguments for logs: the console output is in the unit's journal,
 /// earlier runs included (`from_creation` leaves out other machines of the name); a
 /// booted machine also has a journal of its own.
-/// Refuses logs of a machine whose output was dropped (--log-driver none), as docker
-/// does, rather than showing nothing; a booted machine's own journal is still there.
+/// Refuses logs of a machine whose output was dropped (--log-driver none), rather than
+/// showing nothing; a booted machine's own journal is still there.
 pub fn check_logs_kept(record: &ImageRecord, inside: bool) -> Result<()> {
     if inside || !record.tuning.drops_output() {
         return Ok(());
@@ -2930,7 +2929,7 @@ mod tests {
             serde_json::json!([]),
         );
         assert!(duplicate_mount_points(&twice).is_err());
-        // Two tmpfs on one path are one, as in docker.
+        // Two tmpfs on one path are one.
         let tmpfs = record(
             serde_json::json!([]),
             serde_json::json!(["/tmp", "/tmp/:size=1m"]),
@@ -2944,7 +2943,7 @@ mod tests {
     }
 
     #[test]
-    fn volumes_are_seeded_as_docker_seeds_them() {
+    fn volumes_are_seeded_from_the_image_when_new_or_empty() {
         let named: crate::volume::Volume = "data:/var/lib/app".parse().unwrap();
         let host: crate::volume::Volume = "/srv/data:/var/lib/app".parse().unwrap();
         assert!(seeds(&named, true, false, || false));
@@ -3262,9 +3261,9 @@ mod tests {
             assert_eq!(r.program_is_pid1(), expected, "{mode} {pid1} {init}");
             assert_eq!(r.under_stub_init(), mode == "app" && !expected);
         }
-        // An older record says nothing of either: the stub, as before.
+        // A record that says nothing of either runs its program under the stub.
         assert!(record(&format!(r#"{{{base}, "mode": "app"}}"#)).under_stub_init());
-        // What an older nspawn wrote for --init still reads as --init.
+        // A record of --init as a bool reads as --init.
         let old = record(&format!(
             r#"{{{base}, "mode": "app", "tuning": {{"init": true}}}}"#
         ));

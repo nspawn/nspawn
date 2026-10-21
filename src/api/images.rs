@@ -32,7 +32,7 @@ pub struct ImageSummary {
     pub pulled: Option<u64>,
 }
 
-/// The `created` of a record's image config, what docker shows as an image's CREATED.
+/// The `created` of a record's image config: when the image was made, not pulled.
 fn config_created(store: &crate::store::Store, record: &crate::store::ImageRecord) -> Option<u64> {
     let manifest: oci_client::manifest::OciImageManifest =
         serde_json::from_slice(&store.load_manifest(&record.name).ok()?).ok()?;

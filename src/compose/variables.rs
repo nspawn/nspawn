@@ -340,8 +340,8 @@ pub fn table(text: &str, min_width: usize, padding: usize) -> String {
 }
 
 /// The same through docker/cli's copy of the tabwriter, which counts terminal columns:
-/// compose writes ps and volumes with docker's formatter.
-pub fn docker_table(text: &str, min_width: usize, padding: usize) -> String {
+/// compose writes ps and volumes with it.
+pub fn columns_table(text: &str, min_width: usize, padding: usize) -> String {
     lay_out(text, min_width, padding, |piece| {
         crate::columns::string_width(&piece.chars().map(super::gostr::rune).collect::<String>())
     })
@@ -382,10 +382,10 @@ mod tests {
              A                   false               x                   y\n\
              B                   false               z\n"
         );
-        // docker's copy counts terminal columns: a wide character takes two.
+        // That copy counts terminal columns: a wide character takes two.
         assert_eq!(table("A\tB\n\u{4e2d}\tx\n", 1, 1), "A B\n\u{4e2d} x\n");
         assert_eq!(
-            docker_table("A\tB\n\u{4e2d}\tx\n", 1, 1),
+            columns_table("A\tB\n\u{4e2d}\tx\n", 1, 1),
             "A  B\n\u{4e2d} x\n"
         );
     }

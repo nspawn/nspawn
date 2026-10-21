@@ -558,11 +558,11 @@ impl<'a> Builder<'a> {
     async fn resolve_base(&mut self, reference: &str) -> Result<State> {
         let ctx = self.ctx;
         let store = &ctx.store;
-        let image = ImageRef::docker(reference)?;
+        let image = ImageRef::normalized(reference)?;
         let wanted = image.to_string();
         // `build -t NAME` records NAME under the configured registry: an image built
-        // here is taken by that name too, as docker takes its own tags, but nothing
-        // pulled from that registry stands in for a Docker Hub image.
+        // here is taken by that name too, but nothing pulled from that registry stands
+        // in for a Docker Hub image.
         let built = ImageRef::parse(reference, &ctx.config.registry)
             .map(|r| r.to_string())
             .ok()
@@ -1472,7 +1472,7 @@ impl<'a> Builder<'a> {
 }
 
 /// The local name and the reference of each tag, refused before anything is built when
-/// one is no tag docker takes, carries a digest, or names an image another tag names.
+/// one is no valid tag, carries a digest, or names an image another tag names.
 pub fn tag_names(tags: &[String], registry: &str) -> Result<Vec<(String, String)>> {
     let mut out: Vec<(String, String)> = Vec::new();
     for tag in tags {
@@ -2017,7 +2017,7 @@ pub async fn build(
     cancel: CancellationToken,
 ) -> Result<Built> {
     crate::api::require_root("build")?;
-    // A tag that cannot be installed is said before the steps run, as docker says it.
+    // A tag that cannot be installed is said before the steps run, not after them.
     tag_names(&request.tags, &ctx.config.registry)?;
     ctx.store.init()?;
     let id = format!(

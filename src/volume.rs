@@ -217,8 +217,8 @@ pub struct Volume {
     pub read_only: bool,
 }
 
-/// Where docker's clients look for its socket; a machine that mounts either from the host
-/// gets nspawn's Docker API there.
+/// The paths clients of the Docker API look for its socket at; a machine that mounts
+/// either from the host gets nspawn's Docker API there.
 pub const API_SOCKET_PATHS: [&str; 2] = ["/var/run/docker.sock", "/run/docker.sock"];
 
 impl Volume {
@@ -310,7 +310,7 @@ pub fn plain_inside_path(path: &str) -> bool {
 }
 
 /// The place a path inside the machine mounts at, as systemd-nspawn compares mount
-/// points and docker cleans them: repeated and trailing slashes do not count.
+/// points: repeated and trailing slashes do not count.
 pub fn mount_point(path: &str) -> String {
     let parts: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
     format!("/{}", parts.join("/"))
@@ -430,8 +430,8 @@ pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
                 Err(_) => bail!("{value} has no value here; give it as {value}=VALUE"),
             },
         };
-        // Any name but an empty one, as docker takes them: Elasticsearch reads
-        // discovery.type, and the settings file carries such names as they are.
+        // Any name but an empty one: Elasticsearch reads discovery.type, and the
+        // settings file carries such names as they are.
         if name.is_empty() {
             bail!("invalid environment variable: {value}");
         }
@@ -533,7 +533,7 @@ mod tests {
         }
         assert!(parse_volumes(&["none".to_string()]).unwrap().is_empty());
         assert!(parse_volumes(&["/a:/x".to_string(), "/b:/x".to_string()]).is_err());
-        // The same place however it is spelled, as docker cleans the paths.
+        // The same place however it is spelled.
         for (one, other) in [("/a:/x/y", "/b:/x//y"), ("/a:/x", "/b:/x/")] {
             assert_eq!(
                 parse_volumes(&[one.to_string(), other.to_string()])

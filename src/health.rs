@@ -82,7 +82,7 @@ impl Healthcheck {
     }
 
     /// The command the probe runs in an image whose SHELL is `shell`: CMD-SHELL goes
-    /// through it, as docker's getShell does, /bin/sh -c when the image names none.
+    /// through it, as getShell has it, /bin/sh -c when the image names none.
     pub fn argv_in(&self, shell: &[String]) -> Result<Vec<String>> {
         let mut argv = self.argv()?;
         if self.test.first().map(String::as_str) == Some("CMD-SHELL") && !shell.is_empty() {
@@ -187,8 +187,7 @@ impl Overrides {
         if let Some(test) = &self.test {
             hc.test.clone_from(test);
         }
-        // Timings for an image without a healthcheck are taken and probe nothing, as
-        // docker takes them.
+        // Timings for an image without a healthcheck are taken and probe nothing.
         if !hc.disabled() {
             hc.argv()?;
         }
@@ -200,7 +199,7 @@ impl Overrides {
         ] {
             if let Some(value) = given {
                 // What the bus brings as microseconds is held to Go's range too, and to
-                // the least docker's daemon takes.
+                // a millisecond at least.
                 if value > (i64::MAX / 1000) as u64 {
                     bail!("a healthcheck duration of {value} microseconds is past Go's range");
                 }
@@ -558,7 +557,7 @@ async fn drained(mut reader: tokio::task::JoinHandle<String>, pid: u32) -> Strin
 /// One run of the test inside the machine, killed at `timeout`.
 async fn probe(ctx: &Context, name: &str, argv: &[String], timeout: Duration) -> Result<Probe> {
     let start = now_unix();
-    // As the machine's user, as docker runs its probes: the test comes with the image.
+    // As the machine's user: the test comes with the image.
     let user = ctx
         .store
         .load_image(name)?
@@ -602,7 +601,8 @@ async fn probe(ctx: &Context, name: &str, argv: &[String], timeout: Duration) ->
     };
     let mut output = drained(out, pid).await;
     output.push_str(&drained(err, pid).await);
-    // As docker words it, what the probe said before it was stopped kept.
+    // A probe that ran out of time: the timeout said, with what it printed before it
+    // was stopped.
     if exit_code == -1 {
         let limit = go_duration(timeout.as_micros() as u64);
         output = if output.is_empty() {
@@ -657,7 +657,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn timings_under_a_millisecond_are_refused_as_docker_refuses_them() {
+    fn timings_under_a_millisecond_are_refused() {
         let given = |interval: u64| Overrides {
             interval: Some(interval),
             ..Overrides::default()
@@ -769,8 +769,7 @@ mod tests {
         };
         let hc = exec.apply(None).unwrap();
         assert_eq!(hc.argv().unwrap(), ["/app/check", "a b"]);
-        // Timings with nothing to probe are taken, as docker takes them, and probe
-        // nothing.
+        // Timings with nothing to probe are taken, and probe nothing.
         let bare = flags.apply(None).unwrap();
         assert!(!bare.active() && bare.retries == 5);
         // CMD-SHELL in the image's SHELL; CMD as it is.

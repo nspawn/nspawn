@@ -812,7 +812,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             Ok(())
         }
         Command::Inspect(args) => {
-            // As docker inspect: what is found is printed, what is not said after it.
+            // What is found is printed, what is not said after it.
             let mut out = Vec::new();
             let mut missing = Vec::new();
             for name in &args.names {

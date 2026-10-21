@@ -1,4 +1,4 @@
-//! The Docker Engine API, read-only, for the machines that mount docker's socket:
+//! The Docker Engine API, read-only, for the machines that mount its socket:
 //! reverse proxies that follow container labels, dashboards and log viewers find nspawn's
 //! machines through it. It is served by `nspawn api-serve NAME`, which systemd starts
 //! from the machine's own socket (`nspawn-api@NAME.socket`) when something connects, and
@@ -153,8 +153,8 @@ fn streaming(content_type: &str) -> (Response<Body>, tokio::sync::mpsc::Sender<B
 
 /// The query string's parameters, percent-decoded as Go's ParseQuery decodes them: a
 /// pair that does not decode is left out, and the first error kept for the requests
-/// docker answers it for. A key given twice keeps its first value, as docker reads it,
-/// except where all are read.
+/// the API answers it for. A key given twice keeps its first value, except where all are
+/// read.
 fn query(raw: &str) -> Query {
     let mut pairs = Vec::new();
     let mut bad = None;
@@ -219,7 +219,7 @@ impl Query {
             .map(|(_, v)| v.as_str())
     }
 
-    /// docker's BoolValue: anything but nothing, 0, no, false and none is true; absent is
+    /// BoolValue: anything but nothing, 0, no, false and none is true; absent is
     /// `default`.
     fn flag(&self, key: &str, default: bool) -> bool {
         match self.get(key) {
@@ -647,7 +647,7 @@ fn container_matches(
     if !filters.matches("status", m.state()) {
         return false;
     }
-    // As docker matches it: with the slash and without.
+    // With the slash and without.
     if !filters.matches("name", &format!("/{}", m.name())) && !filters.matches("name", m.name()) {
         return false;
     }
@@ -955,7 +955,7 @@ fn events(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
 /// `nspawn kill` sends it, which acme-companion and docker-gen use to have nginx read
 /// new certificates and configuration.
 async fn kill(ctx: &Arc<Context>, id: &str, query: &Query) -> Response<Body> {
-    // The signal first, as docker checks it before the container; every error says
+    // The signal first, checked before the container; every error says
     // which container it was for.
     let failed = |status: StatusCode, text: String| {
         error(status, format!("cannot kill container: {id}: {text}"))
@@ -985,8 +985,8 @@ async fn kill(ctx: &Arc<Context>, id: &str, query: &Query) -> Response<Body> {
             ),
         );
     }
-    // Between two runs of its restart policy no process gets the signal: as docker,
-    // SIGKILL or the stop signal ends the loop, any signal does without a stop signal of
+    // Between two runs of its restart policy no process gets the signal: SIGKILL or the
+    // stop signal ends the loop, any signal does without a stop signal of
     // its own, and the rest is answered without doing anything.
     let signal = if restarting {
         if !ends_restarts(machine.record.effective_stop_signal(), number) {
@@ -1085,7 +1085,7 @@ fn docker_signal(raw: &str) -> Result<i32, String> {
     Ok(number as i32)
 }
 
-/// docker's killWithSignal: whether `signal` keeps a container from being restarted.
+/// killWithSignal: whether `signal` keeps a container from being restarted.
 fn ends_restarts(stop_signal: Option<&str>, signal: i32) -> bool {
     signal == nix::libc::SIGKILL
         || stop_signal.is_none_or(|s| crate::api::machines::signal_number(s).ok() == Some(signal))
@@ -1136,7 +1136,7 @@ mod tests {
         assert!(!ends_restarts(Some("SIGQUIT"), nix::libc::SIGHUP));
     }
 
-    /// Every request the tools made of docker's API, as recorded by
+    /// Every request the tools made of the Docker API, as recorded by
     /// tests/dockerapi/oracle.sh, is one this API answers.
     #[test]
     fn what_the_tools_ask_is_served() {

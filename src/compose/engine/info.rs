@@ -12,7 +12,7 @@ use crate::client::{self, Dict};
 use crate::compose::cli::{
     EventsArgs, ImagesArgs, LsArgs, PortArgs, PsArgs, StatsArgs, TopArgs, VolumesArgs,
 };
-use crate::compose::variables::{docker_table, table};
+use crate::compose::variables::{columns_table, table};
 
 fn now() -> u64 {
     SystemTime::now()
@@ -148,7 +148,7 @@ fn image_of(e: &Engine<'_>, m: &Machine) -> String {
     if let Some(project) = &e.project {
         if let Ok(service) = super::convert::service(project, &m.service) {
             if let Some(image) = service.get("image").and_then(|v| v.as_str()) {
-                if crate::reference::ImageRef::docker(image)
+                if crate::reference::ImageRef::normalized(image)
                     .is_ok_and(|r| r.to_string() == reference)
                 {
                     return image.to_string();
@@ -268,7 +268,7 @@ pub async fn ps(e: &mut Engine<'_>, a: &PsArgs, out: &mut dyn Write) -> Result<(
                     r["Ports"]
                 ));
             }
-            out.write_all(docker_table(&text, 10, 3).as_bytes())?;
+            out.write_all(columns_table(&text, 10, 3).as_bytes())?;
         }
         "json" => {
             for (m, r) in machines.iter().zip(&rows) {
@@ -405,7 +405,7 @@ pub async fn ls(e: &mut Engine<'_>, a: &LsArgs, out: &mut dyn Write) -> Result<(
         {
             continue;
         }
-        // Without --all, as docker lists containers: running, paused or restarting.
+        // Without --all: running, paused or restarting machines.
         let state = state(&m).to_string();
         if !a.all && !matches!(state.as_str(), "running" | "paused" | "restarting") {
             continue;
@@ -538,7 +538,7 @@ pub async fn images(e: &mut Engine<'_>, a: &ImagesArgs, out: &mut dyn Write) -> 
         return Ok(());
     }
     let format = a.format.as_deref().unwrap_or("");
-    // As docker compose writes JSON: its encoder's line, then Println's.
+    // JSON as Go's encoder writes a line, then Println's newline.
     if format == "json" {
         let text = if rows.is_empty() {
             "null".to_string()
@@ -698,7 +698,7 @@ fn images_map(rows: &[ImageRow]) -> String {
 /// The repository and tag of a machine's image as docker compose reads them from the
 /// image it was made from: its familiar name, and no tag for one by digest.
 fn repository_and_tag(reference: &str) -> (String, String) {
-    match crate::reference::ImageRef::docker(reference) {
+    match crate::reference::ImageRef::normalized(reference) {
         Ok(r) => (
             crate::dockerapi::util::familiar(&format!("{}/{}", r.registry, r.repository)),
             if r.digest.is_some() {
@@ -873,7 +873,7 @@ pub async fn volumes(e: &mut Engine<'_>, a: &VolumesArgs, out: &mut dyn Write) -
         }
         return Ok(());
     }
-    // A volume as docker compose's --format sees one.
+    // A volume as --format templates see one.
     let fields = |name: &str, path: &str| {
         let na = || serde_json::Value::from("N/A");
         vec![
@@ -900,7 +900,7 @@ pub async fn volumes(e: &mut Engine<'_>, a: &VolumesArgs, out: &mut dyn Write) -
             for (v, _) in &listed {
                 text.push_str(&format!("local\t{v}\n"));
             }
-            out.write_all(docker_table(&text, 10, 3).as_bytes())?;
+            out.write_all(columns_table(&text, 10, 3).as_bytes())?;
         }
         Some(format) => {
             let objects: Vec<serde_json::Value> = listed
@@ -1029,8 +1029,8 @@ pub async fn events(e: &mut Engine<'_>, a: &EventsArgs, out: &mut dyn Write) -> 
                         .collect()
                 })
                 .unwrap_or_default();
-            // The machine's labels, as docker's container events carry them, compose's
-            // own left out as compose leaves them.
+            // The machine's labels, which container events carry, compose's own left
+            // out.
             for (k, v) in &labels {
                 if !k.starts_with("com.docker.compose.") {
                     attributes

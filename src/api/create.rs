@@ -243,7 +243,8 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         draft.healthcheck = Some(hc);
     }
     request.tuning.apply(&mut draft.tuning)?;
-    // Refused when the machine is made, as docker refuses it, not at its first start.
+    // Refused when the machine is made, not at its first start: a machine that could
+    // never start is not made.
     crate::api::machines::duplicate_mount_points(&draft)?;
     // Refused here as start refuses them: a booted machine that kept them would never
     // start.

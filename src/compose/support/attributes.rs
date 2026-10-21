@@ -762,8 +762,8 @@ pub static VALUES: &[Value] = &[
     ),
     when("networks.*.ipam.driver", Is("default"), Full),
     when("volumes.*.driver", Is("local"), Full),
-    // The neutral values of what is refused: docker's default driver is the empty
-    // one, and false asks for nothing.
+    // The neutral values of what is refused: the default driver is the empty one, and
+    // false asks for nothing.
     when("networks.*.driver", Is(""), Full),
     when("networks.*.ipam.driver", Is(""), Full),
     when("volumes.*.driver", Is(""), Full),

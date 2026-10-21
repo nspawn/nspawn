@@ -55,7 +55,7 @@ pub fn split_version(path: &str) -> (Option<(u32, u32)>, &str) {
     }
 }
 
-/// HumanDuration of go-units, which docker's statuses are made of.
+/// HumanDuration of go-units, which the API's statuses are made of.
 pub fn human_duration(seconds: u64) -> String {
     let minutes = seconds / 60;
     // Hours are rounded, as the original adds half an hour before truncating.
@@ -105,10 +105,10 @@ pub fn rfc3339_nano(usec: u64, fixed: bool) -> String {
     }
 }
 
-/// What docker writes for a time never reached (a container that never finished).
+/// What the API writes for a time never reached (a container that never finished).
 pub const ZERO_TIME: &str = "0001-01-01T00:00:00Z";
 
-/// A container's Command as docker lists it: the program, then its arguments, each one
+/// A container's Command as the API lists it: the program, then its arguments, each one
 /// that has a space in single quotes.
 pub fn command_line(argv: &[String]) -> String {
     match argv.split_first() {
@@ -130,7 +130,7 @@ pub fn command_line(argv: &[String]) -> String {
     }
 }
 
-/// A reference as docker shows an image: without Docker Hub's host and library/.
+/// A reference as the API shows an image: without Docker Hub's host and library/.
 pub fn familiar(reference: &str) -> String {
     let short = reference
         .strip_prefix("docker.io/")

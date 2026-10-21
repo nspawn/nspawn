@@ -35,7 +35,7 @@ pub enum ModeChoice {
     Auto,
     /// Boot the image's init system (systemd machines).
     Boot,
-    /// Run the image's entrypoint as a single program (docker-style images).
+    /// Run the image's entrypoint as a single program (application images).
     App,
 }
 

@@ -308,8 +308,8 @@ impl Tuning {
             out.push("ReadOnly=yes".to_string());
         }
         for mount in &self.tmpfs {
-            // systemd-nspawn makes a tmpfs given no options 0755 and root's; docker's, as
-            // the kernel's, is 1777, which a program of another user writes to.
+            // systemd-nspawn makes a tmpfs given no options 0755 and root's; the kernel's
+            // default, 1777, lets a program of another user write to it.
             if mount.contains(':') {
                 out.push(format!("TemporaryFileSystem={mount}"));
             } else {

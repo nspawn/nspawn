@@ -177,7 +177,7 @@ pub fn valid_machine_name(name: &str) -> bool {
 /// An image of a compose file as nspawn's registry client reads it: one that names no
 /// registry comes from Docker Hub, an official one under library/.
 pub fn image_reference(image: &str) -> Result<crate::reference::ImageRef> {
-    crate::reference::ImageRef::docker(image)
+    crate::reference::ImageRef::normalized(image)
 }
 
 /// Runs a command that drives machines; the error is the line to print.
@@ -431,8 +431,8 @@ fn check_arguments(command: &ComposeCommand) -> Result<()> {
     }
 }
 
-/// The name of a command that changes machines, images, networks or volumes; docker
-/// compose simulates those under --dry-run, nspawn compose refuses them.
+/// The name of a command that changes machines, images, networks or volumes, which
+/// --dry-run refuses: nothing is simulated.
 fn changes_state(command: &ComposeCommand) -> Option<&'static str> {
     use ComposeCommand as C;
     Some(match command {

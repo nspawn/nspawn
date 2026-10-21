@@ -82,8 +82,7 @@ fn read_stdin() -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// How bytes are compressed, by their magic as buildx's isArchive and docker's
-/// DetectCompression tell it.
+/// How bytes are compressed, by their magic as isArchive and DetectCompression tell it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Compression {
     None,
@@ -573,7 +572,7 @@ pub async fn dockerfile(args: BuildArgs, client: &Client, config: &Config) -> Re
             .collect(),
     );
     put_all("no_cache_filter", d.no_cache_filter.clone());
-    // docker's ValidateLabel: a KEY alone is KEY with an empty value.
+    // As ValidateLabel reads them: a KEY alone is KEY with an empty value.
     put_all(
         "labels",
         d.label

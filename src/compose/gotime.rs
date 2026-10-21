@@ -16,8 +16,8 @@ pub fn local_at(unix: i64) -> (i64, String) {
     local_zone().map_or_else(|| (0, "UTC".to_string()), |zone| zone.at(unix))
 }
 
-/// Go's time.Time.String of a Unix time in the local zone, as docker prints a
-/// container's CreatedAt: `2006-01-02 15:04:05 -0700 MST`, the offset again where the
+/// Go's time.Time.String of a Unix time in the local zone, as ps prints a machine's
+/// CreatedAt: `2006-01-02 15:04:05 -0700 MST`, the offset again where the
 /// zone has no name.
 pub fn time_string(unix: i64) -> String {
     let (offset, name) = local_at(unix);
@@ -413,7 +413,7 @@ fn tzset(s: &str, sec: i64) -> Option<(i64, String)> {
     Some((offset, name.to_string()))
 }
 
-/// docker's timetypes.GetTimestamp: a Go duration before `now`, an RFC 3339 time or
+/// timetypes.GetTimestamp: a Go duration before `now`, an RFC 3339 time or
 /// date in one of the forms it tries (in the zone of `offset` when it names none), or
 /// Unix seconds; as `seconds[.nanoseconds]`.
 pub fn get_timestamp(value: &str, now: f64, offset: i64) -> Result<String, String> {

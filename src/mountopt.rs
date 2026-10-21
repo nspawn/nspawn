@@ -129,8 +129,8 @@ pub fn parse(text: &str) -> Result<Mount> {
             "readonly" | "ro" => read_only = bool_value(&key, value, given)?,
             // A setting of file sharing with a VM; nothing here.
             "consistency" => {}
-            // A bind into a machine propagates nothing either way; a mode docker's daemon
-            // refuses is refused all the same.
+            // A bind into a machine propagates nothing either way; an unknown mode is
+            // refused all the same.
             "bind-propagation" => {
                 bind_options = true;
                 let mode = value.to_lowercase();
@@ -147,7 +147,7 @@ pub fn parse(text: &str) -> Result<Mount> {
                 bail!("bind-nonrecursive is deprecated, use bind-recursive=disabled instead")
             }
             "bind-recursive" => {
-                // Enabled is no bind option of its own, as docker's CLI has it.
+                // Enabled is no bind option of its own.
                 bind_options |= value != "enabled";
                 match value {
                     "enabled" => {}
@@ -301,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn the_forms_docker_takes() {
+    fn the_forms_mount_takes() {
         assert_eq!(
             ok("type=bind,source=/srv,target=/data"),
             Mount::Volume("/srv:/data".into())
@@ -355,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn what_docker_refuses_and_what_nspawn_cannot_do() {
+    fn what_is_refused_and_what_nspawn_cannot_do() {
         assert_eq!(err(""), "value is empty");
         assert_eq!(
             err("type=bind,target"),
@@ -433,15 +433,15 @@ mod tests {
     }
 
     #[test]
-    fn keys_read_as_docker_s_cli_reads_them() {
+    fn keys_and_values_are_read_raw() {
         // enabled is no bind option: a volume takes it.
         assert!(parse("type=volume,src=v,dst=/d,bind-recursive=enabled").is_ok());
-        // The raw value, as docker's CLI matches it: no bool stands for a mode.
+        // The raw value is matched: no bool stands for a mode.
         assert!(err("type=volume,src=v,dst=/d,bind-recursive=true")
             .contains("invalid value for bind-recursive: true"));
         assert!(err("type=bind,src=/a,dst=/d,bind-recursive=false")
             .contains("invalid value for bind-recursive: false"));
-        // A propagation mode docker's daemon does not know is refused.
+        // An unknown propagation mode is refused.
         assert!(err("type=bind,src=/srv,dst=/data,bind-propagation=bogus")
             .contains("invalid propagation mode: bogus"));
         assert!(err("type=volume,src=v,dst=/d,volume-nocopy=maybe").contains("boolean"));

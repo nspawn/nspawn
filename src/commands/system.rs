@@ -393,7 +393,7 @@ pub async fn builder_du(args: BuilderDuArgs, client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// docker system prune's question: what goes, and the filters that narrow it.
+/// The question of system prune: what goes, and the filters that narrow it.
 fn prune_warning(all: bool, volumes: bool, filters: &[String]) -> String {
     let mut warning = String::from("WARNING! This will remove:\n  - all stopped containers\n  - all networks not used by at least one container\n");
     if volumes {
@@ -520,7 +520,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sizes_as_docker_prints_them() {
+    fn sizes_print_in_decimal_units() {
         for (bytes, text) in [
             (0, "0B"),
             (999, "999B"),

@@ -6,7 +6,7 @@ use super::filters::Filters;
 use super::util::{container_id, familiar, network_id};
 use crate::api::events::Event;
 
-/// docker's events for one of nspawn's: none for what docker has no word for, more for a
+/// The API's events for one of nspawn's: none for what it has no word for, more for a
 /// start or an end on bridge networks (the machine's own and a network connect or
 /// disconnect for each network, given as name and ID).
 pub fn translate(event: &Event, networks: &[(String, String)]) -> Vec<Value> {
@@ -133,8 +133,8 @@ pub fn translate(event: &Event, networks: &[(String, String)]) -> Vec<Value> {
     }
 }
 
-/// Whether a translated event passes the filters of GET /events, as docker matches
-/// them: `event=health_status` takes every health status, a container by its ID, its
+/// Whether a translated event passes the filters of GET /events: `event=health_status`
+/// takes every health status, a container by its ID, its
 /// name or a prefix of its ID.
 pub fn passes(filters: &Filters, message: &Value) -> bool {
     let field = |path: &[&str]| -> String {
@@ -200,11 +200,11 @@ pub fn passes(filters: &Filters, message: &Value) -> bool {
     filters.labels("label", &labels)
 }
 
-/// An image's name without its tag or digest, as docker's stripTag gives it; what is no
+/// An image's name without its tag or digest, as stripTag gives it; what is no
 /// reference stays as it is.
 fn strip_tag(image: &str) -> String {
     let id = image.len() == 64 && image.bytes().all(|b| b.is_ascii_hexdigit());
-    match crate::reference::ImageRef::docker(image) {
+    match crate::reference::ImageRef::normalized(image) {
         Ok(r) if !id => familiar(&format!("{}/{}", r.registry, r.repository)),
         _ => image.to_string(),
     }

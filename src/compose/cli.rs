@@ -612,7 +612,7 @@ pub struct CpArgs {
     pub source: Option<String>,
     #[arg(value_name = "DEST")]
     pub destination: Option<String>,
-    /// More than cp takes, for its count to be said as docker says it.
+    /// More than cp takes, for the error to say how many were given.
     #[arg(hide = true)]
     pub extra: Vec<String>,
 }
@@ -872,7 +872,7 @@ pub struct PortArgs {
     pub service: Option<String>,
     #[arg(value_name = "PRIVATE_PORT")]
     pub private_port: Option<String>,
-    /// More than port takes, for its count to be said as docker says it.
+    /// More than port takes, for the error to say how many were given.
     #[arg(hide = true)]
     pub extra: Vec<String>,
 }

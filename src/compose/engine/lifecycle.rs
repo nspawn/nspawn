@@ -110,8 +110,8 @@ fn down_takes(
 
 /// down's and kill's --remove-orphans, whose default is COMPOSE_REMOVE_ORPHANS of the
 /// process's environment, as compose makes it the flag's default.
-/// --remove-orphans, COMPOSE_REMOVE_ORPHANS of the process when it is not given, as
-/// docker compose takes the variable for the flag's default.
+/// --remove-orphans, COMPOSE_REMOVE_ORPHANS of the process when it is not given: the
+/// variable is the flag's default.
 pub(super) fn orphans_too(flag: Option<bool>) -> bool {
     flag.unwrap_or_else(|| {
         std::env::var("COMPOSE_REMOVE_ORPHANS").is_ok_and(|v| up::string_to_bool(&v))
@@ -226,7 +226,7 @@ async fn volumes_down(e: &Engine<'_>) -> Result<()> {
         .map(|v| client::string(v, "name"))
         .collect();
     for (key, def) in &project.volumes {
-        // The host directory a volume binds stays, as with docker.
+        // The host directory a volume binds stays: it is the user's.
         if def.get(&["external"]) == Some(&Value::Bool(true))
             || !matches!(super::convert::volume_device(project, key), Ok(None))
         {
@@ -605,9 +605,9 @@ pub async fn restart(e: &mut Engine<'_>, a: &RestartArgs) -> Result<()> {
     Ok(())
 }
 
-/// The machines kill signals, as docker compose's do: running ones, and those between two
-/// runs of their restart policy, which docker counts as running; one still starting only
-/// for SIGKILL, which ends its start.
+/// The machines kill signals: running ones, and those between two runs of their restart
+/// policy, which count as running; one still starting only for SIGKILL, which ends its
+/// start.
 fn kills(m: &Machine, sigkill: bool) -> bool {
     m.running() || m.state == "restarting" || (sigkill && m.state == "starting")
 }

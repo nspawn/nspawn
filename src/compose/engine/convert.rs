@@ -464,8 +464,8 @@ fn volumes(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
                 let create = sub(volume, "bind")
                     .and_then(|b| b.get("create_host_path"))
                     .is_none_or(|v| v != &Value::Bool(false));
-                // docker's socket is the machine's Docker API, which nspawn provides: a
-                // host without docker must not get a directory there.
+                // A machine's Docker API socket is nspawn's: a host without one of its own
+                // must not get a directory there.
                 let api = crate::volume::API_SOCKET_PATHS.contains(&source);
                 if create && !api && !std::path::Path::new(source).exists() {
                     made.host_paths.push(source.to_string());
@@ -511,8 +511,8 @@ fn volumes(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
             ),
         }
     }
-    // use_api_socket: the socket where docker's clients look for it, unless the service
-    // mounts something there itself.
+    // use_api_socket: the Docker API socket where its clients look for it, unless the
+    // service mounts something there itself.
     if service.get("use_api_socket") == Some(&Value::Bool(true))
         && !binds
             .iter()
@@ -578,8 +578,7 @@ fn secrets(spec: &Spec, service: &Map, made: &mut Made) {
 /// What the machine runs, and its environment. An entrypoint of the file replaces the
 /// image's and drops its command: the whole command line goes to the machine as its
 /// command, after an empty entrypoint. An empty one with no command keeps the image's
-/// command, as docker merges them: compose gives it [] where the command line gives
-/// [""].
+/// command: compose gives [] for it where the command line gives [""].
 fn program(spec: &Spec, service: &Map, made: &mut Made) {
     let entrypoint = service.get("entrypoint").and_then(Value::as_seq);
     let command = service.get("command").and_then(Value::as_seq);
@@ -754,7 +753,7 @@ fn settings(spec: &Spec, service: &Map, made: &mut Made) {
             put(o, option, true);
         }
     }
-    // Either way it says something: false makes the program PID 1, as docker runs it.
+    // Either way it says something: false makes the program PID 1.
     if let Some(Value::Bool(init)) = service.get("init") {
         put(o, "init", *init);
     }
@@ -1343,7 +1342,7 @@ services:
         assert_eq!(list(&web, "ulimits"), ["nofile=64:128"]);
         assert_eq!(text(&web, "log_driver").as_deref(), Some("local"));
         assert_eq!(web.options.get("stop_timeout"), Some(&Bus::from(90u64)));
-        // A negative grace period waits for as long as the program takes, as docker's.
+        // A negative grace period waits for as long as the program takes.
         let forever = self::project(
             "q",
             "services:\n  web:\n    image: nginx\n    stop_grace_period: -1s\n",

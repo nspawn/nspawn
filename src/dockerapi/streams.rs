@@ -18,7 +18,7 @@ use crate::api::machines::LogsRequest;
 use crate::api::stats::Sample;
 use crate::api::Context;
 
-/// A log line as docker multiplexes them without a terminal: the stream (1 for
+/// A log line as the API multiplexes them without a terminal: the stream (1 for
 /// standard output), its length, then the line.
 pub fn frame(stream: u8, payload: &[u8]) -> Bytes {
     let mut out = Vec::with_capacity(payload.len() + 8);
@@ -67,8 +67,7 @@ pub async fn logs(query: LogsQuery, tx: Sender<Bytes>) {
         return;
     };
     let mut lines = tokio::io::BufReader::new(stdout).lines();
-    // A follow ends with the machine, as docker's does with the container: machined's
-    // file of it goes when it stops.
+    // A follow ends with the machine: machined's file of it goes when it stops.
     let registered = std::path::Path::new("/run/systemd/machines").join(&query.request.machine);
     let mut ticks = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut gone = 0;
@@ -103,7 +102,7 @@ pub async fn logs(query: LogsQuery, tx: Sender<Bytes>) {
     let _ = child.kill().await;
 }
 
-/// Total CPU time of the host in nanoseconds, from /proc/stat, as docker reports it:
+/// Total CPU time of the host in nanoseconds, from /proc/stat, as the API reports it:
 /// user, nice, system, idle, iowait, irq and softirq, steal left out.
 fn system_cpu_ns() -> u64 {
     let text = std::fs::read_to_string("/proc/stat").unwrap_or_default();
@@ -127,7 +126,7 @@ fn first_seven(stat: &str) -> u64 {
         .sum()
 }
 
-/// The host's CPUs as docker counts them: the cpuN lines of /proc/stat, whatever this
+/// The host's CPUs as the API counts them: the cpuN lines of /proc/stat, whatever this
 /// process may run on.
 fn online_cpus() -> u64 {
     let text = std::fs::read_to_string("/proc/stat").unwrap_or_default();
@@ -189,7 +188,7 @@ fn cpu(reading: Option<&Reading>) -> Value {
     cpu
 }
 
-/// docker's stats object of a reading, with the one before for the CPU's rate.
+/// The stats object of a reading, with the one before for the CPU's rate.
 pub fn stats_json(
     name: &str,
     id: &str,
@@ -274,7 +273,7 @@ pub async fn stats(
     }
 }
 
-/// docker's events, from `since` (unix seconds) or only new ones, until `until` or
+/// The API's events, from `since` (unix seconds) or only new ones, until `until` or
 /// the client goes.
 /// A machine's attributes (created, image) and labels.
 type Known = (BTreeMap<String, String>, BTreeMap<String, String>);

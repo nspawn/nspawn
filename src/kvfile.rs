@@ -103,7 +103,7 @@ mod tests {
 
     /// The cases of the reference's kvfile_test.go.
     #[test]
-    fn as_docker_reads_them() {
+    fn files_read_as_the_reference_reads_them() {
         assert_eq!(
             lines(
                 "\u{feff}# comment\n  FOO=bar baz  \n\nEMPTY=\nQUOTED=\"x\"\r\nFROM_ENV\nNOT_SET\n"

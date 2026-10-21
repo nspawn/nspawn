@@ -157,19 +157,16 @@ pub fn parse_memory_swap(text: &str) -> Result<i64> {
     i64::try_from(bytes).map_err(|_| anyhow::anyhow!("{text}: too large for --memory-swap"))
 }
 
-/// --memory: a size of at least 4m, or 0 for none.
-/// --restart as docker takes it: no, on-failure[:N], always or unless-stopped. The
-/// count of on-failure is not kept: systemd restarts a unit on every failure.
 /// The stop timeout of a stop that waits for as long as the program takes, never killing
-/// it, as docker's negative ones do.
+/// it: what a negative --stop-timeout asks for.
 pub const NO_STOP_TIMEOUT: u64 = u64::MAX;
 
-/// A stop timeout as docker takes it, in seconds: a negative one is none.
+/// A stop timeout in seconds, as --stop-timeout takes it: a negative one is none.
 pub fn stop_seconds(seconds: i64) -> u64 {
     u64::try_from(seconds).unwrap_or(NO_STOP_TIMEOUT)
 }
 
-/// A stop timeout as docker shows it, -1 for none.
+/// A stop timeout as inspect shows it, -1 for none.
 pub fn shown_stop_timeout(seconds: u64) -> i64 {
     i64::try_from(seconds).unwrap_or(-1)
 }
@@ -204,6 +201,8 @@ impl clap::builder::TypedValueParser for RestartParser {
     }
 }
 
+/// --restart: no, on-failure[:N], always or unless-stopped. The count of on-failure is
+/// not kept: systemd restarts a unit on every failure.
 pub fn parse_restart(text: &str) -> Result<Restart> {
     let (policy, count) = match text.split_once(':') {
         Some((policy, count)) => (policy, Some(count)),
@@ -225,6 +224,7 @@ pub fn parse_restart(text: &str) -> Result<Restart> {
     }
 }
 
+/// --memory: a size of at least 4m, or 0 for none.
 pub fn parse_memory(text: &str) -> Result<u64> {
     let bytes = parse_size(text)?;
     if bytes > 0 && bytes < MIN_MEMORY {
@@ -292,7 +292,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_negative_stop_timeout_is_none_as_in_docker() {
+    fn a_negative_stop_timeout_is_none() {
         assert_eq!(stop_seconds(10), 10);
         assert_eq!(stop_seconds(0), 0);
         assert_eq!(stop_seconds(-1), NO_STOP_TIMEOUT);

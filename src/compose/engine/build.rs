@@ -1,5 +1,5 @@
 //! The images of services with a build section: built by nspawn's builder from their
-//! context, named as docker compose names them, with the labels it gives them.
+//! context, named PROJECT-SERVICE when they name no image, with compose's labels.
 
 use std::collections::BTreeMap;
 

@@ -384,7 +384,7 @@ pub(crate) fn flags(r: &ImageRecord) -> (Vec<Vec<String>>, Vec<String>) {
 }
 
 /// What the script cannot give of a healthcheck: the command line has no exec form of
-/// one, as docker's has none.
+/// one.
 fn health_note(r: &ImageRecord) -> Option<String> {
     let hc = r.healthcheck.as_ref()?;
     let image = r.run.healthcheck.as_ref().map_or(&[][..], |h| &h.test[..]);
@@ -436,7 +436,8 @@ fn health_flags(r: &ImageRecord) -> Vec<Vec<String>> {
     out
 }
 
-/// docker's other flags, as the machine keeps them.
+/// The machine's other flags (hostname, user, capabilities, tmpfs and the rest of
+/// Tuning), as it keeps them.
 fn tuning_flags(t: &crate::tuning::Tuning) -> Vec<Vec<String>> {
     let mut out: Vec<Vec<String>> = Vec::new();
     let flag = |out: &mut Vec<Vec<String>>, name: &str, value: &str| out.push(option(name, value));

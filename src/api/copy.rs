@@ -88,7 +88,7 @@ pub struct Plan {
     pub top: Option<OsString>,
 }
 
-/// docker cp's rules for a destination. `contents` is a source written `DIR/.`,
+/// The rules for the destination of a copy. `contents` is a source written `DIR/.`,
 /// `trailing_slash` a destination written `DIR/`.
 pub fn plan(
     source_is_dir: bool,
@@ -148,14 +148,14 @@ pub fn plan(
     }
 }
 
-/// How many links a destination is followed through after the first, as docker cp's
+/// How many links a destination is followed through after the first, as
 /// CopyInfoDestinationPath counts them.
 const DESTINATION_LINKS: usize = 10;
 
 /// How many links resolving a path inside a machine follows, as FollowSymlinkInScope.
 const SCOPED_LINKS: usize = 255;
 
-/// docker cp's destination on the command line's side: a final link stands for what it
+/// The destination of a copy on the command line's side: a final link stands for what it
 /// names, each target joined to the link's directory as written, so the copy is written
 /// there, whether that exists or not, and the link stays. `read_link` gives a path's
 /// link target, None for anything else; `rooted` paths are relative to a root that `..`
@@ -182,9 +182,9 @@ pub fn follow_destination(
     Ok(path)
 }
 
-/// docker cp's destination inside a machine: a final link stands for what it names,
-/// resolved all the way inside the root as docker's daemon resolves it (LinkTarget),
-/// links on the way included, so the copy is written there, whether that exists or not,
+/// The destination of a copy inside a machine: a final link stands for what it names,
+/// resolved all the way inside the root as LinkTarget resolves it, links on the way
+/// included, so the copy is written there, whether that exists or not,
 /// and the link stays.
 pub fn destination_in(root: BorrowedFd<'_>, dst: &Path) -> Result<PathBuf> {
     if dst.as_os_str().is_empty() || link_in(root, dst)?.is_none() {
@@ -1848,7 +1848,7 @@ mod tests {
         std::os::unix::fs::symlink("/nowhere/new", root.join("etc/dangling")).unwrap();
         std::os::unix::fs::symlink("loop", root.join("etc/loop")).unwrap();
         std::os::unix::fs::symlink("../../../../etc/resolv.conf", root.join("etc/up")).unwrap();
-        // As docker's daemon gives LinkTarget: through the links on the way too.
+        // LinkTarget goes through the links on the way too.
         fs::create_dir_all(root.join("var/www/app/releases/5")).unwrap();
         fs::create_dir_all(root.join("var/www/app/shared/storage")).unwrap();
         std::os::unix::fs::symlink("releases/5", root.join("var/www/app/current")).unwrap();
@@ -1866,7 +1866,7 @@ mod tests {
             follow("etc/resolv.conf").unwrap(),
             Path::new("run/systemd/resolve/stub-resolv.conf")
         );
-        // Created where it points, as docker does.
+        // Created where it points.
         assert_eq!(follow("etc/dangling").unwrap(), Path::new("nowhere/new"));
         assert_eq!(
             follow("etc/up").unwrap(),

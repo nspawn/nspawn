@@ -1621,7 +1621,7 @@ mod tests {
         };
         let start = start.options;
         assert_eq!(start.restart, Some(crate::policy::Restart::UnlessStopped));
-        // docker's on-failure with a count, the count not kept.
+        // on-failure with a count, the count not kept.
         let counted =
             Cli::try_parse_from(["nspawn", "start", "web", "--restart", "on-failure:3"]).unwrap();
         let Command::Start(counted) = counted.command else {
@@ -1633,7 +1633,7 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["nspawn", "start", "web", "--restart", "always:3"]).is_err());
         assert!(Cli::try_parse_from(["nspawn", "start", "web", "--restart", "sometimes"]).is_err());
-        // docker's -1 for a stop that waits as long as the program takes.
+        // -1 for a stop that waits as long as the program takes.
         let Command::Stop(stop) = Cli::try_parse_from(["nspawn", "stop", "-t", "-1", "web"])
             .unwrap()
             .command
@@ -1660,7 +1660,7 @@ mod tests {
             panic!("not start");
         };
         assert_eq!(forever.options.tuning.stop_timeout, Some(-1));
-        // What Makefiles and docker habits give.
+        // What Makefiles and habits give: flags taken and ignored.
         assert!(
             Cli::try_parse_from(["nspawn", "build", "--rm", "--force-rm", "-t", "app", "."])
                 .is_ok()
@@ -1877,8 +1877,8 @@ mod tests {
         assert!(Cli::try_parse_from(["nspawn", "logs", "web", "--since", "-10min"]).is_ok());
         assert!(run.detach);
         assert_eq!(run.options.publish, ["80:80"]);
-        // docker's file and long mount flags on the three commands that make or start a
-        // machine.
+        // The env and label files and the long mount flag on the three commands that make
+        // or start a machine.
         for args in [
             &[
                 "nspawn",
