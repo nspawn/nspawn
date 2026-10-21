@@ -339,7 +339,7 @@ impl Manager {
     }
 
     /// Local images, like `images ls`: name, kind, backend, origin, reference, size,
-    /// read_only.
+    /// read_only, signed_by, image_only, created, pulled.
     async fn list_images(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Vec<Dict>> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Inspect).await?;
@@ -347,9 +347,7 @@ impl Manager {
         Ok(images.iter().map(values::image).collect())
     }
 
-    /// Everything nspawn keeps about one image: reference, digest, backend, mode,
-    /// network, networks, address, addresses, aliases, ports, volumes, env, entrypoint,
-    /// cmd, command, and the OCI config's image_env, working_dir, user and stop_signal.
+    /// Everything nspawn keeps about one image, as `values::record` has it.
     async fn get_image(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<Dict> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Inspect).await?;
@@ -429,7 +427,7 @@ impl Manager {
     }
 
     /// Like `create`. Options: backend (s), network (s) or networks (as), aliases (as),
-    /// publish (as), force (b), entrypoint (s), env (as), volume (as), label (as),
+    /// addresses (as), publish (as), force (b), entrypoint (s), env (as), volume (as), label (as),
     /// restart (s), memory (t, bytes), memory_swap (x, bytes of memory and swap, -1 for
     /// no bound on swap), cpus (d), pids_limit (t), command (as), the flags of
     /// `health_overrides` and `tuning_overrides`, registry (s), ca_cert (s).
@@ -920,8 +918,6 @@ impl Manager {
         .await?)
     }
 
-    /// Like `volume prune`: a job removing every volume no machine uses; its result lists
-    /// them.
     /// Like `auto-update`: the machines labelled org.nspawn.auto-update=registry, or the
     /// ones named, get the image their reference names now at its registry, made anew
     /// with every option they had and put back when they do not come up. Option dry_run
@@ -1143,6 +1139,8 @@ impl Manager {
         ]))
     }
 
+    /// Like `volume prune`: a job removing every volume no machine uses; its result lists
+    /// them.
     async fn prune_volumes(&self, #[zbus(header)] hdr: Header<'_>) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;
@@ -1319,8 +1317,6 @@ impl Manager {
         .await?)
     }
 
-    /// Like `network prune`: a job removing every user-defined network no machine names;
-    /// its result lists them.
     /// Like `network connect`: the machine joins the network, at once when it runs.
     /// Options aliases (as), address (s, a fixed IPv4 address on a network made with
     /// CreateNetwork). A job.
@@ -1394,6 +1390,8 @@ impl Manager {
         .await?)
     }
 
+    /// Like `network prune`: a job removing every user-defined network no machine names;
+    /// its result lists them.
     async fn prune_networks(&self, #[zbus(header)] hdr: Header<'_>) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;
@@ -1553,9 +1551,7 @@ impl Manager {
         Ok(values::machine(&machine))
     }
 
-    /// Like `start`. Options: wait (b, default true), network (s), publish (as),
-    /// entrypoint (s), env (as), volume (as), label (as), restart (s), memory (t,
-    /// bytes), memory_swap (x), cpus (d), pids_limit (t), image_command (b), command (as). Returns
+    /// Like `start`. Options: those of `start_request`, wait defaulting to true. Returns
     /// "started", "ended" when the program returned before the machine registered, or
     /// "restarting" when it ended and its restart policy brings it back, and the notes
     /// made on the way.
@@ -1657,9 +1653,9 @@ impl Manager {
     }
 
     /// Like `stop`. Options: force (b), wait (b, default true), timeout (t, seconds
-    /// before SIGKILL for an app, default 10, a day at most). Returns "stopped" or
-    /// "was-not-running", and the notes made on the way (a program that had to be
-    /// killed, say).
+    /// before SIGKILL; the machine's stop_timeout by default, else 10; a day at most, or
+    /// u64::MAX for none). Returns "stopped" or "was-not-running", and the notes made on
+    /// the way (a program that had to be killed, say).
     async fn stop_machine(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -1800,7 +1796,7 @@ impl Manager {
     }
 
     /// Like `logs`: journalctl's output under "stdout" and "stderr", and a process
-    /// object for its exit status. Options: follow (b), lines (t), since (s),
+    /// object for its exit status. Options: follow (b), lines (t), since (s), until (s),
     /// timestamps (b), all (b), inside (b). journalctl is stopped once nobody reads its
     /// output any more, so a --follow ends with its client.
     async fn logs(
@@ -1903,8 +1899,8 @@ impl Manager {
         ))
     }
 
-    /// Like `events`: what happens to machines, networks and volumes, one JSON object
-    /// per line under "stdout" (time, time_usec, type, action, name, attributes,
+    /// Like `events`: what happens to machines, networks, volumes and secrets, one JSON
+    /// object per line under "stdout" (time, time_usec, type, action, name, attributes,
     /// labels), journalctl's complaints under "stderr". Options since and until (s,
     /// journalctl's time syntax; without until it follows), filters (as, KEY=VALUE:
     /// name, type, event, label). The process object is journalctl's; it ends when
@@ -2008,11 +2004,12 @@ impl Manager {
         ))
     }
 
-    /// Like `exec`: runs argv inside the machine as `user` ("" for root), and hands out
-    /// its streams: with option tty (b, default true) a pseudo terminal of rows x cols
-    /// (t, default 24 x 80) under "tty", otherwise pipes under "stdin", "stdout" and
-    /// "stderr". Option env (as) adds variables, the caller's TERM among them (xterm
-    /// otherwise, on a terminal). The process object says how it ends.
+    /// Like `exec`: runs argv inside the machine as `user` ("" for the machine's own), and
+    /// hands out its streams: with option tty (b, default true) a pseudo terminal of rows
+    /// x cols (t, default 24 x 80) under "tty", otherwise pipes under "stdin", "stdout"
+    /// and "stderr"; with detach (b) none, the output discarded. Option env (as) adds
+    /// variables, the caller's TERM among them (xterm otherwise, on a terminal), and
+    /// workdir (s) replaces the machine's. The process object says how it ends.
     async fn exec(
         &self,
         #[zbus(header)] hdr: Header<'_>,

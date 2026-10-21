@@ -1567,7 +1567,6 @@ fn short(digest: &str) -> String {
         .collect()
 }
 
-/// Holds an exclusive lock of a cache mount while a step uses it (sharing=locked).
 /// BuildKit's limits on what a stream of a step prints: 200 KiB a second since it started,
 /// 2 MiB in all. Past them the output is dropped, said once each time, until it is within
 /// them again; from the first line dropped on, the last 256 KiB are kept, shown if the step
@@ -1653,6 +1652,8 @@ fn try_lock_dir(dir: &Path) -> Result<Option<nix::fcntl::Flock<std::fs::File>>> 
     }
 }
 
+/// The lock of a directory, waited for: a cache mount with sharing=locked is held by one
+/// step at a time.
 fn lock_dir(dir: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
     let file = std::fs::File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
     nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)

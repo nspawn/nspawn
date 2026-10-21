@@ -26,9 +26,9 @@ const MANAGED_NS_UNIT_FILES: [&str; 2] = [
 )]
 #[serde(rename_all = "lowercase")]
 pub enum BackendChoice {
-    /// mstack when the host supports it, otherwise an overlay mount, otherwise a flat copy.
+    /// An overlay mount where the kernel has overlayfs, otherwise a flat copy.
     Auto,
-    /// Shared layers plus an overlayfs mount unit per machine (any systemd with overlayfs).
+    /// Shared layers plus an overlayfs mount unit per machine (Linux 6.5 or newer).
     Overlay,
     /// Extract the layers into a plain directory (no sharing, maximum compatibility).
     Flat,
@@ -651,8 +651,8 @@ fn remove_dir_if_exists(path: &Path) -> Result<bool> {
 /// Text of the mount unit. overlayfs lists the topmost layer first in lowerdir=.
 ///
 /// `metacopy=on` matters with user namespaces: no released kernel lets an overlayfs
-/// mount be idmapped, so nspawn shifts the tree's ownership with a recursive chown
-/// instead, and without metacopy every chown copies the whole file into the upper
+/// mount be idmapped, so systemd-nspawn shifts the tree's ownership with a recursive
+/// chown instead, and without metacopy every chown copies the whole file into the upper
 /// directory. With it only the inode is copied and the layers stay shared.
 pub fn overlay_unit_text(
     name: &str,

@@ -89,7 +89,8 @@ pub enum Command {
     /// reference names now, like podman auto-update: each is made anew with every option
     /// it had, and put back when it does not come up (healthy, with a healthcheck).
     AutoUpdate(AutoUpdateArgs),
-    /// What happens to machines, networks and volumes, as it happens, like docker events.
+    /// What happens to machines, networks, volumes and secrets, as it happens, like docker
+    /// events.
     Events(EventsArgs),
     /// Remove machines and what they alone use, like docker rm (same as images rm).
     Rm(RmArgs),
@@ -683,7 +684,7 @@ pub struct DockerfileArgs {
     #[arg(long = "build-arg", value_name = "KEY[=VALUE]")]
     pub build_arg: Vec<String>,
     /// The stage to build (default: the last one).
-    #[arg(long)]
+    #[arg(long, value_name = "STAGE")]
     pub target: Option<String>,
     /// Build every step again instead of taking it from the cache.
     #[arg(long)]
@@ -913,7 +914,7 @@ pub struct PushArgs {
     #[arg(add = candidates(Kind::Image))]
     pub image: String,
     /// Push under a different reference than the one recorded for the image.
-    #[arg(long)]
+    #[arg(long, value_name = "REFERENCE")]
     pub to: Option<String>,
 }
 
@@ -1060,8 +1061,9 @@ pub struct KillArgs {
     pub names: Vec<String>,
     /// Signal to send: a name (KILL, SIGHUP, RTMIN+3) or a number. SIGKILL stops the
     /// machine like stop --force; other signals go to an app's program or a booted
-    /// machine's init, and a machine they end is restarted by its policy, unless the
-    /// signal was its stop signal.
+    /// machine's init. A machine a signal ends is not restarted by its policy when the
+    /// signal was SIGKILL, any signal to an app without a stop signal of its own, an
+    /// app's stop signal, or a halt or poweroff request to a booted init.
     #[arg(long, short = 's', default_value = "KILL")]
     pub signal: String,
 }
@@ -1133,7 +1135,7 @@ pub struct EventsArgs {
         requires = "since"
     )]
     pub until: Option<String>,
-    /// Only matching events: name=NAME, type=machine|network|volume, event=ACTION,
+    /// Only matching events: name=NAME, type=machine|network|volume|secret, event=ACTION,
     /// label=KEY or label=KEY=VALUE. Repeatable: the same key matches either value,
     /// different keys must all match.
     #[arg(long = "filter", short = 'f', value_name = "KEY=VALUE")]

@@ -2102,8 +2102,8 @@ pub struct KillRequest {
 }
 
 /// kill. SIGKILL is `stop --force`. Other signals go to an app's program or a
-/// booted machine's init, and a machine they end is restarted by its policy, unless it
-/// was its stop signal (through the mark the release hook reads).
+/// booted machine's init; one `exits_on` names keeps the policy from restarting the
+/// machine it ends (through the mark the release hook reads).
 pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Result<()> {
     validate_entry_name(&args.name)?;
     let signal = signal_number(&args.signal)?;
