@@ -1,3 +1,14 @@
+nspawn (2.0.0-1) unstable; urgency=medium
+
+  * nspawn compose: the files and commands of docker compose on nspawn's machines; docs/COMPOSE.md lists what is supported.
+  * nspawn build runs Dockerfiles with a builder of nspawn's own, with a build cache (builder du, builder prune).
+  * A machine that mounts docker's socket gets a read-only Docker API there; nspawn auto-update moves labelled machines to the image their tag points to now.
+  * s6-overlay images run as PID 1; --init and --init=false choose; GPUs and CDI devices with --gpus and --device VENDOR/CLASS=NAME.
+  * --env-file, --label-file, --mount, --ip, ps -q/--filter/--format, inspect -f, images prune, system df, system prune, network connect and disconnect, wait and port.
+  * build -f names the Dockerfile; exec runs as the machine's user; kill ends an app's restarts on any signal without a stop signal of its own; a completed dependency runs until one run of it succeeds.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Wed, 21 Oct 2026 01:18:27 -0500
+
 nspawn (1.10.0-1) unstable; urgency=medium
 
   * --depends-on NAME[:started|healthy|completed][:optional] on run, create and start: the other machines start first, by systemd too, and the machine waits for the condition.

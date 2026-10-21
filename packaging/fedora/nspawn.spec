@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 1.10.0
+%global upstream_version 2.0.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -165,6 +165,14 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Wed Oct 21 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 2.0.0-1
+- nspawn compose: the files and commands of docker compose on nspawn's machines; docs/COMPOSE.md lists what is supported.
+- nspawn build runs Dockerfiles with a builder of nspawn's own, with a build cache (builder du, builder prune).
+- A machine that mounts docker's socket gets a read-only Docker API there; nspawn auto-update moves labelled machines to the image their tag points to now.
+- s6-overlay images run as PID 1; --init and --init=false choose; GPUs and CDI devices with --gpus and --device VENDOR/CLASS=NAME.
+- --env-file, --label-file, --mount, --ip, ps -q/--filter/--format, inspect -f, images prune, system df, system prune, network connect and disconnect, wait and port.
+- build -f names the Dockerfile; exec runs as the machine's user; kill ends an app's restarts on any signal without a stop signal of its own; a completed dependency runs until one run of it succeeds.
+
 * Sat Oct 10 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 1.10.0-1
 - --depends-on NAME[:started|healthy|completed][:optional] on run, create and start: the other machines start first, by systemd too, and the machine waits for the condition.
 - nspawn generate [NAME...] prints the commands that make machines again: network create, then run -d with every flag each machine keeps.
