@@ -1853,9 +1853,19 @@ $NSPAWN exec e2e-dep-db -- touch /ok </dev/null || fail "touch /ok in the machin
 wait $dep_start || fail "start of a machine with dependencies: $(cat /tmp/e2e-dep-start.txt)"
 cat /tmp/e2e-dep-start.txt
 grep_q "e2e-dep-db started first: e2e-dep-web depends on it" /tmp/e2e-dep-start.txt || fail "start does not say it started e2e-dep-db first"
-grep_q "e2e-dep-job started first" /tmp/e2e-dep-start.txt || fail "start does not say it ran e2e-dep-job first"
+grep_q "e2e-dep-job ran first: e2e-dep-web waits for it to complete" /tmp/e2e-dep-start.txt || fail "start does not say it ran e2e-dep-job first"
 $NSPAWN ps | grep_q "^ *e2e-dep-web .* running" || fail "the machine with dependencies is not running"
 retry 5 bash -c "$NSPAWN logs e2e-dep-job | grep -q job-ran-$nonce" || fail "the machine that completes did not run"
+# A run that ended well counts: neither a start again nor a restart runs the job twice,
+# as compose runs a job once. The unit is only ordered after it.
+grep -q "^Wants=systemd-nspawn@e2e-dep-job.service$" $dropin && fail "the unit wants a machine that completes, which runs it at every start"
+$NSPAWN stop e2e-dep-web >/dev/null || fail "stop the machine with dependencies"
+$NSPAWN start e2e-dep-web > /tmp/e2e-dep-start.txt 2>&1 || fail "start again after the job completed: $(cat /tmp/e2e-dep-start.txt)"
+grep_q "e2e-dep-job ran first" /tmp/e2e-dep-start.txt && fail "a start ran a job that had completed again"
+$NSPAWN restart e2e-dep-web >/dev/null || fail "restart the machine with dependencies"
+systemctl restart systemd-nspawn@e2e-dep-web.service || fail "systemctl restart of the machine with dependencies"
+retry 5 bash -c "$NSPAWN ps | grep -q '^ *e2e-dep-web .* running'" || fail "the machine with dependencies does not run after its restarts"
+[ "$($NSPAWN logs e2e-dep-job | grep -c job-ran-$nonce)" = 1 ] || fail "the job ran again: $($NSPAWN logs e2e-dep-job)"
 grep -q "^Wants=systemd-nspawn@e2e-dep-db.service$" $dropin && grep -q "^After=systemd-nspawn@e2e-dep-job.service$" $dropin && grep -q "await-dependencies %i$" $dropin && grep -q "^TimeoutStartSec=infinity$" $dropin || fail "the drop-in lacks the dependencies: $(cat $dropin)"
 # Stopping a dependency leaves the machine alone; removing it is refused.
 $NSPAWN stop e2e-dep-db >/dev/null || fail "stop the machine depended on"

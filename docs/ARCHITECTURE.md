@@ -176,7 +176,11 @@ verdict in `/run/nspawn/health`, or a program that ended with 0, read from the
 unit's state and ExecMainStatus. It fails the start when a dependency fails, or
 writes a warning for an optional one. `completed` reads systemd's `Result=` of
 the run, since ExecMainStatus keeps an earlier run's when this one failed
-before its program started. Conditions that wait (`healthy`, `completed`) also
+before its program started. A machine that completes is only ordered after,
+not wanted, which would run it again at every start: a run of it that ended well
+counts, by `Result=` when its unit was started since the host booted and by the
+exit code the journal kept otherwise, and the hook queues a start of it when it
+has none and waits for that run. Conditions that wait (`healthy`, `completed`) also
 set `TimeoutStartSec=infinity`, and `start` waits for the job without its time
 limit when one of them is anywhere down the chain, since systemd holds each
 start in its queue until the one before it is through; when the job fails,

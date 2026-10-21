@@ -227,16 +227,19 @@ counts as none, so a `:healthy` dependency on it fails at once instead of waitin
 what the condition asks of it. `started`, the default, asks that its start went through;
 `healthy` that its healthcheck says healthy (it needs one, and an unhealthy verdict fails
 the start); `completed` that its program ended with 0, for a machine that prepares
-something and exits, such as a migration, which then runs again at every start of the
-machines that depend on it, as with `docker compose up`. With `:optional` a failure of
+something and exits, such as a migration. A run of it that ended well counts, as docker
+runs a job once: it runs first only when it never did or its last run failed (a run of an
+earlier boot counts by the exit code the journal kept), not at every start or restart of
+the machines that depend on it; `nspawn start` of it runs it again. With `:optional` a failure of
 the other machine is a warning and this one starts anyway. The flag is repeatable and
 remembered, `--depends-on none` forgets them; the machines named must be nspawn's, and a
 cycle is refused.
 
-systemd does the work: the machine's unit wants the other one's and is ordered after it,
+systemd does the work: the machine's unit wants the other one's and is ordered after it
+(one that completes is only ordered after it, and the hook starts it when it has to run),
 and its first hook waits for the condition, so `machinectl start`, a start at boot and a
 restart policy follow the same order as `nspawn start`, which says which machines it
-started first. A start that waits for `healthy` or `completed`, directly or through the
+started or ran first. A start that waits for `healthy` or `completed`, directly or through the
 machines its dependencies depend on, has no time limit, since it lasts as long as the
 other machine takes; `nspawn stop` ends it. A machine on another one's network
 (`--network container:NAME`) that also depends on it gets it started first, at boot as

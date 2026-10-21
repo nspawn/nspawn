@@ -436,9 +436,13 @@ pub fn render_hooks(
     }
     // --depends-on: systemd starts the other machines first, at boot as well, and the
     // first hook waits for what is asked of them. Wanted, not required: stopping one
-    // leaves this machine alone, and a failure is reported by the hook.
+    // leaves this machine alone, and a failure is reported by the hook. One that
+    // completes is only ordered: wanted, it would run again at every start, where a run
+    // that ended well counts, and the hook starts it when it has none.
     for dep in &tuning.depends_on {
-        unit.push(format!("Wants=systemd-nspawn@{}.service", dep.name));
+        if dep.condition != crate::tuning::Condition::Completed {
+            unit.push(format!("Wants=systemd-nspawn@{}.service", dep.name));
+        }
         unit.push(format!("After=systemd-nspawn@{}.service", dep.name));
     }
     if !unit.is_empty() {
@@ -1622,6 +1626,17 @@ mod tests {
                 "{text}"
             );
         }
+        // A machine that completes is ordered, not wanted: it would run again at every
+        // start.
+        let text = render(&tuning(&["db:healthy", "migrate:completed"]));
+        assert!(
+            text.contains("Wants=systemd-nspawn@db.service\nAfter=systemd-nspawn@db.service\nAfter=systemd-nspawn@migrate.service\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("Wants=systemd-nspawn@migrate.service"),
+            "{text}"
+        );
         assert!(!render(&tuning(&[])).contains("await-dependencies"));
     }
 }

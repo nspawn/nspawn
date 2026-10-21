@@ -1,7 +1,8 @@
 //! --depends-on: machines started before another one. systemd starts them and orders
 //! the starts (the Wants= and After= of the machine's drop-in), at boot as well; the
 //! machine's first hook waits for what is asked of each one and fails its start when one
-//! fails.
+//! fails. A machine that completes is only ordered: a run of it that ended well counts,
+//! and the hook starts it only when it has none: a job runs once.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -197,6 +198,35 @@ pub struct Observed {
     exit_code: Option<i32>,
     /// systemd's Result= of its last run, once it ended: "success" or why not.
     result: String,
+    /// Whether its unit was started since the host booted: Result= is of that run then,
+    /// and of nothing otherwise.
+    started_this_boot: bool,
+    /// A start of it waits in systemd's queue.
+    queued: bool,
+}
+
+impl Observed {
+    /// Whether its last run completed, its program ending with 0: by systemd's verdict
+    /// on a run of this boot, by the exit code the journal kept of an earlier one; None
+    /// when no run of it is known.
+    fn completed(&self) -> Option<bool> {
+        if self.started_this_boot {
+            Some(self.result == "success")
+        } else {
+            self.exit_code.map(|code| code == 0)
+        }
+    }
+
+    /// Whether a machine depended on to complete has to run first: it neither runs nor
+    /// is about to, and no run of it ended well.
+    fn has_to_run(&self) -> bool {
+        // Only one of nspawn's: the verdict says what any other one is.
+        self.healthcheck.is_some()
+            && !self.unit.busy()
+            && !self.unit.restarting()
+            && !self.queued
+            && self.completed() != Some(true)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,14 +273,18 @@ pub fn verdict(name: &str, dep: &Dependency, seen: &Observed) -> Verdict {
         // systemd's verdict on the run, which a failure before the program started
         // shares; the exit code may be an earlier run's then, so it only explains.
         Condition::Completed => {
-            let ended = unit.restarting() || matches!(unit.active.as_str(), "inactive" | "failed");
-            match seen.exit_code {
+            let ended = !seen.queued
+                && (unit.restarting() || matches!(unit.active.as_str(), "inactive" | "failed"));
+            match (seen.completed(), seen.exit_code) {
                 _ if !ended => Verdict::Waiting,
-                _ if seen.result == "success" => Verdict::Met,
-                Some(code) if code != 0 => Verdict::Failed(format!(
+                (Some(true), _) => Verdict::Met,
+                (None, _) => Verdict::Failed(format!(
+                    "{other}, which {name} waits for to complete, has not run"
+                )),
+                (Some(false), Some(code)) if code != 0 => Verdict::Failed(format!(
                     "{other}, which {name} waits for to complete, exited with {code}; nspawn logs {other} shows why"
                 )),
-                _ => failed(),
+                (Some(false), _) => failed(),
             }
         }
     }
@@ -259,27 +293,32 @@ pub fn verdict(name: &str, dep: &Dependency, seen: &Observed) -> Verdict {
 /// `dep` as it is now.
 pub async fn observe(sd: &Systemd, store: &Store, dep: &Dependency) -> Result<Observed> {
     let record = store.load_image(&dep.name)?;
-    let unit = sd
-        .unit_status(&format!("systemd-nspawn@{}.service", dep.name))
-        .await?;
+    let name = format!("systemd-nspawn@{}.service", dep.name);
+    let unit = sd.unit_status(&name).await?;
     let ended = unit.restarting() || matches!(unit.active.as_str(), "inactive" | "failed");
-    let (exit_code, result) = match &record {
-        Some(r) if ended && dep.condition == Condition::Completed => (
-            crate::api::machines::last_exit_code(sd, store, r).await,
-            sd.unit_result(&format!("systemd-nspawn@{}.service", dep.name))
-                .await?,
-        ),
-        _ => (None, String::new()),
-    };
-    Ok(Observed {
+    let mut seen = Observed {
         healthcheck: record
             .as_ref()
             .map(|r| r.effective_healthcheck().is_some_and(|h| h.active())),
         unit,
         health: crate::health::read_status(&dep.name).map(|s| s.status),
-        exit_code,
-        result,
-    })
+        exit_code: None,
+        result: String::new(),
+        started_this_boot: false,
+        queued: false,
+    };
+    if let Some(r) = record
+        .as_ref()
+        .filter(|_| dep.condition == Condition::Completed)
+    {
+        seen.queued = sd.start_queued(&name).await?;
+        seen.started_this_boot = sd.started_this_boot(&name).await?;
+        if ended {
+            seen.exit_code = crate::api::machines::last_exit_code(sd, store, r).await;
+            seen.result = sd.unit_result(&name).await?;
+        }
+    }
+    Ok(seen)
 }
 
 /// Why `record`'s machine could not start because of a machine it depends on, if that
@@ -307,6 +346,13 @@ pub async fn await_all(ctx: &Context, name: &str) -> Result<()> {
     }
     let sd = ctx.sd().await?;
     for dep in &record.tuning.depends_on {
+        // Ordered after it, not wanting it: one that has not completed yet runs now.
+        if dep.condition == Condition::Completed && observe(sd, &ctx.store, dep).await?.has_to_run()
+        {
+            eprintln!("{name} runs {} first, which has not completed", dep.name);
+            sd.queue_start(&format!("systemd-nspawn@{}.service", dep.name))
+                .await?;
+        }
         let mut said = false;
         loop {
             match verdict(name, dep, &observe(sd, &ctx.store, dep).await?) {
@@ -348,6 +394,8 @@ mod tests {
             health: None,
             exit_code: None,
             result: String::new(),
+            started_this_boot: true,
+            queued: false,
         }
     }
 
@@ -528,6 +576,51 @@ mod tests {
             ),
             Verdict::Failed(_)
         ));
+    }
+
+    #[test]
+    fn a_completed_run_counts_and_only_a_missing_one_runs_again() {
+        let d = dep("migrate:completed");
+        let at_rest = |this_boot: bool, code: Option<i32>, result: &str| Observed {
+            exit_code: code,
+            result: result.to_string(),
+            started_this_boot: this_boot,
+            ..seen("inactive", "dead")
+        };
+        // A run of this boot that ended well, or of an earlier boot by the journal's exit
+        // code: done, nothing runs again.
+        for done in [
+            at_rest(true, Some(0), "success"),
+            at_rest(false, Some(0), "success"),
+        ] {
+            assert_eq!(verdict("web", &d, &done), Verdict::Met);
+            assert!(!done.has_to_run());
+        }
+        // Never run, or the last run failed: it runs first.
+        let never = at_rest(false, None, "success");
+        assert!(never.has_to_run());
+        assert_eq!(
+            failed_with(verdict("web", &d, &never)),
+            "migrate, which web waits for to complete, has not run"
+        );
+        assert!(at_rest(false, Some(3), "success").has_to_run());
+        assert!(at_rest(true, Some(3), "exit-code").has_to_run());
+        // Systemd's default Result= of a unit not started this boot says nothing.
+        assert!(at_rest(false, Some(1), "success").has_to_run());
+        // Running, or its start queued: waited for, not started again.
+        let queued = Observed {
+            queued: true,
+            ..at_rest(false, None, "success")
+        };
+        assert_eq!(verdict("web", &d, &queued), Verdict::Waiting);
+        assert!(!queued.has_to_run());
+        assert!(!seen("active", "running").has_to_run());
+        // Not one of nspawn's: never started, the verdict says why.
+        let foreign = Observed {
+            healthcheck: None,
+            ..at_rest(false, None, "success")
+        };
+        assert!(!foreign.has_to_run());
     }
 
     #[test]

@@ -1301,12 +1301,19 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     // firewalld only knows a veth once the machine is registered, and published ports
     // need it registered too.
     let firewalld = network == Network::Veth && hostnet::firewalld_running(sd).await;
-    // systemd starts the machines this one depends on, the ones down now said afterwards.
+    // systemd starts the machines this one depends on, the ones down now said afterwards;
+    // the hook starts one that completes when no run of it ended well, which a new run
+    // of its program tells.
     let mut down = Vec::new();
     for dep in &deps {
         let unit = format!("systemd-nspawn@{}.service", dep.name);
         if !sd.unit_status(&unit).await?.busy() {
-            down.push(dep);
+            let ran = if dep.condition == crate::tuning::Condition::Completed {
+                Some(sd.exec_main_start_usec(&unit).await.unwrap_or(0))
+            } else {
+                None
+            };
+            down.push((dep, ran));
         }
     }
     let restarting = match sd.start_machine(&args.name, patient).await {
@@ -1331,13 +1338,25 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             }
         }
     };
-    for dep in down {
+    for (dep, ran) in down {
         let unit = format!("systemd-nspawn@{}.service", dep.name);
         if sd.unit_status(&unit).await?.active != "failed" {
-            note(
-                report,
-                format!("{} started first: {} depends on it", dep.name, args.name),
-            );
+            match ran {
+                None => note(
+                    report,
+                    format!("{} started first: {} depends on it", dep.name, args.name),
+                ),
+                Some(before) if sd.exec_main_start_usec(&unit).await.unwrap_or(0) != before => {
+                    note(
+                        report,
+                        format!(
+                            "{} ran first: {} waits for it to complete",
+                            dep.name, args.name
+                        ),
+                    )
+                }
+                Some(_) => {}
+            }
         } else if dep.optional {
             note(
                 report,

@@ -820,6 +820,31 @@ impl Systemd {
         wait_for_job(&mut jobs, &job, unit, "starting").await
     }
 
+    /// Queues a start job for a unit and returns at once, without watching the job.
+    pub async fn queue_start(&self, unit: &str) -> Result<()> {
+        self.manager
+            .start_unit(unit.to_string(), "replace".to_string())
+            .await
+            .with_context(|| format!("starting {unit}"))?;
+        Ok(())
+    }
+
+    /// Whether the unit has been started since the host booted: what systemd says of its
+    /// last run (Result=, ExecMainStatus=) is of this boot then, and nothing otherwise.
+    pub async fn started_this_boot(&self, unit: &str) -> Result<bool> {
+        let proxy = systemd1::UnitProxy::builder(&self.conn)
+            .path(self.unit_path(unit).await?)?
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await
+            .with_context(|| format!("connecting to {unit}"))?;
+        let left_inactive = proxy
+            .inactive_exit_timestamp_monotonic()
+            .await
+            .with_context(|| format!("reading when {unit} was last started"))?;
+        Ok(left_inactive > 0)
+    }
+
     /// Queues a stop job for a unit and returns at once, without watching the job.
     pub async fn queue_stop(&self, unit: &str) -> Result<()> {
         match self
