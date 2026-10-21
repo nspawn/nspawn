@@ -962,8 +962,9 @@ fn sysctl(text: &str) -> Result<(String, String)> {
     {
         bail!("--sysctl {text}: net.* keys only, set in the machine's network namespace");
     }
-    if value.is_empty() || value.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        bail!("--sysctl {text}: a value without whitespace");
+    // Spaces separate the fields of some values, net.ipv4.ping_group_range's among them.
+    if value.trim().is_empty() || value.chars().any(char::is_control) {
+        bail!("--sysctl {text}: a value without control characters");
     }
     Ok((key.to_string(), value.to_string()))
 }
@@ -998,7 +999,10 @@ mod tests {
             stop_signal: Some("SIGINT".into()),
             stop_timeout: Some(2),
             init: Some(true),
-            sysctls: vec!["net.ipv4.ip_forward=1".into()],
+            sysctls: vec![
+                "net.ipv4.ip_forward=1".into(),
+                "net.ipv4.ping_group_range=0 2147483647".into(),
+            ],
             secrets: vec!["pw".into(), "tls:/etc/key:0400:1000:1000".into()],
             privileged: None,
             timezone: Some("off".into()),
@@ -1067,6 +1071,7 @@ mod tests {
             ("v6", "fd00::1")
         );
         assert_eq!(t.sysctls["net.ipv4.ip_forward"], "1");
+        assert_eq!(t.sysctls["net.ipv4.ping_group_range"], "0 2147483647");
         assert_eq!((t.user.as_deref(), t.stop_timeout), (Some("1000"), Some(2)));
         // A day at most, or none at all.
         for (seconds, ok) in [
@@ -1292,6 +1297,9 @@ mod tests {
             ("log", "json-file"),
             ("sysctl", "kernel.shmmax=1"),
             ("sysctl", "net.ipv4.ip_forward"),
+            ("sysctl", "net.ipv4.ip_forward= "),
+            ("sysctl", "net.ipv4.ip_forward=1\nBind=/:/host"),
+            ("sysctl", "net.ipv4.ping_group_range=0\t1"),
         ] {
             let mut flags = Overrides::default();
             match field {

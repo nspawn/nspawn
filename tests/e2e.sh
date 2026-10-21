@@ -4521,7 +4521,7 @@ out=$($NSPAWN run --rm --pull never e2e-names-none-$nonce:1 -- true 2>&1) && fai
 echo "$out" | grep_q "no local image of $NSPAWN_REGISTRY/e2e-names-none-$nonce:1" || fail "run --pull never of a missing image was not explained: $out"
 for m in $($NSPAWN images ls | awk -v n="e2e-names-$nonce" '$1 ~ n {print $1}'); do $NSPAWN images rm "$m" >/dev/null 2>&1; done
 
-step "an app's own network takes docker's sysctls: another user binds a low port, --sysctl wins, the host keeps its own"
+step "an app's own network takes docker's sysctls: another user binds a low port, --sysctl wins and takes a value with a space, the host keeps its own"
 $NSPAWN run -d --name e2e-sc -u 65534 $rv -- sleep 600 >/dev/null || fail "run e2e-sc"
 sc() { $NSPAWN exec e2e-sc -- /bin/sh -c "$1" </dev/null 2>&1 | tr -d '\r'; }
 [ "$(sc 'cat /proc/sys/net/ipv4/ping_group_range' | tr -s ' \t' ' ')" = "0 2147483647" ] || fail "ping_group_range of an app: $(sc 'cat /proc/sys/net/ipv4/ping_group_range')"
@@ -4531,8 +4531,9 @@ sc() { $NSPAWN exec e2e-sc -- /bin/sh -c "$1" </dev/null 2>&1 | tr -d '\r'; }
 listen='nc -l -p 80 </dev/null >/dev/null 2>&1 & p=$!; sleep 1; netstat -ltn; kill $p'
 sc "$listen" | grep_q ":80 " || fail "a user other than root cannot bind port 80: $(sc "$listen")"
 $NSPAWN rm -f e2e-sc >/dev/null 2>&1
-$NSPAWN run -d --name e2e-sc --sysctl net.ipv4.ip_unprivileged_port_start=1024 $rv -- sleep 600 >/dev/null || fail "run e2e-sc with --sysctl"
+$NSPAWN run -d --name e2e-sc --sysctl net.ipv4.ip_unprivileged_port_start=1024 --sysctl 'net.ipv4.ip_local_port_range=40000 50000' $rv -- sleep 600 >/dev/null || fail "run e2e-sc with --sysctl"
 [ "$(sc 'cat /proc/sys/net/ipv4/ip_unprivileged_port_start')" = 1024 ] || fail "--sysctl did not win over docker's default: $(sc 'cat /proc/sys/net/ipv4/ip_unprivileged_port_start')"
+[ "$(sc 'cat /proc/sys/net/ipv4/ip_local_port_range' | tr -s ' \t' ' ')" = "40000 50000" ] || fail "a --sysctl value with a space: $(sc 'cat /proc/sys/net/ipv4/ip_local_port_range')"
 $NSPAWN rm -f e2e-sc >/dev/null 2>&1
 # Inside, the range reads as the machine's user namespace maps it: the host's is what
 # shows whether an app on the host's network changed it.
