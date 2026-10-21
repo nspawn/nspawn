@@ -933,9 +933,7 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
                 oneoff: false,
                 image_digest: image.digest.clone(),
                 image_cmd: image.cmd.clone(),
-                no_deps: c.no_deps,
                 env_files: e.args.env_file.clone(),
-                scale: &c.scale,
             };
             let made = convert::options(&spec)?;
             let found = existing

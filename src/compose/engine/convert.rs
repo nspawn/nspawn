@@ -22,12 +22,8 @@ pub struct Spec<'a> {
     pub image_digest: String,
     /// That image's own command.
     pub image_cmd: Vec<String>,
-    /// The services it depends on are left alone (--no-deps).
-    pub no_deps: bool,
     /// The env files the project was given, for its label.
     pub env_files: Vec<String>,
-    /// The replicas --scale asks for, by service, over the file's.
-    pub scale: &'a BTreeMap<String, u32>,
 }
 
 /// What a machine takes: the options, and what to see to first.
@@ -270,7 +266,6 @@ pub fn options(spec: &Spec) -> Result<Made> {
     limits(service, &mut made);
     health(service, &mut made);
     settings(spec, service, &mut made);
-    dependencies(spec, service, &mut made)?;
     labels(spec, service, &mut made)?;
     Ok(made)
 }
@@ -847,42 +842,6 @@ pub(super) fn ulimits(section: &Map) -> Vec<String> {
     out
 }
 
-fn dependencies(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
-    if spec.no_deps || spec.oneoff {
-        return Ok(());
-    }
-    let project = spec.project;
-    let mut deps = Vec::new();
-    if let Some(depends) = sub(service, "depends_on") {
-        for (name, dep) in depends {
-            // A dependency out of the project (not selected, or in a disabled profile)
-            // is none of the machine's.
-            let Some(other) = project.services.get(name).and_then(Value::as_map) else {
-                continue;
-            };
-            let dep = dep.as_map().cloned().unwrap_or_default();
-            let condition = match s(&dep, "condition") {
-                "service_healthy" => ":healthy",
-                "service_completed_successfully" => ":completed",
-                _ => "",
-            };
-            let optional = if dep.get("required") == Some(&Value::Bool(false)) {
-                ":optional"
-            } else {
-                ""
-            };
-            // The replicas there will be: none of a service scaled to zero.
-            for n in 1..=replicas(other, spec.scale, name) {
-                let machine =
-                    super::machine_name(&project.name, name, s(other, "container_name"), n);
-                deps.push(format!("{machine}{condition}{optional}"));
-            }
-        }
-    }
-    put_list(&mut made.options, "depends_on", deps);
-    Ok(())
-}
-
 /// The service's labels, and those by which a project knows its machines again.
 fn labels(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
     let project = spec.project;
@@ -1129,9 +1088,7 @@ pub(crate) mod tests {
             oneoff: false,
             image_digest: "sha256:abc".to_string(),
             image_cmd: vec!["nginx".into(), "-g".into(), "daemon off;".into()],
-            no_deps: false,
             env_files: Vec::new(),
-            scale: &BTreeMap::new(),
         })
         .unwrap()
     }
@@ -1337,7 +1294,9 @@ services:
         // A variable without a value is none.
         assert_eq!(list(&web, "env"), ["A=1"]);
         assert_eq!(text(&web, "restart").as_deref(), Some("unless-stopped"));
-        assert_eq!(list(&web, "depends_on"), ["demo-db:healthy"]);
+        // depends_on orders compose's own starts: the machine carries no --depends-on,
+        // which would tie it to db at boot and refuse db's removal.
+        assert!(!web.options.contains_key("depends_on"));
         assert_eq!(list(&web, "extra_hosts"), ["gw:10.0.0.1"]);
         assert_eq!(list(&web, "ulimits"), ["nofile=64:128"]);
         assert_eq!(text(&web, "log_driver").as_deref(), Some("local"));
@@ -1586,32 +1545,35 @@ services:
     }
 
     #[test]
-    fn dependencies_name_the_replicas_there_will_be() {
+    fn depends_on_stays_compose_s_own() {
         let p = project(
-            "replicas",
-            "services:\n  db:\n    image: postgres\n    deploy: {replicas: 0}\n\
-             \x20 web:\n    image: nginx\n    depends_on: [db]\n",
+            "deps",
+            "services:\n  db:\n    image: postgres\n    deploy: {replicas: 2}\n\
+             \x20 migrate:\n    image: app\n\
+             \x20 web:\n    image: nginx\n    depends_on:\n\
+             \x20     db: {condition: service_healthy}\n\
+             \x20     migrate: {condition: service_completed_successfully}\n",
         );
-        let depends = |scale: &BTreeMap<String, u32>| {
-            let made = options(&Spec {
-                project: &p,
-                service: "web",
-                number: 1,
-                name: "web".to_string(),
-                oneoff: false,
-                image_digest: String::new(),
-                image_cmd: Vec::new(),
-                no_deps: false,
-                env_files: Vec::new(),
-                scale,
-            })
-            .unwrap();
-            list(&made, "depends_on")
-        };
-        assert!(depends(&BTreeMap::new()).is_empty());
-        let two = BTreeMap::from([("db".to_string(), 2)]);
-        let db = |n: u32| super::super::machine_name(&p.name, "db", "", n);
-        assert_eq!(depends(&two), [db(1), db(2)]);
+        let made = options(&Spec {
+            project: &p,
+            service: "web",
+            number: 1,
+            name: "web".to_string(),
+            oneoff: false,
+            image_digest: String::new(),
+            image_cmd: Vec::new(),
+            env_files: Vec::new(),
+        })
+        .unwrap();
+        // The machine knows nothing of depends_on: no --depends-on ties web to db at
+        // boot or refuses db's removal, and compose orders its own starts...
+        assert!(!made.options.contains_key("depends_on"));
+        // ...by the label, from which it finds them without the file too.
+        let labels = list(&made, "label");
+        assert!(
+            labels.contains(&"com.docker.compose.depends_on=db:service_healthy:false,migrate:service_completed_successfully:false".to_string()),
+            "{labels:?}"
+        );
     }
 
     #[test]

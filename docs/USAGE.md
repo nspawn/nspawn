@@ -595,8 +595,9 @@ same permissions (`sudo`, or a polkit rule), and what it makes is nspawn's own:
 
 A service becomes a machine per replica, named as docker names its containers,
 `PROJECT-SERVICE-N` with `_` written `-`; its image is pulled from Docker Hub when it
-names no registry and kept under its local name; its networks, volumes, secrets and
-`depends_on` are nspawn's networks, volumes, secrets and `--depends-on`. The machines
+names no registry and kept under its local name; its networks, volumes and secrets
+are nspawn's networks, volumes and secrets, and `depends_on` stays compose's own, as
+with docker: the machines carry no `--depends-on`. The machines
 carry docker compose's labels, which is how `ps`, `logs`, `stop`, `down` and the rest
 find a project again, from its files or from `-p NAME` alone. A machine is made anew
 when its service changed (docker compose's config hash) or its image did.

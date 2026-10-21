@@ -50,9 +50,13 @@ the networks, volumes, secrets and configs those use.
   from a file is bound read-only where the service reads it, as docker binds it;
   one from the environment or written in the file is an nspawn secret,
   `PROJECT_secret_KEY` or `PROJECT_config_KEY`, removed by `down`.
-- **Dependencies.** `depends_on` becomes the machine's own `--depends-on`: up
-  starts the services in order and waits, as docker compose does, and systemd
-  keeps the order when a host boots its machines with a restart policy.
+- **Dependencies.** `depends_on` orders what compose does, as docker compose's
+  does: `up`, `start` and `run` bring the services up in order and wait for the
+  conditions, and `restart` takes along what asks for `restart: true`. The
+  machines know nothing of it, as docker's engine knows nothing of it: they carry
+  no `--depends-on`, so a service that others depend on is made anew, scaled down
+  or removed as with docker, and a host that boots machines with a restart policy
+  starts them in no particular order.
 
 ## Where it differs on purpose
 

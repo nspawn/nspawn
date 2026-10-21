@@ -4404,6 +4404,35 @@ $NSPAWN volume ls --json | python3 -c 'import json,sys; assert all(v["name"] != 
 (cd /tmp/e2e-rv/jobv && $NSPAWN compose -p e2e-rv3b down -v >/dev/null 2>&1)
 $NSPAWN volume rm e2e-rv3b_pgdata pgdata >/dev/null 2>&1
 
+step "compose: a service others depend on is made anew or removed as with docker"
+mkdir -p /tmp/e2e-rv/deps
+cat > /tmp/e2e-rv/deps/compose.yaml <<COMPOSE
+services:
+  db:
+    image: $rv
+    command: ["sleep", "600"]
+    environment: {GEN: "1"}
+  web:
+    image: $rv
+    command: ["sleep", "600"]
+    depends_on: [db]
+COMPOSE
+(cd /tmp/e2e-rv/deps && $NSPAWN compose -p e2e-rv4d up -d >/dev/null 2>&1) || fail "compose up of e2e-rv4d"
+$NSPAWN inspect e2e-rv4d-web-1 | python3 -c 'import json,sys; d = json.load(sys.stdin)[0]; assert not d.get("depends_on"), d.get("depends_on")' || fail "a compose machine carries --depends-on"
+created() { $NSPAWN inspect "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["created"])'; }
+web_created=$(created e2e-rv4d-web-1)
+db_created=$(created e2e-rv4d-db-1)
+sleep 1
+sed -i 's/GEN: "1"/GEN: "2"/' /tmp/e2e-rv/deps/compose.yaml
+out=$(cd /tmp/e2e-rv/deps && $NSPAWN compose -p e2e-rv4d up -d 2>&1) || fail "up that makes db anew under a running web: $out"
+[ "$(created e2e-rv4d-db-1)" != "$db_created" ] || fail "db was not made anew"
+[ "$(created e2e-rv4d-web-1)" = "$web_created" ] || fail "web was made anew with db, which docker compose leaves alone"
+systemctl is-active --quiet systemd-nspawn@e2e-rv4d-web-1.service || fail "web stopped when db was made anew"
+out=$(cd /tmp/e2e-rv/deps && $NSPAWN compose -p e2e-rv4d rm -s -f db 2>&1) || fail "rm of a service another one depends on: $out"
+$NSPAWN images ls | grep_q "^ *e2e-rv4d-db-1 " && fail "rm left db"
+systemctl is-active --quiet systemd-nspawn@e2e-rv4d-web-1.service || fail "web stopped when db was removed"
+(cd /tmp/e2e-rv/deps && $NSPAWN compose -p e2e-rv4d down >/dev/null 2>&1) || fail "compose down of e2e-rv4d"
+
 $NSPAWN rm -f e2e-rv-web e2e-rv-ex e2e-rv-sec e2e-rv-pol e2e-rv-rel >/dev/null 2>&1
 for i in e2e-rv-hl-1 e2e-rv-ctx-1 e2e-rv-url-1; do $NSPAWN images rm $i >/dev/null 2>&1; done
 $NSPAWN secret rm e2e-rv-pw >/dev/null 2>&1

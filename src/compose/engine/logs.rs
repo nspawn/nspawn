@@ -693,9 +693,7 @@ pub async fn run(e: &mut Engine<'_>, a: &RunArgs) -> Result<()> {
         oneoff: true,
         image_digest: image.digest.clone(),
         image_cmd: image.cmd.clone(),
-        no_deps: true,
         env_files: e.args.env_file.clone(),
-        scale: &BTreeMap::new(),
     };
     let mut made = convert::options(&spec)?;
     let o = &mut made.options;
