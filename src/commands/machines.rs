@@ -1474,7 +1474,8 @@ pub async fn exec(args: ExecArgs, client: &Client) -> Result<()> {
         detach: args.detach,
         no_stdin: false,
     };
-    let code = run_command(client, &args.machine, &args.command, &args.user, spec).await?;
+    let user = args.user.as_deref().unwrap_or("");
+    let code = run_command(client, &args.machine, &args.command, user, spec).await?;
     std::process::exit(code);
 }
 

@@ -449,7 +449,9 @@ like its own processes, except CAP_SYS_BOOT in an app that shares the host's use
 namespace (unless `--privileged`): the machine's processes keep it beside a seccomp
 filter that keeps kexec out, which the command does not carry; right after a start it waits, a few seconds at most, until
 systemd-nspawn has finished confining the machine. It attaches a terminal when standard input and output are one
-(`-t` and `-T` decide otherwise), so redirected output is byte-exact, and `-u USER[:GROUP]` takes
+(`-t` and `-T` decide otherwise), so redirected output is byte-exact. It runs as the
+machine's user, its `--user` or else its image's `USER`, as docker exec does (root for a
+booted machine), and `-u USER[:GROUP]` takes
 names or numbers of the image's passwd and group files, with the home of the passwd
 entry and the user's supplementary groups unless a group is given, which is then the
 only one; a uid the passwd lacks runs with group 0 and `/` as home, as with docker and

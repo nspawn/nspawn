@@ -1457,9 +1457,11 @@ pub struct ExecArgs {
     /// Machine name.
     #[arg(add = candidates(Kind::Running))]
     pub machine: String,
-    /// User inside the machine.
-    #[arg(long, short = 'u', default_value = "root")]
-    pub user: String,
+    /// User inside the machine, USER[:GROUP] by name or number; without it the machine's
+    /// own (its --user, else its image's USER), as docker exec runs, root on a booted
+    /// machine.
+    #[arg(long, short = 'u')]
+    pub user: Option<String>,
     /// Environment for the command, VAR=value or VAR (copied from here), like docker
     /// exec -e. Repeatable.
     #[arg(long, short = 'e', value_name = "VAR[=VALUE]")]
@@ -1596,6 +1598,22 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(argv).is_ok(), "{argv:?}");
         }
+    }
+
+    #[test]
+    fn exec_names_no_user_unless_told_one() {
+        let user = |argv: &[&str]| {
+            let Command::Exec(exec) = Cli::try_parse_from(argv).unwrap().command else {
+                panic!("not exec");
+            };
+            exec.user
+        };
+        // The service then takes the machine's own.
+        assert_eq!(user(&["nspawn", "exec", "web", "--", "id"]), None);
+        assert_eq!(
+            user(&["nspawn", "exec", "-u", "root", "web", "--", "id"]),
+            Some("root".to_string())
+        );
     }
 
     #[test]

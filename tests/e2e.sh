@@ -1144,7 +1144,8 @@ out=$($NSPAWN start $app --tmpfs /x/.. -- /bin/sleep 1 2>&1) && fail "a tmpfs of
 
 step "per-machine settings: hostname, user, workdir, capabilities, read-only, tmpfs, devices, dns, hosts, ulimits, signals"
 $NSPAWN start $app --hostname h-$nonce -u nobody -w /tmp --cap-drop ALL --cap-add NET_BIND_SERVICE --read-only --tmpfs /scratch:size=16m --device /dev/null:/dev/nullo:r --dns 10.99.0.1 --dns-search example.test --add-host peer:10.1.1.1 --add-host gw:host-gateway --add-host v6=fd00::1 --ulimit nofile=64:128 --ulimit core=unlimited --stop-signal SIGINT --stop-timeout 2 --oom-score-adj 100 --sysctl net.ipv4.icmp_echo_ignore_all=1 -p none -- /bin/sh -c 'trap "" INT; pwd; exec /bin/sleep 300' || fail "start with the per-machine settings"
-x() { $NSPAWN exec $app -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
+# Root's view of the machine, which runs as nobody.
+x() { $NSPAWN exec -u root $app -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
 [ "$(x hostname)" = "h-$nonce" ] || fail "--hostname not applied: $(x hostname)"
 # The program is the stub init's child: systemd-nspawn runs getent in the machine
 # ahead of it to resolve the user, which takes PIDs 2 and 3 (busybox has no getent;
@@ -1152,6 +1153,9 @@ x() { $NSPAWN exec $app -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; 
 pid=$(x 'cat /proc/1/task/1/children' | tr -d ' ')
 [ -n "$pid" ] || fail "no program under the stub init: $(x 'ls /proc')"
 [ "$(x "awk '/^Uid:/ {print \$2}' /proc/$pid/status")" = 65534 ] || fail "--user not applied: $(x "cat /proc/$pid/status")"
+# exec without -u runs as the machine's user, as docker exec does; -u root as root.
+[ "$($NSPAWN exec $app -- id -u </dev/null | tr -d '\r')" = 65534 ] || fail "exec without -u does not run as the machine's user: $($NSPAWN exec $app -- id </dev/null 2>&1)"
+[ "$($NSPAWN exec -u root $app -- id -u </dev/null | tr -d '\r')" = 0 ] || fail "exec -u root does not run as root"
 # The program prints its directory: exec runs with the machine's capabilities, and
 # without CAP_SYS_PTRACE root cannot read the cwd link of nobody's process.
 retry 5 bash -c "$NSPAWN logs $app -n 5 | tr -d '\r' | grep -qx /tmp" || fail "--workdir not applied: $($NSPAWN logs $app -n 5)"
@@ -1262,7 +1266,7 @@ $NSPAWN create $app e2e-noshell -- /bin/sleep 300 >/dev/null || fail "create e2e
 $NSPAWN start e2e-noshell >/dev/null || fail "start e2e-noshell"
 $NSPAWN exec e2e-noshell -- /bin/rm -r /bin/sh /usr </dev/null || fail "take /bin/sh and /usr out of e2e-noshell"
 $NSPAWN stop e2e-noshell >/dev/null || fail "stop e2e-noshell"
-ns() { $NSPAWN exec e2e-noshell -- /bin/busybox sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
+ns() { $NSPAWN exec -u root e2e-noshell -- /bin/busybox sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
 noshell_pid() {
   local p
   for _ in $(seq 1 20); do
@@ -2097,7 +2101,7 @@ $NSPAWN create $app e2e-mix-app --network e2e-nd --network e2e-ne --network-alia
   --stop-signal SIGINT --stop-timeout 2 --restart on-failure -l role=mix \
   -- /bin/sh -c 'cat /run/secrets/token > /www/index.html; exec /bin/httpd -f -p 80 -h /www' >/dev/null || fail "create the mixed app"
 $NSPAWN start e2e-mix-app >/dev/null || fail "start the mixed app"
-mx() { $NSPAWN exec e2e-mix-app -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
+mx() { $NSPAWN exec -u root e2e-mix-app -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
 retry 10 bash -c "$NSPAWN ps | grep '^ *e2e-mix-app ' | grep_q '(healthy)'" || fail "the mixed app is not healthy: $($NSPAWN ps | grep e2e-mix-app; $NSPAWN logs e2e-mix-app -n 5)"
 retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18095/ | grep_q mix-secret" || fail "the port on loopback does not serve the secret: $(curl -s -m 2 http://127.0.0.1:18095/)"
 curl -sf -m 2 "http://$mix_host_ip:18095/" >/dev/null 2>&1 && fail "the port published on 127.0.0.1 answered on $mix_host_ip"
@@ -2122,7 +2126,7 @@ assert d['health'] == 'healthy' and d['healthcheck']['retries'] == 2, (d['health
 $NSPAWN create $app e2e-mix-side --network container:e2e-mix-app --depends-on e2e-mix-app:healthy -u 65534:65534 --read-only --tmpfs /www2:size=4m,mode=1777 -l role=mix \
   -- /bin/sh -c "echo side-$nonce > /www2/index.html; exec /bin/httpd -f -p 8080 -h /www2" >/dev/null || fail "create the mixed sidecar"
 $NSPAWN start e2e-mix-side >/dev/null || fail "start the mixed sidecar"
-ms() { $NSPAWN exec e2e-mix-side -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
+ms() { $NSPAWN exec -u root e2e-mix-side -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
 retry 5 bash -c "curl -sf -m 2 http://127.0.0.1:18097/ | grep_q side-$nonce" || fail "the sidecar's port does not come out through the app's published port: $(curl -s -m 2 http://127.0.0.1:18097/)"
 [ "$(ms 'ip -4 -o addr show host0' | grep -c " $app_nd/")" = 1 ] || fail "the sidecar does not have the app's address: $(ms 'ip -4 -o addr show')"
 ms 'cat /etc/hosts' | grep_q "^10.1.1.9 peer$" || fail "the sidecar does not read the app's hosts file: $(ms 'cat /etc/hosts')"
@@ -2151,7 +2155,8 @@ $NSPAWN exec e2e-mix-boot -- bash -c 'exec 3<>/dev/tcp/mixweb/80; printf "GET / 
 $NSPAWN exec e2e-mix-boot -- bash -c 'exec 3<>/dev/tcp/inner/80; printf "GET / HTTP/1.0\r\n\r\n" >&3; cat <&3' </dev/null | tr -d '\r' | grep_q mix-secret || fail "the booted machine does not reach the app through the internal network"
 $NSPAWN exec e2e-mix-boot -- bash -c 'exec 3<>/dev/tcp/mixweb/8080; printf "GET / HTTP/1.0\r\n\r\n" >&3; cat <&3' </dev/null | tr -d '\r' | grep_q side-$nonce || fail "the booted machine does not reach the sidecar through the app's alias"
 mx 'cat /etc/hosts' | grep_q " mixboot" || fail "the app's hosts file misses the booted machine's alias: $(mx 'cat /etc/hosts')"
-retry 5 bash -c "$NSPAWN exec e2e-mix-app -- ping -c 1 -W 2 mixboot </dev/null >/dev/null 2>&1" || fail "the app does not reach the booted machine by its alias"
+# The app runs as nobody, and so would exec: ping needs root's raw socket.
+retry 5 bash -c "$NSPAWN exec -u root e2e-mix-app -- ping -c 1 -W 2 mixboot </dev/null >/dev/null 2>&1" || fail "the app does not reach the booted machine by its alias"
 # Operations on top of it all: pause, an update of the healthcheck, restart, top, exec
 # with its flags, the logs of both.
 $NSPAWN pause e2e-mix-app >/dev/null || fail "pause the mixed app"
@@ -4442,6 +4447,23 @@ out=$(cd /tmp/e2e-rv/deps && $NSPAWN compose -p e2e-rv4d rm -s -f db 2>&1) || fa
 $NSPAWN images ls | grep_q "^ *e2e-rv4d-db-1 " && fail "rm left db"
 systemctl is-active --quiet systemd-nspawn@e2e-rv4d-web-1.service || fail "web stopped when db was removed"
 (cd /tmp/e2e-rv/deps && $NSPAWN compose -p e2e-rv4d down >/dev/null 2>&1) || fail "compose down of e2e-rv4d"
+
+step "compose exec and hooks run as the service's user, as docker compose's do"
+mkdir -p /tmp/e2e-rv/user
+cat > /tmp/e2e-rv/user/compose.yaml <<COMPOSE
+services:
+  app:
+    image: $rv
+    command: ["sleep", "600"]
+    user: "65534"
+    post_start:
+      - command: ["sh", "-c", "id -u > /tmp/hook-uid"]
+COMPOSE
+(cd /tmp/e2e-rv/user && $NSPAWN compose -p e2e-rv4u up -d >/dev/null 2>&1) || fail "compose up of a service with a user"
+[ "$(cd /tmp/e2e-rv/user && $NSPAWN compose -p e2e-rv4u exec -T app id -u | tr -d '\r')" = 65534 ] || fail "compose exec without --user does not run as the service's user"
+[ "$(cd /tmp/e2e-rv/user && $NSPAWN compose -p e2e-rv4u exec -T --user root app id -u | tr -d '\r')" = 0 ] || fail "compose exec --user root does not run as root"
+[ "$($NSPAWN exec -u root e2e-rv4u-app-1 -- cat /tmp/hook-uid </dev/null | tr -d '\r')" = 65534 ] || fail "a post_start hook without a user does not run as the service's user"
+(cd /tmp/e2e-rv/user && $NSPAWN compose -p e2e-rv4u down >/dev/null 2>&1)
 
 $NSPAWN rm -f e2e-rv-web e2e-rv-ex e2e-rv-sec e2e-rv-pol e2e-rv-rel >/dev/null 2>&1
 for i in e2e-rv-hl-1 e2e-rv-ctx-1 e2e-rv-url-1; do $NSPAWN images rm $i >/dev/null 2>&1; done

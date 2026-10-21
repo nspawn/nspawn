@@ -2657,11 +2657,7 @@ pub async fn spawn_in_namespaces(
         bail!("machine {machine} changed while the command was being started; try again");
     }
     wait_past_setup(machine, leader).await?;
-    let user = if user == "root" || user.is_empty() {
-        None
-    } else {
-        Some(user)
-    };
+    let user = exec_user(record, user);
     let working_dir = workdir.or_else(|| record.and_then(|r| r.effective_working_dir()));
     let env = record
         .map(|r| volume::merge_env(&r.run.env, &r.env))
@@ -2681,6 +2677,20 @@ pub async fn spawn_in_namespaces(
         )
     })
     .with_context(|| format!("running a command inside {machine}"))
+}
+
+/// Whom a command run inside a machine runs as, None for root: the user asked for, or
+/// without one an app's own (its --user, else its image's USER). A booted machine's image
+/// user is nobody's to take.
+fn exec_user<'a>(record: Option<&'a ImageRecord>, asked: &'a str) -> Option<&'a str> {
+    let user = if asked.is_empty() {
+        record
+            .filter(|r| r.mode == Mode::App)
+            .and_then(ImageRecord::effective_user)?
+    } else {
+        asked
+    };
+    (user != "root").then_some(user)
 }
 
 /// machined's login session on a booted machine (`path` empty for the user's shell). A
@@ -3125,6 +3135,39 @@ mod tests {
         assert!(kill_ends(&state("activating", "start-pre")));
         assert!(!kill_ends(&dead));
         assert!(!kill_ends(&stopping));
+    }
+
+    #[test]
+    fn exec_runs_as_the_machine_s_user_unless_told_otherwise() {
+        let record = |mode: &str, image: Option<&str>, flag: Option<&str>| {
+            let mut r: ImageRecord = serde_json::from_value(serde_json::json!({
+                "name": "web", "reference": "r", "manifest_digest": "d", "layers": [],
+                "backend": "overlay", "created": 0, "mode": mode,
+            }))
+            .unwrap();
+            r.run.user = image.map(str::to_string);
+            r.tuning.user = flag.map(str::to_string);
+            r
+        };
+        let app = record("app", Some("node"), None);
+        assert_eq!(exec_user(Some(&app), ""), Some("node"));
+        assert_eq!(exec_user(Some(&app), "1000:1000"), Some("1000:1000"));
+        assert_eq!(exec_user(Some(&app), "root"), None);
+        // --user wins over the image's, as for the machine's program.
+        let flagged = record("app", Some("node"), Some("65534"));
+        assert_eq!(exec_user(Some(&flagged), ""), Some("65534"));
+        // Root when nothing names a user, or the machine boots, or it is not nspawn's.
+        assert_eq!(exec_user(Some(&record("app", None, None)), ""), None);
+        assert_eq!(
+            exec_user(Some(&record("app", Some("root"), None)), ""),
+            None
+        );
+        assert_eq!(
+            exec_user(Some(&record("boot", Some("node"), None)), ""),
+            None
+        );
+        assert_eq!(exec_user(None, ""), None);
+        assert_eq!(exec_user(None, "nobody"), Some("nobody"));
     }
 
     #[test]
