@@ -11,16 +11,16 @@ and `systemctl` are clients of machined and systemd.
 nspawn search fedora                # images on the hub and on Docker Hub, with their source
 nspawn pull fedora:44               # verify its signature, download and assemble it
 nspawn start fedora-44              # boot it as a machine
-nspawn run -d nginx:1.27 --name web -p 8080:80   # an app from Docker Hub, detached
+nspawn run -d docker.io/library/nginx:1.27 --name web -p 8080:80   # an app, detached
 nspawn run -it --rm docker.io/library/alpine:3 sh   # a terminal, removed at the end
-nspawn start web -e KEY=v -v pgdata:/var/lib/pg --restart always -m 512m   # docker's flags
 nspawn create fedora-44 web2        # another machine from the same local image
 nspawn ps                           # running machines (-a adds stopped ones)
 nspawn exec web -- nginx -T
 nspawn shell fedora-44
 nspawn logs web                     # console output; --inside reads the machine's journal
 nspawn events                       # starts, exits, restarts, pulls and removals, live
-nspawn stop web
+nspawn stop web fedora-44
+nspawn start web -e KEY=v -v pgdata:/var/lib/pg --restart always -m 512m   # docker's flags
 nspawn rm -f web2                   # remove a machine, stopping it first
 nspawn images rm fedora-44          # also frees layers and blobs nobody references
 nspawn network create backend       # a network of its own: --network backend on start
@@ -31,10 +31,12 @@ nspawn compose down -v
 ```
 
 `nspawn --help` lists the rest: `login`, `hub ls`, `inspect`, `update`, `stats`, `top`,
-`cp`, `kill`, `restart`, `pause`, `volume`, `secret`, `network`, `generate` (the
-commands that make the same machines on another host), and `completions` for
-the shells, which complete the names of machines, images, networks and volumes too;
-`man nspawn` is the same reference the packages install.
+`cp`, `kill`, `restart`, `pause`, `wait`, `port`, `volume`, `secret`, `network` (with
+`connect` and `disconnect`), `system df` and `system prune`, `images prune`, `builder`
+(the build cache), `auto-update` (moves labelled machines to the image their tag names
+now), `generate` (the commands that make the same machines on another host), and
+`completions` for the shells, which complete the names of machines, images, networks
+and volumes too; `man nspawn` is the same reference the packages install.
 
 ## Installation
 
@@ -45,7 +47,7 @@ actions, the completions and the manual page:
 | Distribution | Package |
 | --- | --- |
 | Fedora 44 | `nspawn-VERSION-1.fc44.x86_64.rpm`, with `nspawn-selinux-VERSION-1.fc44.noarch.rpm` for SELinux enforcing |
-| Ubuntu 24.04, and later Ubuntu and Debian releases | `nspawn_VERSION-1_amd64.deb` |
+| Ubuntu 24.04 or later, Debian 13 or later | `nspawn_VERSION-1_amd64.deb` |
 | Arch Linux | `nspawn-VERSION-1-x86_64.pkg.tar.zst`, or the AUR's [nspawn](https://aur.archlinux.org/packages/nspawn) and [nspawn-git](https://aur.archlinux.org/packages/nspawn-git) |
 
 The release also has the plain binary in a tarball and a `SHA256SUMS` over everything.
@@ -56,12 +58,12 @@ requirements, building from source and usage examples.
 
 - **docker compose files as they are.** `nspawn compose` takes the files and the
   commands of docker compose (`up`, `down`, `ps`, `logs`, `exec`, `run`, `config` and
-  the rest): each service becomes machines, its networks, volumes and secrets
-  nspawn's own. [docs/COMPOSE.md](docs/COMPOSE.md) has what is supported, attribute
-  by attribute.
-
-- **Two kinds of machine.** An image that ships systemd boots like `machinectl start`
-  does. Any other image, for example anything from Docker Hub, runs as an app: its
+  the rest): each service becomes a machine per replica, and its networks, volumes and
+  secrets become nspawn's. [docs/COMPOSE.md](docs/COMPOSE.md) has what is supported,
+  attribute by attribute.
+- **Two kinds of machine.** An image that ships systemd and runs it (or names no
+  program) boots like `machinectl start` does. Any other image, for example nearly
+  anything from Docker Hub, runs as an app: its
   entrypoint under a stub init, or as PID 1 when it brings a supervisor of its own
   (s6-overlay, as linuxserver.io's images and Home Assistant's), with the environment,
   user, working directory and stop signal of its OCI config. Both take the same flags
@@ -76,25 +78,26 @@ requirements, building from source and usage examples.
   `--restart`, `-m`, `--cpus`, `--pids-limit`, the `--health-*` flags, `--secret`,
   `--label`, `--hostname`, `-u`, `-w`, `--cap-add`, `--cap-drop`, `--privileged`,
   `--read-only`, `--tmpfs`, `--device`, `--dns`, `--add-host`, `--ulimit`,
-  `--stop-signal`, `--log-driver`, `--depends-on` and the rest, remembered per machine;
-  `--depends-on` starts other machines first and waits for them to be started, healthy
-  or completed, at boot as well, since systemd keeps the order; what a machine
-  prints goes to a journal of nspawn's own, apart from the system's, which `logs`
-  reads. `--interface` hands a
-  machine a network interface of the host, a wifi adapter with its phy included;
-  `update` changes the limits,
-  the policy and the healthcheck of a machine, running or not; `exec`, `logs`,
-  `events`, `cp`, `kill`, `pause`, `top`, `stats` and `inspect` behave as docker's.
-  Named volumes are seeded from the image and outlive the machines that use them;
-  secrets are kept encrypted with systemd-creds and handed to a machine as files.
+  `--stop-signal`, `--log-driver`, `--depends-on` and the rest, remembered per machine.
+  `exec`, `logs`, `events`, `cp`, `kill`, `pause`, `top`, `stats` and `inspect` behave
+  as docker's, and `update` changes the limits, the policy and the healthcheck of a
+  machine, running or not.
+- **Dependencies, kept by systemd.** `--depends-on` starts other machines first and
+  waits for them to be started, healthy or completed, at boot as well.
+- **Logs, volumes and secrets.** What a machine prints goes to a journal of nspawn's
+  own, apart from the system's, which `logs` reads. Named volumes are seeded from the
+  image and outlive the machines that use them; secrets are kept encrypted with
+  systemd-creds and handed to a machine as files.
+- **Host interfaces.** `--interface` hands a machine a network interface of the host,
+  a wifi adapter with its phy included.
 - **GPUs through CDI.** `--gpus all` and `--device nvidia.com/gpu=all` hand a machine
   the devices of the CDI specs vendors' tools write (`nvidia-ctk cdi generate`), their
   libraries and hooks included, as docker and podman do; compose's `gpus:` too.
 - **Dockerfiles.** `build` runs a Dockerfile with a builder of nspawn's own, as
   `docker build` does: multi-stage builds, the build cache, `RUN --mount`, build
-  arguments and secrets, each `RUN` confined like an app machine; the layers come out
-  with the same contents as BuildKit's. Compose's `build:` sections and `compose build` use it,
-  and mkosi configurations build too.
+  arguments and secrets, each `RUN` confined like an app machine; a layer is the tar
+  BuildKit writes of the same tree. Compose's `build:` sections and `compose build` use
+  it, and mkosi configurations build too.
 - **One image, many machines.** A pulled image is a machine; `create` makes more from
   it, sharing its layers, each with settings, ports and an address of its own.
 - **Signed images.** Every image on hub.nspawn.org is signed by its build workflow,
@@ -119,7 +122,8 @@ the bus interface, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) how it is bu
 - A host with systemd-nspawn and systemd-machined 255 or newer (255, 259 and 262 are
   tested), Linux 6.5 or newer with overlayfs, and cgroup v2. The `mstack` backend
   (systemd 261 or newer with systemd-nsresourced and systemd-mountfsd) is experimental
-  and only used when asked for with `--backend mstack`.
+  and only used when asked for with `--backend mstack`; its machines do not boot on
+  systemd 262 (systemd/systemd#43899).
 - The service on the system bus: a package installs it, `sudo nspawn daemon --install`
   does the same for a binary built by hand. It runs as root; who may call it is polkit's
   answer (`org.nspawn.inspect`, `org.nspawn.manage`, administrators by default), so
@@ -131,7 +135,7 @@ the bus interface, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) how it is bu
 - `ip` and `nft` on the host (iproute2 and nftables). `--network veth` needs
   systemd-networkd; `--interface` with a wifi adapter needs `iw` for an app on the
   bridge and systemd 256 for a booted machine; `shell` on a booted machine needs D-Bus
-  inside it, `exec` nothing.
+  inside it, `exec` nothing. `build` of an mkosi configuration needs mkosi.
 
 ## Development
 
