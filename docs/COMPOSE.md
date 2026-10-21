@@ -6,7 +6,8 @@ nspawn machines, networks, volumes and secrets.
 ## What is supported
 
 Every attribute of the Compose Specification and every command and option of
-docker compose has a row below, with what nspawn compose does with it:
+docker compose has a row below, its own or that of an attribute above it marked
+"and below", with what nspawn compose does with it:
 
 - **yes**: as docker compose does.
 - **partly**: honored, with the difference the notes give.
@@ -17,8 +18,9 @@ The table is the one in `src/compose/support`, which the loader reads its
 warnings and errors from. Its tests check it against the schema and the command
 reference of the docker compose release it names, kept under
 `src/compose/upstream` (`fetch.sh` there brings those of another release), and
-against the command line itself: a command it says nspawn compose has is one,
-and its options take docker compose's short forms.
+against the command line itself: every command the table supports is on the
+command line and no refused one is, and each option has docker compose's short
+form.
 
 What the table refuses, `config` says as a warning and shows the project all the
 same; `up`, `create`, `run` and `scale` refuse it for the services they start and
@@ -29,16 +31,16 @@ the networks, volumes, secrets and configs those use.
 - **Machines.** Each replica of a service is a machine, `PROJECT-SERVICE-N`, the
   name docker gives its container. machined takes no `_` in a name, so every `_`
   is written `-`: `container_name: ejabberd_postgres` makes the machine
-  `ejabberd-postgres`, and the name as written stays a name of the machine on the
-  service's networks, where other services reach it by it. A `run` machine is
+  `ejabberd-postgres`, and other services still reach it as `ejabberd_postgres` on
+  the service's networks. A `run` machine is
   `PROJECT-SERVICE-run-HEX`.
 - **Labels.** A machine carries the labels docker compose puts on its containers
   (`com.docker.compose.project`, `.service`, `.container-number`, `.oneoff`,
   `.config-hash`, `.depends_on`, `.image`, `.project.working_dir`,
   `.project.config_files`); `down`, `ps`, `logs` and the other commands find a
   project's machines by them, with `-p NAME` alone too. The config hash is docker
-  compose's own: a machine is made anew when its service changed, or the image its
-  pull brought.
+  compose's own: a machine is made anew when its service changes or a pull brings a
+  new image.
 - **Images.** An image without a registry comes from Docker Hub, as with docker,
   and is kept under its local name (`postgres:18-alpine` is `postgres-18-alpine`);
   every machine of it is made from that image. `config --resolve-image-digests`
@@ -50,14 +52,14 @@ the networks, volumes, secrets and configs those use.
   so `nspawn run app` takes it; `user/app` stays Docker Hub's, where `build
   --push` sends it.
 - **Networks, volumes, secrets.** A network of the project is an nspawn network,
-  `PROJECT_KEY`, a volume an nspawn volume of the same name. A secret or config
+  `PROJECT_KEY`, a volume an nspawn volume, `PROJECT_KEY` as well. A secret or config
   from a file is bound read-only where the service reads it, as docker binds it;
   one from the environment or written in the file is an nspawn secret,
   `PROJECT_secret_KEY` or `PROJECT_config_KEY`, removed by `down`.
-- **Dependencies.** `depends_on` orders what compose does, as docker compose's
-  does: `up`, `start` and `run` bring the services up in order and wait for the
+- **Dependencies.** `depends_on` orders what compose does, as in docker compose:
+  `up`, `start` and `run` bring the services up in order and wait for the
   conditions, and `restart` takes along what asks for `restart: true`. The
-  machines know nothing of it, as docker's engine knows nothing of it: they carry
+  machines know nothing of it, as docker's containers do not: they carry
   no `--depends-on`, so a service that others depend on is made anew, scaled down
   or removed as with docker, and a host that boots machines with a restart policy
   starts them in no particular order.
@@ -92,9 +94,8 @@ Beyond the rows that say so:
 - `ps` and `images` show what a machine has: its name where docker shows a
   container ID (`ps -q` too), the digest of its image's manifest as the image ID,
   and `Exited (N)` without how long ago once the journal no longer has the end of
-  that run. `images`
-  gives an image's `Created` to the second, and its platform as `unknown` once the
-  image the machine was made from is no longer here.
+  that run. `images` gives an image's `Created` to the second, and its platform as
+  `unknown` once the image the machine was made from is no longer here.
 
 <!-- The support table: src/compose/support makes it, and NSPAWN_UPDATE_DOCS=1 cargo test writes it here. -->
 Decided on docker compose v5.6.0, whose Compose Specification is that of compose-go v2.16.1. An attribute of a job without a row of its own is the service attribute of the same name.
