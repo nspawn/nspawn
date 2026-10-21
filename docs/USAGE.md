@@ -294,7 +294,10 @@ zone at every start, and `off` leaves the machine's own, so a zone set inside wi
 (see "Where the output goes" below), `--init` and `--init=false` (the program under
 the stub init, which reaps orphans and turns a poweroff into SIGTERM, or as PID 1; see
 "Machines and apps"), `--sysctl` (`net.*` keys, set in an app machine's network
-namespace) and `--interface IFACE`, which has no docker counterpart: a network
+namespace after docker's own defaults there, `net.ipv4.ping_group_range=0 2147483647`
+and `net.ipv4.ip_unprivileged_port_start=0`, so that a user other than root has the ICMP
+echo sockets a ping without raw sockets uses, and binds a port below 1024, as in a
+docker container; a `--sysctl` of either key wins) and `--interface IFACE`, which has no docker counterpart: a network
 interface of the host moved into the machine while it runs (see "Physical
 interfaces" under Networking). A `--tmpfs` without a `mode=` is 1777, as docker's, so a
 program of any user writes to it; unlike docker's it is not mounted `noexec,nosuid`,

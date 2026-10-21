@@ -875,9 +875,32 @@ pub fn host_end_name_at(name: &str, index: usize) -> String {
     format!("vb{index}-{}", short_hash(name))
 }
 
+/// What an app's own network namespace is given before its --sysctl values: ICMP echo
+/// sockets for every group (an unprivileged ping's), and ports below 1024 for every user,
+/// which the default capabilities would allow anyway. Written from the host, the range
+/// covers the ids of every user namespace below 2^31. A key the kernel lacks is left out.
+const DEFAULT_SYSCTLS: [(&str, &str); 2] = [
+    ("net.ipv4.ping_group_range", "0 2147483647"),
+    ("net.ipv4.ip_unprivileged_port_start", "0"),
+];
+
+/// The values set in an app machine's namespace, in order: the defaults the kernel has,
+/// then the machine's own, which win.
+fn netns_sysctls(
+    own: &BTreeMap<String, String>,
+    exists: impl Fn(&str) -> bool,
+) -> Vec<(String, String)> {
+    DEFAULT_SYSCTLS
+        .iter()
+        .filter(|(key, _)| !own.contains_key(*key) && exists(key))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .chain(own.iter().map(|(k, v)| (k.clone(), v.clone())))
+        .collect()
+}
+
 /// An app machine's network namespace, ready before its program starts: a veth pair on
 /// each of its bridges (host0 on the first), the addresses, the default route through
-/// `gateway` and the --sysctl values.
+/// `gateway`, the default sysctls and the --sysctl values.
 pub fn create_netns(
     nets: &[(&NetSpec, Ipv4Addr)],
     name: &str,
@@ -900,7 +923,12 @@ pub fn create_netns(
             "ip",
             &["-n", &ns, "route", "add", "default", "via", &gateway],
         )?;
-        for (key, value) in sysctls {
+        let exists = |key: &str| {
+            std::path::Path::new("/proc/sys")
+                .join(key.replace('.', "/"))
+                .exists()
+        };
+        for (key, value) in netns_sysctls(sysctls, exists) {
             let setting = format!("{key}={value}");
             run(
                 "ip",
@@ -1891,6 +1919,44 @@ fn ports_script(in_use: &[PortInUse]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_app_s_namespace_takes_the_default_sysctls_under_its_own() {
+        let all = |_: &str| true;
+        let pairs = |v: Vec<(String, String)>| {
+            v.into_iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pairs(netns_sysctls(&BTreeMap::new(), all)),
+            [
+                "net.ipv4.ping_group_range=0 2147483647",
+                "net.ipv4.ip_unprivileged_port_start=0"
+            ]
+        );
+        let own = BTreeMap::from([
+            (
+                "net.ipv4.ip_unprivileged_port_start".to_string(),
+                "1024".to_string(),
+            ),
+            ("net.ipv4.tcp_syncookies".to_string(), "0".to_string()),
+        ]);
+        assert_eq!(
+            pairs(netns_sysctls(&own, all)),
+            [
+                "net.ipv4.ping_group_range=0 2147483647",
+                "net.ipv4.ip_unprivileged_port_start=1024",
+                "net.ipv4.tcp_syncookies=0"
+            ]
+        );
+        // A kernel without the key does without it.
+        let no_ping = |k: &str| !k.ends_with("ping_group_range");
+        assert_eq!(
+            pairs(netns_sysctls(&BTreeMap::new(), no_ping)),
+            ["net.ipv4.ip_unprivileged_port_start=0"]
+        );
+    }
 
     #[test]
     fn a_machine_s_port_is_found_by_where_its_peer_is() {

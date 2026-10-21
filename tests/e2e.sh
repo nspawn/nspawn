@@ -97,7 +97,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -4520,6 +4520,27 @@ $NSPAWN rm -f e2e-names-m >/dev/null 2>&1
 out=$($NSPAWN run --rm --pull never e2e-names-none-$nonce:1 -- true 2>&1) && fail "run --pull never of a name nothing has: $out"
 echo "$out" | grep_q "no local image of $NSPAWN_REGISTRY/e2e-names-none-$nonce:1" || fail "run --pull never of a missing image was not explained: $out"
 for m in $($NSPAWN images ls | awk -v n="e2e-names-$nonce" '$1 ~ n {print $1}'); do $NSPAWN images rm "$m" >/dev/null 2>&1; done
+
+step "an app's own network takes docker's sysctls: another user binds a low port, --sysctl wins, the host keeps its own"
+$NSPAWN run -d --name e2e-sc -u 65534 $rv -- sleep 600 >/dev/null || fail "run e2e-sc"
+sc() { $NSPAWN exec e2e-sc -- /bin/sh -c "$1" </dev/null 2>&1 | tr -d '\r'; }
+[ "$(sc 'cat /proc/sys/net/ipv4/ping_group_range' | tr -s ' \t' ' ')" = "0 2147483647" ] || fail "ping_group_range of an app: $(sc 'cat /proc/sys/net/ipv4/ping_group_range')"
+[ "$(sc 'cat /proc/sys/net/ipv4/ip_unprivileged_port_start')" = 0 ] || fail "ip_unprivileged_port_start of an app: $(sc 'cat /proc/sys/net/ipv4/ip_unprivileged_port_start')"
+[ "$(sc 'id -u')" = 65534 ] || fail "exec did not run as the app's user: $(sc 'id -u')"
+# The listener lets go of the output of exec, which waits for it, and goes once seen.
+listen='nc -l -p 80 </dev/null >/dev/null 2>&1 & p=$!; sleep 1; netstat -ltn; kill $p'
+sc "$listen" | grep_q ":80 " || fail "a user other than root cannot bind port 80: $(sc "$listen")"
+$NSPAWN rm -f e2e-sc >/dev/null 2>&1
+$NSPAWN run -d --name e2e-sc --sysctl net.ipv4.ip_unprivileged_port_start=1024 $rv -- sleep 600 >/dev/null || fail "run e2e-sc with --sysctl"
+[ "$(sc 'cat /proc/sys/net/ipv4/ip_unprivileged_port_start')" = 1024 ] || fail "--sysctl did not win over docker's default: $(sc 'cat /proc/sys/net/ipv4/ip_unprivileged_port_start')"
+$NSPAWN rm -f e2e-sc >/dev/null 2>&1
+# Inside, the range reads as the machine's user namespace maps it: the host's is what
+# shows whether an app on the host's network changed it.
+host_range=$(tr -s ' \t' ' ' < /proc/sys/net/ipv4/ping_group_range)
+host_ports=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)
+$NSPAWN run --rm --network host $rv -- true >/dev/null 2>&1 || fail "run of an app on the host's network"
+[ "$(tr -s ' \t' ' ' < /proc/sys/net/ipv4/ping_group_range)" = "$host_range" ] || fail "the host's ping_group_range changed"
+[ "$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)" = "$host_ports" ] || fail "the host's ip_unprivileged_port_start changed"
 
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"
