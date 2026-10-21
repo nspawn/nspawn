@@ -2153,7 +2153,7 @@ $NSPAWN ps | grep "^ *e2e-mix-side " | grep_q " container:e2e-mix-app " || fail 
 $NSPAWN pull "$IMAGE" --name e2e-mix-boot --backend overlay --force >/dev/null || fail "pull e2e-mix-boot"
 $NSPAWN start e2e-mix-boot --network e2e-nd --network e2e-ne --network-alias mixboot --depends-on e2e-mix-side \
   --health-cmd "systemctl is-system-running --wait | grep -Eq '^(running|degraded)\$'" --health-interval 2s --health-timeout 30s --health-retries 3 --health-start-period 40s \
-  --secret e2e-pw --hostname mixboot-$nonce --tmpfs /var/tmp:size=16m --cap-drop SYS_MODULE --add-host peer:10.1.1.9 >/dev/null || fail "start the mixed booted machine"
+  --secret e2e-pw --hostname mixboot-$nonce --tmpfs /var/tmp:size=16m --cap-drop SYS_MODULE --add-host peer:10.1.1.9 --dns-search mix.test >/dev/null || fail "start the mixed booted machine"
 mb() { $NSPAWN exec e2e-mix-boot -- /bin/sh -c "$1" </dev/null 2>/dev/null | tr -d '\r'; }
 retry 30 bash -c "$NSPAWN ps | grep '^ *e2e-mix-boot ' | grep_q '(healthy)'" || fail "the mixed booted machine is not healthy: $($NSPAWN ps | grep e2e-mix-boot; $NSPAWN inspect e2e-mix-boot | grep -A3 health_log)"
 [ "$(mb 'cat /run/secrets/e2e-pw')" = mix-secret ] || fail "the secret is not readable in the booted machine: $(mb 'ls -la /run/secrets')"
@@ -2162,6 +2162,10 @@ retry 30 bash -c "$NSPAWN ps | grep '^ *e2e-mix-boot ' | grep_q '(healthy)'" || 
 mb 'cat /proc/mounts' | grep_q " /var/tmp tmpfs" || fail "--tmpfs missing in the booted machine"
 [ $(( 0x$(mb "awk '/^CapBnd:/ {print \$2}' /proc/1/status") & 0x10000 )) = 0 ] || fail "--cap-drop SYS_MODULE left the capability in the booted machine: $(mb 'grep CapBnd /proc/1/status')"
 mb 'cat /etc/hosts' | grep_q "^10.1.1.9 peer$" || fail "--add-host missing in the booted machine"
+mb 'cat /run/systemd/network/1*-host*.network' | grep_q "^Domains=mix.test$" || fail "--dns-search missing from the booted machine's network files: $(mb 'cat /run/systemd/network/1*-host*.network')"
+if [ -n "$(mb 'command -v resolvectl')" ]; then
+  retry 10 bash -c "$NSPAWN exec e2e-mix-boot -- resolvectl domain </dev/null 2>/dev/null | grep_q mix.test" || fail "systemd-resolved in the booted machine lacks the search domain: $(mb 'resolvectl domain')"
+fi
 mb 'getent hosts mixweb' | grep_q "$app_nd" || fail "the booted machine does not resolve the app's alias on e2e-nd: $(mb 'getent hosts mixweb')"
 mb 'getent hosts inner' | grep_q "$app_ne" || fail "the booted machine does not resolve the app's alias on e2e-ne: $(mb 'getent hosts inner')"
 $NSPAWN exec e2e-mix-boot -- bash -c 'exec 3<>/dev/tcp/mixweb/80; printf "GET / HTTP/1.0\r\n\r\n" >&3; cat <&3' </dev/null | tr -d '\r' | grep_q mix-secret || fail "the booted machine does not reach the app by its alias"
