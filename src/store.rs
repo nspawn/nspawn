@@ -2370,17 +2370,23 @@ mod tests {
         assert_eq!(fs::metadata(target.join("etc")).unwrap().mtime(), 2000);
     }
 
-    /// A chain of `depth` directories below `top`, made through descriptors since its
-    /// paths outgrow PATH_MAX.
-    fn chain(top: &Path, depth: usize) {
+    /// A chain of up to `depth` directories below `top`, made through descriptors since
+    /// its paths outgrow PATH_MAX; how deep it got. Some file systems refuse to go that
+    /// deep (ENAMETOOLONG), as the containers of the package builds do, and the chain
+    /// ends there.
+    fn chain(top: &Path, depth: usize) -> usize {
         use nix::fcntl::{open, openat, OFlag};
         use nix::sys::stat::mkdirat;
         let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
         let mut dir = open(top, flags, FileMode::empty()).unwrap();
-        for _ in 0..depth {
-            mkdirat(&dir, "d", FileMode::from_bits_truncate(0o755)).unwrap();
+        for made in 0..depth {
+            match mkdirat(&dir, "d", FileMode::from_bits_truncate(0o755)) {
+                Err(nix::errno::Errno::ENAMETOOLONG) => return made,
+                r => r.unwrap(),
+            }
             dir = openat(&dir, "d", flags, FileMode::empty()).unwrap();
         }
+        depth
     }
 
     #[test]
@@ -2402,7 +2408,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let top = tmp.path().join("upper");
         fs::create_dir(&top).unwrap();
-        chain(&top, 30_000);
+        let depth = chain(&top, 30_000);
+        assert!(depth >= 1000, "only {depth} levels");
         fs::write(top.join("d/f"), "x").unwrap();
         // remove_dir_all overflows a stack of this size a few thousand levels down.
         let removed = std::thread::Builder::new()
