@@ -136,7 +136,7 @@ with their objects).
 | `networks` | as | every bridge network joined, the primary one first |
 | `address`, `addresses` | s, a{ss} | the address on the primary network, and by network |
 | `aliases` | as | `NETWORK=NAME` |
-| `ports`, `volumes`, `secrets` | as | `[IP:]HOST:CONTAINER[/udp]`; `SOURCE:TARGET[:ro]`; `NAME:TARGET:MODE:UID:GID` |
+| `ports`, `volumes`, `secrets` | as | `[IP:]HOST->CONTAINER/PROTO` (an IPv6 IP in brackets; no IP for every address); `SOURCE:TARGET[:ro]`; `NAME:TARGET:MODE:UID:GID` |
 | `env`, `image_env` | as | the machine's variables, the image's |
 | `entrypoint`, `cmd`, `command`, `image_cmd` | as | the entrypoint and the arguments after it as docker merges them (none after an entrypoint given alone), both together, the image's own cmd |
 | `working_dir`, `user`, `stop_signal` | s | the flag's when given, the image's otherwise |
@@ -167,6 +167,7 @@ A machine of `ListMachines` and `GetMachine` adds:
 | `started`, `finished` | t | when the last run started and ended, 0 when unknown |
 | `leader`, `os` | t, s | the leader's PID on the host, the machine's OS, while it runs |
 | `machine_path` | s | machined's object path, `""` when it does not run |
+| `bindings` | as | where its ports are published, docker's way: `0.0.0.0:8080->80/tcp`, and `[::]:8080->80/tcp` on a host with IPv6 |
 | `exit_code` | i | docker's code for the last run, on a stopped or restarting machine |
 | `health`, `health_failing_streak`, `health_log` | s, u, as | for a running machine with a healthcheck: starting, healthy or unhealthy; the failures in a row; the last probes as `END EXIT_CODE OUTPUT` |
 
@@ -180,7 +181,7 @@ given is remembered for the machine.
 | `network`, `networks` | s, as | bridge, veth, host, none, `container:NAME` or a network made with `CreateNetwork`; several bridge networks, the first one primary |
 | `aliases` | as | `NAME` on the primary network or `NETWORK=NAME` |
 | `addresses` | as | `IP` on the primary network or `NETWORK=IP`: fixed addresses on networks made with `CreateNetwork` |
-| `publish` | as | `[IP:]HOST:CONTAINER[/udp]`, or ranges of equal length on both sides |
+| `publish` | as | `[IP:]HOST:CONTAINER[/udp]` (an IPv6 IP in brackets: `[::1]:8080:80`; `0.0.0.0` every IPv4 address alone, `[::]` every IPv6 one, no IP both), or ranges of equal length on both sides |
 | `entrypoint` | s | replaces the image's and drops its cmd; `""` runs the command alone |
 | `command` | as | replaces an app's cmd |
 | `image_command` | b | forgets the remembered entrypoint and command and runs the image's own |

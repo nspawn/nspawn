@@ -782,6 +782,21 @@ pub fn strings(dict: &Dict, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Where a machine's ports are published, docker's way ("0.0.0.0:8080->80/tcp",
+/// "[::]:8080->80/tcp"); from its ports for a service that names no bindings.
+pub fn bindings(dict: &Dict) -> Vec<String> {
+    if dict.contains_key("bindings") {
+        return strings(dict, "bindings");
+    }
+    strings(dict, "ports")
+        .into_iter()
+        .map(|p| match p.split_once("->") {
+            Some((host, _)) if !host.contains(':') => format!("0.0.0.0:{p}"),
+            _ => p,
+        })
+        .collect()
+}
+
 pub fn u64(dict: &Dict, key: &str) -> u64 {
     maybe_u64(dict, key).unwrap_or(0)
 }

@@ -338,7 +338,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.platform` | partly | the host's architecture is pulled; another one is warned about |
 | `services.*.ports` | yes |  |
 | `services.*.ports.[].app_protocol` | yes |  |
-| `services.*.ports.[].host_ip` | partly | an IPv4 address |
+| `services.*.ports.[].host_ip` | yes |  |
 | `services.*.ports.[].mode` | yes |  |
 | `services.*.ports.[].mode`: `host` | ignored | ports[].mode: host is only honored by the Swarm routing mesh |
 | `services.*.ports.[].name` | yes |  |

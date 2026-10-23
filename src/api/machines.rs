@@ -702,7 +702,9 @@ pub async fn prepare(
         for net in &nets {
             bridge::up(net, &all, sd, report).await?;
         }
-        bridge::check_port_conflicts(store, sd, &record).await?;
+        // A proxy left by an earlier run of the machine holds its IPv6 listeners.
+        crate::portproxy::stop(sd, name).await?;
+        bridge::check_port_conflicts(store, sd, &record, pass == Pass::Hook, report).await?;
         store.record_image(&record)?;
         let addrs = bridge::prepare_machine(store, config, &nets, &all, &mut record)?;
         if record.mode == Mode::App {
@@ -1407,10 +1409,19 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
         let _lock = store.lock().await?;
         bridge::sync_ports(store, sd).await?;
     }
-    if args.wait && booted {
-        return wait_for_init(sd, &args.name).await;
+    // The publish hook starts the port proxy once the unit is up, which for a booted
+    // machine is when its init is.
+    let outcome = if args.wait && booted {
+        wait_for_init(sd, &args.name).await?
+    } else {
+        StartOutcome::Started
+    };
+    if network == Network::Bridge && (!booted || args.wait) {
+        if let Some(record) = store.load_image(&args.name)? {
+            crate::portproxy::report_down(sd, &record, report).await;
+        }
     }
-    Ok(StartOutcome::Started)
+    Ok(outcome)
 }
 
 /// What a start's flags make of the machine's record: each one given replaces what the

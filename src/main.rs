@@ -34,6 +34,7 @@ mod nsenter;
 mod oci;
 mod output;
 mod policy;
+mod portproxy;
 mod pty;
 mod reference;
 mod search;
@@ -78,7 +79,7 @@ async fn run() {
     // leaves must cost it a write error, not its life.
     if matches!(
         args.command,
-        cli::Command::Daemon(_) | cli::Command::ApiServe { .. }
+        cli::Command::Daemon(_) | cli::Command::ApiServe { .. } | cli::Command::PortProxy { .. }
     ) {
         unsafe {
             let _ = nix::sys::signal::signal(

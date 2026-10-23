@@ -422,7 +422,8 @@ pub async fn disconnect(
         bail!("{network} is the only network of {machine}: nspawn network connect another one first, or start it with --network none");
     }
     let running = sd.machine_exists(machine).await?;
-    if networks[0] == network {
+    let primary_left = networks[0] == network;
+    if primary_left {
         // The next network becomes the primary one, with its address.
         let next = record.extra_networks.remove(0);
         record.network_name =
@@ -485,8 +486,13 @@ pub async fn disconnect(
                     )?;
                 }
             }
-            // The published ports follow the primary address, which may have changed.
-            bridge::sync_ports(store, sd).await
+            // The published ports follow the primary address, which may have changed;
+            // the port proxy reads it anew.
+            bridge::sync_ports(store, sd).await?;
+            if primary_left && !record.ports.is_empty() {
+                crate::portproxy::start(ctx, &record).await?;
+            }
+            Ok::<(), anyhow::Error>(())
         };
         if let Err(e) = live.await {
             line(
@@ -812,6 +818,7 @@ pub async fn publish(ctx: &Context, name: &str) -> Result<()> {
             bridge::sync_ports(store, sd).await?;
             // Registered by now: machined says it holds them.
             store.release_ports_claim(name);
+            crate::portproxy::start(ctx, &record).await?;
         }
         Network::Veth if hostnet::firewalld_running(sd).await => {
             hostnet::admit(sd, name, &to_journal).await?;
@@ -838,6 +845,9 @@ pub async fn release(ctx: &Context, name: &str) -> Result<()> {
     if let Ok(sd) = ctx.sd().await {
         hostnet::release_machine(sd, name).await;
         if let Err(e) = crate::health::stop_runner_soon(sd, name).await {
+            eprintln!("warning: {e:#}");
+        }
+        if let Err(e) = crate::portproxy::stop_soon(sd, name).await {
             eprintln!("warning: {e:#}");
         }
     }

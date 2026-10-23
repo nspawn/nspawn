@@ -394,12 +394,6 @@ fn ports(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
             ),
         };
         let host_ip = s(port, "host_ip");
-        if host_ip.contains(':') {
-            bail!(
-                "service {:?}: port {target} on {host_ip}: nspawn publishes on IPv4 addresses",
-                spec.service
-            );
-        }
         let mut published = s(port, "published").to_string();
         if published.contains('-') {
             bail!(
@@ -412,8 +406,11 @@ fn ports(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
             made.ephemeral
                 .push(format!("{published}->{target}/{protocol}"));
         }
+        // An IP as docker compose takes it: 0.0.0.0 is IPv4 alone, :: IPv6 alone.
         let mut text = format!("{published}:{target}");
-        if !host_ip.is_empty() && host_ip != "0.0.0.0" {
+        if host_ip.contains(':') {
+            text = format!("[{host_ip}]:{text}");
+        } else if !host_ip.is_empty() {
             text = format!("{host_ip}:{text}");
         }
         if protocol == "udp" {
@@ -1200,7 +1197,7 @@ services:
     environment:
       A: "1"
       EMPTY:
-    ports: ["127.0.0.1:8080:80", "8443:443/udp"]
+    ports: ["127.0.0.1:8080:80", "8443:443/udp", "0.0.0.0:8081:81", "[::1]:8082:82"]
     volumes:
       - data:/data
       - /srv/conf:/conf:ro
@@ -1279,7 +1276,22 @@ services:
         let web = made(&project, "web", 1);
         assert_eq!(list(&web, "networks"), ["demo_back"]);
         assert_eq!(list(&web, "aliases"), ["demo_back=web", "demo_back=www"]);
-        assert_eq!(list(&web, "publish"), ["127.0.0.1:8080:80", "8443:443/udp"]);
+        // An IP as docker compose takes it: 0.0.0.0 IPv4 alone, an IPv6 one in brackets.
+        assert_eq!(
+            list(&web, "publish"),
+            [
+                "127.0.0.1:8080:80",
+                "8443:443/udp",
+                "0.0.0.0:8081:81",
+                "[::1]:8082:82"
+            ]
+        );
+        for p in list(&web, "publish") {
+            assert!(
+                crate::bridge::parse_publish(std::slice::from_ref(&p)).is_ok(),
+                "{p}"
+            );
+        }
         assert_eq!(
             list(&web, "volume"),
             ["demo_data:/data", "/srv/conf:/conf:ro"]

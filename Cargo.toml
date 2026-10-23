@@ -26,6 +26,7 @@ nix = { version = "0.31", features = [
     "process",
     "poll",
     "socket",
+    "net",
     "uio",
     "time",
     "mount",

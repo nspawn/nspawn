@@ -61,7 +61,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Ok(config) => config,
         // The release hook cleans up after a machine that ended, and the removal of a
         // --rm machine follows it: a configuration broken since the machine started must
-        // not leave its namespace, its rules, its secrets or the machine itself.
+        // not leave its namespace, its rules, its secrets or the machine itself, nor take
+        // the IPv6 side of its ports down.
         Err(e) if cleaning_up(&cli.command) => {
             eprintln!("warning: {e:#}; going by the settings of it that are still valid");
             Config::load_leniently(
@@ -100,6 +101,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Command::HealthRun { name } => crate::health::run(&Context::new(config), &name).await,
         Command::ApiServe { name } => crate::dockerapi::serve(&name, config).await,
+        Command::PortProxy { name } => crate::portproxy::serve(&Context::new(config), &name).await,
         Command::AwaitDependencies { name } => {
             api::dependencies::await_all(&Context::new(config), &name).await
         }
@@ -871,6 +873,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         | Command::RemoveAfterExit { .. }
         | Command::HealthRun { .. }
         | Command::ApiServe { .. }
+        | Command::PortProxy { .. }
         | Command::AwaitDependencies { .. }
         | Command::AttachExec { .. } => {
             unreachable!("handled before")
@@ -893,6 +896,7 @@ fn cleaning_up(command: &Command) -> bool {
         Command::Network(crate::cli::NetworkArgs {
             command: NetworkCommand::Release { .. }
         }) | Command::RemoveAfterExit { .. }
+            | Command::PortProxy { .. }
     )
 }
 

@@ -325,9 +325,10 @@ impl Machine {
     /// Published ports, then the image's exposed ones nothing publishes.
     fn port_list(&self, exposed: &[String]) -> Vec<Value> {
         let mut out = Vec::new();
-        for p in &self.record.ports {
+        let ipv6 = crate::portproxy::host_has_ipv6();
+        for p in crate::bridge::bindings(&self.record.ports, ipv6) {
             out.push(json!({
-                "IP": p.host_ip.map_or_else(|| "0.0.0.0".to_string(), |ip| ip.to_string()),
+                "IP": p.host_ip.map(|ip| ip.to_string()).unwrap_or_default(),
                 "PrivatePort": p.container,
                 "PublicPort": p.host,
                 "Type": p.protocol.name(),
@@ -716,12 +717,13 @@ impl Machine {
         if !self.running() {
             return out;
         }
-        for p in &self.record.ports {
+        let ipv6 = crate::portproxy::host_has_ipv6();
+        for p in crate::bridge::bindings(&self.record.ports, ipv6) {
             let key = format!("{}/{}", p.container, p.protocol.name());
             let entry = out.entry(key).or_insert_with(|| json!([]));
             if let Some(list) = entry.as_array_mut() {
                 list.push(json!({
-                    "HostIp": p.host_ip.map_or_else(|| "0.0.0.0".to_string(), |ip| ip.to_string()),
+                    "HostIp": p.host_ip.map(|ip| ip.to_string()).unwrap_or_default(),
                     "HostPort": p.host.to_string(),
                 }));
             }

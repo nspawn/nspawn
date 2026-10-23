@@ -555,9 +555,10 @@ fn tuning_flags(t: &crate::tuning::Tuning) -> Vec<Vec<String>> {
     out
 }
 
-/// -p as it is given: [IP:]HOST:CONTAINER[/udp].
+/// -p as it is given: [IP:]HOST:CONTAINER[/udp], an IPv6 IP in brackets.
 fn publish_text(port: &PortMap) -> String {
     let mut text = match port.host_ip {
+        Some(std::net::IpAddr::V6(ip)) => format!("[{ip}]:{}:{}", port.host, port.container),
         Some(ip) => format!("{ip}:{}:{}", port.host, port.container),
         None => format!("{}:{}", port.host, port.container),
     };
@@ -753,6 +754,30 @@ mod tests {
             .map(|(_, v)| v)
             .collect();
         assert_eq!(ips, ["10.97.42.50", "back=10.97.43.7"]);
+    }
+
+    #[test]
+    fn ports_come_back_as_they_were_given() {
+        let mut r = record("web", "hub.example/app:1");
+        r.ports = crate::bridge::parse_publish(&[
+            "8080:80".into(),
+            "0.0.0.0:8081:81".into(),
+            "[::1]:8082:82/udp".into(),
+        ])
+        .unwrap();
+        let w = flags(&r).0.concat();
+        let published: Vec<&String> = w
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i > 0 && w[i - 1] == "--publish")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            published,
+            ["8080:80", "0.0.0.0:8081:81", "[::1]:8082:82/udp"]
+        );
+        let again: Vec<String> = published.into_iter().cloned().collect();
+        assert_eq!(crate::bridge::parse_publish(&again).unwrap(), r.ports);
     }
 
     #[test]

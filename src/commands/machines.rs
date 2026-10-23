@@ -322,18 +322,7 @@ fn ps_row(m: &Dict, now: u64, trunc: bool) -> serde_json::Value {
         }
         _ => "Created".to_string(),
     };
-    let ports: Vec<String> = client::strings(m, "ports")
-        .iter()
-        .filter_map(|p| {
-            let (host, inside) = p.split_once("->")?;
-            let host = if host.contains(':') {
-                host.to_string()
-            } else {
-                format!("0.0.0.0:{host}")
-            };
-            Some(format!("{host}->{inside}"))
-        })
-        .collect();
+    let ports = client::bindings(m);
     serde_json::json!({
         "ID": client::string(m, "name"),
         "Names": client::string(m, "name"),
@@ -1278,18 +1267,13 @@ pub async fn port(args: PortArgs, client: &Client) -> Result<()> {
         .await
         .map_err(client::error)?;
     let running = client::string(&machine, "state") != "stopped";
-    // "[IP:]HOST->CONTAINER/PROTO", as the service writes them.
+    // "IP:HOST->CONTAINER/PROTO", an IPv6 IP in brackets.
     let published: Vec<(String, String)> = if running {
-        client::strings(&machine, "ports")
+        client::bindings(&machine)
             .iter()
             .filter_map(|p| {
                 let (host, container) = p.split_once("->")?;
-                let host = if host.contains(':') {
-                    host.to_string()
-                } else {
-                    format!("0.0.0.0:{host}")
-                };
-                Some((container.to_string(), host))
+                Some((container.to_string(), host.to_string()))
             })
             .collect()
     } else {

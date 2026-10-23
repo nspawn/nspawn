@@ -943,16 +943,39 @@ nspawn says so.
 
 ### Published ports
 
-Ports are published like docker: `nspawn start web -p 8080:80 -p 5353:53/udp`. Each one
-is a DNAT entry in the same nftables table, reachable from other hosts, from the host's
-own addresses and from 127.0.0.1, and it goes away when the machine stops. `-p
-127.0.0.1:8080:80` publishes on one address of the host alone, for a reverse proxy in
-front; `-p 8000-8010:8000-8010` publishes a range, one mapping per port. A port another
-running machine publishes (on every address, or on that one), or one a service of the
-host listens on, is refused. The list is remembered for the machine; `-p none` forgets
-it. With firewalld running, the bridge is bound to the trusted zone at runtime, which
-also lets published ports through; the binding does not survive `firewall-cmd
+Ports are published like docker: `nspawn start web -p 8080:80 -p 5353:53/udp`. On IPv4
+each one is a DNAT entry in the same nftables table, reachable from other hosts, from
+the host's own addresses and from 127.0.0.1, and it goes away when the machine stops.
+`-p 8000-8010:8000-8010` publishes a range, one mapping per port. A port another
+running machine publishes on an address they share, or one a service of the host
+listens on, is refused. The list is remembered for the machine; `-p none` forgets it.
+With firewalld running, the bridge is bound to the trusted zone at runtime, which also
+lets published ports through on IPv4; the binding does not survive `firewall-cmd
 --reload`, and the next `start` or `nspawn network up` puts it back.
+
+The machines have IPv4 addresses alone, and nftables cannot translate IPv6 into IPv4,
+so a port answers on the host's IPv6 addresses through a proxy, as docker's userland
+proxy serves it: `nspawn-proxy-NAME.service`, which the unit's hooks start once the
+machine runs and stop with it, listens there and relays TCP connections and UDP
+datagrams to the machine's address. The IP of `-p` says where a port is published, as
+with docker:
+
+| `-p` | Where |
+| --- | --- |
+| `8080:80` | every IPv4 address and, on a host with IPv6, every IPv6 address |
+| `0.0.0.0:8080:80` | every IPv4 address |
+| `127.0.0.1:8080:80` | that IPv4 address, for a reverse proxy in front |
+| `[::]:8080:80` | every IPv6 address |
+| `[2001:db8::1]:8080:80`, `[::1]:8080:80` | that IPv6 address |
+
+A link-local address (`fe80::`) cannot be named, as it needs an interface; `[::]`
+takes it with the others. An IPv6 client reaches the machine from the bridge's gateway
+address, not its own, as with docker's proxy. It comes in through the host's input
+path, not its forwarding, so a host firewall (firewalld's zone of the interface, ufw,
+an nftables input policy) has to let the port in, as for any service of the host; nspawn
+changes no rule for it. `nspawn port`, `ps --format '{{.Ports}}'`, compose and the
+Docker API show each side, `0.0.0.0:8080->80/tcp` and `[::]:8080->80/tcp`, as docker
+does.
 
 ### Firewalls
 

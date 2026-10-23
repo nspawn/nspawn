@@ -34,6 +34,8 @@ ipv4_only() {
 # SIGPIPE, which pipefail counts as a failure: read everything instead.
 grep_q() { grep "$@" >/dev/null; }
 export -f grep_q
+# Whether the host makes IPv6 sockets: a port given no IP is published there too.
+host_ipv6=$(python3 -c 'import socket; socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)' 2>/dev/null && echo yes || true)
 # Runs a command on a pseudo terminal of its own (script(1) is not on every host).
 pyrun() { python3 -c 'import os, pty, sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"; }
 # A machine's address on its network, as inspect has it.
@@ -97,7 +99,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc e2e-v6 e2e-v6b e2e-v6c e2e-v6d e2e-v6u e2e-v6low; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -118,7 +120,7 @@ cleanup_machines() {
   rmmod mac80211_hwsim >/dev/null 2>&1 || true
   $NSPAWN network rm e2e-na e2e-nb e2e-nc e2e-nd e2e-ne e2e-nf e2e-gn e2e-api e2e-capi_default e2e-au-net >/dev/null 2>&1 || true
   $NSPAWN volume rm e2e-au-vol e2e-cli-vol >/dev/null 2>&1 || true
-  $NSPAWN network rm e2e-cli-net e2e-cli-pnet e2e-ip-net e2e-ip-net2 e2e-cip_fixed >/dev/null 2>&1 || true
+  $NSPAWN network rm e2e-cli-net e2e-cli-pnet e2e-ip-net e2e-ip-net2 e2e-cip_fixed e2e-v6net >/dev/null 2>&1 || true
   rm -rf /tmp/e2e-cli /tmp/e2e-cdi
   rm -f /etc/cdi/e2e-nspawn.yaml /etc/cdi/e2e-nspawn-bad.yaml /var/run/cdi/e2e-nspawn-gpu.json /usr/local/bin/e2e-cdi-hook
   $NSPAWN network rm e2e-cdi_default >/dev/null 2>&1 || true
@@ -2987,9 +2989,20 @@ $NSPAWN ps -q | grep_q -x e2e-cli || fail "ps -q misses e2e-cli: $($NSPAWN ps -q
 [ -z "$($NSPAWN ps -q --filter name=^e2e-none-such$)" ] || fail "ps --filter name matched what it should not"
 $NSPAWN ps --format '{{.Names}} {{.State}} {{.Label "e2e.file"}}' | grep_q -x 'e2e-cli running yes' || fail "ps --format: $($NSPAWN ps --format '{{.Names}} {{.State}} {{.Label "e2e.file"}}' 2>&1)"
 $NSPAWN ps --format 'table {{.Names}}\t{{.Ports}}' | sed -n 1p | grep_q -E '^NAMES +PORTS$' || fail "ps --format table: $($NSPAWN ps --format 'table {{.Names}}\t{{.Ports}}' 2>&1)"
-$NSPAWN ps --format json --filter name=e2e-cli | python3 -c "import json,sys; rows = [json.loads(l) for l in sys.stdin]; assert rows[0]['Names'] == 'e2e-cli' and rows[0]['Ports'] == '0.0.0.0:18130->80/tcp', rows" || fail "ps --format json"
-[ "$($NSPAWN port e2e-cli)" = "80/tcp -> 0.0.0.0:18130" ] || fail "port: $($NSPAWN port e2e-cli 2>&1)"
-[ "$($NSPAWN port e2e-cli 80)" = "0.0.0.0:18130" ] || fail "port with a port: $($NSPAWN port e2e-cli 80 2>&1)"
+# A port given no IP is published on every IPv4 and, where the host has IPv6, every IPv6
+# address, as docker shows it.
+if [ "$host_ipv6" = yes ]; then
+  cli_ports='0.0.0.0:18130->80/tcp, [::]:18130->80/tcp'
+  cli_port=$'80/tcp -> 0.0.0.0:18130\n80/tcp -> [::]:18130'
+  cli_port80=$'0.0.0.0:18130\n[::]:18130'
+else
+  cli_ports='0.0.0.0:18130->80/tcp'
+  cli_port='80/tcp -> 0.0.0.0:18130'
+  cli_port80='0.0.0.0:18130'
+fi
+$NSPAWN ps --format json --filter name=e2e-cli | python3 -c "import json,sys; rows = [json.loads(l) for l in sys.stdin]; assert rows[0]['Names'] == 'e2e-cli' and rows[0]['Ports'] == '$cli_ports', rows" || fail "ps --format json"
+[ "$($NSPAWN port e2e-cli)" = "$cli_port" ] || fail "port: $($NSPAWN port e2e-cli 2>&1)"
+[ "$($NSPAWN port e2e-cli 80)" = "$cli_port80" ] || fail "port with a port: $($NSPAWN port e2e-cli 80 2>&1)"
 out=$($NSPAWN port e2e-cli 81 2>&1) && fail "port of a port not published: $out"
 echo "$out" | grep_q "no public port '81' published for e2e-cli" || fail "port of a port not published was not explained: $out"
 # A running app and a running booted machine join a network and leave it.
@@ -4546,6 +4559,80 @@ host_ports=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)
 $NSPAWN run --rm --network host $rv -- true >/dev/null 2>&1 || fail "run of an app on the host's network"
 [ "$(tr -s ' \t' ' ' < /proc/sys/net/ipv4/ping_group_range)" = "$host_range" ] || fail "the host's ping_group_range changed"
 [ "$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)" = "$host_ports" ] || fail "the host's ip_unprivileged_port_start changed"
+
+step "published ports answer on the host's IPv6 addresses through the port proxy; 0.0.0.0 and [IP] keep a port to one family"
+if [ "$host_ipv6" != yes ] || ! python3 -c 'import socket; socket.socket(socket.AF_INET6).bind(("::1", 0))' 2>/dev/null; then
+  echo "this host has no IPv6 loopback: skipped"
+else
+  web6='mkdir -p /www; echo "$0" > /www/index.html; exec /bin/httpd -f -p 80 -h /www'
+  get6() { curl -g -sf -m 3 "$1"; }
+  $NSPAWN run -d --name e2e-v6 -p 18140:80 -p 0.0.0.0:18141:80 -p '[::1]:18142:80' $rv -- /bin/sh -c "$web6" v6-$nonce >/dev/null || fail "run e2e-v6 with ports of both families"
+  retry 10 bash -c "curl -g -sf -m 3 'http://[::1]:18140/' | grep_q v6-$nonce" || fail "a port given no IP does not answer on [::1]: $(systemctl status nspawn-proxy-e2e-v6.service --no-pager 2>&1 | tail -5)"
+  [ "$(systemctl is-active nspawn-proxy-e2e-v6.service)" = active ] || fail "the port proxy of e2e-v6 is not active"
+  get6 http://127.0.0.1:18140/ | grep_q v6-$nonce || fail "the IPv4 side of a port given no IP"
+  get6 http://127.0.0.1:18141/ | grep_q v6-$nonce || fail "0.0.0.0 does not answer on IPv4"
+  get6 'http://[::1]:18141/' >/dev/null && fail "0.0.0.0 answered on IPv6"
+  get6 'http://[::1]:18142/' | grep_q v6-$nonce || fail "[::1] does not answer on [::1]"
+  get6 http://127.0.0.1:18142/ >/dev/null && fail "[::1] answered on IPv4"
+  # Through an address of an interface, as a client on the network comes.
+  link=$(ip -6 -o addr show scope link | awk '$2 != "lo" {split($4, a, "/"); print a[1] "%" $2; exit}')
+  if [ -n "$link" ]; then
+    get6 "http://[${link/\%/%25}]:18140/" | grep_q v6-$nonce || fail "the port does not answer on the link-local address $link"
+  fi
+  $NSPAWN port e2e-v6 | grep_q -x '80/tcp -> \[::\]:18140' || fail "port does not show the IPv6 side: $($NSPAWN port e2e-v6 2>&1)"
+  $NSPAWN port e2e-v6 | grep_q -x '80/tcp -> \[::1\]:18142' || fail "port does not show [::1]: $($NSPAWN port e2e-v6 2>&1)"
+  $NSPAWN inspect e2e-v6 | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['ports'] == ['18140->80/tcp', '0.0.0.0:18141->80/tcp', '[::1]:18142->80/tcp'], d['ports']" || fail "inspect does not keep the ports as given"
+  $NSPAWN generate e2e-v6 | grep_q -- "--publish '\[::1\]:18142:80'" || fail "generate does not give the IPv6 port back: $($NSPAWN generate e2e-v6 2>&1 | grep publish)"
+  # Taken on IPv6 by another machine, or by a service of the host there.
+  out=$($NSPAWN run -d --name e2e-v6b -p '[::]:18140:80' $rv -- sleep 600 2>&1) && fail "a port another machine takes on IPv6 was published again"
+  echo "$out" | grep_q "host port 18140/tcp is already published by e2e-v6" || fail "the clash on IPv6 was not explained: $out"
+  python3 -c 'import socket, time
+s = socket.socket(socket.AF_INET6); s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+s.bind(("::", 18144)); s.listen(); time.sleep(30)' &
+  v6_service=$!
+  sleep 1
+  out=$($NSPAWN run -d --name e2e-v6c -p 18144:80 $rv -- sleep 600 2>&1) && fail "a port a host service takes on IPv6 was published"
+  echo "$out" | grep_q "host port 18144/tcp is in use by a service on the host" || fail "the host service on IPv6 was not explained: $out"
+  kill $v6_service 2>/dev/null; wait $v6_service 2>/dev/null
+  # Created and not running, as docker leaves the container of a refused run.
+  $NSPAWN ps -a --format '{{.Names}} {{.State}}' | grep_q -x 'e2e-v6c created' || fail "a refused run did not leave its machine created: $($NSPAWN ps -a --format '{{.Names}} {{.State}}' | grep e2e-v6c)"
+  # UDP, the replies from the address written to; a port below 1024.
+  $NSPAWN run -d --name e2e-v6u -p 18143:5353/udp $rv -- udpsvd -E 0 5353 cat >/dev/null || fail "run a UDP echo"
+  retry 10 python3 -c 'import socket
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM); s.settimeout(2)
+s.sendto(b"udp-over-v6", ("::1", 18143)); data, peer = s.recvfrom(100)
+assert data == b"udp-over-v6" and peer[0] == "::1", (data, peer)' || fail "a UDP port does not answer on [::1]"
+  $NSPAWN run -d --name e2e-v6low -p 999:80 $rv -- /bin/sh -c "$web6" low-$nonce >/dev/null || fail "run with a port below 1024"
+  retry 10 bash -c "curl -g -sf -m 3 'http://[::1]:999/' | grep_q low-$nonce" || fail "a port below 1024 does not answer on [::1]"
+  # A restart, by the policy and by hand, brings the IPv6 side back.
+  $NSPAWN restart e2e-v6 >/dev/null || fail "restart e2e-v6"
+  retry 10 bash -c "curl -g -sf -m 3 'http://[::1]:18140/' | grep_q v6-$nonce" || fail "the IPv6 side is not back after restart"
+  $NSPAWN rm -f e2e-v6low >/dev/null
+  $NSPAWN run -d --name e2e-v6low --restart on-failure -p 999:80 $rv -- /bin/sh -c "$web6" low-$nonce >/dev/null || fail "run with a restart policy"
+  retry 10 bash -c "curl -g -sf -m 3 'http://[::1]:999/' | grep_q low-$nonce" || fail "the restart-policy machine does not answer on IPv6"
+  leader=$(machinectl show e2e-v6low -p Leader --value)
+  kill -KILL $(pgrep -P "$leader") || fail "cannot kill the program of e2e-v6low"
+  retry 15 bash -c "[ \"\$(systemctl show -p NRestarts --value systemd-nspawn@e2e-v6low.service)\" -ge 1 ]" || fail "on-failure did not restart e2e-v6low"
+  retry 15 bash -c "curl -g -sf -m 3 'http://[::1]:999/' | grep_q low-$nonce" || fail "the IPv6 side is not back after a restart of the policy"
+  # Leaving the primary network moves the IPv6 side with the IPv4 one.
+  $NSPAWN network create e2e-v6net >/dev/null || fail "network create e2e-v6net"
+  $NSPAWN run -d --name e2e-v6d --network bridge --network e2e-v6net -p 18145:80 $rv -- /bin/sh -c "$web6" moved-$nonce >/dev/null || fail "run on two networks"
+  retry 10 bash -c "curl -g -sf -m 3 'http://[::1]:18145/' | grep_q moved-$nonce" || fail "e2e-v6d does not answer on IPv6"
+  $NSPAWN network disconnect bridge e2e-v6d >/dev/null || fail "leave the primary network"
+  retry 10 bash -c "curl -g -sf -m 3 'http://[::1]:18145/' | grep_q moved-$nonce" || fail "the IPv6 side does not follow the new primary network"
+  get6 http://127.0.0.1:18145/ | grep_q moved-$nonce || fail "the IPv4 side does not follow the new primary network"
+  # Stop and rm leave nothing listening and no proxy.
+  $NSPAWN stop e2e-v6 >/dev/null || fail "stop e2e-v6"
+  get6 'http://[::1]:18140/' >/dev/null && fail "the IPv6 side outlived the machine"
+  retry 10 bash -c "! systemctl is-active -q nspawn-proxy-e2e-v6.service" || fail "the port proxy outlived its machine"
+  for m in e2e-v6 e2e-v6b e2e-v6c e2e-v6u e2e-v6low e2e-v6d; do $NSPAWN rm -f $m >/dev/null 2>&1; done
+  $NSPAWN network rm e2e-v6net >/dev/null 2>&1
+  python3 -c 'import socket
+for p in (18140, 18142, 18145, 999):
+    s = socket.socket(socket.AF_INET6); s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("::", p)); s.listen(); s.close()' || fail "a port of the step is still listened on over IPv6 after rm"
+  systemctl list-units --all --no-legend 'nspawn-proxy-e2e-v6*' | grep_q . && fail "a port proxy unit of the step is left: $(systemctl list-units --all --no-legend 'nspawn-proxy-e2e-v6*')"
+fi
 
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"

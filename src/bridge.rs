@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
@@ -265,25 +265,103 @@ impl Protocol {
     }
 }
 
-/// A published port, -p [IP:]HOST:CONTAINER[/udp].
+/// A published port, -p [IP:]HOST:CONTAINER[/udp], an IPv6 IP in brackets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortMap {
-    /// One address of the host, or every address (0.0.0.0).
+    /// None: every address of the host, IPv4 and IPv6, as docker publishes a port given
+    /// no IP. 0.0.0.0 is every IPv4 address alone and :: every IPv6 one, as with docker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_ip: Option<Ipv4Addr>,
+    pub host_ip: Option<IpAddr>,
     pub host: u16,
     pub container: u16,
     pub protocol: Protocol,
 }
 
 impl PortMap {
-    /// Whether both take the same host port: on the same address, or one on every
-    /// address.
+    /// Whether both take the same host port on an address they share.
     pub fn clashes(&self, other: &PortMap) -> bool {
         self.protocol == other.protocol
             && self.host == other.host
-            && (self.host_ip.is_none() || other.host_ip.is_none() || self.host_ip == other.host_ip)
+            && addresses_meet(self.host_ip, other.host_ip)
     }
+
+    /// The IPv4 side, which the DNAT publishes: Some(None) on every IPv4 address,
+    /// Some(Some(ip)) on one, None for a port on IPv6 alone.
+    pub fn ipv4_side(&self) -> Option<Option<Ipv4Addr>> {
+        match self.host_ip {
+            None => Some(None),
+            Some(IpAddr::V4(ip)) if ip.is_unspecified() => Some(None),
+            Some(IpAddr::V4(ip)) => Some(Some(ip)),
+            Some(IpAddr::V6(_)) => None,
+        }
+    }
+
+    /// The IPv6 address the port proxy listens on (:: for every one), None for a port
+    /// on IPv4 alone.
+    pub fn ipv6_side(&self) -> Option<Ipv6Addr> {
+        match self.host_ip {
+            None => Some(Ipv6Addr::UNSPECIFIED),
+            Some(IpAddr::V6(ip)) => Some(ip),
+            Some(IpAddr::V4(_)) => None,
+        }
+    }
+}
+
+/// Where ports are published, docker's way: each on 0.0.0.0 or its IPv4 address, and
+/// on :: or its IPv6 address where the host has IPv6 (`ipv6`), as the port proxy
+/// listens there.
+pub fn bindings(ports: &[PortMap], ipv6: bool) -> Vec<PortMap> {
+    let mut out = Vec::new();
+    for p in ports {
+        if let Some(ip) = p.ipv4_side() {
+            out.push(PortMap {
+                host_ip: Some(IpAddr::V4(ip.unwrap_or(Ipv4Addr::UNSPECIFIED))),
+                ..*p
+            });
+        }
+        if let Some(ip) = p.ipv6_side().filter(|_| ipv6) {
+            out.push(PortMap {
+                host_ip: Some(IpAddr::V6(ip)),
+                ..*p
+            });
+        }
+    }
+    out
+}
+
+/// Whether two published addresses take a host port in common: every address takes
+/// them all, an unspecified one every address of its family.
+fn addresses_meet(a: Option<IpAddr>, b: Option<IpAddr>) -> bool {
+    match (a, b) {
+        (None, _) | (_, None) => true,
+        (Some(a), Some(b)) => {
+            a == b || (a.is_ipv4() == b.is_ipv4() && (a.is_unspecified() || b.is_unspecified()))
+        }
+    }
+}
+
+/// The host part of -p: an IPv4 address, or an IPv6 one, which the brackets carried.
+/// A link-local address needs an interface this syntax has no place for, and a mapped
+/// IPv4 one is that IPv4 address, written so.
+fn host_address(text: &str, ip: &str, bracketed: bool) -> Result<IpAddr> {
+    if bracketed {
+        let ip: Ipv6Addr = ip
+            .parse()
+            .with_context(|| format!("{text}: {ip} is not an IPv6 address"))?;
+        if ip.is_unicast_link_local() {
+            bail!(
+                "{text}: {ip} is a link-local address, which -p cannot name; [::] takes them all"
+            );
+        }
+        if ip.to_ipv4_mapped().is_some() {
+            bail!("{text}: {ip} is an IPv4 address; write it without brackets");
+        }
+        return Ok(IpAddr::V6(ip));
+    }
+    let ip: Ipv4Addr = ip.parse().with_context(|| {
+        format!("{text}: {ip} is not an IPv4 address; an IPv6 one goes in brackets, [::1]:8080:80")
+    })?;
+    Ok(IpAddr::V4(ip))
 }
 
 impl FromStr for PortMap {
@@ -299,17 +377,30 @@ impl FromStr for PortMap {
             "udp" => Protocol::Udp,
             other => bail!("{text}: unknown protocol {other} (tcp or udp)"),
         };
-        let fields: Vec<&str> = ports.split(':').collect();
-        let (host_ip, host, container) = match fields[..] {
-            [port] => (None, port, port),
-            [host, container] => (None, host, container),
-            [ip, host, container] => {
-                let ip: Ipv4Addr = ip
-                    .parse()
-                    .with_context(|| format!("{text}: {ip} is not an IPv4 address of the host"))?;
-                ((ip != Ipv4Addr::UNSPECIFIED).then_some(ip), host, container)
+        // [IPv6]:HOST:CONTAINER, as docker writes an IPv6 address.
+        let (bracketed, ports) = match ports.strip_prefix('[') {
+            Some(rest) => {
+                let (ip, after) = rest
+                    .split_once(']')
+                    .with_context(|| format!("{text}: an IPv6 address ends with ]"))?;
+                let after = after
+                    .strip_prefix(':')
+                    .with_context(|| format!("{text}: expected [IP]:HOST:CONTAINER[/udp]"))?;
+                (Some(ip), after)
             }
-            _ => bail!("{text}: expected [IP:]HOST:CONTAINER[/udp], IPv4 addresses only"),
+            None => (None, ports),
+        };
+        let fields: Vec<&str> = ports.split(':').collect();
+        let (host_ip, host, container) = match (bracketed, &fields[..]) {
+            (None, [port]) => (None, *port, *port),
+            (None, [host, container]) => (None, *host, *container),
+            (None, [ip, host, container]) => {
+                (Some(host_address(text, ip, false)?), *host, *container)
+            }
+            (Some(ip), [host, container]) => {
+                (Some(host_address(text, ip, true)?), *host, *container)
+            }
+            _ => bail!("{text}: expected [IP:]HOST:CONTAINER[/udp], an IPv6 IP in brackets"),
         };
         let port = |s: &str| {
             s.parse::<u16>()
@@ -328,8 +419,10 @@ impl FromStr for PortMap {
 
 impl fmt::Display for PortMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(ip) = self.host_ip {
-            write!(f, "{ip}:")?;
+        match self.host_ip {
+            Some(IpAddr::V6(ip)) => write!(f, "[{ip}]:")?,
+            Some(ip) => write!(f, "{ip}:")?,
+            None => {}
         }
         write!(
             f,
@@ -738,9 +831,11 @@ fn ports_to_withdraw(
     for map in ["ports", "addr_ports"] {
         let elements = map_elements(&list(map));
         for p in ports {
-            let key = match (map, p.host_ip) {
-                ("ports", None) => format!("{} . {}", p.protocol.name(), p.host),
-                ("addr_ports", Some(ip)) => format!("{ip} . {} . {}", p.protocol.name(), p.host),
+            let key = match (map, p.ipv4_side()) {
+                ("ports", Some(None)) => format!("{} . {}", p.protocol.name(), p.host),
+                ("addr_ports", Some(Some(ip))) => {
+                    format!("{ip} . {} . {}", p.protocol.name(), p.host)
+                }
                 _ => continue,
             };
             let ours = elements.iter().any(|(k, v)| {
@@ -1829,13 +1924,23 @@ async fn holds_ports(store: &Store, sd: &Systemd, name: &str) -> Result<bool> {
     ))
 }
 
-/// A port taken by another machine or by a host service (the DNAT would hijack it).
-pub async fn check_port_conflicts(store: &Store, sd: &Systemd, record: &ImageRecord) -> Result<()> {
+/// A port taken by another machine or by a host service (the DNAT or the port proxy
+/// would take it from it). `hook`: the pass of the unit's own hook, where an IPv6
+/// address of the host that is not there yet (still tentative at boot) is waited for by
+/// the proxy instead of refused.
+pub async fn check_port_conflicts(
+    store: &Store,
+    sd: &Systemd,
+    record: &ImageRecord,
+    hook: bool,
+    report: Report<'_>,
+) -> Result<()> {
     // Nothing to publish, nothing of the others to read.
     if record.ports.is_empty() {
         return Ok(());
     }
     let used = ports_in_use(store, sd, &record.name, true).await?;
+    let ipv6 = crate::portproxy::host_has_ipv6();
     for p in &record.ports {
         if let Some(other) = used.iter().find(|u| u.port.clashes(p)) {
             bail!(
@@ -1845,7 +1950,31 @@ pub async fn check_port_conflicts(store: &Store, sd: &Systemd, record: &ImageRec
                 other.machine
             );
         }
-        if let Err(e) = host_port_free(*p) {
+        if let Some(ip) = p.ipv4_side() {
+            if let Err(e) = host_port_free(
+                SocketAddr::from((ip.unwrap_or(Ipv4Addr::UNSPECIFIED), p.host)),
+                p.protocol,
+            ) {
+                if let Some(why) = bind_refusal(e.kind(), p) {
+                    bail!(why);
+                }
+            }
+        }
+        let Some(ip) = p.ipv6_side() else { continue };
+        if !ipv6 {
+            if p.host_ip.is_some() {
+                bail!("{}: this host has no IPv6", p);
+            }
+            continue;
+        }
+        if let Err(e) = host_port_free(SocketAddr::from((ip, p.host)), p.protocol) {
+            if hook && e.kind() == std::io::ErrorKind::AddrNotAvailable {
+                note(
+                    report,
+                    format!("{ip} is not an address of the host yet; the port proxy waits for it"),
+                );
+                continue;
+            }
             if let Some(why) = bind_refusal(e.kind(), p) {
                 bail!(why);
             }
@@ -1875,12 +2004,17 @@ fn bind_refusal(kind: std::io::ErrorKind, p: &PortMap) -> Option<String> {
 
 /// Nothing on the host listens there: bound to the address the port is published on, so
 /// that a service on every address shows up for a port on one address, as the kernel
-/// refuses the second bind.
-fn host_port_free(port: PortMap) -> std::io::Result<()> {
-    let address = (port.host_ip.unwrap_or(Ipv4Addr::UNSPECIFIED), port.host);
-    match port.protocol {
-        Protocol::Tcp => std::net::TcpListener::bind(address).map(|_| ()),
-        Protocol::Udp => std::net::UdpSocket::bind(address).map(|_| ()),
+/// refuses the second bind. An IPv6 address is bound for IPv6 alone, as the proxy binds
+/// it, so that a service on the IPv4 side does not count for it.
+fn host_port_free(address: SocketAddr, protocol: Protocol) -> std::io::Result<()> {
+    match address {
+        SocketAddr::V4(_) => match protocol {
+            Protocol::Tcp => std::net::TcpListener::bind(address).map(|_| ()),
+            Protocol::Udp => std::net::UdpSocket::bind(address).map(|_| ()),
+        },
+        SocketAddr::V6(v6) => crate::portproxy::bind_v6(v6, protocol)
+            .map(|_| ())
+            .map_err(std::io::Error::from),
     }
 }
 
@@ -1906,10 +2040,12 @@ fn ports_script(in_use: &[PortInUse]) -> String {
     let mut taken = std::collections::HashSet::new();
     for used in in_use {
         let (p, addr) = (&used.port, used.address);
-        if !taken.insert((p.host_ip, p.protocol.name(), p.host)) {
+        // The IPv6 side is the port proxy's.
+        let Some(ip) = p.ipv4_side() else { continue };
+        if !taken.insert((ip, p.protocol.name(), p.host)) {
             continue;
         }
-        script.push_str(&match p.host_ip {
+        script.push_str(&match ip {
             Some(ip) => format!(
                 "add element ip {TABLE} addr_ports {{ {ip} . {} . {} : {addr} . {} }}\n",
                 p.protocol.name(),
@@ -1998,6 +2134,29 @@ mod tests {
         let script = ports_script(&[used("a", "10.99.0.2"), used("b", "10.99.0.3")]);
         assert_eq!(script.matches("add element").count(), 1, "{script}");
         assert!(script.contains("10.99.0.2"));
+        // 0.0.0.0 is the same key as no address; the IPv6 side is the port proxy's.
+        let on = |port: &str, address: &str| PortInUse {
+            port: port.parse().unwrap(),
+            machine: "m".to_string(),
+            address: address.parse().unwrap(),
+        };
+        let script = ports_script(&[
+            on("0.0.0.0:80:80", "10.99.0.2"),
+            on("80:80", "10.99.0.3"),
+            on("[::]:90:90", "10.99.0.4"),
+            on("[::1]:91:91", "10.99.0.4"),
+            on("0.0.0.0:92:92/udp", "10.99.0.5"),
+        ]);
+        assert_eq!(
+            script
+                .lines()
+                .filter(|l| l.starts_with("add element"))
+                .collect::<Vec<_>>(),
+            [
+                "add element ip nspawn ports { tcp . 80 : 10.99.0.2 . 80 }",
+                "add element ip nspawn ports { udp . 92 : 10.99.0.5 . 92 }",
+            ]
+        );
     }
 
     #[test]
@@ -2111,21 +2270,64 @@ mod tests {
         assert!("80:x".parse::<PortMap>().is_err());
         assert!("80:80/sctp".parse::<PortMap>().is_err());
         let p: PortMap = "127.0.0.1:8080:80".parse().unwrap();
-        assert_eq!(p.host_ip, Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(p.host_ip, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         assert_eq!(p.to_string(), "127.0.0.1:8080->80/tcp");
+        // 0.0.0.0 is every IPv4 address alone, :: every IPv6 one, as with docker.
+        let v4: PortMap = "0.0.0.0:8080:80".parse().unwrap();
+        assert_eq!(v4.to_string(), "0.0.0.0:8080->80/tcp");
+        assert_eq!((v4.ipv4_side(), v4.ipv6_side()), (Some(None), None));
+        let v6: PortMap = "[::]:8080:80".parse().unwrap();
+        assert_eq!(v6.to_string(), "[::]:8080->80/tcp");
         assert_eq!(
-            "0.0.0.0:8080:80".parse::<PortMap>().unwrap().host_ip,
-            None,
-            "every address"
+            (v6.ipv4_side(), v6.ipv6_side()),
+            (None, Some(Ipv6Addr::UNSPECIFIED))
         );
-        assert!("[::1]:80:80".parse::<PortMap>().is_err(), "IPv4 only");
-        assert!("::1:80:80".parse::<PortMap>().is_err());
-        assert!("1.2.3:80:80".parse::<PortMap>().is_err());
+        let one6: PortMap = "[2001:db8::1]:53:53/udp".parse().unwrap();
+        assert_eq!(one6.to_string(), "[2001:db8::1]:53->53/udp");
+        assert_eq!(
+            one6.to_string().replace("->", ":").replace("/udp", ""),
+            "[2001:db8::1]:53:53"
+        );
         let any: PortMap = "8080:80".parse().unwrap();
+        assert_eq!(
+            (any.ipv4_side(), any.ipv6_side()),
+            (Some(None), Some(Ipv6Addr::UNSPECIFIED))
+        );
+        assert_eq!(
+            (p.ipv4_side(), p.ipv6_side()),
+            (Some(Some(Ipv4Addr::LOCALHOST)), None)
+        );
+        for bad in [
+            "::1:80:80",
+            "[::1]:80",
+            "[::1:80:80",
+            "[::1]80:80",
+            "[127.0.0.1]:80:80",
+            "[fe80::1]:80:80",
+            "[::ffff:10.0.0.1]:80:80",
+            "1.2.3:80:80",
+        ] {
+            assert!(bad.parse::<PortMap>().is_err(), "{bad}");
+        }
+        // Stored records read as they were written.
+        let stored: PortMap = serde_json::from_str(
+            r#"{"host_ip":"127.0.0.1","host":1,"container":2,"protocol":"tcp"}"#,
+        )
+        .unwrap();
+        assert_eq!(stored.host_ip, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let stored: PortMap =
+            serde_json::from_str(r#"{"host":1,"container":2,"protocol":"tcp"}"#).unwrap();
+        assert_eq!(stored.host_ip, None);
         assert!(
             any.clashes(&p) && p.clashes(&any),
             "one address against every address"
         );
+        // An unspecified address takes every address of its family, and only those.
+        assert!(v4.clashes(&p) && p.clashes(&v4));
+        assert!(!v4.clashes(&v6) && !v6.clashes(&v4));
+        assert!(any.clashes(&v6) && v6.clashes(&any));
+        let lo6: PortMap = "[::1]:8080:80".parse().unwrap();
+        assert!(v6.clashes(&lo6) && !lo6.clashes(&p) && !lo6.clashes(&v4));
         assert!(!"10.0.0.1:8080:80".parse::<PortMap>().unwrap().clashes(&p));
         assert!(!"127.0.0.1:8080:80/udp"
             .parse::<PortMap>()
@@ -2139,6 +2341,8 @@ mod tests {
             expand_ports("8000-8001:80-81").unwrap()[1].to_string(),
             "8001->81/tcp"
         );
+        let range6 = expand_ports("[::1]:8000-8001:80-81").unwrap();
+        assert_eq!(range6[1].to_string(), "[::1]:8001->81/tcp");
         assert!(expand_ports("8000-8002:80-81").is_err());
         assert!(expand_ports("8000-8002:80").is_err());
         assert!(expand_ports("8002-8000:80-82").is_err());
@@ -2152,6 +2356,52 @@ mod tests {
             2
         );
         assert!(parse_publish(&["80:80".into(), "80:81".into()]).is_err());
+        // Both families of a port, given apart.
+        assert_eq!(
+            parse_publish(&["0.0.0.0:80:80".into(), "[::]:80:80".into()])
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(parse_publish(&["80:80".into(), "[::]:80:80".into()]).is_err());
+    }
+
+    #[test]
+    fn bindings_name_each_family_a_port_is_published_on() {
+        let ports = parse_publish(&[
+            "8080:80".into(),
+            "0.0.0.0:8081:81".into(),
+            "127.0.0.1:8082:82".into(),
+            "[::]:8083:83/udp".into(),
+            "[::1]:8084:84".into(),
+        ])
+        .unwrap();
+        let text = |ipv6| {
+            bindings(&ports, ipv6)
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            text(true),
+            [
+                "0.0.0.0:8080->80/tcp",
+                "[::]:8080->80/tcp",
+                "0.0.0.0:8081->81/tcp",
+                "127.0.0.1:8082->82/tcp",
+                "[::]:8083->83/udp",
+                "[::1]:8084->84/tcp",
+            ]
+        );
+        assert_eq!(
+            text(false),
+            [
+                "0.0.0.0:8080->80/tcp",
+                "0.0.0.0:8081->81/tcp",
+                "127.0.0.1:8082->82/tcp",
+            ],
+            "no IPv6 side on a host without IPv6"
+        );
     }
 
     #[test]
@@ -2465,6 +2715,15 @@ mod tests {
         // Published to the primary address of an earlier time, still the machine's.
         let both = vec!["10.99.1.5".parse().unwrap(), "10.99.0.2".parse().unwrap()];
         assert_eq!(ports_to_withdraw(&ports, &both, listing).len(), 2);
+        // 0.0.0.0 has the key of every address; an IPv6 port has none in the maps.
+        let ports: Vec<PortMap> = ["0.0.0.0:53:53/udp", "[::]:8080:80"]
+            .iter()
+            .map(|p| p.parse().unwrap())
+            .collect();
+        assert_eq!(
+            ports_to_withdraw(&ports, &at("10.99.0.2"), listing),
+            [("ports", "udp . 53".to_string())]
+        );
     }
 
     #[test]

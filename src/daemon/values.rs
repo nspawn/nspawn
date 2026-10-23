@@ -288,6 +288,13 @@ fn healthcheck(h: &crate::health::Healthcheck) -> Dict {
 
 pub fn machine(m: &MachineSummary) -> Dict {
     let mut dict = m.record.as_ref().map(record).unwrap_or_default();
+    if let Some(r) = &m.record {
+        let bindings = crate::bridge::bindings(&r.ports, crate::portproxy::host_has_ipv6());
+        dict.insert(
+            "bindings".to_string(),
+            strings(&bindings.iter().map(|p| p.to_string()).collect::<Vec<_>>()),
+        );
+    }
     dict.insert("name".to_string(), v(m.name.as_str()));
     dict.insert("state".to_string(), v(m.state.as_str()));
     dict.insert("started".to_string(), v(m.started.unwrap_or(0)));

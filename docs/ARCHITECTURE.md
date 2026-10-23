@@ -31,6 +31,7 @@ hooks.
 | `tuning.rs` | docker's other per-container flags (hostname, user, capabilities, tmpfs, devices, dns, ulimits, signals, sysctls, timezone), `--interface` and `--depends-on`: parsing, and the settings and unit lines they become |
 | `getent.rs` | the getent stand-in bound into an app that runs as a user: a shell script, or a program for an image without a shell |
 | `bridge.rs`, `hostnet.rs` | the nspawn0 bridge and user-defined networks, ports, firewalls; veth mode |
+| `portproxy.rs` | `port-proxy`, the IPv6 side of published ports: a transient unit per machine that listens on the host's IPv6 addresses and relays TCP and UDP to the machine |
 | `volume.rs`, `volmount.rs` | `-v` parsing; host-side mounts for mstack machines |
 | `nsenter.rs`, `pty.rs` | exec through namespaces, terminal pumping |
 | `systemd.rs` | typed D-Bus calls, job waiting |
@@ -496,7 +497,7 @@ the service while a machine starts.
 The default bridge (`nspawn0`, `10.99.0.0/24`) and those of user-defined
 networks (`nsbr-NAME`, the `--subnet` given or the next free /24 of
 `network_pool`) are created with `ip`. The nftables table `ip nspawn` holds the
-DNAT maps for published ports (`ports` for those on every address of the host,
+DNAT maps for published ports (`ports` for those on every IPv4 address of the host,
 `addr_ports` for those on one), and for every network masquerading (not for
 internal ones), hairpin masquerading and a guard so that `route_localnet`
 cannot expose the host's loopback services. Its forward chain keeps the
@@ -504,6 +505,23 @@ networks apart: an internal network forwards nothing, connections to published
 ports cross (DNAT), anything else from one bridge to another is dropped, which
 holds whatever firewalld or iptables accept. The table is always written for
 all networks at once, so bringing one bridge up never drops another's rules.
+
+The machines are IPv4-only and nftables cannot translate IPv6 into IPv4, so the IPv6
+side of a published port is a proxy in user space, as docker's userland proxy is. A
+port given no IP has both sides, `0.0.0.0` the IPv4 one alone, `::` or an IPv6 address
+the IPv6 one alone (`PortMap::ipv4_side`, `ipv6_side`). `network publish` starts
+`nspawn-proxy-NAME.service`, a transient unit with `Requisite=` and `After=` the
+machine's (`portproxy::start`, the health runner's pattern), `Type=notify`, its
+capabilities bounded to `CAP_NET_BIND_SERVICE`. It runs `nspawn port-proxy NAME`,
+which reads the record, binds each IPv6 listener for IPv6 alone (`IPV6_V6ONLY`, so the
+IPv4 port stays the DNAT's), waits up to 30 s for an address still tentative at boot,
+says `READY=1`, and relays: TCP with a copy each way per connection, UDP with a
+connected socket per client towards the machine and the replies sent from the address
+the client wrote to (`IPV6_PKTINFO`), a flow forgotten after 90 s without traffic. It
+ends with the machine's run; `release` queues its stop, `prepare` stops one left over
+before the port checks, which test-bind the IPv6 side too, and `network disconnect` of
+the primary network starts it again on the new address. `start` says so when the proxy
+is not up a few seconds after the machine (or a booted machine's init) is.
 
 A machine's record says its network kind (`network`) and, for a user-defined
 network, its name in `network_name`; the other bridge networks it joins are

@@ -1,4 +1,4 @@
-policy_module(nspawn, 1.10.0)
+policy_module(nspawn, 2.1.0)
 
 ########################################
 #
@@ -42,7 +42,7 @@ gen_require(`
 	type init_var_run_t, systemd_conf_t, unlabeled_t;
 ')
 
-allow nspawn_t self:capability { chown dac_override dac_read_search fowner fsetid kill mknod net_admin setfcap setgid setpcap setuid sys_admin sys_chroot sys_ptrace sys_resource };
+allow nspawn_t self:capability { chown dac_override dac_read_search fowner fsetid kill mknod net_admin net_bind_service setfcap setgid setpcap setuid sys_admin sys_chroot sys_ptrace sys_resource };
 # The same inside a machine's user namespace, where the exec helper works. setpcap
 # narrows the command's bounding set to the machine's.
 allow nspawn_t self:cap_userns { chown dac_override dac_read_search fowner fsetid kill setgid setpcap setuid sys_admin sys_chroot sys_ptrace };

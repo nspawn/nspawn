@@ -420,7 +420,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
     ),
     full("services.*.ports"),
     full("services.*.ports.[].app_protocol"),
-    partly("services.*.ports.[].host_ip", "an IPv4 address"),
+    full("services.*.ports.[].host_ip"),
     full("services.*.ports.[].mode"),
     full("services.*.ports.[].name"),
     full("services.*.ports.[].protocol"),

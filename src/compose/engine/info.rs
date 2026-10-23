@@ -132,16 +132,7 @@ fn status(m: &Machine, now: u64) -> String {
 
 /// The published ports, as ps lists them.
 fn ports(m: &Machine) -> Vec<String> {
-    m.strings("ports")
-        .iter()
-        .map(|p| {
-            if p.matches(':').count() == 0 && !p.contains('.') {
-                format!("0.0.0.0:{p}")
-            } else {
-                p.clone()
-            }
-        })
-        .collect()
+    client::bindings(&m.dict)
 }
 
 fn command(m: &Machine, trunc: bool) -> String {
@@ -326,11 +317,7 @@ const PS_TABLE: &str =
 /// A machine as ps --format sees it, the fields in docker compose's order.
 fn ps_fields(m: &Machine, r: &BTreeMap<&str, String>) -> Vec<(&'static str, serde_json::Value)> {
     let labels: Vec<String> = m.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let publishers: Vec<serde_json::Value> = m
-        .strings("ports")
-        .iter()
-        .filter_map(|p| publisher(p))
-        .collect();
+    let publishers: Vec<serde_json::Value> = ports(m).iter().filter_map(|p| publisher(p)).collect();
     vec![
         ("Command", serde_json::Value::from(r["Command"].clone())),
         (
@@ -375,7 +362,10 @@ fn publisher(port: &str) -> Option<serde_json::Value> {
     let (host, rest) = port.split_once("->")?;
     let (target, protocol) = rest.split_once('/')?;
     let (url, published) = match host.rsplit_once(':') {
-        Some((ip, p)) => (ip.to_string(), p),
+        Some((ip, p)) => (
+            ip.trim_start_matches('[').trim_end_matches(']').to_string(),
+            p,
+        ),
         None => ("0.0.0.0".to_string(), host),
     };
     Some(serde_json::json!({
@@ -814,7 +804,7 @@ pub async fn port(e: &mut Engine<'_>, a: &PortArgs, out: &mut dyn Write) -> Resu
             None => bail!("service {service:?} is not running"),
         }
     };
-    let published = m.strings("ports");
+    let published = client::bindings(&m.dict);
     match &a.private_port {
         Some(private) => {
             let private = private_port(private)?;
@@ -825,11 +815,6 @@ pub async fn port(e: &mut Engine<'_>, a: &PortArgs, out: &mut dyn Write) -> Resu
             match found {
                 Some(p) => {
                     let host = p.split_once("->").map(|(h, _)| h).unwrap_or("");
-                    let host = if host.contains(':') {
-                        host.to_string()
-                    } else {
-                        format!("0.0.0.0:{host}")
-                    };
                     writeln!(out, "{host}")?;
                 }
                 None => bail!("no port {private}/{protocol} for container {}", m.name),
@@ -842,11 +827,6 @@ pub async fn port(e: &mut Engine<'_>, a: &PortArgs, out: &mut dyn Write) -> Resu
                     if a.protocol.is_some() && !rest.ends_with(&format!("/{protocol}")) {
                         continue;
                     }
-                    let host = if host.contains(':') {
-                        host.to_string()
-                    } else {
-                        format!("0.0.0.0:{host}")
-                    };
                     writeln!(out, "{rest} -> {host}")?;
                 }
             }

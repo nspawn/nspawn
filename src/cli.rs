@@ -130,6 +130,10 @@ pub enum Command {
     /// what it asks of them.
     #[command(hide = true)]
     AwaitDependencies { name: String },
+    /// From a transient unit: serves the IPv6 side of a machine's published ports until
+    /// its run is over.
+    #[command(hide = true)]
+    PortProxy { name: String },
     /// ExecStart of an app machine: runs systemd-nspawn with the terminal or input an
     /// attached run hands over, or as it is.
     #[command(hide = true)]
@@ -1319,10 +1323,11 @@ pub struct StartOptions {
     /// nobody else's. Remembered.
     #[arg(long, value_name = "[NETWORK=]IP")]
     pub ip: Vec<String>,
-    /// Publish a port on the host, like docker -p: HOST:CONTAINER[/udp], on one address
-    /// of the host with IP:HOST:CONTAINER, several with a range on both sides
-    /// (8000-8010:8000-8010). Repeatable and remembered for the image; "none" forgets
-    /// them all.
+    /// Publish a port on the host, like docker -p: HOST:CONTAINER[/udp] on every IPv4 and
+    /// IPv6 address of the host, IP:HOST:CONTAINER on one (0.0.0.0 every IPv4 address,
+    /// [::] every IPv6 one, an IPv6 address in brackets), several with a range on both
+    /// sides (8000-8010:8000-8010). Repeatable and remembered for the image; "none"
+    /// forgets them all.
     #[arg(long, short = 'p', value_name = "[IP:]HOST:CONTAINER[/udp]")]
     pub publish: Vec<String>,
     /// Replace the image's entrypoint; an empty string runs the arguments alone.
