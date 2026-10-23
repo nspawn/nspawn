@@ -816,14 +816,24 @@ mod tests {
     async fn giving_up_on_a_probe_s_output_closes_the_pipe() {
         use std::io::Write;
         // A child of the probe that kept the pipe: the reader is let go of, and the
-        // pipe with it. Close-on-exec, as the probes' pipes are: a process another test
-        // starts meanwhile would hold the read end open.
+        // pipe with it. Close-on-exec, as the probes' pipes are; a process another test
+        // starts meanwhile still holds the read end between its fork and its exec, so
+        // the write is tried until that copy is gone.
         let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
         let reader = tokio::spawn(read_capped(Some(read)));
         tokio::time::sleep(Duration::from_millis(50)).await;
         reader.abort();
         assert!(reader.await.unwrap_err().is_cancelled());
-        let e = std::fs::File::from(write).write_all(b"x").unwrap_err();
+        let mut write = std::fs::File::from(write);
+        let mut tries = 0;
+        let e = loop {
+            match write.write_all(b"x") {
+                Err(e) => break e,
+                Ok(()) if tries < 100 => tries += 1,
+                Ok(()) => panic!("the pipe is still open after the reader was let go of"),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
         assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
