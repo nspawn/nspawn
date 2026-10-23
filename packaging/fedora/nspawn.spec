@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 2.0.1
+%global upstream_version 2.1.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -165,6 +165,9 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Fri Oct 23 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 2.1.0-1
+- Published ports answer on the host's IPv6 addresses too, through a proxy unit per machine; -p takes [IPv6]:HOST:CONTAINER and 0.0.0.0 keeps a port to IPv4.
+
 * Wed Oct 21 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 2.0.1-1
 - The unit tests pass in a clean build root without /etc/hostname, as pkgctl build makes.
 

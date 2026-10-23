@@ -1,3 +1,9 @@
+nspawn (2.1.0-1) unstable; urgency=medium
+
+  * Published ports answer on the host's IPv6 addresses too, through a proxy unit per machine; -p takes [IPv6]:HOST:CONTAINER and 0.0.0.0 keeps a port to IPv4.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Fri, 23 Oct 2026 15:34:09 -0500
+
 nspawn (2.0.1-1) unstable; urgency=medium
 
   * The unit tests pass in a clean build root without /etc/hostname, as pkgctl build makes.
