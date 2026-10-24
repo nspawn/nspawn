@@ -1510,6 +1510,15 @@ pub struct ShellArgs {
     pub user: String,
 }
 
+/// --lines and --tail: a count, or all, which is as many as there are.
+fn log_lines(text: &str) -> Result<u32, String> {
+    if text == "all" {
+        return Ok(u32::MAX);
+    }
+    text.parse()
+        .map_err(|_| format!("{text:?} is neither a number of lines nor all"))
+}
+
 #[derive(Args, Debug, Default)]
 pub struct LogsArgs {
     /// Machine names; with several, every line carries its machine's name.
@@ -1518,8 +1527,8 @@ pub struct LogsArgs {
     /// Keep printing new output (starts from the last 10 lines unless --lines says otherwise).
     #[arg(long, short = 'f')]
     pub follow: bool,
-    /// Only the last N lines.
-    #[arg(long, short = 'n', value_name = "N")]
+    /// Only the last N lines, or all of them.
+    #[arg(long, short = 'n', visible_alias = "tail", value_name = "N", value_parser = log_lines)]
     pub lines: Option<u32>,
     /// Only output newer than this: a duration ago (42m, 1h30m), unix seconds, an RFC 3339
     /// time or date, or a time as journalctl reads it ("10 min ago", -1h).
@@ -1594,6 +1603,30 @@ mod tests {
             "and says what it is"
         );
         assert!(man.contains(".SH SYNOPSIS"), "with the usual sections");
+    }
+
+    #[test]
+    fn logs_takes_tail_and_all() {
+        let lines = |argv: &[&str]| match Cli::try_parse_from(argv).map(|c| c.command) {
+            Ok(Command::Logs(a)) => Ok(a.lines),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e.kind()),
+        };
+        assert_eq!(
+            lines(&["nspawn", "logs", "--tail", "50", "web"]),
+            Ok(Some(50))
+        );
+        assert_eq!(
+            lines(&["nspawn", "logs", "--tail", "all", "web"]),
+            Ok(Some(u32::MAX))
+        );
+        assert_eq!(lines(&["nspawn", "logs", "-n", "5", "web"]), Ok(Some(5)));
+        assert_eq!(lines(&["nspawn", "logs", "--lines=3", "web"]), Ok(Some(3)));
+        assert_eq!(lines(&["nspawn", "logs", "web"]), Ok(None));
+        assert_eq!(
+            lines(&["nspawn", "logs", "--tail", "many", "web"]),
+            Err(clap::error::ErrorKind::ValueValidation)
+        );
     }
 
     #[test]

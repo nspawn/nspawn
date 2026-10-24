@@ -529,8 +529,8 @@ fails when a machine failed or went back. The packages ship
 What a machine prints goes, by default (`--log-driver local`), to a journal of
 nspawn's own: journald's `nspawn` namespace, kept apart from the system's journal, so a
 program that writes a lot never floods the host's logs. `logs` and an attached `run`
-read it, with `-f`, `-n`, `--since`, `--until` and timestamps, and
-`journalctl --namespace=nspawn` shows it all. `--since` and `--until`
+read it, with `-f`, `-n` or `--tail` (a number, or `all`), `--since`, `--until` and
+timestamps, and `journalctl --namespace=nspawn` shows it all. `--since` and `--until`
 take a duration ago (`42m`, `1h30m`), Unix seconds, an RFC 3339 time or date, or a time
 as journalctl reads it (`-1h`, `"10 min ago"`, `"2026-09-24 10:00"`), as `events`
 does. `logs` reads the system's journal beside it, which holds systemd's lines

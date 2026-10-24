@@ -1369,12 +1369,15 @@ grep -qx "Wants=systemd-journald@nspawn.socket" "$(hooks_of e2e-quiet)" || fail 
 grep -q "attach-exec e2e-quiet --journal-namespace nspawn -- " "$(hooks_of e2e-quiet)" || fail "a local machine's output is not sent to the namespace: $(cat "$(hooks_of e2e-quiet)")"
 retry 10 bash -c "$NSPAWN logs e2e-quiet 2>/dev/null | tr -d '\r' | grep_q '^detached-$nonce\$'" || fail "logs of a local machine: $($NSPAWN logs e2e-quiet 2>&1)"
 in_system_journal e2e-quiet "detached-$nonce" && fail "a detached local machine wrote to the system's journal"
-# A duration ago and journalctl's times.
+# A duration ago and journalctl's times, and --tail, all included.
 for since in 5m -5min "10 min ago"; do
   $NSPAWN logs --since "$since" e2e-quiet 2>&1 | tr -d '\r' | grep_q "^detached-$nonce\$" || fail "logs --since $since: $($NSPAWN logs --since "$since" e2e-quiet 2>&1 | tail -2)"
 done
 out=$($NSPAWN logs --until 1h e2e-quiet 2>&1) || fail "logs --until 1h: $out"
 echo "$out" | grep_q "detached-$nonce" && fail "logs --until 1h shows what came after: $out"
+for tail in 1 all; do
+  [ "$($NSPAWN logs --tail $tail e2e-quiet 2>/dev/null | tr -d '\r')" = "detached-$nonce" ] || fail "logs --tail $tail: $($NSPAWN logs --tail $tail e2e-quiet 2>&1 | tail -2)"
+done
 $NSPAWN inspect e2e-quiet | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['log_driver'] == 'local', d" || fail "inspect does not show the default log driver"
 # journal: the system's journal, as before local existed.
 $NSPAWN stop e2e-quiet >/dev/null || fail "stop e2e-quiet"
