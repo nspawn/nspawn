@@ -15,6 +15,7 @@ pub mod layer;
 pub mod plan;
 pub mod root;
 pub mod sandbox;
+pub mod untar;
 pub mod walk;
 
 /// The stack of `deep`: trees and texts nest as deep as an image or a Dockerfile makes

@@ -644,6 +644,15 @@ pub struct HealthArgs {
     pub no_healthcheck: bool,
 }
 
+/// Whether --sbom or --provenance asks for none: false as strconv.ParseBool reads it, or
+/// disabled=true, which is what the builder does anyway.
+pub fn attestation_off(value: &str) -> bool {
+    matches!(value, "0" | "f" | "F" | "false" | "FALSE" | "False")
+        || value
+            .split(',')
+            .any(|f| matches!(f.split_once('='), Some(("disabled", "true"))))
+}
+
 #[derive(Args, Debug)]
 pub struct BuildArgs {
     /// The build context: a directory with a Dockerfile, or an mkosi configuration
@@ -836,11 +845,13 @@ impl DockerfileArgs {
             (self.check.is_some(), "--check: the builder has no linter"),
             (self.call.is_some(), "--call: the builder only builds"),
             (
-                self.sbom.is_some(),
+                self.sbom.as_deref().is_some_and(|v| !attestation_off(v)),
                 "--sbom: the builder writes no attestations",
             ),
             (
-                self.provenance.is_some(),
+                self.provenance
+                    .as_deref()
+                    .is_some_and(|v| !attestation_off(v)),
                 "--provenance: the builder writes no attestations",
             ),
             (

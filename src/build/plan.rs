@@ -74,6 +74,9 @@ pub struct Prepared {
     pub(crate) meta_args: Vec<(String, Option<String>)>,
     /// The escape token of the Dockerfile.
     pub(crate) escape: char,
+    /// SOURCE_DATE_EPOCH, from the build arguments or a meta ARG: the time every new
+    /// entry of the history and the image get, and WORKDIR's directories.
+    pub epoch: Option<i64>,
     /// What each stage `dispatch` worked out leaves to the stages FROM it besides its
     /// config (its ARGs in scope, its environment with them, its author), filled by
     /// `dispatch`: a stage is dispatched with the same `Prepared` as the stage it starts
@@ -168,9 +171,12 @@ pub struct Run {
     /// A heredoc script that starts with #!: written to a file the program then is,
     /// /dev/pipes/NAME, mode 0755, on a read-only mount of its own.
     pub script: Option<Inline>,
-    /// The process's whole environment: the image's, then the build arguments in scope,
-    /// then the proxy variables of the build arguments (HTTP_PROXY and http_proxy, ...).
+    /// The process's environment: the image's, then the build arguments in scope.
     pub env: Vec<String>,
+    /// The proxy variables of the build arguments (HTTP_PROXY and http_proxy, ...), which
+    /// the process gets after `env` and the step's key leaves out, as the executor's
+    /// ProxyEnv is left out of an op's.
+    pub proxy_env: Vec<String>,
     /// USER as the image has it at that point; empty for root.
     pub user: String,
     /// The working directory, never empty.

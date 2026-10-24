@@ -50,7 +50,7 @@ hooks.
 | `dockerapi/` | the read-only Docker Engine API (`api-serve`), served on a machine's own socket: routing and versions, containers and networks in docker's shapes, filters, events, logs, stats; the one write is a kill through the service |
 | `build/dockerfile/`, `build/dispatch/` | ports of BuildKit's frontend: the parser, the shell lexer, instructions and flags; stages, build arguments, the steps with their history lines and the image's settings |
 | `build/plan.rs` | the stages and steps of a build, worked out before a step runs |
-| `build/ignore.rs`, `walk.rs`, `copy.rs` | the build context: `.dockerignore` patterns and their `!` exceptions, the walk of a context in lexical order without following symlinks, COPY and ADD with every path resolved inside its root |
+| `build/ignore.rs`, `walk.rs`, `copy.rs`, `untar.rs` | the build context: `.dockerignore` patterns and their `!` exceptions, the walk of a context in lexical order without following symlinks, COPY and ADD with every path resolved inside its root, the context's tar and ADD's archives unpacked with every name resolved inside their destination |
 | `build/layer.rs` | a step's layer: what its overlay upper directory changed over the layers below, as an OCI tar (deletions as `.wh.` whiteouts, file capabilities as PAX records), and its gzip blob |
 | `build/root.rs`, `sandbox.rs` | the overlay mount of a step; the systemd-nspawn of a RUN and the mount points it leaves |
 | `build/cache.rs`, `image.rs`, `exec.rs` | the build cache; the config and manifest; the steps run in order, the layers committed into the store and the images installed |

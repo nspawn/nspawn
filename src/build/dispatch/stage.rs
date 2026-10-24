@@ -720,7 +720,7 @@ impl Dispatcher<'_> {
         );
 
         let mut env = self.env.to_array();
-        env.extend(proxy_env(&self.options.build_args));
+        let proxy_env = proxy_env(&self.options.build_args);
         if envs_from_slice(&env).get("PATH").is_none() && self.config.os != "windows" {
             env.push(format!("PATH={DEFAULT_PATH}"));
         }
@@ -735,6 +735,7 @@ impl Dispatcher<'_> {
                 argv: args,
                 script,
                 env,
+                proxy_env,
                 user: self.config.config.user.clone(),
                 workdir,
                 mounts,

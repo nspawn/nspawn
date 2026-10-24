@@ -48,6 +48,7 @@ const NON_ENV_ARGS: [&str; 2] = ["BUILDKIT_SBOM_SCAN_CONTEXT", "BUILDKIT_SBOM_SC
 /// ARGs expanded, the target and the stages it needs, dependencies first.
 pub fn prepare(dockerfile: &[u8], options: &Options, platform: &Platform) -> Result<Prepared> {
     check_syntax(dockerfile, options)?;
+    check_lint_options(dockerfile, options)?;
     if dockerfile.is_empty() {
         return Err(Error::new("the Dockerfile cannot be empty").into());
     }
@@ -218,6 +219,7 @@ pub fn prepare(dockerfile: &[u8], options: &Options, platform: &Platform) -> Res
         }
     }
 
+    let epoch = source_date_epoch(&options.build_args, &meta_args)?;
     Ok(Prepared {
         stages: infos,
         order: reachable,
@@ -225,8 +227,32 @@ pub fn prepare(dockerfile: &[u8], options: &Options, platform: &Platform) -> Res
         parsed: stages,
         meta_args,
         escape: parsed.escape_token,
+        epoch,
         inherited: Default::default(),
     })
+}
+
+/// getBuildArgValue and resolveSourceDateEpochValue: SOURCE_DATE_EPOCH of the build
+/// arguments, else of a meta ARG that has a value; whole seconds.
+fn source_date_epoch(
+    build_args: &BTreeMap<String, String>,
+    meta_args: &[(String, Option<String>)],
+) -> Result<Option<i64>> {
+    const NAME: &str = "SOURCE_DATE_EPOCH";
+    let value = build_args.get(NAME).cloned().or_else(|| {
+        meta_args
+            .iter()
+            .rev()
+            .find(|(k, v)| k == NAME && v.as_deref().is_some_and(|v| !v.is_empty()))
+            .and_then(|(_, v)| v.clone())
+    });
+    match value.as_deref() {
+        None | Some("") => Ok(None),
+        Some(v) => v
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("invalid SOURCE_DATE_EPOCH: {v}")),
+    }
 }
 
 /// Works out stage `stage` of a prepared Dockerfile from the config it starts with: the
@@ -714,6 +740,64 @@ fn proxy_env(build_args: &BTreeMap<String, String>) -> Vec<String> {
 
 /// The syntax directive, or BUILDKIT_SYNTAX before it, may only ask for the frontend
 /// this is a port of: the reference would hand the build to the image it names.
+/// The check directive and BUILDKIT_DOCKERFILE_CHECK, read as linter.ParseLintOptions
+/// reads them: their words are checked, and no rule runs, as the builder has no linter.
+fn check_lint_options(dockerfile: &[u8], options: &Options) -> Result<()> {
+    let (text, wrap) = match options.build_args.get("BUILDKIT_DOCKERFILE_CHECK") {
+        Some(arg) => (
+            arg.clone(),
+            "failed to parse build-arg:BUILDKIT_DOCKERFILE_CHECK",
+        ),
+        None => match parser::parse_directive("check", dockerfile) {
+            Some(d) => (d.value, "failed to parse check options"),
+            None => return Ok(()),
+        },
+    };
+    lint_options(&text).map_err(|e| anyhow::anyhow!("{wrap}: {e}"))
+}
+
+/// linter.ParseLintOptions: up to three KEY=VALUE parts split on ';', of skip,
+/// experimental and error.
+fn lint_options(text: &str) -> std::result::Result<(), String> {
+    let text = gofmt::trim_space(text);
+    if text.is_empty() {
+        return Ok(());
+    }
+    for part in text.splitn(3, ';') {
+        let Some((key, value)) = part.split_once('=') else {
+            return Err(format!("invalid check option {}", quote(part)));
+        };
+        match gofmt::trim_space(key) {
+            "skip" | "experimental" => {}
+            "error" => {
+                let value = gofmt::trim_space(value);
+                if !matches!(
+                    value,
+                    "1" | "t"
+                        | "T"
+                        | "true"
+                        | "TRUE"
+                        | "True"
+                        | "0"
+                        | "f"
+                        | "F"
+                        | "false"
+                        | "FALSE"
+                        | "False"
+                ) {
+                    return Err(format!(
+                        "failed to parse check option {}: strconv.ParseBool: parsing {}: invalid syntax",
+                        quote(part),
+                        quote(value)
+                    ));
+                }
+            }
+            other => return Err(format!("invalid check option {}", quote(other))),
+        }
+    }
+    Ok(())
+}
+
 fn check_syntax(dockerfile: &[u8], options: &Options) -> Result<()> {
     let (image, what) = match options.build_args.get("BUILDKIT_SYNTAX") {
         Some(cmdline) => (
@@ -729,7 +813,8 @@ fn check_syntax(dockerfile: &[u8], options: &Options) -> Result<()> {
             None => return Ok(()),
         },
     };
-    if is_reference_frontend(&image) {
+    // dockerfile.v0 is the built-in frontend by name, which this one is.
+    if image == "dockerfile.v0" || is_reference_frontend(&image) {
         return Ok(());
     }
     Err(anyhow::anyhow!(

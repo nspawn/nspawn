@@ -10,6 +10,7 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use nix::fcntl::OFlag;
 use zbus::zvariant::Value;
 
+use crate::build::untar::Compression;
 use crate::cli::BuildArgs;
 use crate::client::{self, Client};
 use crate::config::Config;
@@ -83,27 +84,8 @@ fn read_stdin() -> Result<Vec<u8>> {
 }
 
 /// How bytes are compressed, by their magic as isArchive and DetectCompression tell it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Compression {
-    None,
-    Gzip,
-    Bzip2,
-    Xz,
-    Zstd,
-}
-
 fn compression(bytes: &[u8]) -> Compression {
-    if bytes.starts_with(&[0x1f, 0x8b, 0x08]) {
-        Compression::Gzip
-    } else if bytes.starts_with(b"BZh") {
-        Compression::Bzip2
-    } else if bytes.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
-        Compression::Xz
-    } else if bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        Compression::Zstd
-    } else {
-        Compression::None
-    }
+    crate::build::untar::detect(bytes)
 }
 
 /// The tar compressed `bytes` hold, undone as it is read: only the compressed bytes
@@ -311,8 +293,8 @@ impl<R: Read> Read for Reading<'_, R> {
     }
 }
 
-/// Packs the context into `out` as a tar, everything owned by root, modes and times
-/// kept, what the ignore patterns exclude left out.
+/// Packs the context into `out` as a tar, everything owned by root, modes, times and
+/// file capabilities kept, what the ignore patterns exclude left out.
 fn pack(dir: &Path, excludes: Vec<String>, out: impl Write) -> Result<()> {
     use crate::build::walk::{walk, FilterOpt, Step};
     let mut builder = tar::Builder::new(BufWriter::new(out));
@@ -325,6 +307,12 @@ fn pack(dir: &Path, excludes: Vec<String>, out: impl Write) -> Result<()> {
         },
         &mut |st| {
             let kind = st.mode & nix::libc::S_IFMT;
+            if matches!(
+                kind,
+                nix::libc::S_IFDIR | nix::libc::S_IFLNK | nix::libc::S_IFREG
+            ) {
+                append_records(&mut builder, st)?;
+            }
             let mut header = tar::Header::new_gnu();
             header.set_mode(st.mode & 0o7777);
             header.set_uid(0);
@@ -372,6 +360,49 @@ fn pack(dir: &Path, excludes: Vec<String>, out: impl Write) -> Result<()> {
         return Err(e);
     }
     builder.into_inner()?.flush()?;
+    Ok(())
+}
+
+/// The PAX records an entry needs ahead of its header: its time to the nanosecond when
+/// it has a fraction of a second, and the file capabilities of a regular file, the one
+/// extended attribute a layer keeps.
+fn append_records<W: Write>(
+    builder: &mut tar::Builder<W>,
+    st: &crate::build::walk::Stat,
+) -> Result<()> {
+    use crate::build::layer::format_pax_record;
+    let mut body = Vec::new();
+    let (secs, nanos) = (
+        st.mod_time.div_euclid(1_000_000_000),
+        st.mod_time.rem_euclid(1_000_000_000),
+    );
+    if nanos != 0 && secs >= 0 {
+        let time = format!("{secs}.{nanos:09}");
+        body.extend(format_pax_record(
+            b"mtime",
+            time.trim_end_matches('0').as_bytes(),
+        ));
+    }
+    let capability = st
+        .xattrs
+        .get(std::ffi::OsStr::new("security.capability"))
+        .filter(|c| !c.is_empty());
+    if let Some(capability) = capability.filter(|_| st.linkname.as_os_str().is_empty()) {
+        if st.mode & nix::libc::S_IFMT == nix::libc::S_IFREG {
+            body.extend(format_pax_record(
+                b"SCHILY.xattr.security.capability",
+                capability,
+            ));
+        }
+    }
+    if body.is_empty() {
+        return Ok(());
+    }
+    let mut header = tar::Header::new_ustar();
+    header.set_entry_type(tar::EntryType::XHeader);
+    header.set_mode(0o644);
+    header.set_size(body.len() as u64);
+    builder.append_data(&mut header, "PaxHeader", &body[..])?;
     Ok(())
 }
 
@@ -629,6 +660,15 @@ pub async fn dockerfile(args: BuildArgs, client: &Client, config: &Config) -> Re
     }
     if !d.cache_from.is_empty() {
         eprintln!("note: --cache-from is ignored: the build cache is this host's");
+    }
+    // The ID file of an earlier build goes first: a build that fails leaves none.
+    if let Some(path) = &d.iidfile {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("removing {}", path.display()));
+            }
+            _ => {}
+        }
     }
     let done = send(
         client,
@@ -909,6 +949,43 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some(&b"FROM scratch\n"[..])
+        );
+    }
+
+    #[test]
+    fn a_context_keeps_its_times_when_unpacked() {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = dir.path().join("ctx");
+        std::fs::create_dir_all(ctx.join("d")).unwrap();
+        let at = |path: &Path, nanos: u64| {
+            let times = std::fs::FileTimes::new()
+                .set_accessed(UNIX_EPOCH + Duration::from_nanos(nanos))
+                .set_modified(UNIX_EPOCH + Duration::from_nanos(nanos));
+            File::open(path).unwrap().set_times(times).unwrap();
+        };
+        std::fs::write(ctx.join("d/zero"), "0").unwrap();
+        std::fs::write(ctx.join("d/nanos"), "n").unwrap();
+        at(&ctx.join("d/zero"), 0);
+        at(&ctx.join("d/nanos"), 5_250_000_000);
+        at(&ctx.join("d"), 1_000_000_000_000);
+        let mut out = Vec::new();
+        pack(&ctx, Vec::new(), &mut out).unwrap();
+        let into = dir.path().join("into");
+        std::fs::create_dir(&into).unwrap();
+        let me = crate::build::copy::User {
+            uid: nix::unistd::getuid().as_raw(),
+            gid: nix::unistd::getgid().as_raw(),
+        };
+        let mut archive = tar::Archive::new(out.as_slice());
+        crate::build::untar::unpack(archive.entries().unwrap(), &into, Some(me)).unwrap();
+        let meta = |p: &str| std::fs::symlink_metadata(into.join(p)).unwrap();
+        assert_eq!(meta("d").mtime(), 1000);
+        assert_eq!(meta("d/zero").mtime(), 0);
+        assert_eq!(
+            (meta("d/nanos").mtime(), meta("d/nanos").mtime_nsec()),
+            (5, 250_000_000)
         );
     }
 

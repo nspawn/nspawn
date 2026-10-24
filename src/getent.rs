@@ -16,7 +16,7 @@
 
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -279,14 +279,8 @@ fn text_in(resolve: &dyn Fn(&str) -> Option<PathBuf>, relative: &str) -> String 
         };
         let Ok(link) = fs::read_link(&path) else {
             let mut text = String::new();
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-                .open(&path);
-            if let Ok(file) = file {
-                if file.metadata().is_ok_and(|m| m.is_file()) {
-                    let _ = file.take(1 << 20).read_to_string(&mut text);
-                }
+            if let Ok(file) = crate::volume::open_regular(&path) {
+                let _ = file.take(1 << 20).read_to_string(&mut text);
             }
             return text;
         };

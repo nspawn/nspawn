@@ -60,7 +60,7 @@ pub fn root_path(root: &Path, path: &str) -> Result<PathBuf> {
     )?))
 }
 
-fn root_path_bytes(root: &[u8], path: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn root_path_bytes(root: &[u8], path: &[u8]) -> Result<Vec<u8>> {
     if path.is_empty() {
         return Ok(root.to_vec());
     }
@@ -933,11 +933,10 @@ fn copy_device(dst: &Path, fi: &Metadata) -> Result<()> {
     } else {
         0
     };
-    // A socket is copied as an empty file of the same permissions; every other type,
-    // block devices included, keeps its own.
-    if kind == S_IFSOCK {
-        mode &= !S_IFMT;
-    }
+    // copyDevice clears the socket's bits of every mode: a socket becomes an empty file
+    // of the same permissions, and a block device, whose type shares a bit with it, a
+    // character device of the same numbers.
+    mode &= !S_IFSOCK;
     mknod(
         dst,
         SFlag::from_bits_truncate(mode & S_IFMT),
@@ -1169,7 +1168,7 @@ impl CopyAction<'_> {
     }
 }
 
-fn timespec_from_nanos(ts: i64) -> TimeSpec {
+pub(crate) fn timespec_from_nanos(ts: i64) -> TimeSpec {
     TimeSpec::new(ts.div_euclid(1_000_000_000), ts.rem_euclid(1_000_000_000))
 }
 
@@ -1203,6 +1202,12 @@ fn docopy_here(src_root: &Path, dest_root: &Path, action: &CopyAction<'_>) -> Re
             bail!("{}: not found", quote(required));
         }
     }
+    if !action.required_paths.is_empty() {
+        let found = required_found(src, action)?;
+        if let Some((required, _)) = action.required_paths.iter().zip(found).find(|(_, f)| !f) {
+            bail!("{}: not found", quote(required));
+        }
+    }
     let src_path = clean_path(&action.src);
     let dest_path = clean_path(&action.dest);
     if !action.create_dest_path {
@@ -1220,6 +1225,77 @@ fn docopy_here(src_root: &Path, dest_root: &Path, action: &CopyAction<'_>) -> Re
         }
         err
     })
+}
+
+/// For each required path, whether the patterns let a path through that starts with it,
+/// as the content checksum of the copy's source finds them: the entries below the
+/// source, symlinks not followed, each taken when the include patterns match it and the
+/// exclude patterns do not, a directory standing for itself. The reference compares
+/// the paths by their leading bytes.
+fn required_found(src: &[u8], action: &CopyAction<'_>) -> Result<Vec<bool>> {
+    let compile = |patterns: &[String]| -> Result<Option<PatternMatcher>> {
+        if patterns.is_empty() {
+            return Ok(None);
+        }
+        PatternMatcher::new(patterns)
+            .map(Some)
+            .map_err(|e| anyhow!("{e}"))
+    };
+    let include = compile(&action.include_patterns)
+        .with_context(|| format!("invalid includepatterns: {:?}", action.include_patterns))?;
+    let exclude = compile(&action.exclude_patterns)
+        .with_context(|| format!("invalid excludepatterns: {:?}", action.exclude_patterns))?;
+    let required: Vec<&[u8]> = action.required_paths.iter().map(|r| r.as_bytes()).collect();
+    let mut found = vec![false; required.len()];
+    let prefix = lexical::join(&[b"/", action.src.as_bytes()]);
+    let prefix: &[u8] = if prefix == b"/" { b"" } else { &prefix };
+    let top = root_path_bytes(src, &lexical::join(&[b"/", prefix]))?;
+    // What can hold a required path, or lies below one.
+    let worth = |path: &[u8]| {
+        required
+            .iter()
+            .any(|r| r.starts_with(path) || path.starts_with(r))
+    };
+    let mut stack: Vec<(Vec<u8>, Vec<u8>, MatchInfo, MatchInfo)> =
+        vec![(top, Vec::new(), MatchInfo::default(), MatchInfo::default())];
+    while let Some((dir, rel, inc_parent, exc_parent)) = stack.pop() {
+        let (entries, _) = read_dir_sorted(&bytes_path(&dir));
+        for (name, _) in entries {
+            let path = lexical::join(&[&dir, &name]);
+            let candidate = lexical::join(&[&rel, &name]);
+            let shown = lexical::join(&[prefix, b"/", &candidate]);
+            let candidate_str = lossy(&candidate).into_owned();
+            let (mut taken, inc_info) = match &include {
+                None => (true, MatchInfo::default()),
+                Some(m) => m
+                    .matches_using_parent_results(&candidate_str, &inc_parent)
+                    .map_err(|e| anyhow!("failed to match includepatterns: {e}"))?,
+            };
+            let mut exc_info = MatchInfo::default();
+            if taken {
+                if let Some(m) = &exclude {
+                    let (excluded, info) = m
+                        .matches_using_parent_results(&candidate_str, &exc_parent)
+                        .map_err(|e| anyhow!("failed to match excludepatterns: {e}"))?;
+                    taken = !excluded;
+                    exc_info = info;
+                }
+            }
+            if taken {
+                for (f, r) in found.iter_mut().zip(&required) {
+                    *f = *f || shown.starts_with(r);
+                }
+                if found.iter().all(|f| *f) {
+                    return Ok(found);
+                }
+            }
+            let is_dir = fs::symlink_metadata(bytes_path(&path)).is_ok_and(|m| m.is_dir());
+            if is_dir && worth(&shown) {
+                stack.push((path, candidate, inc_info, exc_info));
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn docopy_matches(
@@ -2547,7 +2623,9 @@ mod tests {
         assert_eq!(st("char").mode() & S_IFMT, S_IFCHR);
         assert_eq!(st("char").mode() & 0o777, 0o444);
         assert_eq!(st("char").rdev(), nix::sys::stat::makedev(1, 9));
-        assert_eq!(st("block").mode() & S_IFMT, S_IFBLK);
+        // As fsutil copies one: a character device of the same numbers.
+        assert_eq!(st("block").mode() & S_IFMT, S_IFCHR);
+        assert_eq!(st("block").rdev(), nix::sys::stat::makedev(3, 2));
         assert_eq!(st("block").mode() & 0o777, 0o441);
         assert_eq!(st("fifo").mode() & S_IFMT, S_IFIFO);
         assert_eq!(st("fifo").mode() & 0o777, 0o555);
@@ -3098,6 +3176,32 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(format!("{err:#}"), "\"/a/nope\": not found");
+
+        // A required path that every pattern leaves out is not found either; one that
+        // the excludes leave something of is.
+        for (source, exclude, missing) in [
+            ("x/y/z.txt", "x/y/z.txt", Some("/x/y/z.txt")),
+            ("x/y/z.txt", "x", Some("/x/y/z.txt")),
+            ("x/y/z.txt", "**/*.txt", Some("/x/y/z.txt")),
+            ("x/./y/z.txt", "y", Some("/x/y/z.txt")),
+            // Not a match of a/b/c/file: *.txt takes one component.
+            ("x/y/z.txt", "*.txt", None),
+            ("x/y", "x/y/z.txt", None),
+            ("x/y", "x/y/*", None),
+        ] {
+            let mut action = CopyAction::for_instruction(&copy_source(source, true), "/r/");
+            action.exclude_patterns = vec![exclude.to_string()];
+            let dst = tmp();
+            let copied = docopy(src.path(), dst.path(), &action);
+            match missing {
+                Some(path) => assert_eq!(
+                    format!("{:#}", copied.unwrap_err()),
+                    format!("\"{path}\": not found"),
+                    "{source} {exclude}"
+                ),
+                None => copied.unwrap(),
+            }
+        }
     }
 
     #[test]

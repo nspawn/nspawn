@@ -16,6 +16,8 @@ use crate::backend::{Backend, BackendChoice};
 use crate::build::cache::{self, Cache};
 use crate::build::image::{self, Config};
 use crate::build::plan::{self, Action, BaseRef, From, Platform, RunMount};
+use crate::build::untar::{self, Compression};
+use crate::build::walk::bytes_path;
 use crate::build::{copy, layer, root, sandbox};
 use crate::oci::Mode;
 use crate::reference::ImageRef;
@@ -99,8 +101,9 @@ impl State {
         cache::key(&parts)
     }
 
-    /// The stage of a cached step: what that step ran on and made, whatever the steps
-    /// before it make now.
+    /// The stage of a cached step: the layers it ran on and made, with their entries of
+    /// the history, and this build's entries of the steps that made no layer, which may
+    /// differ from those of the build that made it as they are not in its key.
     fn take(&mut self, stage: &cache::Stage) {
         self.layers = stage
             .layers
@@ -112,7 +115,18 @@ impl State {
             })
             .collect();
         self.config.rootfs.diff_ids = stage.layers.iter().map(|l| l.diff_id.clone()).collect();
-        self.config.history.clone_from(&stage.history);
+        let mut layers = stage.history.iter().filter(|h| !h.empty_layer);
+        let mut history: Vec<_> = self
+            .config
+            .history
+            .iter()
+            .map(|h| match h.empty_layer {
+                true => h.clone(),
+                false => layers.next().cloned().unwrap_or_else(|| h.clone()),
+            })
+            .collect();
+        history.extend(layers.cloned());
+        self.config.history = history;
     }
 
     /// The stage once a step that ran added its layer, for the step's cache entry.
@@ -139,6 +153,22 @@ impl State {
             history: self.config.history.clone(),
         }
     }
+}
+
+/// The action as its step's key takes it: without the proxy variables, and without a
+/// cache mount's id and sharing, which ExecOp.CacheMap leaves out (checkShouldClearCacheOpts).
+fn keyed(action: &Action) -> Action {
+    let mut action = action.clone();
+    if let Action::Run(run) = &mut action {
+        run.proxy_env.clear();
+        for mount in &mut run.mounts {
+            if let RunMount::Cache { id, sharing, .. } = mount {
+                id.clear();
+                sharing.clear();
+            }
+        }
+    }
+    action
 }
 
 /// A read-only overlay of an image's layers, for a stage or image a step takes files
@@ -170,7 +200,9 @@ pub struct Builder<'a> {
     /// Images taken from, each resolved once a build.
     images: HashMap<String, State>,
     /// URLs ADD fetched, each once a build: where to, its file name and its digest.
-    downloads: HashMap<String, (PathBuf, String, String)>,
+    downloads: HashMap<String, Downloaded>,
+    /// SOURCE_DATE_EPOCH, once the Dockerfile is read.
+    epoch: Option<i64>,
 }
 
 const CANCELLED: &str = "the build was cancelled: its client went away";
@@ -183,6 +215,12 @@ pub(crate) const MARKER: &str = ".nspawn-dockerfile-build";
 
 /// In the output directory of an mkosi build until it ends, for the same sweep.
 pub(crate) const MKOSI_MARKER: &str = ".nspawn-mkosi-build";
+
+/// SOURCE_DATE_EPOCH as the history writes it: encoding/json of a time.Time in UTC.
+fn epoch_time(epoch: i64) -> String {
+    let usec = u64::try_from(epoch).unwrap_or(0).saturating_mul(1_000_000);
+    crate::dockerapi::util::rfc3339_nano(usec, false)
+}
 
 fn timestamp_now() -> String {
     let nanos = std::time::SystemTime::now()
@@ -234,23 +272,20 @@ impl<'a> Builder<'a> {
             hold: None,
             images: HashMap::new(),
             downloads: HashMap::new(),
+            epoch: None,
         }
     }
 
     /// An ADD of a URL: fetched once a build into the work directory, checked against
     /// `checksum`; its directory, file name and digest. A step taking it is keyed by its
     /// contents, as the reference keys it.
-    async fn download(
-        &mut self,
-        url: &str,
-        checksum: Option<&str>,
-    ) -> Result<(PathBuf, String, String)> {
+    async fn download(&mut self, url: &str, checksum: Option<&str>) -> Result<Downloaded> {
         // Each ADD checks its own --checksum, the URL fetched before included.
-        let check = |found: &(PathBuf, String, String)| -> Result<()> {
+        let check = |found: &Downloaded| -> Result<()> {
             match checksum {
-                Some(checksum) if found.2 != checksum => bail!(
+                Some(checksum) if found.digest != checksum => bail!(
                     "digest mismatch for {url}: expected {checksum}, got {}",
-                    found.2
+                    found.digest
                 ),
                 _ => Ok(()),
             }
@@ -260,11 +295,10 @@ impl<'a> Builder<'a> {
             return Ok(found.clone());
         }
         let dir = self.work.join(format!("url-{}", self.downloads.len()));
-        let fetched = tokio::select! {
+        let found = tokio::select! {
             fetched = fetch_url(url, &dir) => fetched?,
             () = self.cancel.cancelled() => bail!(CANCELLED),
         };
-        let found = (dir, fetched.0, fetched.1);
         self.downloads.insert(url.to_string(), found.clone());
         check(&found)?;
         Ok(found)
@@ -339,6 +373,7 @@ impl<'a> Builder<'a> {
                 crate::build::dispatch::prepare(&req.dockerfile, &req.options, &platform)
             })
         })?;
+        self.epoch = prepared.epoch;
         for &index in &prepared.order {
             let info = prepared.stages[index].clone();
             let state = match &info.base {
@@ -402,6 +437,10 @@ impl<'a> Builder<'a> {
         no_cache: bool,
     ) -> Result<State> {
         let total = dispatched.steps.len();
+        let base_len = state.config.history.len();
+        // The steps that only set settings before the stage's first layer: they get its
+        // time, as normalizeLayersAndHistory gives them, once it is known.
+        let mut leading: Option<Vec<usize>> = Some(Vec::new());
         // A step's time: the last layer's, so that a build taken from the cache gives
         // the same image.
         let mut created = state
@@ -422,9 +461,13 @@ impl<'a> Builder<'a> {
                 i + 1,
                 step.description
             ));
+            // A step that only sets the image's settings changes no layer: the steps after
+            // it are keyed by what they run with, as an op is, not by it.
             let Some(action) = &step.action else {
+                if let Some(leading) = &mut leading {
+                    leading.push(state.config.history.len());
+                }
                 state.config.note(step.created_by.clone(), &created);
-                state.key = cache::key(&[state.key.as_bytes(), step.created_by.as_bytes()]);
                 self.say(format!("#{n} DONE {:.1}s", start.elapsed().as_secs_f64()));
                 continue;
             };
@@ -441,7 +484,7 @@ impl<'a> Builder<'a> {
             }
             let key = cache::key(&[
                 state.key.as_bytes(),
-                format!("{action:?}").as_bytes(),
+                format!("{:?}", keyed(action)).as_bytes(),
                 self.inputs(action).await?.as_bytes(),
             ]);
             let cached = if no_cache {
@@ -486,6 +529,19 @@ impl<'a> Builder<'a> {
                 }
             }
             state.key = key;
+            if let Some(leading) = leading.take() {
+                for i in leading {
+                    state.config.history[i].created = Some(created.clone());
+                }
+            }
+        }
+        // With SOURCE_DATE_EPOCH every entry the stage adds has that time, as
+        // commitToHistory gives it.
+        if let Some(epoch) = self.epoch {
+            let at = epoch_time(epoch);
+            for h in &mut state.config.history[base_len..] {
+                h.created = Some(at.clone());
+            }
         }
         let history = std::mem::take(&mut state.config.history);
         let rootfs = std::mem::take(&mut state.config.rootfs);
@@ -533,19 +589,26 @@ impl<'a> Builder<'a> {
         if let Action::Copy(copy) = action {
             if copy.add {
                 for source in copy.sources.iter().filter(|s| is_url(s)) {
-                    let (_, _, digest) = self.download(source, copy.checksum.as_deref()).await?;
-                    parts.push(format!("url {source} {digest}"));
+                    let found = self.download(source, copy.checksum.as_deref()).await?;
+                    // The time is the file's, so its key, as Last-Modified is the key's of
+                    // the reference.
+                    let modified = found.modified.map(|t| t.to_string()).unwrap_or_default();
+                    parts.push(format!("url {source} {} {modified}", found.digest));
                 }
             }
         }
-        let from = |from: &From, paths: &[String], parts: &mut Vec<String>| -> Result<()> {
+        let from = |from: &From,
+                    paths: &[String],
+                    exclude: &[String],
+                    parts: &mut Vec<String>|
+         -> Result<()> {
             match from {
                 From::Context => {
                     // A large context takes a while to hash: the runtime's other tasks go
                     // on meanwhile.
                     for path in paths {
                         parts.push(tokio::task::block_in_place(|| {
-                            content_hash(&self.req.context, path)
+                            content_hash(&self.req.context, path, exclude)
                         })?);
                     }
                 }
@@ -566,25 +629,27 @@ impl<'a> Builder<'a> {
             Ok(())
         };
         match action {
-            Action::Copy(copy) => from(&copy.from, &copy.sources, &mut parts)?,
+            Action::Copy(copy) => from(&copy.from, &copy.sources, &copy.exclude, &mut parts)?,
             Action::Run(run) => {
                 for mount in &run.mounts {
                     match mount {
                         RunMount::Bind {
                             from: f, source, ..
-                        } => from(f, std::slice::from_ref(source), &mut parts)?,
+                        } => from(f, std::slice::from_ref(source), &[], &mut parts)?,
                         RunMount::Cache {
                             from: Some((f, source)),
                             ..
-                        } => from(f, std::slice::from_ref(source), &mut parts)?,
+                        } => from(f, std::slice::from_ref(source), &[], &mut parts)?,
                         _ => {}
                     }
                 }
                 parts.push(format!("{:?}", self.network_of(run.network)));
-                // What the step's sandbox is given, as the reference keys it.
+                // What the step's sandbox is given, as the reference keys it: the names of
+                // the extra hosts, not their addresses.
+                let hosts: Vec<&str> = self.req.add_hosts.iter().map(|(h, _)| h.as_str()).collect();
                 parts.push(format!(
                     "{:?} {:?} {:?}",
-                    self.req.add_hosts, self.req.ulimits, self.req.shm_size
+                    hosts, self.req.ulimits, self.req.shm_size
                 ));
             }
             Action::Workdir { .. } => {}
@@ -782,7 +847,7 @@ impl<'a> Builder<'a> {
             Action::Run(run) => self.run_step(n, &step_root.merged, run).await,
             Action::Copy(c) => self.copy_step(n, &step_root.merged, c).await,
             Action::Workdir { path, user } => {
-                tokio::task::block_in_place(|| workdir(&step_root.merged, path, user))
+                tokio::task::block_in_place(|| workdir(&step_root.merged, path, user, self.epoch))
             }
         };
         let unmounted = root::unmount(sd, &step_root).await;
@@ -933,7 +998,8 @@ impl<'a> Builder<'a> {
         let dir = self.work.join(format!("run-{n}"));
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         let mut mounts = Vec::new();
-        let env = run.env.clone();
+        let mut env = run.env.clone();
+        env.extend(run.proxy_env.iter().cloned());
         let mut secret_env: Vec<(String, Vec<u8>)> = Vec::new();
         let mut targets: Vec<String> = Vec::new();
         let mut locks = Vec::new();
@@ -1064,9 +1130,15 @@ impl<'a> Builder<'a> {
                 }
                 RunMount::Tmpfs { target, size } => {
                     targets.push(target.clone());
+                    // The kernel's tmpfs, 1777, as the executor mounts one: systemd-nspawn's
+                    // --tmpfs alone would be 0755.
+                    let mut options = "mode=1777,nosuid".to_string();
+                    if let Some(size) = size {
+                        options.push_str(&format!(",size={size}"));
+                    }
                     mounts.push(sandbox::Mount::Tmpfs {
                         target: target.clone(),
-                        options: size.map(|s| format!("size={s}")).unwrap_or_default(),
+                        options,
                     });
                 }
                 RunMount::Secret {
@@ -1080,7 +1152,7 @@ impl<'a> Builder<'a> {
                 } => {
                     let Some(content) = req.secrets.get(id) else {
                         if *required {
-                            bail!("secret {id} not found");
+                            bail!("secret {id}: not found");
                         }
                         continue;
                     };
@@ -1168,10 +1240,10 @@ impl<'a> Builder<'a> {
             shm_size: req.shm_size,
             ulimits: req.ulimits.clone(),
         };
-        // A working directory that is not there is made: the step's --chdir needs it.
-        let workdir = copy::root_path(merged, &step.workdir)?;
-        if !workdir.exists() {
-            std::fs::create_dir_all(&workdir)?;
+        // A working directory that is not there is made, 0755 and the step's user's, as
+        // the executor's MkdirAllAndChown makes it: the step's --chdir needs it.
+        if !copy::root_path(merged, &step.workdir)?.exists() {
+            workdir(merged, &step.workdir, &run.user, None)?;
         }
         let stubs = sandbox::Stubs::before(merged, &targets);
         let result = self.spawn(n, &step).await;
@@ -1215,6 +1287,9 @@ impl<'a> Builder<'a> {
                 format!("#{n} {:.3} {text}", started.elapsed().as_secs_f64()),
             );
         };
+        // systemd-nspawn says when the step's process died of a signal, and exits 1 then,
+        // or 0 for SIGINT: the executor reports 128 plus the signal.
+        let mut signalled: Option<i32> = None;
         loop {
             tokio::select! {
                 () = self.cancel.cancelled() => {
@@ -1222,7 +1297,10 @@ impl<'a> Builder<'a> {
                     bail!(CANCELLED);
                 }
                 text = rx.recv() => match text {
-                    Some(text) => show(&text),
+                    Some(text) => match terminated_by(&text, &step.machine) {
+                        Some(signal) => signalled = Some(signal),
+                        None => show(&text),
+                    },
                     None => break,
                 },
             }
@@ -1234,7 +1312,7 @@ impl<'a> Builder<'a> {
                 bail!(CANCELLED);
             }
         };
-        if !status.success() {
+        if !status.success() || signalled.is_some() {
             for pump in pumps {
                 if let Ok(clip) = pump.await {
                     for kept in &clip.tail {
@@ -1242,10 +1320,10 @@ impl<'a> Builder<'a> {
                     }
                 }
             }
+            let code = signalled.map_or_else(|| status.code().unwrap_or(1), |s| 128 + s);
             bail!(
-                "process {:?} did not complete successfully: exit code: {}",
+                "process {:?} did not complete successfully: exit code: {code}",
                 step.argv.join(" "),
-                status.code().unwrap_or(1)
             );
         }
         Ok(())
@@ -1255,7 +1333,7 @@ impl<'a> Builder<'a> {
     async fn source_identity(&mut self, from: &From, source: &str) -> Result<String> {
         Ok(match from {
             From::Context => {
-                tokio::task::block_in_place(|| content_hash(&self.req.context, source))?
+                tokio::task::block_in_place(|| content_hash(&self.req.context, source, &[]))?
             }
             From::Stage(i) => self
                 .states
@@ -1354,18 +1432,10 @@ impl<'a> Builder<'a> {
             Url,
         }
         let mut sources: Vec<(PathBuf, String, Named)> = Vec::new();
-        for (i, file) in c.inline.iter().enumerate() {
-            let inline = dir.join(format!("inline-{i}"));
-            std::fs::create_dir_all(&inline)?;
-            let name = heredoc_file(&file.name)?;
-            std::fs::write(inline.join(&name), &file.data)?;
-            std::fs::set_permissions(inline.join(&name), std::fs::Permissions::from_mode(0o644))?;
-            sources.push((inline, name, Named::Inline));
-        }
         for source in &c.sources {
             if c.add && is_url(source) {
-                let (fetched, name, _) = self.download(source, c.checksum.as_deref()).await?;
-                sources.push((fetched, name, Named::Url));
+                let found = self.download(source, c.checksum.as_deref()).await?;
+                sources.push((found.dir, found.name, Named::Url));
                 continue;
             }
             if c.add && source.contains("://") {
@@ -1373,6 +1443,16 @@ impl<'a> Builder<'a> {
             }
             let root = self.source_root(&c.from).await?;
             sources.push((root, source.clone(), Named::Pattern));
+        }
+        // The heredocs after the paths, as dispatchCopy copies them: one wins a name
+        // they share.
+        for (i, file) in c.inline.iter().enumerate() {
+            let inline = dir.join(format!("inline-{i}"));
+            std::fs::create_dir_all(&inline)?;
+            let name = heredoc_file(&file.name)?;
+            std::fs::write(inline.join(&name), &file.data)?;
+            std::fs::set_permissions(inline.join(&name), std::fs::Permissions::from_mode(0o644))?;
+            sources.push((inline, name, Named::Inline));
         }
         // A URL is copied as it came unless --unpack says otherwise, a local archive
         // unpacked unless --unpack=false says so.
@@ -1642,6 +1722,16 @@ fn cache_mount_name(id: &str, uid: u32, gid: u32, mode: u32, base: &str) -> Stri
     ]))
 }
 
+/// The signal systemd-nspawn's `Container NAME terminated by signal KILL.` names, for the
+/// step's own machine.
+fn terminated_by(line: &str, machine: &str) -> Option<i32> {
+    let name = line
+        .strip_prefix(&format!("Container {machine} terminated by signal "))?
+        .strip_suffix('.')?;
+    let signal: nix::sys::signal::Signal = format!("SIG{name}").parse().ok()?;
+    Some(signal as i32)
+}
+
 /// The lock of a directory if nobody holds it, None if somebody does.
 fn try_lock_dir(dir: &Path) -> Result<Option<nix::fcntl::Flock<std::fs::File>>> {
     let file = std::fs::File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
@@ -1661,14 +1751,18 @@ fn lock_dir(dir: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
 }
 
 /// WORKDIR: the directory made, with its missing parents, owned by `user`.
-fn workdir(merged: &Path, path: &str, user: &str) -> Result<()> {
+/// The directories made get `epoch` as their times when SOURCE_DATE_EPOCH gives one.
+fn workdir(merged: &Path, path: &str, user: &str, epoch: Option<i64>) -> Result<()> {
     let target = copy::root_path(merged, path)?;
-    if target.exists() {
+    // One there already is kept; a file or anything else there is refused by mkdir_all
+    // (ENOTDIR), as fsutil's MkdirAll refuses it.
+    if target.is_dir() {
         return Ok(());
     }
     let owner = (!user.is_empty()).then(|| resolve_chown(merged, user));
     let chown = |u: Option<copy::User>| -> Result<Option<copy::User>> { Ok(owner.or(u)) };
-    copy::mkdir_all(&target, 0o755, Some(&chown), None)?;
+    let time = epoch.map(|e| nix::sys::time::TimeSpec::new(e, 0));
+    copy::mkdir_all(&target, 0o755, Some(&chown), time)?;
     Ok(())
 }
 
@@ -1689,20 +1783,13 @@ fn source_action(
 /// USER[:GROUP] by name or number against the root's passwd and group files, as the
 /// reference resolves --chown: a name the files lack is 0.
 fn resolve_chown(root: &Path, spec: &str) -> copy::User {
-    // A file only: a FIFO an image has there would hold the open for ever.
+    // A regular file only: a FIFO an image has there would hold the open for ever, and a
+    // device node would be opened on the host.
     let read = |file: &str| -> String {
-        use std::os::unix::fs::OpenOptionsExt;
         copy::root_path(root, file)
             .ok()
             .and_then(|p| {
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
-                    .open(p)
-                    .ok()?;
-                if !file.metadata().ok()?.is_file() {
-                    return None;
-                }
+                let file = crate::volume::open_regular(&p).ok()?;
                 let mut bytes = Vec::new();
                 file.take(10 << 20).read_to_end(&mut bytes).ok()?;
                 Some(String::from_utf8_lossy(&bytes).into_owned())
@@ -1747,11 +1834,19 @@ fn resolve_chown(root: &Path, spec: &str) -> copy::User {
 
 /// A digest of what a source of the context names: every path it matches as the copy
 /// finds them (wildcards in any component, the source's own symlinks followed), and
-/// below each the names, kinds, modes, owners, link targets and contents.
-fn content_hash(context: &Path, path: &str) -> Result<String> {
+/// below each the names, kinds, modes, owners, file capabilities, link targets and
+/// contents.
+fn content_hash(context: &Path, path: &str, exclude: &[String]) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     hash.update(path.as_bytes());
+    // What --exclude leaves out of the copy is left out of its key, as the selectors of
+    // the copy's content checksum leave it.
+    let excluded = if exclude.is_empty() {
+        None
+    } else {
+        Some(crate::build::ignore::PatternMatcher::new(exclude).map_err(|e| anyhow!("{e}"))?)
+    };
     // A source that matches nothing fails in the copy itself.
     for found in copy::resolve_wildcards(context, path, true).unwrap_or_default() {
         let found = found.to_string_lossy().into_owned();
@@ -1760,14 +1855,18 @@ fn content_hash(context: &Path, path: &str) -> Result<String> {
         let Ok(real) = copy::root_path(context, &found) else {
             continue;
         };
-        hash_tree(&mut hash, &real)?;
+        hash_tree(&mut hash, &real, excluded.as_ref())?;
     }
     Ok(format!("sha256:{}", hex::encode(hash.finalize())))
 }
 
 /// Everything below `top` into `hash`, by paths relative to it, without following
-/// symlinks.
-fn hash_tree(hash: &mut sha2::Sha256, top: &Path) -> Result<()> {
+/// symlinks, but what `exclude` matches.
+fn hash_tree(
+    hash: &mut sha2::Sha256,
+    top: &Path,
+    exclude: Option<&crate::build::ignore::PatternMatcher>,
+) -> Result<()> {
     use sha2::Digest;
     use std::os::unix::fs::MetadataExt;
     let mut stack = vec![top.to_path_buf()];
@@ -1775,6 +1874,28 @@ fn hash_tree(hash: &mut sha2::Sha256, top: &Path) -> Result<()> {
         let Ok(meta) = p.symlink_metadata() else {
             continue;
         };
+        let relative = p
+            .strip_prefix(top)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .into_owned();
+        if let Some(m) = exclude.filter(|_| !relative.is_empty()) {
+            if m.matches(&relative).map_err(|e| anyhow!("{e}"))? {
+                // A directory whose patterns could take something below back is gone
+                // through all the same.
+                if meta.is_dir() && m.exclusions() {
+                    let mut children: Vec<PathBuf> = std::fs::read_dir(&p)
+                        .with_context(|| format!("reading {}", p.display()))?
+                        .flatten()
+                        .map(|e| e.path())
+                        .collect();
+                    children.sort();
+                    children.reverse();
+                    stack.extend(children);
+                }
+                continue;
+            }
+        }
         hash.update(b"\0entry\0");
         hash.update(
             p.strip_prefix(top)
@@ -1789,8 +1910,13 @@ fn hash_tree(hash: &mut sha2::Sha256, top: &Path) -> Result<()> {
             hash.update(std::fs::read_link(&p)?.as_os_str().as_encoded_bytes());
         } else if meta.is_file() {
             hash.update(meta.len().to_le_bytes());
-            let mut file =
-                std::fs::File::open(&p).with_context(|| format!("reading {}", p.display()))?;
+            // The file capabilities, the one extended attribute a layer keeps.
+            if let Ok(Some(capability)) = xattr::get(&p, "security.capability") {
+                hash.update(b"\0capability\0");
+                hash.update(&capability);
+            }
+            let mut file = crate::volume::open_regular(&p)
+                .with_context(|| format!("reading {}", p.display()))?;
             let mut buf = vec![0u8; 1 << 16];
             loop {
                 let n = file.read(&mut buf)?;
@@ -1921,7 +2047,7 @@ const DOWNLOAD_STALL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// ADD of a URL: the file written into `dir` as it comes, hashed on the way; its name
 /// and digest.
-async fn fetch_url(url: &str, dir: &Path) -> Result<(String, String)> {
+async fn fetch_url(url: &str, dir: &Path) -> Result<Downloaded> {
     use sha2::{Digest, Sha256};
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt;
@@ -1936,6 +2062,11 @@ async fn fetch_url(url: &str, dir: &Path) -> Result<(String, String)> {
         .with_context(|| format!("fetching {url}"))?
         .error_for_status()
         .with_context(|| format!("fetching {url}"))?;
+    let last_modified = response
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     // Named after the URL asked for, decoded, as the reference names it: not after
     // where a redirect led.
     let name = crate::build::dispatch::url_file_name(url);
@@ -1960,34 +2091,268 @@ async fn fetch_url(url: &str, dir: &Path) -> Result<(String, String)> {
         file.write_all(&chunk)
             .with_context(|| format!("writing {}", path.display()))?;
     }
-    Ok((name, format!("sha256:{}", hex::encode(hash.finalize()))))
+    // Last-Modified is the file's time, the epoch without one that parses.
+    let modified = last_modified.as_deref().and_then(http_time);
+    let at = |nanos: i64| {
+        let since = Duration::from_nanos(nanos.unsigned_abs());
+        if nanos < 0 {
+            std::time::UNIX_EPOCH - since
+        } else {
+            std::time::UNIX_EPOCH + since
+        }
+    };
+    let time = at(modified.unwrap_or(0));
+    file.set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(time)
+            .set_modified(time),
+    )
+    .with_context(|| format!("setting the times of {}", path.display()))?;
+    Ok(Downloaded {
+        dir: dir.to_path_buf(),
+        name,
+        digest: format!("sha256:{}", hex::encode(hash.finalize())),
+        modified,
+    })
 }
 
-/// The compression of an archive, by its first bytes; None when it is no tar.
-fn archive_kind(head: &[u8]) -> Option<&'static str> {
-    if head.starts_with(&[0x1f, 0x8b, 0x08]) {
-        Some("gzip")
-    } else if head.starts_with(b"BZh") {
-        Some("bzip2")
-    } else if head.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
-        Some("xz")
-    } else if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        Some("zstd")
-    } else if head.len() > 262 && &head[257..262] == b"ustar" {
-        Some("tar")
-    } else {
-        None
+/// A file an ADD of a URL fetched: where it is, its digest, and the time its
+/// Last-Modified gave, in nanoseconds since the epoch.
+#[derive(Debug, Clone)]
+struct Downloaded {
+    dir: PathBuf,
+    name: String,
+    digest: String,
+    modified: Option<i64>,
+}
+
+/// A Last-Modified value as net/http's ParseTime reads it: the form of http.TimeFormat,
+/// RFC 850's or asctime's, as time.Parse takes each; in nanoseconds since the epoch.
+fn http_time(text: &str) -> Option<i64> {
+    const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const LONG_DAYS: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    struct Cursor<'a>(&'a str);
+    impl Cursor<'_> {
+        fn lit(&mut self, s: &str) -> Option<()> {
+            self.0 = self.0.strip_prefix(s)?;
+            Some(())
+        }
+        /// The first of `names` the text starts with, letters in either case.
+        fn name(&mut self, names: &[&str]) -> Option<i64> {
+            let (i, n) = names.iter().enumerate().find(|(_, n)| {
+                self.0
+                    .get(..n.len())
+                    .is_some_and(|head| head.eq_ignore_ascii_case(n))
+            })?;
+            self.0 = &self.0[n.len()..];
+            Some(i as i64)
+        }
+        /// getnum: two digits, or one when `fixed` is not asked for.
+        fn num(&mut self, fixed: bool) -> Option<i64> {
+            let b = self.0.as_bytes();
+            if !b.first()?.is_ascii_digit() {
+                return None;
+            }
+            let n = if b.get(1).is_some_and(u8::is_ascii_digit) {
+                2
+            } else if fixed {
+                return None;
+            } else {
+                1
+            };
+            let v = self.0[..n].parse().ok()?;
+            self.0 = &self.0[n..];
+            Some(v)
+        }
+        fn year(&mut self) -> Option<i64> {
+            let head = self.0.get(..4)?;
+            if !head.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            self.0 = &self.0[4..];
+            head.parse().ok()
+        }
+        /// Seconds, with the fraction time.Parse takes after them though the layout has
+        /// none; in nanoseconds.
+        fn seconds(&mut self) -> Option<i64> {
+            let sec = self.num(true)?;
+            let b = self.0.as_bytes();
+            let mut nanos = 0;
+            if b.len() >= 2 && matches!(b[0], b'.' | b',') && b[1].is_ascii_digit() {
+                let n = 1 + b[1..].iter().take_while(|c| c.is_ascii_digit()).count();
+                let digits: String = self.0[1..n]
+                    .chars()
+                    .chain(std::iter::repeat('0'))
+                    .take(9)
+                    .collect();
+                if n - 1 > 9 {
+                    return None;
+                }
+                nanos = digits.parse().ok()?;
+                self.0 = &self.0[n..];
+            }
+            (sec < 60).then_some(sec * 1_000_000_000 + nanos)
+        }
+        /// A zone as time.Parse takes one for MST: UTC, GMT with an hour offset or not,
+        /// a signed hour offset, or three to five capitals. The instant stays the one of
+        /// the clock read as UTC, as it does where the local zone does not name the zone.
+        fn zone(&mut self) -> Option<()> {
+            if self.lit("UTC").is_some() {
+                return Some(());
+            }
+            let signed = |s: &str| -> usize {
+                let Some(rest) = s.strip_prefix(['+', '-']) else {
+                    return 0;
+                };
+                let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                match rest[..digits].parse::<u64>() {
+                    Ok(x) if x <= 23 => 1 + digits,
+                    _ => 0,
+                }
+            };
+            let n = if self.0.starts_with("ChST") || self.0.starts_with("MeST") {
+                4
+            } else if let Some(rest) = self.0.strip_prefix("GMT") {
+                3 + signed(rest)
+            } else if self.0.starts_with(['+', '-']) {
+                signed(self.0)
+            } else {
+                let b = self.0.as_bytes();
+                match b
+                    .iter()
+                    .take(6)
+                    .take_while(|c| c.is_ascii_uppercase())
+                    .count()
+                {
+                    3 => 3,
+                    4 if b[3] == b'T' || self.0.starts_with("WITA") => 4,
+                    5 if b[4] == b'T' => 5,
+                    _ => 0,
+                }
+            };
+            if n == 0 {
+                return None;
+            }
+            self.0 = &self.0[n..];
+            Some(())
+        }
     }
+    let leap = |y: i64| (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let at = |year: i64, month: i64, day: i64, hour: i64, min: i64, nanos: i64| {
+        let mdays = [
+            31,
+            if leap(year) { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        if day < 1 || day > mdays[month as usize] || hour > 23 || min > 59 {
+            return None;
+        }
+        let y = year - 1;
+        let days = 365 * (year - 1970) + (y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400))
+            - (1969 / 4 - 1969 / 100 + 1969 / 400)
+            + mdays[..month as usize].iter().sum::<i64>()
+            + day
+            - 1;
+        let secs = days * 86_400 + hour * 3600 + min * 60;
+        secs.checked_mul(1_000_000_000)?.checked_add(nanos)
+    };
+    // Mon, 02 Jan 2006 15:04:05 GMT
+    let fixdate = || {
+        let mut c = Cursor(text);
+        c.name(&DAYS)?;
+        c.lit(", ")?;
+        let day = c.num(true)?;
+        c.lit(" ")?;
+        let month = c.name(&MONTHS)?;
+        c.lit(" ")?;
+        let year = c.year()?;
+        c.lit(" ")?;
+        let hour = c.num(false)?;
+        c.lit(":")?;
+        let min = c.num(true)?;
+        c.lit(":")?;
+        let nanos = c.seconds()?;
+        c.lit(" GMT")?;
+        c.0.is_empty().then_some(())?;
+        at(year, month, day, hour, min, nanos)
+    };
+    // Monday, 02-Jan-06 15:04:05 MST
+    let rfc850 = || {
+        let mut c = Cursor(text);
+        c.name(&LONG_DAYS)?;
+        c.lit(", ")?;
+        let day = c.num(true)?;
+        c.lit("-")?;
+        let month = c.name(&MONTHS)?;
+        c.lit("-")?;
+        let yy = c.num(true)?;
+        let year = if yy >= 69 { 1900 + yy } else { 2000 + yy };
+        c.lit(" ")?;
+        let hour = c.num(false)?;
+        c.lit(":")?;
+        let min = c.num(true)?;
+        c.lit(":")?;
+        let nanos = c.seconds()?;
+        c.lit(" ")?;
+        c.zone()?;
+        c.0.is_empty().then_some(())?;
+        at(year, month, day, hour, min, nanos)
+    };
+    // Mon Jan _2 15:04:05 2006
+    let asctime = || {
+        let mut c = Cursor(text);
+        c.name(&DAYS)?;
+        c.lit(" ")?;
+        let month = c.name(&MONTHS)?;
+        c.lit(" ")?;
+        let _ = c.lit(" ");
+        let day = c.num(false)?;
+        c.lit(" ")?;
+        let hour = c.num(false)?;
+        c.lit(":")?;
+        let min = c.num(true)?;
+        c.lit(":")?;
+        let nanos = c.seconds()?;
+        c.lit(" ")?;
+        let year = c.year()?;
+        c.0.is_empty().then_some(())?;
+        at(year, month, day, hour, min, nanos)
+    };
+    fixdate().or_else(rfc850).or_else(asctime)
 }
 
-/// The contents of an archive of `kind`; xz, whose decoder writes, through a file in
-/// `dir`.
-fn decompressed(kind: &str, file: std::fs::File, dir: &Path) -> Result<Box<dyn std::io::Read>> {
+/// The contents of an archive compressed as `kind`; xz, whose decoder writes, through a
+/// file in `dir`.
+fn decompressed(
+    kind: Compression,
+    file: std::fs::File,
+    dir: &Path,
+) -> Result<Box<dyn std::io::Read>> {
     Ok(match kind {
-        "gzip" => Box::new(flate2::read::MultiGzDecoder::new(file)),
-        "bzip2" => Box::new(bzip2::read::MultiBzDecoder::new(file)),
-        "zstd" => Box::new(zstd::stream::read::Decoder::new(file)?),
-        "xz" => {
+        Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(file)),
+        Compression::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(file)),
+        Compression::Zstd => Box::new(zstd::stream::read::Decoder::new(file)?),
+        Compression::Xz => {
             let path = dir.join(format!("xz-{}", crate::store::unique_suffix()));
             let mut out = std::fs::File::options()
                 .read(true)
@@ -2001,71 +2366,59 @@ fn decompressed(kind: &str, file: std::fs::File, dir: &Path) -> Result<Box<dyn s
             std::io::Seek::rewind(&mut out)?;
             Box::new(out)
         }
-        _ => Box::new(file),
+        Compression::None => Box::new(file),
     })
 }
 
-/// ADD of a local archive: unpacked into a scratch directory, whose contents then go to
-/// the destination as a directory copy would. False when the source is no archive.
+/// ADD of a local archive, unpacked into the destination as the reference's unpack does
+/// it: a regular file that decompresses, if it is compressed, to something a tar reader
+/// takes a first header from. False when the source is no archive, which is copied as it
+/// is then.
 fn unpack_archive(r: &copy::UnpackRequest<'_>, dir: &Path) -> Result<bool> {
-    let src = copy::root_path(r.src_root, &r.src.to_string_lossy())?;
-    if !src.is_file() {
+    use crate::build::walk::path_bytes;
+    let src = bytes_path(&copy::root_path_bytes(
+        path_bytes(r.src_root),
+        path_bytes(r.src),
+    )?);
+    if !std::fs::metadata(&src).is_ok_and(|m| m.is_file()) {
         return Ok(false);
     }
-    let mut head = vec![0u8; 512];
-    let n = {
-        let mut file = std::fs::File::open(&src)?;
-        file.read(&mut head)?
-    };
-    head.truncate(n);
-    let Some(kind) = archive_kind(&head) else {
+    let mut head = Vec::with_capacity(10);
+    std::fs::File::open(&src)?
+        .take(10)
+        .read_to_end(&mut head)
+        .with_context(|| format!("reading {}", src.display()))?;
+    let Ok(reader) = decompressed(untar::detect(&head), std::fs::File::open(&src)?, dir) else {
         return Ok(false);
     };
-    // A compressed file that does not decompress, or holds no tar, is copied as it is.
-    let Ok(mut reader) = decompressed(kind, std::fs::File::open(&src)?, dir) else {
+    let mut archive = tar::Archive::new(reader);
+    let Ok(entries) = archive.entries() else {
         return Ok(false);
     };
-    let mut inner = vec![0u8; 512];
-    let mut filled = 0;
-    while filled < inner.len() {
-        match reader.read(&mut inner[filled..]) {
-            Ok(0) | Err(_) => break,
-            Ok(m) => filled += m,
-        }
-    }
-    if filled < 262 || &inner[257..262] != b"ustar" {
+    let mut entries = entries.peekable();
+    if !matches!(entries.peek(), Some(Ok(_))) {
         return Ok(false);
     }
-    inner.truncate(filled);
-    let scratch = dir.join(format!("unpack-{}", crate::store::unique_suffix()));
-    std::fs::create_dir_all(&scratch)?;
-    let mut archive = tar::Archive::new(std::io::Cursor::new(inner).chain(reader));
-    archive.set_preserve_permissions(true);
-    archive.set_preserve_ownerships(true);
-    archive.set_unpack_xattrs(false);
-    archive
-        .unpack(&scratch)
-        .with_context(|| format!("unpacking {}", r.src.display()))?;
-    let dest = r.dest.to_string_lossy().into_owned();
-    copy::docopy(
-        &scratch,
-        r.dest_root,
-        &copy::CopyAction {
-            src: "/".to_string(),
-            dest,
-            owner: r.owner,
-            dir_copy_contents: true,
-            create_dest_path: true,
-            ..Default::default()
-        },
+    let dest = bytes_path(&copy::root_path_bytes(
+        path_bytes(r.dest_root),
+        path_bytes(r.dest),
+    )?);
+    let owner = r.owner;
+    let chowner = move |_: Option<copy::User>| -> Result<Option<copy::User>> { Ok(owner) };
+    copy::mkdir_all(
+        &dest,
+        0o755,
+        Some(&chowner),
+        r.timestamp.map(copy::timespec_from_nanos),
     )?;
-    let _ = crate::store::remove_tree(&scratch);
+    untar::unpack(entries, &dest, r.owner)
+        .with_context(|| format!("unpacking {}", r.src.display()))?;
     Ok(true)
 }
 
 /// A build whose context comes as a tar stream on `context`: unpacked into the build's
-/// work directory, everything owned by root as the reference's context transfer leaves
-/// it.
+/// work directory as an archive is, owned as the tar says (root, for a directory the
+/// command line packed, as the reference's context transfer leaves it).
 pub async fn build(
     ctx: &Context,
     mut request: Request,
@@ -2090,17 +2443,8 @@ pub async fn build(
     let target = dir.clone();
     let unpacked = tokio::task::spawn_blocking(move || -> Result<()> {
         let mut archive = tar::Archive::new(std::fs::File::from(context));
-        archive.set_preserve_permissions(true);
-        archive.set_preserve_mtime(true);
-        archive.set_preserve_ownerships(false);
-        archive.set_unpack_xattrs(false);
-        for entry in archive.entries().context("reading the build context")? {
-            let mut entry = entry.context("reading the build context")?;
-            entry
-                .unpack_in(&target)
-                .context("unpacking the build context")?;
-        }
-        Ok(())
+        let entries = archive.entries().context("reading the build context")?;
+        untar::unpack(entries, &target, None).context("unpacking the build context")
     })
     .await
     .context("unpacking the build context")?;
@@ -2233,6 +2577,58 @@ fn mounted_below(dir: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_step_killed_by_a_signal_says_which() {
+        assert_eq!(
+            terminated_by(
+                "Container nspawn-build-ab terminated by signal KILL.",
+                "nspawn-build-ab"
+            ),
+            Some(9)
+        );
+        assert_eq!(
+            terminated_by(
+                "Container nspawn-build-ab terminated by signal INT.",
+                "nspawn-build-ab"
+            ),
+            Some(2)
+        );
+        // What the step prints itself is its own.
+        assert_eq!(
+            terminated_by(
+                "Container other terminated by signal KILL.",
+                "nspawn-build-ab"
+            ),
+            None
+        );
+        assert_eq!(terminated_by("hello", "nspawn-build-ab"), None);
+    }
+
+    #[test]
+    fn a_working_directory_is_made_as_the_user_and_never_over_a_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("etc")).unwrap();
+        std::fs::write(
+            root.path().join("etc/passwd"),
+            "app:x:1000:1000::/home/app:/bin/sh\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("app"), "").unwrap();
+        // A file where the directory goes fails the step, as fsutil's MkdirAll does.
+        let err = workdir(root.path(), "/app", "", None).unwrap_err();
+        assert!(format!("{err:#}").contains("not a directory"), "{err:#}");
+        assert!(workdir(root.path(), "/etc", "", None).is_ok());
+        // Missing, it is made 0755 and the user's, its parents with it.
+        if nix::unistd::geteuid().is_root() {
+            workdir(root.path(), "/srv/w", "app", None).unwrap();
+            let meta = std::fs::metadata(root.path().join("srv/w")).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (1000, 1000));
+            assert_eq!(meta.permissions().mode() & 0o777, 0o755);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -2601,7 +2997,7 @@ mod tests {
         let keys = |sources: &[&str]| -> Vec<String> {
             sources
                 .iter()
-                .map(|s| content_hash(ctx, s).unwrap())
+                .map(|s| content_hash(ctx, s, &[]).unwrap())
                 .collect()
         };
         let sources = [".", "pkgs/.", "pkgs/*/package.json", "link.txt", "top.txt"];
@@ -2618,7 +3014,52 @@ mod tests {
         // The same tree elsewhere gives the same key.
         let other = tempfile::tempdir().unwrap();
         std::fs::write(other.path().join("top.txt"), "t1").unwrap();
-        assert_eq!(content_hash(other.path(), "top.txt").unwrap(), after[4]);
+        assert_eq!(
+            content_hash(other.path(), "top.txt", &[]).unwrap(),
+            after[4]
+        );
+        // What --exclude leaves out of the copy does not count.
+        let excluding = |e: &[&str]| {
+            let e: Vec<String> = e.iter().map(|s| s.to_string()).collect();
+            content_hash(ctx, "pkgs", &e).unwrap()
+        };
+        let kept = excluding(&["b"]);
+        std::fs::write(ctx.join("pkgs/b/package.json"), "b3").unwrap();
+        assert_eq!(kept, excluding(&["b"]));
+        std::fs::write(ctx.join("pkgs/a/package.json"), "a2").unwrap();
+        assert_ne!(kept, excluding(&["b"]));
+        // A pattern that takes a file back below an excluded directory still counts it.
+        let back = excluding(&["b", "!b/package.json"]);
+        std::fs::write(ctx.join("pkgs/b/package.json"), "b4").unwrap();
+        assert_ne!(back, excluding(&["b", "!b/package.json"]));
+    }
+
+    #[test]
+    fn a_step_s_key_leaves_out_what_the_reference_leaves_out() {
+        let run = |proxy: &str, id: &str| {
+            Action::Run(plan::Run {
+                argv: vec!["true".to_string()],
+                script: None,
+                env: vec!["A=1".to_string()],
+                proxy_env: vec![format!("HTTP_PROXY={proxy}")],
+                user: String::new(),
+                workdir: "/".to_string(),
+                mounts: vec![RunMount::Cache {
+                    target: "/cache".to_string(),
+                    id: id.to_string(),
+                    from: None,
+                    sharing: "locked".to_string(),
+                    read_only: false,
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                }],
+                network: plan::Network::Default,
+                insecure: false,
+            })
+        };
+        let key = |a: &Action| format!("{:?}", keyed(a));
+        assert_eq!(key(&run("http://a", "one")), key(&run("http://b", "two")));
     }
 
     #[test]
@@ -2640,14 +3081,14 @@ mod tests {
         lzma_rs::xz_compress(&mut &tar[..], &mut xz).unwrap();
         let zstd = zstd::encode_all(&tar[..], 0).unwrap();
         for (kind, bytes) in [
-            ("tar", tar.clone()),
-            ("gzip", gzip.finish().unwrap()),
-            ("bzip2", bzip2.finish().unwrap()),
-            ("xz", xz),
-            ("zstd", zstd),
+            (Compression::None, tar.clone()),
+            (Compression::Gzip, gzip.finish().unwrap()),
+            (Compression::Bzip2, bzip2.finish().unwrap()),
+            (Compression::Xz, xz),
+            (Compression::Zstd, zstd),
         ] {
-            assert_eq!(archive_kind(&bytes[..bytes.len().min(512)]), Some(kind));
-            let path = dir.path().join(kind);
+            assert_eq!(untar::detect(&bytes[..bytes.len().min(10)]), kind);
+            let path = dir.path().join(format!("{kind:?}"));
             std::fs::write(&path, &bytes).unwrap();
             let reader =
                 decompressed(kind, std::fs::File::open(&path).unwrap(), dir.path()).unwrap();
@@ -2657,10 +3098,130 @@ mod tests {
                 .unwrap()
                 .map(|e| e.unwrap().path().unwrap().display().to_string())
                 .collect();
-            assert_eq!(names, ["hello.txt"], "{kind}");
+            assert_eq!(names, ["hello.txt"], "{kind:?}");
         }
-        assert_eq!(archive_kind(b"plain text"), None);
         // Only xz's scratch file was made, and it is gone.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 5);
+    }
+
+    #[test]
+    fn what_a_tar_reader_takes_is_an_archive_and_the_rest_is_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dest = dir.path().join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let uid = u64::from(nix::unistd::getuid().as_raw());
+        let gid = u64::from(nix::unistd::getgid().as_raw());
+        // A V7 tar: no magic, only the checksum says it is a header.
+        let mut v7 = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_old();
+        header.set_uid(uid);
+        header.set_gid(gid);
+        header.set_size(2);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        v7.append_data(&mut header, "v7.txt", &b"v7"[..]).unwrap();
+        let v7 = v7.into_inner().unwrap();
+        // zstd behind a skippable frame.
+        let mut skippable = vec![0x50, 0x2a, 0x4d, 0x18, 4, 0, 0, 0, 1, 2, 3, 4];
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_uid(uid);
+        header.set_gid(gid);
+        header.set_size(1);
+        header.set_mode(0o644);
+        tar.append_data(&mut header, "z.txt", &b"z"[..]).unwrap();
+        skippable.extend(zstd::encode_all(&tar.into_inner().unwrap()[..], 0).unwrap());
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gzip.write_all(b"text, not a tar").unwrap();
+        for (name, bytes) in [
+            ("v7.tar", v7),
+            ("skippable.tar.zst", skippable),
+            ("text.gz", gzip.finish().unwrap()),
+            ("BZh.txt", b"BZh, not bzip2".to_vec()),
+            ("plain", b"plain text".to_vec()),
+        ] {
+            std::fs::write(src.join(name), bytes).unwrap();
+        }
+        let unpack = |name: &str| {
+            unpack_archive(
+                &copy::UnpackRequest {
+                    src_root: &src,
+                    src: Path::new(name),
+                    dest_root: &dest,
+                    dest: Path::new("/out/"),
+                    owner: None,
+                    timestamp: None,
+                },
+                dir.path(),
+            )
+            .unwrap()
+        };
+        assert!(unpack("v7.tar"));
+        assert_eq!(std::fs::read(dest.join("out/v7.txt")).unwrap(), b"v7");
+        assert!(unpack("skippable.tar.zst"));
+        assert_eq!(std::fs::read(dest.join("out/z.txt")).unwrap(), b"z");
+        for name in ["text.gz", "BZh.txt", "plain"] {
+            assert!(!unpack(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn last_modified_is_read_as_net_http_reads_it() {
+        // What Go 1.26's http.ParseTime gives for each, under TZ=UTC.
+        for (text, want) in [
+            (
+                "Mon, 02 Jan 2006 15:04:05 GMT",
+                Some(1_136_214_245_000_000_000),
+            ),
+            (
+                "Sun, 06 Nov 1994 08:49:37 GMT",
+                Some(784_111_777_000_000_000),
+            ),
+            (
+                "Sunday, 06-Nov-94 08:49:37 GMT",
+                Some(784_111_777_000_000_000),
+            ),
+            ("Sun Nov  6 08:49:37 1994", Some(784_111_777_000_000_000)),
+            ("Sun Nov 6 08:49:37 1994", Some(784_111_777_000_000_000)),
+            (
+                "mon, 02 jan 2006 15:04:05 GMT",
+                Some(1_136_214_245_000_000_000),
+            ),
+            ("Mon, 02 Jan 2006 15:04:05 UTC", None),
+            ("Mon, 30 Feb 2006 15:04:05 GMT", None),
+            (
+                "Mon, 29 Feb 2000 15:04:05 GMT",
+                Some(951_836_645_000_000_000),
+            ),
+            (
+                "Mon, 02 Jan 2006 15:04:05.5 GMT",
+                Some(1_136_214_245_500_000_000),
+            ),
+            ("Mon, 2 Jan 2006 15:04:05 GMT", None),
+            ("Thursday, 01-Jan-70 00:00:00 EST", Some(0)),
+            (
+                "Monday, 02-Jan-06 15:04:05 GMT+2",
+                Some(1_136_214_245_000_000_000),
+            ),
+            (
+                "Monday, 02-Jan-06 15:04:05 UTC",
+                Some(1_136_214_245_000_000_000),
+            ),
+            ("Mon, 02 Jan 2006 24:00:00 GMT", None),
+            (
+                "Mon, 02 Jan 2006 1:04:05 GMT",
+                Some(1_136_163_845_000_000_000),
+            ),
+            ("Wed, 31 Dec 1969 23:59:59 GMT", Some(-1_000_000_000)),
+            ("Mon, 02 Jan 2006 15:04:05 GMT ", None),
+            (
+                "Friday, 31-Dec-99 23:59:59 CEST",
+                Some(946_684_799_000_000_000),
+            ),
+        ] {
+            assert_eq!(http_time(text), want, "{text}");
+        }
     }
 }

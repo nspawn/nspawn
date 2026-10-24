@@ -89,7 +89,13 @@ is refused) and runs it with a builder of nspawn's own. It takes:
 - every stage the target needs (`--target`, the last one otherwise), multi-stage builds,
   `COPY --from`, `ARG` and `--build-arg`, `ONBUILD` and heredocs;
 - `COPY --chown --chmod --parents --exclude --link`, and `ADD` of local archives (gzip,
-  bzip2, xz, zstd or plain tar, unpacked) and of http(s) URLs (`--checksum`);
+  bzip2, xz, zstd or plain tar, unpacked) and of http(s) URLs (`--checksum`). An
+  archive is unpacked into the destination: an entry replaces what is at its path
+  unless both are directories, a parent it does not list is made 0755, and its owners
+  (unless `--chown`), modes, times, FIFOs, device nodes and extended attributes are
+  kept. A file fetched from a URL has its `Last-Modified` time, the epoch without one;
+- `--build-arg SOURCE_DATE_EPOCH=SECONDS` (or an `ARG` of it with a default before the
+  first `FROM`), the time of the image and of the history entries the build adds;
 - `RUN --mount` of the cache, bind, tmpfs and secret kinds. `--secret id=ID,src=PATH`
   reads a file, `env=VAR` a variable, which wins over a file; with neither, the
   variable named ID when it is set, else the file. The command line reads them as the
@@ -100,10 +106,12 @@ is refused) and runs it with a builder of nspawn's own. It takes:
   `--no-cache-filter`, `-q`, `--iidfile` and `--push` (the tags, once built).
 
 The context is the directory given, packed by the command line as the user, everything
-owned by root, with what its ignore file excludes left out: `NAME.dockerignore` next to
-the Dockerfile `NAME`, which wins, else the context's `.dockerignore`. `-` takes a
-context tar, or a Dockerfile with no context, from standard input; `-f` then names the
-Dockerfile in the tar, and is refused with a Dockerfile on standard input. An ignore
+owned by root, times to the nanosecond and file capabilities kept, with what its ignore
+file excludes left out: `NAME.dockerignore` next to the Dockerfile `NAME`, which wins,
+else the context's `.dockerignore`. `-` takes a context tar, or a Dockerfile with no
+context, from standard input; `-f` then names the Dockerfile in the tar, and is refused
+with a Dockerfile on standard input. A context tar is unpacked as `ADD` unpacks an
+archive, its owners kept. An ignore
 file that cannot be read fails the build, and so does a file of the context that fails
 partway through its reading; a file the user cannot open, or a socket, goes in as an
 empty file. `--rm`, `--force-rm`, `-m`, `--memory-swap`, `-c`, `--cpu-period`,
@@ -138,12 +146,14 @@ two builds at once each run on their own.
 What the builder does not do, or does its own way:
 
 - No SSH forwarding (`--ssh`), no output other than a local image (`--output`,
-  `--cache-to`), no named contexts, no remote contexts or git sources, no attestations,
-  only this host's platform, no `RUN --security=insecure` or `RUN --device`, no
-  `--check` or `--call`, and no linter.
+  `--cache-to`), no named contexts, no remote contexts or git sources, no attestations
+  (`--provenance=false` and `--sbom=false` are taken), only this host's platform, no `RUN --security=insecure` or `RUN --device`, no
+  `--check` or `--call`, and no linter: a `# check=` directive or
+  `BUILDKIT_DOCKERFILE_CHECK` is read and its words checked, and no rule runs.
 - Stages run one after another, and `COPY --link` copies as a plain `COPY`.
 - `/run` is a tmpfs during a `RUN`, so what a step writes there is not kept, and
-  systemd-nspawn adds `container=systemd-nspawn` to a step's environment.
+  systemd-nspawn adds `container=systemd-nspawn`, `container_uuid`, `USER` and
+  `LOGNAME` to a step's environment.
 - The mount points systemd-nspawn makes for a step (an empty `/etc/machine-id`, `/bin`
   and the like as links into `/usr` where the base had none) are taken out of its layer,
   even when the step made them itself.
@@ -153,7 +163,10 @@ What the builder does not do, or does its own way:
 - Each step starts from the layers as the image keeps them, so what a layer does not
   carry (ACLs and extended attributes other than file capabilities) is gone for the
   next step.
-- FIFOs and device nodes of the context are left out of it.
+- FIFOs and device nodes of a context directory are left out of it; those of a context
+  tar are kept.
+- A `RUN` of `USER 0:GID` or `USER root:GROUP` runs with group 0, and a `RUN` as root
+  without root's supplementary groups: systemd-nspawn sets no group of its own for root.
 - A Dockerfile is read as UTF-8: bytes that are not (Latin-1 text in a heredoc) become
   U+FFFD. A `.dockerignore` pattern with a Unicode class of Go's regular expressions
   (`\p`, `\P`) is refused.

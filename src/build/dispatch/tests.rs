@@ -563,10 +563,11 @@ fn proxy_args_reach_run_but_not_history() {
     let (prepared, done) = build_with("FROM busybox\nRUN true\n", &o).unwrap();
     let d = &done[&prepared.target];
     assert_eq!(history(d), ["RUN /bin/sh -c true"]);
+    assert_eq!(runs(d)[0].env, [PATH_ENV]);
+    // The process gets them after the rest; the step's key does not.
     assert_eq!(
-        runs(d)[0].env,
+        runs(d)[0].proxy_env,
         [
-            PATH_ENV,
             "HTTPS_PROXY=http://proxy:3128",
             "https_proxy=http://proxy:3128"
         ]
@@ -1292,6 +1293,62 @@ fn syntax_directive() {
         &options(&[("BUILDKIT_SYNTAX", " docker/dockerfile:1 x")]),
     )
     .unwrap();
+    // The built-in frontend by its name, whatever the directive says.
+    build_with(
+        "# syntax=other/frontend\nFROM busybox\n",
+        &options(&[("BUILDKIT_SYNTAX", "dockerfile.v0")]),
+    )
+    .unwrap();
+}
+
+#[test]
+fn check_options_are_read_as_the_linter_reads_them() {
+    build("# check=skip=JSONArgsRecommended;error=true\nFROM busybox\n");
+    build("# check=skip=all\nFROM busybox\n");
+    assert_eq!(
+        error_with("# check=skipp=all\nFROM busybox\n", &options(&[])),
+        "failed to parse check options: invalid check option \"skipp\""
+    );
+    assert_eq!(
+        error_with("# check=error=maybe\nFROM busybox\n", &options(&[])),
+        "failed to parse check options: failed to parse check option \"error=maybe\": strconv.ParseBool: parsing \"maybe\": invalid syntax"
+    );
+    assert_eq!(
+        error_with(
+            "FROM busybox\n",
+            &options(&[("BUILDKIT_DOCKERFILE_CHECK", "nope")])
+        ),
+        "failed to parse build-arg:BUILDKIT_DOCKERFILE_CHECK: invalid check option \"nope\""
+    );
+}
+
+#[test]
+fn source_date_epoch_is_read_as_the_frontend_reads_it() {
+    let epoch = |dockerfile: &str, args: &[(&str, &str)]| {
+        build_with(dockerfile, &options(args)).map(|(p, _)| p.epoch)
+    };
+    assert_eq!(epoch("FROM busybox\n", &[]).unwrap(), None);
+    assert_eq!(
+        epoch("FROM busybox\n", &[("SOURCE_DATE_EPOCH", "0")]).unwrap(),
+        Some(0)
+    );
+    // A meta ARG with a value, which a build argument overrides.
+    assert_eq!(
+        epoch("ARG SOURCE_DATE_EPOCH=1700000000\nFROM busybox\n", &[]).unwrap(),
+        Some(1_700_000_000)
+    );
+    assert_eq!(
+        epoch(
+            "ARG SOURCE_DATE_EPOCH=1700000000\nFROM busybox\n",
+            &[("SOURCE_DATE_EPOCH", "5")]
+        )
+        .unwrap(),
+        Some(5)
+    );
+    assert_eq!(
+        error_with("FROM busybox\n", &options(&[("SOURCE_DATE_EPOCH", "abc")])),
+        "invalid SOURCE_DATE_EPOCH: abc"
+    );
 }
 
 #[test]

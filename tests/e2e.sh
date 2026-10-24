@@ -4695,6 +4695,78 @@ for p in (18140, 18142, 18145, 999):
   systemctl list-units --all --no-legend 'nspawn-proxy-e2e-v6*' | grep_q . && fail "a port proxy unit of the step is left: $(systemctl list-units --all --no-legend 'nspawn-proxy-e2e-v6*')"
 fi
 
+step "review: builds: ADD of an archive unpacked into its destination, the context's and a URL's times, a --parents source left out whole, a step's process killed"
+d=/tmp/e2e-rv/unpack && rm -rf $d && mkdir -p $d/ctx/d $d/http
+python3 - "$d/ctx/a.tar" <<'PY'
+import io, sys, tarfile
+t = tarfile.open(sys.argv[1], "w", format=tarfile.PAX_FORMAT)
+def add(name, kind=tarfile.REGTYPE, mode=0o644, mtime=7, data=b"", uid=0, gid=0, dev=(0, 0)):
+    i = tarfile.TarInfo(name)
+    i.type, i.mode, i.mtime, i.uid, i.gid = kind, mode, mtime, uid, gid
+    i.devmajor, i.devminor = dev
+    i.size = len(data) if kind == tarfile.REGTYPE else 0
+    t.addfile(i, io.BytesIO(data) if kind == tarfile.REGTYPE else None)
+add("mylib/libfoo.so", data=b"elf")
+add("repl/", tarfile.DIRTYPE, 0o750)
+add("tmp/inside", data=b"i")
+add("implied/deep/f", data=b"f")
+add("t/", tarfile.DIRTYPE, 0o755, mtime=1000)
+add("t/zero", mtime=0, data=b"0")
+add("t/fifo", tarfile.FIFOTYPE, 0o640)
+add("t/null", tarfile.CHRTYPE, 0o666, dev=(1, 3))
+add("t/owned", mode=0o4755, uid=1234, gid=4321, data=b"o")
+t.close()
+PY
+echo zero > $d/ctx/d/zero && touch -d @0 $d/ctx/d/zero && touch -d @1000 $d/ctx/d
+lm=$((1000000000 + nonce % 100000))
+echo payload > $d/http/file.txt && touch -d @$lm $d/http/file.txt
+python3 -m http.server 18201 --bind 127.0.0.1 --directory $d/http >/dev/null 2>&1 &
+http_pid=$!
+sleep 1
+cat > $d/ctx/Dockerfile <<DOCKERFILE
+FROM $rv
+RUN mkdir -p /usr/mylib /usr/repl && ln -s usr/mylib /mylib && ln -s usr/repl /repl
+ADD a.tar /
+COPY d /d
+ADD http://127.0.0.1:18201/file.txt /f.txt
+RUN echo "lib=\$(cat /usr/mylib/libfoo.so) \$([ -L /mylib ] && echo link) repl=\$([ -L /repl ] && echo link || echo dir)" > /out; \
+    echo "tmp=\$(stat -c %a /tmp) implied=\$(stat -c %a /implied)/\$(stat -c %a /implied/deep)" >> /out; \
+    echo "t=\$(stat -c %Y /t) zero=\$(stat -c %Y /t/zero) fifo=\$(stat -c %F:%a /t/fifo) null=\$(stat -c %t:%T /t/null)" >> /out; \
+    echo "owned=\$(stat -c %u:%g:%a /t/owned)" >> /out; \
+    echo "ctx=\$(stat -c %Y /d)/\$(stat -c %Y /d/zero) url=\$(stat -c %Y:%a /f.txt)" >> /out
+DOCKERFILE
+$NSPAWN build -t e2e-rv5-unpack:1 $d/ctx > $d/build.txt 2>&1 || fail "the build of archives, context times and a URL: $(tail -20 $d/build.txt)"
+kill $http_pid 2>/dev/null
+out=$($NSPAWN run --rm e2e-rv5-unpack:1 -- cat /out 2>/dev/null | tr -d '\r')
+want="lib=elf link repl=dir
+tmp=1777 implied=755/755
+t=1000 zero=0 fifo=fifo:640 null=1:3
+owned=1234:4321:4755
+ctx=1000/0 url=$lm:600"
+[ "$out" = "$want" ] || fail "ADD of an archive, the context's times or a URL's Last-Modified: got
+$out
+want
+$want"
+# A context tar on standard input keeps its owners and its FIFOs.
+mkdir -p $d/tar && echo f > $d/tar/f && mkfifo $d/tar/fifo
+printf 'FROM %s\nCOPY f fifo /in/\nRUN stat -c %%u:%%g:%%F /in/f /in/fifo > /out\n' "$rv" > $d/tar/Dockerfile
+(cd $d/tar && tar --owner=1234 --group=4321 -cf - Dockerfile f fifo) | $NSPAWN build -t e2e-rv5-tar:1 - > $d/tar.txt 2>&1 || fail "a context tar on standard input: $(tail -10 $d/tar.txt)"
+out=$($NSPAWN run --rm e2e-rv5-tar:1 -- cat /out 2>/dev/null | tr -d '\r' | tr '\n' ' ')
+[ "$out" = "1234:4321:regular file 1234:4321:fifo " ] || fail "a context tar on standard input lost owners or a FIFO: $out"
+# COPY --parents of a literal source its --exclude leaves out whole: not found.
+mkdir -p $d/par/a && echo b > $d/par/a/b.txt
+printf 'FROM %s\nCOPY --parents --exclude=a/b.txt a/b.txt /dst/\n' "$rv" > $d/par/Dockerfile
+out=$($NSPAWN build -t e2e-rv5-par:1 $d/par 2>&1) && fail "COPY --parents of a source excluded whole was taken"
+echo "$out" | grep_q '"/a/b.txt": not found' || fail "COPY --parents of an excluded source was not said: $(echo "$out" | tail -3)"
+# A step whose process a signal ends exits as 128 and the signal.
+printf 'FROM %s\nRUN sleep 41.%s\n' "$rv" "$nonce" > $d/par/Dockerfile.kill
+( for i in $(seq 1 120); do p=$(pgrep -f "^(/bin/sh -c )?sleep 41.$nonce\$" | head -1); [ -n "$p" ] && { sleep 1; kill -9 $p; break; }; sleep 0.5; done ) &
+killer=$!
+out=$($NSPAWN build --no-cache -f $d/par/Dockerfile.kill -t e2e-rv5-kill:1 $d/par 2>&1) && fail "a step killed by SIGKILL succeeded"
+wait $killer
+echo "$out" | grep_q "did not complete successfully: exit code: 137" || fail "a step killed by SIGKILL: $(echo "$out" | tail -3)"
+for i in e2e-rv5-unpack-1 e2e-rv5-tar-1; do $NSPAWN images rm $i >/dev/null 2>&1; done
+
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"
 

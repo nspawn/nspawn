@@ -117,6 +117,19 @@ github.com/containerd/continuity v0.5.0
     fs/path.go (RootPath), fs/path_test.go (TestRootPath)
     Ported in: copy.rs (root_path)
 
+github.com/moby/go-archive v0.3.3
+    License: LICENSE.go-archive (Apache-2.0)
+    archive.go (Unpack, createTarFile, createImpliedDirectories, resolveArchivePath,
+    resolveHardlinkTarget), archive_unix.go (handleTarTypeBlockCharFifo, handleLChmod),
+    time.go (boundTime, latestTime), compression/compression_detect.go (Detect), and
+    chrootarchive (Untar with the destination as the root)
+    buildkit v0.33.1: solver/llbsolver/file/unpack.go (unpack, isArchivePath),
+    cache/contenthash/checksum.go (includedPaths: the required paths of --parents),
+    source/http/source.go (the time of a fetched file)
+    Go 1.26.9: archive/tar (parseNumeric, parsePAXTime, mergePAX, the legacy regular
+    type with a trailing slash), net/http ParseTime and the parts of time.Parse it uses
+    Ported in: untar.rs, exec.rs (unpack_archive, http_time), copy.rs (required_found)
+
 github.com/tonistiigi/dchapes-mode v0.0.0-20250318174251-73d941a28323
     License: LICENSE.dchapes-mode (BSD-2-Clause), and NOTICE.dchapes-mode: the
     copyright notice of BSD's setmode.c, from the header of its mode.go

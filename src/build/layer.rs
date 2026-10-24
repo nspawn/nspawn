@@ -1415,7 +1415,7 @@ fn valid_pax_record(k: &[u8], v: &[u8]) -> bool {
 }
 
 /// "%d %s=%s\n", the length counting its own digits.
-fn format_pax_record(k: &[u8], v: &[u8]) -> Vec<u8> {
+pub(crate) fn format_pax_record(k: &[u8], v: &[u8]) -> Vec<u8> {
     let record = |size: usize| [format!("{size} ").as_bytes(), k, b"=", v, b"\n"].concat();
     let mut size = k.len() + v.len() + 3;
     size += size.to_string().len();

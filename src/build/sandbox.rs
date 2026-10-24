@@ -81,6 +81,8 @@ pub fn argv(step: &Step) -> Vec<String> {
         "--register=no".to_string(),
         "--settings=no".to_string(),
         format!("--machine={}", step.machine),
+        // The executor's hostname, which the step's /etc/hosts gives 127.0.0.1.
+        "--hostname=buildkitsandbox".to_string(),
         format!("--directory={}", step.root.display()),
         "--private-users=no".to_string(),
         "--console=pipe".to_string(),
@@ -90,6 +92,9 @@ pub fn argv(step: &Step) -> Vec<String> {
         format!("--chdir={}", step.workdir),
     ];
     out.extend(confinement());
+    // An app machine may reboot itself, a step not: reboot(2) fails, as under
+    // containerd's default capabilities, instead of starting it again or ending it.
+    out.push("--drop-capability=CAP_SYS_BOOT".to_string());
     match &step.network {
         Network::Namespace(name) => out.push(format!(
             "--network-namespace-path={}",
@@ -101,6 +106,9 @@ pub fn argv(step: &Step) -> Vec<String> {
     if let Some(user) = &step.user {
         out.push(format!("--user={user}"));
     }
+    // systemd-nspawn's notify socket is no step's business, as it is no app's: empty,
+    // which its clients take for none, unless the step's own variables say otherwise.
+    out.push("--setenv=NOTIFY_SOCKET=".to_string());
     for var in &step.env {
         out.push(format!("--setenv={var}"));
     }
@@ -203,20 +211,56 @@ impl Stubs {
             .map(|s| s.to_string())
             .chain(extra.iter().cloned())
         {
-            let Ok(host) = crate::backend::resolve_in_root(root, &path) else {
+            // The path and, where its directories are missing too, each of them from the
+            // first one missing: systemd-nspawn makes them all for the mount, and the
+            // executor takes them all away after.
+            let mut chain = Vec::new();
+            let mut wanted = Path::new(path.trim_start_matches('/'));
+            let host = loop {
+                if let Ok(host) = crate::backend::resolve_in_root(root, &wanted.to_string_lossy()) {
+                    break Some(host);
+                }
+                chain.push(wanted.to_path_buf());
+                match wanted.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => wanted = parent,
+                    _ => break None,
+                }
+            };
+            let Some(mut host) = host else {
                 continue;
             };
-            if host.symlink_metadata().is_ok() {
+            let mut first = true;
+            if !chain.is_empty() {
+                // The deepest prefix that resolves is there; what comes below it is made.
+                if host.symlink_metadata().is_err() {
+                    chain.push(wanted.to_path_buf());
+                } else {
+                    first = false;
+                }
+            } else if host.symlink_metadata().is_ok() {
                 continue;
+            } else {
+                chain.push(wanted.to_path_buf());
             }
-            let times = host
-                .parent()
-                .and_then(|p| p.metadata().ok())
-                .map(|m| (m.atime(), m.atime_nsec(), m.mtime(), m.mtime_nsec()));
-            let inside = host
-                .strip_prefix(root)
-                .map_or_else(|_| path.clone(), |p| p.to_string_lossy().into_owned());
-            missing.push((inside, host, times));
+            chain.reverse();
+            let base = if first {
+                host.parent().map(Path::to_path_buf).unwrap_or_default()
+            } else {
+                host.clone()
+            };
+            let top = if first { wanted.parent() } else { Some(wanted) };
+            for (i, inside) in chain.iter().enumerate() {
+                let below = top.map_or(inside.as_path(), |t| {
+                    inside.strip_prefix(t).unwrap_or(inside)
+                });
+                host = base.join(below);
+                // The times of the parent that was there go back once all of it is gone.
+                let times = (i == 0)
+                    .then(|| host.parent().and_then(|p| p.metadata().ok()))
+                    .flatten()
+                    .map(|m| (m.atime(), m.atime_nsec(), m.mtime(), m.mtime_nsec()));
+                missing.push((format!("/{}", inside.display()), host.clone(), times));
+            }
         }
         let made = KEPT
             .iter()
@@ -284,6 +328,39 @@ impl Stubs {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn mount_points_and_the_directories_made_for_them_go_after_the_step() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("srv")).unwrap();
+        let srv_mtime = std::fs::metadata(root.path().join("srv")).unwrap().mtime();
+        let stubs = Stubs::before(
+            root.path(),
+            &["/cache/go/mod".to_string(), "/srv/x/y".to_string()],
+        );
+        // What systemd-nspawn makes for the mounts, and what the step writes itself.
+        std::fs::create_dir_all(root.path().join("cache/go/mod")).unwrap();
+        std::fs::create_dir_all(root.path().join("srv/x/y")).unwrap();
+        std::fs::create_dir_all(root.path().join("etc")).unwrap();
+        std::fs::write(root.path().join("etc/hosts"), "").unwrap();
+        std::fs::write(root.path().join("etc/kept"), "written by the step").unwrap();
+        stubs.clean();
+        assert!(
+            !root.path().join("cache").exists(),
+            "every directory made for the mount goes"
+        );
+        assert!(!root.path().join("srv/x").exists());
+        assert!(root.path().join("srv").is_dir());
+        assert_eq!(
+            std::fs::metadata(root.path().join("srv")).unwrap().mtime(),
+            srv_mtime
+        );
+        // A directory the step wrote in stays, the stub in it does not.
+        assert!(root.path().join("etc/kept").exists());
+        assert!(!root.path().join("etc/hosts").exists());
+    }
+
     use super::*;
 
     #[test]
@@ -333,6 +410,8 @@ mod tests {
             "--tmpfs=/dev/shm:size=1048576",
             "--rlimit=RLIMIT_NOFILE=64:128",
             "--system-call-filter=~kexec_load kexec_file_load",
+            "--hostname=buildkitsandbox",
+            "--drop-capability=CAP_SYS_BOOT",
         ] {
             assert!(argv.iter().any(|a| a == wanted), "{wanted} in {argv:?}");
         }

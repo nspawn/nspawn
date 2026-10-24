@@ -316,6 +316,26 @@ pub fn mount_point(path: &str) -> String {
     format!("/{}", parts.join("/"))
 }
 
+/// A regular file opened for reading, and nothing else: the path is pinned with O_PATH
+/// first, which runs no driver's open and waits on no FIFO, its type checked on that,
+/// and only then opened through /proc/self/fd. A device node an image or a machine has
+/// where a file is read would otherwise reach the host's device.
+pub fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let pinned = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_PATH | nix::libc::O_NOFOLLOW)
+        .open(path)?;
+    if !pinned.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    std::fs::File::open(format!("/proc/self/fd/{}", pinned.as_raw_fd()))
+}
+
 pub fn validate_volume_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.starts_with('.')
@@ -443,6 +463,30 @@ pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_a_regular_file_is_opened() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("passwd");
+        std::fs::write(&file, "root:x:0:0::/root:/bin/sh\n").unwrap();
+        let mut text = String::new();
+        open_regular(&file)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert!(text.starts_with("root:"));
+        // A FIFO is refused at once, a device node, a link and a directory as well.
+        let fifo = dir.path().join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        assert!(open_regular(&fifo).is_err());
+        assert!(open_regular(Path::new("/dev/null")).is_err());
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(open_regular(&link).is_err());
+        assert!(open_regular(dir.path()).is_err());
+    }
+
     use super::*;
 
     #[test]
