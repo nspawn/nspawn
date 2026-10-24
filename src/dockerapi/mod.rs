@@ -8,7 +8,7 @@
 pub mod events;
 pub mod filters;
 pub mod model;
-mod streams;
+pub(crate) mod streams;
 pub mod util;
 
 use std::collections::BTreeMap;

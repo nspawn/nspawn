@@ -430,7 +430,13 @@ fn json_value(
 /// encoding/json's floats: plain digits, an exponent below 1e-6 or from 1e21 up.
 fn json_float(x: f64, single: bool) -> String {
     let abs = x.abs();
-    let exponent = abs != 0.0 && (abs < 1e-6 || abs >= 1e21);
+    // floatEncoder: a float32 is compared as a float32.
+    let exponent = if single {
+        let abs = abs as f32;
+        abs != 0.0 && (abs < 1e-6 || abs >= 1e21)
+    } else {
+        abs != 0.0 && (abs < 1e-6 || abs >= 1e21)
+    };
     let digits: String = if single {
         format!("{:e}", x as f32)
     } else {
@@ -493,6 +499,15 @@ pub fn json_string(s: &str, html: bool, text: &mut String) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_float32_at_the_edge_is_written_as_go_writes_it() {
+        assert_eq!(json_float(f64::from(1e-6f32), true), "0.000001");
+        assert_eq!(json_float(f64::from(9e-7f32), true), "9e-7");
+        assert_eq!(json_float(f64::from(1.1e-6f32), true), "0.0000011");
+        assert_eq!(json_float(1e-7, false), "1e-7");
+    }
+
     use super::*;
 
     fn s(text: &str) -> Out {

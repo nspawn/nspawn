@@ -15,6 +15,10 @@ enum Kind {
     Str,
     Strings,
     Int,
+    /// opts.MemBytes: a size as units.RAMInBytes reads one.
+    Bytes,
+    /// opts.FilterOpt: NAME=VALUE, an empty one passed over.
+    Filters,
 }
 
 #[derive(Debug)]
@@ -46,11 +50,22 @@ fn flags_of(command: &Command, inherited: &[Flag]) -> Vec<Flag> {
         let parser = arg.get_value_parser().type_id();
         let tristate = !matches!(arg.get_action(), ArgAction::SetTrue)
             && parser == std::any::TypeId::of::<bool>();
+        let filters = arg
+            .get_value_names()
+            .is_some_and(|n| n.iter().any(|n| n == "FILTER"));
         let kind = match arg.get_action() {
             ArgAction::SetTrue => Kind::Bool,
             _ if tristate => Kind::Bool,
+            ArgAction::Append if filters => Kind::Filters,
             ArgAction::Append => Kind::Strings,
             _ if parser == std::any::TypeId::of::<i64>() => Kind::Int,
+            _ if arg
+                .get_value_names()
+                .is_some_and(|n| n.iter().any(|n| n == "MEMORY")) =>
+            {
+                Kind::Bytes
+            }
+
             _ => Kind::Str,
         };
         flags.push(Flag {
@@ -94,7 +109,9 @@ struct Values {
 impl Values {
     fn put(&mut self, flag: &Flag, value: String) {
         match self.set.iter_mut().find(|(n, _)| *n == flag.name) {
-            Some((_, values)) if flag.kind == Kind::Strings => values.push(value),
+            Some((_, values)) if matches!(flag.kind, Kind::Strings | Kind::Filters) => {
+                values.push(value)
+            }
             Some((_, values)) => *values = vec![value],
             None => self.set.push((flag.name.clone(), vec![value])),
         }
@@ -143,6 +160,17 @@ fn set(values: &mut Values, flag: &Flag, value: &str) -> Result<(), String> {
         Kind::Int => gostr::parse_int(value, 0, 64)
             .map(|n| n.to_string())
             .map_err(|e| gostr::num_error("ParseInt", value, e)),
+        Kind::Bytes => {
+            crate::build::dockerfile::compat::ram_in_bytes(value).map(|_| value.to_string())
+        }
+        Kind::Filters if value.is_empty() => return Ok(()),
+        Kind::Filters if !value.contains('=') => {
+            Err("bad format of filter (expected name=value)".to_string())
+        }
+        Kind::Filters => {
+            let (name, value) = value.split_once('=').unwrap_or_default();
+            Ok(format!("{}={}", name.trim().to_lowercase(), value.trim()))
+        }
         Kind::Str | Kind::Strings => Ok(value.to_string()),
     };
     match canonical {
@@ -166,7 +194,32 @@ fn set(values: &mut Values, flag: &Flag, value: &str) -> Result<(), String> {
 }
 
 /// pflag's parseArgs over a command's flags.
-fn parse_flags(flags: &[Flag], args: &[String], interspersed: bool) -> Result<Values, String> {
+/// The flag names a command's SetNormalizeFunc maps to its own, and the deprecation
+/// warning some of them give.
+fn normalize<'a>(command: &str, name: &'a str, notes: &mut Vec<String>) -> &'a str {
+    match (command, name) {
+        ("down", "volume") => {
+            notes.push("--volume is deprecated, please use --volumes".to_string());
+            "volumes"
+        }
+        ("up" | "create", "y") => {
+            notes.push("--y is deprecated, please use --yes instead".to_string());
+            "yes"
+        }
+        ("exec" | "run", "no-TTY") => "no-tty",
+        ("run", "volumes") => "volume",
+        ("run", "labels") => "label",
+        _ => name,
+    }
+}
+
+fn parse_flags(
+    flags: &[Flag],
+    args: &[String],
+    interspersed: bool,
+    command: &str,
+    notes: &mut Vec<String>,
+) -> Result<Values, String> {
     let mut values = Values::default();
     let mut rest = args;
     while let Some((s, tail)) = rest.split_first() {
@@ -193,6 +246,7 @@ fn parse_flags(flags: &[Flag], args: &[String], interspersed: bool) -> Result<Va
                 Some((n, v)) => (n, Some(v)),
                 None => (name, None),
             };
+            let name = normalize(command, name, notes);
             let Some(flag) = flags.iter().find(|f| f.name == name) else {
                 return Err(format!("unknown flag: --{name}"));
             };
@@ -389,7 +443,7 @@ fn version_again(compose: &Command, given: &[String]) -> Outcome {
         .find_subcommand("version")
         .expect("compose has a version command");
     let flags = flags_of(version, &[]);
-    match parse_flags(&flags, given, true) {
+    match parse_flags(&flags, given, true, "version", &mut Vec::new()) {
         Err(e) => Outcome::Fail(format!("Error: {e}\n{}\n{e}", version_usage(version))),
         Ok(values) if values.help() => Outcome::Help(vec!["version".to_string()]),
         Ok(values) => {
@@ -417,6 +471,8 @@ fn version_usage(version: &Command) -> String {
                 Kind::Str => " string",
                 Kind::Strings => " stringArray",
                 Kind::Int => " int",
+                Kind::Bytes => " bytes",
+                Kind::Filters => " filter",
             });
             let usage = if flag.name == "help" {
                 "help for version".to_string()
@@ -439,8 +495,9 @@ fn version_usage(version: &Command) -> String {
     usage
 }
 
-/// Reads the arguments after `nspawn compose`.
-pub fn parse(compose: &Command, given: &[String]) -> Outcome {
+/// Reads the arguments after `nspawn compose`, the warnings the flag names give into
+/// `notes`.
+pub fn parse_noting(compose: &Command, given: &[String], notes: &mut Vec<String>) -> Outcome {
     let args = match convert(given) {
         Ok(args) => args,
         Err(e) => return Outcome::Fail(e),
@@ -449,7 +506,7 @@ pub fn parse(compose: &Command, given: &[String]) -> Outcome {
     let inherited = persistent(compose);
     let Some((at, sub)) = traverse(compose, &root_flags, &args) else {
         // compose itself: its flags, then what is left are words that are not commands.
-        let values = match parse_flags(&root_flags, &args, false) {
+        let values = match parse_flags(&root_flags, &args, false, "", &mut Vec::new()) {
             Ok(v) => v,
             Err(e) => return Outcome::Fail(e),
         };
@@ -462,14 +519,20 @@ pub fn parse(compose: &Command, given: &[String]) -> Outcome {
             Some(word) => Outcome::Unknown(word.clone()),
         };
     };
-    let mut root = match parse_flags(&root_flags, &args[..at], false) {
+    let mut root = match parse_flags(&root_flags, &args[..at], false, "", notes) {
         Ok(v) => v,
         Err(e) => return Outcome::Fail(e),
     };
     let sub_flags = flags_of(sub, &inherited);
     // exec and run stop at their first argument: what follows is the command's.
     let interspersed = !matches!(sub.get_name(), "exec" | "run");
-    let values = match parse_flags(&sub_flags, &args[at + 1..], interspersed) {
+    let values = match parse_flags(
+        &sub_flags,
+        &args[at + 1..],
+        interspersed,
+        sub.get_name(),
+        notes,
+    ) {
         Ok(v) => v,
         Err(e) => return Outcome::Fail(e),
     };
@@ -517,7 +580,7 @@ mod tests {
 
     fn parse(line: &str) -> Outcome {
         let args: Vec<String> = line.split_whitespace().map(String::from).collect();
-        super::parse(&compose(), &args)
+        super::parse_noting(&compose(), &args, &mut Vec::new())
     }
 
     fn run(line: &str) -> Vec<String> {
@@ -532,6 +595,42 @@ mod tests {
             Outcome::Fail(e) => e,
             other => panic!("{line}: {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_flag_names_are_taken_and_some_say_so() {
+        let noting = |line: &str| {
+            let args: Vec<String> = line.split_whitespace().map(String::from).collect();
+            let mut notes = Vec::new();
+            let outcome = super::parse_noting(&compose(), &args, &mut notes);
+            (outcome, notes)
+        };
+        let (down, notes) = noting("down --volume");
+        assert!(
+            matches!(&down, Outcome::Run(l) if l.iter().any(|a| a == "--volumes")),
+            "{down:?}"
+        );
+        assert_eq!(notes, ["--volume is deprecated, please use --volumes"]);
+        let (up, notes) = noting("up --y -d");
+        assert!(
+            matches!(&up, Outcome::Run(l) if l.iter().any(|a| a == "--yes")),
+            "{up:?}"
+        );
+        assert_eq!(notes, ["--y is deprecated, please use --yes instead"]);
+        let (run, notes) = noting("run --no-TTY --labels a=b --volumes /x:/y web");
+        assert!(notes.is_empty());
+        let Outcome::Run(line) = run else {
+            panic!("{run:?}")
+        };
+        for want in ["--no-tty=true", "--label=a=b", "--volume=/x:/y"] {
+            assert!(line.iter().any(|a| a == want), "{want}: {line:?}");
+        }
+        assert_eq!(fail("ps --volume"), "unknown flag: --volume");
+        assert!(
+            fail("build -m bogus").contains("invalid size: 'bogus'"),
+            "{}",
+            fail("build -m bogus")
+        );
     }
 
     #[test]

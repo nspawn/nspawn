@@ -385,7 +385,10 @@ pub static ATTRIBUTES: &[Attribute] = &[
         "driver options are docker's; nspawn attaches a machine its own way",
     )
     .and_below(),
-    full("services.*.networks.*.gw_priority"),
+    partly(
+        "services.*.networks.*.gw_priority",
+        "the machine routes through the first network that is not internal, in the order priority gives",
+    ),
     ignored(
         "services.*.networks.*.interface_name",
         "nspawn names the interfaces of a machine host0, host1 and on",

@@ -74,12 +74,12 @@ fn secrets(e: &Engine<'_>, build: &Map) -> Result<BTreeMap<String, Vec<u8>>> {
             }
             _ if def.contains_key("content") => s(def, "content").as_bytes().to_vec(),
             ("", "") => bail!("secret {source}: build secrets come from a file or the environment"),
+            // An unset variable is an empty secret, as compose's bake path gives it.
             (_, var) => project
                 .environment
                 .get(var)
-                .with_context(|| format!("secret {source}: {var} is not set"))?
-                .as_bytes()
-                .to_vec(),
+                .map(|v| v.as_bytes().to_vec())
+                .unwrap_or_default(),
         };
         out.insert(target.to_string(), bytes);
     }

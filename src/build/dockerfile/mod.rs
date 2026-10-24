@@ -13,7 +13,7 @@
 #![allow(dead_code)]
 
 mod bflag;
-mod compat;
+pub(crate) mod compat;
 pub mod instructions;
 mod json;
 pub mod parser;

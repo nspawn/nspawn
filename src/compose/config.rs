@@ -192,6 +192,22 @@ fn load_project(
     warn: Warn,
 ) -> Result<Project, String> {
     let mut prepared = prepared(flags, config, host, Load::Project { resolve_env }, warn)?;
+    // The attributes nspawn ignores are said by the commands that make or show the
+    // project, as compose says its unsupported ones (warnUnsupportedAttributes); the
+    // others find machines by it and leave that out.
+    use super::cli::ComposeCommand as C;
+    prepared.options.quiet_ignored = !args.command.as_ref().is_none_or(|c| {
+        matches!(
+            c,
+            C::Config(_)
+                | C::Up(_)
+                | C::Create(_)
+                | C::Run(_)
+                | C::Scale(_)
+                | C::Pull(_)
+                | C::Build(_)
+        )
+    });
     let model = loader::load_model(&mut prepared.details, &mut prepared.options, warn)?;
     let mut project = project::from_model(model, &prepared.options, &prepared.details.env, warn)?;
     // What nspawn would not run, said and shown all the same by config; the commands
@@ -225,6 +241,33 @@ fn load_project(
         project.without_unnecessary_resources();
     }
     Ok(project)
+}
+
+/// jobTargetErr: a selection that failed on a name the project declares as a job says
+/// so, as a job is triggered by run alone; None for any other failure.
+pub fn job_target_err(
+    args: &ComposeArgs,
+    flags: &Flags,
+    host: &Host,
+    names: &[String],
+    err: &str,
+) -> Option<String> {
+    if names.is_empty() || !err.contains("no such service: ") {
+        return None;
+    }
+    let project = project_for(args, flags, host, &[], &mut |_| {}).ok()?;
+    names
+        .iter()
+        .find(|n| {
+            (project.jobs.contains_key(*n) || project.disabled_jobs.contains_key(*n))
+                && err.contains(&format!("no such service: {n}"))
+        })
+        .map(|n| {
+            format!(
+                "job {} can only be triggered with \"docker compose run\"",
+                super::gostr::quote(n)
+            )
+        })
 }
 
 /// The project of a command that drives machines, as WithServices loads it: the services named and their dependencies, the environment of each
@@ -822,6 +865,13 @@ pub fn service_hash(service: &Value) -> Result<String, String> {
     rest.sort_by(|a, b| a.0.cmp(&b.0));
     pinned.extend(rest);
     let text = emit::json_compact(&Out::Struct(pinned))?;
+    Ok(hex::encode(Sha256::digest(text.as_bytes())))
+}
+
+/// compose's NetworkHash: the network as compact JSON, then SHA-256.
+pub fn network_hash(network: &Value) -> Result<String, String> {
+    let out = model::encode(Some(network), &Ty::Struct(&types::NETWORK), Format::Json);
+    let text = emit::json_compact(&out)?;
     Ok(hex::encode(Sha256::digest(text.as_bytes())))
 }
 

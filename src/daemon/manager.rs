@@ -453,6 +453,7 @@ impl Manager {
             force: options.bool("force", false)?,
             entrypoint: options.string("entrypoint")?,
             env: options.strings("env")?,
+            unset_env: options.strings("unset_env")?,
             volume: options.strings("volume")?,
             label: options.strings("label")?,
             restart: options
@@ -1797,8 +1798,9 @@ impl Manager {
 
     /// Like `logs`: journalctl's output under "stdout" and "stderr", and a process
     /// object for its exit status. Options: follow (b), lines (t), since (s), until (s),
-    /// timestamps (b), all (b), inside (b). journalctl is stopped once nobody reads its
-    /// output any more, so a --follow ends with its client.
+    /// timestamps (b), all (b), inside (b), json (b: journalctl's JSON entries, one a
+    /// line, for a client that writes each line's time itself). journalctl is stopped
+    /// once nobody reads its output any more, so a --follow ends with its client.
     async fn logs(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -1821,7 +1823,7 @@ impl Manager {
             all: options.bool("all", false)?,
             inside: options.bool("inside", false)?,
             namespace: None,
-            json: false,
+            json: options.bool("json", false)?,
         };
         options.finish()?;
         crate::reference::validate_entry_name(&request.machine)?;

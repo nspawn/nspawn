@@ -171,6 +171,9 @@ cleanup_machines() {
     $NSPAWN network rm "$n" >/dev/null 2>&1 || true
   done
   $NSPAWN volume rm e2e-rvr_data >/dev/null 2>&1 || true
+  for v in $($NSPAWN volume ls 2>/dev/null | awk '$1 ~ /^e2e-rv5c-/ {print $1}'); do
+    $NSPAWN volume rm "$v" >/dev/null 2>&1 || true
+  done
   for v in e2e-rv3-deep e2e-rv3-vol e2e-rv3-dupvol e2e-rv3-sv e2e-rv3j_data; do
     $NSPAWN volume rm "$v" >/dev/null 2>&1 || true
   done
@@ -4766,6 +4769,58 @@ out=$($NSPAWN build --no-cache -f $d/par/Dockerfile.kill -t e2e-rv5-kill:1 $d/pa
 wait $killer
 echo "$out" | grep_q "did not complete successfully: exit code: 137" || fail "a step killed by SIGKILL: $(echo "$out" | tail -3)"
 for i in e2e-rv5-unpack-1 e2e-rv5-tar-1; do $NSPAWN images rm $i >/dev/null 2>&1; done
+
+step "review: compose: start waits for what a service depends on, an image's VOLUME gets an anonymous volume, a changed network is made anew, down SERVICE"
+d=/tmp/e2e-rv/c5 && rm -rf $d && mkdir -p $d/p $d/vol $d/empty
+printf 'FROM %s\nVOLUME /data\n' "$rv" > $d/vol/Dockerfile
+cat > $d/p/compose.yaml <<COMPOSE
+services:
+  db:
+    image: $rv
+    command: ["sh", "-c", "echo db-up; sleep 3; touch /tmp/ready; exec sleep 600"]
+    healthcheck: {test: ["CMD", "test", "-f", "/tmp/ready"], interval: 1s, retries: 60}
+  app:
+    image: $rv
+    command: ["sleep", "600"]
+    depends_on: {db: {condition: service_healthy}}
+  vol:
+    build: {context: ../vol}
+    command: ["sh", "-c", "[ -f /data/x ] || cat /proc/sys/kernel/random/uuid > /data/x; exec sleep 600"]
+    networks: [n]
+networks:
+  n:
+    labels: {gen: "1"}
+COMPOSE
+# -f: with -p alone, down and the other commands that act on what runs take the project
+# from the labels, compose file or not.
+c5() { (cd $d/p && $NSPAWN compose -f compose.yaml -p e2e-rv5c "$@" 2>&1); }
+out=$(c5 up -d) || fail "compose up of e2e-rv5c: $out"
+out=$(c5 stop) || fail "compose stop of e2e-rv5c: $out"
+out=$(c5 start app) || fail "compose start app: $out"
+echo "$out" | grep_q "e2e-rv5c-db-1 *Healthy" || fail "compose start app did not wait for db to be healthy: $out"
+$NSPAWN ps --format '{{.Names}} {{.Status}}' | grep_q '^e2e-rv5c-db-1 Up' || fail "compose start app did not start db"
+out=$(c5 up -d vol)
+[ "$($NSPAWN volume ls | awk '$1 ~ /^e2e-rv5c-vol-1_anon_/' | wc -l)" = 1 ] || fail "no anonymous volume for the image's VOLUME: $($NSPAWN volume ls)"
+x1=$($NSPAWN exec e2e-rv5c-vol-1 -- cat /data/x </dev/null | tr -d '\r')
+out=$(c5 up -d --force-recreate vol) || fail "up --force-recreate vol: $out"
+[ "$($NSPAWN exec e2e-rv5c-vol-1 -- cat /data/x </dev/null | tr -d '\r')" = "$x1" ] || fail "a recreated machine lost its anonymous volume"
+out=$(c5 up -d -V vol) || fail "up -V vol: $out"
+x3=$($NSPAWN exec e2e-rv5c-vol-1 -- cat /data/x </dev/null | tr -d '\r')
+[ -n "$x3" ] && [ "$x3" != "$x1" ] || fail "up -V did not renew the anonymous volume: $x1 $x3"
+sed -i 's/gen: "1"/gen: "2"/' $d/p/compose.yaml
+out=$(c5 up -d vol) || fail "up after the network's definition changed: $out"
+echo "$out" | grep_q "Network e2e-rv5c_n *Removed" || fail "the changed network was not made anew: $out"
+$NSPAWN network inspect e2e-rv5c_n | python3 -c 'import json,sys; assert json.load(sys.stdin)[0]["labels"]["gen"] == "2"' || fail "the network made anew lacks its new label"
+out=$(c5 logs -t --no-log-prefix db)
+echo "$out" | head -1 | grep_q -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}\.[0-9]+Z db-up$' || fail "compose logs -t: $out"
+out=$(c5 down db) || fail "compose down db: $out"
+[ "$($NSPAWN ps -a --format '{{.Names}}' | grep -cE '^e2e-rv5c-(app|vol)-1$')" = 2 ] || fail "down db with the files took more than db: $out; left: $($NSPAWN ps -a --format '{{.Names}} {{.Status}}' | grep e2e-rv5c | tr '\n' ';')"
+c5 up -d >/dev/null
+out=$(cd $d/empty && $NSPAWN compose -p e2e-rv5c down db 2>&1) || fail "compose down db without the files: $out"
+[ "$($NSPAWN ps -a --format '{{.Names}}' | grep -E '^e2e-rv5c-.*-[0-9]+$' | tr '\n' ' ')" = "e2e-rv5c-vol-1 " ] || fail "down db without the files left app: $($NSPAWN ps -a --format '{{.Names}}' | grep e2e-rv5c)"
+out=$(c5 down -v) || fail "compose down -v: $out"
+[ "$($NSPAWN volume ls | awk '$1 ~ /^e2e-rv5c-/' | wc -l)" = 0 ] || fail "down -v left the anonymous volume"
+$NSPAWN images rm e2e-rv5c-vol >/dev/null 2>&1
 
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"

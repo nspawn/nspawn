@@ -106,14 +106,16 @@ fn status(m: &Machine, now: u64) -> String {
     match state(m) {
         "running" | "paused" => {
             let mut text = format!("Up {}", human_duration(now.saturating_sub(m.started)));
+            // State.String: a paused container says so, and not its health.
+            if m.state == "paused" {
+                text.push_str(" (Paused)");
+                return text;
+            }
             match m.health.as_str() {
                 "healthy" => text.push_str(" (healthy)"),
                 "unhealthy" => text.push_str(" (unhealthy)"),
                 "starting" => text.push_str(" (health: starting)"),
                 _ => {}
-            }
-            if m.state == "paused" {
-                text.push_str(" (Paused)");
             }
             text
         }
@@ -167,13 +169,142 @@ fn image_of(e: &Engine<'_>, m: &Machine) -> String {
 }
 
 fn json_line(fields: &[(&str, serde_json::Value)]) -> String {
-    let mut sorted: Vec<&(&str, serde_json::Value)> = fields.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(b.0));
-    let body: Vec<String> = sorted
+    json_line_with(fields, &[])
+}
+
+/// json_line, with fields whose JSON is written already (a list of structs, whose
+/// fields go in their order), in place of those of the same name.
+fn json_line_with(fields: &[(&str, serde_json::Value)], raw: &[(&str, String)]) -> String {
+    let mut all: Vec<(&str, String)> = fields
         .iter()
-        .map(|(k, v)| format!("{}:{}", serde_json::Value::from(*k), v))
+        .filter(|(k, _)| !raw.iter().any(|(r, _)| r == k))
+        .map(|(k, v)| (*k, v.to_string()))
+        .collect();
+    all.extend(raw.iter().map(|(k, v)| (*k, v.clone())));
+    all.sort_by(|a, b| a.0.cmp(b.0));
+    let body: Vec<String> = all
+        .iter()
+        .map(|(k, v)| format!("{}:{v}", serde_json::Value::from(*k)))
         .collect();
     format!("{{{}}}", body.join(","))
+}
+
+/// A published port as the record has it: [IP:]HOST->CONTAINER/PROTO.
+struct Binding {
+    ip: Option<std::net::IpAddr>,
+    public: u16,
+    private: u16,
+    protocol: String,
+}
+
+fn binding(text: &str) -> Option<Binding> {
+    let (host, rest) = text.split_once("->")?;
+    let (private, protocol) = rest.split_once('/')?;
+    let (ip, public) = match host.rsplit_once(':') {
+        Some((ip, p)) => (
+            ip.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse()
+                .ok(),
+            p,
+        ),
+        None => (None, host),
+    };
+    Some(Binding {
+        ip,
+        public: public.parse().ok()?,
+        private: private.parse().ok()?,
+        protocol: protocol.to_string(),
+    })
+}
+
+/// netip.Addr.Compare: IPv4 before IPv6, then by the bytes.
+fn ip_order(ip: &Option<std::net::IpAddr>) -> (u8, Vec<u8>) {
+    match ip {
+        None => (0, Vec::new()),
+        Some(std::net::IpAddr::V4(a)) => (1, a.octets().to_vec()),
+        Some(std::net::IpAddr::V6(a)) => (2, a.octets().to_vec()),
+    }
+}
+
+/// net.JoinHostPort: an IPv6 address in brackets.
+fn join_host_port(ip: &std::net::IpAddr, port: &str) -> String {
+    match ip {
+        std::net::IpAddr::V6(a) => format!("[{a}]:{port}"),
+        std::net::IpAddr::V4(a) => format!("{a}:{port}"),
+    }
+}
+
+/// DisplayablePorts: the ports sorted, those published on the same number grouped into
+/// ranges by address and protocol, then the others as HOST->CONTAINER.
+fn displayable_ports(bindings: &[String]) -> String {
+    let mut ports: Vec<Binding> = bindings.iter().filter_map(|b| binding(b)).collect();
+    ports.sort_by(|a, b| {
+        (a.private, ip_order(&a.ip), a.public, &a.protocol).cmp(&(
+            b.private,
+            ip_order(&b.ip),
+            b.public,
+            &b.protocol,
+        ))
+    });
+    let group = |ip: Option<&std::net::IpAddr>, protocol: &str, first: u16, last: u16| {
+        let mut range = first.to_string();
+        if first != last {
+            range = format!("{range}-{last}");
+        }
+        match ip {
+            Some(ip) => format!("{}->{range}/{protocol}", join_host_port(ip, &range)),
+            None => format!("{range}/{protocol}"),
+        }
+    };
+    let mut groups: Vec<(Option<std::net::IpAddr>, String, u16, u16)> = Vec::new();
+    let mut result = Vec::new();
+    let mut mappings = Vec::new();
+    for p in &ports {
+        if let Some(ip) = &p.ip {
+            if p.public != p.private {
+                mappings.push(format!(
+                    "{}->{}/{}",
+                    join_host_port(ip, &p.public.to_string()),
+                    p.private,
+                    p.protocol
+                ));
+                continue;
+            }
+        }
+        match groups
+            .iter_mut()
+            .find(|(ip, protocol, _, _)| *ip == p.ip && *protocol == p.protocol)
+        {
+            None => groups.push((p.ip, p.protocol.clone(), p.private, p.private)),
+            Some(g) if p.private == g.3.wrapping_add(1) => g.3 = p.private,
+            Some(g) => {
+                result.push(group(g.0.as_ref(), &g.1, g.2, g.3));
+                g.2 = p.private;
+                g.3 = p.private;
+            }
+        }
+    }
+    for g in &groups {
+        result.push(group(g.0.as_ref(), &g.1, g.2, g.3));
+    }
+    result.extend(mappings);
+    result.join(", ")
+}
+
+/// ps's parseFilter: --filter status=VALUE, the one filter there is.
+pub fn ps_filter(filter: Option<&str>) -> Result<Option<String>> {
+    let Some(filter) = filter.filter(|f| !f.is_empty()) else {
+        return Ok(None);
+    };
+    let Some((key, value)) = filter.split_once('=') else {
+        bail!("arguments to --filter should be in form KEY=VAL");
+    };
+    match key {
+        "status" => Ok(Some(value.to_string())),
+        "source" => bail!("not implemented"),
+        other => bail!("unknown filter {other}"),
+    }
 }
 
 pub async fn ps(e: &mut Engine<'_>, a: &PsArgs, out: &mut dyn Write) -> Result<()> {
@@ -186,13 +317,7 @@ pub async fn ps(e: &mut Engine<'_>, a: &PsArgs, out: &mut dyn Write) -> Result<(
             .collect()
     });
     let mut filters: Vec<String> = a.status.clone();
-    if let Some(filter) = &a.filter {
-        match filter.split_once('=') {
-            Some(("status", value)) => filters.push(value.to_string()),
-            Some((key, _)) => bail!("invalid filter {key:?}"),
-            None => bail!("invalid filter {filter:?}"),
-        }
-    }
+    filters.extend(ps_filter(a.filter.as_deref())?);
     let machines: Vec<Machine> = e
         .machines()
         .await?
@@ -217,6 +342,12 @@ pub async fn ps(e: &mut Engine<'_>, a: &PsArgs, out: &mut dyn Write) -> Result<(
             }
         }
     }
+    if a.quiet {
+        for m in &machines {
+            writeln!(out, "{}", m.name)?;
+        }
+        return Ok(());
+    }
     if a.services {
         let mut seen = Vec::new();
         for m in &machines {
@@ -224,15 +355,8 @@ pub async fn ps(e: &mut Engine<'_>, a: &PsArgs, out: &mut dyn Write) -> Result<(
                 seen.push(m.service.clone());
             }
         }
-        for s in seen {
-            writeln!(out, "{s}")?;
-        }
-        return Ok(());
-    }
-    if a.quiet {
-        for m in &machines {
-            writeln!(out, "{}", m.name)?;
-        }
+        // Fprintln of the services joined: a line even for none.
+        writeln!(out, "{}", seen.join("\n"))?;
         return Ok(());
     }
     let format = a.format.clone().unwrap_or_else(|| "table".to_string());
@@ -255,7 +379,7 @@ pub async fn ps(e: &mut Engine<'_>, a: &PsArgs, out: &mut dyn Write) -> Result<(
                 ("State", state(m).to_string()),
                 ("Health", m.health.clone()),
                 ("ExitCode", m.exit_code.unwrap_or(0).to_string()),
-                ("Ports", ports(m).join(", ")),
+                ("Ports", displayable_ports(&ports(m))),
                 ("Networks", m.strings("networks").join(",")),
             ])
         })
@@ -279,7 +403,12 @@ pub async fn ps(e: &mut Engine<'_>, a: &PsArgs, out: &mut dyn Write) -> Result<(
         }
         "json" => {
             for (m, r) in machines.iter().zip(&rows) {
-                writeln!(out, "{}", json_line(&ps_fields(m, r)))?;
+                let raw = [("Publishers", publishers_json(m))];
+                writeln!(
+                    out,
+                    "{}",
+                    json_line_with(&ps_fields(m, r, !a.no_trunc), &raw)
+                )?;
             }
         }
         other => {
@@ -287,10 +416,11 @@ pub async fn ps(e: &mut Engine<'_>, a: &PsArgs, out: &mut dyn Write) -> Result<(
                 .iter()
                 .zip(&rows)
                 .map(|(m, r)| {
-                    let mut row: serde_json::Map<String, serde_json::Value> = ps_fields(m, r)
-                        .into_iter()
-                        .map(|(k, v)| (k.to_string(), v))
-                        .collect();
+                    let mut row: serde_json::Map<String, serde_json::Value> =
+                        ps_fields(m, r, !a.no_trunc)
+                            .into_iter()
+                            .map(|(k, v)| (k.to_string(), v))
+                            .collect();
                     // What the rows' Label method reads.
                     row.insert("LabelsMap".into(), serde_json::json!(m.labels));
                     serde_json::Value::Object(row)
@@ -314,10 +444,55 @@ pub async fn ps(e: &mut Engine<'_>, a: &PsArgs, out: &mut dyn Write) -> Result<(
 const PS_TABLE: &str =
     "table {{.Name}}\t{{.Image}}\t{{.Command}}\t{{.Service}}\t{{.RunningFor}}\t{{.Status}}\t{{.Ports}}";
 
-/// A machine as ps --format sees it, the fields in docker compose's order.
-fn ps_fields(m: &Machine, r: &BTreeMap<&str, String>) -> Vec<(&'static str, serde_json::Value)> {
+/// The Publishers of a machine sorted by the port in the machine, each with its fields in
+/// PortPublisher's order.
+fn publishers_json(m: &Machine) -> String {
+    let mut ports: Vec<Binding> = ports(m).iter().filter_map(|b| binding(b)).collect();
+    ports.sort_by_key(|p| p.private);
+    let items: Vec<String> = ports
+        .iter()
+        .map(|p| {
+            let url =
+                p.ip.map_or_else(|| "0.0.0.0".to_string(), |ip| ip.to_string());
+            format!(
+                "{{\"URL\":{},\"TargetPort\":{},\"PublishedPort\":{},\"Protocol\":{}}}",
+                serde_json::Value::from(url),
+                p.private,
+                p.public,
+                serde_json::Value::from(p.protocol.clone())
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// A machine as ps --format sees it, the fields in the order its JSON gives them;
+/// `trunc` shortens the mounts as the table does.
+fn ps_fields(
+    m: &Machine,
+    r: &BTreeMap<&str, String>,
+    trunc: bool,
+) -> Vec<(&'static str, serde_json::Value)> {
     let labels: Vec<String> = m.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let publishers: Vec<serde_json::Value> = ports(m).iter().filter_map(|p| publisher(p)).collect();
+    // containerMounts: a volume by its name, a bind by its source; LocalVolumes counts
+    // the volumes.
+    let volumes = m.strings("volumes");
+    let sources: Vec<&str> = volumes
+        .iter()
+        .map(|v| v.split(':').next().unwrap_or(""))
+        .collect();
+    let local = sources.iter().filter(|s| !s.starts_with('/')).count();
+    let mounts: Vec<String> = sources
+        .iter()
+        .map(|s| {
+            if trunc {
+                crate::gotemplate::ellipsis(s, 15)
+            } else {
+                s.to_string()
+            }
+        })
+        .collect();
     vec![
         ("Command", serde_json::Value::from(r["Command"].clone())),
         (
@@ -333,13 +508,11 @@ fn ps_fields(m: &Machine, r: &BTreeMap<&str, String>) -> Vec<(&'static str, serd
         ("Image", serde_json::Value::from(r["Image"].clone())),
         ("Labels", serde_json::Value::from(labels.join(","))),
         (
-            "LocalVolumes",
-            serde_json::Value::from(m.strings("volumes").len().to_string()),
+            "Engine",
+            serde_json::Value::from(m.label("com.docker.compose.engine").to_string()),
         ),
-        (
-            "Mounts",
-            serde_json::Value::from(m.strings("volumes").join(",")),
-        ),
+        ("LocalVolumes", serde_json::Value::from(local.to_string())),
+        ("Mounts", serde_json::Value::from(mounts.join(","))),
         ("Name", serde_json::Value::from(m.name.clone())),
         ("Names", serde_json::Value::from(m.name.clone())),
         ("Networks", serde_json::Value::from(r["Networks"].clone())),
@@ -432,23 +605,25 @@ pub async fn ls(e: &mut Engine<'_>, a: &LsArgs, out: &mut dyn Write) -> Result<(
         }
         entry.1 = files.join(",");
     }
+    // The command line made each NAME=VALUE (FilterOpt); name is the one key there is.
     let mut names: Vec<String> = Vec::new();
     for filter in &a.filter {
         match filter.split_once('=') {
             Some(("name", value)) => names.push(value.to_string()),
-            _ => bail!("invalid filter {filter:?}"),
+            Some((key, _)) => bail!("invalid filter '{key}'"),
+            None => {}
         }
     }
-    // filters.Match: each value a regular expression, one that does not compile no
-    // match.
-    let names: Vec<regex::Regex> = names
-        .iter()
-        .filter_map(|n| regex::Regex::new(n).ok())
-        .collect();
-    let filtered = !a.filter.is_empty();
+    // match: a name given as it is, or as a regular expression that matches.
+    let matches = |project: &str| {
+        names
+            .iter()
+            .any(|n| n == project || regex::Regex::new(n).is_ok_and(|r| r.is_match(project)))
+    };
+    let filtered = !names.is_empty();
     let rows: Vec<(String, String, String)> = projects
         .into_iter()
-        .filter(|(name, _)| !filtered || names.iter().any(|n| n.is_match(name)))
+        .filter(|(name, _)| !filtered || matches(name))
         .map(|(name, (states, files))| {
             let mut counts: BTreeMap<String, usize> = BTreeMap::new();
             for s in states {
@@ -464,27 +639,38 @@ pub async fn ls(e: &mut Engine<'_>, a: &LsArgs, out: &mut dyn Write) -> Result<(
         }
         return Ok(());
     }
-    match a.format.as_deref().unwrap_or("table") {
-        "json" => {
-            let items: Vec<String> = rows
-                .iter()
-                .map(|(n, s, f)| {
-                    json_line(&[
-                        ("Name", serde_json::Value::from(n.clone())),
-                        ("Status", serde_json::Value::from(s.clone())),
-                        ("ConfigFiles", serde_json::Value::from(f.clone())),
-                    ])
-                })
-                .collect();
-            writeln!(out, "[{}]", items.join(","))?;
-        }
-        _ => {
+    // formatter.Print: the stackView fields in their order, encoded as encoding/json
+    // encodes them.
+    let object = |(n, s, f): &(String, String, String)| {
+        format!(
+            "{{\"Name\":{},\"Status\":{},\"ConfigFiles\":{}}}",
+            serde_json::Value::from(n.clone()),
+            serde_json::Value::from(s.clone()),
+            serde_json::Value::from(f.clone())
+        )
+    };
+    let format = a.format.clone().unwrap_or_else(|| "table".to_string());
+    match format.to_lowercase().as_str() {
+        "table" | "pretty" | "" => {
             let mut text = String::from("NAME\tSTATUS\tCONFIG FILES\n");
             for (n, s, f) in &rows {
                 text.push_str(&format!("{n}\t{s}\t{f}\n"));
             }
             out.write_all(table(&text, 20, 3).as_bytes())?;
         }
+        "{{json.}}" => {
+            for row in &rows {
+                writeln!(out, "{}", object(row))?;
+            }
+        }
+        "json" => {
+            let items: Vec<String> = rows.iter().map(object).collect();
+            writeln!(out, "[{}]", items.join(","))?;
+        }
+        _ => bail!(
+            "format value {} could not be parsed: parsing failed",
+            crate::compose::gostr::quote(&format)
+        ),
     }
     Ok(())
 }
@@ -817,7 +1003,18 @@ pub async fn port(e: &mut Engine<'_>, a: &PortArgs, out: &mut dyn Write) -> Resu
                     let host = p.split_once("->").map(|(h, _)| h).unwrap_or("");
                     writeln!(out, "{host}")?;
                 }
-                None => bail!("no port {private}/{protocol} for container {}", m.name),
+                None => {
+                    // portNotFoundError: the container's ports, each side of each.
+                    let ports: Vec<&str> = published
+                        .iter()
+                        .filter_map(|p| p.split_once("->").map(|(_, rest)| rest))
+                        .collect();
+                    bail!(
+                        "no port {private}/{protocol} for container {}: {}",
+                        m.name,
+                        ports.join(", ")
+                    )
+                }
             }
         }
         None => {
@@ -1092,6 +1289,26 @@ fn local_time(usec: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn ports_are_shown_as_docker_shows_them() {
+        let list = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Same number on both sides grouped into a range, IPv4 before IPv6, the other
+        // mappings after, each kind by the port in the machine.
+        assert_eq!(
+            displayable_ports(&list(&[
+                "0.0.0.0:8001->8001/tcp",
+                "[::]:8001->8001/tcp",
+                "0.0.0.0:8000->8000/tcp",
+                "[::]:8000->8000/tcp",
+                "0.0.0.0:9090->80/tcp",
+                "127.0.0.1:5353->53/udp",
+            ])),
+            "0.0.0.0:8000-8001->8000-8001/tcp, [::]:8000-8001->8000-8001/tcp, 127.0.0.1:5353->53/udp, 0.0.0.0:9090->80/tcp"
+        );
+        assert_eq!(displayable_ports(&[]), "");
+    }
+
     use super::*;
 
     #[test]
@@ -1240,7 +1457,7 @@ mod tests {
             ("Status", "Up".to_string()),
         ]);
         let row = serde_json::Value::Object(
-            ps_fields(&m, &r)
+            ps_fields(&m, &r, true)
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))
                 .collect(),

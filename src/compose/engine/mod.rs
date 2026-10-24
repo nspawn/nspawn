@@ -57,6 +57,9 @@ pub struct Engine<'a> {
     pub cwd: String,
     /// The service's registry, which the images a project builds are named under.
     pub registry: String,
+    /// The ANSI mode pre_run resolved: always, never, auto, or what else was given,
+    /// which is never.
+    pub ansi: String,
 }
 
 /// A machine of the project, as ListMachines has it.
@@ -271,21 +274,23 @@ fn named(command: &ComposeCommand) -> Vec<String> {
 
 /// How a command finds its project: loaded with its services (up, create, run, pull,
 /// scale), or by name when no file is given and -p is (down, ps, logs and the others,
-/// projectOrName), or by name alone (ls).
+/// projectOrName), or by its name alone, read from the files only when neither -p nor
+/// COMPOSE_PROJECT_NAME gives it (exec, port, cp, images, top and stats, toProjectName),
+/// or not at all (ls).
 enum Wants {
     Project,
     ProjectOrName,
+    Name,
     Nothing,
 }
 
 fn wants(command: &ComposeCommand) -> Wants {
     use ComposeCommand as C;
     match command {
-        // exec, port, cp, images, top and stats find their project by -p NAME alone,
-        // as down and ps do.
         C::Up(_) | C::Create(_) | C::Run(_) | C::Pull(_) | C::Build(_) | C::Scale(_) => {
             Wants::Project
         }
+        C::Exec(_) | C::Port(_) | C::Cp(_) | C::Images(_) | C::Top(_) | C::Stats(_) => Wants::Name,
         C::Ls(_) => Wants::Nothing,
         _ => Wants::ProjectOrName,
     }
@@ -343,9 +348,30 @@ async fn dispatch(
                                 .map_err(anyhow::Error::msg)?
                                 .ok_or_else(|| anyhow::Error::msg(e))?
                         }
+                        Err(e) if matches!(command, ComposeCommand::Create(_)) => bail!(
+                            super::config::job_target_err(args, flags, host, &services, &e)
+                                .unwrap_or(e)
+                        ),
                         other => other.map_err(anyhow::Error::msg)?,
                     };
                 (project.name.clone(), Some(project))
+            }
+            Wants::Name => {
+                let given = args.project_name.clone().unwrap_or_default();
+                let from_env = host
+                    .env
+                    .get("COMPOSE_PROJECT_NAME")
+                    .filter(|n| !n.is_empty())
+                    .cloned();
+                match (given.is_empty(), from_env) {
+                    (false, _) => (named_as_given(command, given), None),
+                    (true, Some(name)) => (named_as_given(command, name), None),
+                    (true, None) => {
+                        let project = super::config::project_for(args, flags, host, &[], &mut warn)
+                            .map_err(anyhow::Error::msg)?;
+                        (named_as_given(command, project.name), None)
+                    }
+                }
             }
             Wants::ProjectOrName => {
                 let given = args.project_name.clone().unwrap_or_default();
@@ -354,10 +380,17 @@ async fn dispatch(
                 } else {
                     match super::config::project_for(args, flags, host, &services, &mut warn) {
                         Ok(project) => (project.name.clone(), Some(project)),
-                        Err(e) => match host.env.get("COMPOSE_PROJECT_NAME") {
-                            Some(name) if !name.is_empty() => (name.clone(), None),
-                            _ => bail!(e),
-                        },
+                        Err(e) => {
+                            if let Some(job) =
+                                super::config::job_target_err(args, flags, host, &services, &e)
+                            {
+                                bail!(job);
+                            }
+                            match host.env.get("COMPOSE_PROJECT_NAME") {
+                                Some(name) if !name.is_empty() => (name.clone(), None),
+                                _ => bail!(e),
+                            }
+                        }
                     }
                 }
             }
@@ -386,6 +419,7 @@ async fn dispatch(
         log,
         cwd: host.cwd.clone(),
         registry,
+        ansi: flags.ansi.clone(),
     };
     use ComposeCommand as C;
     match command {
@@ -439,6 +473,11 @@ fn check_arguments(command: &ComposeCommand) -> Result<()> {
             }
             Ok(())
         }
+        C::Logs(c) if c.index.is_some_and(|i| i > 0) && c.service.len() != 1 => {
+            bail!("--index requires one service to be selected")
+        }
+        // ps's PreRunE.
+        C::Ps(c) => info::ps_filter(c.filter.as_deref()).map(|_| ()),
         C::Stats(c) if c.service.len() > 1 => {
             bail!("accepts at most 1 arg(s), received {}", c.service.len())
         }
@@ -451,6 +490,13 @@ fn check_arguments(command: &ComposeCommand) -> Result<()> {
         }
         C::Run(c) if c.service.is_none() => {
             bail!("requires at least 1 arg(s), only received 0")
+        }
+        // run's PreRunE.
+        C::Run(c) if c.service_ports && !c.publish.is_empty() => {
+            bail!("--service-ports and --publish are incompatible")
+        }
+        C::Run(c) if c.tty.is_some() && c.no_tty.is_some() => {
+            bail!("--tty and --no-tty can't be used together")
         }
         C::Port(c) => {
             let received = usize::from(c.service.is_some())

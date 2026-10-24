@@ -77,6 +77,8 @@ pub struct Options {
     pub profiles: Vec<String>,
     pub selected_services: Vec<String>,
     pub prune: bool,
+    /// The attributes nspawn ignores go without their warnings.
+    pub quiet_ignored: bool,
     /// The home `~` stands for, the HOME of the process.
     pub home: Option<String>,
     /// What the support table refuses in the model, found as it loads.
@@ -211,7 +213,8 @@ fn load(details: &Details, opts: &Options, loaded: &[String], warn: Warn) -> Res
     if !opts.skip_validation && opts.project_name.is_empty() {
         return Err("project name must not be empty".to_string());
     }
-    let refused = check_support(&model, warn);
+    let mut quiet = |_: String| {};
+    let refused = check_support(&model, if opts.quiet_ignored { &mut quiet } else { warn });
     opts.refused.borrow_mut().extend(refused);
     if !opts.skip_normalization {
         model.insert("name".to_string(), Value::Str(opts.project_name.clone()));

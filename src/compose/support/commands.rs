@@ -17,7 +17,6 @@ const fn option(command: &'static str, name: &'static str, support: Support) -> 
 
 const BUILDER: &str = "nspawn builds with its own builder";
 const NO_ATTESTATIONS: &str = "nspawn's builder writes no attestations";
-const NO_ANONYMOUS: &str = "nspawn has no anonymous volumes";
 const VERSION: &str =
     "--short and json give the docker compose release it matches; the plain form names nspawn's version too";
 
@@ -74,7 +73,10 @@ pub static COMMANDS: &[Command] = &[
     command("start", Full),
     command("stats", Full),
     command("stop", Full),
-    command("top", Full),
+    command(
+        "top",
+        Partial("the columns are SERVICE, #, PID, USER, TIME and COMMAND: no PPID, C, STIME or TTY"),
+    ),
     command("unpause", Full),
     command("up", Full),
     command("version", Partial(VERSION)),
@@ -176,9 +178,17 @@ pub static OPTIONS: &[Opt] = &[
     option("create", "yes", Full),
     // down
     option("down", "remove-orphans", Full),
-    option("down", "rmi", Full),
+    option(
+        "down",
+        "rmi",
+        Partial("the images are known from the files: without them none is removed"),
+    ),
     option("down", "timeout", Full),
-    option("down", "volumes", Full),
+    option(
+        "down",
+        "volumes",
+        Partial("named volumes are known from the files: without them only the anonymous ones go"),
+    ),
     // events
     option("events", "json", Full),
     option("events", "since", Full),
@@ -244,7 +254,7 @@ pub static OPTIONS: &[Opt] = &[
     option("rm", "all", Ignored("deprecated, as in docker compose: one-off machines stay")),
     option("rm", "force", Full),
     option("rm", "stop", Full),
-    option("rm", "volumes", Partial(NO_ANONYMOUS)),
+    option("rm", "volumes", Full),
     // run
     option("run", "build", Full),
     option("run", "cap-add", Full),
@@ -309,7 +319,7 @@ pub static OPTIONS: &[Opt] = &[
     option("up", "quiet-build", Full),
     option("up", "quiet-pull", Full),
     option("up", "remove-orphans", Full),
-    option("up", "renew-anon-volumes", Partial(NO_ANONYMOUS)),
+    option("up", "renew-anon-volumes", Full),
     option("up", "scale", Full),
     option("up", "timeout", Full),
     option("up", "timestamps", Full),

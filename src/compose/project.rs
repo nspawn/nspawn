@@ -1054,9 +1054,11 @@ impl Project {
             if container_name.is_empty() {
                 continue;
             }
+            // compose-go keeps the names in a set, whose empty struct is what it prints
+            // for the service.
             if names.contains_key(&container_name) {
                 return Err(format!(
-                    "services.{name}: container name {} is already in use by service {container_name}\"",
+                    "services.{name}: container name {} is already in use by service {{}}\"",
                     go_quote(&container_name)
                 ));
             }

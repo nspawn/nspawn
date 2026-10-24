@@ -21,6 +21,8 @@ use crate::compose::value::{Map, Value};
 pub struct Converge {
     pub services: Vec<String>,
     pub force_recreate: bool,
+    /// -V: the machines made anew get new anonymous volumes.
+    pub renew_anonymous: bool,
     pub no_recreate: bool,
     pub always_recreate_deps: bool,
     pub remove_orphans: bool,
@@ -50,6 +52,8 @@ pub struct Image {
     pub digest: String,
     /// Its own command, which an empty entrypoint of the file keeps.
     pub cmd: Vec<String>,
+    /// Its VOLUME paths.
+    pub volumes: Vec<String>,
 }
 
 fn s<'a>(map: &'a Map, key: &str) -> &'a str {
@@ -215,6 +219,9 @@ pub fn validate_flags(a: &UpArgs) -> Result<()> {
 
 pub async fn up(e: &mut Engine<'_>, a: &UpArgs) -> Result<()> {
     validate_flags(a)?;
+    if !e.args.all_resources && e.project().services.is_empty() {
+        bail!("no service selected");
+    }
     let remove_orphans = a
         .remove_orphans
         .unwrap_or_else(|| removes_orphans(e.project()));
@@ -226,6 +233,7 @@ pub async fn up(e: &mut Engine<'_>, a: &UpArgs) -> Result<()> {
         bail!("cannot combine --attach and --attach-dependencies");
     }
     reject_scheduled_jobs(e.project())?;
+    check_pull(a.pull.as_deref())?;
     let jobs: Vec<&str> = e.project().jobs.keys().map(String::as_str).collect();
     if !jobs.is_empty() {
         e.warn(format!(
@@ -239,7 +247,9 @@ pub async fn up(e: &mut Engine<'_>, a: &UpArgs) -> Result<()> {
     };
     let converge = Converge {
         services: a.service.clone(),
-        force_recreate: a.force_recreate,
+        // recreateStrategy: -V makes the machines anew as --force-recreate does.
+        force_recreate: a.force_recreate || a.renew_anon_volumes,
+        renew_anonymous: a.renew_anon_volumes,
         no_recreate: a.no_recreate,
         always_recreate_deps: a.always_recreate_deps,
         remove_orphans,
@@ -259,8 +269,13 @@ pub async fn up(e: &mut Engine<'_>, a: &UpArgs) -> Result<()> {
         force_build: a.build,
         ..Default::default()
     };
+    // An attached up checks what it is to attach to before anything is made.
+    let attached = !(a.detach || a.no_start || a.wait);
+    if attached {
+        super::logs::attach_sets(a, e.project())?;
+    }
     let machines = converge_project(e, &converge).await?;
-    if a.detach || a.no_start || a.wait {
+    if !attached {
         return Ok(());
     }
     let since = converge
@@ -278,6 +293,7 @@ pub async fn create(e: &mut Engine<'_>, a: &CreateArgs) -> Result<()> {
         bail!("--force-recreate and --no-recreate are incompatible");
     }
     reject_scheduled_jobs(e.project())?;
+    check_pull(a.pull.as_deref())?;
     let converge = Converge {
         services: a.service.clone(),
         force_recreate: a.force_recreate,
@@ -368,8 +384,21 @@ fn policy(service: &Map, flag: Option<&str>, unset: &str) -> String {
         p => p,
     };
     match flag {
-        None | Some("policy") => own.to_string(),
+        None => own.to_string(),
+        Some("if_not_present") => "missing".to_string(),
         Some(p) => p.to_string(),
+    }
+}
+
+/// createOptions.Apply: the --pull of up, create and run, one of the policies a service
+/// may have.
+pub fn check_pull(flag: Option<&str>) -> Result<()> {
+    match flag {
+        None | Some("always" | "never" | "build" | "missing" | "if_not_present") => Ok(()),
+        Some(other) => bail!(
+            "invalid --pull option {}",
+            crate::compose::gostr::quote(other)
+        ),
     }
 }
 
@@ -532,7 +561,12 @@ pub async fn images(
             continue;
         }
         let existing = found(&local, &full);
-        let policy = policy(service, p.flag, unset);
+        // --build makes every service with a build section a built one, not pulled.
+        let policy = if p.force_build && service.get("build").and_then(Value::as_map).is_some() {
+            "build".to_string()
+        } else {
+            policy(service, p.flag, unset)
+        };
         if !pulls(&policy, true, existing.is_some()).with_context(|| format!("service {name:?}"))? {
             continue;
         }
@@ -638,6 +672,7 @@ pub async fn images(
                 name: local_name,
                 digest: client::string(&record, "digest"),
                 cmd: client::strings(&record, "image_cmd"),
+                volumes: client::strings(&record, "image_volumes"),
             },
         );
     }
@@ -656,17 +691,29 @@ pub async fn images(
 
 /// The networks the project's services join, made where they are not, and the
 /// external ones there.
-pub(super) async fn networks(e: &Engine<'_>) -> Result<()> {
+/// The networks of the project, made where they are missing. With `renew`, one made by
+/// an earlier up whose definition has changed since (its config hash) is made anew, as
+/// compose's reconcileNetworks does; the machines of the project on it are removed
+/// first, to be made again by the pass, as nspawn cannot keep their place on a network
+/// that goes.
+pub(super) async fn networks(e: &Engine<'_>, renew: bool, timeout: Option<u64>) -> Result<()> {
     let project = e.project();
-    let existing: BTreeSet<String> = e
+    let listed = e
         .client
         .manager
         .list_networks()
         .await
-        .map_err(client::error)?
-        .iter()
-        .map(|n| client::string(n, "name"))
-        .collect();
+        .map_err(client::error)?;
+    let mut existing: BTreeSet<String> = listed.iter().map(|n| client::string(n, "name")).collect();
+    let hash_of = |name: &str| -> Option<String> {
+        listed
+            .iter()
+            .find(|n| client::string(n, "name") == name)
+            .and_then(|n| n.get("labels"))
+            .and_then(|l| std::collections::HashMap::<String, String>::try_from(l.clone()).ok())
+            .filter(|l| l.get(label::PROJECT) == Some(&project.name))
+            .and_then(|l| l.get(label::CONFIG_HASH).cloned())
+    };
     // An nspawn network has one subnet: a second IPv4 one is refused before any is made.
     for (key, def) in &project.networks {
         let v4: Vec<&str> = def
@@ -694,8 +741,16 @@ pub(super) async fn networks(e: &Engine<'_>) -> Result<()> {
             }
             continue;
         }
+        let hash = crate::compose::config::network_hash(&Value::Map(def.clone()))
+            .map_err(anyhow::Error::msg)?;
         if existing.contains(&name) {
-            continue;
+            match hash_of(&name) {
+                Some(had) if renew && had != hash => {
+                    renew_network(e, &name, timeout).await?;
+                    existing.remove(&name);
+                }
+                _ => continue,
+            }
         }
         e.progress.network(&name, "Creating", Status::Working);
         let mut options = Options::new();
@@ -706,6 +761,7 @@ pub(super) async fn networks(e: &Engine<'_>) -> Result<()> {
             _ => Vec::new(),
         };
         labels.extend([
+            format!("{}={hash}", label::CONFIG_HASH),
             format!("{}={}", label::PROJECT, project.name),
             format!("{}={key}", label::NETWORK),
             format!("{}={}", label::VERSION, super::compose_version()),
@@ -734,6 +790,27 @@ pub(super) async fn networks(e: &Engine<'_>) -> Result<()> {
             .with_context(|| format!("creating network {name}"))?;
         e.progress.network(&name, "Created", Status::Done);
     }
+    Ok(())
+}
+
+/// A network of the project that is to be made anew: the project's machines on it go,
+/// then it does.
+async fn renew_network(e: &Engine<'_>, name: &str, timeout: Option<u64>) -> Result<()> {
+    for m in e.machines().await?.iter().filter(|m| {
+        client::strings(&m.dict, "networks")
+            .iter()
+            .any(|n| n == name)
+    }) {
+        stop_and_remove(e, m, timeout).await?;
+    }
+    e.progress.network(name, "Removing", Status::Working);
+    let names = [name.to_string()];
+    let manager = &e.client.manager;
+    e.client
+        .run_job_silent(|| manager.remove_networks(&names), true)
+        .await
+        .with_context(|| format!("removing network {name}, whose definition changed"))?;
+    e.progress.network(name, "Removed", Status::Done);
     Ok(())
 }
 
@@ -872,6 +949,9 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
     }
     let project = e.project().clone();
     check_refusals(&project)?;
+    project
+        .check_container_name_unicity()
+        .map_err(anyhow::Error::msg)?;
     unique_names(&project, &c.scale)?;
     let order = order(&project);
     let pulls = Pulls {
@@ -882,7 +962,7 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
         ..Default::default()
     };
     let images = images(e, &order, &pulls).await?;
-    networks(e).await?;
+    networks(e, true, c.timeout).await?;
     volumes(e).await?;
     secrets(e).await?;
     let mut machines = e.machines().await?;
@@ -899,6 +979,8 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
     // parentNamespaceRecreated: a machine in the network of a service made anew this
     // pass would stay in the namespace of the old one.
     let mut recreated: BTreeSet<String> = BTreeSet::new();
+    // The machines stopped for a dependency made anew, each once.
+    let mut stopped: BTreeSet<String> = BTreeSet::new();
     for name in &order {
         let service = convert::service(&project, name)?.clone();
         let Some(image) = images.get(name) else {
@@ -914,11 +996,7 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
             .cloned()
             .collect();
         existing.sort_by_key(|m| m.number);
-        // Replicas past the count go, the highest first.
-        for extra in existing.iter().rev().filter(|m| m.number > want) {
-            stop_and_remove(e, extra, c.timeout).await?;
-        }
-        for number in 1..=want {
+        let spec = |number: u32| -> Result<(String, convert::Made)> {
             let machine = machine_name(&project.name, name, s(&service, "container_name"), number);
             if !valid_machine_name(&machine) {
                 bail!(
@@ -934,61 +1012,93 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
                 image_digest: image.digest.clone(),
                 image_cmd: image.cmd.clone(),
                 env_files: e.args.env_file.clone(),
+                image_volumes: image.volumes.clone(),
             };
-            let made = convert::options(&spec)?;
-            let found = existing
-                .iter()
-                .find(|m| m.number == number || m.name == machine);
-            match found {
-                Some(current) => {
-                    let hash = labels_of(&made).get(label::CONFIG_HASH).cloned();
-                    // A name it should go by and does not, as a link of another service
-                    // gives it; one given by hand with network connect stays.
-                    let has: BTreeSet<String> = client::strings(&current.dict, "aliases")
-                        .into_iter()
-                        .collect();
-                    let stale = parent_recreated
-                        || current.labels.get(label::CONFIG_HASH) != hash.as_ref()
-                        || current.label(label::IMAGE) != image.digest
-                        || !convert::aliases(&made).is_subset(&has);
-                    let recreate = recreates(c, name, stale);
-                    if recreate {
-                        recreated.insert(name.clone());
-                        e.progress
-                            .container(&current.name, "Recreate", Status::Working);
-                        // Made anew in its place, which the service checks before the
-                        // old one goes, and which keeps the machines that depend on it
-                        // pointing at it; under another name, the old one goes first.
-                        if current.name == machine {
-                            stop_only(e, current, c.timeout).await?;
-                            make(e, image, &machine, made, true).await?;
-                        } else {
-                            stop_and_remove(e, current, c.timeout).await?;
-                            make(e, image, &machine, made, false).await?;
+            Ok((machine, convert::options(&spec)?))
+        };
+        // Which replicas are to be made anew, each by what it would be made as now.
+        let mut replicas = Vec::new();
+        for current in &existing {
+            let (_, made) = spec(current.number)?;
+            let hash = labels_of(&made).get(label::CONFIG_HASH).cloned();
+            // A name it should go by and does not, as a link of another service
+            // gives it; one given by hand with network connect stays.
+            let has: BTreeSet<String> = client::strings(&current.dict, "aliases")
+                .into_iter()
+                .collect();
+            let stale = parent_recreated
+                || current.labels.get(label::CONFIG_HASH) != hash.as_ref()
+                || current.label(label::IMAGE) != image.digest
+                || !convert::aliases(&made).is_subset(&has);
+            replicas.push(Replica {
+                number: current.number,
+                recreate: recreates(c, name, stale),
+                created: current.created,
+            });
+        }
+        let plan = plan_replicas(&replicas, want);
+        let by_number = |n: u32| existing.iter().find(|m| m.number == n);
+        for number in &plan.remove {
+            if let Some(extra) = by_number(*number) {
+                stop_and_remove(e, extra, c.timeout).await?;
+            }
+        }
+        for number in &plan.recreate {
+            let Some(current) = by_number(*number) else {
+                continue;
+            };
+            let (machine, made) = spec(*number)?;
+            if !recreated.contains(name) {
+                // planStopDependents: what restarts with this service stops before
+                // it is made anew, and starts again once it is what they wait for.
+                for dependent in restarted_by(&project, name) {
+                    for m in machines
+                        .iter()
+                        .filter(|m| m.service == dependent && !m.oneoff)
+                    {
+                        // A stop of the plan, without the pre_stop hooks a stop of the
+                        // service runs.
+                        if stopped.insert(m.name.clone()) && m.running() {
+                            stop_only(e, m, c.timeout).await?;
                         }
-                        e.progress.container(&machine, "Recreated", Status::Done);
                     }
-                }
-                None => {
-                    if all.contains(&machine) {
-                        // Another service of the project made it: their names differ
-                        // only where machine names write '_' as '-'.
-                        if let Some(other) = machines.iter().find(|m| m.name == machine) {
-                            bail!(
-                                "the services {:?} and {name:?} would both make the machine {machine}: machine names take no '_', which is written '-'; rename one of them or its container_name",
-                                other.service
-                            );
-                        }
-                        bail!(
-                            "machine {machine} exists and is not one of project {}'s; remove it or rename the service",
-                            project.name
-                        );
-                    }
-                    e.progress.container(&machine, "Creating", Status::Working);
-                    make(e, image, &machine, made, false).await?;
-                    e.progress.container(&machine, "Created", Status::Done);
                 }
             }
+            recreated.insert(name.clone());
+            e.progress
+                .container(&current.name, "Recreate", Status::Working);
+            // Made anew in its place, which the service checks before the old one
+            // goes, and which keeps the machines that depend on it pointing at it;
+            // under another name, the old one goes first.
+            if current.name == machine && !c.renew_anonymous {
+                stop_only(e, current, c.timeout).await?;
+                make(e, image, &machine, made, true).await?;
+            } else {
+                // -V: new anonymous volumes, the old ones going with the machine.
+                stop_and_remove(e, current, c.timeout).await?;
+                make(e, image, &machine, made, false).await?;
+            }
+            e.progress.container(&machine, "Recreated", Status::Done);
+        }
+        for number in &plan.create {
+            let (machine, made) = spec(*number)?;
+            if all.contains(&machine) {
+                // Another service of the project made it: their names differ
+                // only where machine names write '_' as '-'.
+                if let Some(other) = machines.iter().find(|m| m.name == machine) {
+                    bail!(
+                        "the services {:?} and {name:?} would both make the machine {machine}: machine names take no '_', which is written '-'; rename one of them or its container_name",
+                        other.service
+                    );
+                }
+                bail!(
+                    "machine {machine} exists and is not one of project {}'s; remove it or rename the service",
+                    project.name
+                );
+            }
+            e.progress.container(&machine, "Creating", Status::Working);
+            make(e, image, &machine, made, false).await?;
+            e.progress.container(&machine, "Created", Status::Done);
         }
     }
     machines = e.machines().await?;
@@ -1001,6 +1111,54 @@ pub async fn converge_project(e: &mut Engine<'_>, c: &Converge) -> Result<Vec<Ma
         wait_running(e, &started, c.wait_timeout).await?;
     }
     Ok(started)
+}
+
+/// A replica of a service as up finds it.
+#[derive(Debug, Clone, Copy)]
+struct Replica {
+    number: u32,
+    /// Whether this pass makes it anew.
+    recreate: bool,
+    created: u64,
+}
+
+/// What a pass does with a service's replicas, by their numbers.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReplicaPlan {
+    remove: Vec<u32>,
+    recreate: Vec<u32>,
+    create: Vec<u32>,
+}
+
+/// reconcileService's replicas: those made anew go first, then the highest numbers,
+/// past the count; the ones kept and up to date stay as they are, and new ones take the
+/// numbers after the highest there is.
+fn plan_replicas(replicas: &[Replica], want: u32) -> ReplicaPlan {
+    let mut sorted = replicas.to_vec();
+    sorted.sort_by_key(|r| (r.recreate, r.number, std::cmp::Reverse(r.created)));
+    let want = want as usize;
+    let next = replicas.iter().map(|r| r.number).max().unwrap_or(0) + 1;
+    let kept = sorted.len().min(want);
+    ReplicaPlan {
+        remove: sorted[kept..].iter().map(|r| r.number).collect(),
+        recreate: sorted[..kept]
+            .iter()
+            .filter(|r| r.recreate)
+            .map(|r| r.number)
+            .collect(),
+        create: (0..(want - kept) as u32).map(|i| next + i).collect(),
+    }
+}
+
+/// GetDependentsForService with restart: the services that depend on `service` with
+/// `restart: true`.
+fn restarted_by(project: &Project, service: &str) -> Vec<String> {
+    project
+        .services
+        .iter()
+        .filter(|(_, s)| s.get(&["depends_on", service, "restart"]) == Some(&Value::Bool(true)))
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 fn labels_of(made: &convert::Made) -> BTreeMap<String, String> {
@@ -1031,6 +1189,7 @@ async fn make(
     for path in &made.host_paths {
         std::fs::create_dir_all(path).with_context(|| format!("creating {path}"))?;
     }
+    anonymous_volumes(e, &made.anonymous, replace).await?;
     let manager = &e.client.manager;
     let mut options = made.options;
     if replace {
@@ -1043,6 +1202,69 @@ async fn make(
         )
         .await
         .with_context(|| format!("creating {machine}"))?;
+    Ok(())
+}
+
+/// A machine's anonymous volumes, made where missing. Made anew in its place, it keeps
+/// those it had; made from nothing, it gets new ones, as a container does: what an
+/// earlier machine of the name left goes.
+pub(super) async fn anonymous_volumes(
+    e: &Engine<'_>,
+    names: &[String],
+    replace: bool,
+) -> Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let existing: BTreeSet<String> = e
+        .client
+        .manager
+        .list_volumes()
+        .await
+        .map_err(client::error)?
+        .iter()
+        .map(|v| client::string(v, "name"))
+        .collect();
+    let manager = &e.client.manager;
+    for name in names {
+        if existing.contains(name) {
+            if replace {
+                continue;
+            }
+            let list = [name.clone()];
+            e.client
+                .run_job_silent(|| manager.remove_volumes(&list), true)
+                .await
+                .with_context(|| format!("removing the anonymous volume {name} a machine left"))?;
+        }
+        manager
+            .create_volume(name)
+            .await
+            .map_err(client::error)
+            .with_context(|| format!("creating the anonymous volume {name}"))?;
+    }
+    Ok(())
+}
+
+/// The anonymous volumes of a machine that is gone, as down -v and rm -v remove them.
+pub async fn remove_anonymous(e: &Engine<'_>, machine: &str) -> Result<()> {
+    let names: Vec<String> = e
+        .client
+        .manager
+        .list_volumes()
+        .await
+        .map_err(client::error)?
+        .iter()
+        .map(|v| client::string(v, "name"))
+        .filter(|n| convert::anonymous_of(machine, n))
+        .collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    let manager = &e.client.manager;
+    e.client
+        .run_job_silent(|| manager.remove_volumes(&names), true)
+        .await?;
     Ok(())
 }
 
@@ -1104,8 +1326,8 @@ async fn orphans(
     } else if !ignore {
         let names: Vec<&str> = orphans.iter().map(|m| m.name.as_str()).collect();
         e.warn(format!(
-            "Found orphan containers ([{}]) for this project. If you removed or renamed this service in your compose file, you can run this command with the --remove-orphans flag to clean it up.",
-            names.join(" ")
+            "Found orphan containers ({}) for this project. If you removed or renamed this service in your compose file, you can run this command with the --remove-orphans flag to clean it up.",
+            names.join(", ")
         ));
     }
     Ok(())
@@ -1132,7 +1354,7 @@ async fn start_in_order(
             continue;
         }
         if !c.no_deps || asked.is_empty() {
-            wait_dependencies(e, project, &service, name).await?;
+            wait_dependencies(e, project, &service, name, c.wait_timeout).await?;
         }
         for m in &mine {
             if m.running() {
@@ -1187,54 +1409,180 @@ pub(super) async fn post_start(e: &Engine<'_>, m: &Machine) -> Result<()> {
     Ok(())
 }
 
-/// Waits for what a service asks of the services it depends on, saying so: Waiting,
-/// then Healthy or Exited.
-pub async fn wait_dependencies(
-    e: &Engine<'_>,
-    project: &Project,
-    service: &Map,
-    name: &str,
-) -> Result<()> {
+/// A condition a service waits for on one of the services it depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Awaited {
+    pub service: String,
+    /// service_healthy or service_completed_successfully: service_started is the order
+    /// the services start in.
+    pub condition: String,
+    pub required: bool,
+}
+
+/// shouldWaitForDependency over a service's depends_on in the file: the conditions to
+/// wait for, without those on a service that is not to run (disabled, as with
+/// --no-deps) or has no machine to run (scale 0).
+pub fn awaited(project: &Project, service: &Map) -> Vec<Awaited> {
     let Some(deps) = service.get("depends_on").and_then(Value::as_map) else {
-        return Ok(());
+        return Vec::new();
     };
+    let mut out = Vec::new();
     for (dep, def) in deps {
         let def = def.as_map().cloned().unwrap_or_default();
         let condition = s(&def, "condition");
-        let required = def.get("required") != Some(&Value::Bool(false));
         if !matches!(
             condition,
             "service_healthy" | "service_completed_successfully"
         ) {
             continue;
         }
-        if !project.services.contains_key(dep) {
+        let Some(of) = project.services.get(dep).and_then(Value::as_map) else {
+            continue;
+        };
+        if convert::replicas(of, &BTreeMap::new(), dep) == 0 {
             continue;
         }
-        let machines: Vec<Machine> = e
-            .machines()
-            .await?
-            .into_iter()
-            .filter(|m| m.service == *dep && !m.oneoff)
-            .collect();
-        for m in machines {
-            e.progress.container(&m.name, "Waiting", Status::Working);
-            let outcome = await_condition(e, &m.name, condition).await;
-            match outcome {
-                Ok(text) => e.progress.container(&m.name, text, Status::Done),
-                Err(why) if !required => {
-                    e.progress.container(&m.name, "Error", Status::Warning);
-                    e.warn(format!("optional dependency {dep:?} failed: {why}"));
+        out.push(Awaited {
+            service: dep.clone(),
+            condition: condition.to_string(),
+            required: def.get("required") != Some(&Value::Bool(false)),
+        });
+    }
+    out
+}
+
+/// The conditions of a machine's depends_on label (NAME:CONDITION:RESTART, comma
+/// separated), as a project made from the labels has them: every one required.
+pub fn awaited_by_label(m: &Machine) -> Vec<Awaited> {
+    m.label(label::DEPENDS_ON)
+        .split(',')
+        .filter_map(|d| {
+            let mut parts = d.split(':');
+            let service = parts.next().filter(|s| !s.is_empty())?;
+            let condition = parts.next().unwrap_or("");
+            matches!(
+                condition,
+                "service_healthy" | "service_completed_successfully"
+            )
+            .then(|| Awaited {
+                service: service.to_string(),
+                condition: condition.to_string(),
+                required: true,
+            })
+        })
+        .collect()
+}
+
+/// Waits for what a service asks of the services it depends on in the file.
+pub async fn wait_dependencies(
+    e: &Engine<'_>,
+    project: &Project,
+    service: &Map,
+    name: &str,
+    timeout: Option<Duration>,
+) -> Result<()> {
+    wait_for(e, name, awaited(project, service), timeout).await
+}
+
+/// waitDependencies: each condition waited for on every machine of its service, saying
+/// so (Waiting, then Healthy or Exited), all of them within `timeout` when one is given.
+pub async fn wait_for(
+    e: &Engine<'_>,
+    name: &str,
+    awaited: Vec<Awaited>,
+    timeout: Option<Duration>,
+) -> Result<()> {
+    let wait = async {
+        for dep in &awaited {
+            let machines: Vec<Machine> = e
+                .machines()
+                .await?
+                .into_iter()
+                .filter(|m| m.service == dep.service && !m.oneoff)
+                .collect();
+            if machines.is_empty() {
+                if dep.required {
+                    bail!("{name} is missing dependency {}", dep.service);
                 }
-                Err(why) => {
-                    e.progress.container(&m.name, "Error", Status::Error);
-                    bail!("dependency failed to start: {why}");
+                e.warn(format!("{name} is missing dependency {}", dep.service));
+                continue;
+            }
+            for m in &machines {
+                e.progress.container(&m.name, "Waiting", Status::Working);
+            }
+            for m in &machines {
+                let id = format!("Container {}", m.name);
+                let failure = match await_condition(e, &m.name, &dep.condition).await {
+                    Ok(text) => {
+                        e.progress.container(&m.name, text, Status::Done);
+                        continue;
+                    }
+                    Err(failure) => failure,
+                };
+                let words = failure.words(&dep.service);
+                if dep.required {
+                    e.progress
+                        .event(&id, "Error", &words.details, Status::Error);
+                    bail!(words.error);
+                }
+                e.progress.event(
+                    &id,
+                    &format!("Skipped: optional dependency {}", words.reason),
+                    "",
+                    Status::Warning,
+                );
+                e.warn(words.warning);
+            }
+        }
+        Ok(())
+    };
+    match timeout {
+        Some(t) => tokio::time::timeout(t, wait)
+            .await
+            .unwrap_or_else(|_| bail!("timeout waiting for dependencies")),
+        None => wait.await,
+    }
+}
+
+/// What failed in a dependency: a start (exited, unhealthy, no healthcheck) with why,
+/// or a completion with the code it exited with.
+#[derive(Debug)]
+enum Failure {
+    Start(String),
+    Exit(i32),
+}
+
+/// How a failed dependency is worded: the error of a required one and its progress
+/// line, and the reason and warning of an optional one.
+#[derive(Debug, PartialEq, Eq)]
+struct Words {
+    error: String,
+    details: String,
+    reason: String,
+    warning: String,
+}
+
+impl Failure {
+    fn words(&self, dep: &str) -> Words {
+        let quoted = crate::compose::gostr::quote(dep);
+        match self {
+            Failure::Start(why) => Words {
+                error: format!("dependency failed to start: {why}"),
+                details: format!("dependency {dep} failed to start"),
+                reason: format!("{quoted} failed to start"),
+                warning: format!("optional dependency {quoted} failed to start: {why}"),
+            },
+            Failure::Exit(code) => {
+                let what = format!("{quoted} didn't complete successfully: exit {code}");
+                Words {
+                    error: format!("service {what}"),
+                    details: format!("service {what}"),
+                    warning: format!("optional dependency {what}"),
+                    reason: what,
                 }
             }
         }
-        let _ = name;
     }
-    Ok(())
 }
 
 /// Polls a machine until it is healthy, or has completed with 0.
@@ -1242,34 +1590,35 @@ async fn await_condition(
     e: &Engine<'_>,
     machine: &str,
     condition: &str,
-) -> Result<&'static str, String> {
+) -> Result<&'static str, Failure> {
     loop {
         let found = e.client.manager.get_machine(machine).await;
-        let dict = found.map_err(|err| format!("{:#}", client::error(err)))?;
+        let dict = found.map_err(|err| Failure::Start(format!("{:#}", client::error(err))))?;
         let m = Machine::from_dict(dict);
         if condition == "service_healthy" {
             if m.running() {
                 match m.health.as_str() {
                     "healthy" => return Ok("Healthy"),
-                    "unhealthy" => return Err(format!("container {machine} is unhealthy")),
+                    "unhealthy" => {
+                        return Err(Failure::Start(format!("container {machine} is unhealthy")))
+                    }
                     "" if !checks_health(&m) => {
-                        return Err(format!("container {machine} has no healthcheck configured"))
+                        return Err(Failure::Start(format!(
+                            "container {machine} has no healthcheck configured"
+                        )))
                     }
                     _ => {}
                 }
             } else if m.state == "stopped" {
-                return Err(format!(
+                return Err(Failure::Start(format!(
                     "container {machine} exited ({})",
                     m.exit_code.unwrap_or(0)
-                ));
+                )));
             }
         } else if m.state == "stopped" {
             return match m.exit_code {
                 Some(0) | None => Ok("Exited"),
-                Some(code) => Err(format!(
-                    "service {:?} didn't complete successfully: exit {code}",
-                    m.service
-                )),
+                Some(code) => Err(Failure::Exit(code)),
             };
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1396,6 +1745,106 @@ pub async fn wait_running(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_network_s_hash_changes_with_its_definition() {
+        let hash = |yaml: &str| {
+            let p = convert::tests::project(
+                "nethash",
+                &format!("services:\n  web:\n    image: x\n    networks: [back]\nnetworks:\n  back: {yaml}\n"),
+            );
+            crate::compose::config::network_hash(&p.networks["back"]).unwrap()
+        };
+        assert_eq!(hash("{}"), hash("{}"));
+        assert_ne!(hash("{}"), hash("{internal: true}"));
+        assert_ne!(
+            hash("{ipam: {config: [{subnet: 172.30.0.0/24}]}}"),
+            hash("{ipam: {config: [{subnet: 172.31.0.0/24}]}}")
+        );
+    }
+
+    #[test]
+    fn a_service_waits_for_the_conditions_of_what_runs() {
+        let p = convert::tests::project(
+            "awaited",
+            "services:\n  db:\n    image: x\n    healthcheck: {test: [CMD, \"true\"]}\n  cache:\n    image: x\n  migrate:\n    image: x\n  idle:\n    image: x\n    scale: 0\n  web:\n    image: x\n    depends_on:\n      db: {condition: service_healthy}\n      migrate: {condition: service_completed_successfully, required: false}\n      idle: {condition: service_healthy}\n      cache: {condition: service_started}\n",
+        );
+        let web = convert::service(&p, "web").unwrap();
+        assert_eq!(
+            awaited(&p, web),
+            [
+                Awaited {
+                    service: "db".to_string(),
+                    condition: "service_healthy".to_string(),
+                    required: true,
+                },
+                Awaited {
+                    service: "migrate".to_string(),
+                    condition: "service_completed_successfully".to_string(),
+                    required: false,
+                },
+            ],
+            "service_started is the order, a service of scale 0 is not waited for"
+        );
+        let mut m = super::super::Machine {
+            name: "p-web-1".to_string(),
+            service: "web".to_string(),
+            number: 1,
+            oneoff: false,
+            state: "stopped".to_string(),
+            health: String::new(),
+            exit_code: None,
+            labels: BTreeMap::new(),
+            created: 0,
+            started: 0,
+            dict: crate::client::Dict::new(),
+        };
+        m.labels.insert(
+            label::DEPENDS_ON.to_string(),
+            "db:service_healthy:false,cache:service_started:false,migrate:service_completed_successfully:true".to_string(),
+        );
+        let by_label: Vec<String> = awaited_by_label(&m)
+            .into_iter()
+            .map(|a| format!("{}:{}:{}", a.service, a.condition, a.required))
+            .collect();
+        assert_eq!(
+            by_label,
+            [
+                "db:service_healthy:true",
+                "migrate:service_completed_successfully:true"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_dependency_is_worded_as_docker_compose_words_it() {
+        let start = Failure::Start("container p-db-1 is unhealthy".to_string()).words("db");
+        assert_eq!(
+            start.error,
+            "dependency failed to start: container p-db-1 is unhealthy"
+        );
+        assert_eq!(start.details, "dependency db failed to start");
+        assert_eq!(start.reason, "\"db\" failed to start");
+        assert_eq!(
+            start.warning,
+            "optional dependency \"db\" failed to start: container p-db-1 is unhealthy"
+        );
+        let exit = Failure::Exit(3).words("migrate");
+        assert_eq!(
+            exit.error,
+            "service \"migrate\" didn't complete successfully: exit 3"
+        );
+        assert_eq!(exit.details, exit.error);
+        assert_eq!(
+            exit.reason,
+            "\"migrate\" didn't complete successfully: exit 3"
+        );
+        assert_eq!(
+            exit.warning,
+            "optional dependency \"migrate\" didn't complete successfully: exit 3"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1672,8 +2121,17 @@ mod tests {
             "always"
         );
         assert_eq!(
-            policy(&service("never"), Some("policy"), "missing"),
-            "never"
+            policy(&service("never"), Some("if_not_present"), "always"),
+            "missing"
         );
+        // --pull takes a service's policies; its default word is not one to give.
+        for given in ["always", "never", "build", "missing", "if_not_present"] {
+            assert!(check_pull(Some(given)).is_ok(), "{given}");
+        }
+        assert_eq!(
+            check_pull(Some("policy")).unwrap_err().to_string(),
+            "invalid --pull option \"policy\""
+        );
+        assert!(check_pull(Some("daily")).is_err());
     }
 }

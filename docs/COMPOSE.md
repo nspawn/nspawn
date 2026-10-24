@@ -38,9 +38,11 @@ the networks, volumes, secrets and configs those use.
   (`com.docker.compose.project`, `.service`, `.container-number`, `.oneoff`,
   `.config-hash`, `.depends_on`, `.image`, `.project.working_dir`,
   `.project.config_files`); `down`, `ps`, `logs` and the other commands find a
-  project's machines by them, with `-p NAME` alone too. The config hash is docker
-  compose's own: a machine is made anew when its service changes or a pull brings a
-  new image.
+  project's machines by them, with `-p NAME` alone too. Given `-p NAME` and no `-f`,
+  those commands take the project from the labels even where the directory has a
+  compose file, so `down SERVICE` also takes the services that depend on it, as their
+  `depends_on` labels say. The config hash is docker compose's own: a machine is made
+  anew when its service changes or a pull brings a new image.
 - **Images.** An image without a registry comes from Docker Hub, as with docker,
   and is kept under its local name (`postgres:18-alpine` is `postgres-18-alpine`);
   every machine of it is made from that image. `config --resolve-image-digests`
@@ -87,6 +89,14 @@ Beyond the rows that say so:
   container before it stops the old one, nspawn cannot have two machines of one
   name. What the old machine wrote outside its volumes goes with it, as with
   docker.
+- An anonymous volume (a volume without a source, or a `VOLUME` of the image nothing
+  of the service mounts over) is an nspawn volume named after the machine and a digest
+  of its path, `NAME_anon_HEX`. A machine made anew finds its own again, and one made
+  from nothing gets new ones, as a container does; `up -V` makes new ones, `down -v`
+  and `rm -v` remove them. Those of a `run -d --rm` stay once it ends.
+- A network whose definition changed since `up` made it (its `internal`, its subnet, its
+  labels...) is made anew, with the machines of the project on it: nspawn cannot
+  keep their place on a network that goes, where docker reconnects its containers.
 - A missing bind source is made by compose, which runs as its caller. A source under a
   directory the caller cannot look into (`/etc/letsencrypt/live` for anyone but root) is
   left to the service, which runs as root and mounts it, or refuses it when it is not
@@ -328,7 +338,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.networks.*` | yes |  |
 | `services.*.networks.*.aliases` | yes |  |
 | `services.*.networks.*.driver_opts` and below | ignored | driver options are docker's; nspawn attaches a machine its own way |
-| `services.*.networks.*.gw_priority` | yes |  |
+| `services.*.networks.*.gw_priority` | partly | the machine routes through the first network that is not internal, in the order priority gives |
 | `services.*.networks.*.interface_name` | ignored | nspawn names the interfaces of a machine host0, host1 and on |
 | `services.*.networks.*.ipv4_address` | yes |  |
 | `services.*.networks.*.ipv6_address` | ignored | nspawn networks are IPv4 only |
@@ -511,9 +521,9 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `create --yes` | yes |  |
 | `down` | yes |  |
 | `down --remove-orphans` | yes |  |
-| `down --rmi` | yes |  |
+| `down --rmi` | partly | the images are known from the files: without them none is removed |
 | `down --timeout` | yes |  |
-| `down --volumes` | yes |  |
+| `down --volumes` | partly | named volumes are known from the files: without them only the anonymous ones go |
 | `events` | yes |  |
 | `events --json` | yes |  |
 | `events --since` | yes |  |
@@ -579,7 +589,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `rm --all` | ignored | deprecated, as in docker compose: one-off machines stay |
 | `rm --force` | yes |  |
 | `rm --stop` | yes |  |
-| `rm --volumes` | partly | nspawn has no anonymous volumes |
+| `rm --volumes` | yes |  |
 | `run` | yes |  |
 | `run --build` | yes |  |
 | `run --cap-add` | yes |  |
@@ -618,7 +628,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `stats --no-trunc` | yes |  |
 | `stop` | yes |  |
 | `stop --timeout` | yes |  |
-| `top` | yes |  |
+| `top` | partly | the columns are SERVICE, #, PID, USER, TIME and COMMAND: no PPID, C, STIME or TTY |
 | `unpause` | yes |  |
 | `up` | yes |  |
 | `up --abort-on-container-exit` | yes |  |
@@ -642,7 +652,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `up --quiet-build` | yes |  |
 | `up --quiet-pull` | yes |  |
 | `up --remove-orphans` | yes |  |
-| `up --renew-anon-volumes` | partly | nspawn has no anonymous volumes |
+| `up --renew-anon-volumes` | yes |  |
 | `up --scale` | yes |  |
 | `up --timeout` | yes |  |
 | `up --timestamps` | yes |  |

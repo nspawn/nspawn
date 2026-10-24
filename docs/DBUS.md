@@ -186,6 +186,7 @@ given is remembered for the machine.
 | `command` | as | replaces an app's cmd |
 | `image_command` | b | forgets the remembered entrypoint and command and runs the image's own |
 | `env`, `volume`, `label` | as | `VAR=value` or `VAR`; `SOURCE:TARGET[:ro]`; `KEY=VALUE` on top of the image's labels |
+| `unset_env` | as | `CreateMachine` only: variables of the image's the machine goes without |
 | `restart` | s | no, on-failure[:N], always or unless-stopped |
 | `memory`, `pids_limit`, `memory_swap`, `cpus` | t, t, x, d | as in the record; 0 removes a limit |
 | `health_cmd`, `health_test` | s, as | the probe through the image's shell, or the whole test (`["CMD", ARGV...]` runs without a shell) |
@@ -264,7 +265,7 @@ error that says so.
 | `CopyFrom(s machine, s path, a{sv} options) -> (h, o)` | `cp NAME:PATH ...` | a tar stream of `path` on the pipe, owners as the machine sees them, and a job with the outcome; a running machine, or a stopped overlay or flat one; options: none |
 | `CopyTo(s machine, s path, h stream, a{sv} options) -> o` | `cp ... NAME:PATH` | the tar stream read from `stream` unpacked at `path` by `cp`'s rules (see USAGE.md), everything root's inside; option contents (b: the source was `DIR/.`); a job |
 | `Events(a{sv} options) -> (a{sh}, o)` | `events` | options since, until (journalctl's time syntax; without until it follows, and until needs since), filters (as: name= or machine=, type=, event= or action=, label=KEY or KEY=VALUE); under "stdout" one JSON event per line (see Events), journalctl's complaints under "stderr", and a process object for its end; a user other than root holds 64 streams at once at most |
-| `Logs(s machine, a{sv} options) -> (a{sh}, o)` | `logs` | options follow, lines, since, until (journalctl's time syntax; with until nothing is followed), timestamps, all, inside; journalctl's "stdout" and "stderr" and a process object for its exit status. Lines from before the machine was created (a removed machine of the same name) are left out; a local machine's lines come from nspawn's journal namespace and the system's journal interleaved; journalctl is stopped once nobody reads its output. A machine whose log_driver is none is refused unless inside is set |
+| `Logs(s machine, a{sv} options) -> (a{sh}, o)` | `logs` | options follow, lines, since, until (journalctl's time syntax; with until nothing is followed), timestamps, all, inside, json (b: journalctl's JSON entries, one a line, for a client that writes each line's time itself); journalctl's "stdout" and "stderr" and a process object for its exit status. Lines from before the machine was created (a removed machine of the same name) are left out; a local machine's lines come from nspawn's journal namespace and the system's journal interleaved; journalctl is stopped once nobody reads its output. A machine whose log_driver is none is refused unless inside is set |
 
 `StartMachine` waits for a booted machine's init and `StopMachine` for the
 machine to be gone, which can take longer than a client's default timeout

@@ -38,6 +38,9 @@ pub struct CreateRequest {
     pub entrypoint: Option<String>,
     /// VAR=value or VAR (copied from the environment).
     pub env: Vec<String>,
+    /// Variables of the image's that the machine goes without, as the engine drops one a
+    /// container's environment names without a value.
+    pub unset_env: Vec<String>,
     /// SOURCE:TARGET[:ro].
     pub volume: Vec<String>,
     /// KEY=VALUE labels on top of the image's.
@@ -318,7 +321,14 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         origin: installed.origin,
         mode: installed.mode,
         pid1: installed.pid1,
-        run: installed.run,
+        run: {
+            let mut run = installed.run;
+            run.env.retain(|v| {
+                let name = v.split_once('=').map_or(v.as_str(), |(k, _)| k);
+                !request.unset_env.iter().any(|u| u == name)
+            });
+            run
+        },
         signed_by: installed.signed_by,
         signed_at: installed.signed_at,
         ..draft

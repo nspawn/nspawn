@@ -285,7 +285,8 @@ pub fn read(args: &[String]) -> Line {
         message,
         help: false,
     };
-    let line = match cobra::parse(&compose, args) {
+    let mut notices = Vec::new();
+    let line = match cobra::parse_noting(&compose, args, &mut notices) {
         cobra::Outcome::Run(line) => line,
         cobra::Outcome::Help(path) => return Line::Help(path),
         cobra::Outcome::Fail(message) => return error(message),
@@ -308,9 +309,12 @@ pub fn read(args: &[String]) -> Line {
         .chain(line);
     match crate::cli::Cli::try_parse_from(argv) {
         Ok(crate::cli::Cli {
-            command: crate::cli::Command::Compose(args),
+            command: crate::cli::Command::Compose(mut args),
             ..
-        }) => Line::Run(Box::new(args)),
+        }) => {
+            args.notices = notices;
+            Line::Run(Box::new(args))
+        }
         Ok(_) => unreachable!("the line starts with compose"),
         Err(e) => error(e.to_string().trim_end().to_string()),
     }
@@ -402,6 +406,9 @@ pub fn execute(
     out: &mut dyn Write,
     log: &dyn Log,
 ) -> Result<(), String> {
+    for notice in &args.notices {
+        log.warn(notice.clone());
+    }
     let requested = cli::requested(args);
     for &(command, name) in &requested {
         if let Some(Support::Refused(text)) = support::option(command, name) {
@@ -442,7 +449,10 @@ pub fn execute(
             notes();
             engine::execute(args, host, &flags, log, out)
         }
+        // The root command's RunE: its PersistentPreRunE runs first, so a flag it refuses
+        // fails before the help.
         None => {
+            pre_run(args, host, log)?;
             notes();
             help(&[]);
             Ok(())
@@ -479,6 +489,7 @@ fn pre_run(
         project_directory: args.project_directory.clone().unwrap_or_default(),
         env_files,
         profiles: args.profile.clone(),
+        ansi: String::new(),
     };
     options::compose_env_from_files(&flags, &mut host.env, &host.cwd, &mut warn)?;
     let mut ansi = args.ansi.clone().unwrap_or_else(|| "auto".to_string());
@@ -497,6 +508,7 @@ fn pre_run(
     if let Some(v) = host.env.get("COMPOSE_ANSI") {
         ansi.clone_from(v);
     }
+    flags.ansi.clone_from(&ansi);
     let progress = args
         .progress
         .clone()

@@ -10,6 +10,10 @@ use clap::{Args, Subcommand};
                   docs/COMPOSE.md has what is supported."
 )]
 pub struct ComposeArgs {
+    /// The warnings reading the command line gave (a deprecated flag name), which the
+    /// command says first.
+    #[arg(skip)]
+    pub notices: Vec<String>,
     /// Compose configuration files.
     #[arg(short = 'f', long = "file", value_name = "FILE")]
     pub file: Vec<String>,
@@ -279,8 +283,13 @@ pub fn requested(args: &ComposeArgs) -> Vec<(&'static str, &'static str)> {
             flag(command, "builder", c.builder.is_some());
             flag(command, "check", c.check);
             flag(command, "print", c.print);
-            flag(command, "provenance", c.provenance.is_some());
-            flag(command, "sbom", c.sbom.is_some());
+            // Asking for none is what the builder does.
+            let wanted = |v: &Option<String>| {
+                v.as_deref()
+                    .is_some_and(|v| !crate::cli::attestation_off(v))
+            };
+            flag(command, "provenance", wanted(&c.provenance));
+            flag(command, "sbom", wanted(&c.sbom));
             flag(command, "ssh", c.ssh.is_some());
             flag(command, "compress", c.compress.is_some());
             flag(command, "force-rm", c.force_rm.is_some());

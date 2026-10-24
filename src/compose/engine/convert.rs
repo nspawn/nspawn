@@ -24,6 +24,9 @@ pub struct Spec<'a> {
     pub image_cmd: Vec<String>,
     /// The env files the project was given, for its label.
     pub env_files: Vec<String>,
+    /// That image's VOLUME paths, which get an anonymous volume each unless the service
+    /// mounts something there.
+    pub image_volumes: Vec<String>,
 }
 
 /// What a machine takes: the options, and what to see to first.
@@ -36,6 +39,25 @@ pub struct Made {
     pub host_paths: Vec<String>,
     /// Ports published without a host port, which took a free one of the host.
     pub ephemeral: Vec<String>,
+    /// The machine's anonymous volumes, made before it is: named after it and their path,
+    /// they are there again when it is made anew.
+    pub anonymous: Vec<String>,
+}
+
+/// The name of an anonymous volume: the machine's, and a digest of the path it is
+/// mounted at.
+pub fn anonymous_volume(machine: &str, target: &str) -> String {
+    use sha2::Digest as _;
+    let digest = hex::encode(sha2::Sha256::digest(target.as_bytes()));
+    format!("{machine}_anon_{}", &digest[..12])
+}
+
+/// Whether a volume is one of `machine`'s anonymous ones.
+pub fn anonymous_of(machine: &str, volume: &str) -> bool {
+    volume
+        .strip_prefix(machine)
+        .and_then(|rest| rest.strip_prefix("_anon_"))
+        .is_some_and(|hash| hash.len() == 12 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 fn s<'a>(map: &'a Map, key: &str) -> &'a str {
@@ -196,11 +218,8 @@ pub fn service_networks(service: &Map) -> Vec<(String, Option<Map>)> {
                 .collect()
         })
         .unwrap_or_default();
-    let priority = |v: &Option<Map>| {
-        v.as_ref()
-            .and_then(|m| int(m.get("gw_priority")).or_else(|| int(m.get("priority"))))
-            .unwrap_or(0)
-    };
+    // NetworksByPriority: priority alone orders them, the highest first, then by name.
+    let priority = |v: &Option<Map>| v.as_ref().and_then(|m| int(m.get("priority"))).unwrap_or(0);
     networks.sort_by(|a, b| priority(&b.1).cmp(&priority(&a.1)).then(a.0.cmp(&b.0)));
     networks
 }
@@ -256,6 +275,7 @@ pub fn options(spec: &Spec) -> Result<Made> {
         notes: Vec::new(),
         host_paths: Vec::new(),
         ephemeral: Vec::new(),
+        anonymous: Vec::new(),
     };
     network(spec, service, &mut made)?;
     platform(spec, service, &mut made);
@@ -264,7 +284,7 @@ pub fn options(spec: &Spec) -> Result<Made> {
     secrets(spec, service, &mut made);
     program(spec, service, &mut made);
     limits(service, &mut made);
-    health(service, &mut made);
+    health(service, &mut made)?;
     settings(spec, service, &mut made);
     labels(spec, service, &mut made)?;
     Ok(made)
@@ -381,6 +401,15 @@ fn ports(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
     if spec.oneoff {
         return Ok(());
     }
+    // A machine on the host's network has its ports there already: the engine drops
+    // what is published and starts it all the same.
+    if s(service, "network_mode") == "host" {
+        if !seq(service, "ports").is_empty() {
+            made.notes
+                .push("Published ports are discarded when using host network mode".to_string());
+        }
+        return Ok(());
+    }
     let mut publish = Vec::new();
     for port in seq(service, "ports") {
         let Some(port) = port.as_map() else { continue };
@@ -467,10 +496,9 @@ fn volumes(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
             "volume" => {
                 let source = s(volume, "source");
                 if source.is_empty() {
-                    made.notes.push(format!(
-                        "service {:?}: {target} has no source: on nspawn its data lives in the machine and goes with it",
-                        spec.service
-                    ));
+                    let name = anonymous_volume(&spec.name, target);
+                    binds.push(format!("{name}:{target}{ro}"));
+                    made.anonymous.push(name);
                     continue;
                 }
                 match volume_device(project, source)? {
@@ -501,6 +529,22 @@ fn volumes(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
                 "service {:?}: a volume of type {other} is not supported",
                 spec.service
             ),
+        }
+    }
+    // The image's VOLUME paths that nothing of the service covers: an anonymous volume
+    // each, as the engine gives a container.
+    for path in &spec.image_volumes {
+        let path = crate::volume::mount_point(path);
+        let covered = binds
+            .iter()
+            .any(|b| b.split(':').nth(1).map(crate::volume::mount_point) == Some(path.clone()))
+            || tmpfs
+                .iter()
+                .any(|t| crate::volume::mount_point(t.split(':').next().unwrap_or("")) == path);
+        if !covered {
+            let name = anonymous_volume(&spec.name, &path);
+            binds.push(format!("{name}:{path}"));
+            made.anonymous.push(name);
         }
     }
     // use_api_socket: the Docker API socket where its clients look for it, unless the
@@ -555,10 +599,28 @@ fn secrets(spec: &Spec, service: &Map, made: &mut Made) {
             if !file.is_empty() {
                 binds.push(format!("{file}:{target}:ro"));
             } else {
-                secrets.push(format!(
-                    "{}:{target}",
-                    secret_name(&project.name, kind, source)
-                ));
+                // createTar: the file written with the mode, 0444 by default, and the
+                // owner asked for, root's by default.
+                let name = secret_name(&project.name, kind, source);
+                let mode = int(entry.get("mode"));
+                let (uid, gid) = (s(entry, "uid"), s(entry, "gid"));
+                if mode.is_none() && uid.is_empty() && gid.is_empty() {
+                    secrets.push(format!("{name}:{target}"));
+                } else {
+                    let or_root = |id: &str| {
+                        if id.is_empty() {
+                            "0".to_string()
+                        } else {
+                            id.to_string()
+                        }
+                    };
+                    secrets.push(format!(
+                        "{name}:{target}:{:o}:{}:{}",
+                        mode.unwrap_or(0o444),
+                        or_root(uid),
+                        or_root(gid)
+                    ));
+                }
             }
         }
     }
@@ -596,15 +658,20 @@ fn program(spec: &Spec, service: &Map, made: &mut Made) {
         put_list(&mut made.options, "command", strings(command));
     }
     let mut env = Vec::new();
+    // A variable with no value takes the image's away.
+    let mut unset = Vec::new();
     if let Some(environment) = sub(service, "environment") {
         for (k, v) in environment {
-            if !v.is_null() {
+            if v.is_null() {
+                unset.push(k.clone());
+            } else {
                 env.push(format!("{k}={v}"));
             }
         }
     }
     let _ = spec;
     put_list(&mut made.options, "env", env);
+    put_list(&mut made.options, "unset_env", unset);
 }
 
 fn limits(service: &Map, made: &mut Made) {
@@ -644,18 +711,29 @@ fn limits(service: &Map, made: &mut Made) {
     }
 }
 
-fn health(service: &Map, made: &mut Made) {
+fn health(service: &Map, made: &mut Made) -> Result<()> {
     let Some(hc) = sub(service, "healthcheck") else {
-        return;
+        return Ok(());
     };
+    // ToMobyHealthCheck: moby/moby#48874.
+    if hc.contains_key("start_interval") && !hc.contains_key("start_period") {
+        bail!("healthcheck.start_interval requires healthcheck.start_period to be set");
+    }
     let test = strings(seq(hc, "test"));
     if hc.get("disable") == Some(&Value::Bool(true)) || test.first().is_some_and(|t| t == "NONE") {
         put(&mut made.options, "no_healthcheck", true);
-        return;
+        return Ok(());
     }
     match test.first().map(String::as_str) {
-        Some("CMD-SHELL") => {
-            put(&mut made.options, "health_cmd", test[1..].join(" "));
+        // The script through the shell; words after it are its $0, $1 and on, as the
+        // engine appends them to `sh -c`.
+        Some("CMD-SHELL") if test.len() == 2 => {
+            put(&mut made.options, "health_cmd", test[1].clone());
+        }
+        Some("CMD-SHELL") if test.len() > 2 => {
+            let mut argv = vec!["CMD".to_string(), "/bin/sh".to_string(), "-c".to_string()];
+            argv.extend(test[1..].iter().cloned());
+            put_list(&mut made.options, "health_test", argv);
         }
         // The exec form runs without a shell, which an image may not have.
         Some("CMD") => {
@@ -677,6 +755,7 @@ fn health(service: &Map, made: &mut Made) {
     if let Some(retries) = int(hc.get("retries")) {
         put(&mut made.options, "health_retries", retries.max(0) as u32);
     }
+    Ok(())
 }
 
 fn settings(spec: &Spec, service: &Map, made: &mut Made) {
@@ -1094,6 +1173,7 @@ pub(crate) mod tests {
             image_digest: "sha256:abc".to_string(),
             image_cmd: vec!["nginx".into(), "-g".into(), "daemon off;".into()],
             env_files: Vec::new(),
+            image_volumes: Vec::new(),
         })
         .unwrap()
     }
@@ -1583,6 +1663,140 @@ services:
     }
 
     #[test]
+    fn anonymous_volumes_are_the_machine_s_own_and_cover_the_image_s() {
+        let p = project(
+            "anon",
+            "services:\n  db:\n    image: postgres\n    volumes:\n      - /var/lib/postgresql/data\n      - logs:/var/log\nvolumes:\n  logs: {}\n",
+        );
+        let made = options(&Spec {
+            project: &p,
+            service: "db",
+            number: 1,
+            name: "anon-db-1".to_string(),
+            oneoff: false,
+            image_digest: String::new(),
+            image_cmd: Vec::new(),
+            env_files: Vec::new(),
+            image_volumes: vec![
+                "/var/lib/postgresql/data".to_string(),
+                "/srv//cache/".to_string(),
+                "/var/log".to_string(),
+            ],
+        })
+        .unwrap();
+        let data = anonymous_volume("anon-db-1", "/var/lib/postgresql/data");
+        let cache = anonymous_volume("anon-db-1", "/srv/cache");
+        // The file's anonymous one, its named one, and the image's VOLUME nothing covers.
+        assert_eq!(
+            list(&made, "volume"),
+            [
+                format!("{data}:/var/lib/postgresql/data"),
+                format!("{}_logs:/var/log", p.name),
+                format!("{cache}:/srv/cache"),
+            ]
+        );
+        assert_eq!(made.anonymous, [data.clone(), cache]);
+        // The same name for the same machine and path, which a recreate finds again.
+        assert_eq!(
+            data,
+            anonymous_volume("anon-db-1", "/var/lib/postgresql/data")
+        );
+        assert!(anonymous_of("anon-db-1", &data));
+        assert!(!anonymous_of("anon-db-10", &data));
+        assert!(!anonymous_of("anon-db-1", "anon-db-1_anon_notahexvalue"));
+        crate::volume::validate_volume_name(&data).unwrap();
+    }
+
+    #[test]
+    fn ports_of_a_machine_on_the_host_network_are_dropped_with_a_word() {
+        let p = project(
+            "hostports",
+            "services:\n  web:\n    image: nginx\n    network_mode: host\n    ports: [\"8080:80\"]\n",
+        );
+        let web = made(&p, "web", 1);
+        assert!(list(&web, "publish").is_empty());
+        assert_eq!(
+            web.notes,
+            ["Published ports are discarded when using host network mode"]
+        );
+    }
+
+    #[test]
+    fn a_secret_from_the_file_s_content_keeps_its_mode_and_owner() {
+        let p = project(
+            "secretmode",
+            "services:\n  web:\n    image: nginx\n    secrets:\n      - source: token\n        mode: 0400\n        uid: \"101\"\n      - source: plain\n    configs:\n      - source: conf\n        target: /etc/app.conf\n        gid: \"5\"\nsecrets:\n  token: {environment: HOME}\n  plain: {environment: HOME}\nconfigs:\n  conf: {content: x}\n",
+        );
+        let web = made(&p, "web", 1);
+        let name = |kind: &str, key: &str| secret_name(&p.name, kind, key);
+        assert_eq!(
+            list(&web, "secrets"),
+            [
+                format!("{}:/run/secrets/token:400:101:0", name("secret", "token")),
+                format!("{}:/run/secrets/plain", name("secret", "plain")),
+                format!("{}:/etc/app.conf:444:0:5", name("config", "conf")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_variable_with_no_value_takes_the_image_s_away() {
+        let p = project(
+            "unsetenv",
+            "services:\n  web:\n    image: nginx\n    environment:\n      KEEP: \"1\"\n      NGINX_VERSION: null\n",
+        );
+        let web = made(&p, "web", 1);
+        assert_eq!(list(&web, "env"), ["KEEP=1"]);
+        assert_eq!(list(&web, "unset_env"), ["NGINX_VERSION"]);
+    }
+
+    #[test]
+    fn a_healthcheck_is_taken_as_the_engine_takes_it() {
+        let shell = |test: &str| {
+            let p = project(
+                "hcshell",
+                &format!(
+                    "services:\n  web:\n    image: nginx\n    healthcheck:\n      test: {test}\n"
+                ),
+            );
+            made(&p, "web", 1)
+        };
+        let one = shell("[CMD-SHELL, \"curl -f localhost\"]");
+        assert_eq!(
+            one.options.get("health_cmd"),
+            Some(&Bus::from("curl -f localhost"))
+        );
+        // Words after the script are its arguments, not more of it.
+        let more = shell("[CMD-SHELL, \"exit $0\", \"3\"]");
+        assert_eq!(
+            list(&more, "health_test"),
+            ["CMD", "/bin/sh", "-c", "exit $0", "3"]
+        );
+        let p = project(
+            "hcinterval",
+            "services:\n  web:\n    image: nginx\n    healthcheck:\n      test: [CMD, \"true\"]\n      start_interval: 1s\n",
+        );
+        let spec = Spec {
+            project: &p,
+            service: "web",
+            number: 1,
+            name: "web".to_string(),
+            oneoff: false,
+            image_digest: String::new(),
+            image_cmd: Vec::new(),
+            env_files: Vec::new(),
+            image_volumes: Vec::new(),
+        };
+        assert_eq!(
+            options(&spec).err().map(|e| e.to_string()),
+            Some(
+                "healthcheck.start_interval requires healthcheck.start_period to be set"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
     fn depends_on_stays_compose_s_own() {
         let p = project(
             "deps",
@@ -1601,6 +1815,7 @@ services:
             image_digest: String::new(),
             image_cmd: Vec::new(),
             env_files: Vec::new(),
+            image_volumes: Vec::new(),
         })
         .unwrap();
         // The machine knows nothing of depends_on: no --depends-on ties web to db at

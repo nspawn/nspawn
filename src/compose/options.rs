@@ -11,7 +11,7 @@ use super::gostr;
 use super::loader::{self, ConfigFile, Details, Options, Warn};
 use super::paths;
 
-/// The flags that make a project.
+/// The flags that make a project, and the ANSI mode the output takes.
 #[derive(Debug, Clone, Default)]
 pub struct Flags {
     pub files: Vec<String>,
@@ -19,6 +19,9 @@ pub struct Flags {
     pub project_directory: String,
     pub env_files: Vec<String>,
     pub profiles: Vec<String>,
+    /// --ansi, never with --no-ansi, COMPOSE_ANSI of the environment or an env file
+    /// over either.
+    pub ansi: String,
 }
 
 const DEFAULT_FILES: &[&str] = &[

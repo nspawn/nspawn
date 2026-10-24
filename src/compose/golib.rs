@@ -181,6 +181,15 @@ const HOUR: i64 = 60 * MINUTE;
 /// go-str2duration's ParseDuration: Go's durations with days (`d`) and weeks (`w`).
 /// Its arithmetic wraps as Go's does, and an overflow is caught where Go catches it.
 pub fn parse_duration(original: &str) -> Result<i64, String> {
+    durations(original, true)
+}
+
+/// time.ParseDuration: units up to hours, without go-str2duration's days and weeks.
+pub fn parse_go_duration(original: &str) -> Result<i64, String> {
+    durations(original, false)
+}
+
+fn durations(original: &str, days: bool) -> Result<i64, String> {
     let invalid = || format!("time: invalid duration \"{original}\"");
     let mut s = original.as_bytes();
     let mut negative = false;
@@ -258,8 +267,8 @@ pub fn parse_duration(original: &str) -> Result<i64, String> {
             "s" => SECOND,
             "m" => MINUTE,
             "h" => HOUR,
-            "d" => 24 * HOUR,
-            "w" => 168 * HOUR,
+            "d" if days => 24 * HOUR,
+            "w" if days => 168 * HOUR,
             _ => {
                 return Err(format!(
                     "time: unknown unit \"{unit_text}\" in duration \"{original}\""

@@ -417,8 +417,9 @@ fn tzset(s: &str, sec: i64) -> Option<(i64, String)> {
 /// date in one of the forms it tries (in the zone of `offset` when it names none), or
 /// Unix seconds; as `seconds[.nanoseconds]`.
 pub fn get_timestamp(value: &str, now: f64, offset: i64) -> Result<String, String> {
+    // GetTimestamp reads a duration with time.ParseDuration: no days or weeks.
     if value != "0" {
-        if let Ok(nanos) = super::golib::parse_duration(value) {
+        if let Ok(nanos) = super::golib::parse_go_duration(value) {
             return Ok(format!("{}", (now - nanos as f64 / 1e9).floor() as i64));
         }
     }
@@ -487,8 +488,14 @@ fn parse_layout(
         if b.get(at) != Some(&b'T') {
             return None;
         }
-        hour = num(at + 1, 2)?;
-        at += 3;
+        // stdHour: one digit or two.
+        let width = b[(at + 1).min(b.len())..]
+            .iter()
+            .take(2)
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        hour = num(at + 1, width.max(1))?;
+        at += 1 + width;
         if parts > 1 {
             if b.get(at) != Some(&b':') {
                 return None;
@@ -503,19 +510,24 @@ fn parse_layout(
             sec = num(at + 1, 2)?;
             at += 3;
         }
-        if fraction {
-            if b.get(at) != Some(&b'.') {
-                return None;
-            }
-            let digits = b[at + 1..]
+        // A fraction of the seconds after them, written with a period or a comma, of
+        // any length: parseNanoseconds keeps nine digits.
+        let marked = matches!(b.get(at), Some(b'.' | b','));
+        let digits = if marked {
+            b[at + 1..]
                 .iter()
                 .take_while(|c| c.is_ascii_digit())
-                .count();
-            if digits == 0 || digits > 9 {
-                return None;
-            }
-            let text = std::str::from_utf8(&b[at + 1..at + 1 + digits]).ok()?;
-            nanos = text.parse::<u32>().ok()? * 10u32.pow(9 - digits as u32);
+                .count()
+        } else {
+            0
+        };
+        if fraction && digits == 0 {
+            return None;
+        }
+        if digits > 0 {
+            let kept = digits.min(9);
+            let text = std::str::from_utf8(&b[at + 1..at + 1 + kept]).ok()?;
+            nanos = text.parse::<u32>().ok()? * 10u32.pow(9 - kept as u32);
             at += 1 + digits;
         }
         if hour > 23 || min > 59 || sec > 59 {
@@ -701,6 +713,19 @@ mod tests {
         );
         assert!(at("2024-13-01").is_err());
         assert!(at("10 min ago").is_err());
+        // time.ParseDuration has no days or weeks.
+        assert!(at("2d").is_err());
+        assert!(at("1w").is_err());
+        // time.Parse: an hour of one digit, a fraction of any length or after a comma.
+        assert_eq!(at("2024-10-24T9:00:00Z").unwrap(), "1729760400.000000000");
+        assert_eq!(
+            at("2024-10-24T12:00:00.1234567891Z").unwrap(),
+            "1729771200.123456789"
+        );
+        assert_eq!(
+            at("2024-10-24T12:00:00,5Z").unwrap(),
+            "1729771200.500000000"
+        );
     }
 
     #[test]
