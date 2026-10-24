@@ -50,3 +50,14 @@ anything:
   pass and its workflows belong to that repository: write the content, leave
   those alone.
 - Documentation and messages are plain ASCII English without emojis.
+- Code, comments, help texts and documentation say what nspawn does. Another
+  tool (docker, docker compose, BuildKit, Podman and the like) is named only
+  where it is strictly needed: the name of a real thing (Docker Hub, a
+  Dockerfile, the DOCKER-USER chain), a format or interface nspawn reads or
+  serves (the Docker Engine API, compose files), or the upstream source a port
+  follows, which src/build/upstream/SOURCE records. No comparisons with it
+  otherwise.
+- Code, comments, help texts and documentation describe the code as it is,
+  never an earlier version of it: no "before", "as before", "previously", "no
+  longer", "used to", "like we did" or "now does". What changed belongs in
+  commit messages and release notes.
