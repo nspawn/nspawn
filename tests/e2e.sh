@@ -345,6 +345,8 @@ for backend in overlay flat mstack; do
   grep -q "NOTIFY_SOCKET" /etc/systemd/nspawn/$name.nspawn && fail "a booted machine lost systemd-nspawn's notify socket: $(grep NOTIFY_SOCKET /etc/systemd/nspawn/$name.nspawn)"
   step "images ls"
   $NSPAWN images ls | tee /tmp/e2e-img.txt
+  # images alone is the list.
+  [ "$($NSPAWN images)" = "$(cat /tmp/e2e-img.txt)" ] || fail "images alone does not print what images ls does: $($NSPAWN images 2>&1 | head -3)"
   grep -q "^ *$name " /tmp/e2e-img.txt || fail "$name not listed"
   grep "^ *$name " /tmp/e2e-img.txt | grep_q "$backend" || fail "$name backend not shown"
   $NSPAWN images ls --json | python3 -c "import json,sys; d = [i for i in json.load(sys.stdin) if i['name'] == '$name']; assert d and d[0]['backend'] == '$backend', d" || fail "images ls --json misses $name or its backend"

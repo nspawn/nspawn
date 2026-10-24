@@ -692,7 +692,8 @@ The names are all the service hands out without asking polkit, so this works for
 user and under `sudo` without a password; secrets are not completed. Flags come once
 the word starts with `-`, or where there is no name to offer.
 
-`ps`, `machines ls`, `images ls`, `network ls`, `volume ls` and `secret ls` take
+`ps`, `machines ls`, `images ls` (or `images` alone), `network ls`, `volume ls` and
+`secret ls` take
 `--json` and print what the service answered instead of a table (so do `system df`,
 `stats`, `events`, `auto-update` and `builder du`), and `nspawn inspect NAME...` prints
 the whole record of machines or images (running or not) as a JSON array, like docker

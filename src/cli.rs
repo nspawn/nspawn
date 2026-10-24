@@ -923,9 +923,13 @@ pub struct PushArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct ImagesArgs {
     #[command(subcommand)]
-    pub command: ImagesCommand,
+    pub command: Option<ImagesCommand>,
+    /// The options of the list, which images alone prints.
+    #[command(flatten)]
+    pub ls: OutputArgs,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1603,6 +1607,29 @@ mod tests {
             "and says what it is"
         );
         assert!(man.contains(".SH SYNOPSIS"), "with the usual sections");
+    }
+
+    #[test]
+    fn images_alone_lists_them() {
+        let images = |argv: &[&str]| match Cli::try_parse_from(argv).map(|c| c.command) {
+            Ok(Command::Images(a)) => Ok(a),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e.kind()),
+        };
+        let alone = images(&["nspawn", "images"]).unwrap();
+        assert!(alone.command.is_none() && !alone.ls.json);
+        assert!(images(&["nspawn", "images", "--json"]).unwrap().ls.json);
+        let ls = images(&["nspawn", "images", "ls", "--json"]).unwrap();
+        assert!(matches!(
+            ls.command,
+            Some(ImagesCommand::Ls(OutputArgs { json: true }))
+        ));
+        assert!(matches!(
+            images(&["nspawn", "images", "rm", "web"]).unwrap().command,
+            Some(ImagesCommand::Rm(_))
+        ));
+        // A flag of the list belongs before no subcommand.
+        assert!(images(&["nspawn", "images", "--json", "rm", "web"]).is_err());
     }
 
     #[test]

@@ -625,7 +625,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             );
             Ok(())
         }
-        Command::Images(args) => match args.command {
+        Command::Images(args) => match args.command.unwrap_or(ImagesCommand::Ls(args.ls)) {
             ImagesCommand::Ls(output) => {
                 let images = manager.list_images().await.map_err(client::error)?;
                 if output.json {
