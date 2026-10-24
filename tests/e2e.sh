@@ -2744,10 +2744,16 @@ RULE
   closed=$(mktemp -d /tmp/e2e-closed.XXXXXX); chmod 700 "$closed"; echo "closed-$nonce" > "$closed/cert.pem"
   cbind=$(mktemp -d /tmp/e2e-cbind.XXXXXX); chown "$who" "$cbind"
   printf 'services:\n  w:\n    image: %s\n    command: ["sleep", "300"]\n    volumes: ["%s/cert.pem:/cert.pem:ro"]\n' "$busybox_ref" "$closed" > "$cbind/compose.yaml"
+  # What compose pulls goes after the step: a copy of busybox left behind would hold the
+  # blobs the progress step downloads again on the next run.
+  images_before=$($NSPAWN images ls | awk 'NR > 1 {print $1}' | sort)
   out=$(cd "$cbind" && sudo -u "$who" $NSPAWN compose -p e2e-cbind up -d 2>&1) || fail "compose up as $who with a bind under a directory only root reads: $out"
   [ "$($NSPAWN exec e2e-cbind-w-1 -- cat /cert.pem </dev/null | tr -d '\r')" = "closed-$nonce" ] || fail "the machine does not see the file under the closed directory"
   [ -f "$closed/cert.pem" ] || fail "the file under the closed directory is not a file any more"
   (cd "$cbind" && sudo -u "$who" $NSPAWN compose -p e2e-cbind down >/dev/null 2>&1) || fail "compose down as $who"
+  for m in $(comm -13 <(echo "$images_before") <($NSPAWN images ls | awk 'NR > 1 {print $1}' | sort)); do
+    $NSPAWN images rm "$m" >/dev/null 2>&1 || fail "images rm $m, which compose pulled"
+  done
   rm -rf "$closed" "$cbind"
   rm -f "$rules"
   retry 5 bash -c "! sudo -u $who $NSPAWN ps >/dev/null 2>&1" || fail "$who can still list machines after the rule went"
