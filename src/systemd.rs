@@ -177,9 +177,8 @@ impl Systemd {
             .unwrap_or_else(UnitState::unknown))
     }
 
-    /// Enables a machine's unit at boot the way `machinectl enable` does: the unit and
-    /// machines.target, which pulls it in. Returns whether anything changed, i.e. whether
-    /// a daemon-reload is due.
+    /// Enables a machine's unit at boot: the unit and machines.target, which pulls it in.
+    /// Returns whether anything changed, i.e. whether a daemon-reload is due.
     pub async fn enable_unit(&self, unit: &str) -> Result<bool> {
         let (_, changes) = self
             .manager
@@ -193,8 +192,9 @@ impl Systemd {
         Ok(!changes.is_empty())
     }
 
-    /// Undoes `enable_unit` for the machine's unit (machines.target stays, as machinectl
-    /// leaves it). Unknown units are not an error. Returns whether anything changed.
+    /// Undoes `enable_unit` for the machine's unit (machines.target stays: other machines
+    /// may still be enabled). Unknown units are not an error. Returns whether anything
+    /// changed.
     pub async fn disable_unit(&self, unit: &str) -> Result<bool> {
         match self
             .manager
@@ -471,7 +471,7 @@ impl Systemd {
             .with_context(|| format!("signalling {name}"))
     }
 
-    /// Asks the machine to power off cleanly (SIGRTMIN+4 to its init, like machinectl poweroff).
+    /// Asks the machine to power off cleanly (SIGRTMIN+4 to its init).
     pub async fn poweroff_machine(&self, name: &str) -> Result<()> {
         self.machined
             .kill_machine(name.to_string(), "leader".to_string(), libc::SIGRTMIN() + 4)

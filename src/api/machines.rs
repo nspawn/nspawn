@@ -767,8 +767,8 @@ pub async fn prepare(
             );
         }
     }
-    // Named volumes are made on first use; a host path must exist, as with podman: the
-    // service does not make directories anywhere on the host.
+    // Named volumes are made on first use; a host path must exist: the service does not
+    // make directories anywhere on the host.
     if record.backend == BackendChoice::Overlay {
         crate::backend::mount_root(sd, store, name).await?;
     }
@@ -933,9 +933,8 @@ pub async fn prepare(
     }
     // A booted machine's systemd sets the hostname from /etc/hostname, over the one
     // systemd-nspawn set: --hostname goes in as that file. A machine that takes the
-    // Docker API gets it from a directory named after its container ID, as docker binds
-    // it: the tools reading the socket find their own container by that line of their
-    // mountinfo.
+    // Docker API gets it from a directory named after its container ID: the tools
+    // reading the socket find their own container by that line of their mountinfo.
     let hostname_file = if record.takes_api_socket() {
         let id = crate::dockerapi::util::container_id(name, record.created);
         let ids = store.machine_files_dir(name).join("docker");
@@ -1285,9 +1284,8 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     let patient = crate::api::dependencies::waits(&store.list_images()?, &args.name);
     // The unit's own hooks take the lock; it must be free while the unit starts.
     drop(lock);
-    // always and unless-stopped enable the unit, as machinectl enable does. It is only
-    // disabled when the policy changes away from those, so that a unit an administrator
-    // enabled stays enabled.
+    // always and unless-stopped enable the unit. It is only disabled when the policy
+    // changes away from those, so that a unit an administrator enabled stays enabled.
     if let Some(policy) = policy {
         let changed = if policy.enabled_at_boot() {
             sd.enable_unit(&unit).await?

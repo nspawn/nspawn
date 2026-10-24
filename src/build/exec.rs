@@ -86,7 +86,8 @@ struct State {
 
 impl State {
     /// What the stage holds, for the keys of steps that take files from it: its layers'
-    /// contents, as BuildKit keys a copy from a stage by the files it copies.
+    /// contents: a copy from a stage is keyed by the files it takes, not by the steps
+    /// that made them.
     fn made(&self) -> String {
         let parts: Vec<&[u8]> = self
             .config
@@ -488,8 +489,7 @@ impl<'a> Builder<'a> {
         }
         let history = std::mem::take(&mut state.config.history);
         let rootfs = std::mem::take(&mut state.config.rootfs);
-        // The base image's author stays unless MAINTAINER names another, as BuildKit
-        // keeps it.
+        // The base image's author stays unless MAINTAINER names another.
         let base_author = state.config.author.take();
         state.config = dispatched.config.clone();
         state.config.history = history;
@@ -1168,7 +1168,7 @@ impl<'a> Builder<'a> {
             shm_size: req.shm_size,
             ulimits: req.ulimits.clone(),
         };
-        // The working directory is the reference's to make, as runc makes it.
+        // A working directory that is not there is made: the step's --chdir needs it.
         let workdir = copy::root_path(merged, &step.workdir)?;
         if !workdir.exists() {
             std::fs::create_dir_all(&workdir)?;
@@ -1567,7 +1567,7 @@ fn short(digest: &str) -> String {
         .collect()
 }
 
-/// BuildKit's limits on what a stream of a step prints: 200 KiB a second since it started,
+/// The limits on what a stream of a step prints: 200 KiB a second since it started,
 /// 2 MiB in all. Past them the output is dropped, said once each time, until it is within
 /// them again; from the first line dropped on, the last 256 KiB are kept, shown if the step
 /// fails.
@@ -1850,9 +1850,9 @@ const STEP_LINES_IN_TRANSIT: usize = 1024;
 /// One output stream of a step, read to its end a line at a time, as bytes (a line that is
 /// no UTF-8 is still a line), and what the clip lets through sent on; the clip comes back,
 /// with the tail a failure shows. A step printing faster than its lines are taken waits on
-/// its pipe, and that wait is no time of the step's: BuildKit's clip goes by the time the
-/// step took to write, as nothing holds its output back, so counting it would let a step
-/// print more the slower its lines are shown.
+/// its pipe, and that wait is no time of the step's: the clip goes by the time the step
+/// took to write, so counting it would let a step print more the slower its lines are
+/// shown.
 async fn pump(
     stream: impl tokio::io::AsyncRead + Unpin,
     tx: tokio::sync::mpsc::Sender<String>,

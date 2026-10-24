@@ -1,5 +1,5 @@
-//! Registry credentials. `nspawn login` keeps them in /etc/nspawn/auth.json, the auth.json
-//! format podman and skopeo use, and that file is the only one consulted: the service
+//! Registry credentials. `nspawn login` keeps them in /etc/nspawn/auth.json, in the
+//! containers-auth.json format, and that file is the only one consulted: the service
 //! answers many callers and has no home of theirs to look into. Everything is looked up
 //! by registry host.
 

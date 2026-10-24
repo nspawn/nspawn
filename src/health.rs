@@ -148,7 +148,7 @@ fn usec(value: u64) -> Duration {
 pub struct Overrides {
     /// --health-cmd: a shell line.
     pub cmd: Option<String>,
-    /// The whole test, as compose writes it: ["CMD", argv...] runs without a shell.
+    /// The whole test: ["CMD", argv...] runs without a shell.
     pub test: Option<Vec<String>>,
     pub interval: Option<u64>,
     pub timeout: Option<u64>,

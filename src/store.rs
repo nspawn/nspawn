@@ -1493,7 +1493,7 @@ pub fn extract_layer(
             continue;
         }
         let header = entry.header();
-        // Malformed numeric fields are treated as root, like GNU tar does.
+        // Malformed numeric fields are treated as root.
         let uid = header.uid().unwrap_or(0) as u32;
         let gid = header.gid().unwrap_or(0) as u32;
         let file_mode = header.mode().unwrap_or(0o644) & 0o7777;
@@ -1574,9 +1574,9 @@ pub fn extract_layer(
         }
         count += 1;
     }
-    // In the order of the entries, a directory given twice taking its last time, as
-    // containerd sets them; each reached from the target with no symlink on its way,
-    // since later entries may have put one there that leads out of it.
+    // In the order of the entries, a directory given twice taking its last time; each
+    // reached from the target with no symlink on its way, since later entries may have
+    // put one there that leads out of it.
     if !dir_times.is_empty() {
         if let Ok(root_fd) = nix::fcntl::open(
             target,
@@ -1629,8 +1629,8 @@ fn set_mtime(path: &Path, mtime: i64) {
 }
 
 /// A hard link of a layer, made to the name it gives: to a symlink itself when that
-/// name is one, as containerd links it, where tar's unpack follows the symlink and
-/// fails on one that leads outside the layer. Whether one was made.
+/// name is one, where tar's unpack follows the symlink and fails on one that leads
+/// outside the layer. Whether one was made.
 fn hard_link_in<R: Read>(target: &Path, path: &Path, entry: &tar::Entry<R>) -> Result<bool> {
     let source = entry
         .link_name()?
@@ -2863,8 +2863,8 @@ mod tests {
             "img"
         );
         store.remove_record("aaa").unwrap();
-        // A reference recorded under Docker Hub's old name is found by the name docker
-        // reads it as.
+        // A reference recorded under Docker Hub's old name is found by its name under
+        // docker.io.
         let mut old = rec.clone();
         old.name = "nginx".to_string();
         old.reference = "index.docker.io/library/nginx:latest".to_string();

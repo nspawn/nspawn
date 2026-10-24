@@ -268,8 +268,8 @@ impl Protocol {
 /// A published port, -p [IP:]HOST:CONTAINER[/udp], an IPv6 IP in brackets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortMap {
-    /// None: every address of the host, IPv4 and IPv6, as docker publishes a port given
-    /// no IP. 0.0.0.0 is every IPv4 address alone and :: every IPv6 one, as with docker.
+    /// None: every address of the host, IPv4 and IPv6. 0.0.0.0 is every IPv4 address
+    /// alone and :: every IPv6 one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip: Option<IpAddr>,
     pub host: u16,
@@ -307,9 +307,8 @@ impl PortMap {
     }
 }
 
-/// Where ports are published, docker's way: each on 0.0.0.0 or its IPv4 address, and
-/// on :: or its IPv6 address where the host has IPv6 (`ipv6`), as the port proxy
-/// listens there.
+/// Where ports are published: each on 0.0.0.0 or its IPv4 address, and on :: or its
+/// IPv6 address where the host has IPv6 (`ipv6`), as the port proxy listens there.
 pub fn bindings(ports: &[PortMap], ipv6: bool) -> Vec<PortMap> {
     let mut out = Vec::new();
     for p in ports {
@@ -377,7 +376,7 @@ impl FromStr for PortMap {
             "udp" => Protocol::Udp,
             other => bail!("{text}: unknown protocol {other} (tcp or udp)"),
         };
-        // [IPv6]:HOST:CONTAINER, as docker writes an IPv6 address.
+        // [IPv6]:HOST:CONTAINER: the brackets keep the address's colons apart.
         let (bracketed, ports) = match ports.strip_prefix('[') {
             Some(rest) => {
                 let (ip, after) = rest

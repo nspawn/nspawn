@@ -32,31 +32,31 @@ pub struct Cli {
 pub enum Command {
     /// Query the hub (OCI registry).
     Hub(HubArgs),
-    /// Find images on the hub and on Docker Hub, like docker search.
+    /// Find images on the hub and on Docker Hub.
     Search(SearchArgs),
-    /// Keep credentials for a registry (the hub by default), like docker login.
+    /// Keep credentials for a registry (the hub by default).
     Login(LoginArgs),
     /// Forget the credentials of a registry.
     Logout(LogoutArgs),
     /// Download an image from the hub and make it available to machinectl.
     Pull(PullArgs),
-    /// Make a machine from an image and start it, like docker run -d: a local image with
-    /// that reference is reused, the hub is asked otherwise.
+    /// Make a machine from an image and start it: a local image with that reference is
+    /// reused, the hub is asked otherwise.
     Run(RunArgs),
-    /// Build an image from a Dockerfile, like docker build, or with mkosi from an mkosi
-    /// configuration, and make it available locally, ready to push.
+    /// Build an image from a Dockerfile, or with mkosi from an mkosi configuration, and
+    /// make it available locally, ready to push.
     Build(BuildArgs),
-    /// Make another machine from a local image, like docker create (no registry needed).
+    /// Make another machine from a local image (no registry needed).
     Create(CreateArgs),
     /// Upload a local image to the hub.
     Push(PushArgs),
-    /// Manage local images.
+    /// Manage local images; without a subcommand, list them.
     Images(ImagesArgs),
     /// Manage running machines.
     Machines(MachinesArgs),
-    /// List running machines, like docker ps (same as machines ls).
+    /// List running machines (same as machines ls).
     Ps(PsArgs),
-    /// Everything nspawn knows about machines or images, as JSON, like docker inspect.
+    /// Everything nspawn knows about machines or images, as JSON.
     Inspect(InspectArgs),
     /// Print the nspawn commands that make machines again, on another host or this one:
     /// run -d with every flag a machine keeps, after the networks it joins and the
@@ -66,53 +66,52 @@ pub enum Command {
     Start(StartArgs),
     /// Power off running machines.
     Stop(StopArgs),
-    /// Stop machines and start them again, like docker restart.
+    /// Stop machines and start them again.
     Restart(RestartArgs),
-    /// Send a signal to running machines, like docker kill (SIGKILL stops them for good).
+    /// Send a signal to running machines (SIGKILL, the default, stops them for good).
     Kill(KillArgs),
-    /// Freeze running machines, every process in them, like docker pause.
+    /// Freeze running machines, every process in them.
     Pause(NamesArgs),
     /// Let paused machines run again.
     Unpause(NamesArgs),
-    /// The processes of a running machine, like docker top.
+    /// The processes of a running machine.
     Top(TopArgs),
-    /// Wait for machines to stop and print each one's exit code, like docker wait.
+    /// Wait for machines to stop and print each one's exit code.
     Wait(WaitArgs),
-    /// The ports a running machine publishes, like docker port.
+    /// The ports a running machine publishes.
     Port(PortArgs),
-    /// Change the restart policy and limits of machines, like docker update; a running
-    /// machine gets the limits at once.
+    /// Change the restart policy and limits of machines; a running machine gets the
+    /// limits at once.
     Update(UpdateArgs),
-    /// What running machines use: CPU, memory, network, disk, processes, like docker stats.
+    /// What running machines use: CPU, memory, network, disk, processes.
     Stats(StatsArgs),
     /// Give the machines labelled org.nspawn.auto-update=registry the image their
-    /// reference names now, like podman auto-update: each is made anew with every option
-    /// it had, and put back when it does not come up (healthy, with a healthcheck).
+    /// reference names now: each is made anew with every option it had, and put back
+    /// when it does not come up (healthy, with a healthcheck).
     AutoUpdate(AutoUpdateArgs),
-    /// What happens to machines, networks, volumes and secrets, as it happens, like docker
-    /// events.
+    /// What happens to machines, networks, volumes and secrets, as it happens.
     Events(EventsArgs),
-    /// Remove machines and what they alone use, like docker rm (same as images rm).
+    /// Remove machines and what they alone use (same as images rm).
     Rm(RmArgs),
     /// Run a command inside a running machine.
     Exec(ExecArgs),
     /// Open an interactive shell inside a running machine.
     Shell(ShellArgs),
-    /// Show what a machine printed, like docker logs.
+    /// Show what a machine printed.
     Logs(LogsArgs),
-    /// Copy files between the host and a machine, like docker cp.
+    /// Copy files between the host and a machine.
     Cp(CpArgs),
     /// The bridge network shared by the machines.
     Network(NetworkArgs),
-    /// Manage named volumes (-v NAME:/path), like docker volume.
+    /// Manage named volumes (-v NAME:/path).
     Volume(VolumeArgs),
-    /// Manage secrets (--secret NAME), like docker secret: kept encrypted for this host.
+    /// Manage secrets (--secret NAME), kept encrypted for this host.
     Secret(SecretArgs),
-    /// What nspawn keeps on disk, and its prune, like docker system.
+    /// What nspawn keeps on disk, and its prune.
     System(SystemArgs),
-    /// The cache of Dockerfile builds, like docker builder.
+    /// The cache of Dockerfile builds.
     Builder(BuilderArgs),
-    /// Run docker compose files on nspawn machines, with docker compose's commands.
+    /// Run docker compose files on nspawn machines.
     Compose(crate::compose::cli::ComposeArgs),
     /// Serve org.nspawn on the system bus (started by the bus; see --install).
     Daemon(DaemonArgs),
@@ -123,7 +122,7 @@ pub enum Command {
     #[command(hide = true)]
     HealthRun { name: String },
     /// From nspawn-api@NAME.socket: serves the Docker API on the socket a machine mounts
-    /// as docker's.
+    /// from /var/run/docker.sock or /run/docker.sock.
     #[command(hide = true)]
     ApiServe { name: String },
     /// ExecStartPre of a machine with --depends-on: waits until the other machines are
@@ -182,7 +181,7 @@ pub struct NetworkCreateArgs {
     /// ports; they reach each other and the host.
     #[arg(long)]
     pub internal: bool,
-    /// Label the network, KEY=VALUE, like docker network create --label. Repeatable.
+    /// Label the network, KEY=VALUE. Repeatable.
     #[arg(long, value_name = "KEY=VALUE")]
     pub label: Vec<String>,
 }
@@ -201,8 +200,8 @@ pub enum NetworkCommand {
     /// List the networks: the default one (bridge) and those made with network create.
     #[command(alias = "list")]
     Ls(OutputArgs),
-    /// Make a network of its own for some machines, like docker network create: they
-    /// reach each other by name, and machines on other networks do not reach them.
+    /// Make a network of its own for some machines: they reach each other by name, and
+    /// machines on other networks do not reach them.
     Create(NetworkCreateArgs),
     /// The networks with their machines, addresses and published ports, as JSON.
     Inspect {
@@ -217,8 +216,8 @@ pub enum NetworkCommand {
         #[arg(required = true, add = candidates(Kind::Network))]
         names: Vec<String>,
     },
-    /// Join a machine to a network, like docker network connect: a running one at once,
-    /// with an interface of its own on it.
+    /// Join a machine to a network: a running one at once, with an interface of its own
+    /// on it.
     Connect {
         /// Network name.
         #[arg(add = candidates(Kind::Network))]
@@ -233,8 +232,7 @@ pub enum NetworkCommand {
         #[arg(long, value_name = "ADDRESS")]
         ip: Option<String>,
     },
-    /// Take a machine off a network, like docker network disconnect: a running one at
-    /// once.
+    /// Take a machine off a network: a running one at once.
     Disconnect {
         /// Network name.
         #[arg(add = candidates(Kind::Network))]
@@ -316,7 +314,7 @@ pub enum SecretCommand {
         /// Read the content from this file instead of standard input.
         #[arg(long, short = 'f', value_name = "FILE")]
         file: Option<std::path::PathBuf>,
-        /// Label the secret, KEY=VALUE, like docker secret create --label. Repeatable.
+        /// Label the secret, KEY=VALUE. Repeatable.
         #[arg(long, short = 'l', value_name = "KEY=VALUE")]
         label: Vec<String>,
     },
@@ -413,8 +411,7 @@ pub struct PullArgs {
     #[arg(long, short = 'f')]
     pub force: bool,
     /// Skip the signature check: the hub's images are signed and refused without a valid
-    /// signature, and nspawn.toml can ask the same of other registries; like docker's
-    /// --disable-content-trust.
+    /// signature, and nspawn.toml can ask the same of other registries.
     #[arg(long)]
     pub no_verify: bool,
 }
@@ -431,18 +428,18 @@ pub struct CreateArgs {
     #[arg(long, value_enum, default_value_t = BackendChoice::Auto)]
     pub backend: BackendChoice,
     /// Network of the new machine: bridge, veth, host, none, container:NAME (that
-    /// machine's network, as docker's) or a network made with network create;
+    /// machine's network) or a network made with network create;
     /// repeatable to join several bridge networks, the first one primary (default: the
     /// source's kind; a network made with network create is not inherited).
     #[arg(long, value_name = "NETWORK", add = candidates(Kind::NetworkChoice))]
     pub network: Vec<String>,
-    /// Another name for the machine on a network, like docker --network-alias: NAME on
-    /// its primary network, or NETWORK=NAME. Repeatable.
+    /// Another name for the machine on a network: NAME on its primary network, or
+    /// NETWORK=NAME. Repeatable.
     #[arg(long, value_name = "[NETWORK=]NAME")]
     pub network_alias: Vec<String>,
-    /// A fixed IPv4 address on the primary network, like docker --ip (NETWORK=IP for
-    /// another network it joins): one made with network create, inside its subnet, and
-    /// nobody else's. Remembered.
+    /// A fixed IPv4 address on the primary network (NETWORK=IP for another network it
+    /// joins): one made with network create, inside its subnet, and nobody else's.
+    /// Remembered.
     #[arg(long, value_name = "[NETWORK=]IP")]
     pub ip: Vec<String>,
     /// Ports to publish on the host, like start -p.
@@ -452,51 +449,50 @@ pub struct CreateArgs {
     #[arg(long, short = 'f')]
     pub force: bool,
     /// Skip the signature check of an image that has to be pulled (a local source is not
-    /// checked); like docker's --disable-content-trust.
+    /// checked).
     #[arg(long)]
     pub no_verify: bool,
     /// Replace the image's entrypoint; an empty string runs the arguments alone.
     #[arg(long, value_name = "PROGRAM")]
     pub entrypoint: Option<String>,
-    /// Environment for the program, VAR=value or VAR (copied from here), like docker -e.
+    /// Environment for the program, VAR=value or VAR (copied from here).
     #[arg(long, short = 'e', value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
-    /// Mount a host directory or a named volume, SOURCE:TARGET[:ro], like docker -v.
+    /// Mount a host directory or a named volume, SOURCE:TARGET[:ro].
     #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]", value_hint = clap::ValueHint::AnyPath)]
     pub volume: Vec<String>,
-    /// Read variables from a file of VAR=value lines, like docker --env-file: no quoting
-    /// or expansion, a VAR alone copied from here; -e comes after and wins. Repeatable.
+    /// Read variables from a file of VAR=value lines: no quoting or expansion, a VAR
+    /// alone copied from here; -e comes after and wins. Repeatable.
     #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
     pub env_file: Vec<std::path::PathBuf>,
-    /// Read labels from a file of KEY=VALUE lines, like docker --label-file; --label comes
-    /// after and wins. Repeatable.
+    /// Read labels from a file of KEY=VALUE lines; --label comes after and wins.
+    /// Repeatable.
     #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
     pub label_file: Vec<std::path::PathBuf>,
-    /// A mount in docker's long form, type=bind|volume|tmpfs,source=...,target=...[,readonly]
+    /// A mount in long form, type=bind|volume|tmpfs,source=...,target=...[,readonly]
     /// (tmpfs-size, tmpfs-mode): -v or --tmpfs written out. Repeatable.
     #[arg(long, value_name = "type=TYPE,source=SRC,target=DST")]
     pub mount: Vec<String>,
-    /// Label the machine, KEY=VALUE, like docker --label; the image's own labels stay
-    /// underneath. Repeatable and remembered; "none" forgets them.
+    /// Label the machine, KEY=VALUE; the image's own labels stay underneath.
+    /// Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'l', value_name = "KEY=VALUE")]
     pub label: Vec<String>,
-    /// Restart policy, like docker --restart: no, on-failure[:N] (the count is not kept),
+    /// Restart policy: no, on-failure[:N] (the count is not kept),
     /// always (also starts it at
     /// boot) or unless-stopped (like always, until nspawn stop). Remembered; applied at
     /// the next start.
     #[arg(long, value_name = "POLICY", value_parser = crate::policy::RestartParser)]
     pub restart: Option<crate::policy::Restart>,
-    /// Memory limit of the whole machine, like docker -m: 512m, 2g, and as much swap
-    /// again unless --memory-swap says otherwise; 0 removes it. Remembered; applied at the
-    /// next start.
+    /// Memory limit of the whole machine: 512m, 2g, and as much swap again unless
+    /// --memory-swap says otherwise; 0 removes it. Remembered; applied at the next start.
     #[arg(long, short = 'm', value_name = "SIZE", value_parser = crate::policy::parse_memory)]
     pub memory: Option<u64>,
-    /// Memory and swap together, like docker --memory-swap: a size of at least --memory
-    /// (equal to it, no swap), or -1 for swap without a bound; 0 goes back to as much swap
-    /// again as memory. Remembered; applied at the next start.
+    /// Memory and swap together: a size of at least --memory (equal to it, no swap), or -1
+    /// for swap without a bound; 0 goes back to as much swap again as memory. Remembered;
+    /// applied at the next start.
     #[arg(long, value_name = "SIZE", allow_hyphen_values = true, value_parser = crate::policy::parse_memory_swap)]
     pub memory_swap: Option<i64>,
-    /// CPU limit of the whole machine, like docker --cpus: 0.5, 2; 0 removes it.
+    /// CPU limit of the whole machine: 0.5, 2; 0 removes it.
     /// Remembered; applied at the next start.
     #[arg(long, value_name = "N", value_parser = crate::policy::parse_cpus)]
     pub cpus: Option<f64>,
@@ -509,20 +505,20 @@ pub struct CreateArgs {
     #[command(flatten)]
     pub tuning: TuningArgs,
     /// For app images: the arguments after -- replace the image's cmd and follow its
-    /// entrypoint, as with docker.
+    /// entrypoint.
     #[arg(last = true)]
     pub command: Vec<String>,
 }
 
-/// docker's other per-container flags; remembered, each one given replacing what the
-/// machine had.
+/// The other per-machine flags; remembered, each one given replacing what the machine
+/// had.
 #[derive(Args, Debug, Default, Clone)]
 pub struct TuningArgs {
     /// Hostname inside the machine (default: its name).
     #[arg(long, value_name = "NAME")]
     pub hostname: Option<String>,
     /// User the program runs as, instead of the image's: USER or USER:GROUP, each a
-    /// name or a number of the image, as docker takes them.
+    /// name or a number of the image.
     #[arg(long, short = 'u', value_name = "USER[:GROUP]")]
     pub user: Option<String>,
     /// Working directory of the program, instead of the image's.
@@ -536,7 +532,7 @@ pub struct TuningArgs {
     /// Capability to drop from the default set. Repeatable; "none" forgets them.
     #[arg(long, value_name = "CAP")]
     pub cap_drop: Vec<String>,
-    /// Every capability, like docker --privileged (--privileged=false takes it back).
+    /// Every capability (--privileged=false takes it back).
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", value_name = "BOOL")]
     pub privileged: Option<bool>,
     /// Mount the machine's root read-only (--read-only=false takes it back).
@@ -546,17 +542,16 @@ pub struct TuningArgs {
     /// "none" forgets them.
     #[arg(long, value_name = "PATH[:OPTIONS]")]
     pub tmpfs: Vec<String>,
-    /// Size of /dev/shm, like docker: 64m, 1g; 0 for the default.
+    /// Size of /dev/shm: 64m, 1g; 0 for the default.
     #[arg(long, value_name = "SIZE", value_parser = crate::policy::parse_size)]
     pub shm_size: Option<u64>,
-    /// A device node of the host for the machine, HOST[:CONTAINER[:PERMISSIONS]], like
-    /// docker --device, or a CDI device of the host's specs (nvidia.com/gpu=all).
-    /// Repeatable; "none" forgets them.
+    /// A device node of the host for the machine, HOST[:CONTAINER[:PERMISSIONS]], or a
+    /// CDI device of the host's specs (nvidia.com/gpu=all). Repeatable; "none" forgets
+    /// them.
     #[arg(long, value_name = "HOST[:CONTAINER[:rwm]]", value_hint = clap::ValueHint::AnyPath)]
     pub device: Vec<String>,
-    /// GPUs from the CDI spec of their vendor, like docker --gpus: all, a count, or
-    /// device=0,1 (nvidia-ctk cdi generate writes NVIDIA's). Repeatable; "none" forgets
-    /// them.
+    /// GPUs from the CDI spec of their vendor: all, a count, or device=0,1 (nvidia-ctk
+    /// cdi generate writes NVIDIA's). Repeatable; "none" forgets them.
     #[arg(long, value_name = "REQUEST")]
     pub gpus: Vec<String>,
     /// A network interface of the host, moved into the machine while it runs and given
@@ -575,8 +570,8 @@ pub struct TuningArgs {
     /// on the machine's network. Repeatable; "none" forgets them.
     #[arg(long, value_name = "HOST:IP")]
     pub add_host: Vec<String>,
-    /// A resource limit of the program, NAME=SOFT[:HARD], like docker --ulimit
-    /// (nofile=1024:4096). Repeatable; "none" forgets them.
+    /// A resource limit of the program, NAME=SOFT[:HARD] (nofile=1024:4096). Repeatable;
+    /// "none" forgets them.
     #[arg(long, value_name = "NAME=SOFT[:HARD]")]
     pub ulimit: Vec<String>,
     /// OOM score adjustment of the machine, -1000 to 1000.
@@ -586,7 +581,7 @@ pub struct TuningArgs {
     #[arg(long, value_name = "SIGNAL")]
     pub stop_signal: Option<String>,
     /// Seconds `stop` waits after the signal before SIGKILL, unless -t says otherwise; a
-    /// negative number waits for as long as the program takes, as docker's -1.
+    /// negative number waits for as long as the program takes.
     #[arg(long, value_name = "SECONDS", allow_negative_numbers = true)]
     pub stop_timeout: Option<i64>,
     /// How systemd-nspawn sets the machine's /etc/localtime at each start: auto (its
@@ -594,28 +589,27 @@ pub struct TuningArgs {
     /// bind, symlink or delete. Remembered.
     #[arg(long, value_name = "MODE", value_parser = ["auto", "off", "copy", "bind", "symlink", "delete"])]
     pub timezone: Option<String>,
-    /// Where the program's output goes, like docker --log-driver: local (the default, a
-    /// journal of nspawn's own, apart from the system's, which logs and an attached run
-    /// read), journal (the system's journal) or none (dropped; an attached run still shows
-    /// it, straight from the program, and logs has nothing). Remembered.
+    /// Where the program's output goes: local (the default, a journal of nspawn's own,
+    /// apart from the system's, which logs and an attached run read), journal (the
+    /// system's journal) or none (dropped; an attached run still shows it, straight from
+    /// the program, and logs has nothing). Remembered.
     #[arg(long, value_name = "DRIVER", value_parser = ["local", "journal", "none"])]
     pub log_driver: Option<String>,
     /// Run an app's program under an init that reaps orphans and turns a stop into
-    /// SIGTERM (systemd-nspawn's stub init), like docker --init; --init=false makes the
-    /// program PID 1 of the machine, as docker runs it. Without it, PID 1 only for images
-    /// that ask for it (s6-overlay). Remembered.
+    /// SIGTERM (systemd-nspawn's stub init); --init=false makes the program PID 1 of the
+    /// machine. Without it, PID 1 only for images that ask for it (s6-overlay).
+    /// Remembered.
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", value_name = "BOOL")]
     pub init: Option<bool>,
     /// A net.* sysctl for an app machine's network namespace, KEY=VALUE. Repeatable;
     /// "none" forgets them.
     #[arg(long, value_name = "KEY=VALUE")]
     pub sysctl: Vec<String>,
-    /// A secret (nspawn secret create) as a read-only file inside the machine, like
-    /// docker's --secret: NAME alone is /run/secrets/NAME with mode 0444, root's.
-    /// Repeatable; "none" forgets them.
+    /// A secret (nspawn secret create) as a read-only file inside the machine: NAME alone
+    /// is /run/secrets/NAME with mode 0444, root's. Repeatable; "none" forgets them.
     #[arg(long, value_name = "NAME[:TARGET[:MODE[:UID:GID]]]")]
     pub secret: Vec<String>,
-    /// Another machine to start first, like compose's depends_on: started (the default),
+    /// Another machine to start first, and what to wait for: started (the default),
     /// healthy (its healthcheck passes) or completed (its program ended with 0); with
     /// :optional a failure of it is a warning. systemd follows it at boot as well.
     /// Repeatable; "none" forgets them.
@@ -623,14 +617,14 @@ pub struct TuningArgs {
     pub depends_on: Vec<String>,
 }
 
-/// docker's --health-* flags, on top of the image's HEALTHCHECK; remembered.
+/// The --health-* flags, on top of the image's HEALTHCHECK; remembered.
 #[derive(Args, Debug, Default, Clone)]
 pub struct HealthArgs {
     /// Command that says whether the machine is healthy, run inside it through /bin/sh
-    /// -c at every --health-interval, like docker --health-cmd: exit 0 is healthy.
+    /// -c at every --health-interval: exit 0 is healthy.
     #[arg(long, value_name = "COMMAND")]
     pub health_cmd: Option<String>,
-    /// Time between probes, like docker: 10s, 1m30s, 500ms (default 30s).
+    /// Time between probes: 10s, 1m30s, 500ms (default 30s).
     #[arg(long, value_name = "DURATION", value_parser = crate::health::parse_duration)]
     pub health_interval: Option<u64>,
     /// Time a probe may take before it counts as failed (default 30s).
@@ -677,11 +671,11 @@ pub struct BuildArgs {
     pub mkosi: MkosiArgs,
 }
 
-/// The flags of a Dockerfile build, as docker build takes them.
+/// The flags of a Dockerfile build.
 #[derive(Args, Debug, Default)]
 pub struct DockerfileArgs {
-    /// The Dockerfile, like docker build -f (default: Dockerfile, dockerfile or
-    /// Containerfile in the context); - reads it from standard input.
+    /// The Dockerfile (default: Dockerfile, dockerfile or Containerfile in the
+    /// context); - reads it from standard input.
     #[arg(long, short = 'f', value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     pub file: Option<String>,
     /// A build argument, KEY=VALUE, or KEY to take it from the environment. Repeatable.
@@ -717,7 +711,7 @@ pub struct DockerfileArgs {
     /// the caller. Repeatable.
     #[arg(long, value_name = "id=ID[,src=PATH]")]
     pub secret: Vec<String>,
-    /// Size of /dev/shm in RUN steps, like docker: 64m, 1g.
+    /// Size of /dev/shm in RUN steps: 64m, 1g.
     #[arg(long, value_name = "SIZE", value_parser = crate::policy::parse_size)]
     pub shm_size: Option<u64>,
     /// A resource limit of RUN steps, NAME=SOFT[:HARD]. Repeatable.
@@ -765,8 +759,8 @@ pub struct DockerfileArgs {
     pub provenance: Option<String>,
     #[arg(long, hide = true)]
     pub attest: Vec<String>,
-    /// docker build's (buildx's) compatibility flags, which Makefiles still give:
-    /// accepted and ignored, as buildx ignores them, three of them with its warning.
+    /// Flags of older builders that Makefiles still give: accepted and ignored, three of
+    /// them with a warning.
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", hide = true)]
     pub rm: Option<bool>,
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", hide = true)]
@@ -820,7 +814,7 @@ impl DockerfileArgs {
             || self.no_verify
     }
 
-    /// The flags of docker build nspawn's builder has no counterpart of.
+    /// The build flags nspawn's builder takes by name but has no counterpart of.
     pub fn refused(&self) -> Option<&'static str> {
         [
             (
@@ -939,9 +933,8 @@ pub enum ImagesCommand {
     Ls(OutputArgs),
     /// Remove local images (and the layers nobody uses any more).
     Rm(ImagesRmArgs),
-    /// Remove images no machine uses, like docker image prune: with -a every image no
-    /// machine was made from; without, the dangling ones, which nspawn's store has none
-    /// of.
+    /// Remove images no machine uses: with -a every image no machine was made from;
+    /// without, the dangling ones, which nspawn's store has none of.
     Prune(ImagesPruneArgs),
 }
 
@@ -966,10 +959,9 @@ pub struct SystemArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum SystemCommand {
-    /// What images, machines and volumes take on disk, like docker system df.
+    /// What images, machines and volumes take on disk.
     Df(SystemDfArgs),
-    /// Remove stopped machines, unused networks and, with -a, unused images, like docker
-    /// system prune.
+    /// Remove stopped machines, unused networks and, with -a, unused images.
     Prune(SystemPruneArgs),
 }
 
@@ -988,7 +980,7 @@ pub struct SystemPruneArgs {
     /// Every image no machine was made from, not only the dangling ones.
     #[arg(long, short = 'a')]
     pub all: bool,
-    /// Anonymous volumes too, as docker takes it: nspawn has none.
+    /// Anonymous volumes too, which nspawn has none of: accepted with a note.
     #[arg(long)]
     pub volumes: bool,
     /// Do not ask.
@@ -1007,8 +999,7 @@ pub struct BuilderArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum BuilderCommand {
-    /// Remove build cache, like docker builder prune: without -a what no image takes
-    /// too.
+    /// Remove build cache: without -a, only what no image takes too.
     Prune(BuilderPruneArgs),
     /// What the build cache holds, most recently used first.
     Du(BuilderDuArgs),
@@ -1057,7 +1048,7 @@ pub struct RmArgs {
     /// Machine names.
     #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
-    /// Stop a running machine first (SIGKILL, like docker rm -f) instead of refusing.
+    /// Stop a running machine first (SIGKILL) instead of refusing.
     #[arg(long, short = 'f')]
     pub force: bool,
 }
@@ -1179,20 +1170,20 @@ pub struct PsArgs {
     /// Also list nspawn images that are not running.
     #[arg(long, short = 'a')]
     pub all: bool,
-    /// Only the names, one per line, as docker ps -q gives IDs.
+    /// Only the names, one per line.
     #[arg(long, short = 'q')]
     pub quiet: bool,
-    /// Only matching machines, like docker ps --filter: name, label, status, network,
-    /// ancestor, health, exited, volume, publish, expose, id, before, since. Repeatable:
-    /// the same key matches either value, different keys must all match.
+    /// Only matching machines: name, label, status, network, ancestor, health, exited,
+    /// volume, publish, expose, id, before, since. Repeatable: the same key matches either
+    /// value, different keys must all match.
     #[arg(long = "filter", short = 'f', value_name = "KEY=VALUE")]
     pub filters: Vec<String>,
-    /// A Go template over docker's fields (.Names, .Image, .Status, .Ports, .Label "k",
-    /// ...) and nspawn's (.Mode, .Address, .OS), "table TEMPLATE" for a table, or json.
+    /// A Go template over each machine's fields (.Names, .Image, .Status, .Ports, .Label
+    /// "k", .Mode, .Address, .OS, ...), "table TEMPLATE" for a table, or json.
     #[arg(long, value_name = "FORMAT")]
     pub format: Option<String>,
-    /// Give --format's .Command, .Mounts and .Image whole, which are cut as docker ps
-    /// cuts them otherwise.
+    /// Give --format's .Command, .Mounts and .Image whole, which are cut otherwise: the
+    /// command to 20 columns, each mount to 15, the image without its digest.
     #[arg(long)]
     pub no_trunc: bool,
     #[command(flatten)]
@@ -1212,8 +1203,8 @@ pub struct InspectArgs {
     /// Machine or image names.
     #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
-    /// A Go template over each object, like docker inspect -f: '{{.state}}',
-    /// '{{json .labels}}'; the keys are the ones inspect prints.
+    /// A Go template over each object: '{{.state}}', '{{json .labels}}'; the keys are
+    /// the ones inspect prints.
     #[arg(long, short = 'f', value_name = "FORMAT")]
     pub format: Option<String>,
 }
@@ -1237,7 +1228,7 @@ pub struct StartArgs {
     #[arg(long)]
     pub image_command: bool,
     /// For app images: the arguments after -- replace the image's cmd and follow its
-    /// entrypoint, as with docker. Remembered for later starts.
+    /// entrypoint. Remembered for later starts.
     #[arg(last = true)]
     pub command: Vec<String>,
 }
@@ -1277,29 +1268,27 @@ pub struct RunArgs {
     #[arg(long, short = 'f')]
     pub force: bool,
     /// Skip the signature check: the hub's images are signed and refused without a valid
-    /// signature, and nspawn.toml can ask the same of other registries; like docker's
-    /// --disable-content-trust.
+    /// signature, and nspawn.toml can ask the same of other registries.
     #[arg(long)]
     pub no_verify: bool,
-    /// Start it in the background and return, like docker run -d; without it the
-    /// output follows until the machine ends and run exits with its exit code.
+    /// Start it in the background and return; without it the output follows until the
+    /// machine ends and run exits with its exit code.
     #[arg(long, short = 'd')]
     pub detach: bool,
-    /// Remove the machine when it ends (named volumes stay), like docker run --rm.
+    /// Remove the machine when it ends (named volumes stay).
     #[arg(long)]
     pub rm: bool,
-    /// Give the program of an app this standard input, like docker run -i.
+    /// Give the program of an app this standard input.
     #[arg(long, short = 'i')]
     pub interactive: bool,
-    /// Give the program of an app a terminal, like docker run -t; -it on a booted
-    /// image opens a shell once it is up, and leaving it powers the machine off.
+    /// Give the program of an app a terminal; -it on a booted image opens a shell once
+    /// it is up, and leaving it powers the machine off.
     #[arg(long, short = 't')]
     pub tty: bool,
     #[command(flatten)]
     pub options: StartOptions,
-    /// For app images, as with docker run: what follows the image replaces its cmd
-    /// and follows its entrypoint (run -it alpine sh); after -- as well. Remembered for
-    /// later starts.
+    /// For app images: what follows the image replaces its cmd and follows its
+    /// entrypoint (run -it alpine sh); after -- as well. Remembered for later starts.
     #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 }
@@ -1314,71 +1303,69 @@ pub struct StartOptions {
     /// Network of the machine, remembered for the image: bridge (the default network),
     /// veth (systemd-networkd on the host, booted images), host (the host's own
     /// network), none (no network), container:NAME (the network of that running
-    /// machine, as docker's --network container:) or the name of a network made with
-    /// network create; repeatable to join several bridge networks, the first one primary.
+    /// machine) or the name of a network made with network create; repeatable to join
+    /// several bridge networks, the first one primary.
     #[arg(long, value_name = "NETWORK", add = candidates(Kind::NetworkChoice))]
     pub network: Vec<String>,
-    /// Another name for the machine on a network, like docker --network-alias: NAME on
-    /// its primary network, or NETWORK=NAME. Repeatable and remembered; "none" forgets
-    /// them.
+    /// Another name for the machine on a network: NAME on its primary network, or
+    /// NETWORK=NAME. Repeatable and remembered; "none" forgets them.
     #[arg(long, value_name = "[NETWORK=]NAME")]
     pub network_alias: Vec<String>,
-    /// A fixed IPv4 address on the primary network, like docker --ip (NETWORK=IP for
-    /// another network it joins): one made with network create, inside its subnet, and
-    /// nobody else's. Remembered.
+    /// A fixed IPv4 address on the primary network (NETWORK=IP for another network it
+    /// joins): one made with network create, inside its subnet, and nobody else's.
+    /// Remembered.
     #[arg(long, value_name = "[NETWORK=]IP")]
     pub ip: Vec<String>,
-    /// Publish a port on the host, like docker -p: HOST:CONTAINER[/udp] on every IPv4 and
-    /// IPv6 address of the host, IP:HOST:CONTAINER on one (0.0.0.0 every IPv4 address,
-    /// [::] every IPv6 one, an IPv6 address in brackets), several with a range on both
-    /// sides (8000-8010:8000-8010). Repeatable and remembered for the image; "none"
-    /// forgets them all.
+    /// Publish a port on the host: HOST:CONTAINER[/udp] on every IPv4 and IPv6 address
+    /// of the host, IP:HOST:CONTAINER on one (0.0.0.0 every IPv4 address, [::] every
+    /// IPv6 one, an IPv6 address in brackets), several with a range on both sides
+    /// (8000-8010:8000-8010). Repeatable and remembered for the image; "none" forgets
+    /// them all.
     #[arg(long, short = 'p', value_name = "[IP:]HOST:CONTAINER[/udp]")]
     pub publish: Vec<String>,
     /// Replace the image's entrypoint; an empty string runs the arguments alone.
     #[arg(long, value_name = "PROGRAM")]
     pub entrypoint: Option<String>,
-    /// Environment for the program, VAR=value or VAR (copied from here), like docker -e.
+    /// Environment for the program, VAR=value or VAR (copied from here).
     /// Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'e', value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
-    /// Mount a host directory or a named volume, SOURCE:TARGET[:ro], like docker -v.
+    /// Mount a host directory or a named volume, SOURCE:TARGET[:ro].
     /// Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]", value_hint = clap::ValueHint::AnyPath)]
     pub volume: Vec<String>,
-    /// Read variables from a file of VAR=value lines, like docker --env-file: no quoting
-    /// or expansion, a VAR alone copied from here; -e comes after and wins. Repeatable.
+    /// Read variables from a file of VAR=value lines: no quoting or expansion, a VAR
+    /// alone copied from here; -e comes after and wins. Repeatable.
     #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
     pub env_file: Vec<std::path::PathBuf>,
-    /// Read labels from a file of KEY=VALUE lines, like docker --label-file; --label comes
-    /// after and wins. Repeatable.
+    /// Read labels from a file of KEY=VALUE lines; --label comes after and wins.
+    /// Repeatable.
     #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
     pub label_file: Vec<std::path::PathBuf>,
-    /// A mount in docker's long form, type=bind|volume|tmpfs,source=...,target=...[,readonly]
+    /// A mount in long form, type=bind|volume|tmpfs,source=...,target=...[,readonly]
     /// (tmpfs-size, tmpfs-mode): -v or --tmpfs written out. Repeatable.
     #[arg(long, value_name = "type=TYPE,source=SRC,target=DST")]
     pub mount: Vec<String>,
-    /// Label the machine, KEY=VALUE, like docker --label; the image's own labels stay
-    /// underneath. Repeatable and remembered; "none" forgets them.
+    /// Label the machine, KEY=VALUE; the image's own labels stay underneath.
+    /// Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'l', value_name = "KEY=VALUE")]
     pub label: Vec<String>,
-    /// Restart policy, like docker --restart: no, on-failure[:N] (the count is not kept),
+    /// Restart policy: no, on-failure[:N] (the count is not kept),
     /// always (also starts it at
     /// boot) or unless-stopped (like always, until nspawn stop). Remembered; applied at
     /// the next start.
     #[arg(long, value_name = "POLICY", value_parser = crate::policy::RestartParser)]
     pub restart: Option<crate::policy::Restart>,
-    /// Memory limit of the whole machine, like docker -m: 512m, 2g, and as much swap
-    /// again unless --memory-swap says otherwise; 0 removes it. Remembered; applied at the
-    /// next start.
+    /// Memory limit of the whole machine: 512m, 2g, and as much swap again unless
+    /// --memory-swap says otherwise; 0 removes it. Remembered; applied at the next start.
     #[arg(long, short = 'm', value_name = "SIZE", value_parser = crate::policy::parse_memory)]
     pub memory: Option<u64>,
-    /// Memory and swap together, like docker --memory-swap: a size of at least --memory
-    /// (equal to it, no swap), or -1 for swap without a bound; 0 goes back to as much swap
-    /// again as memory. Remembered; applied at the next start.
+    /// Memory and swap together: a size of at least --memory (equal to it, no swap), or -1
+    /// for swap without a bound; 0 goes back to as much swap again as memory. Remembered;
+    /// applied at the next start.
     #[arg(long, value_name = "SIZE", allow_hyphen_values = true, value_parser = crate::policy::parse_memory_swap)]
     pub memory_swap: Option<i64>,
-    /// CPU limit of the whole machine, like docker --cpus: 0.5, 2; 0 removes it.
+    /// CPU limit of the whole machine: 0.5, 2; 0 removes it.
     /// Remembered; applied at the next start.
     #[arg(long, value_name = "N", value_parser = crate::policy::parse_cpus)]
     pub cpus: Option<f64>,
@@ -1470,12 +1457,10 @@ pub struct ExecArgs {
     #[arg(add = candidates(Kind::Running))]
     pub machine: String,
     /// User inside the machine, USER[:GROUP] by name or number; without it the machine's
-    /// own (its --user, else its image's USER), as docker exec runs, root on a booted
-    /// machine.
+    /// own (its --user, else its image's USER), root on a booted machine.
     #[arg(long, short = 'u')]
     pub user: Option<String>,
-    /// Environment for the command, VAR=value or VAR (copied from here), like docker
-    /// exec -e. Repeatable.
+    /// Environment for the command, VAR=value or VAR (copied from here). Repeatable.
     #[arg(long, short = 'e', value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
     /// Working directory of the command, instead of the machine's.
@@ -1487,7 +1472,7 @@ pub struct ExecArgs {
     /// A terminal for the command, even without one here.
     #[arg(long, short = 't')]
     pub tty: bool,
-    /// Accepted for docker's sake: the command's input is always this one.
+    /// Accepted and ignored: the command's input is always this one.
     #[arg(long, short = 'i')]
     pub interactive: bool,
     /// Leave the command running in the background and return at once.
@@ -1496,7 +1481,7 @@ pub struct ExecArgs {
     /// Accepted and ignored: exec always enters the machine's namespaces.
     #[arg(long, hide = true)]
     pub nsenter: bool,
-    /// docker's: accepted with a note; the command gets the machine's capabilities.
+    /// Accepted with a note: the command gets the machine's capabilities.
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true", hide = true)]
     pub privileged: Option<bool>,
     /// Command and arguments.

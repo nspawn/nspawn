@@ -1,6 +1,6 @@
 //! org.nspawn.Manager at /org/nspawn: everything the command line does, as methods.
 //! Dictionaries (a{sv}) carry the results; the long operations come back as jobs.
-//! `Like` in the functions descriptions are references to Docker commands.
+//! A method described as "Like `CMD`" does what `nspawn CMD` does.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -219,8 +219,8 @@ pub(crate) fn start_request(
     })
 }
 
-/// The --health-* flags: health_cmd (s), health_test (as, the whole test as compose
-/// writes it), health_interval, health_timeout, health_start_period,
+/// The --health-* flags: health_cmd (s), health_test (as, the whole test),
+/// health_interval, health_timeout, health_start_period,
 /// health_start_interval (t, microseconds), health_retries (u), no_healthcheck (b).
 fn health_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::health::Overrides> {
     let test = options.strings("health_test")?;

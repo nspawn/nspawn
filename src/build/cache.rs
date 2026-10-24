@@ -26,8 +26,7 @@ pub struct Entry {
     pub description: String,
     /// The stage as the step left it. A build that takes the entry goes on from there,
     /// though a step before it ran again since and made something else: keys follow
-    /// what the steps are, as BuildKit's do, and an entry without one is taken by no
-    /// build.
+    /// what the steps are, and an entry without one is taken by no build.
     #[serde(default)]
     pub stage: Option<Stage>,
 }
@@ -228,9 +227,9 @@ pub fn usage(store: &crate::store::Store) -> Result<Vec<Usage>> {
     Ok(out)
 }
 
-/// What `builder prune` takes, as BuildKit's prune: without `all`, what no image takes
-/// too; only what was last used before `until`; and with `keep_storage`, the least
-/// recently used first, until what the cache holds of its own fits in that many bytes.
+/// What `builder prune` takes: without `all`, what no image takes too; only what was
+/// last used before `until`; and with `keep_storage`, the least recently used first,
+/// until what the cache holds of its own fits in that many bytes.
 /// `kept` rows are never taken (a cache mount a build has bound, say), and still count
 /// against `keep_storage`: they stay on disk.
 pub fn prunable(

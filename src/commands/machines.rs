@@ -1337,8 +1337,9 @@ pub(crate) fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
     pa.len().cmp(&pb.len())
 }
 
-/// auto-update: podman's table, the reasons on standard error; fails when a machine
-/// failed or went back to its old image, so that the timer's unit says so.
+/// auto-update: a table of UNIT, CONTAINER, IMAGE, POLICY and UPDATED, the reasons on
+/// standard error; fails when a machine failed or went back to its old image, so that
+/// the timer's unit says so.
 pub async fn auto_update(args: AutoUpdateArgs, client: &Client) -> Result<()> {
     let mut options = Options::new();
     options.insert("dry_run", Value::from(args.dry_run));

@@ -28,7 +28,7 @@ hooks.
 | `attach.rs` | `attach-exec`, a machine's `ExecStart=`: the terminal, input or output an attached run hands over on its socket, or the stream into the journal namespace |
 | `policy.rs` | restart policies and resource limits (`--restart`, `-m`, `--cpus`, `--pids-limit`), written into the hook drop-in |
 | `health.rs` | healthchecks: the image's or the flags', the probe runner (`health-run`, a transient unit with `Requisite=` the machine's), its verdict under `/run/nspawn/health` |
-| `tuning.rs` | docker's other per-container flags (hostname, user, capabilities, tmpfs, devices, dns, ulimits, signals, sysctls, timezone), `--interface` and `--depends-on`: parsing, and the settings and unit lines they become |
+| `tuning.rs` | the other per-machine flags (hostname, user, capabilities, tmpfs, devices, dns, ulimits, signals, sysctls, timezone), `--interface` and `--depends-on`: parsing, and the settings and unit lines they become |
 | `getent.rs` | the getent stand-in bound into an app that runs as a user: a shell script, or a program for an image without a shell |
 | `bridge.rs`, `hostnet.rs` | the nspawn0 bridge and user-defined networks, ports, firewalls; veth mode |
 | `portproxy.rs` | `port-proxy`, the IPv6 side of published ports: a transient unit per machine that listens on the host's IPv6 addresses and relays TCP and UDP to the machine |
@@ -37,10 +37,10 @@ hooks.
 | `systemd.rs` | typed D-Bus calls, job waiting |
 | `unitname.rs` | `systemd-escape --path`: mount and device unit names |
 | `journal.rs`, `api/events.rs` | structured journal entries for nspawn's own events; the journal read back as events |
-| `cdi.rs` | CDI specs read as the reference reads them (strict fields, versions, priorities, conflicts), `--gpus` parsed as docker does and mapped to a vendor's devices, the plan a start applies (nodes, binds, variables) and the hooks run before it in a private mount namespace (`nsenter::in_hook_root`) |
-| `kvfile.rs`, `mountopt.rs` | `--env-file` and `--label-file` (KEY=VALUE files as docker reads them, shared with compose's raw `env_file`), `--mount` read as docker's CSV form and turned into `-v` and `--tmpfs` |
-| `gotemplate.rs` | Go's text/template over JSON values, with docker's functions and `table` layout: `ps --format`, `inspect -f` |
-| `output.rs`, `columns.rs` | tables and sizes; the columns a character takes, as docker/cli counts them for `--format` |
+| `cdi.rs` | CDI specs read strictly (no unknown field, the `cdiVersion` a spec's contents need, `/var/run/cdi` over `/etc/cdi`, a device two specs of one directory name refused), `--gpus` parsed (all, a count, `device=`, `driver=`, `capabilities=`) and mapped to a vendor's devices, the plan a start applies (nodes, binds, variables) and the hooks run before it in a private mount namespace (`nsenter::in_hook_root`) |
+| `kvfile.rs`, `mountopt.rs` | `--env-file` and `--label-file` (KEY=VALUE files without quoting or expansion, shared with compose's raw `env_file`), `--mount` read as CSV and turned into `-v` and `--tmpfs` |
+| `gotemplate.rs` | Go's text/template over JSON values, with the functions `json`, `join`, `split`, `lower`, `upper`, `title`, `pad` and `truncate` and the `table` layout: `ps --format`, `inspect -f` |
+| `output.rs`, `columns.rs` | tables and sizes; the columns text takes where `--format` cuts it or lines it up (East Asian Width where it is cut; per grapheme cluster where a table lines it up, its characters' widths added up to at most two) |
 | `api/secrets.rs` | secrets: systemd-creds around them, their files under the state directory, decrypted into a root-only tmpfs for a running machine and bind-mounted read-only |
 | `api/generate.rs` | `generate`: the `network create` and `run -d` commands that make machines again from their records, in the order of their dependencies, quoted for a shell |
 | `api/dependencies.rs` | `--depends-on`: the checks (machines of nspawn's, no cycle), the hook that waits for each condition (`await-dependencies`), the verdict on a dependency as its unit and healthcheck show it |
@@ -48,14 +48,14 @@ hooks.
 | `api/disk.rs`, `commands/system.rs` | what is an image and what a machine (a record pulled or built and never started is an image only), sizes by kind for `system df`, `images prune`, and `system prune` on top of the removals and prunes of the service |
 | `api/recreate.rs`, `api/autoupdate.rs` | a machine made anew from a newer image with its options, and put back from its rollback when the new one does not come up; `auto-update`: candidates by label, the registry asked once per reference, dependents restarted |
 | `dockerapi/` | the read-only Docker Engine API (`api-serve`), served on a machine's own socket: routing and versions, containers and networks in docker's shapes, filters, events, logs, stats; the one write is a kill through the service |
-| `build/dockerfile/`, `build/dispatch/` | ports of BuildKit's frontend: the parser, the shell lexer, instructions and flags; stages, build arguments and the image's settings as convert.go makes them |
+| `build/dockerfile/`, `build/dispatch/` | ports of BuildKit's frontend: the parser, the shell lexer, instructions and flags; stages, build arguments, the steps with their history lines and the image's settings |
 | `build/plan.rs` | the stages and steps of a build, worked out before a step runs |
-| `build/ignore.rs`, `walk.rs`, `copy.rs` | BuildKit's context rules: `.dockerignore`, the walk of a context, COPY and ADD |
-| `build/layer.rs` | BuildKit's overlay differ: what a step changed, as the tar containerd writes |
+| `build/ignore.rs`, `walk.rs`, `copy.rs` | the build context: `.dockerignore` patterns and their `!` exceptions, the walk of a context in lexical order without following symlinks, COPY and ADD with every path resolved inside its root |
+| `build/layer.rs` | a step's layer: what its overlay upper directory changed over the layers below, as an OCI tar (deletions as `.wh.` whiteouts, file capabilities as PAX records), and its gzip blob |
 | `build/root.rs`, `sandbox.rs` | the overlay mount of a step; the systemd-nspawn of a RUN and the mount points it leaves |
 | `build/cache.rs`, `image.rs`, `exec.rs` | the build cache; the config and manifest; the steps run in order, the layers committed into the store and the images installed |
 | `commands/build.rs`, `compose/engine/build.rs` | `build` of a Dockerfile on the client: the builder picked, the context packed as the user with its ignore file, secrets read; compose's `build` sections, image names and labels |
-| `compose/` | `nspawn compose`, a client of the service like the rest of the command line: docker compose's command line read as cobra reads it (`cobra.rs`), the files loaded as compose-go loads them (go-yaml's parser and constructor, interpolation, merging, include and extends, the model), `config`, the support table (`support/`) |
+| `compose/` | `nspawn compose`, a client of the service like the rest of the command line: docker compose's command line read (`cobra.rs`: global flags before the command, `=false` on a bool flag, the last of a repeated flag winning), the files loaded (the YAML parser and constructor, interpolation, merging, include and extends, the model), `config`, the support table (`support/`) |
 | `compose/engine/` | a project's services made machines through the bus: a service turned into the options of `CreateMachine`, up's convergence, the commands on a project's machines, found by docker compose's labels |
 | `packaging/` | what the packages ship (the units, the bus files, the polkit actions and an example rule, `journald@nspawn.conf`, the SELinux module) and the Arch, Debian and Fedora packaging |
 
@@ -131,9 +131,8 @@ hooks.
                      images builds pulled), mounts/ (RUN --mount=type=cache);
                      its layers and blobs stay until builder prune. A key
                      comes from the step and the keys before it, not from
-                     the layers they made, as BuildKit's do, so when another
-                     build runs a shared step again the entries after it
-                     stay valid
+                     the layers they made, so when another build runs a
+                     shared step again the entries after it stay valid
   cache/mkosi/       mkosi's own cache
   cache/mkosi-workspace/ID/  an mkosi build's workspace, removed at its end
                      and at the service's start
@@ -198,9 +197,9 @@ When the machine has a healthcheck, `network publish` also starts
 `Requisite=` and `After=` on the machine's unit keep it from starting the
 machine, and it ends once the machine is gone. It runs the test through
 `nsenter` at its interval, at the start interval while a machine still starting
-is in its start period. The verdict follows docker's rule: a success is
-healthy, `retries` failures in a row are unhealthy, and failures during the
-start period of a machine never healthy do not count. The verdict and the last
+is in its start period. A success is healthy, `retries` failures in a row
+are unhealthy, and failures during the start period of a machine never
+healthy do not count. The verdict and the last
 five probes go to `/run/nspawn/health/NAME.json`, which `ps` and `inspect`
 read; each change is a `health_status` event. `network release` removes the
 file.
@@ -252,20 +251,21 @@ and waits for the release hook of its last run.
 `kill` with SIGKILL is `stop --force`. Any other signal goes to an app's
 program (the stub init's child, or the leader when the program is PID 1, once
 the leader no longer bears systemd-nspawn's name, which it keeps until it
-executes the program) or to a booted machine's init. As with docker's kill, the
-signal counts as a stop when it is any signal to an app without a stop signal
-of its own, an app's own stop signal, or a halt or poweroff request to an init;
-after any other the policy applies, should the machine end. A kill that counts
+executes the program) or to a booted machine's init. The signal counts as a
+stop when it is any signal to an app without a stop signal of its own, an
+app's own stop signal, or a halt or poweroff request to an init; after any
+other the policy applies, should the machine end. A kill that counts
 as a stop, of a machine with a restart policy, leaves `exit-on-next` in the
 machine's directory, and the release hook, finding it, queues the stop job
 while the unit is still winding down. `prepare` removes a mark an earlier run
 left.
 
 The policy and the limits go into the hooks drop-in, since the settings file
-has no keys for them; `always` and `unless-stopped` enable the unit the way
-`machinectl enable` does, `stop` disables an `unless-stopped` one and removing
-a machine disables it. `update` rewrites the record and the drop-in and
-reloads: systemd applies a running unit's changed limits to its cgroup at a
+has no keys for them; `always` and `unless-stopped` enable the unit together
+with `machines.target`, which pulls it in at boot, `stop` disables an
+`unless-stopped` one and removing a machine disables it (`machines.target`
+stays enabled). `update` rewrites the record and the drop-in and reloads:
+systemd applies a running unit's changed limits to its cgroup at a
 daemon-reload (255 to 262 alike), and reads `Restart=` again for its next
 ending. `update` does not call SetUnitProperties: with `runtime` it leaves
 copies under `/run/systemd/system.control` that would win over the drop-in
@@ -322,7 +322,8 @@ run inside the machine, which busybox lacks, musl's getent (alpine) cannot
 answer and glibc's refuses for a uid the passwd does not list. An app that runs
 as a user gets `getent.rs`'s stand-in, a shell script bound over
 `/usr/bin/getent` that answers those two from the image's passwd and group files
-as docker reads them and hands anything else to the image's own getent, bound
+(a uid they do not list with gid 0 and no home, a group asked for as the
+primary and only one) and hands anything else to the image's own getent, bound
 at `/run/nspawn/getent`. An image without `/bin/sh` gets a program instead: a
 few hundred bytes of x86_64 or aarch64 code without a libc, into which nspawn
 writes the two answers it reads from the same files ahead of the start, and
@@ -337,9 +338,10 @@ Apps on a bridge, or in another machine's network namespace, run with
 on the host. With no user namespace, systemd-nspawn's capability set would leave
 `CAP_SYS_ADMIN` to root in the app, and its seccomp filter allows `@mount`, so
 root could remount `/proc/sys` writable and reach the host through
-`kernel.core_pattern`. Such an app gets docker's default capabilities plus
-`CAP_SYS_BOOT` instead: `Tuning::exec_lines` writes the difference as
-`DropCapability=` (keeping `CAP_NET_ADMIN` with `--interface`) and adds
+`kernel.core_pattern`. Such an app gets `tuning::DEFAULT_CAPABILITIES`
+instead, the least that lets images run as written plus `CAP_SYS_BOOT`:
+`Tuning::exec_lines` writes the difference as `DropCapability=` (keeping
+`CAP_NET_ADMIN` with `--interface`) and adds
 `SystemCallFilter=~kexec_load kexec_file_load`, since in its own PID namespace
 reboot(2) only signals the machine's init while kexec_load would load a kernel
 into the host. An app image is assembled with overlay even when mstack is asked
@@ -426,9 +428,9 @@ manifest, or of the index the reference named, are verified offline with the
 log entry and the timestamp they carry, against the trusted root
 sigstore-verify embeds or the policy's `trusted_root`; the pull ends there when
 none verifies, unless the policy says `required = false`, which only notes it.
-It then fetches the blobs the store lacks three at a time, as docker does, each
-verified against its digest as it streams and written next to its final name
-until then; a download that ends any other way takes its part file with it.
+It then fetches the blobs the store lacks three at a time, each verified
+against its digest as it streams and written next to its final name until
+then; a download that ends any other way takes its part file with it.
 
 machined's `MachineNew` and `MachineRemoved` are relayed as `MachineStarted`
 and `MachineStopped` for the machines nspawn installed.
@@ -456,9 +458,9 @@ CA certificate the command line was given travel as options of the calls that
 reach a registry, so `--registry`, `--ca-cert` and the environment keep their
 meaning.
 
-`run` makes several calls, as docker's does: `PullImage` (then `CreateMachine`
-from it with `--rm`, so the image stays) or `CreateMachine` from a local image,
-then `StartMachine` for `-d` and `RunMachine` otherwise. `RunMachine`
+`run` makes several calls: `PullImage` (then `CreateMachine` from it with
+`--rm`, so the image stays) or `CreateMachine` from a local image, then
+`StartMachine` for `-d` and `RunMachine` otherwise. `RunMachine`
 subscribes to systemd's unit signals and watches the unit's
 `PropertiesChanged` from before the start: the run ends with the
 `ExecMainCode` and `ExecMainStatus` that signal carries, since a later read
@@ -507,9 +509,9 @@ holds whatever firewalld or iptables accept. The table is always written for
 all networks at once, so bringing one bridge up never drops another's rules.
 
 The machines are IPv4-only and nftables cannot translate IPv6 into IPv4, so the IPv6
-side of a published port is a proxy in user space, as docker's userland proxy is. A
-port given no IP has both sides, `0.0.0.0` the IPv4 one alone, `::` or an IPv6 address
-the IPv6 one alone (`PortMap::ipv4_side`, `ipv6_side`). `network publish` starts
+side of a published port is a proxy in user space. A port given no IP has both sides,
+`0.0.0.0` the IPv4 one alone, `::` or an IPv6 address the IPv6 one alone
+(`PortMap::ipv4_side`, `ipv6_side`). `network publish` starts
 `nspawn-proxy-NAME.service`, a transient unit with `Requisite=` and `After=` the
 machine's (`portproxy::start`, the health runner's pattern), `Type=notify`, its
 capabilities bounded to `CAP_NET_BIND_SERVICE`. It runs `nspawn port-proxy NAME`,
@@ -549,8 +551,8 @@ route goes through the first network that is not internal
   applies; it binds NAME's generated hosts and resolv.conf, and `release` drops
   the name while the namespace stays NAME's.
 - Each veth nspawn makes (an app's, and those of a live `network connect`)
-  takes its inside MAC from its address (`02:42:` and the four octets, as
-  docker's), so a restart keeps it and the host's neighbour cache stays right.
+  takes its inside MAC from its address (`02:42:` and the four octets), so a
+  restart keeps it and the host's neighbour cache stays right.
 - Under managed user namespaces (mstack) systemd-nsresourced creates a booted
   machine's veths and systemd-nspawn does not apply `Bridge=`, so the publish
   hook puts each host end on its bridge (`bridge::adopt_managed_veth`, which

@@ -85,7 +85,7 @@ polkit.addRule(function (action, subject) {
 
 Copy it to `/etc/polkit-1/rules.d/50-nspawn.rules`. Everyone in that group can
 run commands as root inside a machine and mount any host path into one, so the
-rule makes them administrators of the host, as the docker group does.
+rule makes them administrators of the host.
 
 ## SELinux
 
@@ -98,7 +98,7 @@ policy lives in `packaging/selinux` and the `nspawn-selinux` package loads it.
 `--install` warns when SELinux is enabled and the module is not loaded, and,
 with the module loaded, when the binary is not labelled `nspawn_exec_t`, which
 a build installed by hand is not. Commands run inside a machine take the
-machine's own context, as with docker exec.
+machine's own context.
 
 ## org.nspawn.Manager at /org/nspawn
 
@@ -138,7 +138,7 @@ with their objects).
 | `aliases` | as | `NETWORK=NAME` |
 | `ports`, `volumes`, `secrets` | as | `[IP:]HOST->CONTAINER/PROTO` (an IPv6 IP in brackets; no IP for every address); `SOURCE:TARGET[:ro]`; `NAME:TARGET:MODE:UID:GID` |
 | `env`, `image_env` | as | the machine's variables, the image's |
-| `entrypoint`, `cmd`, `command`, `image_cmd` | as | the entrypoint and the arguments after it as docker merges them (none after an entrypoint given alone), both together, the image's own cmd |
+| `entrypoint`, `cmd`, `command`, `image_cmd` | as | the entrypoint (the one given, else the image's) and the arguments after it (the ones given, none after an entrypoint given alone, else the image's cmd), both together, the image's own cmd |
 | `working_dir`, `user`, `stop_signal` | s | the flag's when given, the image's otherwise |
 | `labels`, `image_labels` | a{ss} | the image's with the machine's on top, the image's alone |
 | `restart` | s | no, on-failure, always or unless-stopped |
@@ -157,7 +157,7 @@ with their objects).
 | `ulimits`, `sysctls` | a{ss} | NAME to `SOFT:HARD`; KEY to VALUE |
 | `depends_on` | as | `NAME:CONDITION` or `NAME:CONDITION:optional`, the condition started, healthy or completed |
 | `image_volumes` | as | what the image declares as volumes |
-| `healthcheck` | a{sv} | test (as), interval, timeout, start_period, start_interval (t, microseconds, 0 for docker's default), retries (u); empty without one |
+| `healthcheck` | a{sv} | test (as), interval, timeout, start_period, start_interval (t, microseconds, 0 for the default: 30 s, 30 s, none and 5 s), retries (u, 0 for 3); empty without one |
 
 A machine of `ListMachines` and `GetMachine` adds:
 
@@ -167,8 +167,8 @@ A machine of `ListMachines` and `GetMachine` adds:
 | `started`, `finished` | t | when the last run started and ended, 0 when unknown |
 | `leader`, `os` | t, s | the leader's PID on the host, the machine's OS, while it runs |
 | `machine_path` | s | machined's object path, `""` when it does not run |
-| `bindings` | as | where its ports are published, docker's way: `0.0.0.0:8080->80/tcp`, and `[::]:8080->80/tcp` on a host with IPv6 |
-| `exit_code` | i | docker's code for the last run, on a stopped or restarting machine |
+| `bindings` | as | where its ports are published, the host's side first: `0.0.0.0:8080->80/tcp`, and `[::]:8080->80/tcp` on a host with IPv6 |
+| `exit_code` | i | the last run's exit code (the program's, or 128 plus the signal it died of), on a stopped or restarting machine |
 | `health`, `health_failing_streak`, `health_log` | s, u, as | for a running machine with a healthcheck: starting, healthy or unhealthy; the failures in a row; the last probes as `END EXIT_CODE OUTPUT` |
 
 ### Machine options
@@ -196,7 +196,7 @@ given is remembered for the machine.
 | `log_driver` | s | local (the default) writes to nspawn's own journal namespace, journal to the system journal, none drops the output, though an attached `RunMachine` still passes it straight through |
 | `cap_add`, `cap_drop`, `tmpfs`, `dns`, `dns_search`, `interfaces` | as | as the flags take them |
 | `devices` | as | `HOST[:CONTAINER[:PERMISSIONS]]` or a CDI device name, `VENDOR/CLASS=NAME` |
-| `gpus` | as | as docker's `--gpus` takes them: all, a count, `device=IDS`, `driver=`, `capabilities=` |
+| `gpus` | as | as `--gpus` takes them: all, a count, `device=IDS`, `driver=`, `capabilities=` |
 | `extra_hosts`, `ulimits`, `sysctls` | as | `HOST:IP`; `NAME=SOFT[:HARD]`; `KEY=VALUE` |
 | `secrets` | as | `NAME[:TARGET[:MODE[:UID:GID]]]` |
 | `depends_on` | as | `NAME[:CONDITION][:optional]`, other machines systemd starts first |
@@ -250,19 +250,19 @@ error that says so.
 | `ListMachines(b all) -> aa{sv}` | `ps`, `ps -a` | the machines that run (and, with `all`, every machine nspawn keeps a record of; a restarting one is listed without it too), each a record and its machine keys (see Records) |
 | `GetMachine(s name) -> a{sv}` | `inspect` | one machine as `ListMachines` has it, running or not; fails for a name that neither runs nor has a record |
 | `StartMachine(s name, a{sv} options) -> (s, as)` | `start` | the machine options (see Machine options); "started", "ended" (the program returned before the machine registered) or "restarting" (it ended and its restart policy brings it back), and the notes made on the way |
-| `RunMachine(s name, a{sv} options, a{sh} fds) -> (a{sh}, o, as)` | `run` without `-d` | starts, attached, a machine that `PullImage` or `CreateMachine` made; options those of `StartMachine` (wait defaults to false, remove is `--rm`), tty (b), rows and cols (t, 24 and 80), term (s, xterm); descriptor stdin for the program's input without tty. An app gets a pseudo terminal with tty, its master under "tty"; otherwise the machine's output, a line at a time, under "stdout". Returns the streams, a process object whose exit status is docker run's (the program's, 128 plus the signal nspawn sent, 137 after SIGKILL), and the start's notes. A transient unit removes a `--rm` machine once the machine's unit is down |
-| `StopMachine(s name, a{sv} options) -> (s, as)` | `stop` | options force, wait (default true), timeout (seconds; the machine's stop_timeout by default, else 10; a day at most, or 18446744073709551615 to wait for as long as it takes, docker's -1); "stopped" or "was-not-running", and the notes (a program that had to be killed) |
-| `KillMachine(s name, a{sv} options) -> as` | `kill` | option signal (a name such as KILL, SIGHUP or RTMIN+3, or a number; SIGKILL by default). SIGKILL is `StopMachine` with force; other signals go to an app's program (waited for a few seconds right after a start) or to a booted machine's init. A signal that stops the machine keeps its restart policy from bringing it back, as with docker: SIGKILL, any signal to an app without a stop signal of its own, an app's own stop signal, or SIGRTMIN+3 and SIGRTMIN+4 (halt, poweroff) to a booted init; other signals leave the policy in charge. Fails for a machine that does not run, except SIGKILL, which also ends one between two runs of its restart policy or still waiting to start. Returns the notes |
-| `PauseMachine(s name)`, `UnpauseMachine(s name)` | `pause`, `unpause` | the machine's cgroup frozen and thawed (docker pause); fail for a machine that does not run |
+| `RunMachine(s name, a{sv} options, a{sh} fds) -> (a{sh}, o, as)` | `run` without `-d` | starts, attached, a machine that `PullImage` or `CreateMachine` made; options those of `StartMachine` (wait defaults to false, remove is `--rm`), tty (b), rows and cols (t, 24 and 80), term (s, xterm); descriptor stdin for the program's input without tty. An app gets a pseudo terminal with tty, its master under "tty"; otherwise the machine's output, a line at a time, under "stdout". Returns the streams, a process object with the run's exit status (the program's, or 128 plus the signal it died of, 137 after SIGKILL), and the start's notes. A transient unit removes a `--rm` machine once the machine's unit is down |
+| `StopMachine(s name, a{sv} options) -> (s, as)` | `stop` | options force, wait (default true), timeout (seconds; the machine's stop_timeout by default, else 10; a day at most, or 18446744073709551615 to wait for as long as it takes, as `stop -t -1` asks); "stopped" or "was-not-running", and the notes (a program that had to be killed) |
+| `KillMachine(s name, a{sv} options) -> as` | `kill` | option signal (a name such as KILL, SIGHUP or RTMIN+3, or a number; SIGKILL by default). SIGKILL is `StopMachine` with force; other signals go to an app's program (waited for a few seconds right after a start) or to a booted machine's init. A signal that stops the machine keeps its restart policy from bringing it back: SIGKILL, any signal to an app without a stop signal of its own, an app's own stop signal, or SIGRTMIN+3 and SIGRTMIN+4 (halt, poweroff) to a booted init; other signals leave the policy in charge. Fails for a machine that does not run, except SIGKILL, which also ends one between two runs of its restart policy or still waiting to start. Returns the notes |
+| `PauseMachine(s name)`, `UnpauseMachine(s name)` | `pause`, `unpause` | the machine's cgroup frozen and thawed; fail for a machine that does not run |
 | `UpdateMachine(s name, a{sv} options) -> b` | `update` | options restart, memory, memory_swap, cpus, pids_limit, no_healthcheck and the health_* ones, as for `StartMachine` (0 removes a limit, absent keeps it); a running machine gets the limits at once and its probes start over; true when it was running |
-| `MachineStats(as names) -> aa{sv}` | `stats` | one sample of each named machine that runs (every running container when none is named; names that do not run are left out): name, time_usec (CLOCK_MONOTONIC), cpu_usec, memory (memory.current without inactive_file, as docker), memory_limit (the host's memory without a limit), pids, io_read, io_write, net_rx, net_tx; a counter that cannot be read is left out, the network ones on the host's network; rates come from two samples |
+| `MachineStats(as names) -> aa{sv}` | `stats` | one sample of each named machine that runs (every running container when none is named; names that do not run are left out): name, time_usec (CLOCK_MONOTONIC), cpu_usec, memory (memory.current without inactive_file), memory_limit (the host's memory without a limit), pids, io_read, io_write, net_rx, net_tx; a counter that cannot be read is left out, the network ones on the host's network; rates come from two samples |
 | `MachineProcesses(s name) -> aa{sv}` | `top` | the processes in the machine's PID namespace, from its cgroup: pid (u), user (s, the uid as the machine sees it, root for 0), time (s, CPU time HH:MM:SS), command (s) |
 | `Generate(as names, a{sv} options) -> s` | `generate` | a shell script that makes the named machines again, every machine of nspawn's when none is named: `network create` for the networks they join, then `run -d` with every flag a machine keeps (`pull` for an image without flags of its own), each after the machines it depends on or takes its network from, which come along; what the flags cannot carry (secrets, host directories, images built on this host, a healthcheck in exec form) as comments at the top; options: none (any key is an error) |
 | `AutoUpdate(as names, a{sv} options) -> o` | `auto-update` | the machines labelled org.nspawn.auto-update=registry (or io.containers.autoupdate=registry), or the ones named, are made anew from the image their reference names now at its registry, with every option they had, started when they ran, and put back when they do not come up (healthy, with a healthcheck). Option dry_run (b) only looks. A job; each machine's outcome is an `auto-update` event |
 | `Exec(s machine, as argv, s user, a{sv} options) -> (a{sh}, o)` | `exec` | user `""` for the machine's own (its --user, else its image's USER; root without either, and on a booted machine); options tty (default true), rows and cols (t, 24 and 80), env (as, the caller's `TERM=` among them; xterm otherwise on a terminal), workdir (s, instead of the machine's), detach (b: no streams come back, the output is discarded and the command runs on); returns the streams ("tty", or "stdin", "stdout", "stderr") and a process object |
 | `Shell(s machine, s user, a{sv} options) -> (h, s)` | `shell` | user `""` for root; the login session machined offers for a booted machine: its pseudo terminal and the terminal's path; options env, as for `Exec`; apps get `Exec` of a shell with a tty instead |
 | `CopyFrom(s machine, s path, a{sv} options) -> (h, o)` | `cp NAME:PATH ...` | a tar stream of `path` on the pipe, owners as the machine sees them, and a job with the outcome; a running machine, or a stopped overlay or flat one; options: none |
-| `CopyTo(s machine, s path, h stream, a{sv} options) -> o` | `cp ... NAME:PATH` | the tar stream read from `stream` unpacked at `path` by docker cp's rules, everything root's inside; option contents (b: the source was `DIR/.`); a job |
+| `CopyTo(s machine, s path, h stream, a{sv} options) -> o` | `cp ... NAME:PATH` | the tar stream read from `stream` unpacked at `path` by `cp`'s rules (see USAGE.md), everything root's inside; option contents (b: the source was `DIR/.`); a job |
 | `Events(a{sv} options) -> (a{sh}, o)` | `events` | options since, until (journalctl's time syntax; without until it follows, and until needs since), filters (as: name= or machine=, type=, event= or action=, label=KEY or KEY=VALUE); under "stdout" one JSON event per line (see Events), journalctl's complaints under "stderr", and a process object for its end; a user other than root holds 64 streams at once at most |
 | `Logs(s machine, a{sv} options) -> (a{sh}, o)` | `logs` | options follow, lines, since, until (journalctl's time syntax; with until nothing is followed), timestamps, all, inside; journalctl's "stdout" and "stderr" and a process object for its exit status. Lines from before the machine was created (a removed machine of the same name) are left out; a local machine's lines come from nspawn's journal namespace and the system's journal interleaved; journalctl is stopped once nobody reads its output. A machine whose log_driver is none is refused unless inside is set |
 
@@ -339,7 +339,7 @@ entries are PID 1's about `systemd-nspawn@` units and nspawn's own (message ID
 
 | Type | Actions | Attributes of every action | The action's own |
 |---|---|---|---|
-| `machine` | `start`, `die`, `stop`, `restart`, `oom`, `fail` (systemd's, for every `systemd-nspawn@` unit), `pull`, `build`, `create`, `push`, `kill`, `update`, `pause`, `unpause`, `health_status`, `auto-update`, `remove` (nspawn's) | `image` (the record's reference), `created` (which machine of the name it was) | `die`: `code` (`exited`, `killed`, `dumped`), `exit_code` (docker's code for that run, from the signal nspawn sent to it while the record exists; the status systemd logged once it is gone), `signal`; `restart`: `restarts`; `fail`: `result`; `pull`: `reference`, `signed_by` (when a signature was verified); `build`: `reference`; `create`: `from`, `reference`; `push`: `reference` (the destination); `kill`: `signal`; `health_status`: `status`; `auto-update`: `result`, `from`, `to` |
+| `machine` | `start`, `die`, `stop`, `restart`, `oom`, `fail` (systemd's, for every `systemd-nspawn@` unit), `pull`, `build`, `create`, `push`, `kill`, `update`, `pause`, `unpause`, `health_status`, `auto-update`, `remove` (nspawn's) | `image` (the record's reference), `created` (which machine of the name it was) | `die`: `code` (`exited`, `killed`, `dumped`), `exit_code` (that run's exit code, the program's or 128 plus its signal: from the signal nspawn sent to it while the record exists, from the status systemd logged once it is gone), `signal`; `restart`: `restarts`; `fail`: `result`; `pull`: `reference`, `signed_by` (when a signature was verified); `build`: `reference`; `create`: `from`, `reference`; `push`: `reference` (the destination); `kill`: `signal`; `health_status`: `status`; `auto-update`: `result`, `from`, `to` |
 | `network` | `create`, `remove`, `connect`, `disconnect` | `subnet`, `interface`, `internal`, `created` | `connect`, `disconnect`: `container`, `container_created` |
 | `volume` | `create`, `remove` | `path` | |
 | `secret` | `create`, `remove` | `size` (bytes of the plaintext) | |

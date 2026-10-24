@@ -1,5 +1,5 @@
-//! docker search: the hub first, then Docker Hub, each hit with its source and the
-//! reference pull takes.
+//! search: the hub first, then Docker Hub, each hit with its source and the reference
+//! pull takes.
 
 use anyhow::Result;
 

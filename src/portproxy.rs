@@ -1,9 +1,9 @@
 //! The IPv6 side of published ports. Machines have IPv4 addresses alone and nftables
 //! cannot translate IPv6 into IPv4, so a port published on the host's IPv6 addresses is
-//! served by a proxy in user space, as docker's userland proxy serves it:
-//! `nspawn port-proxy NAME`, run by the transient unit `nspawn-proxy-NAME.service` from
-//! the machine's publish hook, listens there and relays TCP connections and UDP
-//! datagrams to the machine's address. The IPv4 side stays the DNAT's.
+//! served by a proxy in user space: `nspawn port-proxy NAME`, run by the transient unit
+//! `nspawn-proxy-NAME.service` from the machine's publish hook, listens there and relays
+//! TCP connections and UDP datagrams to the machine's address. The IPv4 side stays the
+//! DNAT's.
 
 use std::collections::HashMap;
 use std::io::{IoSlice, IoSliceMut};
@@ -28,7 +28,7 @@ use crate::bridge::Protocol;
 use crate::store::ImageRecord;
 use crate::systemd::Systemd;
 
-/// docker-proxy's: a UDP flow nothing has crossed for this long is forgotten.
+/// UDP has no end of a flow: one nothing has crossed for this long is forgotten.
 const UDP_IDLE: Duration = Duration::from_secs(90);
 /// Clients of one UDP port relayed at once; a datagram of one more is dropped.
 const UDP_FLOWS: usize = 4096;

@@ -36,8 +36,7 @@ pub struct ExtraHost {
     pub ip: String,
 }
 
-/// What a machine waits for of another one it depends on, as compose's depends_on
-/// conditions.
+/// What a machine waits for of another one it depends on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Condition {

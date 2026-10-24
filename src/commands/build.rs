@@ -275,8 +275,8 @@ fn excludes(dir: &Path, dockerfile: Option<&Path>) -> Result<Vec<String>> {
         p.with_file_name(name)
     });
     for path in beside.into_iter().chain([dir.join(".dockerignore")]) {
-        // One that is not there, or no file, is none, as BuildKit reads it; one that
-        // cannot be read fails the build, as its transfer would.
+        // One that is not there, or no file, is none; one that cannot be read fails the
+        // build.
         let file = match File::open(&path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -408,13 +408,13 @@ fn broken<W: Write>(builder: &mut tar::Builder<W>) {
 }
 
 /// --secret id=ID[,src=PATH][,env=VAR][,type=file|env]: the secret's bytes, read here as
-/// the user, as BuildKit's secrets provider reads them: an env wins over a file, and
-/// without either the variable named ID when it is set, else the file named ID.
+/// the user: an env wins over a file, and without either the variable named ID when it
+/// is set, else the file named ID.
 fn secret(spec: &str) -> Result<(String, Vec<u8>)> {
     secret_with(spec, &|var| std::env::var_os(var))
 }
 
-/// The largest secret BuildKit's provider takes.
+/// The largest secret --secret takes.
 const MAX_SECRET: u64 = 500 * 1024;
 
 fn secret_with(
@@ -878,7 +878,7 @@ mod tests {
         let tar = std::fs::read(&out).unwrap();
         assert!(is_tar(&tar));
         assert!(!is_tar(b"FROM scratch\n"));
-        // Whatever docker undoes is undone, a Dockerfile left as it is.
+        // A gzip, bzip2, xz or zstd context is undone, a Dockerfile left as it is.
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         std::io::Write::write_all(&mut gz, &tar).unwrap();
         let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());

@@ -406,7 +406,7 @@ fn ports(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
             made.ephemeral
                 .push(format!("{published}->{target}/{protocol}"));
         }
-        // An IP as docker compose takes it: 0.0.0.0 is IPv4 alone, :: IPv6 alone.
+        // 0.0.0.0 is IPv4 alone, :: IPv6 alone.
         let mut text = format!("{published}:{target}");
         if host_ip.contains(':') {
             text = format!("[{host_ip}]:{text}");
@@ -1284,7 +1284,7 @@ services:
         let web = made(&project, "web", 1);
         assert_eq!(list(&web, "networks"), ["demo_back"]);
         assert_eq!(list(&web, "aliases"), ["demo_back=web", "demo_back=www"]);
-        // An IP as docker compose takes it: 0.0.0.0 IPv4 alone, an IPv6 one in brackets.
+        // 0.0.0.0 is IPv4 alone, an IPv6 address goes in brackets.
         assert_eq!(
             list(&web, "publish"),
             [
