@@ -172,7 +172,9 @@ no command at all; `shell` opens machined's login session there. Any other image
 example nearly anything from Docker Hub, is an "app": its program runs under
 systemd-nspawn's stub init, with the environment, working directory, user and stop
 signal from the OCI config, and joins the bridge network like any other machine (see
-Networking).
+Networking). The `NOTIFY_SOCKET` systemd-nspawn hands its payload is set empty for an
+app: a program that notifies systemd takes an empty one for none, instead of failing on
+a socket only root may write to.
 
 An image with s6-overlay (found by its files: linuxserver.io's images, Home Assistant's
 and others) runs as an app with its `/init` as PID 1 of the machine, which s6 insists on
