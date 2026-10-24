@@ -1369,6 +1369,12 @@ grep -qx "Wants=systemd-journald@nspawn.socket" "$(hooks_of e2e-quiet)" || fail 
 grep -q "attach-exec e2e-quiet --journal-namespace nspawn -- " "$(hooks_of e2e-quiet)" || fail "a local machine's output is not sent to the namespace: $(cat "$(hooks_of e2e-quiet)")"
 retry 10 bash -c "$NSPAWN logs e2e-quiet 2>/dev/null | tr -d '\r' | grep_q '^detached-$nonce\$'" || fail "logs of a local machine: $($NSPAWN logs e2e-quiet 2>&1)"
 in_system_journal e2e-quiet "detached-$nonce" && fail "a detached local machine wrote to the system's journal"
+# A duration ago and journalctl's times.
+for since in 5m -5min "10 min ago"; do
+  $NSPAWN logs --since "$since" e2e-quiet 2>&1 | tr -d '\r' | grep_q "^detached-$nonce\$" || fail "logs --since $since: $($NSPAWN logs --since "$since" e2e-quiet 2>&1 | tail -2)"
+done
+out=$($NSPAWN logs --until 1h e2e-quiet 2>&1) || fail "logs --until 1h: $out"
+echo "$out" | grep_q "detached-$nonce" && fail "logs --until 1h shows what came after: $out"
 $NSPAWN inspect e2e-quiet | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['log_driver'] == 'local', d" || fail "inspect does not show the default log driver"
 # journal: the system's journal, as before local existed.
 $NSPAWN stop e2e-quiet >/dev/null || fail "stop e2e-quiet"
@@ -1743,6 +1749,8 @@ assert all(e["time"].endswith("Z") for e in events)
 PY
 out=$(timeout 30 $NSPAWN events --since "$since" --until now --filter name=$app --filter event=die) || fail "events --since --until did not end by itself: $out"
 echo "$out" | grep_q "machine die $app (.*exit_code=3" || fail "events --since --until misses the exit: $out"
+out=$(timeout 30 $NSPAWN events --since 10m --until 0s --filter name=$app --filter event=die) || fail "events --since 10m --until 0s did not end by itself: $out"
+echo "$out" | grep_q "machine die $app (.*exit_code=3" || fail "events with a duration ago misses the exit: $out"
 echo "$out" | grep -v "machine die $app " | grep_q . && fail "events --filter let other events through: $out"
 $NSPAWN events --filter colour=red 2>/dev/null && fail "events with an unknown filter succeeded"
 

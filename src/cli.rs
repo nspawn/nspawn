@@ -1127,8 +1127,9 @@ pub struct AutoUpdateArgs {
 
 #[derive(Args, Debug)]
 pub struct EventsArgs {
-    /// Show events since this time (journalctl's syntax: "2026-09-24 10:00", "-1h",
-    /// "today"); without it, only new ones.
+    /// Show events since this time: a duration ago (42m, 1h30m), unix seconds, an RFC 3339
+    /// time or date, or a time as journalctl reads it ("2026-09-24 10:00", -1h, today);
+    /// without it, only new ones.
     #[arg(long, value_name = "WHEN", allow_hyphen_values = true)]
     pub since: Option<String>,
     /// Stop at this time instead of waiting for new events (with --since).
@@ -1520,10 +1521,11 @@ pub struct LogsArgs {
     /// Only the last N lines.
     #[arg(long, short = 'n', value_name = "N")]
     pub lines: Option<u32>,
-    /// Only output newer than this (journalctl --since syntax, e.g. "10 min ago" or -1h).
+    /// Only output newer than this: a duration ago (42m, 1h30m), unix seconds, an RFC 3339
+    /// time or date, or a time as journalctl reads it ("10 min ago", -1h).
     #[arg(long, value_name = "WHEN", allow_hyphen_values = true)]
     pub since: Option<String>,
-    /// Only output older than this (journalctl --until syntax); nothing is followed then.
+    /// Only output older than this, in the forms --since takes; nothing is followed then.
     #[arg(long, value_name = "WHEN", allow_hyphen_values = true)]
     pub until: Option<String>,
     /// Prefix every line with its timestamp.

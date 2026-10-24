@@ -1655,11 +1655,12 @@ pub async fn events(args: EventsArgs, client: &Client) -> Result<()> {
     // A bad filter is said before anything is asked.
     crate::api::events::Filters::parse(&args.filters)?;
     let mut options = Options::new();
+    let now = unix_now();
     if let Some(since) = args.since {
-        options.insert("since", Value::from(since));
+        options.insert("since", Value::from(journal_time(&since, now)));
     }
     if let Some(until) = args.until {
-        options.insert("until", Value::from(until));
+        options.insert("until", Value::from(journal_time(&until, now)));
     }
     if !args.filters.is_empty() {
         options.insert("filters", Value::from(args.filters));
@@ -1723,10 +1724,31 @@ fn event_line(event: &serde_json::Value) -> String {
     line
 }
 
+/// A time of --since or --until as journalctl reads it. A duration ago (42m, 1h30m),
+/// unix seconds and RFC 3339 times and dates become the absolute time they name; the
+/// rest goes as written: journalctl's own forms ("10 min ago", "2026-09-24 10:00",
+/// today) and its relative ones (-1h), which would read as a duration ahead otherwise.
+fn journal_time(text: &str, now: f64) -> String {
+    if text.starts_with(['-', '+']) {
+        return text.to_string();
+    }
+    let offset = crate::compose::gotime::local_offset(now as i64);
+    crate::compose::gotime::get_timestamp(text, now, offset)
+        .map_or_else(|_| text.to_string(), |t| format!("@{t}"))
+}
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
 /// logs: journalctl's output comes through pipes from the service, and its exit
 /// status through the process object.
 pub async fn logs(args: LogsArgs, client: &Client) -> Result<()> {
     let mut streams = Vec::new();
+    let now = unix_now();
     for machine in &args.machines {
         let mut options = Options::new();
         options.insert("follow", Value::from(args.follow));
@@ -1734,10 +1756,10 @@ pub async fn logs(args: LogsArgs, client: &Client) -> Result<()> {
             options.insert("lines", Value::from(lines as u64));
         }
         if let Some(since) = &args.since {
-            options.insert("since", Value::from(since.clone()));
+            options.insert("since", Value::from(journal_time(since, now)));
         }
         if let Some(until) = &args.until {
-            options.insert("until", Value::from(until.clone()));
+            options.insert("until", Value::from(journal_time(until, now)));
         }
         options.insert("timestamps", Value::from(args.timestamps));
         options.insert("all", Value::from(args.all));
@@ -1834,6 +1856,29 @@ mod tests {
         assert!(still_this_run(0, "restarting", 0));
         assert!(still_this_run(0, "starting", 0));
         assert!(!still_this_run(0, "running", 131));
+    }
+
+    #[test]
+    fn logs_and_events_take_durations_times_and_journalctl_s_forms() {
+        let now = 1_800_000_000.0;
+        // A duration is that long ago, unix seconds stay what they are.
+        assert_eq!(journal_time("5m", now), "@1799999700");
+        assert_eq!(journal_time("1h30m", now), "@1799994600");
+        assert_eq!(journal_time("1700000000", now), "@1700000000");
+        assert_eq!(journal_time("1700000000.5", now), "@1700000000.5");
+        assert!(journal_time("2026-10-24T07:00:00Z", now).starts_with("@1792"));
+        // journalctl's own forms reach it as written: -1h is an hour ago there, and would
+        // be an hour ahead as a duration.
+        for text in [
+            "-1h",
+            "+5min",
+            "10 min ago",
+            "today",
+            "yesterday",
+            "2026-09-24 10:00",
+        ] {
+            assert_eq!(journal_time(text, now), text);
+        }
     }
 
     #[test]

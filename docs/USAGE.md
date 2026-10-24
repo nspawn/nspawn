@@ -430,7 +430,8 @@ takes. mstack machines take no secrets.
 ### Events
 
 `events` is docker events: what happens to machines, networks, volumes and secrets, as
-it happens or between `--since` and `--until`, filtered by name, type, event or label,
+it happens or between `--since` and `--until` (a duration ago such as `42m`, an RFC
+3339 time, or journalctl's `-1h` or `today`), filtered by name, type, event or label,
 as text or `--json`. The actions of a machine are systemd's `start`, `die` (with its
 exit code), `stop`, `restart`, `oom` and `fail`, and nspawn's own `pull`, `build`,
 `create`, `push`, `kill`, `update`, `pause`, `unpause`, `health_status`, `auto-update`
@@ -528,8 +529,11 @@ fails when a machine failed or went back. The packages ship
 What a machine prints goes, by default (`--log-driver local`), to a journal of
 nspawn's own: journald's `nspawn` namespace, kept apart from the system's journal, so a
 program that writes a lot never floods the host's logs. `logs` and an attached `run`
-read it, with `-f`, `-n`, `--since` and timestamps, and `journalctl --namespace=nspawn`
-shows it all. `logs` reads the system's journal beside it, which holds systemd's lines
+read it, with `-f`, `-n`, `--since`, `--until` and timestamps, and
+`journalctl --namespace=nspawn` shows it all. `--since` and `--until`
+take a duration ago (`42m`, `1h30m`), Unix seconds, an RFC 3339 time or date, or a time
+as journalctl reads it (`-1h`, `"10 min ago"`, `"2026-09-24 10:00"`), as `events`
+does. `logs` reads the system's journal beside it, which holds systemd's lines
 about the unit and what the machine wrote there under another driver. As with docker,
 `logs` shows what this machine wrote, from its creation on: a removed machine of the
 same name, whose lines are still in the journal, does not show, even with an earlier
