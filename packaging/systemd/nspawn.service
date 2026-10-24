@@ -1,6 +1,6 @@
 [Unit]
 Description=nspawn manager
-Documentation=https://github.com/nspawn/nspawn
+Documentation=https://nspawn.org/docs/overview/#the-service
 
 [Service]
 Type=dbus

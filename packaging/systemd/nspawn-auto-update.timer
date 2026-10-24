@@ -1,6 +1,6 @@
 [Unit]
 Description=Daily update of the nspawn machines labelled org.nspawn.auto-update
-Documentation=https://github.com/nspawn/nspawn
+Documentation=https://nspawn.org/docs/docker-api/#auto-update
 
 [Timer]
 OnCalendar=daily
