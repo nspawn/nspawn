@@ -584,11 +584,13 @@ pub async fn down(net: &NetSpec, remaining: &[NetSpec], sd: &Systemd) -> Result<
 /// DOCKER-USER, which docker keeps for this and never flushes, or else to the top of
 /// FORWARD.
 fn allow_forwarding_past_iptables(bridge: &str, report: Report<'_>) -> Result<()> {
-    let chain = if iptables(&["-S", "DOCKER-USER"]) {
-        "DOCKER-USER"
-    } else if iptables(&["-S", "FORWARD"]) && forward_policy_is_drop() {
-        "FORWARD"
-    } else {
+    let chain = exception_chain(
+        iptables(&["-S", "DOCKER-USER"]),
+        iptables(&["-S", "FORWARD"]),
+        forward_policy_is_drop(),
+        FORWARD_DROPPERS.iter().any(|p| Path::new(p).exists()),
+    );
+    let Some(chain) = chain else {
         // Rules without the iptables command to edit them, or an nftables ruleset of its
         // own: the machines would lose the outside world silently, so say it.
         if let Some(who) = filtered_forwarding() {
@@ -614,6 +616,36 @@ fn allow_forwarding_past_iptables(bridge: &str, report: Report<'_>) -> Result<()
         }
     }
     Ok(())
+}
+
+/// What may set FORWARD's policy to DROP once machines run: ufw when it is enabled, and
+/// docker in its iptables mode when it is the one that turns IP forwarding on.
+const FORWARD_DROPPERS: [&str; 5] = [
+    "/usr/bin/dockerd",
+    "/usr/sbin/dockerd",
+    "/usr/local/bin/dockerd",
+    "/snap/bin/docker",
+    "/usr/sbin/ufw",
+];
+
+/// The chain the bridge's exception goes into: DOCKER-USER once docker made it, else
+/// FORWARD where its policy drops already, or where docker or ufw is installed and has
+/// not come up yet. Neither empties FORWARD when it does: their jumps go above the
+/// exception, which their chains fall through to for traffic of no bridge of theirs, so
+/// it still comes before the policy. None where nothing drops and nothing will.
+fn exception_chain(
+    reserved_chain: bool,
+    forward_listed: bool,
+    forward_drops: bool,
+    dropper_installed: bool,
+) -> Option<&'static str> {
+    if reserved_chain {
+        Some("DOCKER-USER")
+    } else if forward_listed && (forward_drops || dropper_installed) {
+        Some("FORWARD")
+    } else {
+        None
+    }
 }
 
 /// Out of the bridge anything; in, only published ports and replies.
@@ -2192,6 +2224,24 @@ mod tests {
     fn the_mac_follows_the_address() {
         assert_eq!(mac_of("10.99.0.2".parse().unwrap()), "02:42:0a:63:00:02");
         assert_eq!(mac_of("172.16.255.1".parse().unwrap()), "02:42:ac:10:ff:01");
+    }
+
+    #[test]
+    fn the_exception_is_there_before_forwarding_is_dropped() {
+        // (DOCKER-USER exists, FORWARD can be listed, its policy drops, docker or ufw is
+        // installed)
+        assert_eq!(exception_chain(true, true, true, true), Some("DOCKER-USER"));
+        assert_eq!(
+            exception_chain(true, true, false, false),
+            Some("DOCKER-USER")
+        );
+        assert_eq!(exception_chain(false, true, true, false), Some("FORWARD"));
+        // Installed and not dropping yet, as ufw before it is enabled.
+        assert_eq!(exception_chain(false, true, false, true), Some("FORWARD"));
+        // Nothing drops and nothing will: iptables' table is left alone.
+        assert_eq!(exception_chain(false, true, false, false), None);
+        // Without the iptables command there is nowhere to put it.
+        assert_eq!(exception_chain(false, false, false, true), None);
     }
 
     #[test]

@@ -562,7 +562,8 @@ members share goes to the one whose name sorts first), and
 `host.nspawn.internal`, the gateway of the machine's gateway network. With
 firewalld the bridges are bound to the trusted zone, and so is a veth machine's
 interface while it runs; with docker or ufw, accept rules go into DOCKER-USER
-or FORWARD. `network rm` undoes all of it for its bridge. The bridge is IPv4
+or FORWARD, before either has set FORWARD's policy when it is installed and not
+up yet. `network rm` undoes all of it for its bridge. The bridge is IPv4
 only: it gets `addrgenmode none` and no `fe80::` address, and host0 gets
 `LinkLocalAddressing=no` in its `.network` file or `addrgenmode none` in an
 app's namespace, so machined never hands out a link-local address under a

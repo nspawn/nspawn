@@ -982,11 +982,15 @@ does.
 Hosts running docker (in its default iptables mode) or ufw have a FORWARD policy of
 DROP; `start` then adds two rules to the DOCKER-USER chain, which docker reserves for
 that, or to FORWARD itself: anything out of the bridge, and into the bridge only what
-was published or belongs to a connection a machine opened. That needs the `iptables`
-command, which those tools bring with them. Where the rules are there and the command
-is not, or where a hand-written nftables firewall drops forwarded traffic, `start` says
-so and the exception has to be made by hand; without it the machines reach nothing
-beyond the bridge and published ports answer on the host alone.
+was published or belongs to a connection a machine opened. Where docker or ufw is
+installed and has not set the policy yet, the rules go to FORWARD all the same, so that
+they are there when it changes: ufw sets it when it is enabled, machines running or
+not, and docker when it is the one that turns IP forwarding on. Neither empties
+FORWARD. That needs the `iptables` command, which those tools bring with them. Where
+the rules are there and the command is not, or where a hand-written nftables firewall
+drops forwarded traffic, `start` says so and the exception has to be made by hand;
+without it the machines reach nothing beyond the bridge and published ports answer on
+the host alone.
 
 ### host and veth
 
