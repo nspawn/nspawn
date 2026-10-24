@@ -99,7 +99,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc e2e-v6 e2e-v6b e2e-v6c e2e-v6d e2e-v6u e2e-v6low e2e-notify e2e-fwd; do
+  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc e2e-v6 e2e-v6b e2e-v6c e2e-v6d e2e-v6u e2e-v6low e2e-notify e2e-fwd e2e-cbind-w-1; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -123,7 +123,7 @@ cleanup_machines() {
   $NSPAWN network rm e2e-cli-net e2e-cli-pnet e2e-ip-net e2e-ip-net2 e2e-cip_fixed e2e-v6net >/dev/null 2>&1 || true
   rm -rf /tmp/e2e-cli /tmp/e2e-cdi
   rm -f /etc/cdi/e2e-nspawn.yaml /etc/cdi/e2e-nspawn-bad.yaml /var/run/cdi/e2e-nspawn-gpu.json /usr/local/bin/e2e-cdi-hook
-  $NSPAWN network rm e2e-cdi_default >/dev/null 2>&1 || true
+  $NSPAWN network rm e2e-cdi_default e2e-cbind_default >/dev/null 2>&1 || true
   $NSPAWN images rm e2e-mirror e2e-api-curl >/dev/null 2>&1 || true
   rm -rf /tmp/e2e-compose-api
   $NSPAWN secret rm e2e-pw e2e-pw2 e2e-gen-pw >/dev/null 2>&1 || true
@@ -2723,6 +2723,16 @@ RULE
     out=$(sudo -u "$who" busctl --system get-property org.nspawn "$proc" org.nspawn.Process Argv 2>&1) && fail "$who could read a command root ran: $out"
     echo "$out" | grep_q -i "denied" || fail "reading another user's command failed for the wrong reason: $out"
   fi
+  # A bind source under a directory only root reads, as /etc/letsencrypt/live: compose,
+  # which runs as $who, leaves it to the service instead of failing to make it.
+  closed=$(mktemp -d /tmp/e2e-closed.XXXXXX); chmod 700 "$closed"; echo "closed-$nonce" > "$closed/cert.pem"
+  cbind=$(mktemp -d /tmp/e2e-cbind.XXXXXX); chown "$who" "$cbind"
+  printf 'services:\n  w:\n    image: %s\n    command: ["sleep", "300"]\n    volumes: ["%s/cert.pem:/cert.pem:ro"]\n' "$busybox_ref" "$closed" > "$cbind/compose.yaml"
+  out=$(cd "$cbind" && sudo -u "$who" $NSPAWN compose -p e2e-cbind up -d 2>&1) || fail "compose up as $who with a bind under a directory only root reads: $out"
+  [ "$($NSPAWN exec e2e-cbind-w-1 -- cat /cert.pem </dev/null | tr -d '\r')" = "closed-$nonce" ] || fail "the machine does not see the file under the closed directory"
+  [ -f "$closed/cert.pem" ] || fail "the file under the closed directory is not a file any more"
+  (cd "$cbind" && sudo -u "$who" $NSPAWN compose -p e2e-cbind down >/dev/null 2>&1) || fail "compose down as $who"
+  rm -rf "$closed" "$cbind"
   rm -f "$rules"
   retry 5 bash -c "! sudo -u $who $NSPAWN ps >/dev/null 2>&1" || fail "$who can still list machines after the rule went"
   # Root never needs any of this.

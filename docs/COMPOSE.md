@@ -87,6 +87,10 @@ Beyond the rows that say so:
   container before it stops the old one, nspawn cannot have two machines of one
   name. What the old machine wrote outside its volumes goes with it, as with
   docker.
+- A missing bind source is made by compose, which runs as its caller. A source under a
+  directory the caller cannot look into (`/etc/letsencrypt/live` for anyone but root) is
+  left to the service, which runs as root and mounts it, or refuses it when it is not
+  there either.
 - A port with no host port takes a free one of the host when its machine is
   made, and keeps it; docker picks one at every start.
 - The progress on a terminal is printed line by line; docker compose redraws a

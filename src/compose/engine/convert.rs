@@ -459,7 +459,7 @@ fn volumes(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
                 // A machine's Docker API socket is nspawn's: a host without one of its own
                 // must not get a directory there.
                 let api = crate::volume::API_SOCKET_PATHS.contains(&source);
-                if create && !api && !std::path::Path::new(source).exists() {
+                if create && !api && absent(source) {
                     made.host_paths.push(source.to_string());
                 }
                 binds.push(format!("{source}:{target}{ro}"));
@@ -516,6 +516,14 @@ fn volumes(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
     put_list(&mut made.options, "volume", binds);
     put_list(&mut made.options, "tmpfs", tmpfs);
     Ok(())
+}
+
+/// Whether a bind's source is to be made: only one known not to be there. The client
+/// runs as its caller, who may not look into a directory only root reads
+/// (/etc/letsencrypt/live): such a source is the service's to find, which runs as root,
+/// and making it here would fail or shadow what is there.
+fn absent(path: &str) -> bool {
+    matches!(std::fs::metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Secrets and configs: a file is bound read-only where the machine reads it; one from
@@ -1337,6 +1345,24 @@ services:
             .iter()
             .any(|l| l.starts_with("com.docker.compose.config-hash=")));
         assert_eq!(web.host_paths, ["/srv/conf"]);
+    }
+
+    #[test]
+    fn only_a_bind_source_known_missing_is_made() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let here = tmp.path().join("here");
+        std::fs::write(&here, "").unwrap();
+        assert!(!absent(here.to_str().unwrap()));
+        assert!(absent(tmp.path().join("gone").to_str().unwrap()));
+        // A directory its caller cannot look into, as /etc/letsencrypt/live for a user:
+        // what is under it is left to the service. Run as root, the file is seen.
+        let closed = tmp.path().join("closed");
+        std::fs::create_dir(&closed).unwrap();
+        std::fs::write(closed.join("cert.pem"), "").unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(!absent(closed.join("cert.pem").to_str().unwrap()));
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
