@@ -549,10 +549,10 @@ impl Registry {
                     continue;
                 }
                 let path = entry.path();
-                if !matches!(
-                    path.extension().and_then(|e| e.to_str()),
-                    Some("json" | "yaml")
-                ) {
+                // By the name's end, as the reference tells them: ".yaml" alone is one.
+                let name = entry.file_name();
+                let name = std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str());
+                if !(name.ends_with(b".json") || name.ends_with(b".yaml")) {
                     continue;
                 }
                 let spec = match read_spec(&path, priority) {
@@ -1704,7 +1704,8 @@ containerEdits:
         let lib = dir.path().join("libcuda.so.1");
         std::fs::write(&lib, "").unwrap();
         let lib = lib.to_str().unwrap();
-        write(&etc, "nvidia.yaml", &NVIDIA.replace("LIBCUDA", lib));
+        // Named ".yaml" alone, which is a spec file too.
+        write(&etc, ".yaml", &NVIDIA.replace("LIBCUDA", lib));
         // Not a spec file: neither .yaml nor .json.
         write(&etc, "notes.yml", "nonsense");
         let registry = Registry::load_from(&[&etc, &run]);

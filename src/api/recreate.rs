@@ -279,10 +279,9 @@ async fn update(
     if let Err(e) = swapped {
         if running && back {
             *restarted = true;
-            if let Err(start) =
-                crate::api::machines::start(ctx, &StartRequest::keep(name), report).await
-            {
-                note(report, format!("warning: starting {name} again: {start:#}"));
+            let started = crate::api::machines::start(ctx, &StartRequest::keep(name), report).await;
+            if let Some(how) = not_up(&started) {
+                return Err(anyhow::anyhow!("{e:#}; {how}"));
             }
         }
         return Err(e);
@@ -337,15 +336,29 @@ async fn update(
                     )
                 })?;
             }
-            let back =
-                match crate::api::machines::start(ctx, &StartRequest::keep(name), report).await {
-                    Ok(_) => "it runs on its old image again".to_string(),
-                    Err(e) => format!("the old image did not start either: {e:#}"),
-                };
-            Err(anyhow::Error::new(RolledBack(format!(
-                "{why}; rolled back: {back}"
-            ))))
+            let started = crate::api::machines::start(ctx, &StartRequest::keep(name), report).await;
+            // Rolled back is the old machine running again; put back but not up is a
+            // failure.
+            match not_up(&started) {
+                None => Err(anyhow::Error::new(RolledBack(format!(
+                    "{why}; rolled back: it runs on its old image again"
+                )))),
+                Some(how) => Err(anyhow::anyhow!("{why}; the old image is back, but {how}")),
+            }
         }
+    }
+}
+
+/// Why a machine started again is not up, if it is not.
+fn not_up(started: &Result<crate::api::machines::StartOutcome>) -> Option<String> {
+    use crate::api::machines::StartOutcome;
+    match started {
+        Ok(StartOutcome::Started) => None,
+        Ok(StartOutcome::Ended) => Some("it ended as soon as it started".to_string()),
+        Ok(StartOutcome::Restarting) => {
+            Some("it did not stay up: its restart policy is bringing it back".to_string())
+        }
+        Err(e) => Some(format!("it did not start: {e:#}")),
     }
 }
 
@@ -658,6 +671,19 @@ async fn ended(ctx: &Context, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rollback_is_the_old_machine_up_again() {
+        use crate::api::machines::StartOutcome;
+        assert_eq!(not_up(&Ok(StartOutcome::Started)), None);
+        assert!(not_up(&Ok(StartOutcome::Ended)).unwrap().contains("ended"));
+        assert!(not_up(&Ok(StartOutcome::Restarting))
+            .unwrap()
+            .contains("did not stay up"));
+        assert!(not_up(&Err(anyhow::anyhow!("no")))
+            .unwrap()
+            .contains("did not start: no"));
+    }
 
     fn record(json: serde_json::Value) -> ImageRecord {
         serde_json::from_value(json).unwrap()

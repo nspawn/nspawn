@@ -752,8 +752,8 @@ fn health(service: &Map, made: &mut Made) -> Result<()> {
             put(&mut made.options, option, (ns / 1000) as u64);
         }
     }
-    if let Some(retries) = int(hc.get("retries")) {
-        put(&mut made.options, "health_retries", retries.max(0) as u32);
+    if let Some(retries) = int(hc.get("retries")).filter(|n| *n > 0) {
+        put(&mut made.options, "health_retries", retries as u32);
     }
     Ok(())
 }

@@ -514,7 +514,8 @@ at once), 16 of them logs or events streams, each running a `journalctl` (one mo
 
 `nspawn auto-update` gives the machines labelled `org.nspawn.auto-update=registry` the
 image their reference names now at its registry. The label
-`io.containers.autoupdate=registry` is taken too, on the machine, never from its image.
+`io.containers.autoupdate=registry` is taken too, on the machine, never from its image,
+with `image` meaning `registry` and `disabled` or an empty value no updates.
 
 For each machine the registry is asked for the tag's digest, with a HEAD, which
 registries do not count against their limits. A newer image is pulled, signature policy
@@ -534,9 +535,10 @@ machine's image label follows, so that `compose up` does not take it back.
 
 These are left alone as `skipped`: built images, references pinned by digest, `run
 --rm` machines, booted machines (their state is their writable layer), flat and mstack
-ones, a policy other than `registry`, and machines whose image declares a volume no
-`-v` covers. The reason goes to standard error for the machines named on the command
-line, and is in `--json` for all.
+ones, the `local` policy, and machines whose image declares a volume no `-v` covers.
+The reason goes to standard error for the machines named on the command line, and is in
+`--json` for all. A policy that is none of these (a misspelt one) is `failed`, so that
+the run and its timer show it.
 
 An update cut short (a crash, a stop of the service) is put back at the next run (not
 `--dry-run`) or start of the service, unless its new image was in place and the machine

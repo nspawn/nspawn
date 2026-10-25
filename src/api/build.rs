@@ -133,18 +133,7 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
     let outcome: Result<Mode> = async {
         let layout = Layout::find_below(&output_dir)?;
         let mut manifest = layout.manifest.clone();
-        let annotations = manifest.annotations.get_or_insert_with(Default::default);
-        if let Some(tag) = &image.tag {
-            annotations.insert("org.opencontainers.image.version".to_string(), tag.clone());
-        }
-        annotations.insert(
-            "org.opencontainers.image.ref.name".to_string(),
-            image.to_string(),
-        );
-        annotations.insert(
-            "org.nspawn.builder".to_string(),
-            format!("nspawn {} / mkosi", env!("CARGO_PKG_VERSION")),
-        );
+        annotate(&mut manifest, &image);
         let manifest_bytes = serde_json::to_vec(&manifest)?;
         let manifest_digest = sha256_digest(&manifest_bytes);
 
@@ -325,9 +314,46 @@ fn find_in_path(program: &str) -> Option<PathBuf> {
     })
 }
 
+/// The annotations nspawn gives an image mkosi made. The version mkosi wrote from
+/// ImageVersion= is the software's; the tag only stands in for one it did not write.
+fn annotate(manifest: &mut oci_client::manifest::OciImageManifest, image: &ImageRef) {
+    let annotations = manifest.annotations.get_or_insert_with(Default::default);
+    if let Some(tag) = &image.tag {
+        annotations
+            .entry("org.opencontainers.image.version".to_string())
+            .or_insert_with(|| tag.clone());
+    }
+    annotations.insert(
+        "org.opencontainers.image.ref.name".to_string(),
+        image.to_string(),
+    );
+    annotations.insert(
+        "org.nspawn.builder".to_string(),
+        format!("nspawn {} / mkosi", env!("CARGO_PKG_VERSION")),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mkosi_s_image_version_stays() {
+        let image = ImageRef::parse("team/app:latest", "hub.example").unwrap();
+        let mut manifest = oci_client::manifest::OciImageManifest::default();
+        let version = "org.opencontainers.image.version".to_string();
+        manifest.annotations = Some([(version.clone(), "1.4".to_string())].into());
+        annotate(&mut manifest, &image);
+        let annotations = manifest.annotations.unwrap();
+        assert_eq!(annotations[&version], "1.4");
+        assert_eq!(
+            annotations["org.opencontainers.image.ref.name"],
+            image.to_string()
+        );
+        let mut bare = oci_client::manifest::OciImageManifest::default();
+        annotate(&mut bare, &image);
+        assert_eq!(bare.annotations.unwrap()[&version], "latest");
+    }
 
     #[test]
     fn mkosi_command_line() {

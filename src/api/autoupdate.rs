@@ -72,17 +72,34 @@ pub struct Request {
 
 /// The machine's policy: its own label, never one its image carries.
 pub fn policy(record: &ImageRecord) -> Option<&str> {
-    record
+    let value = record
         .labels
         .get(LABEL)
-        .or_else(|| record.labels.get(PODMAN_LABEL))
-        .map(String::as_str)
+        .or_else(|| record.labels.get(PODMAN_LABEL))?;
+    match value.as_str() {
+        // podman's values for no updates.
+        "" | "disabled" => None,
+        // podman's older name of registry.
+        "image" => Some("registry"),
+        other => Some(other),
+    }
+}
+
+/// A policy that is none of the known ones, a misspelt one: said as a failure, so that
+/// the run and its timer show it.
+pub fn invalid_policy(record: &ImageRecord) -> Option<String> {
+    match policy(record)? {
+        "registry" | "local" => None,
+        other => Some(format!(
+            "invalid auto-update policy {other:?}: valid policies are registry, image, local and disabled"
+        )),
+    }
 }
 
 /// Why a labelled machine is not updated, if it is not.
 pub fn skip_reason(record: &ImageRecord, built: &BTreeSet<&str>) -> Option<String> {
     match policy(record) {
-        None => return Some(format!("it has no {LABEL} label")),
+        None => return Some(format!("it has no {LABEL} label, or a disabled one")),
         Some("registry") => {}
         Some(other) => {
             return Some(format!(
@@ -224,6 +241,12 @@ pub async fn run(ctx: &Context, request: &Request, report: Report<'_>) -> Result
             from: record.manifest_digest.clone(),
             to: String::new(),
         };
+        if let Some(why) = invalid_policy(&record) {
+            outcome.updated = Updated::Failed;
+            outcome.reason = why;
+            outcomes.push(outcome);
+            continue;
+        }
         if let Some(why) = skip_reason(&record, &built) {
             outcome.reason = why;
             outcomes.push(outcome);
@@ -621,6 +644,24 @@ mod tests {
         assert!(skip_reason(&local, &none)
             .unwrap()
             .contains("unsupported policy"));
+        assert_eq!(invalid_policy(&local), None);
+        // podman's values: image is registry, disabled and empty are no updates.
+        let image = record(serde_json::json!({ "labels": { PODMAN_LABEL: "image" } }));
+        assert_eq!(
+            (policy(&image), skip_reason(&image, &none)),
+            (Some("registry"), None)
+        );
+        for off in ["disabled", ""] {
+            assert_eq!(
+                policy(&record(serde_json::json!({ "labels": { LABEL: off } }))),
+                None
+            );
+        }
+        // A misspelt one fails.
+        let typo = record(serde_json::json!({ "labels": { LABEL: "regsitry" } }));
+        assert!(invalid_policy(&typo)
+            .unwrap()
+            .contains("invalid auto-update policy"));
         assert!(skip_reason(&record(serde_json::json!({ "origin": "build" })), &none).is_some());
         // A machine of a built image, its build's record gone.
         assert!(skip_reason(

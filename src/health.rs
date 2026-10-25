@@ -161,13 +161,30 @@ pub struct Overrides {
 
 impl Overrides {
     pub fn is_empty(&self) -> bool {
-        *self == Overrides::default()
+        self.given() == Overrides::default()
+    }
+
+    /// These flags without the values that are none given, as the reference reads them:
+    /// an empty command, and 0 for a timing or the retries.
+    fn given(&self) -> Overrides {
+        let set = |v: Option<u64>| v.filter(|v| *v != 0);
+        Overrides {
+            cmd: self.cmd.clone().filter(|c| !c.is_empty()),
+            interval: set(self.interval),
+            timeout: set(self.timeout),
+            start_period: set(self.start_period),
+            start_interval: set(self.start_interval),
+            retries: self.retries.filter(|r| *r != 0),
+            ..self.clone()
+        }
     }
 
     /// The machine's healthcheck after these flags, on top of `base`.
     pub fn apply(&self, base: Option<&Healthcheck>) -> Result<Healthcheck> {
-        if self.disable {
-            if *self
+        let this = self.given();
+        let this = &this;
+        if this.disable {
+            if *this
                 != (Overrides {
                     disable: true,
                     ..Overrides::default()
@@ -181,10 +198,10 @@ impl Overrides {
             });
         }
         let mut hc = base.cloned().unwrap_or_default();
-        if let Some(cmd) = &self.cmd {
+        if let Some(cmd) = &this.cmd {
             hc.test = vec!["CMD-SHELL".to_string(), cmd.clone()];
         }
-        if let Some(test) = &self.test {
+        if let Some(test) = &this.test {
             hc.test.clone_from(test);
         }
         // Timings for an image without a healthcheck are taken and probe nothing.
@@ -192,10 +209,10 @@ impl Overrides {
             hc.argv()?;
         }
         for (given, field, name) in [
-            (self.interval, &mut hc.interval, "Interval"),
-            (self.timeout, &mut hc.timeout, "Timeout"),
-            (self.start_period, &mut hc.start_period, "StartPeriod"),
-            (self.start_interval, &mut hc.start_interval, "StartInterval"),
+            (this.interval, &mut hc.interval, "Interval"),
+            (this.timeout, &mut hc.timeout, "Timeout"),
+            (this.start_period, &mut hc.start_period, "StartPeriod"),
+            (this.start_interval, &mut hc.start_interval, "StartInterval"),
         ] {
             if let Some(value) = given {
                 // What the bus brings as microseconds is held to Go's range too, and to
@@ -203,13 +220,13 @@ impl Overrides {
                 if value > (i64::MAX / 1000) as u64 {
                     bail!("a healthcheck duration of {value} microseconds is past Go's range");
                 }
-                if value != 0 && value < 1000 {
+                if value < 1000 {
                     bail!("{name} in Healthcheck cannot be less than 1ms");
                 }
                 *field = value;
             }
         }
-        if let Some(retries) = self.retries {
+        if let Some(retries) = this.retries {
             hc.retries = retries;
         }
         Ok(hc)
@@ -769,6 +786,32 @@ mod tests {
         };
         let hc = exec.apply(None).unwrap();
         assert_eq!(hc.argv().unwrap(), ["/app/check", "a b"]);
+        // 0 is no value given: the image's stays.
+        let zeros = Overrides {
+            interval: Some(0),
+            retries: Some(0),
+            timeout: Some(2_000_000),
+            ..Overrides::default()
+        };
+        let hc = zeros.apply(Some(&image)).unwrap();
+        assert_eq!(
+            (hc.interval, hc.retries, hc.timeout),
+            (30_000_000, 0, 2_000_000)
+        );
+        // An empty command is none given: the image's test stays.
+        let empty = Overrides {
+            cmd: Some(String::new()),
+            ..Overrides::default()
+        };
+        assert!(empty.is_empty());
+        assert_eq!(empty.apply(Some(&image)).unwrap().test, image.test);
+        // --no-healthcheck with values that are none given is taken.
+        let off = Overrides {
+            disable: true,
+            retries: Some(0),
+            ..Overrides::default()
+        };
+        assert!(off.apply(Some(&image)).unwrap().disabled());
         // Timings with nothing to probe are taken, and probe nothing.
         let bare = flags.apply(None).unwrap();
         assert!(!bare.active() && bare.retries == 5);

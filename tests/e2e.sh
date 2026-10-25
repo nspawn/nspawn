@@ -4900,6 +4900,19 @@ $NSPAWN create $rv e2e-rv7-l --label traefik.enable --restart always:0 --pids-li
 [ "$($NSPAWN inspect -f json e2e-rv7-l | wc -l)" = 1 ] || fail "inspect -f json is not one line"
 $NSPAWN rm -f e2e-rv7-l >/dev/null 2>&1
 
+step "review: auto-update takes podman's policy values and fails a misspelt one; healthcheck flags of 0 or empty keep what the machine has"
+$NSPAWN create $rv e2e-rv8-typo --label org.nspawn.auto-update=regsitry -- sleep 600 >/dev/null 2>&1 || fail "create with a misspelt policy"
+out=$($NSPAWN auto-update e2e-rv8-typo 2>&1) && fail "auto-update of a misspelt policy succeeded: $out"
+echo "$out" | grep_q "invalid auto-update policy" || fail "a misspelt policy: $out"
+$NSPAWN create $rv e2e-rv8-off --label io.containers.autoupdate=disabled -- sleep 600 >/dev/null 2>&1 || fail "create with a disabled policy"
+out=$($NSPAWN auto-update e2e-rv8-off 2>&1) || fail "auto-update of a disabled machine failed: $out"
+echo "$out" | grep_q "or a disabled one" || fail "a disabled policy: $out"
+$NSPAWN create $rv e2e-rv8-h --health-cmd true --health-interval 2s --health-retries 4 -- sleep 600 >/dev/null 2>&1 || fail "create with a healthcheck"
+$NSPAWN update e2e-rv8-h --restart no --health-interval 0 --health-retries 0 --health-cmd "" >/dev/null 2>&1 || fail "update with health flags of 0"
+out=$($NSPAWN inspect -f '{{.healthcheck.interval}} {{.healthcheck.retries}} {{json .healthcheck.test}}' e2e-rv8-h)
+[ "$out" = '2000000 4 ["CMD-SHELL","true"]' ] || fail "health flags of 0 or empty changed the healthcheck: $out"
+$NSPAWN rm -f e2e-rv8-typo e2e-rv8-off e2e-rv8-h >/dev/null 2>&1
+
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"
 
