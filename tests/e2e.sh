@@ -710,12 +710,14 @@ $NSPAWN pull docker.io/library/busybox:latest --name $app --backend overlay --fo
 cat /tmp/e2e-app.txt
 grep -q "(app image)" /tmp/e2e-app.txt || fail "busybox not detected as an app image"
 grep -q "Boot=no" /etc/systemd/nspawn/$app.nspawn || fail "settings file does not disable --boot"
-# systemd-nspawn's notify socket is root's alone and of no use to an app: its program
-# finds it empty, which sd_notify's clients take for none. By the reference $app was
-# pulled from, which run takes from it: no other image keeps the layers the progress
-# step downloads again.
+# An app's program finds NOTIFY_SOCKET as systemd-nspawn sets it (an empty one is EINVAL
+# to libsystemd's and Rust's sd_notify), and -e still gives it another. By the reference
+# $app was pulled from, which run takes from it: no other image keeps the layers the
+# progress step downloads again.
 out=$($NSPAWN run --rm docker.io/library/busybox:latest --name e2e-notify -- /bin/sh -c 'echo "notify=[${NOTIFY_SOCKET-unset}]"' 2>/dev/null | tr -d '\r')
-[ "$out" = "notify=[]" ] || fail "an app's program found systemd-nspawn's notify socket: $out"
+[ "$out" = "notify=[/run/host/notify]" ] || fail "an app's program does not find systemd-nspawn's notify socket: $out"
+out=$($NSPAWN run --rm -e NOTIFY_SOCKET= docker.io/library/busybox:latest --name e2e-notify -- /bin/sh -c 'echo "notify=[${NOTIFY_SOCKET-unset}]"' 2>/dev/null | tr -d '\r')
+[ "$out" = "notify=[]" ] || fail "-e NOTIFY_SOCKET= did not empty it: $out"
 step "machinectl start right after pull: the unit hooks prepare everything"
 [ -e /etc/systemd/system/systemd-nspawn@$app.service.d/nspawn-hooks.conf ] || fail "no hooks drop-in after pull"
 machinectl start $app || fail "machinectl start of a freshly pulled app"

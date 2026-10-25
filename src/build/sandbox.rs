@@ -106,9 +106,8 @@ pub fn argv(step: &Step) -> Vec<String> {
     if let Some(user) = &step.user {
         out.push(format!("--user={user}"));
     }
-    // systemd-nspawn's notify socket is no step's business, as it is no app's: empty,
-    // which its clients take for none, unless the step's own variables say otherwise.
-    out.push("--setenv=NOTIFY_SOCKET=".to_string());
+    // systemd-nspawn's NOTIFY_SOCKET stays: a step is its PID 1, which may notify, and an
+    // empty one is EINVAL to libsystemd's and Rust's sd_notify.
     for var in &step.env {
         out.push(format!("--setenv={var}"));
     }

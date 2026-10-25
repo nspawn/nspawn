@@ -187,9 +187,11 @@ no command at all; `shell` opens machined's login session there. Any other image
 example nearly anything from Docker Hub, is an "app": its program runs under
 systemd-nspawn's stub init, with the environment, working directory, user and stop
 signal from the OCI config, and joins the bridge network like any other machine (see
-Networking). The `NOTIFY_SOCKET` systemd-nspawn hands its payload is set empty for an
-app: a program that notifies systemd takes an empty one for none, instead of failing on
-a socket only root may write to.
+Networking). An app's program finds the `NOTIFY_SOCKET` systemd-nspawn hands its
+payload, a socket only root may write to with recent systemd: a program that notifies
+systemd as another user logs that it could not, and goes on. `-e NOTIFY_SOCKET=` (or
+`NOTIFY_SOCKET: ""` in a compose file's `environment`) quiets one that takes an empty
+value for none, as Go's and Erlang's clients do; libsystemd's and Rust's refuse it.
 
 An image with s6-overlay (found by its files: linuxserver.io's images, Home Assistant's
 and others) runs as an app with its `/init` as PID 1 of the machine, which s6 insists

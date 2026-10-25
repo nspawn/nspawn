@@ -137,12 +137,9 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
                 let quoted: Vec<String> = s.command.iter().map(|a| quote(a)).collect();
                 out.push_str(&format!("Parameters={}\n", quoted.join(" ")));
             }
-            // systemd-nspawn gives its payload NOTIFY_SOCKET=/run/host/notify, a socket only
-            // root may write to and an app has no use for: a program that finds it
-            // notifies, and logs an error when it runs as another user. sd_notify's clients
-            // take an empty value for none, and Environment= wins over systemd-nspawn's own.
-            out.push_str("Environment=NOTIFY_SOCKET=\n");
-            // A later assignment of the same variable wins, so -e comes after the image's.
+            // systemd-nspawn's NOTIFY_SOCKET stays: an empty one is EINVAL to libsystemd's
+            // and Rust's sd_notify, and Environment= cannot unset it. A later assignment of
+            // the same variable wins, so -e comes after the image's.
             for var in s.run.env.iter().chain(s.extra_env) {
                 out.push_str(&format!("Environment={}\n", quote(var)));
             }
@@ -1329,11 +1326,12 @@ mod tests {
         });
         assert!(app.contains("Boot=no\nProcessTwo=yes\n"));
         assert!(app.contains("Parameters=nginx -g 'daemon off;'\n"));
-        // systemd-nspawn's notify socket is taken away before the image's variables, so
-        // that one the image or -e gives still wins.
+        // systemd-nspawn's own notify socket stays: nothing empties it, and one the image
+        // or -e gives still wins.
         assert!(app.contains(
-            "Environment=NOTIFY_SOCKET=\nEnvironment=PATH=/usr/bin\nEnvironment='GREETING=hello world'\n"
+            "Parameters=nginx -g 'daemon off;'\nEnvironment=PATH=/usr/bin\nEnvironment='GREETING=hello world'\n"
         ));
+        assert!(!app.contains("NOTIFY_SOCKET"));
         let notify = vec!["NOTIFY_SOCKET=/run/notify".to_string()];
         let given = render(&MachineSettings {
             name: "web",
@@ -1351,11 +1349,8 @@ mod tests {
             tuning: &Tuning::default(),
             bridge: None,
         });
-        let empty = given.find("Environment=NOTIFY_SOCKET=\n").unwrap();
-        let set = given
-            .find("Environment=NOTIFY_SOCKET=/run/notify\n")
-            .unwrap();
-        assert!(empty < set, "{given}");
+        assert!(given.contains("Environment=NOTIFY_SOCKET=/run/notify\n"));
+        assert!(!given.contains("Environment=NOTIFY_SOCKET=\n"), "{given}");
         assert!(app.contains("WorkingDirectory=/srv\nUser=nginx\nKillSignal=SIGRTMIN+4\n"));
         assert!(app.ends_with("[Network]\nVirtualEthernet=no\n"));
 
@@ -1432,7 +1427,7 @@ mod tests {
             "a numeric user applies, the gid is nspawn's business"
         );
         assert!(text.contains(
-            "Parameters=/bin/sleep infinity\nEnvironment=NOTIFY_SOCKET=\nEnvironment=GREETING=hi\nUser=1000\nKillSignal=SIGRTMIN+4\n"
+            "Parameters=/bin/sleep infinity\nEnvironment=GREETING=hi\nUser=1000\nKillSignal=SIGRTMIN+4\n"
         ));
         assert!(!text.contains("[Network]"));
         // The template's -U applies here, so volumes are idmapped.
