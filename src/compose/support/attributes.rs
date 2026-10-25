@@ -7,6 +7,8 @@ use super::{full, ignored, partly, refused, when, Attribute, Value};
 
 /// What a machine of an image that boots cannot take: its init runs as it is.
 const BOOTED: &str = "refused for an image that boots, whose init runs as it is";
+/// The program's arguments: `BOOTED`, and a newline goes through the image's /bin/sh.
+const ARGUMENTS: &str = "refused for an image that boots, whose init runs as it is; an argument with a newline needs a /bin/sh in the image, which hands it over";
 const GPU_CAPABILITIES: &str =
     "they pick the vendor whose CDI spec is used, as docker picks its device driver";
 const GPU_DRIVER: &str = "nvidia, amd or cdi, through the CDI specs of the host";
@@ -145,7 +147,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
         "services.*.cgroup_parent",
         "machines live in the slice of systemd-nspawn's units",
     ),
-    partly("services.*.command", BOOTED),
+    partly("services.*.command", ARGUMENTS),
     full("services.*.configs"),
     full("services.*.configs.[].source"),
     full("services.*.configs.[].target"),
@@ -287,7 +289,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
         "services.*.domainname",
         "a machine has a hostname and no domain name",
     ),
-    partly("services.*.entrypoint", BOOTED),
+    partly("services.*.entrypoint", ARGUMENTS),
     full("services.*.env_file"),
     full("services.*.env_file.[].format"),
     full("services.*.env_file.[].path"),

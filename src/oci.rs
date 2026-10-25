@@ -143,20 +143,22 @@ impl RunSpec {
     /// machine's settings file, which is line based, and an image does not get to
     /// write directives there (a newline in WorkingDir would be one). A tab in what
     /// the file quotes (the program's arguments, the environment) is a character like
-    /// any other.
+    /// any other, and so is a newline of an argument, which the file carries encoded
+    /// (`settings::needs_shell`).
     pub fn check_plain(&self) -> Result<()> {
+        let arguments: &[char] = &['\t', '\n'];
         let fields = [
-            ("Entrypoint", &self.entrypoint[..]),
-            ("Cmd", &self.cmd[..]),
-            ("Env", &self.env[..]),
+            ("Entrypoint", &self.entrypoint[..], arguments),
+            ("Cmd", &self.cmd[..], arguments),
+            ("Env", &self.env[..], &['\t']),
             // Not in the settings file, but in the notes of every start, which reach the
             // operator's terminal.
-            ("Volumes", &self.volumes[..]),
-            ("Shell", &self.shell[..]),
+            ("Volumes", &self.volumes[..], &['\t']),
+            ("Shell", &self.shell[..], &['\t']),
         ];
-        for (field, values) in fields {
+        for (field, values, kept) in fields {
             for value in values {
-                plain(field, value, true)?;
+                plain(field, value, true, kept)?;
             }
         }
         for (field, value) in [
@@ -165,7 +167,7 @@ impl RunSpec {
             ("StopSignal", &self.stop_signal),
         ] {
             if let Some(value) = value {
-                plain(field, value, false)?;
+                plain(field, value, false, &[])?;
             }
         }
         // Written up to its ':' only, where a backslash would end the line as well.
@@ -199,11 +201,8 @@ impl RunSpec {
     }
 }
 
-fn plain(field: &str, value: &str, quoted: bool) -> Result<()> {
-    if value
-        .chars()
-        .any(|c| c.is_control() && !(quoted && c == '\t'))
-    {
+fn plain(field: &str, value: &str, quoted: bool, kept: &[char]) -> Result<()> {
+    if value.chars().any(|c| c.is_control() && !kept.contains(&c)) {
         anyhow::bail!(
             "the image config's {field} holds a control character ({value:?}); refusing the image"
         );
@@ -427,14 +426,15 @@ mod tests {
 
     #[test]
     fn a_config_that_would_write_settings_directives_is_refused() {
-        // A newline in any of these would end the line of the settings file and start a
-        // directive of the image's choosing.
+        // A newline or a carriage return in any of these would end the line of the
+        // settings file and start a directive of the image's choosing; an argument's
+        // newline goes encoded (below), any other control character is refused.
         for (field, value) in [
             ("WorkingDir", r#""/srv\n[Files]\nBind=/:/host""#),
             ("User", r#""nginx\nPrivateUsers=no""#),
             ("StopSignal", r#""SIGTERM\nCapability=all""#),
-            ("Entrypoint", r#"["/bin/sh\nBind=/:/host"]"#),
-            ("Cmd", r#"["a", "b\n"]"#),
+            ("Entrypoint", r#"["/bin/sh\rBind=/:/host"]"#),
+            ("Cmd", r#"["a", "b\u001b"]"#),
             ("Env", r#"["A=1\nBind=/:/x"]"#),
             // Printed in a note on every start.
             ("Volumes", r#"{"/data\u001b]52;c;eA==\u0007": {}}"#),
@@ -455,6 +455,12 @@ mod tests {
         assert_eq!(spec.env, ["DEPS=llvm21-dev \tclang21"]);
         let tab = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{"WorkingDir":"/a\tb"}}"#;
         assert!(RunSpec::from_config(tab).is_err());
+        // A newline of an argument goes encoded: the program's arguments take it.
+        let script = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]},"config":{"Entrypoint":["/bin/sh","-c"],"Cmd":["echo one\necho two"]}}"#;
+        assert_eq!(
+            RunSpec::from_config(script).unwrap().argv(),
+            ["/bin/sh", "-c", "echo one\necho two"]
+        );
         // A backslash at the end of an unquoted value would join the next line.
         for field in ["WorkingDir", "User"] {
             let json = format!(

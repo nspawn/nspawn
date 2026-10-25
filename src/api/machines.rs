@@ -965,6 +965,13 @@ pub async fn prepare(
     if record.mode == Mode::App {
         binds.extend(crate::getent::shim(store, name, &record)?);
         crate::backend::ensure_usr(store, name, record.backend)?;
+        if settings::needs_shell(&record.effective_command())
+            && !crate::backend::root_has(store, name, record.backend, "bin/sh", |m| {
+                !m.is_file() || m.len() > 0
+            })
+        {
+            bail!("{name}: an argument of its program holds a newline, which the settings file cannot carry and nspawn hands over through /bin/sh, and the image has none");
+        }
     }
     if record.tuning.read_only && record.backend == BackendChoice::Mstack {
         // Its mount points would be made in the writable layer over the image's own
@@ -1490,7 +1497,7 @@ pub fn apply_flags(r: &mut ImageRecord, args: &StartRequest) -> Result<()> {
         );
     }
     if let Some(entrypoint) = &args.entrypoint {
-        volume::reject_control_characters_but_tab(entrypoint)?;
+        volume::reject_argument_control_characters(entrypoint)?;
         r.entrypoint = Some(if entrypoint.is_empty() {
             Vec::new()
         } else {
@@ -1501,7 +1508,7 @@ pub fn apply_flags(r: &mut ImageRecord, args: &StartRequest) -> Result<()> {
     }
     if !args.command.is_empty() {
         for arg in &args.command {
-            volume::reject_control_characters_but_tab(arg)?;
+            volume::reject_argument_control_characters(arg)?;
         }
         r.cmd = Some(args.command.clone());
     }

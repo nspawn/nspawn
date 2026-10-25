@@ -403,6 +403,18 @@ pub fn reject_control_characters_but_tab(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// The same for an argument of the program, where a newline is taken too: such
+/// arguments reach it through the image's /bin/sh (`settings::needs_shell`).
+pub fn reject_argument_control_characters(text: &str) -> Result<()> {
+    if text
+        .chars()
+        .any(|c| c.is_control() && c != '\t' && c != '\n')
+    {
+        bail!("{text:?}: control characters other than tabs and newlines are not allowed");
+    }
+    Ok(())
+}
+
 /// Environment as a program sees it when `extra` comes after `base`: one entry per
 /// variable, the later value winning (execve keeps duplicates and getenv reads the
 /// first, which is not what a later Environment= line means to systemd).

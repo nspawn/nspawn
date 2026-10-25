@@ -134,7 +134,7 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
                 "Boot=no\nProcessTwo=yes\n"
             });
             if !s.command.is_empty() {
-                let quoted: Vec<String> = s.command.iter().map(|a| quote(a)).collect();
+                let quoted: Vec<String> = written(s.command).iter().map(|a| quote(a)).collect();
                 out.push_str(&format!("Parameters={}\n", quoted.join(" ")));
             }
             // systemd-nspawn's NOTIFY_SOCKET stays: an empty one is EINVAL to libsystemd's
@@ -609,6 +609,42 @@ pub fn unit_quote(arg: &str) -> String {
     quoted
 }
 
+/// Whether the program's arguments reach it through the image's /bin/sh: the settings
+/// file takes no newline, so `handover` writes them encoded for the shell to decode.
+pub fn needs_shell(command: &[String]) -> bool {
+    command.iter().any(|arg| arg.contains('\n'))
+}
+
+/// Decodes each argument with printf's %b in order and execs them, so that the program
+/// gets them as given and keeps the PID the shell had. The x keeps the newlines a
+/// command substitution would take off the end.
+const HANDOVER: &str =
+    r#"for a in "$@"; do shift; d=$(printf '%bx' "$a"); set -- "$@" "${d%x}"; done; exec "$@""#;
+
+/// The program's arguments as the settings file carries them.
+fn written(command: &[String]) -> Vec<String> {
+    if needs_shell(command) {
+        handover(command)
+    } else {
+        command.to_vec()
+    }
+}
+
+/// `command` as /bin/sh runs it with `HANDOVER`: backslashes doubled and newlines
+/// written \n, which %b turns back.
+fn handover(command: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = ["/bin/sh", "-c", HANDOVER, "sh"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    argv.extend(
+        command
+            .iter()
+            .map(|arg| arg.replace('\\', r"\\").replace('\n', r"\n")),
+    );
+    argv
+}
+
 /// Writes the file when it changed, root's alone: -e often carries secrets.
 pub fn write(s: &MachineSettings, route: &NamespaceRoute) -> Result<()> {
     check_plain(s)?;
@@ -621,9 +657,10 @@ pub fn write(s: &MachineSettings, route: &NamespaceRoute) -> Result<()> {
 pub fn check_plain(s: &MachineSettings) -> Result<()> {
     let mut values: Vec<(&str, String)> = Vec::new();
     let mut quoted: Vec<(&str, String)> = Vec::new();
-    // The command and the environment are written in quotes: a tab there is kept.
-    for arg in s.command {
-        quoted.push(("the command", arg.clone()));
+    // The command and the environment are written in quotes: a tab there is kept. The
+    // command is checked as it is written, a newline of it encoded (`written`).
+    for arg in written(s.command) {
+        quoted.push(("the command", arg));
     }
     for var in s.run.env.iter().chain(s.extra_env) {
         quoted.push(("the environment", var.clone()));
@@ -1066,7 +1103,10 @@ mod tests {
         };
         let none = Tuning::default();
         assert!(plain(&["nginx".into()], &run, &none));
-        assert!(!plain(&["x\n[Files]\nBind=/:/host".into()], &run, &none));
+        // A newline of the command goes encoded; any other control character is refused.
+        assert!(plain(&["x\n[Files]\nBind=/:/host".into()], &run, &none));
+        assert!(!plain(&["x\r[Files]".into()], &run, &none));
+        assert!(!plain(&["a\nb\r[Files]".into()], &run, &none));
         let mut bad = run.clone();
         bad.working_dir = Some("/srv\nBind=/:/host".into());
         assert!(!plain(&[], &bad, &none));
@@ -1106,6 +1146,95 @@ mod tests {
             quote("DEPS=llvm21-dev \t\tclang21"),
             "'DEPS=llvm21-dev \t\tclang21'"
         );
+    }
+
+    /// A Parameters= value split as systemd-nspawn's config_parse_strv does: words apart
+    /// at whitespace, quotes taken off, backslashes kept.
+    fn parameters(file: &str) -> Vec<String> {
+        let line = file
+            .lines()
+            .find_map(|l| l.strip_prefix("Parameters="))
+            .unwrap();
+        let mut words = Vec::new();
+        let (mut word, mut quote, mut any) = (String::new(), None, false);
+        for c in line.chars() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), c) => word.push(c),
+                (None, '\'' | '"') => {
+                    quote = Some(c);
+                    any = true;
+                }
+                (None, ' ') if any => {
+                    words.push(std::mem::take(&mut word));
+                    any = false;
+                }
+                (None, ' ') => {}
+                (None, c) => {
+                    word.push(c);
+                    any = true;
+                }
+            }
+        }
+        if any {
+            words.push(word);
+        }
+        words
+    }
+
+    #[test]
+    fn an_argument_with_a_newline_reaches_the_program_through_the_shell() {
+        let run = RunSpec::default();
+        let render_app = |command: &[String]| {
+            render(&MachineSettings {
+                name: "web",
+                managed_userns: false,
+                mode: Mode::App,
+                pid1: false,
+                run: &run,
+                command,
+                extra_env: &[],
+                binds: &[],
+                volume_units: None,
+                network: Network::Bridge,
+                no_network: false,
+                hostname_file: None,
+                tuning: &Tuning::default(),
+                bridge: None,
+            })
+        };
+        let plain: Vec<String> = vec!["sh".into(), "-c".into(), "echo one; echo two".into()];
+        assert!(!needs_shell(&plain));
+        assert!(render_app(&plain).contains("Parameters=sh -c 'echo one; echo two'\n"));
+
+        let evil: Vec<String> = vec!["x\n[Files]\nBind=/:/host".into()];
+        let file = render_app(&evil);
+        assert!(
+            !file.lines().any(|l| l == "Bind=/:/host" || l == "[Files]"),
+            "{file}"
+        );
+        assert_eq!(file.matches("Parameters=").count(), 1);
+
+        let command: Vec<String> = vec![
+            "printf".into(),
+            "[%s]".into(),
+            "if true; then\n  echo one\nfi\n".into(),
+            r"back\slash \n \c \0101 %s".into(),
+            "it's \"quoted\"\t$HOME `id`".into(),
+            "\n".into(),
+            String::new(),
+        ];
+        assert!(needs_shell(&command));
+        let file = render_app(&command);
+        let argv = parameters(&file);
+        assert_eq!(argv[..4], ["/bin/sh", "-c", HANDOVER, "sh"]);
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let expected: String = command[2..].iter().map(|a| format!("[{a}]")).collect();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), expected);
     }
 
     #[test]

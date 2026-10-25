@@ -4830,6 +4830,61 @@ out=$(c5 down -v) || fail "compose down -v: $out"
 [ "$($NSPAWN volume ls | awk '$1 ~ /^e2e-rv5c-/' | wc -l)" = 0 ] || fail "down -v left the anonymous volume"
 $NSPAWN images rm e2e-rv5c-vol >/dev/null 2>&1
 
+step "review: arguments with newlines reach the program through the image's /bin/sh, from run, an image's CMD and compose; a layer's names from the root down (ko) land inside it"
+d=/tmp/e2e-rv/c6 && rm -rf $d && mkdir -p $d/p $d/img
+script='if true; then
+  echo one
+fi
+printf "%s|" "$@"'
+out=$($NSPAWN run --rm $rv --name e2e-rv6-nl -- /bin/sh -c "$script" sh 'two
+lines' 'back\slash \n \c' "it's" 2>/dev/null | tr -d '\r')
+[ "$out" = 'one
+two
+lines|back\slash \n \c|it'"'"'s|' ] || fail "run with newlines in its arguments: $out"
+# A line of an argument that reads like a directive stays in the argument.
+$NSPAWN run -d $rv --name e2e-rv6-inj -- /bin/sh -c 'echo "x
+[Files]
+Bind=/:/host"; exec sleep 600' >/dev/null 2>&1 || fail "run -d with a newline in an argument"
+f=/etc/systemd/nspawn/e2e-rv6-inj.nspawn
+[ "$(grep -c '^Parameters=' $f)" = 1 ] && ! grep -q '^Bind=/:/host$' $f || fail "an argument's line reached the settings file: $(cat $f)"
+$NSPAWN exec e2e-rv6-inj -- test -e /host/etc </dev/null && fail "an argument's line bound the host's root"
+retry 10 bash -c "$NSPAWN logs e2e-rv6-inj 2>&1 | tr -d '\r' | grep_q -x 'Bind=/:/host'" || fail "the argument did not reach the program whole: $($NSPAWN logs e2e-rv6-inj 2>&1)"
+$NSPAWN rm -f e2e-rv6-inj >/dev/null 2>&1
+# An image's CMD, whose last argument ($0 of the script) reads like a directive.
+printf 'FROM %s\nCMD ["/bin/sh", "-c", "echo one\\necho two", "x\\n[Files]\\nBind=/:/host"]\n' "$rv" > $d/img/Dockerfile
+$NSPAWN build -t e2e-rv6-cmd $d/img >/dev/null 2>&1 || fail "build of an image whose CMD holds a newline"
+out=$($NSPAWN run --rm e2e-rv6-cmd --name e2e-rv6-cmdr 2>/dev/null | tr -d '\r')
+[ "$out" = 'one
+two' ] || fail "an image's CMD with a newline: $out"
+$NSPAWN create e2e-rv6-cmd e2e-rv6-cmdc >/dev/null 2>&1 && $NSPAWN start e2e-rv6-cmdc >/dev/null 2>&1 || fail "start of an image whose CMD holds a newline"
+f=/etc/systemd/nspawn/e2e-rv6-cmdc.nspawn
+[ "$(grep -c '^Parameters=' $f)" = 1 ] && ! grep -q '^Bind=/:/host$' $f || fail "an image's CMD reached the settings file: $(cat $f)"
+$NSPAWN rm -f e2e-rv6-cmdc >/dev/null 2>&1
+$NSPAWN images rm e2e-rv6-cmd >/dev/null 2>&1
+cat > $d/p/compose.yaml <<COMPOSE
+services:
+  nl:
+    image: $rv
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo first
+        echo second
+COMPOSE
+c6() { (cd $d/p && $NSPAWN compose -f compose.yaml -p e2e-rv6c "$@" 2>&1); }
+out=$(c6 up -d) || fail "compose up of a command with a block scalar: $out"
+retry 10 bash -c "cd $d/p && $NSPAWN compose -f compose.yaml -p e2e-rv6c logs --no-log-prefix nl 2>&1 | tr -d '\r' | tr '\n' ' ' | grep_q 'first second'" || fail "compose command with a block scalar: $(c6 logs nl)"
+c6 down >/dev/null
+# ko writes its program under an absolute name; the image has no /bin/sh.
+$NSPAWN pull gcr.io/go-containerregistry/crane:latest --name e2e-rv6-ko >/dev/null 2>&1 || fail "pull of a ko image"
+$NSPAWN start e2e-rv6-ko -- version >/dev/null 2>&1 || fail "start of a ko image"
+retry 10 bash -c "$NSPAWN logs e2e-rv6-ko 2>&1 | tr -d '\r' | grep_q -E '^v?[0-9]+\.[0-9]+'" || fail "a ko image's program did not run: $($NSPAWN logs e2e-rv6-ko 2>&1)"
+out=$($NSPAWN start e2e-rv6-ko -- 'a
+b' 2>&1) && fail "an argument with a newline started without /bin/sh in the image: $out"
+echo "$out" | grep_q "holds a newline.*/bin/sh, and the image has none" || fail "the refusal without /bin/sh: $out"
+$NSPAWN rm -f e2e-rv6-ko >/dev/null 2>&1
+
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"
 

@@ -312,7 +312,11 @@ systemd-nspawn looks for it (`/sbin/init`, `/usr/lib/systemd/systemd`...),
 image's own (s6-overlay's) is not mistaken for it in a base that also has
 busybox's `/sbin/init`. Anything else is an app: its command runs under the
 stub init (`ProcessTwo=yes`), with the OCI config's environment, working
-directory, user and stop signal.
+directory, user and stop signal. An argument with a newline, which the settings
+file cannot carry, goes in encoded: `Parameters=` then runs the image's `/bin/sh`
+with a fixed script that turns each argument back with printf's `%b` and execs
+the program with them, which keeps the shell's PID. An image without `/bin/sh`
+cannot take such an argument.
 
 An image that carries s6-overlay (found at install, across the layers, and kept
 as `pid1` in the record) has its program run as PID 1 instead (`Boot=no` alone,

@@ -217,7 +217,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     }
     crate::api::machines::apply_addresses(store, config, &mut draft, &request.addresses)?;
     if let Some(entrypoint) = &request.entrypoint {
-        volume::reject_control_characters_but_tab(entrypoint)?;
+        volume::reject_argument_control_characters(entrypoint)?;
         draft.entrypoint = Some(if entrypoint.is_empty() {
             Vec::new()
         } else {
@@ -230,7 +230,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     draft.cmd = request.entrypoint.as_ref().map(|_| Vec::new());
     if !request.command.is_empty() {
         for arg in &request.command {
-            volume::reject_control_characters_but_tab(arg)?;
+            volume::reject_argument_control_characters(arg)?;
         }
         draft.cmd = Some(request.command.clone());
     }

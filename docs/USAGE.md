@@ -32,7 +32,12 @@ A machine made from a local image is checked against the start's flags as it is 
 so a start that would be refused (a mount point given twice, an app with nothing to
 run) leaves no machine behind. A name that is taken is refused unless `--force`, which
 makes the machine anew. What follows the image replaces an app's command
-(`nspawn run -it alpine sh`; after `--` as well).
+(`nspawn run -it alpine sh`; after `--` as well). An argument may hold newlines, as
+a script for `sh -c` does: the settings file systemd-nspawn reads takes none, so the
+program is then started through the image's `/bin/sh`, which gets the arguments
+encoded and runs the program with them as they were given. An image without
+`/bin/sh` cannot take such an argument, from the command line, compose or its own
+config.
 
 `run` stays attached: the machine's output follows until it ends, stdout and stderr
 together, a line at a time. It is read from the journal (nspawn's own with the default

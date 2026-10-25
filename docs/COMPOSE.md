@@ -224,7 +224,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.cgroup` | yes |  |
 | `services.*.cgroup`: `host` | ignored | a machine always has a cgroup namespace of its own |
 | `services.*.cgroup_parent` | ignored | machines live in the slice of systemd-nspawn's units |
-| `services.*.command` | partly | refused for an image that boots, whose init runs as it is |
+| `services.*.command` | partly | refused for an image that boots, whose init runs as it is; an argument with a newline needs a /bin/sh in the image, which hands it over |
 | `services.*.configs` | yes |  |
 | `services.*.configs.[].gid` | ignored | gid is not supported outside Swarm mode and will be ignored |
 | `services.*.configs.[].mode` | ignored | mode is not supported outside Swarm mode and will be ignored |
@@ -285,7 +285,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.dns_opt` | ignored | the resolv.conf of a machine takes no options |
 | `services.*.dns_search` | yes |  |
 | `services.*.domainname` | ignored | a machine has a hostname and no domain name |
-| `services.*.entrypoint` | partly | refused for an image that boots, whose init runs as it is |
+| `services.*.entrypoint` | partly | refused for an image that boots, whose init runs as it is; an argument with a newline needs a /bin/sh in the image, which hands it over |
 | `services.*.env_file` | yes |  |
 | `services.*.env_file.[].format` | yes |  |
 | `services.*.env_file.[].path` | yes |  |
