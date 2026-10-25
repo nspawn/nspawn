@@ -4912,6 +4912,12 @@ $NSPAWN update e2e-rv8-h --restart no --health-interval 0 --health-retries 0 --h
 out=$($NSPAWN inspect -f '{{.healthcheck.interval}} {{.healthcheck.retries}} {{json .healthcheck.test}}' e2e-rv8-h)
 [ "$out" = '2000000 4 ["CMD-SHELL","true"]' ] || fail "health flags of 0 or empty changed the healthcheck: $out"
 $NSPAWN rm -f e2e-rv8-typo e2e-rv8-off e2e-rv8-h >/dev/null 2>&1
+# A run --rm whose program ends at once, before its start call returns, is removed.
+for i in 1 2 3 4 5; do
+  $NSPAWN run --rm $rv --name e2e-rv8-quick -- sh -c 'exit 3' >/dev/null 2>&1
+  [ $? = 3 ] || fail "run --rm of a program that exits 3"
+  retry 5 bash -c "! $NSPAWN ps -a --format '{{.Names}}' | grep_q -x e2e-rv8-quick" || { fail "run --rm left e2e-rv8-quick after a quick exit"; break; }
+done
 
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"

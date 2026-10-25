@@ -903,9 +903,11 @@ pub async fn remove_after_exit(ctx: &Context, name: &str, invocation: &str) -> R
     let unit = format!("systemd-nspawn@{name}.service");
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
-        // Down: its stop hooks done too, which still read the record and its files.
+        // Down: its stop hooks done too, which still read the record and its files. And
+        // its start call returned: a program that ends sooner leaves the machine marked
+        // as starting, which a removal refuses.
         let state = sd.unit_status(&unit).await?;
-        if !state.busy() && !state.shutting_down() {
+        if !state.busy() && !state.shutting_down() && !ctx.store.is_starting(name) {
             break;
         }
         if !invocation.is_empty() && sd.invocation_id(&unit).await? != invocation {
