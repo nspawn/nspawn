@@ -434,6 +434,9 @@ mod tests {
     fn tar(name: &str, data: &[u8]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
         header.set_size(data.len() as u64);
         header.set_mode(0o644);
         header.set_entry_type(tar::EntryType::Regular);

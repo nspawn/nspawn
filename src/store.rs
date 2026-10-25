@@ -3260,9 +3260,13 @@ mod tests {
             ),
         )
         .unwrap();
-        // The opaque marker of an overlay layer is a trusted.* attribute, which only
-        // root sets.
-        let modes: &[WhiteoutMode] = if nix::unistd::geteuid().is_root() {
+        // An overlay layer's whiteouts are 0/0 devices and its opaque marker a trusted.*
+        // attribute, which root makes where it may (not in a package build's container).
+        let probe = tmp.path().join("probe");
+        fs::create_dir(&probe).unwrap();
+        let whiteouts = mknod(&probe.join("w"), SFlag::S_IFCHR, FileMode::empty(), 0).is_ok()
+            && xattr::set(&probe, "trusted.overlay.opaque", b"y").is_ok();
+        let modes: &[WhiteoutMode] = if whiteouts {
             &[WhiteoutMode::Apply, WhiteoutMode::OverlayLower]
         } else {
             &[WhiteoutMode::Apply]
