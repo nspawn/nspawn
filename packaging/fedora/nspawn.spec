@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 2.2.1
+%global upstream_version 2.3.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -165,6 +165,9 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Sun Oct 25 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 2.3.0-1
+- Layers applied inside their tree and checked against the config's diff_ids, ko images keep their program, arguments with newlines through /bin/sh, more flag forms read: -v modes and relative sources, --tmpfs options, --label KEY, --pids-limit -1; auto-update takes podman's policy values.
+
 * Sat Oct 24 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 2.2.1-1
 - An app's program and a build step find systemd-nspawn's NOTIFY_SOCKET again, as with 2.1.0: 2.2.0 emptied it, which libsystemd and Rust's sd-notify refuse.
 
