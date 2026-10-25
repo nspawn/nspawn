@@ -65,7 +65,12 @@ hooks.
 /var/lib/nspawn/     0711, and 0700 for every directory below but machines/:
                      the layers hold the images' setuid programs and device
                      nodes, the records the machines' environment
-  layers/            root-owned extracted layers (overlay backend)
+  layers/            root-owned extracted layers (overlay backend); .diffids/
+                     the digest each layer's archive was found to have, which
+                     the image's config names (checked at extraction, and
+                     from the blob for a layer extracted without a record),
+                     with the format of the extraction; .empty, the lower
+                     directory of an image without layers
   layers-foreign/    layers shifted into the foreign UID range (mstack)
   blobs/             compressed blobs, kept for push; .hold-* lists the blobs
                      of a pull, push or build in flight, which the collector
@@ -138,6 +143,8 @@ hooks.
                      and at the service's start
   .lock              flock serialising commands that change the store
 /var/lib/machines/NAME        the root machined boots (mount point or dir)
+/var/lib/machines/.nspawn-staging-NAME   a flat machine's layers applied
+                     before they replace the machine of the name
 /var/lib/machines/NAME.mstack mstack layout (layer@N links, rw/)
 /etc/systemd/nspawn/NAME.nspawn   generated settings, regenerated on start;
                      0600, the -e variables are in it
@@ -400,8 +407,16 @@ idmapped, so systemd-nspawn shifts the tree with a recursive chown at the first
 start. The mount carries `metacopy=on` so that this chown copies inodes rather
 than file contents into the upper directory and the layers stay shared.
 Attributes in overlayfs's own namespace (`trusted.overlay.*`, `user.overlay.*`)
-are dropped from every layer on extraction, so an image cannot redirect a file
-or its data.
+are dropped from every layer on extraction, and so is every other `trusted.*`
+attribute, so an image cannot redirect a file or its data.
+
+A layer is applied entry by entry: each lands where its name resolves inside
+the tree, a symlink's absolute target starting again at the tree's root and `..`
+never going above it, and whatever is done to the entry is done there. A name from the root down (`/ko-app/crane`, as ko writes them) is one
+inside the layer. A layer's archive is read to its end, and its digest has to be
+the one the image's config gives it. A layer found without a record of its format is
+kept as it is; `images rm` of the images that use it and a pull again extract it
+anew.
 
 ## The bus service
 

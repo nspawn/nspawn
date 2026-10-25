@@ -63,7 +63,7 @@ fn numeric(field: &[u8]) -> Result<i64> {
 }
 
 /// The fields of a header an entry is made from.
-struct Fields {
+pub(crate) struct Fields {
     mode: u32,
     uid: i64,
     gid: i64,
@@ -73,7 +73,7 @@ struct Fields {
 }
 
 impl Fields {
-    fn of(header: &tar::Header) -> Result<Fields> {
+    pub(crate) fn of(header: &tar::Header) -> Result<Fields> {
         let b = header.as_bytes();
         // V7 has no device numbers.
         let ustar = header.as_ustar().is_some() || header.as_gnu().is_some();
@@ -128,7 +128,7 @@ fn skippable_zstd_frame(head: &[u8]) -> bool {
 /// Both times of an entry, in nanoseconds since the epoch, bounded as boundTime bounds
 /// them.
 #[derive(Debug, Clone, Copy)]
-struct Times {
+pub(crate) struct Times {
     atime: i64,
     mtime: i64,
 }
@@ -136,7 +136,7 @@ struct Times {
 impl Times {
     /// Sets them on `path` itself, a symlink included: what the reference follows to is
     /// resolved inside the root before.
-    fn utimens(&self, path: &[u8]) -> Result<()> {
+    pub(crate) fn utimens(&self, path: &[u8]) -> Result<()> {
         let spec =
             |ns: i64| TimeSpec::new(ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000));
         let path = bytes_path(path);
@@ -233,7 +233,7 @@ fn resolve(root: &[u8], name: &[u8]) -> Result<Vec<u8>> {
 
 /// The parents of `dst` that are missing, made 0755 whatever the umask, as
 /// createImpliedDirectories makes them.
-fn implied_directories(root: &[u8], dst: &[u8]) -> Result<()> {
+pub(crate) fn implied_directories(root: &[u8], dst: &[u8]) -> Result<()> {
     let parent = lexical::dir(dst);
     if parent == root {
         return Ok(());
@@ -291,7 +291,9 @@ fn hardlink_target(root: &[u8], linkname: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// The PAX records of an entry, the last of a key winning.
-fn records<R: Read>(entry: &mut tar::Entry<'_, R>) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
+pub(crate) fn records<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
     let mut out = BTreeMap::new();
     if let Some(extensions) = entry.pax_extensions()? {
         for extension in extensions {
@@ -324,7 +326,7 @@ fn pax_time(value: &[u8]) -> Result<i128> {
 
 /// The times an entry gives its path: the modification time, and the later of it and
 /// the access time; outside what a timespec of nanoseconds holds, the epoch.
-fn times(
+pub(crate) fn times(
     header: &tar::Header,
     fields: &Fields,
     records: &BTreeMap<Vec<u8>, Vec<u8>>,

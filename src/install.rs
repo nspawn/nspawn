@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use oci_client::manifest::OciImageManifest;
 
 use crate::api::{note, Report};
@@ -59,7 +59,7 @@ fn assembled_with(
 /// Extracts the layers of `manifest` into the store ahead of `install`, where the same
 /// extraction then finds them done: what can fail in it (a media type nobody knows, a
 /// hostile archive, a full disk) fails before the machine being replaced is removed. A
-/// flat machine extracts into its own directory and is not covered.
+/// flat machine's are applied in its staging directory, which install moves into place.
 pub async fn stage_layers(
     store: &Store,
     backend: Backend,
@@ -69,10 +69,43 @@ pub async fn stage_layers(
 ) -> Result<()> {
     // install says its notes; this pass keeps quiet.
     let (backend, _) = assembled_with(store, backend, manifest, mode, &|_| {}, name)?;
+    let diff_ids = diff_ids(store, manifest)?;
     if backend == Backend::Flat {
+        let staging = store.flat_staging_dir(name);
+        if fs::symlink_metadata(&staging).is_ok() {
+            crate::store::remove_tree(&staging)
+                .with_context(|| format!("removing {}", staging.display()))?;
+        }
+        fs::create_dir_all(&staging).with_context(|| format!("creating {}", staging.display()))?;
+        for (layer, diff_id) in manifest.layers.iter().zip(diff_ids) {
+            let (blob, media_type, digest, target) = (
+                store.blob_path(&layer.digest),
+                layer.media_type.clone(),
+                layer.digest.clone(),
+                staging.clone(),
+            );
+            let applied = tokio::task::spawn_blocking(move || {
+                crate::store::extract_layer_checked(
+                    &blob,
+                    &media_type,
+                    &target,
+                    crate::store::WhiteoutMode::Apply,
+                    crate::store::Ownership::Root,
+                    Some(&diff_id),
+                )
+                .with_context(|| format!("extracting layer {digest}"))
+            })
+            .await
+            .context("extracting a layer")
+            .and_then(|r| r);
+            if let Err(e) = applied {
+                let _ = crate::store::remove_tree(&staging);
+                return Err(e);
+            }
+        }
         return Ok(());
     }
-    for layer in &manifest.layers {
+    for (layer, diff_id) in manifest.layers.iter().zip(diff_ids) {
         let store = store.clone();
         let (digest, media_type, blob, ownership) = (
             layer.digest.clone(),
@@ -81,12 +114,40 @@ pub async fn stage_layers(
             backend.ownership(),
         );
         tokio::task::spawn_blocking(move || {
-            store.import_layer(&digest, &media_type, &blob, ownership)
+            store.import_layer(&digest, &media_type, &blob, ownership, Some(&diff_id))
         })
         .await
         .context("extracting a layer")??;
     }
     Ok(())
+}
+
+/// The digests the image's config gives its layers' archives, one per layer of the
+/// manifest: an image whose two lists differ is refused, as its layers cannot be checked.
+pub fn diff_ids(store: &Store, manifest: &OciImageManifest) -> Result<Vec<String>> {
+    #[derive(serde::Deserialize, Default)]
+    struct Rootfs {
+        #[serde(default)]
+        diff_ids: Vec<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Config {
+        #[serde(default)]
+        rootfs: Rootfs,
+    }
+    let path = store.blob_path(&manifest.config.digest);
+    let blob = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    let config: Config =
+        serde_json::from_slice(&blob).with_context(|| format!("reading {}", path.display()))?;
+    let ids = config.rootfs.diff_ids;
+    if ids.len() != manifest.layers.len() {
+        bail!(
+            "the image's config names {} layer archives, and its manifest {} layers",
+            ids.len(),
+            manifest.layers.len()
+        );
+    }
+    Ok(ids)
 }
 
 /// All blobs named in the manifest (layers and config) must already be in the store.
@@ -102,10 +163,12 @@ pub async fn install(
         .manifest
         .layers
         .iter()
-        .map(|d| Layer {
+        .zip(diff_ids(store, spec.manifest)?)
+        .map(|(d, diff_id)| Layer {
             digest: d.digest.clone(),
             media_type: d.media_type.clone(),
             blob: store.blob_path(&d.digest),
+            diff_id: Some(diff_id),
         })
         .collect();
     // An mstack image runs with managed user namespaces, which cannot join the network
@@ -336,4 +399,105 @@ pub async fn forget_unit_ending(sd: &Systemd, name: &str) {
     let _ = sd
         .reset_failed(&format!("systemd-nspawn@{name}.service"))
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store with a config of `diff_ids` and the given layer blobs, raw tars.
+    fn image(store: &Store, layers: &[Vec<u8>], diff_ids: &[String]) -> OciImageManifest {
+        let config = serde_json::to_vec(&serde_json::json!({
+            "architecture": "amd64", "os": "linux", "config": { "Cmd": ["/bin/true"] },
+            "rootfs": { "type": "layers", "diff_ids": diff_ids },
+        }))
+        .unwrap();
+        let put = |bytes: &[u8]| {
+            let digest = crate::layout::sha256_digest(bytes);
+            fs::create_dir_all(store.blob_path(&digest).parent().unwrap()).unwrap();
+            fs::write(store.blob_path(&digest), bytes).unwrap();
+            digest
+        };
+        let config_digest = put(&config);
+        let layers: Vec<serde_json::Value> = layers
+            .iter()
+            .map(|l| serde_json::json!({ "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": put(l), "size": l.len() }))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest, "size": config.len() },
+            "layers": layers,
+        }))
+        .unwrap()
+    }
+
+    fn tar(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder.append_data(&mut header, name, data).unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_flat_machine_is_staged_whole_or_not_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("m"), &tmp.path().join("s"));
+        let (one, two) = (tar("a", b"1"), tar("b", b"2"));
+        let ids = [
+            crate::layout::sha256_digest(&one),
+            crate::layout::sha256_digest(&two),
+        ];
+        let good = image(&store, &[one.clone(), two.clone()], &ids);
+        stage_layers(&store, Backend::Flat, &good, Some(Mode::App), "web")
+            .await
+            .unwrap();
+        let staging = store.flat_staging_dir("web");
+        assert!(staging.join("a").is_file() && staging.join("b").is_file());
+        // A layer that is not what the config says leaves no staging behind.
+        let wrong = [ids[0].clone(), format!("sha256:{}", "0".repeat(64))];
+        let bad = image(&store, &[one, two], &wrong);
+        assert!(
+            stage_layers(&store, Backend::Flat, &bad, Some(Mode::App), "web")
+                .await
+                .is_err()
+        );
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn an_image_whose_config_and_manifest_disagree_on_layers_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("m"), &tmp.path().join("s"));
+        let config = br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":["sha256:aa"]}}"#;
+        let digest = crate::layout::sha256_digest(config);
+        fs::create_dir_all(store.blob_path(&digest).parent().unwrap()).unwrap();
+        fs::write(store.blob_path(&digest), config).unwrap();
+        let layer = |d: &str| serde_json::json!({ "mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": d, "size": 1 });
+        let manifest = |layers: Vec<serde_json::Value>| -> OciImageManifest {
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion": 2,
+                "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": digest, "size": config.len() },
+                "layers": layers,
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            diff_ids(&store, &manifest(vec![layer("sha256:l1")])).unwrap(),
+            ["sha256:aa"]
+        );
+        let e = diff_ids(
+            &store,
+            &manifest(vec![layer("sha256:l1"), layer("sha256:l2")]),
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("names 1 layer archives, and its manifest 2 layers"),
+            "{e}"
+        );
+    }
 }

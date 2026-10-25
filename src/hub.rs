@@ -445,6 +445,10 @@ impl Hub {
                 progress.advance(chunk.len() as u64);
             }
             file.flush().await?;
+            // On disk before it takes its name: a blob there is never downloaded again.
+            file.sync_all()
+                .await
+                .with_context(|| format!("writing {}", part.display()))?;
             progress.finish();
             Ok::<String, anyhow::Error>(hex::encode(hasher.finalize()))
         };
@@ -456,6 +460,11 @@ impl Hub {
             );
         }
         fs::rename(&part, dest).with_context(|| format!("moving {} into place", dest.display()))?;
+        if let Some(dir) = dest.parent() {
+            fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .with_context(|| format!("writing {}", dir.display()))?;
+        }
         unfinished.keep();
         Ok(())
     }

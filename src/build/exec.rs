@@ -756,15 +756,23 @@ impl<'a> Builder<'a> {
             layers: manifest.layers.iter().map(|l| l.digest.clone()).collect(),
             used: now_unix(),
         })?;
-        for layer in &manifest.layers {
-            let (store, digest, media_type) = (
+        if config.rootfs.diff_ids.len() != manifest.layers.len() {
+            bail!(
+                "{wanted}: its config names {} layer archives, and its manifest {} layers",
+                config.rootfs.diff_ids.len(),
+                manifest.layers.len()
+            );
+        }
+        for (layer, diff_id) in manifest.layers.iter().zip(&config.rootfs.diff_ids) {
+            let (store, digest, media_type, diff_id) = (
                 store.clone(),
                 layer.digest.clone(),
                 layer.media_type.clone(),
+                diff_id.clone(),
             );
             tokio::task::spawn_blocking(move || {
                 let blob = store.blob_path(&digest);
-                store.import_layer(&digest, &media_type, &blob, Ownership::Root)
+                store.import_layer(&digest, &media_type, &blob, Ownership::Root, Some(&diff_id))
             })
             .await
             .context("extracting a layer")??;
@@ -908,9 +916,15 @@ impl<'a> Builder<'a> {
         } else {
             std::fs::rename(&part, &blob).with_context(|| format!("keeping {}", blob.display()))?;
         }
-        let digest = committed.digest.clone();
+        let (digest, diff_id) = (committed.digest.clone(), committed.diff_id.clone());
         tokio::task::spawn_blocking(move || {
-            store.import_layer(&digest, LAYER_MEDIA_TYPE, &blob, Ownership::Root)
+            store.import_layer(
+                &digest,
+                LAYER_MEDIA_TYPE,
+                &blob,
+                Ownership::Root,
+                Some(&diff_id),
+            )
         })
         .await
         .context("extracting the layer")??;

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
-use crate::store::{extract_layer, Ownership, Store, WhiteoutMode, FOREIGN_UID_BASE};
+use crate::store::{extract_layer_checked, Ownership, Store, WhiteoutMode, FOREIGN_UID_BASE};
 use crate::systemd::Systemd;
 use crate::unitname;
 
@@ -146,6 +146,9 @@ pub struct Layer {
     pub digest: String,
     pub media_type: String,
     pub blob: PathBuf,
+    /// The digest the image's config gives the layer's archive, which it is checked
+    /// against.
+    pub diff_id: Option<String>,
 }
 
 pub struct Assembler<'a> {
@@ -176,21 +179,35 @@ impl Assembler<'_> {
             // that the service keeps answering the bus meanwhile.
             Backend::Flat => {
                 let dir = self.machine_dir(name);
+                // Staged ahead by install::stage_layers, applied whole.
+                let staging = self.store.flat_staging_dir(name);
+                if staging.is_dir() {
+                    fs::rename(&staging, &dir).with_context(|| {
+                        format!(
+                            "moving {} into place at {}",
+                            staging.display(),
+                            dir.display()
+                        )
+                    })?;
+                    return Ok(vec![dir]);
+                }
                 fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
                 for layer in layers {
-                    let (blob, media_type, digest, target) = (
+                    let (blob, media_type, digest, target, diff_id) = (
                         layer.blob.clone(),
                         layer.media_type.clone(),
                         layer.digest.clone(),
                         dir.clone(),
+                        layer.diff_id.clone(),
                     );
                     tokio::task::spawn_blocking(move || {
-                        extract_layer(
+                        extract_layer_checked(
                             &blob,
                             &media_type,
                             &target,
                             WhiteoutMode::Apply,
                             Ownership::Root,
+                            diff_id.as_deref(),
                         )
                         .with_context(|| format!("extracting layer {digest}"))
                     })
@@ -203,15 +220,22 @@ impl Assembler<'_> {
                 let mut dirs = Vec::new();
                 for layer in layers {
                     let store = self.store.clone();
-                    let (digest, media_type, blob, ownership) = (
+                    let (digest, media_type, blob, ownership, diff_id) = (
                         layer.digest.clone(),
                         layer.media_type.clone(),
                         layer.blob.clone(),
                         backend.ownership(),
+                        layer.diff_id.clone(),
                     );
                     dirs.push(
                         tokio::task::spawn_blocking(move || {
-                            store.import_layer(&digest, &media_type, &blob, ownership)
+                            store.import_layer(
+                                &digest,
+                                &media_type,
+                                &blob,
+                                ownership,
+                                diff_id.as_deref(),
+                            )
                         })
                         .await
                         .context("extracting a layer")??,
@@ -220,6 +244,9 @@ impl Assembler<'_> {
                 if backend == Backend::Overlay {
                     self.write_overlay(name, &dirs).await?;
                 } else {
+                    if dirs.is_empty() {
+                        bail!("{name}: an image without layers is assembled as overlay or flat, not mstack");
+                    }
                     write_mstack(&self.mstack_dir(name), &dirs)?;
                 }
                 Ok(dirs)
@@ -240,7 +267,8 @@ impl Assembler<'_> {
         crate::store::restrict(&private, crate::store::PRIVATE)?;
         let mp = mountpoint.to_string_lossy().to_string();
         let unit = unitname::mount_unit_for(&mp);
-        let text = overlay_unit_text(name, &mp, layer_dirs, &upper, &work);
+        let lowers = overlay_lowers(self.store, layer_dirs)?;
+        let text = overlay_unit_text(name, &mp, &lowers, &upper, &work);
         let unit_path = Path::new(UNIT_DIR).join(&unit);
         fs::write(&unit_path, text).with_context(|| format!("writing {}", unit_path.display()))?;
         let dropin_dir = dropin_dir(name);
@@ -654,6 +682,20 @@ fn remove_dir_if_exists(path: &Path) -> Result<bool> {
 /// mount be idmapped, so systemd-nspawn shifts the tree's ownership with a recursive
 /// chown instead, and without metacopy every chown copies the whole file into the upper
 /// directory. With it only the inode is copied and the layers stay shared.
+/// The lower directories of an overlay: the layers, or for an image without any (FROM
+/// scratch with only config) one empty directory of the store, since overlayfs mounts
+/// nothing without a lower directory.
+pub fn overlay_lowers(store: &Store, layer_dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    if !layer_dirs.is_empty() {
+        return Ok(layer_dirs.to_vec());
+    }
+    let empty = store.layers_dir(Ownership::Root).join(".empty");
+    fs::create_dir_all(&empty).with_context(|| format!("creating {}", empty.display()))?;
+    fs::set_permissions(&empty, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .with_context(|| format!("setting the mode of {}", empty.display()))?;
+    Ok(vec![empty])
+}
+
 pub fn overlay_unit_text(
     name: &str,
     mountpoint: &str,
@@ -1067,6 +1109,31 @@ mod tests {
         assert_eq!(systemd_major("261.3-1-arch"), Some(261));
         assert_eq!(systemd_major("259 (259.7-1.fc44)"), Some(259));
         assert_eq!(systemd_major("v255"), None);
+    }
+
+    #[test]
+    fn an_image_without_layers_gets_one_empty_lower_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("m"), &tmp.path().join("s"));
+        let lowers = overlay_lowers(&store, &[]).unwrap();
+        assert_eq!(lowers.len(), 1);
+        assert!(lowers[0].is_dir() && fs::read_dir(&lowers[0]).unwrap().next().is_none());
+        let text = overlay_unit_text(
+            "m",
+            "/var/lib/machines/m",
+            &lowers,
+            Path::new("/u"),
+            Path::new("/w"),
+        );
+        assert!(
+            text.contains(&format!(
+                "Options=lowerdir+={},upperdir=/u",
+                lowers[0].display()
+            )),
+            "{text}"
+        );
+        let some = vec![PathBuf::from("/l/1")];
+        assert_eq!(overlay_lowers(&store, &some).unwrap(), some);
     }
 
     #[test]
