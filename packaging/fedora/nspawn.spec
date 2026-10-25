@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 2.2.0
+%global upstream_version 2.2.1
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -165,6 +165,9 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Sat Oct 24 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 2.2.1-1
+- An app's program and a build step find systemd-nspawn's NOTIFY_SOCKET again, as with 2.1.0: 2.2.0 emptied it, which libsystemd and Rust's sd-notify refuse.
+
 * Sat Oct 24 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 2.2.0-1
 - Machines keep their network under ufw, apps get an empty notify socket, compose mounts bind sources it cannot read, logs takes durations and --tail; compose and the builder follow their references more closely: start and down with dependencies, anonymous volumes, networks made anew, ADD of archives and URLs, the context's times and capabilities.
 

@@ -1,3 +1,9 @@
+nspawn (2.2.1-1) unstable; urgency=medium
+
+  * An app's program and a build step find systemd-nspawn's NOTIFY_SOCKET again, as with 2.1.0: 2.2.0 emptied it, which libsystemd and Rust's sd-notify refuse.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Sat, 24 Oct 2026 19:23:14 -0500
+
 nspawn (2.2.0-1) unstable; urgency=medium
 
   * Machines keep their network under ufw, apps get an empty notify socket, compose mounts bind sources it cannot read, logs takes durations and --tail; compose and the builder follow their references more closely: start and down with dependencies, anonymous volumes, networks made anew, ADD of archives and URLs, the context's times and capabilities.
