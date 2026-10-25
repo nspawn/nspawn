@@ -548,9 +548,11 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         }
         Command::Create(mut a) => {
             // --mount is -v or --tmpfs written out; the files come before the flags.
-            let (mounted, tmpfs) = crate::mountopt::split(&a.mount)?;
-            a.volume.extend(mounted);
-            a.tuning.tmpfs.extend(tmpfs);
+            (a.volume, a.tuning.tmpfs) = crate::mountopt::with_mounts(
+                std::mem::take(&mut a.volume),
+                std::mem::take(&mut a.tuning.tmpfs),
+                &a.mount,
+            )?;
             a.env = crate::kvfile::env_with_files(&a.env_file, &a.env)?;
             a.label = crate::kvfile::labels_with_files(&a.label_file, &a.label)?;
             let mut options = client::registry_options(config);
@@ -828,13 +830,16 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 Some(format) if !format.is_empty() && format != "json" => {
                     let template = crate::gotemplate::Template::parse(format)
                         .map_err(|e| anyhow::anyhow!("template parsing error: {e}"))?;
+                    // An object the template fails on is said with the missing ones,
+                    // the others printed still.
                     for object in &out {
-                        let text = template
-                            .execute(object)
-                            .map_err(|e| anyhow::anyhow!("template parsing error: {e}"))?;
-                        println!("{text}");
+                        match template.execute(object) {
+                            Ok(text) => println!("{text}"),
+                            Err(e) => missing.push(anyhow::anyhow!("template parsing error: {e}")),
+                        }
                     }
                 }
+                Some("json") => println!("{}", serde_json::Value::Array(out)),
                 _ => client::print_json(&serde_json::Value::Array(out)),
             }
             match missing.pop() {

@@ -228,13 +228,13 @@ pub fn parse(text: &str) -> Result<Mount> {
                 bail!("invalid mount config for type \"bind\": invalid mount path: '{source}' mount path must be absolute");
             }
             let spec = format!("{source}:{target}{ro}");
-            // Made only for a mount the service will take.
-            spec.parse::<crate::volume::Volume>()?;
+            // Made only for a mount the service will take, where it takes it: cleaned.
+            let volume = spec.parse::<crate::volume::Volume>()?;
             if create_source {
-                std::fs::create_dir_all(&source)
-                    .with_context(|| format!("creating {source} (bind-create-src)"))?;
+                std::fs::create_dir_all(&volume.source)
+                    .with_context(|| format!("creating {} (bind-create-src)", volume.source))?;
             }
-            Ok(Mount::Volume(spec))
+            Ok(Mount::Volume(volume.to_string()))
         }
         "volume" => {
             if source.is_empty() {
@@ -276,6 +276,36 @@ pub fn parse(text: &str) -> Result<Mount> {
     }
 }
 
+/// The `-v` and `--tmpfs` lists of a command with its `--mount` values added. A `-v`
+/// source starting with '.' is a host path relative to this directory, as the reference
+/// takes it, which only the client knows. "none" alone forgets the remembered list; with
+/// values from `--mount` the given list replaces it anyway, so it goes.
+pub fn with_mounts(
+    mut volumes: Vec<String>,
+    mut tmpfs: Vec<String>,
+    mounts: &[String],
+) -> Result<(Vec<String>, Vec<String>)> {
+    let (mounted, mounted_tmpfs) = split(mounts)?;
+    let cwd = std::env::current_dir().ok();
+    for volume in &mut volumes {
+        if let (true, Some(cwd)) = (volume.starts_with('.'), &cwd) {
+            let (source, rest) = volume.split_once(':').unwrap_or((volume.as_str(), ""));
+            let source = crate::api::copy::clean(&cwd.join(source), false);
+            *volume = match rest {
+                "" => source.to_string_lossy().into_owned(),
+                rest => format!("{}:{rest}", source.to_string_lossy()),
+            };
+        }
+    }
+    for (list, added) in [(&mut volumes, mounted), (&mut tmpfs, mounted_tmpfs)] {
+        if !added.is_empty() && list.len() == 1 && list[0] == "none" {
+            list.clear();
+        }
+        list.extend(added);
+    }
+    Ok((volumes, tmpfs))
+}
+
 /// Every `--mount`, split into what `-v` and `--tmpfs` take.
 pub fn split(values: &[String]) -> Result<(Vec<String>, Vec<String>)> {
     let (mut volumes, mut tmpfs) = (Vec::new(), Vec::new());
@@ -290,6 +320,36 @@ pub fn split(values: &[String]) -> Result<(Vec<String>, Vec<String>)> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn volumes_are_taken_with_the_mounts_and_this_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let (volumes, tmpfs) = with_mounts(
+            vec![".:/app".into(), "./data:/d:ro".into(), "data:/x".into()],
+            vec!["none".into()],
+            &["type=tmpfs,dst=/t".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            volumes,
+            [
+                format!("{}:/app", cwd.display()),
+                format!("{}:/d:ro", cwd.join("data").display()),
+                "data:/x".to_string(),
+            ]
+        );
+        assert_eq!(tmpfs, ["/t"]);
+        // "none" alone stays, to forget the remembered list.
+        let (volumes, _) = with_mounts(vec!["none".into()], Vec::new(), &[]).unwrap();
+        assert_eq!(volumes, ["none"]);
+        let (volumes, _) = with_mounts(
+            vec!["none".into()],
+            Vec::new(),
+            &["type=bind,src=/srv,dst=/srv".into()],
+        )
+        .unwrap();
+        assert_eq!(volumes, ["/srv:/srv"]);
+    }
     use super::*;
 
     fn ok(text: &str) -> Mount {
@@ -422,14 +482,15 @@ mod tests {
         );
         assert!(parse(&text).is_err());
         assert!(!refused.exists(), "nothing is made for a refused mount");
-        // Nor for one the service would refuse.
+        // A source with .. is made where it leads, without the way there.
         let climbing = dir.path().join("up");
         let text = format!(
             "type=bind,bind-create-src,source={}/../x,target=/x",
             climbing.display()
         );
-        assert!(parse(&text).is_err());
+        parse(&text).unwrap();
         assert!(!climbing.exists());
+        assert!(dir.path().join("x").is_dir());
     }
 
     #[test]

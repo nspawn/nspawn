@@ -1146,8 +1146,8 @@ $NSPAWN stop $app >/dev/null; $NSPAWN start $app -e PATH=/opt/none:/usr/bin:/bin
 retry 5 bash -c "$NSPAWN ps | grep_q '^ *$app '" || fail "app with a PATH override is not running"
 [ "$($NSPAWN exec $app -- /bin/sh -c 'echo $PATH' </dev/null | tr -d '\r')" = "/opt/none:/usr/bin:/bin" ] || fail "exec does not apply a -e override of an image variable"
 $NSPAWN stop $app || fail "stop app with volumes"
-out=$($NSPAWN start $app --label novalue 2>&1) && fail "a label without a value was accepted"
-echo "$out" | grep_q "KEY=VALUE" || fail "a bad label was not explained: $out"
+out=$($NSPAWN start $app --label "no key=x" 2>&1) && fail "a label key with whitespace was accepted"
+echo "$out" | grep_q "a label needs a key without whitespace" || fail "a bad label was not explained: $out"
 $NSPAWN start $app --image-command -e none -v none --label none || fail "start with the image's own command"
 $NSPAWN inspect $app | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert 'caddy' not in d['labels'], d" || fail "--label none did not forget the labels"
 $NSPAWN ps | grep "^ *$app " | grep_q " sh " || fail "--image-command did not restore the image's cmd"
@@ -4884,6 +4884,21 @@ out=$($NSPAWN start e2e-rv6-ko -- 'a
 b' 2>&1) && fail "an argument with a newline started without /bin/sh in the image: $out"
 echo "$out" | grep_q "holds a newline.*/bin/sh, and the image has none" || fail "the refusal without /bin/sh: $out"
 $NSPAWN rm -f e2e-rv6-ko >/dev/null 2>&1
+
+step "review: flags read as the reference reads them: -v ./DIR:z, --tmpfs options, --label KEY, --restart always:0, --pids-limit -1, capabilities, inspect -f json"
+d=/tmp/e2e-rv/c7 && rm -rf $d && mkdir -p $d/data && echo from-dir > $d/data/f
+out=$(cd $d && $NSPAWN run --rm $rv --name e2e-rv7-v -v ./data:/d:ro,z -- cat /d/f 2>/dev/null | tr -d '\r')
+[ "$out" = from-dir ] || fail "-v ./DIR:ro,z: $out"
+out=$($NSPAWN create $rv e2e-rv7-t --tmpfs /t:rw,noexec,size=1m 2>&1) && fail "--tmpfs noexec was taken: $out"
+echo "$out" | grep_q "cannot make it noexec" || fail "--tmpfs noexec refusal: $out"
+out=$($NSPAWN run --rm $rv --name e2e-rv7-t --tmpfs /t:rw,size=1m -- sh -c 'df -k /t | tail -1' 2>/dev/null | tr -d '\r')
+echo "$out" | grep_q " 1024 " || fail "--tmpfs /t:rw,size=1m: $out"
+out=$($NSPAWN create $rv e2e-rv7-c --cap-add SYS_ADMN 2>&1) && fail "an unknown capability was taken: $out"
+echo "$out" | grep_q "unknown capability CAP_SYS_ADMN" || fail "unknown capability refusal: $out"
+$NSPAWN create $rv e2e-rv7-l --label traefik.enable --restart always:0 --pids-limit -1 -- sleep 600 >/dev/null 2>&1 || fail "create with --label KEY, --restart always:0 and --pids-limit -1"
+[ "$($NSPAWN inspect -f '{{json .labels}}' e2e-rv7-l)" = '{"traefik.enable":""}' ] || fail "--label KEY: $($NSPAWN inspect -f '{{json .labels}}' e2e-rv7-l)"
+[ "$($NSPAWN inspect -f json e2e-rv7-l | wc -l)" = 1 ] || fail "inspect -f json is not one line"
+$NSPAWN rm -f e2e-rv7-l >/dev/null 2>&1
 
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"

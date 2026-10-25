@@ -209,7 +209,7 @@ pub fn parse_restart(text: &str) -> Result<Restart> {
         None => (text, None),
     };
     let restart = match policy {
-        "no" => Restart::No,
+        "" | "no" => Restart::No,
         "on-failure" => Restart::OnFailure,
         "always" => Restart::Always,
         "unless-stopped" => Restart::UnlessStopped,
@@ -217,11 +217,27 @@ pub fn parse_restart(text: &str) -> Result<Restart> {
             "{text}: a restart policy is no, on-failure[:N], always or unless-stopped"
         ),
     };
-    match count {
-        None => Ok(restart),
-        Some(n) if restart == Restart::OnFailure && n.parse::<u32>().is_ok() => Ok(restart),
-        Some(_) => anyhow::bail!("{text}: only on-failure takes a count of restarts"),
+    // An empty count is 0, which every policy takes; a count above it only on-failure.
+    let count = match count {
+        None | Some("") => 0,
+        Some(n) => n
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n >= 0)
+            .ok_or_else(|| anyhow::anyhow!("{text}: the count of restarts is a number"))?,
+    };
+    if count > 0 && restart != Restart::OnFailure {
+        anyhow::bail!("{text}: only on-failure takes a count of restarts");
     }
+    Ok(restart)
+}
+
+/// --pids-limit: 0 or a negative number, -1 as written usually, removes the limit.
+pub fn parse_pids_limit(text: &str) -> Result<u64> {
+    let n: i64 = text
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{text}: --pids-limit is a number"))?;
+    Ok(n.max(0) as u64)
 }
 
 /// --memory: a size of at least 4m, or 0 for none.
@@ -299,6 +315,34 @@ mod tests {
         assert_eq!(stop_seconds(i64::MIN), NO_STOP_TIMEOUT);
         assert_eq!(shown_stop_timeout(NO_STOP_TIMEOUT), -1);
         assert_eq!(shown_stop_timeout(90), 90);
+    }
+
+    #[test]
+    fn restart_and_pids_limit_take_the_reference_s_forms() {
+        for (text, restart) in [
+            ("", Restart::No),
+            ("always:0", Restart::Always),
+            ("on-failure:", Restart::OnFailure),
+            ("on-failure:5000000000", Restart::OnFailure),
+            ("unless-stopped:", Restart::UnlessStopped),
+        ] {
+            assert_eq!(parse_restart(text).unwrap(), restart, "{text}");
+        }
+        for bad in ["always:1", "on-failure:-1", "on-failure:x", "sometimes"] {
+            assert!(parse_restart(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_pids_limit("-1").unwrap(), 0);
+        assert_eq!(parse_pids_limit("0").unwrap(), 0);
+        assert_eq!(parse_pids_limit("100").unwrap(), 100);
+        assert!(parse_pids_limit("many").is_err());
+        let cli = <crate::cli::Cli as clap::Parser>::try_parse_from([
+            "nspawn",
+            "run",
+            "--pids-limit",
+            "-1",
+            "img",
+        ]);
+        assert!(cli.is_ok(), "{:?}", cli.err());
     }
 
     #[test]

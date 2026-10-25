@@ -450,9 +450,11 @@ fn with_start_flags<'a>(mut options: Options<'a>, start: &Options<'static>) -> O
 /// The options of a StartMachine call from what start or run was given.
 fn start_options(mut args: StartOptions, command: Vec<String>) -> Result<Options<'static>> {
     // --mount is -v or --tmpfs written out; the files come before the flags, which win.
-    let (mounted, tmpfs) = crate::mountopt::split(&args.mount)?;
-    args.volume.extend(mounted);
-    args.tuning.tmpfs.extend(tmpfs);
+    (args.volume, args.tuning.tmpfs) = crate::mountopt::with_mounts(
+        std::mem::take(&mut args.volume),
+        std::mem::take(&mut args.tuning.tmpfs),
+        &args.mount,
+    )?;
     args.env = crate::kvfile::env_with_files(&args.env_file, &args.env)?;
     args.label = crate::kvfile::labels_with_files(&args.label_file, &args.label)?;
     let mut options = Options::new();

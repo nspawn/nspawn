@@ -458,7 +458,7 @@ pub struct CreateArgs {
     /// Environment for the program, VAR=value or VAR (copied from here).
     #[arg(long, short = 'e', value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
-    /// Mount a host directory or a named volume, SOURCE:TARGET[:ro].
+    /// Mount a host directory or a named volume, SOURCE:TARGET[:ro]; z, Z, a propagation, nocopy and cached are taken and do nothing.
     #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]", value_hint = clap::ValueHint::AnyPath)]
     pub volume: Vec<String>,
     /// Read variables from a file of VAR=value lines: no quoting or expansion, a VAR
@@ -496,9 +496,9 @@ pub struct CreateArgs {
     /// Remembered; applied at the next start.
     #[arg(long, value_name = "N", value_parser = crate::policy::parse_cpus)]
     pub cpus: Option<f64>,
-    /// Most processes and threads the machine may have; 0 removes the limit.
+    /// Most processes and threads the machine may have; 0 or -1 removes the limit.
     /// Remembered; applied at the next start.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", allow_negative_numbers = true, value_parser = crate::policy::parse_pids_limit)]
     pub pids_limit: Option<u64>,
     #[command(flatten)]
     pub health: HealthArgs,
@@ -1098,8 +1098,8 @@ pub struct UpdateArgs {
     /// CPU limit of the whole machine: 0.5, 2; 0 removes it.
     #[arg(long, value_name = "N", value_parser = crate::policy::parse_cpus)]
     pub cpus: Option<f64>,
-    /// Most processes and threads the machine may have; 0 removes the limit.
-    #[arg(long, value_name = "N")]
+    /// Most processes and threads the machine may have; 0 or -1 removes the limit.
+    #[arg(long, value_name = "N", allow_negative_numbers = true, value_parser = crate::policy::parse_pids_limit)]
     pub pids_limit: Option<u64>,
     #[command(flatten)]
     pub health: HealthArgs,
@@ -1341,7 +1341,7 @@ pub struct StartOptions {
     /// Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'e', value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
-    /// Mount a host directory or a named volume, SOURCE:TARGET[:ro].
+    /// Mount a host directory or a named volume, SOURCE:TARGET[:ro]; z, Z, a propagation, nocopy and cached are taken and do nothing.
     /// Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]", value_hint = clap::ValueHint::AnyPath)]
     pub volume: Vec<String>,
@@ -1380,9 +1380,9 @@ pub struct StartOptions {
     /// Remembered; applied at the next start.
     #[arg(long, value_name = "N", value_parser = crate::policy::parse_cpus)]
     pub cpus: Option<f64>,
-    /// Most processes and threads the machine may have; 0 removes the limit.
+    /// Most processes and threads the machine may have; 0 or -1 removes the limit.
     /// Remembered; applied at the next start.
-    #[arg(long, value_name = "N")]
+    #[arg(long, value_name = "N", allow_negative_numbers = true, value_parser = crate::policy::parse_pids_limit)]
     pub pids_limit: Option<u64>,
     #[command(flatten)]
     pub health: HealthArgs,

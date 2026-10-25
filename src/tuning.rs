@@ -831,12 +831,16 @@ fn capability(text: &str) -> Result<String> {
     {
         bail!("{text}: not a capability name (NET_ADMIN, SYS_PTRACE, ALL)");
     }
+    // systemd-nspawn would leave a name it does not know out, the flag lost unsaid.
+    if !ALL_CAPABILITIES.contains(&format!("CAP_{name}").as_str()) {
+        bail!("{text}: unknown capability CAP_{name}");
+    }
     Ok(name.to_string())
 }
 
-/// --tmpfs PATH[:options]; the options go to the mount as they are.
+/// --tmpfs PATH[:OPTIONS], with the options a tmpfs systemd-nspawn mounts takes.
 fn tmpfs(text: &str) -> Result<String> {
-    let path = text.split_once(':').map_or(text, |(p, _)| p);
+    let (path, options) = text.split_once(':').unwrap_or((text, ""));
     if !crate::volume::plain_inside_path(path)
         || path == "/"
         || path.chars().any(char::is_whitespace)
@@ -845,7 +849,30 @@ fn tmpfs(text: &str) -> Result<String> {
     }
     // The options become part of a settings line.
     reject_whitespace("--tmpfs", text)?;
-    Ok(text.to_string())
+    // systemd-nspawn gives them to the tmpfs as they are, mounted read-write, nodev and
+    // strictatime: tmpfs's own parameters are taken, what the mount is anyway goes, and
+    // a flag it cannot have is refused rather than dropped, which would give the machine
+    // what the option meant to keep from it.
+    let mut kept: Vec<&str> = Vec::new();
+    for option in options.split(',').filter(|o| !o.is_empty()) {
+        let key = option.split_once('=').map_or(option, |(k, _)| k);
+        match key {
+            "size" | "mode" | "uid" | "gid" | "nr_inodes" | "nr_blocks" | "mpol" | "huge"
+            | "inode32" | "inode64" | "noswap" => kept.push(option),
+            "rw" | "exec" | "suid" | "nodev" | "strictatime" | "private" | "rprivate" => {}
+            "ro" | "noexec" | "nosuid" | "dev" | "atime" | "noatime" | "relatime"
+            | "norelatime" | "nostrictatime" | "diratime" | "nodiratime" | "sync" | "async"
+            | "dirsync" | "shared" | "rshared" | "slave" | "rslave" => bail!(
+                "--tmpfs {text}: systemd-nspawn mounts a tmpfs read-write, nodev and strictatime, and cannot make it {option}"
+            ),
+            _ => bail!("--tmpfs {text}: invalid tmpfs option {option:?}"),
+        }
+    }
+    Ok(if kept.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}:{}", kept.join(","))
+    })
 }
 
 /// --device HOST[:CONTAINER[:PERMISSIONS]].
@@ -856,12 +883,20 @@ fn device(text: &str) -> Result<Device> {
             bail!("--device {text}: {e}");
         }
     }
+    // r, w and m, each once; a second field that is one is the permissions of the node
+    // at the same place, as the reference reads HOST:MODE.
+    let mode = |m: &str| {
+        !m.is_empty()
+            && m.chars().all(|c| matches!(c, 'r' | 'w' | 'm'))
+            && m.chars().enumerate().all(|(i, c)| !m[..i].contains(c))
+    };
     let fields: Vec<&str> = text.split(':').collect();
     let (host, container, permissions) = match fields[..] {
         [host] => (host, host, "rwm"),
+        [host, second] if mode(second) => (host, host, second),
         [host, container] => (host, container, "rwm"),
         [host, container, permissions] => (host, container, permissions),
-        _ => bail!("--device {text}: HOST[:CONTAINER[:PERMISSIONS]]"),
+        _ => bail!("--device {text}: HOST[:CONTAINER][:PERMISSIONS]"),
     };
     if !host.starts_with("/dev/") || !crate::volume::plain_inside_path(container) {
         bail!("--device {text}: a node under /dev, and an absolute path inside the machine");
@@ -869,11 +904,8 @@ fn device(text: &str) -> Result<Device> {
     if text.chars().any(char::is_whitespace) {
         bail!("--device {text}: no whitespace");
     }
-    if permissions.is_empty()
-        || permissions.len() > 3
-        || !permissions.chars().all(|c| matches!(c, 'r' | 'w' | 'm'))
-    {
-        bail!("--device {text}: permissions are r, w and m");
+    if !mode(permissions) {
+        bail!("--device {text}: permissions are r, w and m, each once");
     }
     Ok(Device {
         host: host.to_string(),
@@ -970,6 +1002,60 @@ fn sysctl(text: &str) -> Result<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn devices_and_capabilities_are_read_as_the_reference_reads_them() {
+        let d = device("/dev/sda:r").unwrap();
+        assert_eq!(
+            (
+                d.host.as_str(),
+                d.container.as_str(),
+                d.permissions.as_str()
+            ),
+            ("/dev/sda", "/dev/sda", "r")
+        );
+        let d = device("/dev/sda:/dev/xvda").unwrap();
+        assert_eq!(
+            (d.container.as_str(), d.permissions.as_str()),
+            ("/dev/xvda", "rwm")
+        );
+        let d = device("/dev/sda:/dev/xvda:rw").unwrap();
+        assert_eq!(d.permissions, "rw");
+        assert!(device("/dev/sda:/dev/xvda:rr").is_err());
+        assert!(device("/dev/sda:/dev/xvda:rwx").is_err());
+        assert_eq!(capability("net_admin").unwrap(), "NET_ADMIN");
+        assert_eq!(capability("CAP_SYS_PTRACE").unwrap(), "SYS_PTRACE");
+        assert_eq!(capability("all").unwrap(), "ALL");
+        let e = capability("SYS_ADMN").unwrap_err();
+        assert!(
+            e.to_string().contains("unknown capability CAP_SYS_ADMN"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn tmpfs_options_are_those_systemd_nspawn_can_mount() {
+        assert_eq!(tmpfs("/tmp").unwrap(), "/tmp");
+        // No options is the 1777 tmpfs, an empty list included.
+        assert_eq!(tmpfs("/tmp:").unwrap(), "/tmp");
+        assert_eq!(tmpfs("/tmp:rw,exec,size=64m").unwrap(), "/tmp:size=64m");
+        assert_eq!(
+            tmpfs("/cache:mode=0700,uid=1000,nr_inodes=5k").unwrap(),
+            "/cache:mode=0700,uid=1000,nr_inodes=5k"
+        );
+        for flag in ["noexec", "nosuid", "ro", "noatime"] {
+            let e = tmpfs(&format!("/run/app:rw,{flag},size=65536k")).unwrap_err();
+            assert!(
+                e.to_string().contains(&format!("cannot make it {flag}")),
+                "{e}"
+            );
+        }
+        let e = tmpfs("/x:bogus=1").unwrap_err();
+        assert!(
+            e.to_string().contains("invalid tmpfs option \"bogus=1\""),
+            "{e}"
+        );
+    }
     use super::*;
 
     #[test]

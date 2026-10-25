@@ -214,8 +214,13 @@ entrypoint nor a cmd) is refused with `no command specified`. Both are remembere
 `start --image-command` goes back to the image's own.
 
 `-e VAR=value` adds environment on top of the image's (`-e VAR` copies it from your
-shell). `-v SOURCE:TARGET[:ro]` mounts a host directory, which has to exist, or a named
-volume, into any kind of machine. nspawn keeps a named volume under
+shell, and is refused when your shell does not have it). `-v SOURCE:TARGET[:MODE]` mounts a host directory, which has to exist, or a
+named volume, into any kind of machine. A source starting with `.` is a directory
+relative to the one the command runs in, and a host path is taken cleaned. MODE is `ro`
+or `rw`, and the other words a mode may hold are accepted and do nothing: the SELinux
+relabelling `z` and `Z` (the policy labels what a machine sees), a propagation
+(systemd-nspawn binds with its own), `nocopy` and `cached`, `delegated` or
+`consistent`. A path with whitespace is not taken. nspawn keeps a named volume under
 `/var/lib/nspawn/volumes/NAME` and creates it on first use with what the image has at
 that path, owner and files included. In machines that run with private users the mount
 is idmapped, so a file root writes inside belongs to root on the host, and the other
@@ -271,7 +276,7 @@ MemoryMax=, CPUQuota= and TasksMax=), which is why they cannot be seen from insi
 unless `--memory-swap` gives memory and swap together: equal to `--memory` for no swap,
 larger for more, `-1` for swap without a bound (a size needs `--memory`, and `0` goes
 back to the default). They are remembered like the ports and apply at the next start;
-`--restart no` and a limit of 0 remove them. `update` changes them without a start: a
+`--restart no` and a limit of 0 remove them (`--pids-limit -1` as well). `update` changes them without a start: a
 running machine gets the new limits in its cgroup at once, and an unless-stopped
 machine stopped by hand stays off the boot list until its next start, its policy given
 again or not. `stats` shows what each running machine uses
@@ -331,12 +336,14 @@ command, and then removes it after them.
 KEY=VALUE lines (no quoting, no expansion, `#` comments, a KEY alone copied from here
 for a variable and left out for a label), before the `-e` and `--label` that follow and
 win. A variable's value may hold a tab but no newline or other control character: the
-settings file that carries the machine's variables is read a line at a time.
+settings file that carries the machine's variables is read a line at a time. A label's
+value holds no control character either, tabs included, as labels are printed on
+terminals.
 
 `--mount type=bind|volume|tmpfs,source=...,target=...` is the long form of `-v` and
 `--tmpfs` (`readonly`, `tmpfs-size`, `tmpfs-mode`). A volume needs its name, since nspawn
-has no anonymous volumes; image, cluster and npipe mounts, `volume-subpath` and driver
-options are refused.
+has no anonymous volumes; image, cluster and npipe mounts, `volume-subpath`, driver
+options and a source or target with `:` are refused.
 
 `--ip ADDRESS` fixes the address on the primary network, `--ip NETWORK=ADDRESS` on
 another one. The network must be one made with `network create`, not the default one,
@@ -355,11 +362,14 @@ More flags, remembered like the rest:
   `--cap-drop ALL --cap-add NET_BIND_SERVICE` keeps NET_BIND_SERVICE alone.
 - `--privileged` and `--read-only`.
 - `--tmpfs PATH[:OPTIONS]`. Given without options it is mode 1777, so a program of any
-  user writes to it; it is not mounted `noexec,nosuid`, which systemd-nspawn cannot ask
-  for. A `--tmpfs` on or below `/run` (`/var/run` in
+  user writes to it. The options are tmpfs's own (`size`, `mode`, `uid`, `gid`,
+  `nr_inodes`, `nr_blocks`, `mpol`, `huge`, `inode32`, `inode64`, `noswap`);
+  systemd-nspawn mounts it read-write, nodev and strictatime, so `rw`, `exec`, `suid`
+  and `nodev` are taken as they are, and `ro`, `noexec`, `nosuid` and the other atime
+  flags are refused rather than dropped. A `--tmpfs` on or below `/run` (`/var/run` in
   most images) is left out with a note: `/run` is a tmpfs of every machine already.
 - `--shm-size`.
-- `--device HOST[:CONTAINER[:rwm]]`: a node, or a directory such as `/dev/dri`, whose
+- `--device HOST[:CONTAINER][:rwm]`: a node, or a directory such as `/dev/dri`, whose
   nodes are allowed one by one, or a CDI name such as `nvidia.com/gpu=all` (see
   [GPUs and CDI devices](#gpus-and-cdi-devices)), and `--gpus`.
 - `--dns` and `--dns-search`.
@@ -613,8 +623,9 @@ SELinux hosts a binary below a home directory is refused with "Permission denied
 ### Labels
 
 An image's own labels (`LABEL` in a Dockerfile, `OciLabels=` in a mkosi.conf) are read
-from its OCI config when it is pulled or built, and `--label KEY=VALUE` on `run`,
-`start` or `create` adds labels of the machine's own on top, remembered like the ports
+from its OCI config when it is pulled or built, and `--label KEY=VALUE` (a KEY alone
+for an empty value) on `run`, `start` or `create` adds labels of the machine's own on
+top, remembered like the ports
 (`--label none` forgets them). nspawn itself does nothing with
 them; `inspect` and `ps --json` show both the merged `labels` and the `image_labels`,
 for tools such as a reverse proxy that configures itself from them.
@@ -733,7 +744,10 @@ command line and the bus never disagree.
 `inspect -f TEMPLATE` prints a template over each object, a line each, over the keys
 inspect prints (`{{.state}}`, `{{json .labels}}`, `{{index .addresses "front"}}`). The
 templates are Go's text/template, with the functions `json`, `join`, `split`, `lower`,
-`upper`, `title`, `pad` and `truncate`.
+`upper`, `title`, `pad` and `truncate`. A key the object lacks prints `<no value>`, as
+several keys are there only for some machines (`health`, `exit_code`); an object the
+template fails on is said after the others are printed. `-f json` prints the objects
+on one line.
 
 `system df` shows images, machines (the `Containers` row), volumes and build cache,
 with what each takes and what a prune would give back (`-v` for each of them, `--json`).

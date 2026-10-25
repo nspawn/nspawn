@@ -251,22 +251,22 @@ impl FromStr for Volume {
             [source, target, mode] => (*source, *target, *mode),
             _ => bail!("{text}: expected SOURCE:TARGET[:ro]"),
         };
-        let read_only = match mode {
-            "rw" => false,
-            "ro" => true,
-            other => bail!("{text}: unknown option {other} (ro or rw)"),
-        };
+        let read_only = mount_mode(text, mode)?;
         if source.is_empty() || target.is_empty() {
             bail!("{text}: source and target must not be empty");
         }
         if !target.starts_with('/') {
             bail!("{text}: the target must be an absolute path inside the machine");
         }
-        if source.starts_with('/') {
-            if source.contains("/../") || source.ends_with("/..") {
-                bail!("{text}: the source must be a plain absolute path");
-            }
-        } else if validate_volume_name(source).is_err() {
+        // A host path is taken cleaned, as the reference cleans it.
+        let cleaned;
+        let source = if source.starts_with('/') {
+            cleaned = crate::api::copy::clean(Path::new(source), false);
+            cleaned.to_str().unwrap_or(source)
+        } else {
+            source
+        };
+        if !source.starts_with('/') && validate_volume_name(source).is_err() {
             bail!("{text}: a volume name may only have letters, digits, _ . and -");
         }
         if [source, target]
@@ -288,6 +288,33 @@ impl FromStr for Volume {
             read_only,
         })
     }
+}
+
+/// Whether the mode of a -v makes it read-only. It takes the words the reference takes,
+/// each group once: rw or ro; the SELinux relabelling z or Z, the propagation, nocopy
+/// and the consistency, none of which nspawn applies (systemd-nspawn binds with its own
+/// propagation, the policy labels what a machine sees, a volume starts empty and the
+/// consistency is a macOS matter).
+fn mount_mode(text: &str, mode: &str) -> Result<bool> {
+    const GROUPS: [&[&str]; 5] = [
+        &["rw", "ro"],
+        &["z", "Z"],
+        &[
+            "private", "rprivate", "shared", "rshared", "slave", "rslave",
+        ],
+        &["nocopy"],
+        &["consistent", "cached", "delegated"],
+    ];
+    let mut seen = [false; GROUPS.len()];
+    for word in mode.split(',') {
+        let Some(group) = GROUPS.iter().position(|g| g.contains(&word)) else {
+            bail!("{text}: invalid mode: {mode}");
+        };
+        if std::mem::replace(&mut seen[group], true) {
+            bail!("{text}: invalid mode: {mode}");
+        }
+    }
+    Ok(mode.split(',').any(|word| word == "ro"))
 }
 
 impl fmt::Display for Volume {
@@ -357,9 +384,8 @@ pub fn parse_labels(values: &[String]) -> Result<std::collections::BTreeMap<Stri
     }
     for value in values {
         reject_control_characters(value)?;
-        let Some((key, val)) = value.split_once('=') else {
-            bail!("{value}: expected KEY=VALUE");
-        };
+        // A KEY alone is a label with an empty value, as the reference takes it.
+        let (key, val) = value.split_once('=').unwrap_or((value.as_str(), ""));
         if key.is_empty() || key.chars().any(char::is_whitespace) {
             bail!("{value}: a label needs a key without whitespace");
         }
@@ -374,7 +400,13 @@ pub fn parse_volumes(values: &[String]) -> Result<Vec<Volume>> {
         return Ok(Vec::new());
     }
     let mut out: Vec<Volume> = Vec::new();
+    let mut given: Vec<&str> = Vec::new();
     for value in values {
+        // The same value twice is one bind, as the reference keeps it once.
+        if given.contains(&value.as_str()) {
+            continue;
+        }
+        given.push(value);
         let volume: Volume = value.parse()?;
         let target = mount_point(&volume.target);
         if out.iter().any(|v| mount_point(&v.target) == target) {
@@ -515,7 +547,12 @@ mod tests {
         assert_eq!(labels["caddy.reverse_proxy"], "{{upstreams 80}}");
         assert_eq!(labels["empty"], "");
         assert!(parse_labels(&["none".to_string()]).unwrap().is_empty());
-        for bad in ["novalue", "=x", "a b=c", "a=\nb"] {
+        // A KEY alone is a label with an empty value.
+        assert_eq!(
+            parse_labels(&["traefik.enable".to_string()]).unwrap()["traefik.enable"],
+            ""
+        );
+        for bad in ["=x", "a b=c", "a=\nb"] {
             assert!(parse_labels(&[bad.to_string()]).is_err(), "{bad}");
         }
     }
@@ -580,8 +617,10 @@ mod tests {
             "/a:relative",
             "a b:/x",
             "../x:/x",
-            "/a/../b:/x",
             "a:/x:rx",
+            "/a:/x:ro,rw",
+            "/a:/x:z,Z",
+            "/a:/x:ro,",
             ".hidden:/x",
             ":/x",
         ] {
@@ -600,6 +639,27 @@ mod tests {
         }
         assert_eq!(mount_point("/var//lib/pg/"), "/var/lib/pg");
         assert_eq!(mount_point("/"), "/");
+        // The reference's modes, each group once; only ro changes anything.
+        for (mode, read_only) in [
+            ("z", false),
+            ("ro,Z", true),
+            ("rshared", false),
+            ("rw,rslave,nocopy,cached", false),
+            ("delegated,ro", true),
+        ] {
+            let v: Volume = format!("/srv/data:/data:{mode}").parse().unwrap();
+            assert_eq!(v.read_only, read_only, "{mode}");
+        }
+        // A host path is taken cleaned.
+        let v: Volume = "/srv/app/../shared:/shared".parse().unwrap();
+        assert_eq!(v.source, "/srv/shared");
+        // The same value twice is one bind; another value for the place is not.
+        let twice = [
+            "data:/var/lib/db".to_string(),
+            "data:/var/lib/db".to_string(),
+        ];
+        assert_eq!(parse_volumes(&twice).unwrap().len(), 1);
+        assert!(parse_volumes(&["data:/x".to_string(), "data:/x:rw".to_string()]).is_err());
     }
 
     #[test]
