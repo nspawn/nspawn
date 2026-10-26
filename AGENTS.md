@@ -45,10 +45,10 @@ anything:
   follows which files. Its examples are checked against a real run.
 - Changes to it go on a branch and reach `main` through a pull request that the
   maintainer merges, never as a commit on `main`. Preview them with
-  `docker compose up` in that repository and open http://localhost:1313; the
-  host has no Hugo or Go, so building it any other way fails. Its formatting
-  pass and its workflows belong to that repository: write the content, leave
-  those alone.
+  `sudo nspawn compose up` in that repository and open http://localhost:1313;
+  the host has no Hugo or Go, so building it any other way fails. Its
+  formatting pass and its workflows belong to that repository: write the
+  content, leave those alone.
 - Documentation and messages are plain ASCII English without emojis.
 - Code, comments, help texts and documentation say what nspawn does. Another
   tool (docker, docker compose, BuildKit, Podman and the like) is named only
