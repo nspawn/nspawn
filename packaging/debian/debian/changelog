@@ -1,3 +1,9 @@
+nspawn (2.3.2-1) unstable; urgency=medium
+
+  * needrestart leaves the machines and the units nspawn runs for them alone after an upgrade (/etc/needrestart/conf.d/nspawn.conf in the deb).
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Mon, 26 Oct 2026 01:09:46 -0500
+
 nspawn (2.3.1-1) unstable; urgency=medium
 
   * Published on apt.nspawn.org and rpm.nspawn.org; an upgrade of the deb leaves the auto-update timer as it was.

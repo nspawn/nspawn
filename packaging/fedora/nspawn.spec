@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 2.3.1
+%global upstream_version 2.3.2
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -165,6 +165,9 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Mon Oct 26 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 2.3.2-1
+- needrestart leaves the machines and the units nspawn runs for them alone after an upgrade (/etc/needrestart/conf.d/nspawn.conf in the deb).
+
 * Mon Oct 26 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 2.3.1-1
 - Published on apt.nspawn.org and rpm.nspawn.org; an upgrade of the deb leaves the auto-update timer as it was.
 
