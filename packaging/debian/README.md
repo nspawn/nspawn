@@ -19,6 +19,10 @@ whose own rust is new enough they are what gets used, and `-d` can go.
 The binary links against the glibc of the distribution it was built on, so a
 package built on 24.04 runs on later releases and not the other way round.
 
+`/etc/needrestart/conf.d/nspawn.conf` keeps needrestart from restarting the
+machines and the units nspawn runs for them after an upgrade; they take the new
+binaries at the machine's next start.
+
 ## The APT repository
 
 Every stable release is published at <https://apt.nspawn.org>. Once the

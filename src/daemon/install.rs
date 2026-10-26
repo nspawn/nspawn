@@ -297,6 +297,40 @@ mod tests {
         );
     }
 
+    /// The deb's needrestart rules name every unit nspawn runs for a machine, and the
+    /// machine's own, and leave the service alone: the package restarts that one.
+    #[test]
+    fn needrestart_leaves_the_machines_and_their_units_alone() {
+        let conf = include_str!("../../packaging/debian/debian/needrestart.conf");
+        let patterns: Vec<regex::Regex> = conf
+            .lines()
+            .filter_map(|l| {
+                l.strip_prefix("$nrconf{override_rc}{qr(")?
+                    .strip_suffix(")} = 0;")
+            })
+            .map(|p| regex::Regex::new(p).unwrap())
+            .collect();
+        assert_eq!(patterns.len(), 3);
+        let left_alone = |unit: &str| patterns.iter().any(|p| p.is_match(unit));
+        for unit in [
+            crate::health::unit_name("web"),
+            crate::portproxy::unit_name("web"),
+            "nspawn-drain-web.service".to_string(),
+            "nspawn-rm-web-0123abcd.service".to_string(),
+            "nspawn-api@web.service".to_string(),
+            "systemd-nspawn@web.service".to_string(),
+        ] {
+            assert!(left_alone(&unit), "{unit}");
+        }
+        for unit in [
+            "nspawn.service",
+            "nspawn-auto-update.service",
+            "nspawn-api@web.socket",
+        ] {
+            assert!(!left_alone(unit), "{unit}");
+        }
+    }
+
     #[test]
     fn a_binary_the_policy_does_not_know_is_pointed_out() {
         let binary = Path::new("/usr/local/bin/nspawn");
