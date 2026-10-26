@@ -39,8 +39,7 @@ and volumes too; `man nspawn` is the same reference the packages install.
 
 ## Installation
 
-Use a package: they are built and tested with every release. Debian 13 or later and
-Ubuntu 24.04 or later (amd64):
+Debian 13 or later and Ubuntu 24.04 or later (amd64):
 
 ```
 sudo curl -fsSLo /etc/apt/sources.list.d/nspawn.sources https://apt.nspawn.org/nspawn.sources
