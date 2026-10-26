@@ -159,13 +159,13 @@ jobs:
               gh release create "$tag" upload/* --title "nspawn $tag" $body $pre
           fi
 
-  apt:
-    name: Import the deb into apt.nspawn.org
+  packages:
+    name: Import the packages into apt.nspawn.org and rpm.nspawn.org
     needs: release
     runs-on: ubuntu-latest
     steps:
-      # The server takes the deb and its SHA256SUMS from the release itself and
-      # leaves pre-releases out: the connection only tells it to look, and its key
+      # The server takes the deb, the RPMs and their SHA256SUMS from the release itself
+      # and leaves pre-releases out: the connection only tells it to look, and its key
       # can do nothing else. Where and how to connect are repository secrets.
       - name: Run the import on the server over SSH
         env:
