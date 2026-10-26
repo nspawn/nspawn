@@ -22,7 +22,7 @@ package built on 24.04 runs on later releases and not the other way round.
 ## The APT repository
 
 Every stable release is published at <https://apt.nspawn.org>. Once the
-`release` job has attached the deb, the `apt` job tells the server to look:
+`release` job has attached the deb, the `packages` job tells the server to look:
 the server takes the deb and `SHA256SUMS` from the GitHub release, checks the
 one against the other and the package's name, version and architecture
 against its file name, and keeps the last five releases in the suite `stable`,
