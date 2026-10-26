@@ -158,3 +158,26 @@ jobs:
           else
               gh release create "$tag" upload/* --title "nspawn $tag" $body $pre
           fi
+
+  apt:
+    name: Import the deb into apt.nspawn.org
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      # The server takes the deb and its SHA256SUMS from the release itself and
+      # leaves pre-releases out: the connection only tells it to look, and its key
+      # can do nothing else. Where and how to connect are repository secrets.
+      - name: Run the import on the server over SSH
+        env:
+          APT_SSH_KEY: ${{ secrets.APT_SSH_KEY }}
+          APT_KNOWN_HOSTS: ${{ secrets.APT_KNOWN_HOSTS }}
+          APT_HOST: ${{ secrets.APT_HOST }}
+          APT_PORT: ${{ secrets.APT_PORT }}
+          APT_USER: ${{ secrets.APT_USER }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$APT_SSH_KEY" > ~/.ssh/apt_key
+          printf '%s\n' "$APT_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          ssh -i ~/.ssh/apt_key -p "$APT_PORT" -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes \
+              "$APT_USER@$APT_HOST" sync
