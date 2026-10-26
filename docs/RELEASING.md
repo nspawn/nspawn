@@ -1,9 +1,10 @@
 # Releasing
 
 A release is a tag. The `packages` workflow builds the RPM, the deb and the
-Arch package from it and attaches them to the GitHub release together with the
-plain binary and a `SHA256SUMS`, so the only things done by hand are the
-version and the documentation; the AUR packages are the maintainer's.
+Arch package from it, attaches them to the GitHub release together with the
+plain binary and a `SHA256SUMS`, and has apt.nspawn.org and rpm.nspawn.org
+import the deb and the RPMs, so the only things done by hand are the version
+and the documentation; the AUR packages are the maintainer's.
 
 ## Before the tag
 
@@ -35,7 +36,7 @@ version and the documentation; the AUR packages are the maintainer's.
    | --- | --- |
    | `docs/reference.md` | `src/cli.rs`: every command, flag, default and value name |
    | `docs/configuration.md` | `src/config.rs` and the per-machine record |
-   | `docs/getting-started.md` | the packaging, `src/daemon/install.rs`, the requirements |
+   | `docs/getting-started.md` | the packaging and its repositories, `src/daemon/install.rs`, the requirements |
    | `docs/overview.md` | `src/daemon/`, the polkit actions, the architecture |
    | `docs/images.md`, `docs/machines.md`, `docs/networking.md` | `src/api/`, `src/store.rs`, `src/bridge.rs`, `src/settings.rs` |
    | `docs/building.md` | `src/build/`, `src/commands/build.rs` and the Dockerfile flags in `src/cli.rs`; `src/api/build.rs` and the mkosi arguments it passes |
@@ -62,8 +63,11 @@ version and the documentation; the AUR packages are the maintainer's.
    `--skipchecksums`.
 6. Commit that as the last commit, subject `Release X.Y.Z`.
 7. Tag it and push the tag. The workflow does the rest; check the release page
-   afterwards, and install from one of the packages on a host that never had a
-   build of its own.
+   afterwards and that both repositories have the version, and install from one
+   of them on a host that never had a build of its own.
+
+   A published release's tag does not move: the repositories keep the packages
+   they imported, so a fix is a new version.
 
 ## After the tag
 

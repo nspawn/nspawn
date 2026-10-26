@@ -232,6 +232,7 @@ elsewhere, so remove what `--install` listed before going from a build to a pack
 The `packages` workflow builds all three in their own containers on every tag and on
 demand, keeps them as artifacts, and on a tag attaches them to the GitHub release
 together with the plain binary tarball (built on the oldest supported distribution,
-so that it runs on the later ones) and a `SHA256SUMS` over the lot. The suite on the
+so that it runs on the later ones) and a `SHA256SUMS` over the lot; the deb and the
+RPMs of a stable release then go to apt.nspawn.org and rpm.nspawn.org. The suite on the
 VMs of the matrix is where the packages get tested, each on its own distribution,
 since a container has neither SELinux enforcing nor machined.
