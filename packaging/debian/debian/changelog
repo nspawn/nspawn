@@ -1,3 +1,9 @@
+nspawn (2.3.1-1) unstable; urgency=medium
+
+  * Published on apt.nspawn.org and rpm.nspawn.org; an upgrade of the deb leaves the auto-update timer as it was.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Mon, 26 Oct 2026 00:07:39 -0500
+
 nspawn (2.3.0-1) unstable; urgency=medium
 
   * Layers applied inside their tree and checked against the config's diff_ids, ko images keep their program, arguments with newlines through /bin/sh, more flag forms read: -v modes and relative sources, --tmpfs options, --label KEY, --pids-limit -1; auto-update takes podman's policy values.
