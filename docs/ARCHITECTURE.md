@@ -534,6 +534,13 @@ ports cross (DNAT), anything else from one bridge to another is dropped, which
 holds whatever firewalld or iptables accept. The table is always written for
 all networks at once, so bringing one bridge up never drops another's rules.
 
+A published port without a host port (0) gets a free one on `create`, or in the
+prepare pass of a `start` that gave it: the first free one of its host range when it
+has one, otherwise one the kernel hands out to bind to. A port another running machine
+publishes or a service of the host holds is passed over. The record keeps it, so the
+prepare pass ahead of the unit and the unit's hook publish the same port, and so do
+later starts.
+
 The machines are IPv4-only and nftables cannot translate IPv6 into IPv4, so the IPv6
 side of a published port is a proxy in user space. A port given no IP has both sides,
 `0.0.0.0` the IPv4 one alone, `::` or an IPv6 address the IPv6 one alone

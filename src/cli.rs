@@ -443,7 +443,7 @@ pub struct CreateArgs {
     #[arg(long, value_name = "[NETWORK=]IP")]
     pub ip: Vec<String>,
     /// Ports to publish on the host, like start -p.
-    #[arg(long, short = 'p', value_name = "[IP:]HOST:CONTAINER[/udp]")]
+    #[arg(long, short = 'p', value_name = "[IP:][HOST:]CONTAINER[/udp]")]
     pub publish: Vec<String>,
     /// Replace an existing machine with the same name.
     #[arg(long, short = 'f')]
@@ -1327,12 +1327,14 @@ pub struct StartOptions {
     /// Remembered.
     #[arg(long, value_name = "[NETWORK=]IP")]
     pub ip: Vec<String>,
-    /// Publish a port on the host: HOST:CONTAINER[/udp] on every IPv4 and IPv6 address
+    /// Publish a port on the host: [HOST:]CONTAINER[/udp] on every IPv4 and IPv6 address
     /// of the host, IP:HOST:CONTAINER on one (0.0.0.0 every IPv4 address, [::] every
-    /// IPv6 one, an IPv6 address in brackets), several with a range on both sides
-    /// (8000-8010:8000-8010). Repeatable and remembered for the image; "none" forgets
-    /// them all.
-    #[arg(long, short = 'p', value_name = "[IP:]HOST:CONTAINER[/udp]")]
+    /// IPv6 one, an IPv6 address in brackets). No host port, or 0, takes a free one; a
+    /// host range with one container port (8000-8010:80) the first free one in it;
+    /// ranges on both sides (8000-8010:8000-8010) give one mapping per port. Also
+    /// published=HOST,target=CONTAINER[,protocol=udp][,host_ip=IP]. Repeatable and
+    /// remembered for the image; "none" forgets them all.
+    #[arg(long, short = 'p', value_name = "[IP:][HOST:]CONTAINER[/udp]")]
     pub publish: Vec<String>,
     /// Replace the image's entrypoint; an empty string runs the arguments alone.
     #[arg(long, value_name = "PROGRAM")]

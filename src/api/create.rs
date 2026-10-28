@@ -111,7 +111,8 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     }
     // Everything given is checked before the old machine goes or the new one is
     // assembled.
-    let ports = bridge::parse_publish(&request.publish)?;
+    let mut ports = bridge::parse_publish(&request.publish)?;
+    bridge::assign_host_ports(store, sd, &request.name, &mut ports).await?;
     let network = if request.network.is_empty() {
         None
     } else {

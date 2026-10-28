@@ -1253,6 +1253,73 @@ $NSPAWN ps | grep "^ *$app " | grep_q " sh " || fail "--image-command did not re
 grep -q "Bind=" /etc/systemd/nspawn/$app.nspawn && fail "-v none left volumes in the settings"
 $NSPAWN stop $app -t 2 || fail "stop app running its own cmd"
 
+step "CLI: published port forms and free host ports"
+cli_name=e2e-rv-cli-ports
+cli_ip_flags=()
+cli_has_v6=0
+if [ -n "$host_ipv6" ] && ip -6 addr show dev lo | grep_q "inet6 ::1/128"; then
+  cli_ip_flags=(-p "::1:18013:90")
+  cli_has_v6=1
+fi
+# A service of the host holds the first port of a host range: the next one is taken.
+python3 -c 'import socket,time; s=socket.socket(); s.bind(("0.0.0.0",18020)); s.listen(); time.sleep(120)' &
+listener_pid=$!
+sleep 1
+$NSPAWN create $app $cli_name --label org.nspawn.e2e.cli=$nonce \
+  -p 80 -p :81 -p 0:82 -p 18000-18001:83 -p 84-85 \
+  -p 127.0.0.1:18010:86/TCP -p 18011:87/ \
+  -p published=18012,target=88,protocol=UDP,host_ip=127.0.0.1 \
+  -p published=,target=89,protocol=,host_ip= \
+  -p '[127.0.0.1]:18014:91' -p :18015:92 -p 18020-18021:93 "${cli_ip_flags[@]}" \
+  -- /bin/sh -c 'mkdir -p /www; echo cli-ports > /www/index.html; exec /bin/httpd -f -p 80 -h /www' >/dev/null || fail "create with the CLI network forms"
+kill "$listener_pid" 2>/dev/null; listener_pid=
+$NSPAWN inspect $cli_name > /tmp/e2e-cli-ports.before || fail "inspect the CLI machine after create"
+$NSPAWN start $cli_name >/dev/null || fail "start with the CLI network forms"
+$NSPAWN inspect $cli_name > /tmp/e2e-cli-ports.after || fail "inspect the CLI machine after start"
+python3 - /tmp/e2e-cli-ports.before /tmp/e2e-cli-ports.after "$nonce" "$cli_has_v6" <<'PY' || fail "the CLI network forms were not applied"
+import json, sys
+before = json.load(open(sys.argv[1]))[0]
+after = json.load(open(sys.argv[2]))[0]
+nonce, has_v6 = sys.argv[3], int(sys.argv[4])
+ports = before["ports"]
+assert ports == after["ports"], (ports, after["ports"])
+assert len(ports) == 13 + has_v6, ports
+expected = {
+    "18000->83/tcp", "127.0.0.1:18010->86/tcp",
+    "18011->87/tcp", "127.0.0.1:18012->88/udp",
+    "127.0.0.1:18014->91/tcp", "18015->92/tcp", "18021->93/tcp",
+}
+if has_v6:
+    expected.add("[::1]:18013->90/tcp")
+assert expected <= set(ports), (expected - set(ports), ports)
+def target(port):
+    return int(port.rsplit("->", 1)[1].split("/")[0])
+def host(port):
+    return int(port.rsplit("->", 1)[0].rsplit(":", 1)[-1])
+assert all(host(port) > 0 for port in ports), ports
+dynamic = [port for port in ports if target(port) in {80, 81, 82, 84, 85, 89}]
+assert len(dynamic) == 6, dynamic
+assert len({host(port) for port in dynamic}) == len(dynamic), dynamic
+assert before["labels"]["org.nspawn.e2e.cli"] == nonce
+PY
+# The host port of a container port, as inspect has it.
+cli_port() { python3 -c 'import json,sys; d = json.load(open(sys.argv[1]))[0]; p = next(p for p in d["ports"] if p.endswith(sys.argv[2])); print(p.rsplit("->", 1)[0].rsplit(":", 1)[-1])' "$@"; }
+cli_http_port=$(cli_port /tmp/e2e-cli-ports.after "->80/tcp")
+retry 5 bash -c "curl -sf -m 5 http://127.0.0.1:$cli_http_port/ | grep_q cli-ports" || fail "the free host port does not publish the app"
+$NSPAWN stop $cli_name >/dev/null || fail "stop the CLI machine"
+# Ports given on start get theirs in the prepare pass, and later starts keep them.
+$NSPAWN start $cli_name -p 80 -p 18030-18031:81 >/dev/null || fail "start with a free port and a host range"
+$NSPAWN inspect $cli_name > /tmp/e2e-cli-ports.start || fail "inspect the CLI machine after a start with ports"
+python3 -c 'import json,sys; p = json.load(open(sys.argv[1]))[0]["ports"]; assert len(p) == 2 and "18030->81/tcp" in p and not p[0].startswith("0->"), p' /tmp/e2e-cli-ports.start || fail "start did not assign the ports it was given"
+cli_http_port=$(cli_port /tmp/e2e-cli-ports.start "->80/tcp")
+retry 5 bash -c "curl -sf -m 5 http://127.0.0.1:$cli_http_port/ | grep_q cli-ports" || fail "the port assigned on start does not publish the app"
+$NSPAWN stop $cli_name >/dev/null || fail "stop the CLI machine again"
+$NSPAWN start $cli_name >/dev/null || fail "start the CLI machine with its ports"
+[ "$(cli_port <($NSPAWN inspect $cli_name) "->80/tcp")" = "$cli_http_port" ] || fail "a later start moved the assigned port"
+$NSPAWN stop $cli_name >/dev/null || fail "stop the CLI machine at the end"
+$NSPAWN images rm $cli_name >/dev/null || fail "remove the CLI machine"
+rm -f /tmp/e2e-cli-ports.before /tmp/e2e-cli-ports.after /tmp/e2e-cli-ports.start
+
 # A path inside the machine with a dot component would mount elsewhere, the root for one.
 out=$($NSPAWN start $app -v /tmp:/. -- /bin/sleep 1 2>&1) && fail "a volume target of /. was accepted"
 echo "$out" | grep_q "without . or .." || fail "the dot target was not explained: $out"

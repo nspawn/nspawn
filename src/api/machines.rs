@@ -704,6 +704,7 @@ pub async fn prepare(
         }
         // A proxy left by an earlier run of the machine holds its IPv6 listeners.
         crate::portproxy::stop(sd, name).await?;
+        bridge::assign_host_ports(store, sd, name, &mut record.ports).await?;
         bridge::check_port_conflicts(store, sd, &record, pass == Pass::Hook, report).await?;
         store.record_image(&record)?;
         let addrs = bridge::prepare_machine(store, config, &nets, &all, &mut record)?;

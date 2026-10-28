@@ -983,16 +983,22 @@ nspawn says so.
 
 ### Published ports
 
-`-p [IP:]HOST:CONTAINER[/udp]` publishes a port of the machine on the host:
-`nspawn start web -p 8080:80 -p 5353:53/udp`. On IPv4 each one is a DNAT entry in the
-same nftables table, reachable from other hosts, from the host's own addresses and from
-127.0.0.1, and it goes away when the machine stops. `-p 8000-8010:8000-8010` publishes
-a range, one mapping per port. A port another running machine publishes on an address
-they share, or one a service of the host listens on, is refused. The list is
-remembered for the machine; `-p none` forgets it. With firewalld running, the bridge is
-bound to the trusted zone at runtime, which also lets published ports through on IPv4;
-the binding does not survive `firewall-cmd --reload`, and the next `start` or
-`nspawn network up` puts it back.
+`-p [IP:][HOST:]CONTAINER[/udp]` publishes a port of the machine on the host:
+`nspawn start web -p 8080:80 -p 5353:53/udp`. Without a host port (`-p 80`, `-p :80`)
+or with 0, the port gets a free one of the host, and `nspawn port web` shows which; a
+host range with one container port (`-p 8000-8010:80`) gets the first free port of the
+range. `-p 8000-8010:8000-8010` publishes a range, one mapping per port, and `-p 80-82`
+one free host port per container port. The machine keeps the ports it got. The long
+form, `published=8080,target=80,protocol=udp,host_ip=127.0.0.1`, has the same fields,
+`target` the only one required.
+
+On IPv4 each one is a DNAT entry in the same nftables table, reachable from other hosts,
+from the host's own addresses and from 127.0.0.1, and it goes away when the machine
+stops. A port another running machine publishes on an address they share, or one a
+service of the host listens on, is refused. The list is remembered for the machine;
+`-p none` forgets it. With firewalld running, the bridge is bound to the trusted zone at
+runtime, which also lets published ports through on IPv4; the binding does not survive
+`firewall-cmd --reload`, and the next `start` or `nspawn network up` puts it back.
 
 The machines have IPv4 addresses alone, and nftables cannot translate IPv6 into IPv4,
 so a port answers on the host's IPv6 addresses through a proxy in user space:

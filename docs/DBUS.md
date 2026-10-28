@@ -181,7 +181,7 @@ given is remembered for the machine.
 | `network`, `networks` | s, as | bridge, veth, host, none, `container:NAME` or a network made with `CreateNetwork`; several bridge networks, the first one primary |
 | `aliases` | as | `NAME` on the primary network or `NETWORK=NAME` |
 | `addresses` | as | `IP` on the primary network or `NETWORK=IP`: fixed addresses on networks made with `CreateNetwork` |
-| `publish` | as | `[IP:]HOST:CONTAINER[/udp]` (an IPv6 IP in brackets: `[::1]:8080:80`; `0.0.0.0` every IPv4 address alone, `[::]` every IPv6 one, no IP both), or ranges of equal length on both sides |
+| `publish` | as | `[IP:][HOST:]CONTAINER[/udp]` (an IPv6 IP in brackets: `[::1]:8080:80`; `0.0.0.0` every IPv4 address alone, `[::]` every IPv6 one, no IP both) or `published=HOST,target=CONTAINER[,protocol=udp][,host_ip=IP]`; no host port or 0 takes a free one, a host range with one container port the first free one in it, ranges of equal length one mapping per port |
 | `entrypoint` | s | replaces the image's and drops its cmd; `""` runs the command alone |
 | `command` | as | replaces an app's cmd |
 | `image_command` | b | forgets the remembered entrypoint and command and runs the image's own |

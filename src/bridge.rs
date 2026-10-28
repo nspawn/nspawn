@@ -265,14 +265,17 @@ impl Protocol {
     }
 }
 
-/// A published port, -p [IP:]HOST:CONTAINER[/udp], an IPv6 IP in brackets.
+/// A published port, -p [IP:][HOST:]CONTAINER[/udp].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortMap {
     /// None: every address of the host, IPv4 and IPv6. 0.0.0.0 is every IPv4 address
     /// alone and :: every IPv6 one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_ip: Option<IpAddr>,
+    /// Zero until create or start gives it a free one, of `host_range` when there is one.
     pub host: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_range: Option<(u16, u16)>,
     pub container: u16,
     pub protocol: Protocol,
 }
@@ -339,80 +342,152 @@ fn addresses_meet(a: Option<IpAddr>, b: Option<IpAddr>) -> bool {
     }
 }
 
-/// The host part of -p: an IPv4 address, or an IPv6 one, which the brackets carried.
-/// A link-local address needs an interface this syntax has no place for, and a mapped
-/// IPv4 one is that IPv4 address, written so.
-fn host_address(text: &str, ip: &str, bracketed: bool) -> Result<IpAddr> {
-    if bracketed {
-        let ip: Ipv6Addr = ip
-            .parse()
-            .with_context(|| format!("{text}: {ip} is not an IPv6 address"))?;
-        if ip.is_unicast_link_local() {
+/// The fields of one -p value as written: the IP with its brackets, the host and
+/// container ports or ranges, the protocol.
+struct PortSpec {
+    host_ip: String,
+    host: String,
+    container: String,
+    protocol: String,
+}
+
+impl PortSpec {
+    fn parse(text: &str) -> Result<Self> {
+        if text.contains('=') {
+            return Self::long(text);
+        }
+        let (ports, protocol) = text.rsplit_once('/').unwrap_or((text, "tcp"));
+        if ports.starts_with('[') {
+            let end = ports
+                .find(']')
+                .with_context(|| format!("{text}: a bracketed address ends with ]"))?;
+            let host_ip = ports[..=end].to_string();
+            let after = ports[end + 1..]
+                .strip_prefix(':')
+                .with_context(|| format!("{text}: expected [IP]:HOST:CONTAINER[/udp]"))?;
+            let fields: Vec<&str> = after.split(':').collect();
+            let [host, container] = fields.as_slice() else {
+                bail!("{text}: expected [IP]:HOST:CONTAINER[/udp]");
+            };
+            return Ok(PortSpec {
+                host_ip,
+                host: (*host).to_string(),
+                container: (*container).to_string(),
+                protocol: protocol.to_string(),
+            });
+        }
+        let fields: Vec<&str> = ports.split(':').collect();
+        let (host_ip, host, container) = match fields.len() {
+            1 => (String::new(), String::new(), fields[0].to_string()),
+            2 => (String::new(), fields[0].to_string(), fields[1].to_string()),
+            n => (
+                fields[..n - 2].join(":"),
+                fields[n - 2].to_string(),
+                fields[n - 1].to_string(),
+            ),
+        };
+        Ok(PortSpec {
+            host_ip,
+            host,
+            container,
+            protocol: protocol.to_string(),
+        })
+    }
+
+    /// published=HOST,target=CONTAINER,protocol=PROTO,host_ip=IP, any of them left out
+    /// or empty but target; other keys are passed over.
+    fn long(text: &str) -> Result<Self> {
+        let mut spec = PortSpec {
+            host_ip: String::new(),
+            host: String::new(),
+            container: String::new(),
+            protocol: "tcp".to_string(),
+        };
+        for parameter in text.split(',') {
+            let (key, value) = parameter.split_once('=').with_context(|| {
+                format!("invalid publish opts format (should be name=value but got '{parameter}')")
+            })?;
+            if key.is_empty() {
+                bail!("invalid publish opts format (should be name=value but got '{parameter}')");
+            }
+            match key {
+                "published" => spec.host = value.to_string(),
+                "target" => spec.container = value.to_string(),
+                "protocol" => spec.protocol = value.to_string(),
+                "host_ip" => spec.host_ip = value.to_string(),
+                _ => {}
+            }
+        }
+        if spec.host_ip.contains(':') && !spec.host_ip.starts_with('[') {
+            spec.host_ip = format!("[{}]", spec.host_ip);
+        }
+        Ok(spec)
+    }
+}
+
+/// The host IP of -p, its brackets taken off. A link-local address needs an interface
+/// this syntax has no place for, and a mapped IPv4 address is not an IPv6 one of its own.
+fn host_address(text: &str, ip: &str) -> Result<IpAddr> {
+    let address: IpAddr = ip
+        .parse()
+        .with_context(|| format!("{text}: {ip} is not an IP address"))?;
+    if let IpAddr::V6(v6) = address {
+        if v6.is_unicast_link_local() {
             bail!(
                 "{text}: {ip} is a link-local address, which -p cannot name; [::] takes them all"
             );
         }
-        if ip.to_ipv4_mapped().is_some() {
-            bail!("{text}: {ip} is an IPv4 address; write it without brackets");
+        if v6.to_ipv4_mapped().is_some() {
+            bail!("{text}: {ip} is an IPv4-mapped IPv6 address, which -p cannot name");
         }
-        return Ok(IpAddr::V6(ip));
     }
-    let ip: Ipv4Addr = ip.parse().with_context(|| {
-        format!("{text}: {ip} is not an IPv4 address; an IPv6 one goes in brackets, [::1]:8080:80")
-    })?;
-    Ok(IpAddr::V4(ip))
+    Ok(address)
+}
+
+/// One mapping of a -p value, `host` and `container` single ports of it; no host port is 0.
+fn port_map(text: &str, spec: &PortSpec, host: &str, container: &str) -> Result<PortMap> {
+    let protocol = match spec.protocol.to_ascii_lowercase().as_str() {
+        "" | "tcp" => Protocol::Tcp,
+        "udp" => Protocol::Udp,
+        other => bail!("{text}: unknown protocol {other} (tcp or udp)"),
+    };
+    let host_ip = if spec.host_ip.is_empty() || spec.host_ip == "[]" {
+        None
+    } else {
+        let ip = match spec.host_ip.strip_prefix('[') {
+            Some(rest) => rest
+                .strip_suffix(']')
+                .with_context(|| format!("{text}: a bracketed address ends with ]"))?,
+            None => spec.host_ip.as_str(),
+        };
+        Some(host_address(text, ip)?)
+    };
+    let number = |value: &str, zero: bool| {
+        value
+            .parse::<u16>()
+            .ok()
+            .filter(|port| zero || *port > 0)
+            .with_context(|| format!("{text}: bad port {value}"))
+    };
+    Ok(PortMap {
+        host_ip,
+        host: if host.is_empty() {
+            0
+        } else {
+            number(host, true)?
+        },
+        host_range: None,
+        container: number(container, false)?,
+        protocol,
+    })
 }
 
 impl FromStr for PortMap {
     type Err = anyhow::Error;
 
     fn from_str(text: &str) -> Result<Self> {
-        let (ports, protocol) = match text.rsplit_once('/') {
-            Some((ports, proto)) => (ports, proto),
-            None => (text, "tcp"),
-        };
-        let protocol = match protocol {
-            "tcp" => Protocol::Tcp,
-            "udp" => Protocol::Udp,
-            other => bail!("{text}: unknown protocol {other} (tcp or udp)"),
-        };
-        // [IPv6]:HOST:CONTAINER: the brackets keep the address's colons apart.
-        let (bracketed, ports) = match ports.strip_prefix('[') {
-            Some(rest) => {
-                let (ip, after) = rest
-                    .split_once(']')
-                    .with_context(|| format!("{text}: an IPv6 address ends with ]"))?;
-                let after = after
-                    .strip_prefix(':')
-                    .with_context(|| format!("{text}: expected [IP]:HOST:CONTAINER[/udp]"))?;
-                (Some(ip), after)
-            }
-            None => (None, ports),
-        };
-        let fields: Vec<&str> = ports.split(':').collect();
-        let (host_ip, host, container) = match (bracketed, &fields[..]) {
-            (None, [port]) => (None, *port, *port),
-            (None, [host, container]) => (None, *host, *container),
-            (None, [ip, host, container]) => {
-                (Some(host_address(text, ip, false)?), *host, *container)
-            }
-            (Some(ip), [host, container]) => {
-                (Some(host_address(text, ip, true)?), *host, *container)
-            }
-            _ => bail!("{text}: expected [IP:]HOST:CONTAINER[/udp], an IPv6 IP in brackets"),
-        };
-        let port = |s: &str| {
-            s.parse::<u16>()
-                .ok()
-                .filter(|p| *p > 0)
-                .with_context(|| format!("{text}: bad port {s}"))
-        };
-        Ok(PortMap {
-            host_ip,
-            host: port(host)?,
-            container: port(container)?,
-            protocol,
-        })
+        let spec = PortSpec::parse(text)?;
+        port_map(text, &spec, &spec.host, &spec.container)
     }
 }
 
@@ -423,39 +498,21 @@ impl fmt::Display for PortMap {
             Some(ip) => write!(f, "{ip}:")?,
             None => {}
         }
-        write!(
-            f,
-            "{}->{}/{}",
-            self.host,
-            self.container,
-            self.protocol.name()
-        )
+        match self.host_range {
+            Some((from, to)) if self.host == 0 => write!(f, "{from}-{to}")?,
+            _ => write!(f, "{}", self.host)?,
+        }
+        write!(f, "->{}/{}", self.container, self.protocol.name())
     }
 }
 
-/// One -p value, ranges expanded: HOST-HOST:CONTAINER-CONTAINER of equal lengths gives one
-/// mapping per port, as inspect shows them.
+/// One -p value, with ranges expanded and the long form read into the same fields. A
+/// range of host ports with one container port is one mapping, which takes the first free
+/// port of the range.
 fn expand_ports(text: &str) -> Result<Vec<PortMap>> {
-    let (ports, suffix) = match text.rsplit_once('/') {
-        Some((ports, proto)) => (ports, format!("/{proto}")),
-        None => (text, String::new()),
-    };
-    let Some((left, right)) = ports.rsplit_once(':') else {
-        return Ok(vec![text.parse()?]);
-    };
-    let (Some((host_from, host_to)), Some((cont_from, cont_to))) =
-        (left.split_once('-'), right.split_once('-'))
-    else {
-        if left.contains('-') || right.contains('-') {
-            bail!("{text}: a range of host ports goes with a range of container ports of the same length");
-        }
-        return Ok(vec![text.parse()?]);
-    };
-    let (prefix, host_from) = match host_from.rsplit_once(':') {
-        Some((prefix, from)) => (format!("{prefix}:"), from),
-        None => (String::new(), host_from),
-    };
-    let range = |from: &str, to: &str| -> Result<std::ops::RangeInclusive<u16>> {
+    let spec = PortSpec::parse(text)?;
+    let range = |value: &str| -> Result<std::ops::RangeInclusive<u16>> {
+        let (from, to) = value.split_once('-').unwrap_or((value, value));
         let from: u16 = from
             .parse()
             .with_context(|| format!("{text}: bad port {from}"))?;
@@ -467,17 +524,27 @@ fn expand_ports(text: &str) -> Result<Vec<PortMap>> {
         }
         Ok(from..=to)
     };
-    let hosts = range(host_from, host_to)?;
-    let containers = range(cont_from, cont_to)?;
-    if hosts.clone().count() != containers.clone().count() {
-        bail!(
-            "{text}: a range of host ports goes with a range of container ports of the same length"
-        );
+    let mapping = |host: &str, container: u16| port_map(text, &spec, host, &container.to_string());
+    let containers = range(&spec.container)?;
+    if !spec.host.contains('-') {
+        if containers.len() > 1 && !spec.host.is_empty() {
+            bail!("{text}: a container range needs an empty host port or a host range");
+        }
+        return containers.map(|c| mapping(&spec.host, c)).collect();
     }
-    hosts
-        .zip(containers)
-        .map(|(host, container)| format!("{prefix}{host}:{container}{suffix}").parse())
-        .collect()
+    let hosts = range(&spec.host)?;
+    if hosts.len() == containers.len() {
+        return hosts
+            .zip(containers)
+            .map(|(h, c)| mapping(&h.to_string(), c))
+            .collect();
+    }
+    if containers.len() > 1 {
+        bail!("{text}: ranges of host and container ports have different lengths");
+    }
+    let mut p = mapping("", *containers.start())?;
+    p.host_range = Some((*hosts.start(), *hosts.end()));
+    Ok(vec![p])
 }
 
 /// "none" alone clears the list.
@@ -488,13 +555,209 @@ pub fn parse_publish(values: &[String]) -> Result<Vec<PortMap>> {
     let mut out: Vec<PortMap> = Vec::new();
     for value in values {
         for p in expand_ports(value)? {
-            if out.iter().any(|o| o.clashes(&p)) {
+            if p.host != 0 && out.iter().any(|o| o.clashes(&p)) {
                 bail!("host port {}/{} given twice", p.host, p.protocol.name());
             }
             out.push(p);
         }
     }
     Ok(out)
+}
+
+/// A port the kernel hands out to bind to on `address`.
+fn ephemeral_port(address: SocketAddr, protocol: Protocol) -> std::io::Result<u16> {
+    match protocol {
+        Protocol::Tcp => std::net::TcpListener::bind(address)?
+            .local_addr()
+            .map(|address| address.port()),
+        Protocol::Udp => std::net::UdpSocket::bind(address)?
+            .local_addr()
+            .map(|address| address.port()),
+    }
+}
+
+/// Whether no service of the host holds the port on a side it is published on; an
+/// address the host lacks is for check_port_conflicts to tell.
+fn free_on_host(p: &PortMap, ipv6: bool) -> bool {
+    let held = |address: SocketAddr| matches!(host_port_free(address, p.protocol), Err(e) if e.kind() == std::io::ErrorKind::AddrInUse);
+    if let Some(ip) = p.ipv4_side() {
+        if held(SocketAddr::from((
+            ip.unwrap_or(Ipv4Addr::UNSPECIFIED),
+            p.host,
+        ))) {
+            return false;
+        }
+    }
+    !p.ipv6_side()
+        .filter(|_| ipv6)
+        .is_some_and(|ip| held(SocketAddr::from((ip, p.host))))
+}
+
+/// Gives each port without a host port one: the first of its range, or one the kernel
+/// hands out, that no other machine publishes (`used`), no other port of these takes and
+/// `free` finds no service of the host on.
+fn pick_host_ports(
+    ports: &mut [PortMap],
+    used: &[PortMap],
+    free: impl Fn(&PortMap) -> bool,
+) -> Result<()> {
+    let mut taken: Vec<PortMap> = used
+        .iter()
+        .chain(ports.iter().filter(|p| p.host != 0))
+        .copied()
+        .collect();
+    for p in ports.iter_mut().filter(|p| p.host == 0) {
+        let usable = |port: u16| {
+            let candidate = PortMap {
+                host: port,
+                host_range: None,
+                ..*p
+            };
+            (!taken.iter().any(|t| t.clashes(&candidate)) && free(&candidate)).then_some(candidate)
+        };
+        let target = format!("{}/{}", p.container, p.protocol.name());
+        let picked = match p.host_range {
+            Some((from, to)) => (from..=to)
+                .find_map(usable)
+                .with_context(|| format!("no free host port in {from}-{to} for {target}"))?,
+            None => {
+                let address =
+                    SocketAddr::from((p.host_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED)), 0));
+                let mut picked = None;
+                for _ in 0..128 {
+                    let port = ephemeral_port(address, p.protocol)
+                        .with_context(|| format!("finding a free host port for {target}"))?;
+                    picked = usable(port);
+                    if picked.is_some() {
+                        break;
+                    }
+                }
+                picked.with_context(|| format!("no free host port for {target}"))?
+            }
+        };
+        *p = picked;
+        taken.push(picked);
+    }
+    Ok(())
+}
+
+/// Gives the ports that leave their host port to nspawn one (see pick_host_ports), on
+/// create or before a start's port checks.
+pub async fn assign_host_ports(
+    store: &Store,
+    sd: &Systemd,
+    name: &str,
+    ports: &mut [PortMap],
+) -> Result<()> {
+    if ports.iter().all(|p| p.host != 0) {
+        return Ok(());
+    }
+    let used: Vec<PortMap> = ports_in_use(store, sd, name, true)
+        .await?
+        .into_iter()
+        .map(|used| used.port)
+        .collect();
+    let ipv6 = crate::portproxy::host_has_ipv6();
+    pick_host_ports(ports, &used, |p| free_on_host(p, ipv6))
+}
+
+#[cfg(test)]
+mod publish_form_tests {
+    use super::*;
+
+    fn one(text: &str) -> PortMap {
+        let ports = parse_publish(&[text.to_string()]).unwrap();
+        assert_eq!(ports.len(), 1, "{text}");
+        ports[0]
+    }
+
+    #[test]
+    fn an_empty_or_zero_host_port_is_left_for_a_free_one() {
+        for text in ["80", ":80", "0:80"] {
+            let p = one(text);
+            assert_eq!((p.host, p.host_range, p.container), (0, None, 80), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_host_range_for_one_port_is_one_mapping() {
+        let p = one("18000-18002:80");
+        assert_eq!(
+            (p.host, p.host_range, p.container),
+            (0, Some((18000, 18002)), 80)
+        );
+        assert_eq!(p.to_string(), "18000-18002->80/tcp");
+        // A range of one port is that port.
+        let p = one("18000-18000:80");
+        assert_eq!((p.host, p.host_range), (18000, None));
+        let containers = parse_publish(&["80-82".to_string()]).unwrap();
+        assert_eq!(containers.len(), 3);
+        assert_eq!((containers[2].host, containers[2].container), (0, 82));
+    }
+
+    #[test]
+    fn protocols_ignore_case_and_an_empty_one_is_tcp() {
+        assert_eq!(one("80/TCP").protocol, Protocol::Tcp);
+        assert_eq!(one("53/UDP").protocol, Protocol::Udp);
+        assert_eq!(one("80/").protocol, Protocol::Tcp);
+    }
+
+    #[test]
+    fn the_long_publish_form_is_read() {
+        let p = one("target=80,host_ip=127.0.0.1,published=18000,protocol=UDP");
+        assert_eq!(
+            (p.host, p.container, p.protocol),
+            (18000, 80, Protocol::Udp)
+        );
+        assert_eq!(p.host_ip, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let p = one("published=,target=81,protocol=,host_ip=");
+        assert_eq!((p.host, p.container, p.protocol), (0, 81, Protocol::Tcp));
+        assert_eq!(p.host_ip, None);
+    }
+
+    #[test]
+    fn host_addresses_take_unbracketed_ipv6_bracketed_ipv4_and_an_empty_ip() {
+        let p = one("::1:18000:80");
+        assert_eq!(p.host_ip, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!((p.host, p.container), (18000, 80));
+        let p = one("[127.0.0.1]:18000:80");
+        assert_eq!(p.host_ip, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let p = one(":18000:80");
+        assert_eq!(p.host_ip, None);
+        assert_eq!((p.host, p.container), (18000, 80));
+        assert_eq!(one("[]:18000:80").host_ip, None);
+    }
+
+    #[test]
+    fn free_ports_are_assigned_once_and_avoid_taken_ports() {
+        let mut ports =
+            parse_publish(&["80".to_string(), "80".to_string(), "80-81".to_string()]).unwrap();
+        pick_host_ports(&mut ports, &[], |_| true).unwrap();
+        assert!(ports.iter().all(|p| p.host > 0));
+        let unique: std::collections::BTreeSet<u16> = ports.iter().map(|p| p.host).collect();
+        assert_eq!(unique.len(), ports.len());
+        let used = ports.clone();
+        let mut other = parse_publish(&["82".to_string()]).unwrap();
+        pick_host_ports(&mut other, &used, |_| true).unwrap();
+        assert!(!used.iter().any(|p| p.clashes(&other[0])));
+        let assigned = other[0].host;
+        pick_host_ports(&mut other, &used, |_| true).unwrap();
+        assert_eq!(other[0].host, assigned);
+    }
+
+    #[test]
+    fn a_host_range_takes_its_first_free_port() {
+        let mut ports =
+            parse_publish(&["18000-18003:80".to_string(), "18000-18003:81".to_string()]).unwrap();
+        // Another machine publishes 18000, a service of the host holds 18001.
+        let used = parse_publish(&["18000:90".to_string()]).unwrap();
+        pick_host_ports(&mut ports, &used, |p| p.host != 18001).unwrap();
+        assert_eq!((ports[0].host, ports[0].host_range), (18002, None));
+        assert_eq!(ports[1].host, 18003);
+        let mut full = parse_publish(&["18000-18001:80".to_string()]).unwrap();
+        let e = pick_host_ports(&mut full, &used, |p| p.host != 18001).unwrap_err();
+        assert_eq!(e.to_string(), "no free host port in 18000-18001 for 80/tcp");
+    }
 }
 
 /// Creates a network's bridge, forwarding, NAT and firewall exceptions; idempotent. The
@@ -2314,8 +2577,8 @@ mod tests {
         let p: PortMap = "53:5353/udp".parse().unwrap();
         assert_eq!((p.host, p.container, p.protocol), (53, 5353, Protocol::Udp));
         let p: PortMap = "443".parse().unwrap();
-        assert_eq!((p.host, p.container), (443, 443));
-        assert!("0:80".parse::<PortMap>().is_err());
+        assert_eq!((p.host, p.container), (0, 443));
+        assert_eq!("0:80".parse::<PortMap>().unwrap().host, 0);
         assert!("80:x".parse::<PortMap>().is_err());
         assert!("80:80/sctp".parse::<PortMap>().is_err());
         let p: PortMap = "127.0.0.1:8080:80".parse().unwrap();
@@ -2347,11 +2610,9 @@ mod tests {
             (Some(Some(Ipv4Addr::LOCALHOST)), None)
         );
         for bad in [
-            "::1:80:80",
             "[::1]:80",
             "[::1:80:80",
             "[::1]80:80",
-            "[127.0.0.1]:80:80",
             "[fe80::1]:80:80",
             "[::ffff:10.0.0.1]:80:80",
             "1.2.3:80:80",
@@ -2382,7 +2643,7 @@ mod tests {
             .parse::<PortMap>()
             .unwrap()
             .clashes(&p));
-        // Ranges, one mapping per port; a range of host ports for one port is refused.
+        // Ranges, one mapping per port.
         let range = expand_ports("127.0.0.1:8000-8002:80-82/udp").unwrap();
         assert_eq!(range.len(), 3);
         assert_eq!(range[2].to_string(), "127.0.0.1:8002->82/udp");
@@ -2393,7 +2654,9 @@ mod tests {
         let range6 = expand_ports("[::1]:8000-8001:80-81").unwrap();
         assert_eq!(range6[1].to_string(), "[::1]:8001->81/tcp");
         assert!(expand_ports("8000-8002:80-81").is_err());
-        assert!(expand_ports("8000-8002:80").is_err());
+        let one_container = expand_ports("8000-8002:80").unwrap();
+        assert_eq!(one_container.len(), 1);
+        assert_eq!(one_container[0].host_range, Some((8000, 8002)));
         assert!(expand_ports("8002-8000:80-82").is_err());
         assert!(parse_publish(&["8000-8001:80-81".into(), "8001:81".into()]).is_err());
 
