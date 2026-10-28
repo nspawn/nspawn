@@ -1,3 +1,9 @@
+nspawn (2.4.0-1) unstable; urgency=medium
+
+  * A port published without a host port takes a free one; image index entries are chosen by the platforms the host runs; -p, --dns-search and --add-host read more forms.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Wed, 28 Oct 2026 12:08:36 -0500
+
 nspawn (2.3.2-1) unstable; urgency=medium
 
   * needrestart leaves the machines and the units nspawn runs for them alone after an upgrade (/etc/needrestart/conf.d/nspawn.conf in the deb).

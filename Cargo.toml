@@ -1,6 +1,6 @@
 [package]
 name = "nspawn"
-version = "2.3.2"
+version = "2.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Docker-like management of systemd-nspawn machines: OCI images from a hub, shared layers, systemd integration"

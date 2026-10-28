@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 2.3.2
+%global upstream_version 2.4.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -165,6 +165,9 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Wed Oct 28 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 2.4.0-1
+- A port published without a host port takes a free one; image index entries are chosen by the platforms the host runs; -p, --dns-search and --add-host read more forms.
+
 * Mon Oct 26 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 2.3.2-1
 - needrestart leaves the machines and the units nspawn runs for them alone after an upgrade (/etc/needrestart/conf.d/nspawn.conf in the deb).
 
