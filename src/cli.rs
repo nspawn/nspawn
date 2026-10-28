@@ -563,11 +563,13 @@ pub struct TuningArgs {
     /// them.
     #[arg(long, value_name = "IP")]
     pub dns: Vec<String>,
-    /// DNS search domain. Repeatable; "none" forgets them.
+    /// DNS search domain; a trailing dot is dropped and "." stands for none. Repeatable;
+    /// "none" forgets them.
     #[arg(long, value_name = "DOMAIN")]
     pub dns_search: Vec<String>,
-    /// A line for the machine's /etc/hosts, HOST:IP; host-gateway is the host's address
-    /// on the machine's network. Repeatable; "none" forgets them.
+    /// A line for the machine's /etc/hosts, HOST:IP or HOST=IP, the IP in brackets or
+    /// not; host-gateway is the host's address on the machine's network. Repeatable;
+    /// "none" forgets them.
     #[arg(long, value_name = "HOST:IP")]
     pub add_host: Vec<String>,
     /// A resource limit of the program, NAME=SOFT[:HARD] (nofile=1024:4096). Repeatable;
@@ -2017,5 +2019,33 @@ mod tests {
         };
         assert!(rm.force);
         assert_eq!(rm.names, ["a", "b"]);
+    }
+
+    #[test]
+    fn network_value_forms_reach_the_service_unchanged() {
+        let cli = Cli::try_parse_from([
+            "nspawn",
+            "create",
+            "-p",
+            "published=,target=80,protocol=UDP,host_ip=::1",
+            "--add-host",
+            "under_score..name=[::1]",
+            "--dns-search",
+            ".",
+            "--dns-search",
+            "example.test.",
+            "img",
+            "m",
+        ])
+        .unwrap();
+        let Command::Create(create) = cli.command else {
+            panic!("not create");
+        };
+        assert_eq!(
+            create.publish,
+            ["published=,target=80,protocol=UDP,host_ip=::1"]
+        );
+        assert_eq!(create.tuning.add_host, ["under_score..name=[::1]"]);
+        assert_eq!(create.tuning.dns_search, [".", "example.test."]);
     }
 }

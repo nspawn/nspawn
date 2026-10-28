@@ -1253,7 +1253,7 @@ $NSPAWN ps | grep "^ *$app " | grep_q " sh " || fail "--image-command did not re
 grep -q "Bind=" /etc/systemd/nspawn/$app.nspawn && fail "-v none left volumes in the settings"
 $NSPAWN stop $app -t 2 || fail "stop app running its own cmd"
 
-step "CLI: published port forms and free host ports"
+step "CLI: published port forms, free host ports, extra hosts and search domains"
 cli_name=e2e-rv-cli-ports
 cli_ip_flags=()
 cli_has_v6=0
@@ -1271,6 +1271,8 @@ $NSPAWN create $app $cli_name --label org.nspawn.e2e.cli=$nonce \
   -p published=18012,target=88,protocol=UDP,host_ip=127.0.0.1 \
   -p published=,target=89,protocol=,host_ip= \
   -p '[127.0.0.1]:18014:91' -p :18015:92 -p 18020-18021:93 "${cli_ip_flags[@]}" \
+  --add-host 'under_score..name=[fd00::1]' --add-host 'v4=[127.0.0.2]' \
+  --dns-search . --dns-search example.test. \
   -- /bin/sh -c 'mkdir -p /www; echo cli-ports > /www/index.html; exec /bin/httpd -f -p 80 -h /www' >/dev/null || fail "create with the CLI network forms"
 kill "$listener_pid" 2>/dev/null; listener_pid=
 $NSPAWN inspect $cli_name > /tmp/e2e-cli-ports.before || fail "inspect the CLI machine after create"
@@ -1301,11 +1303,16 @@ dynamic = [port for port in ports if target(port) in {80, 81, 82, 84, 85, 89}]
 assert len(dynamic) == 6, dynamic
 assert len({host(port) for port in dynamic}) == len(dynamic), dynamic
 assert before["labels"]["org.nspawn.e2e.cli"] == nonce
+assert before["dns_search"] == ["example.test"], before["dns_search"]
+assert set(before["extra_hosts"]) == {"under_score..name:fd00::1", "v4:127.0.0.2"}, before["extra_hosts"]
 PY
 # The host port of a container port, as inspect has it.
 cli_port() { python3 -c 'import json,sys; d = json.load(open(sys.argv[1]))[0]; p = next(p for p in d["ports"] if p.endswith(sys.argv[2])); print(p.rsplit("->", 1)[0].rsplit(":", 1)[-1])' "$@"; }
 cli_http_port=$(cli_port /tmp/e2e-cli-ports.after "->80/tcp")
 retry 5 bash -c "curl -sf -m 5 http://127.0.0.1:$cli_http_port/ | grep_q cli-ports" || fail "the free host port does not publish the app"
+$NSPAWN exec $cli_name -- cat /etc/hosts </dev/null | grep_q "^fd00::1 under_score..name$" || fail "--add-host with brackets and a loose name was not applied"
+$NSPAWN exec $cli_name -- cat /etc/hosts </dev/null | grep_q "^127.0.0.2 v4$" || fail "--add-host with a bracketed IPv4 was not applied"
+$NSPAWN exec $cli_name -- cat /etc/resolv.conf </dev/null | grep_q "^search example.test$" || fail "--dns-search did not drop . and the trailing dot"
 $NSPAWN stop $cli_name >/dev/null || fail "stop the CLI machine"
 # Ports given on start get theirs in the prepare pass, and later starts keep them.
 $NSPAWN start $cli_name -p 80 -p 18030-18031:81 >/dev/null || fail "start with a free port and a host range"
@@ -1318,6 +1325,12 @@ $NSPAWN start $cli_name >/dev/null || fail "start the CLI machine with its ports
 [ "$(cli_port <($NSPAWN inspect $cli_name) "->80/tcp")" = "$cli_http_port" ] || fail "a later start moved the assigned port"
 $NSPAWN stop $cli_name >/dev/null || fail "stop the CLI machine at the end"
 $NSPAWN images rm $cli_name >/dev/null || fail "remove the CLI machine"
+out=$($NSPAWN create $app e2e-rv-cli-bad --dns-search 123.456 -- /bin/true 2>&1) && fail "an all-digit DNS search domain was accepted"
+echo "$out" | grep_q "not a valid domain" || fail "the all-digit DNS search domain was not explained: $out"
+long_domain=$(python3 -c 'print(".".join(["a" * 63] * 4))')
+out=$($NSPAWN create $app e2e-rv-cli-bad --dns-search "$long_domain" -- /bin/true 2>&1) && fail "a DNS search domain of 255 characters was accepted"
+echo "$out" | grep_q "254 characters at most" || fail "the long DNS search domain was not explained: $out"
+$NSPAWN inspect e2e-rv-cli-bad >/dev/null 2>&1 && fail "an invalid DNS search domain left a machine"
 rm -f /tmp/e2e-cli-ports.before /tmp/e2e-cli-ports.after /tmp/e2e-cli-ports.start
 
 # A path inside the machine with a dot component would mount elsewhere, the root for one.

@@ -376,9 +376,10 @@ More flags, remembered like the rest:
 - `--device HOST[:CONTAINER][:rwm]`: a node, or a directory such as `/dev/dri`, whose
   nodes are allowed one by one, or a CDI name such as `nvidia.com/gpu=all` (see
   [GPUs and CDI devices](#gpus-and-cdi-devices)), and `--gpus`.
-- `--dns` and `--dns-search`.
-- `--add-host HOST:IP` or `HOST=IP`, with `host-gateway`; the second form for IPv6
-  addresses.
+- `--dns` and `--dns-search`; a search domain needs a letter and is 254 characters at
+  most, a trailing dot is dropped and `.` stands for no search domain.
+- `--add-host HOST:IP` or `HOST=IP`, with `host-gateway`, the IP in brackets or not; the
+  name is anything without colons or whitespace.
 - `--ulimit NAME=SOFT[:HARD]`, numbers or `unlimited`.
 - `--oom-score-adj`.
 - `--stop-signal` and `--stop-timeout`, what `stop` uses unless `-t` says otherwise; -1

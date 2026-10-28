@@ -645,10 +645,10 @@ impl Overrides {
             })?;
         }
         if !self.dns_search.is_empty() {
-            t.dns_search = list(&self.dns_search, |s| {
-                validate_hostname(s)?;
-                Ok(s.to_string())
-            })?;
+            t.dns_search = list(&self.dns_search, dns_search)?
+                .into_iter()
+                .flatten()
+                .collect();
         }
         if !self.extra_hosts.is_empty() {
             t.extra_hosts = list(&self.extra_hosts, extra_host)?;
@@ -801,8 +801,8 @@ pub fn interface_name(text: &str) -> Result<String> {
     Ok(text.to_string())
 }
 
-/// A hostname (or a search domain) as the kernel takes it: labels of letters, digits and
-/// hyphens, dots between them, 64 characters at most.
+/// A hostname as the kernel takes it: labels of letters, digits and hyphens, dots between
+/// them, 64 characters at most.
 pub fn validate_hostname(name: &str) -> Result<()> {
     let label_ok = |l: &str| {
         !l.is_empty()
@@ -814,6 +814,29 @@ pub fn validate_hostname(name: &str) -> Result<()> {
         bail!("{name:?} is not a hostname: letters, digits and hyphens, dots between labels, 64 characters at most");
     }
     Ok(())
+}
+
+/// A search domain: labels of letters, digits and hyphens with a letter among them, 254
+/// characters at most, a trailing dot dropped. "." asks for none: None.
+fn dns_search(text: &str) -> Result<Option<String>> {
+    let text = text.trim_matches(' ');
+    if text == "." {
+        return Ok(None);
+    }
+    let domain = text.strip_suffix('.').unwrap_or(text);
+    if domain.len() > 254 {
+        bail!("--dns-search {text:?}: a domain is 254 characters at most");
+    }
+    let label_ok = |label: &str| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    if !domain.bytes().any(|b| b.is_ascii_alphabetic()) || !domain.split('.').all(label_ok) {
+        bail!("--dns-search {text:?}: not a valid domain");
+    }
+    Ok(Some(domain.to_string()))
 }
 
 /// A capability with or without its prefix (NET_ADMIN, CAP_NET_ADMIN, all), kept without the
@@ -917,13 +940,24 @@ fn device(text: &str) -> Result<Device> {
 /// --add-host HOST:IP (or HOST=IP); "host-gateway" stands for the machine's gateway.
 pub fn extra_host(text: &str) -> Result<ExtraHost> {
     // HOST=IP first, the form for IPv6 addresses, whose colons would split HOST:IP
-    // wrong; a hostname never carries an equals sign.
+    // wrong; a name never carries an equals sign.
     let (host, ip) = text
         .split_once('=')
         .or_else(|| text.split_once(':'))
         .with_context(|| format!("--add-host {text}: HOST:IP"))?;
-    validate_hostname(host)?;
+    // Anything an /etc/hosts line keeps as one name.
+    if host.is_empty()
+        || host
+            .chars()
+            .any(|c| c == ':' || c.is_whitespace() || c.is_control())
+    {
+        bail!("--add-host {text:?}: a name without colons or whitespace");
+    }
+    let mut ip = ip;
     if ip != "host-gateway" {
+        if ip.len() > 2 && ip.starts_with('[') && ip.ends_with(']') {
+            ip = &ip[1..ip.len() - 1];
+        }
         ip.parse::<IpAddr>()
             .with_context(|| format!("--add-host {text}: {ip} is not an IP address"))?;
     }
@@ -1580,5 +1614,46 @@ mod tests {
             ..Tuning::default()
         };
         assert!(t.unit_lines().is_empty());
+    }
+
+    #[test]
+    fn extra_hosts_take_brackets_and_loose_names() {
+        let host = extra_host("v6=[fd00::1]").unwrap();
+        assert_eq!((host.host.as_str(), host.ip.as_str()), ("v6", "fd00::1"));
+        let host = extra_host("v4=[127.0.0.1]").unwrap();
+        assert_eq!((host.host.as_str(), host.ip.as_str()), ("v4", "127.0.0.1"));
+        let host = extra_host("under_score..name:127.0.0.1").unwrap();
+        assert_eq!(host.host, "under_score..name");
+        for bad in ["two names:127.0.0.1", "line\nbreak=127.0.0.1", ":127.0.0.1"] {
+            assert!(extra_host(bad).is_err(), "{bad}");
+        }
+    }
+
+    fn search_domains(values: &[&str]) -> Result<Vec<String>> {
+        let mut tuning = Tuning::default();
+        Overrides {
+            dns_search: values.iter().map(|s| s.to_string()).collect(),
+            ..Overrides::default()
+        }
+        .apply(&mut tuning)?;
+        Ok(tuning.dns_search)
+    }
+
+    #[test]
+    fn dns_search_drops_the_root_and_a_trailing_dot() {
+        assert!(search_domains(&["."]).unwrap().is_empty());
+        assert_eq!(
+            search_domains(&[".", "example.test."]).unwrap(),
+            ["example.test"]
+        );
+        let longest = format!("{}.", vec!["a".repeat(63); 4].join(".").get(..254).unwrap());
+        assert_eq!(search_domains(&[&longest]).unwrap()[0].len(), 254);
+    }
+
+    #[test]
+    fn dns_search_refuses_numeric_and_overlong_domains() {
+        assert!(search_domains(&["123.456"]).is_err());
+        let over = vec!["a".repeat(63); 4].join(".") + ".a";
+        assert!(search_domains(&[&over[..255]]).is_err());
     }
 }
