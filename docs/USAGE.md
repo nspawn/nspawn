@@ -73,7 +73,11 @@ refuses it without a valid signature, and `--no-verify` skips the check for that
 command, on `run` and `create` too. Docker Hub's short names are expanded:
 `docker.io/alpine` is `docker.io/library/alpine`, and `index.docker.io` is `docker.io`.
 A reference by digest takes a sha256 digest; sha384 and sha512 ones are refused, in a
-Dockerfile's `FROM` before anything is built.
+Dockerfile's `FROM` before anything is built. Of an image index, nspawn takes the entry
+of the best platform the host runs: amd64 then 386, arm64 from the CPU's variant down
+to v8 and then 32-bit arm, arm from the CPU's variant down to v5. Without one, it tries
+the entries that name no platform, in the index's order, and takes the first whose
+config gives a platform the host runs, before any layer comes down.
 
 `build` builds a Dockerfile, or runs mkosi on an mkosi configuration. A directory with
 a `Dockerfile` (or `dockerfile`, `Containerfile`), `-f` naming one, `-` on standard

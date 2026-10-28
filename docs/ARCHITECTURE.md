@@ -440,6 +440,13 @@ job's report events become `JobOutput` signals and the object's `Output`, the
 progress of its downloads and uploads `JobProgress` signals, and `JobRemoved`
 says how it ended.
 
+`Hub::resolve` picks an index's entry itself. The host's platform gives an order of the
+architectures and variants it runs, best first (`platform_vector`), and the entry of the
+best of them is taken, the first of equals. Without one, the entries that name no
+platform are tried in the index's order: the first whose config, read whole and checked
+against its digest, gives a platform the host runs. Nothing else of the image has come
+down by then.
+
 A pull first checks the image's signatures where its registry has a policy (the
 hub's is built in: the project's key or the build workflow's keyless identity,
 one of them required). The Sigstore bundles among the referrers of the

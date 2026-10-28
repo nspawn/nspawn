@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use oci_client::client::{Certificate, CertificateEncoding, ClientConfig, ClientProtocol};
-use oci_client::manifest::{OciDescriptor, OciImageManifest};
+use oci_client::manifest::{ImageIndexEntry, OciDescriptor, OciImageManifest, OciManifest};
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference, RegistryOperation};
 use sha2::{Digest, Sha256};
@@ -118,7 +118,8 @@ impl Hub {
         let client_config = |extra_root_certificates, read_timeout| ClientConfig {
             protocol: ClientProtocol::Https,
             extra_root_certificates,
-            platform_resolver: Some(Box::new(oci_client::client::current_platform_resolver)),
+            // Hub::resolve picks an index's entry itself.
+            platform_resolver: None,
             user_agent: concat!("nspawn/", env!("CARGO_PKG_VERSION")),
             read_timeout,
             connect_timeout: Some(std::time::Duration::from_secs(30)),
@@ -262,19 +263,85 @@ impl Hub {
             .with_context(|| format!("fetching the digest of {image}"))
     }
 
-    /// Resolves a reference to the image manifest for this platform (indexes are followed)
-    /// and returns it with its digest, and the index's when the reference named one.
+    /// Resolves a reference to the image manifest for this host and returns it with its
+    /// digest, and the index's when the reference named one. Of an index, the entry of the
+    /// best platform the host runs or, without one, the first entry naming no platform
+    /// whose config says the host runs it.
     pub async fn resolve(&self, image: &Reference) -> Result<Resolved> {
-        let (manifest, digest, index_digest) = self
-            .client(image.registry())
-            .pull_image_manifest_and_list_digest(image, &self.auth(image.registry()))
+        let (manifest, digest) = self
+            .manifest(image)
             .await
             .with_context(|| format!("fetching the manifest of {image}"))?;
-        Ok(Resolved {
-            manifest,
-            digest,
-            index_digest,
-        })
+        let index = match manifest {
+            OciManifest::Image(manifest) => {
+                return Ok(Resolved {
+                    manifest,
+                    digest,
+                    index_digest: None,
+                })
+            }
+            OciManifest::ImageIndex(index) => index,
+        };
+        let host = HostPlatform::current();
+        let unlisted = match choose_entries(&index.manifests, &host) {
+            IndexChoice::Listed(i) => {
+                let entry = &index.manifests[i].digest;
+                let (manifest, entry_digest) = self.index_entry(image, entry).await?;
+                let OciManifest::Image(manifest) = manifest else {
+                    bail!("manifest {entry} of {image} is an index, not an image's manifest");
+                };
+                return Ok(Resolved {
+                    manifest,
+                    digest: entry_digest,
+                    index_digest: Some(digest),
+                });
+            }
+            IndexChoice::Unlisted(unlisted) => unlisted,
+        };
+        let vector = platform_vector(&host);
+        let mut seen = Vec::new();
+        for i in unlisted {
+            let entry = &index.manifests[i].digest;
+            // An index inside the index is not followed.
+            let (OciManifest::Image(manifest), entry_digest) =
+                self.index_entry(image, entry).await?
+            else {
+                continue;
+            };
+            validate_digest(&manifest.config.digest)?;
+            let config = self
+                .small_blob(image, &manifest.config, CONFIG_MAX_SIZE)
+                .await
+                .with_context(|| format!("reading the config of manifest {entry} of {image}"))?;
+            let Some((os, architecture, variant)) = config_platform(&config) else {
+                continue;
+            };
+            if platform_rank(&vector, &host, &os, &architecture, &variant).is_some() {
+                return Ok(Resolved {
+                    manifest,
+                    digest: entry_digest,
+                    index_digest: Some(digest),
+                });
+            }
+            seen.push(platform_name(&os, &architecture, &variant));
+        }
+        bail!(no_image_for(image, &host, &index.manifests, &seen))
+    }
+
+    /// What a reference names, an image's manifest or an index, with its digest.
+    async fn manifest(&self, image: &Reference) -> Result<(OciManifest, String)> {
+        Ok(self
+            .client(image.registry())
+            .pull_manifest(image, &self.auth(image.registry()))
+            .await?)
+    }
+
+    /// The manifest an entry of the image's index names, by its digest.
+    async fn index_entry(&self, image: &Reference, digest: &str) -> Result<(OciManifest, String)> {
+        validate_digest(digest)?;
+        self.manifest(&image.clone_with_digest(digest.to_string()))
+            .await
+            .with_context(|| format!("fetching manifest {digest} of {image}"))
     }
 
     /// The Sigstore bundles kept as referrers of `subject`, a digest in the image's
@@ -467,6 +534,450 @@ impl Hub {
         }
         unfinished.keep();
         Ok(())
+    }
+}
+
+/// An image's config, read whole to see the platform of an index entry that names none.
+const CONFIG_MAX_SIZE: u64 = 8 << 20;
+
+/// The platform images run on here: the host's OS and architecture, and on arm the
+/// CPU's variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostPlatform {
+    os: String,
+    architecture: String,
+    variant: String,
+}
+
+impl HostPlatform {
+    fn current() -> Self {
+        let architecture = crate::oci::host_architecture().to_string();
+        let variant = match architecture.as_str() {
+            "arm64" => "v8".to_string(),
+            "arm" => fs::read_to_string("/proc/cpuinfo")
+                .ok()
+                .and_then(|cpuinfo| arm_cpu_variant(&cpuinfo))
+                .unwrap_or_else(|| "v7".to_string()),
+            _ => String::new(),
+        };
+        HostPlatform {
+            os: std::env::consts::OS.to_string(),
+            architecture,
+            variant,
+        }
+    }
+
+    fn name(&self) -> String {
+        platform_name(&self.os, &self.architecture, &self.variant)
+    }
+}
+
+/// OS/ARCHITECTURE[/VARIANT], as indexes write a platform.
+fn platform_name(os: &str, architecture: &str, variant: &str) -> String {
+    if variant.is_empty() {
+        format!("{os}/{architecture}")
+    } else {
+        format!("{os}/{architecture}/{variant}")
+    }
+}
+
+/// The variant of an arm CPU from the "CPU architecture" line of /proc/cpuinfo: v7 for 7.
+fn arm_cpu_variant(cpuinfo: &str) -> Option<String> {
+    cpuinfo.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if !key.trim().eq_ignore_ascii_case("CPU architecture") {
+            return None;
+        }
+        let version: String = value
+            .trim()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        (!version.is_empty()).then(|| format!("v{version}"))
+    })
+}
+
+/// An architecture and its variant in the one spelling each has: x86_64 is amd64, aarch64
+/// is arm64 with v8 left out, armhf is arm/v7 and an arm without a variant v7.
+fn normalize_arch(architecture: &str, variant: &str) -> (String, String) {
+    let architecture = architecture.to_lowercase();
+    let mut variant = variant.to_lowercase();
+    let architecture = match architecture.as_str() {
+        "i386" => {
+            variant.clear();
+            "386".to_string()
+        }
+        "x86_64" | "x86-64" | "amd64" => {
+            if variant == "v1" {
+                variant.clear();
+            }
+            "amd64".to_string()
+        }
+        "aarch64" | "arm64" => {
+            match variant.as_str() {
+                "8" | "v8" | "v8.0" => variant.clear(),
+                "9" | "9.0" | "v9.0" => variant = "v9".to_string(),
+                _ => {}
+            }
+            "arm64".to_string()
+        }
+        "armhf" => {
+            variant = "v7".to_string();
+            "arm".to_string()
+        }
+        "armel" => {
+            variant = "v6".to_string();
+            "arm".to_string()
+        }
+        "arm" => {
+            match variant.as_str() {
+                "" | "7" => variant = "v7".to_string(),
+                "5" | "6" | "8" => variant = format!("v{variant}"),
+                _ => {}
+            }
+            "arm".to_string()
+        }
+        _ => architecture,
+    };
+    (architecture, variant)
+}
+
+/// A variant's major and minor version: v8.2 is (8, 2), v7 is (7, 0).
+fn variant_version(variant: &str) -> Option<(u32, u32)> {
+    let version = variant.strip_prefix('v')?;
+    let (major, minor) = version.split_once('.').unwrap_or((version, "0"));
+    if minor.contains('.') {
+        return None;
+    }
+    Some((major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// The arm64 variants from vMAJOR.MINOR down to vMAJOR, v8 written as none.
+fn push_arm64(vector: &mut Vec<(String, String)>, major: u32, minor: u32) {
+    for minor in (0..=minor).rev() {
+        let variant = match (major, minor) {
+            (8, 0) => String::new(),
+            (_, 0) => format!("v{major}"),
+            _ => format!("v{major}.{minor}"),
+        };
+        vector.push(("arm64".to_string(), variant));
+    }
+}
+
+/// An arm variant and every older one down to v5.
+fn arm_vector(variant: &str) -> Vec<(String, String)> {
+    let mut vector = vec![("arm".to_string(), variant.to_string())];
+    if let Some((major, 0)) = variant_version(variant) {
+        for version in (5..major).rev() {
+            vector.push(("arm".to_string(), format!("v{version}")));
+        }
+    }
+    vector
+}
+
+/// The architectures and variants the host runs, best first: amd64 then 386; arm64 from
+/// the CPU's variant down to v8, then 32-bit arm from v8; arm from the CPU's variant down
+/// to v5. An arm64 v9.N CPU runs what v8.(N+5) does.
+fn platform_vector(host: &HostPlatform) -> Vec<(String, String)> {
+    let (architecture, variant) = normalize_arch(&host.architecture, &host.variant);
+    match architecture.as_str() {
+        "amd64" => {
+            let mut vector = vec![(architecture, variant.clone())];
+            if let Some((major, 0)) = variant_version(&variant) {
+                for version in (1..major).rev() {
+                    vector.push(normalize_arch("amd64", &format!("v{version}")));
+                }
+            }
+            vector.push(("386".to_string(), String::new()));
+            vector
+        }
+        "arm" => arm_vector(&variant),
+        "arm64" => {
+            let effective = if variant.is_empty() {
+                "v8".to_string()
+            } else {
+                variant
+            };
+            let Some((major, minor)) = variant_version(&effective) else {
+                return Vec::new();
+            };
+            let mut vector = Vec::new();
+            match (major, minor) {
+                (8, 0..=9) => push_arm64(&mut vector, 8, minor),
+                (9, 0..=7) => {
+                    push_arm64(&mut vector, 9, minor);
+                    push_arm64(&mut vector, 8, (minor + 5).min(9));
+                }
+                _ => return vector,
+            }
+            vector.extend(arm_vector("v8"));
+            vector
+        }
+        _ => vec![(architecture, variant)],
+    }
+}
+
+/// Where a platform comes in `vector`, the host's order; None for one the host does not
+/// run.
+fn platform_rank(
+    vector: &[(String, String)],
+    host: &HostPlatform,
+    os: &str,
+    architecture: &str,
+    variant: &str,
+) -> Option<usize> {
+    if !os.eq_ignore_ascii_case(&host.os) {
+        return None;
+    }
+    let candidate = normalize_arch(architecture, variant);
+    vector.iter().position(|wanted| *wanted == candidate)
+}
+
+/// The entries of an index to try on this host.
+#[derive(Debug, PartialEq, Eq)]
+enum IndexChoice {
+    /// The entry of the best platform the host runs, the first of equals.
+    Listed(usize),
+    /// Without one, the entries that name no platform, in the index's order: each one's
+    /// config says what it is for.
+    Unlisted(Vec<usize>),
+}
+
+fn choose_entries(manifests: &[ImageIndexEntry], host: &HostPlatform) -> IndexChoice {
+    let vector = platform_vector(host);
+    let mut best: Option<(usize, usize)> = None;
+    let mut unlisted = Vec::new();
+    for (index, entry) in manifests.iter().enumerate() {
+        let Some(platform) = &entry.platform else {
+            unlisted.push(index);
+            continue;
+        };
+        let rank = platform_rank(
+            &vector,
+            host,
+            &platform.os.to_string(),
+            &platform.architecture.to_string(),
+            platform.variant.as_deref().unwrap_or(""),
+        );
+        if let Some(rank) = rank {
+            if best.is_none_or(|(best_rank, _)| rank < best_rank) {
+                best = Some((rank, index));
+            }
+        }
+    }
+    match best {
+        Some((_, index)) => IndexChoice::Listed(index),
+        None => IndexChoice::Unlisted(unlisted),
+    }
+}
+
+/// The OS, architecture and variant an image's config gives; None for a config that is
+/// no image's, an artifact's.
+fn config_platform(config: &[u8]) -> Option<(String, String, String)> {
+    #[derive(serde::Deserialize)]
+    struct ConfigPlatform {
+        os: String,
+        architecture: String,
+        #[serde(default)]
+        variant: String,
+    }
+    let config: ConfigPlatform = serde_json::from_slice(config).ok()?;
+    Some((config.os, config.architecture, config.variant))
+}
+
+/// Why an index has nothing for this host: the platforms it names, and those the configs
+/// of its entries without one give (`unlisted`). The unknown/unknown entries that carry
+/// attestations are left out.
+fn no_image_for(
+    image: &Reference,
+    host: &HostPlatform,
+    manifests: &[ImageIndexEntry],
+    unlisted: &[String],
+) -> String {
+    let mut has: Vec<String> = Vec::new();
+    for platform in manifests.iter().filter_map(|e| e.platform.as_ref()) {
+        let name = platform_name(
+            &platform.os.to_string(),
+            &platform.architecture.to_string(),
+            platform.variant.as_deref().unwrap_or(""),
+        );
+        if name != "unknown/unknown" && !has.contains(&name) {
+            has.push(name);
+        }
+    }
+    if !unlisted.is_empty() {
+        has.push(format!(
+            "entries without a platform for {}",
+            unlisted.join(", ")
+        ));
+    }
+    let has = if has.is_empty() {
+        "no images".to_string()
+    } else {
+        has.join(", ")
+    };
+    format!(
+        "{image} has no image for {}: its index has {has}",
+        host.name()
+    )
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    use oci_client::manifest::Platform;
+
+    fn host(architecture: &str, variant: &str) -> HostPlatform {
+        HostPlatform {
+            os: "linux".to_string(),
+            architecture: architecture.to_string(),
+            variant: variant.to_string(),
+        }
+    }
+
+    fn entry(os: &str, architecture: &str, variant: &str) -> ImageIndexEntry {
+        ImageIndexEntry {
+            media_type: oci_client::manifest::OCI_IMAGE_MEDIA_TYPE.to_string(),
+            digest: "sha256:0".to_string(),
+            size: 1,
+            platform: Some(Platform {
+                architecture: architecture.into(),
+                os: os.into(),
+                os_version: None,
+                os_features: None,
+                variant: (!variant.is_empty()).then(|| variant.to_string()),
+                features: None,
+            }),
+            annotations: None,
+            artifact_type: None,
+        }
+    }
+
+    fn without_platform() -> ImageIndexEntry {
+        ImageIndexEntry {
+            platform: None,
+            ..entry("linux", "amd64", "")
+        }
+    }
+
+    fn runs(host: &HostPlatform, config: &str) -> bool {
+        let (os, architecture, variant) = config_platform(config.as_bytes()).unwrap();
+        platform_rank(&platform_vector(host), host, &os, &architecture, &variant).is_some()
+    }
+
+    #[test]
+    fn amd64_prefers_its_default_variant_then_386() {
+        let entries = [
+            entry("linux", "386", ""),
+            entry("linux", "amd64", "v2"),
+            entry("linux", "amd64", "v1"),
+            entry("linux", "amd64", ""),
+        ];
+        // v1 and no variant are the same: the first of them.
+        assert_eq!(
+            choose_entries(&entries, &host("amd64", "")),
+            IndexChoice::Listed(2)
+        );
+        assert_eq!(
+            choose_entries(&entries[..2], &host("amd64", "")),
+            IndexChoice::Listed(0)
+        );
+    }
+
+    #[test]
+    fn arm64_and_arm_prefer_the_newest_variant_they_run() {
+        let entries = [
+            entry("linux", "arm", "v7"),
+            entry("linux", "arm64", "v9"),
+            entry("linux", "arm64", "v8.1"),
+            entry("linux", "arm64", "v8"),
+            entry("linux", "aarch64", ""),
+        ];
+        assert_eq!(
+            choose_entries(&entries, &host("arm64", "v8")),
+            IndexChoice::Listed(3)
+        );
+        assert_eq!(
+            choose_entries(&entries[..1], &host("arm64", "v8")),
+            IndexChoice::Listed(0)
+        );
+        let entries = [
+            entry("linux", "arm", "v5"),
+            entry("linux", "arm", "v6"),
+            entry("linux", "arm", ""),
+        ];
+        assert_eq!(
+            choose_entries(&entries, &host("arm", "v7")),
+            IndexChoice::Listed(2)
+        );
+        assert_eq!(
+            choose_entries(&entries[..2], &host("arm", "v7")),
+            IndexChoice::Listed(1)
+        );
+        assert_eq!(
+            arm_cpu_variant("processor\t: 0\nCPU architecture: 7\n").as_deref(),
+            Some("v7")
+        );
+    }
+
+    #[test]
+    fn entries_without_a_platform_are_the_last_resort_in_order() {
+        let entries = [
+            without_platform(),
+            entry("linux", "arm64", "v8"),
+            without_platform(),
+            entry("linux", "amd64", ""),
+            entry("windows", "amd64", ""),
+        ];
+        assert_eq!(
+            choose_entries(&entries, &host("amd64", "")),
+            IndexChoice::Listed(3)
+        );
+        assert_eq!(
+            choose_entries(&entries[..3], &host("amd64", "")),
+            IndexChoice::Unlisted(vec![0, 2])
+        );
+        assert_eq!(
+            choose_entries(&entries[4..], &host("amd64", "")),
+            IndexChoice::Unlisted(Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_config_says_whether_the_host_runs_it() {
+        let amd64 = host("amd64", "");
+        assert!(runs(&amd64, r#"{"os":"linux","architecture":"amd64"}"#));
+        assert!(runs(&amd64, r#"{"os":"linux","architecture":"386"}"#));
+        assert!(!runs(&amd64, r#"{"os":"linux","architecture":"arm64"}"#));
+        assert!(!runs(&amd64, r#"{"os":"windows","architecture":"amd64"}"#));
+        // The config's variant counts: an arm config without one is v7.
+        let armv6 = host("arm", "v6");
+        assert!(runs(
+            &armv6,
+            r#"{"os":"linux","architecture":"arm","variant":"v6"}"#
+        ));
+        assert!(!runs(&armv6, r#"{"os":"linux","architecture":"arm"}"#));
+        // An artifact's empty config is no image's.
+        assert!(config_platform(b"{}").is_none());
+    }
+
+    #[test]
+    fn no_image_names_what_the_index_has() {
+        let image: Reference = "registry.test/app:1".parse().unwrap();
+        let entries = [
+            entry("linux", "arm64", "v8"),
+            entry("unknown", "unknown", ""),
+            entry("linux", "arm64", "v8"),
+            without_platform(),
+        ];
+        assert_eq!(
+            no_image_for(&image, &host("amd64", ""), &entries, &["linux/arm64".to_string()]),
+            "registry.test/app:1 has no image for linux/amd64: its index has linux/arm64/v8, entries without a platform for linux/arm64"
+        );
+        assert_eq!(
+            no_image_for(&image, &host("amd64", ""), &[], &[]),
+            "registry.test/app:1 has no image for linux/amd64: its index has no images"
+        );
     }
 }
 

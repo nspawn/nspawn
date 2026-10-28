@@ -308,6 +308,105 @@ step "hub tags"
 $NSPAWN hub tags "${IMAGE%%:*}" > /tmp/e2e-tags.txt || fail "hub tags"
 grep -qx "${IMAGE##*:}" /tmp/e2e-tags.txt || fail "tag ${IMAGE##*:} missing"
 
+step "image indexes: platform order and entries without a platform"
+if [ "$(uname -m)" = x86_64 ]; then
+  platform_dir=/tmp/e2e-rv/platform
+  rm -rf "$platform_dir"; mkdir -p "$platform_dir"
+  platform_repo=e2e/platform-$nonce-$$
+  python3 - "$NSPAWN_REGISTRY" "$NSPAWN_CA_CERT" "$busybox_ref" "$platform_repo" "$platform_dir" "$nonce" <<'PY' || fail "make the platform indexes"
+import base64, copy, hashlib, json, os, ssl, sys, urllib.request
+reg, ca, src, dst, directory, nonce = sys.argv[1:]
+ctx = ssl.create_default_context(cafile=ca)
+ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+auth = "Basic " + base64.b64encode(b"tester:s3cret").decode()
+def req(method, url, data=None, headers={}):
+    return urllib.request.urlopen(urllib.request.Request(url, data=data, method=method, headers={"Authorization": auth, **headers}), context=ctx)
+def get(path):
+    return req("GET", f"https://{reg}/v2/{path}")
+def put_blob(data):
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    location = req("POST", f"https://{reg}/v2/{dst}/blobs/uploads/").headers["Location"]
+    if location.startswith("/"):
+        location = f"https://{reg}{location}"
+    req("PUT", location + ("&" if "?" in location else "?") + "digest=" + digest, data, {"Content-Type": "application/octet-stream"})
+    return digest
+src_repo, src_tag = src[len(reg) + 1:].rsplit(":", 1)
+manifest = json.load(get(f"{src_repo}/manifests/{src_tag}"))
+config = json.load(get(f"{src_repo}/blobs/{manifest['config']['digest']}"))
+config.setdefault("config", {}).setdefault("Labels", {})["org.nspawn.e2e.platform"] = nonce
+config_raw = json.dumps(config, separators=(",", ":")).encode()
+manifest["config"]["digest"] = put_blob(config_raw)
+manifest["config"]["size"] = len(config_raw)
+for layer in manifest["layers"]:
+    put_blob(get(f"{src_repo}/blobs/{layer['digest']}").read())
+def make_manifest(name, raw_config=config_raw):
+    made = copy.deepcopy(manifest)
+    made.setdefault("annotations", {})["org.nspawn.e2e.platform"] = name
+    if raw_config is not config_raw:
+        made["config"]["digest"] = put_blob(raw_config)
+        made["config"]["size"] = len(raw_config)
+    raw = json.dumps(made, separators=(",", ":")).encode()
+    digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+    req("PUT", f"https://{reg}/v2/{dst}/manifests/{digest}", raw, {"Content-Type": made.get("mediaType", "application/vnd.oci.image.manifest.v1+json")})
+    return {"mediaType": made.get("mediaType", "application/vnd.oci.image.manifest.v1+json"), "digest": digest, "size": len(raw)}
+def put_index(tag, entries):
+    manifests = []
+    for descriptor, platform in entries:
+        descriptor = copy.deepcopy(descriptor)
+        if platform is not None:
+            architecture, variant = platform
+            descriptor["platform"] = {"os": "linux", "architecture": architecture}
+            if variant:
+                descriptor["platform"]["variant"] = variant
+        manifests.append(descriptor)
+    raw = json.dumps({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": manifests}, separators=(",", ":")).encode()
+    req("PUT", f"https://{reg}/v2/{dst}/manifests/{tag}", raw, {"Content-Type": "application/vnd.oci.image.index.v1+json"})
+    pushed.insert(0, "sha256:" + hashlib.sha256(raw).hexdigest())
+pushed = []
+made = {name: make_manifest(name) for name in ["unlisted", "386", "v2", "v1", "default", "arm64"]}
+foreign = dict(config, architecture="arm64", os="linux")
+made["foreign"] = make_manifest("foreign", json.dumps(foreign, separators=(",", ":")).encode())
+put_index("rank", [(made["unlisted"], None), (made["386"], ("386", "")), (made["v2"], ("amd64", "v2")), (made["arm64"], ("arm64", "v8")), (made["v1"], ("amd64", "v1")), (made["default"], ("amd64", ""))])
+put_index("fallback", [(made["unlisted"], None), (made["386"], ("386", "")), (made["arm64"], ("arm64", "v8"))])
+put_index("unlisted", [(made["arm64"], ("arm64", "v8")), (made["unlisted"], None)])
+put_index("foreign", [(made["arm64"], ("arm64", "v8")), (made["foreign"], None)])
+put_index("second", [(made["foreign"], None), (made["unlisted"], None)])
+pushed += [descriptor["digest"] for descriptor in made.values()]
+with open(os.path.join(directory, "digests.json"), "w") as f:
+    json.dump({name: descriptor["digest"] for name, descriptor in made.items()}, f)
+with open(os.path.join(directory, "pushed"), "w") as f:
+    f.write("".join(digest + "\n" for digest in pushed))
+PY
+  platform_digest() { python3 -c 'import json,sys; print(json.load(open("/tmp/e2e-rv/platform/digests.json"))[sys.argv[1]])' "$1"; }
+  if [ -s "$platform_dir/digests.json" ]; then
+    $NSPAWN pull "$NSPAWN_REGISTRY/$platform_repo:rank" --name e2e-rv-platform-rank >/dev/null || fail "pull the ranked image index"
+    [ "$($NSPAWN inspect -f '{{.digest}}' e2e-rv-platform-rank 2>/dev/null)" = "$(platform_digest v1)" ] || fail "the index did not select amd64 v1"
+    $NSPAWN pull "$NSPAWN_REGISTRY/$platform_repo:fallback" --name e2e-rv-platform-fallback >/dev/null || fail "pull the 386 fallback index"
+    [ "$($NSPAWN inspect -f '{{.digest}}' e2e-rv-platform-fallback 2>/dev/null)" = "$(platform_digest 386)" ] || fail "the index did not select 386 after amd64 had no usable entry"
+    $NSPAWN pull "$NSPAWN_REGISTRY/$platform_repo:unlisted" --name e2e-rv-platform-unlisted >/dev/null || fail "pull an index entry without a platform"
+    [ "$($NSPAWN inspect -f '{{.digest}}' e2e-rv-platform-unlisted 2>/dev/null)" = "$(platform_digest unlisted)" ] || fail "the entry without a platform was not the last resort"
+    out=$($NSPAWN pull "$NSPAWN_REGISTRY/$platform_repo:foreign" --name e2e-rv-platform-foreign 2>&1) && fail "an entry without a platform pulled a foreign image"
+    echo "$out" | grep_q "has no image for linux/amd64: its index has linux/arm64/v8, entries without a platform for linux/arm64" || fail "the foreign config was not explained: $out"
+    echo "$out" | grep_q "blob " && fail "a blob of the foreign image came down: $out"
+    $NSPAWN inspect e2e-rv-platform-foreign >/dev/null 2>&1 && fail "the foreign image left a local record"
+    $NSPAWN pull "$NSPAWN_REGISTRY/$platform_repo:second" --name e2e-rv-platform-second >/dev/null || fail "pull an index whose first entry without a platform is foreign"
+    [ "$($NSPAWN inspect -f '{{.digest}}' e2e-rv-platform-second 2>/dev/null)" = "$(platform_digest unlisted)" ] || fail "the second entry without a platform was not tried"
+    for m in e2e-rv-platform-rank e2e-rv-platform-fallback e2e-rv-platform-unlisted e2e-rv-platform-second; do
+      $NSPAWN images rm "$m" >/dev/null || fail "remove the platform test image $m"
+    done
+    $NSPAWN images rm e2e-rv-platform-foreign >/dev/null 2>&1 || true
+  fi
+  # What the step pushed: the indexes, then the manifests they name.
+  if [ -s "$platform_dir/pushed" ]; then
+    while read -r d; do
+      curl -sS --cacert "$NSPAWN_CA_CERT" -u tester:s3cret -X DELETE -o /dev/null "https://$NSPAWN_REGISTRY/v2/$platform_repo/manifests/$d" || true
+    done < "$platform_dir/pushed"
+  fi
+  rm -rf "$platform_dir"
+else
+  echo "platform index checks need an amd64 host: skipped"
+fi
+
 # mstack images need systemd 261 with managed user namespaces (nsresourced, mountfsd).
 systemd_major=$(systemctl --version | awk 'NR==1{print $2}' | tr -dc 0-9)
 mstack_supported=no
