@@ -595,21 +595,23 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             let images =
                 machines::Listed::all(&manager.list_images().await.map_err(client::error)?);
             let registry = registry_name(client, config).await;
-            let source = match create_source(&images, &a.source, &a.name, &registry, a.force)? {
-                CreateSource::Local(source) => source,
-                CreateSource::Pull { reference, base } => {
-                    let mut pull = client::registry_options(config);
-                    put(&mut pull, "name", base.clone());
-                    backend(&mut pull, a.backend);
-                    if a.no_verify {
-                        put(&mut pull, "verify", false);
+            let local = machines::local_image(client, config, &a.source, &a.name).await?;
+            let source =
+                match create_source(&images, &a.source, &a.name, &registry, a.force, local)? {
+                    CreateSource::Local(source) => source,
+                    CreateSource::Pull { reference, base } => {
+                        let mut pull = client::registry_options(config);
+                        put(&mut pull, "name", base.clone());
+                        backend(&mut pull, a.backend);
+                        if a.no_verify {
+                            put(&mut pull, "verify", false);
+                        }
+                        client
+                            .run_job_to_stderr(|| manager.pull_image(&reference, pull))
+                            .await?;
+                        base
                     }
-                    client
-                        .run_job_to_stderr(|| manager.pull_image(&reference, pull))
-                        .await?;
-                    base
-                }
-            };
+                };
             let done = client
                 .run_job(|| manager.create_machine(&source, &a.name, options))
                 .await?;
@@ -933,17 +935,17 @@ fn cleaning_up(command: &Command) -> bool {
     )
 }
 
-/// A source named is taken as it is; one given by its reference is an image of it never
-/// run (machines::Listed::image_of), compared as the service records references
-/// (`fedora:44` is `hub.example/fedora:44` there), so that an image pulled by a short
-/// reference is not pulled again, or else a pull: a machine that ran is no image, and
-/// would give the new one its backend, mode and network.
+/// A source named is taken as it is; one given by its reference is `local`, the image of
+/// it never run that the service resolves (machines::local_image), so that an image
+/// pulled by a short reference is not pulled again, or else a pull: a machine that ran is
+/// no image, and would give the new one its backend, mode and network.
 fn create_source(
     images: &[machines::Listed],
     source: &str,
     name: &str,
     registry: &str,
     force: bool,
+    local: Option<String>,
 ) -> Result<CreateSource> {
     // Refused before anything is pulled, as the service would refuse it after.
     if !force && images.iter().any(|i| i.name == name) {
@@ -957,11 +959,8 @@ fn create_source(
         return Ok(CreateSource::Local(source.to_string()));
     };
     let reference = image.to_string();
-    let spellings = machines::local_spellings(source, registry)?;
-    for spelled in std::iter::once(source).chain(spellings.iter().map(String::as_str)) {
-        if let Some(found) = machines::Listed::image_of(images, spelled, name) {
-            return Ok(CreateSource::Local(found.name.clone()));
-        }
+    if let Some(found) = local {
+        return Ok(CreateSource::Local(found));
     }
     let mut base = image.local_name();
     if images
@@ -1049,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn create_pulls_only_what_is_not_local_by_any_spelling() {
+    fn create_pulls_only_what_is_not_local() {
         let listed = |name: &str, reference: &str, image_only: bool| machines::Listed {
             name: name.into(),
             reference: reference.into(),
@@ -1061,48 +1060,37 @@ mod tests {
             listed("web", "docker.io/library/nginx:1.27", false),
             listed("vm", "", false),
         ];
-        let source = |s: &str| create_source(&images, s, "machine", "hub.example", false);
+        let source = |s: &str, local: Option<&str>| {
+            create_source(
+                &images,
+                s,
+                "machine",
+                "hub.example",
+                false,
+                local.map(str::to_string),
+            )
+        };
         assert_eq!(
-            source("fedora-44").unwrap(),
+            source("fedora-44", None).unwrap(),
             CreateSource::Local("fedora-44".to_string()),
             "a local name"
         );
         assert_eq!(
-            source("hub.example/fedora:44").unwrap(),
+            source("fedora:44", Some("fedora-44")).unwrap(),
             CreateSource::Local("fedora-44".to_string()),
-            "the reference as recorded"
+            "the image the service resolves the reference to"
         );
-        assert_eq!(
-            source("fedora:44").unwrap(),
-            CreateSource::Local("fedora-44".to_string()),
-            "the short reference of a local image"
-        );
-        // A machine that ran is no image: the image is pulled beside it.
+        // Nothing here goes by it: a pull, beside a machine of the reference that ran.
         let ran = vec![listed("nginx-1.27", "hub.example/nginx:1.27", false)];
         assert_eq!(
-            create_source(&ran, "nginx:1.27", "machine", "hub.example", false).unwrap(),
+            create_source(&ran, "nginx:1.27", "machine", "hub.example", false, None).unwrap(),
             CreateSource::Pull {
                 reference: "nginx:1.27".to_string(),
                 base: "nginx-1.27-2".to_string()
             }
         );
         assert_eq!(
-            source("nginx:1.27").unwrap(),
-            CreateSource::Pull {
-                reference: "nginx:1.27".to_string(),
-                base: "nginx-1.27".to_string()
-            },
-            "a machine of Docker Hub's nginx that ran is no image"
-        );
-        // An image of Docker Hub's that compose pulled is taken when the registry's own is
-        // not here.
-        let docker_hub = vec![listed("nginx-1.27", "docker.io/library/nginx:1.27", true)];
-        assert_eq!(
-            create_source(&docker_hub, "nginx:1.27", "machine", "hub.example", false).unwrap(),
-            CreateSource::Local("nginx-1.27".to_string())
-        );
-        assert_eq!(
-            source("fedora:45").unwrap(),
+            source("fedora:45", None).unwrap(),
             CreateSource::Pull {
                 reference: "fedora:45".to_string(),
                 base: "fedora-45".to_string()
@@ -1110,26 +1098,48 @@ mod tests {
         );
         let taken = vec![listed("fedora-45", "other.example/fedora:45", true)];
         let clash =
-            create_source(&taken, "fedora:45", "machine", "hub.example", false).unwrap_err();
+            create_source(&taken, "fedora:45", "machine", "hub.example", false, None).unwrap_err();
         assert!(clash.to_string().contains("nspawn pull --name"), "{clash}");
-        let own =
-            create_source(&images, "fedora:45", "fedora-45", "hub.example", false).unwrap_err();
+        let own = create_source(
+            &images,
+            "fedora:45",
+            "fedora-45",
+            "hub.example",
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(
             own.to_string()
                 .starts_with("fedora-45 is the name fedora:45 is pulled under"),
             "{own}"
         );
         assert_eq!(
-            source("not a reference").unwrap(),
+            source("not a reference", None).unwrap(),
             CreateSource::Local("not a reference".to_string()),
             "the service says what is wrong with it"
         );
         // A name taken is refused before anything is pulled, unless --force.
         let pulled = vec![listed("nginx-1.27", "hub.example/nginx:1.27", true)];
-        let taken =
-            create_source(&pulled, "nginx:1.27", "nginx-1.27", "hub.example", false).unwrap_err();
+        let taken = create_source(
+            &pulled,
+            "nginx:1.27",
+            "nginx-1.27",
+            "hub.example",
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(taken.to_string().contains("already exists"), "{taken}");
-        assert!(create_source(&pulled, "nginx:1.27", "nginx-1.27", "hub.example", true).is_ok());
+        assert!(create_source(
+            &pulled,
+            "nginx:1.27",
+            "nginx-1.27",
+            "hub.example",
+            true,
+            None
+        )
+        .is_ok());
     }
 
     #[test]

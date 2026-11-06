@@ -10,6 +10,8 @@ use serde_json::{json, Map, Value};
 
 use super::filters::{Filters, Invalid};
 use super::util::familiar;
+pub use crate::api::resolve::by_digest;
+use crate::api::resolve::{full_digest, full_tag, Resolved};
 use crate::api::Context;
 use crate::reference::ImageRef;
 use crate::store::{ImageRecord, Store};
@@ -153,56 +155,26 @@ pub fn count(ctx: &Context) -> anyhow::Result<usize> {
     Ok(configs.len())
 }
 
-/// A record's reference in full, the way it names an image: None for one pinned by a
-/// digest alone.
-fn full_tag(reference: &str, registry: &str) -> Option<String> {
-    let parsed = ImageRef::parse(reference, registry).ok()?;
-    // One pulled by a digest is that digest's, whatever tag came with it.
-    if parsed.digest.is_some() {
-        return None;
-    }
-    parsed.tag.as_ref()?;
-    Some(
-        ImageRef {
-            digest: None,
-            ..parsed
+/// What the service resolves `key` to, read as clients of the Docker Engine API read the
+/// name of an image (ResolveImage with docker): None when nothing here goes by it, or it
+/// is no reference.
+pub async fn resolve(key: &str) -> anyhow::Result<Option<Resolved>> {
+    let client = crate::client::Client::connect().await?;
+    let mut options = crate::client::Options::new();
+    options.insert("docker", zbus::zvariant::Value::from(true));
+    match client.manager.resolve_image(key, options).await {
+        Ok(found) => Ok(Some(Resolved {
+            name: crate::client::string(&found, "name"),
+            reference: crate::client::string(&found, "reference"),
+        })),
+        Err(e) => {
+            let e = crate::client::error(e);
+            match crate::client::error_name(&e) {
+                Some("NoSuchImage" | "Invalid") => Ok(None),
+                _ => Err(e),
+            }
         }
-        .to_string(),
-    )
-}
-
-/// A reference as the engine looks it up: by its digest alone when it has one, the tag
-/// beside it left out.
-pub fn by_digest(reference: ImageRef) -> ImageRef {
-    match reference.digest {
-        Some(_) => ImageRef {
-            tag: None,
-            ..reference
-        },
-        None => reference,
     }
-}
-
-/// `repository@digest` of the manifest a record was pulled by, in full; a built image
-/// was pulled by none.
-fn full_digest(record: &ImageRecord, registry: &str) -> Option<String> {
-    // A built image, and a container made from one, has no digest a registry knows.
-    if record.origin == "build" || record.built {
-        return None;
-    }
-    let parsed = ImageRef::parse(&record.reference, registry).ok()?;
-    let digest = record
-        .index_digest
-        .clone()
-        .unwrap_or_else(|| record.manifest_digest.clone());
-    Some(
-        ImageRef {
-            tag: None,
-            digest: Some(digest),
-            ..parsed
-        }
-        .to_string(),
-    )
 }
 
 /// The record a reference with a tag names (`wanted` in full), ranked as `list` ranks
@@ -318,10 +290,15 @@ pub fn list(ctx: &Context) -> anyhow::Result<Vec<Image>> {
     Ok(out)
 }
 
-/// The image `key` names, as the engine looks one up: a reference, then the name of a
-/// record that is an image (nspawn's own way, which a name of hex digits would otherwise
-/// lose to an ID that starts with them), then the config's digest or a prefix of it.
-pub fn find<'a>(images: &'a [Image], key: &str) -> Result<&'a Image, String> {
+/// The image `key` names, as the engine looks one up: a reference, the record the service
+/// resolves it to (`resolve`), then the name of a record (nspawn's own way, which a name of
+/// hex digits would otherwise lose to an ID that starts with them), then the config's
+/// digest or a prefix of it.
+pub fn find<'a>(
+    images: &'a [Image],
+    key: &str,
+    resolved: Option<&Resolved>,
+) -> Result<&'a Image, String> {
     // Named as the engine names it: a reference with its tag, short.
     let missing = || match ImageRef::normalized(key) {
         Ok(wanted) if !key.starts_with("sha256:") => {
@@ -332,13 +309,10 @@ pub fn find<'a>(images: &'a [Image], key: &str) -> Result<&'a Image, String> {
     if key.is_empty() {
         return Err(missing());
     }
-    if let Ok(wanted) = ImageRef::normalized(key).map(by_digest) {
-        let wanted_text = wanted.to_string();
-        let found = match &wanted.digest {
-            Some(_) => images.iter().find(|i| i.digests.contains(&wanted_text)),
-            None => images.iter().find(|i| i.tags.contains(&wanted_text)),
-        };
-        if let Some(image) = found {
+    if let Some(found) = resolved {
+        let holds =
+            |i: &&Image| i.records.contains(&found.name) || i.containers.contains(&found.name);
+        if let Some(image) = images.iter().find(holds) {
             return Ok(image);
         }
     }
@@ -361,26 +335,13 @@ pub fn find<'a>(images: &'a [Image], key: &str) -> Result<&'a Image, String> {
     Err(missing())
 }
 
-/// The record a container of `image` is made from, `key` being how it was asked for:
-/// the one the reference names, ranked as `list` ranks them (an image before a
-/// container, the last made first), so that the container keeps that reference; the
-/// record of that name for a record's name; the image's first record otherwise.
-pub fn source(
-    image: &Image,
-    key: &str,
-    registry: &str,
-    load: impl Fn(&str) -> Option<ImageRecord>,
-) -> Option<String> {
+/// The record a container of `image` is made from, `key` being how it was asked for: the
+/// one the service resolves the reference to, so that the container keeps that reference;
+/// the record of that name for a record's name; the image's first record otherwise.
+pub fn source(image: &Image, key: &str, resolved: Option<&Resolved>) -> Option<String> {
     let mut held = image.records.iter().chain(&image.containers);
-    if let Ok(wanted) = ImageRef::normalized(key).map(by_digest) {
-        let wanted = wanted.to_string();
-        let named = |name: &&String| {
-            load(name).is_some_and(|record| {
-                full_tag(&record.reference, registry).as_deref() == Some(&wanted)
-                    || full_digest(&record, registry).as_deref() == Some(&wanted)
-            })
-        };
-        if let Some(name) = held.clone().find(named) {
+    if let Some(found) = resolved {
+        if let Some(name) = held.clone().find(|name| **name == found.name) {
             return Some(name.clone());
         }
     }
@@ -403,7 +364,11 @@ const FILTERS: &[&str] = &[
 
 /// The images GET /images/json lists: with `all`, the intermediate ones too, which this
 /// store has none of; `filters` as the engine reads them.
-pub fn select<'a>(images: &'a [Image], filters: &Filters) -> Result<Vec<&'a Image>, Invalid> {
+pub fn select<'a>(
+    images: &'a [Image],
+    filters: &Filters,
+    resolved: &HashMap<String, Option<Resolved>>,
+) -> Result<Vec<&'a Image>, Invalid> {
     filters.only(FILTERS)?;
     if let Some(values) = filters.values("dangling") {
         if let Some(bad) = values
@@ -419,7 +384,8 @@ pub fn select<'a>(images: &'a [Image], filters: &Filters) -> Result<Vec<&'a Imag
         };
         let mut out = None;
         for value in values {
-            let image = find(images, value).map_err(Invalid)?;
+            let found = resolved.get(value).and_then(Option::as_ref);
+            let image = find(images, value, found).map_err(Invalid)?;
             out = Some(image.created());
         }
         Ok(out)
@@ -736,6 +702,7 @@ pub fn removal(
     force: bool,
     registry: &str,
     users: &[User],
+    resolved: Option<&Resolved>,
 ) -> Result<Untag, Answer> {
     use hyper::StatusCode;
     let short =
@@ -783,10 +750,8 @@ pub fn removal(
             answer,
         });
     }
-    let wanted = ImageRef::normalized(key)
-        .map(by_digest)
-        .ok()
-        .map(|r| r.to_string());
+    // The reference the service resolved the key to, in full.
+    let wanted = resolved.map(|found| found.reference.clone());
     let (chosen, asked, by_tag): (Vec<&ImageRecord>, String, bool) = match wanted {
         Some(wanted) if image.tags.contains(&wanted) => (
             held.iter()
@@ -865,7 +830,11 @@ pub fn removal(
 async fn remove(ctx: &Context, key: &str, force: bool) -> Result<Value, Answer> {
     use hyper::StatusCode;
     let all = list(ctx).map_err(|e| failed(format!("{e:#}")))?;
-    let image = find(&all, key).map_err(|e| says(super::lookup_status(&e), e))?;
+    let resolved = resolve(key)
+        .await
+        .map_err(|e| says(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    let image =
+        find(&all, key, resolved.as_ref()).map_err(|e| says(super::lookup_status(&e), e))?;
     let records: Vec<ImageRecord> = image
         .records
         .iter()
@@ -883,7 +852,15 @@ async fn remove(ctx: &Context, key: &str, force: bool) -> Result<Value, Answer> 
             running: m.running(),
         })
         .collect();
-    let untag = removal(image, &records, key, force, &ctx.config.registry, &users)?;
+    let untag = removal(
+        image,
+        &records,
+        key,
+        force,
+        &ctx.config.registry,
+        &users,
+        resolved.as_ref(),
+    )?;
     if !untag.names.is_empty() {
         let client = crate::client::Client::connect()
             .await
@@ -1168,9 +1145,20 @@ mod tests {
     fn a_reference_with_a_digest_is_looked_up_by_the_digest_alone() {
         let digest = format!("sha256:{}", "a".repeat(64));
         let images = [busybox()];
-        let found = find(&images, &format!("busybox:1.37@{digest}")).unwrap();
+        // The image of the record the service resolves the reference to; nothing when it
+        // resolves none.
+        let held = by(
+            &images[0].records[0],
+            &format!("docker.io/library/busybox@{digest}"),
+        );
+        let found = find(&images, &format!("busybox:1.37@{digest}"), Some(&held)).unwrap();
         assert_eq!(found.id, images[0].id);
-        assert!(find(&images, &format!("busybox:1.37@sha256:{}", "b".repeat(64))).is_err());
+        assert!(find(
+            &images,
+            &format!("busybox:1.37@sha256:{}", "b".repeat(64)),
+            None
+        )
+        .is_err());
         // A record pulled as tag and digest holds the digest, not the tag.
         let pinned = format!("docker.io/library/postgres:16@{digest}");
         assert_eq!(full_tag(&pinned, "hub.nspawn.org"), None);
@@ -1180,63 +1168,49 @@ mod tests {
         );
     }
 
+    /// What the service resolves a name to.
+    pub(super) fn by(name: &str, reference: &str) -> Resolved {
+        Resolved {
+            name: name.to_string(),
+            reference: reference.to_string(),
+        }
+    }
+
     #[test]
     fn a_container_is_made_from_the_record_its_reference_names() {
-        let record = |name: &str, reference: &str, digest: &str| -> ImageRecord {
-            serde_json::from_value(json!({
-                "name": name,
-                "reference": reference,
-                "manifest_digest": digest,
-                "layers": [],
-                "backend": "overlay",
-                "created": 0,
-            }))
-            .unwrap()
-        };
-        let stable = format!("sha256:{}", "b".repeat(64));
-        let pinned = format!("sha256:{}", "c".repeat(64));
-        let records = [
-            record("nginxstable", "docker.io/library/nginx:stable", &stable),
-            record("nginx127", "docker.io/library/nginx:1.27", &stable),
-            record(
-                "pinned",
-                &format!("docker.io/library/nginx@{pinned}"),
-                &pinned,
-            ),
-            record("web", "docker.io/library/nginx:1.27", &stable),
-        ];
-        let load = |name: &str| records.iter().find(|r| r.name == name).cloned();
         let image = Image {
             records: vec!["nginxstable".into(), "nginx127".into(), "pinned".into()],
             containers: vec!["web".into()],
             ..busybox()
         };
-        let source = |key: &str| source(&image, key, "docker.io", load);
-        assert_eq!(source("nginx:1.27").as_deref(), Some("nginx127"));
+        let source = |key: &str, found: Option<Resolved>| source(&image, key, found.as_ref());
         assert_eq!(
-            source("docker.io/library/nginx:stable").as_deref(),
-            Some("nginxstable")
+            source(
+                "nginx:1.27",
+                Some(by("nginx127", "docker.io/library/nginx:1.27"))
+            )
+            .as_deref(),
+            Some("nginx127"),
+            "the record the service resolves the reference to"
         );
         assert_eq!(
-            source(&format!("nginx@{pinned}")).as_deref(),
-            Some("pinned"),
-            "a digest stays pinned"
+            source(
+                "nginx:1.27",
+                Some(by("web", "docker.io/library/nginx:1.27"))
+            )
+            .as_deref(),
+            Some("web"),
+            "a container that alone holds the reference"
         );
         assert_eq!(
-            source("pinned").as_deref(),
+            source("pinned", None).as_deref(),
             Some("pinned"),
             "a record's name"
         );
-        assert_eq!(source(&image.id).as_deref(), Some("nginxstable"), "an ID");
-        // Only a container holds the reference: its record it is.
-        let image = Image {
-            records: vec!["nginxstable".into()],
-            containers: vec!["web".into()],
-            ..busybox()
-        };
         assert_eq!(
-            super::source(&image, "nginx:1.27", "docker.io", load).as_deref(),
-            Some("web")
+            source(&image.id, None).as_deref(),
+            Some("nginxstable"),
+            "an ID"
         );
     }
 
@@ -1301,7 +1275,7 @@ mod tests {
             "../../tests/dockerapi/golden/image-missing.body"
         ));
         assert_eq!(
-            find(&[image], "nope").unwrap_err(),
+            find(&[image], "nope", None).unwrap_err(),
             docker["message"].as_str().unwrap()
         );
     }
@@ -1318,31 +1292,30 @@ mod tests {
             ),
             image(&b, &["ghcr.io/x/y:latest"], "2024-02-01T00:00:00Z"),
         ];
-        assert_eq!(find(&images, "busybox:1.37").unwrap().id, a);
+        let rec_a = format!("rec-{a}");
+        let busybox = by(&rec_a, "docker.io/library/busybox:1.37");
+        assert_eq!(find(&images, "busybox:1.37", Some(&busybox)).unwrap().id, a);
+        assert_eq!(find(&images, &a, None).unwrap().id, a);
         assert_eq!(
-            find(&images, "docker.io/library/busybox:1.37").unwrap().id,
+            find(&images, a.trim_start_matches("sha256:"), None)
+                .unwrap()
+                .id,
             a
         );
-        assert_eq!(find(&images, "ghcr.io/x/y").unwrap().id, b);
-        assert_eq!(find(&images, &a).unwrap().id, a);
-        assert_eq!(
-            find(&images, a.trim_start_matches("sha256:")).unwrap().id,
-            a
-        );
-        assert_eq!(find(&images, "aaaa").unwrap().id, a);
-        assert!(find(&images, "aaa")
+        assert_eq!(find(&images, "aaaa", None).unwrap().id, a);
+        assert!(find(&images, "aaa", None)
             .unwrap_err()
             .starts_with("multiple IDs"));
-        assert_eq!(find(&images, &format!("rec-{b}")).unwrap().id, b);
+        assert_eq!(find(&images, &format!("rec-{b}"), None).unwrap().id, b);
         // A record named with hex digits is that record, not the ID they start.
         let mut named = images.clone();
         named[1].records.push("aaaa".to_string());
-        assert_eq!(find(&named, "aaaa").unwrap().id, b);
+        assert_eq!(find(&named, "aaaa", None).unwrap().id, b);
         assert_eq!(
-            find(&images, "busybox").unwrap_err(),
+            find(&images, "busybox", None).unwrap_err(),
             "No such image: busybox:latest"
         );
-        assert_eq!(find(&images, "").unwrap_err(), "No such image: ");
+        assert_eq!(find(&images, "", None).unwrap_err(), "No such image: ");
     }
 
     #[test]
@@ -1376,7 +1349,17 @@ mod tests {
         ];
         let ids = |text: &str| -> Vec<String> {
             let filters = Filters::parse(Some(text)).unwrap();
-            select(&images, &filters)
+            let resolved = HashMap::from([
+                (
+                    "a:1".to_string(),
+                    Some(by("rec-sha256:1", "docker.io/library/a:1")),
+                ),
+                (
+                    "c:1".to_string(),
+                    Some(by("rec-sha256:3", "docker.io/library/c:1")),
+                ),
+            ]);
+            select(&images, &filters, &resolved)
                 .unwrap()
                 .iter()
                 .map(|i| i.id.clone())
@@ -1390,10 +1373,10 @@ mod tests {
         assert_eq!(ids(r#"{"before":["c:1"]}"#), ["sha256:1", "sha256:2"]);
         assert_eq!(ids(r#"{"since":["a:1"]}"#), ["sha256:2", "sha256:3"]);
         let bad = Filters::parse(Some(r#"{"nope":["x"]}"#)).unwrap();
-        assert!(select(&images, &bad).is_err());
+        assert!(select(&images, &bad, &HashMap::new()).is_err());
         let bad = Filters::parse(Some(r#"{"dangling":["maybe"]}"#)).unwrap();
         assert_eq!(
-            select(&images, &bad).unwrap_err().0,
+            select(&images, &bad, &HashMap::new()).unwrap_err().0,
             "invalid filter 'dangling=maybe'"
         );
     }
@@ -1427,6 +1410,7 @@ mod tests {
 
 #[cfg(test)]
 mod changes {
+    use super::tests::by;
     use super::*;
     use hyper::{Method, StatusCode};
 
@@ -1488,7 +1472,15 @@ mod changes {
         answer.push(json!({ "Deleted": id() }));
         for key in ["nginx", "nginx:latest", "docker.io/library/nginx:latest"] {
             assert_eq!(
-                removal(&image, &records, key, false, REGISTRY, &[]),
+                removal(
+                    &image,
+                    &records,
+                    key,
+                    false,
+                    REGISTRY,
+                    &[],
+                    Some(&by("nginx", "docker.io/library/nginx:latest"))
+                ),
                 Ok(Untag {
                     names: vec!["nginx".into()],
                     answer: answer.clone(),
@@ -1498,13 +1490,31 @@ mod changes {
         }
         // By the name of the record that holds it, as `nspawn images` lists it.
         assert_eq!(
-            removal(&image, &records, "nginx", true, REGISTRY, &[])
-                .unwrap()
-                .names,
+            removal(
+                &image,
+                &records,
+                "nginx",
+                true,
+                REGISTRY,
+                &[],
+                Some(&by("nginx", "docker.io/library/nginx:latest"))
+            )
+            .unwrap()
+            .names,
             ["nginx"]
         );
         // By the digest: that reference alone is untagged.
-        let by_digest = removal(&image, &records, &pinned, false, REGISTRY, &[]).unwrap();
+        let pinned_full = format!("docker.io/library/nginx@{}", digest());
+        let by_digest = removal(
+            &image,
+            &records,
+            &pinned,
+            false,
+            REGISTRY,
+            &[],
+            Some(&by("nginx", &pinned_full)),
+        )
+        .unwrap();
         assert_eq!(by_digest.names, ["nginx"]);
         assert_eq!(by_digest.answer[0], json!({ "Untagged": pinned }));
         assert_eq!(
@@ -1520,14 +1530,23 @@ mod changes {
         let stopped = [user(false)];
         let (c12, i12) = ("e".repeat(12), "c".repeat(12));
         assert_eq!(
-            removal(&image, &records, "nginx", false, REGISTRY, &stopped),
+            removal(&image, &records, "nginx", false, REGISTRY, &stopped, Some(&by("nginx", "docker.io/library/nginx:latest"))),
             Err(says(
                 StatusCode::CONFLICT,
                 format!("conflict: unable to remove repository reference \"nginx\" (must force) - container {c12} is using its referenced image {i12}")
             ))
         );
         // With force the record goes and the container keeps the image: not deleted.
-        let forced = removal(&image, &records, "nginx", true, REGISTRY, &stopped).unwrap();
+        let forced = removal(
+            &image,
+            &records,
+            "nginx",
+            true,
+            REGISTRY,
+            &stopped,
+            Some(&by("nginx", "docker.io/library/nginx:latest")),
+        )
+        .unwrap();
         assert_eq!(forced.names, ["nginx"]);
         assert_eq!(
             forced.answer,
@@ -1537,25 +1556,58 @@ mod changes {
         let held = nginx(&[], &["web"]);
         let mut only = held.clone();
         only.tags = ["docker.io/library/nginx:latest".to_string()].into();
-        assert!(removal(&only, &[], "nginx", false, REGISTRY, &stopped).is_err());
-        let forced = removal(&only, &[], &id(), true, REGISTRY, &stopped).unwrap();
+        let web = by("web", "docker.io/library/nginx:latest");
+        assert!(removal(&only, &[], "nginx", false, REGISTRY, &stopped, Some(&web)).is_err());
+        let forced = removal(&only, &[], &id(), true, REGISTRY, &stopped, None).unwrap();
         assert!(forced.names.is_empty());
         assert_eq!(forced.answer, untag(&["nginx:latest"]));
         // By ID, the engine's words for each conflict.
         assert_eq!(
-            removal(&image, &records, &"c".repeat(8), false, REGISTRY, &[user(true)]),
+            removal(&image, &records, &"c".repeat(8), false, REGISTRY, &[user(true)], None),
             Err(says(
                 StatusCode::CONFLICT,
                 format!("conflict: unable to delete {i12} (cannot be forced) - image is being used by running container {c12}")
             ))
         );
         assert_eq!(
-            removal(&image, &records, &id(), false, REGISTRY, &stopped),
+            removal(&image, &records, &id(), false, REGISTRY, &stopped, None),
             Err(says(
                 StatusCode::CONFLICT,
                 format!("conflict: unable to delete {i12} (must be forced) - image is being used by stopped container {c12}")
             ))
         );
+    }
+
+    #[test]
+    fn an_image_built_here_is_removed_by_the_name_the_service_resolves() {
+        let mut app = record("somos-app-1", "hub.nspawn.org/somos/app:1");
+        app.origin = "build".into();
+        let records = [app];
+        let image = nginx(&records, &[]);
+        // somos/app:1, which the service resolves to the record built here.
+        let found = by("somos-app-1", "hub.nspawn.org/somos/app:1");
+        assert_eq!(
+            find(std::slice::from_ref(&image), "somos/app:1", Some(&found))
+                .unwrap()
+                .id,
+            image.id
+        );
+        assert_eq!(
+            source(&image, "somos/app:1", Some(&found)).as_deref(),
+            Some("somos-app-1")
+        );
+        let gone = removal(
+            &image,
+            &records,
+            "somos/app:1",
+            false,
+            REGISTRY,
+            &[],
+            Some(&found),
+        )
+        .unwrap();
+        assert_eq!(gone.names, ["somos-app-1"]);
+        assert_eq!(gone.answer[0], untag(&["hub.nspawn.org/somos/app:1"])[0]);
     }
 
     #[test]
@@ -1573,11 +1625,12 @@ mod changes {
             false,
             REGISTRY,
             &[user(false)],
+            Some(&by("nginx-alt", "docker.io/library/nginx:1.27")),
         )
         .unwrap();
         assert_eq!(one.names, ["nginx-alt"]);
         assert_eq!(one.answer, untag(&["nginx:1.27"]));
-        let by_record = removal(&image, &records, "nginx-alt", false, REGISTRY, &[]).unwrap();
+        let by_record = removal(&image, &records, "nginx-alt", false, REGISTRY, &[], None).unwrap();
         assert_eq!(
             by_record,
             Untag {
@@ -1586,13 +1639,22 @@ mod changes {
             }
         );
         assert_eq!(
-            removal(&image, &records, &"c".repeat(12), false, REGISTRY, &[]),
+            removal(&image, &records, &"c".repeat(12), false, REGISTRY, &[], None),
             Err(says(
                 StatusCode::CONFLICT,
                 format!("conflict: unable to delete {} (must be forced) - image is referenced in multiple repositories", "c".repeat(12))
             ))
         );
-        let all = removal(&nginx(&records, &[]), &records, &id(), true, REGISTRY, &[]).unwrap();
+        let all = removal(
+            &nginx(&records, &[]),
+            &records,
+            &id(),
+            true,
+            REGISTRY,
+            &[],
+            None,
+        )
+        .unwrap();
         assert_eq!(all.names, ["nginx", "nginx-alt"]);
         assert_eq!(all.answer.last().unwrap(), &json!({ "Deleted": id() }));
         assert_eq!(all.answer.len(), 4, "two tags, a digest, the image");

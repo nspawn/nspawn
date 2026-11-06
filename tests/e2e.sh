@@ -129,7 +129,7 @@ cleanup_machines() {
   for m in $($NSPAWN ps -a 2>/dev/null | awk '$1 ~ /^e2e-dk-/ {print $1}'); do
     $NSPAWN rm -f "$m" >/dev/null 2>&1 || true
   done
-  $NSPAWN images rm e2e-dk-cli e2e-dk-bb >/dev/null 2>&1 || true
+  $NSPAWN images rm e2e-dk-cli e2e-dk-bb e2e-dk-built-1 >/dev/null 2>&1 || true
   # Its volumes and networks: by the run's label, or by the names it gave them.
   for v in $($NSPAWN volume ls --json 2>/dev/null | python3 -c 'import json, sys
 for v in json.load(sys.stdin):
@@ -2756,7 +2756,7 @@ if command -v busctl >/dev/null 2>&1; then
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
   $NSPAWN ps 2>&1 >/dev/null | grep_q "warning: the nspawn service runs" && fail "the command and the service disagree on their version: $($NSPAWN ps 2>&1 >/dev/null)"
-  for m in ListImages GetImage Generate PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ImageDigest ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine PauseMachine UnpauseMachine MachineProcesses UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes AutoUpdate PruneImages DiskUsage ConnectNetwork DisconnectNetwork; do
+  for m in ListImages GetImage Generate PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ImageDigest ResolveImage ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine PauseMachine UnpauseMachine MachineProcesses UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes AutoUpdate PruneImages DiskUsage ConnectNetwork DisconnectNetwork; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do
@@ -3562,6 +3562,14 @@ out=$(dkt network prune -f --filter label=e2e.dk=1 2>&1) || fail "docker network
 echo "$out" | grep_q e2e-dk-n2 || fail "docker network prune left e2e-dk-n2: $out"
 out=$(dkt network rm bridge 2>&1) && fail "the network bridge was removed"
 echo "$out" | grep_q pre-defined || fail "docker network rm bridge: $out"
+# An image built here with a short name goes by it, filed under the configured registry.
+mkdir -p "$dk_dir/built"
+printf 'FROM %s\nCMD ["echo", "built-short"]\n' "$busybox_ref" > "$dk_dir/built/Dockerfile"
+$NSPAWN build -t e2e-dk-built:1 "$dk_dir/built" >/dev/null 2>&1 || fail "nspawn build -t e2e-dk-built:1"
+dk image inspect e2e-dk-built:1 >/dev/null 2>&1 || fail "docker image inspect by the short name of an image built here"
+[ "$(dkt run --rm --label e2e.dk=1 e2e-dk-built:1 2>&1)" = built-short ] || fail "docker run by the short name of an image built here: $(dkt run --rm e2e-dk-built:1 2>&1)"
+dkt rmi e2e-dk-built:1 >/dev/null 2>&1 || fail "docker rmi by the short name of an image built here"
+$NSPAWN images ls | grep_q '^ *e2e-dk-built-1 ' && fail "docker rmi left the record e2e-dk-built-1"
 # rmi of the image the step above pulled: refused while a container was made from it.
 # Docker Hub's busybox:1.37 may be the very image the mirror of busybox:latest holds,
 # whose tags and containers the checks would then count too.

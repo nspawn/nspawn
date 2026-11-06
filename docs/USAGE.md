@@ -544,7 +544,13 @@ and plugins are not served. A record pulled
 or built that never ran is an image there, not a container, and a machine made from it
 is a container. Images are told apart by their config: an image's ID is its config's
 digest, its tags are the references its records were pulled or built as, and a
-reference names the image of the last record pulled with it.
+reference names the image of the last record pulled with it. An image built here with
+a name without a registry, which nspawn files under the configured registry
+(`hub.nspawn.org/somos/app:1` for `nspawn build -t somos/app:1`), goes by that short
+name too while Docker Hub's image of it is not here: `docker run somos/app:1` and
+`docker image inspect somos/app:1` find it. The service decides which local image a name
+means, for the command line and the API alike (`ResolveImage`), each reading a name
+without a registry its own way.
 
 Containers are made and run through the bus service, as the command line's requests
 are: `POST /containers/create`, `start`, `stop`, `restart`, `kill`, `pause`, `unpause`,

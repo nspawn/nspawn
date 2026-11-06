@@ -561,41 +561,42 @@ impl Listed {
             })
             .collect()
     }
-
-    /// The image of `reference` a new machine is made from: one never run, the last
-    /// pulled of several, as a tag names the last pull; never `but`.
-    pub(crate) fn image_of<'a>(
-        images: &'a [Listed],
-        reference: &str,
-        but: &str,
-    ) -> Option<&'a Listed> {
-        images
-            .iter()
-            .filter(|i| i.reference == reference && i.name != but && i.image_only)
-            .max_by_key(|i| i.pulled)
-    }
 }
 
 /// An existing machine of that name is started with start, or made anew with --force; a
 /// mode other than auto can only come with a pull.
-/// The references a local image of `text` goes by, in the order run and create look for
-/// one: under the configured registry, as nspawn names what it pulls and builds, then
-/// with Docker Hub as the registry of a name that gives none, for an image compose took
-/// from there. Only after both is the registry asked.
-pub(crate) fn local_spellings(text: &str, registry: &str) -> Result<Vec<String>> {
-    let mut out = vec![ImageRef::parse(text, registry)?.to_string()];
-    if let Ok(hub) = ImageRef::normalized(text) {
-        let hub = hub.to_string();
-        if !out.contains(&hub) {
-            out.push(hub);
+/// The image a new machine named `name` is made from, of `reference` as the command line
+/// reads it (ResolveImage): one never run, the last pulled of several, never the machine
+/// itself; None when nothing here goes by the reference, which is then pulled.
+pub(crate) async fn local_image(
+    client: &Client,
+    config: &Config,
+    reference: &str,
+    name: &str,
+) -> Result<Option<String>> {
+    let mut options = client::registry_options(config);
+    options.insert("images_only", Value::from(true));
+    options.insert("except", Value::from(name));
+    match client.manager.resolve_image(reference, options).await {
+        Ok(found) => Ok(Some(client::string(&found, "name"))),
+        Err(e) => {
+            let e = client::error(e);
+            // What is no reference is left to the service to refuse with the machine.
+            if matches!(client::error_name(&e), Some("NoSuchImage" | "Invalid")) {
+                Ok(None)
+            } else {
+                Err(e)
+            }
         }
     }
-    Ok(out)
 }
 
+/// Where run takes its machine from: `local`, the image `reference` names here, or the
+/// registry, as the pull policy says.
 fn run_source(
     images: &[Listed],
-    references: &[String],
+    local: Option<String>,
+    reference: &str,
     name: &str,
     force: bool,
     pull: PullPolicy,
@@ -604,20 +605,13 @@ fn run_source(
     if !force && images.iter().any(|i| i.name == name) {
         bail!("machine {name} exists: nspawn start {name}, or nspawn run --force to make it anew");
     }
-    let local = references
-        .iter()
-        .find_map(|r| Listed::image_of(images, r, name))
-        .map(|i| i.name.clone());
     Ok(match (pull, local) {
         (PullPolicy::Always, _) => Source::Registry,
         (PullPolicy::Never, _) if mode_given => {
             bail!("--mode takes a pull of the image; drop it, or use --pull missing")
         }
         (PullPolicy::Never, None) => {
-            bail!(
-                "no local image of {}; pull it, or use --pull missing",
-                references.first().map_or("", String::as_str)
-            )
+            bail!("no local image of {reference}; pull it, or use --pull missing")
         }
         (_, Some(source)) if !mode_given => Source::Local(source),
         _ => Source::Registry,
@@ -657,9 +651,11 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
         None => image.local_name(),
     };
     let images = Listed::all(&client.manager.list_images().await.map_err(client::error)?);
+    let local = local_image(client, config, &args.reference, &name).await?;
     let source = run_source(
         &images,
-        &local_spellings(&args.reference, &registry)?,
+        local,
+        &image.to_string(),
         &name,
         args.force,
         args.pull,
@@ -2353,9 +2349,9 @@ mod tests {
             listed("fedora-44", "hub.nspawn.org/fedora:44", true, 1),
             listed("vm", "", false, 0),
         ];
-        let one = |r: &str| vec![r.to_string()];
+        let web = || Some("web".to_string());
         let source = |name: &str, force: bool, pull: PullPolicy, mode: bool| {
-            run_source(&images, &one(nginx), name, force, pull, mode)
+            run_source(&images, web(), nginx, name, force, pull, mode)
         };
         assert_eq!(
             source("web2", false, PullPolicy::Missing, false).unwrap(),
@@ -2377,91 +2373,41 @@ mod tests {
             source("vm", false, PullPolicy::Missing, false).is_err(),
             "an image machined lists takes the name too"
         );
+        // Made anew with --force, the one local copy being the machine itself: the
+        // service resolves none, and the image is pulled.
         assert_eq!(
-            source("web", true, PullPolicy::Missing, false).unwrap(),
-            Source::Registry,
-            "made anew from the registry: the one local copy is the machine itself"
+            run_source(
+                &images,
+                None,
+                nginx,
+                "web",
+                true,
+                PullPolicy::Missing,
+                false
+            )
+            .unwrap(),
+            Source::Registry
         );
-        assert!(run_source(
+        let never = run_source(
             &images,
-            &one("hub.nspawn.org/x:1"),
+            None,
+            "hub.nspawn.org/x:1",
             "x",
             false,
             PullPolicy::Never,
-            false
+            false,
         )
-        .is_err());
+        .unwrap_err();
+        assert!(
+            never
+                .to_string()
+                .contains("no local image of hub.nspawn.org/x:1"),
+            "{never}"
+        );
         assert_eq!(
             source("web2", false, PullPolicy::Never, false).unwrap(),
             Source::Local("web".to_string())
         );
         assert!(source("web2", false, PullPolicy::Never, true).is_err());
-        // A machine that ran is no image: the newest image of the reference, or a pull.
-        let ran = vec![
-            listed("a", nginx, false, 5),
-            listed("old", nginx, true, 1),
-            listed("new", nginx, true, 3),
-        ];
-        assert_eq!(
-            run_source(&ran, &one(nginx), "b", false, PullPolicy::Missing, false).unwrap(),
-            Source::Local("new".to_string())
-        );
-        assert_eq!(
-            run_source(
-                &ran[..1],
-                &one(nginx),
-                "b",
-                false,
-                PullPolicy::Missing,
-                false
-            )
-            .unwrap(),
-            Source::Registry
-        );
-        // The registry's own image first, then Docker Hub's that compose pulled, and the
-        // registry only when neither is here.
-        let app = local_spellings("app", "hub.nspawn.org").unwrap();
-        let hub = listed("app", "hub.nspawn.org/app:latest", true, 1);
-        let docker_hub = listed("app-2", "docker.io/library/app:latest", true, 2);
-        assert_eq!(
-            run_source(
-                &[hub, docker_hub.clone()],
-                &app,
-                "m",
-                false,
-                PullPolicy::Missing,
-                false
-            )
-            .unwrap(),
-            Source::Local("app".to_string())
-        );
-        assert_eq!(
-            run_source(&[docker_hub], &app, "m", false, PullPolicy::Missing, false).unwrap(),
-            Source::Local("app-2".to_string())
-        );
-        assert_eq!(
-            run_source(&[], &app, "m", false, PullPolicy::Missing, false).unwrap(),
-            Source::Registry
-        );
-    }
-
-    #[test]
-    fn a_name_is_looked_for_under_the_registry_then_under_docker_hub() {
-        assert_eq!(
-            local_spellings("app", "hub.nspawn.org").unwrap(),
-            ["hub.nspawn.org/app:latest", "docker.io/library/app:latest"]
-        );
-        assert_eq!(
-            local_spellings("user/app:1", "hub.nspawn.org").unwrap(),
-            ["hub.nspawn.org/user/app:1", "docker.io/user/app:1"]
-        );
-        assert_eq!(
-            local_spellings("ghcr.io/x/y:2", "hub.nspawn.org").unwrap(),
-            ["ghcr.io/x/y:2"]
-        );
-        assert_eq!(
-            local_spellings("nginx", "docker.io").unwrap(),
-            ["docker.io/library/nginx:latest"]
-        );
     }
 }

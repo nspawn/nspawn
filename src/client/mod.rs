@@ -88,6 +88,8 @@ pub trait Manager {
     #[zbus(allow_interactive_auth)]
     fn image_digest(&self, reference: &str, options: Options<'_>) -> zbus::Result<String>;
     #[zbus(allow_interactive_auth)]
+    fn resolve_image(&self, reference: &str, options: Options<'_>) -> zbus::Result<Dict>;
+    #[zbus(allow_interactive_auth)]
     fn list_machines(&self, all: bool) -> zbus::Result<Vec<Dict>>;
     #[zbus(allow_interactive_auth)]
     fn get_machine(&self, name: &str) -> zbus::Result<Dict>;

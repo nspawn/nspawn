@@ -21,6 +21,7 @@ pub mod network;
 pub mod pull;
 pub mod push;
 pub mod recreate;
+pub mod resolve;
 pub mod run;
 pub mod search;
 pub mod secrets;

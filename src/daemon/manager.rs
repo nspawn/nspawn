@@ -1806,6 +1806,47 @@ impl Manager {
             .collect())
     }
 
+    /// The local record a reference means: name (s), the record, and reference (s), the
+    /// reference it goes by there in full. Read as the command line reads a reference
+    /// (a name without a registry under the configured one first, then as Docker Hub's),
+    /// or with docker (b) as clients of the Docker Engine API read one (Docker Hub's
+    /// first, then an image built here under the configured registry); among the records
+    /// of a reference, images before machines and the last made first. Options
+    /// images_only (b), except (s, a record passed over), registry (s). NoSuchImage when
+    /// nothing here goes by it.
+    async fn resolve_image(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        reference: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<Dict> {
+        let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
+        let mut options = Options::new(&options);
+        let docker = options.bool("docker", false)?;
+        let images_only = options.bool("images_only", false)?;
+        let except = options.string("except")?.filter(|e| !e.is_empty());
+        let ctx = self.context_for(&mut options)?;
+        options.finish()?;
+        let reading = if docker {
+            api::resolve::Reading::Docker
+        } else {
+            api::resolve::Reading::Nspawn
+        };
+        let found = api::resolve::resolve(
+            &ctx.store,
+            &ctx.config.registry,
+            &reference,
+            reading,
+            images_only,
+            except.as_deref(),
+        )?;
+        Ok(HashMap::from([
+            ("name".to_string(), values::v(found.name)),
+            ("reference".to_string(), values::v(found.reference)),
+        ]))
+    }
+
     /// The digest a reference names on its registry now, an index's for a tag of
     /// several platforms, without pulling it: what compose config pins images to.
     /// Options: registry (s), ca_cert (s).

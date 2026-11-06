@@ -1125,7 +1125,10 @@ pub async fn create(ctx: &Arc<Context>, query: &Query, sent: Sent) -> Response<B
             .map_err(|e| failed(format!("{e:#}")))?;
         let mut plan = create::translate(&body, &Live(&snapshot))?;
         let all = super::images::list(ctx).map_err(|e| failed(format!("{e:#}")))?;
-        let image = super::images::find(&all, &plan.image)
+        let resolved = super::images::resolve(&plan.image)
+            .await
+            .map_err(|e| failed(format!("{e:#}")))?;
+        let image = super::images::find(&all, &plan.image, resolved.as_ref())
             .map_err(|e| Answer::says(lookup_status(&e), e))?;
         if let Some(network) = &plan.missing_network {
             return Err(Answer::says(
@@ -1156,15 +1159,13 @@ pub async fn create(ctx: &Arc<Context>, query: &Query, sent: Sent) -> Response<B
             "" => create::generated_name(&plan.image, random()),
             given => check_name(given)?,
         };
-        let source = super::images::source(image, &plan.image, &ctx.config.registry, |name| {
-            ctx.store.load_image(name).ok().flatten()
-        })
-        .ok_or_else(|| {
-            Answer::says(
-                StatusCode::NOT_FOUND,
-                format!("No such image: {}", plan.image),
-            )
-        })?;
+        let source =
+            super::images::source(image, &plan.image, resolved.as_ref()).ok_or_else(|| {
+                Answer::says(
+                    StatusCode::NOT_FOUND,
+                    format!("No such image: {}", plan.image),
+                )
+            })?;
         let mut opts = plan.opts.clone();
         opts.insert("api_name", Opt::Text(name.clone()));
         let client = connect().await?;
@@ -1857,7 +1858,7 @@ mod tests {
         let image = create::translate(&create::decode(body.as_bytes()).unwrap(), &Nothing)
             .unwrap()
             .image;
-        let e = crate::dockerapi::images::find(&[], &image).unwrap_err();
+        let e = crate::dockerapi::images::find(&[], &image, None).unwrap_err();
         assert_eq!((lookup_status(&e), Some(e)), case("create-noimage"));
         assert!(check_platform("").is_ok());
         assert!(check_platform(&format!("linux/{}", go_arch())).is_ok());

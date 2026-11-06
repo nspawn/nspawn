@@ -24,7 +24,7 @@ pub(crate) mod streams;
 pub mod util;
 pub mod volumes;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -728,8 +728,8 @@ async fn route_request(
         Route::Archive(call) => archive::serve(ctx, call, query, sent).await,
         Route::Pull => pull::create(ctx, query).await,
         Route::Plugins => json_response(StatusCode::OK, &json!([])),
-        Route::Images => list_images(ctx, query),
-        Route::Image(name, what) => image_read(ctx, &name, &what),
+        Route::Images => list_images(ctx, query).await,
+        Route::Image(name, what) => image_read(ctx, &name, &what).await,
         Route::Volumes => list_volumes(ctx, query),
         Route::Volume(name) => match crate::api::volumes::list(&ctx.store) {
             Ok(all) => match all.iter().find(|v| v.name == name) {
@@ -1405,7 +1405,7 @@ async fn disk_usage(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
     json_response(StatusCode::OK, &out)
 }
 
-fn list_images(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
+async fn list_images(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
     let filters = match Filters::parse(query.get("filters")) {
         Ok(f) => f,
         Err(filters::Invalid(message)) => return error(StatusCode::BAD_REQUEST, message),
@@ -1414,7 +1414,19 @@ fn list_images(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
         Ok(all) => all,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
-    match images::select(&all, &filters) {
+    // The images before and since name, as the service resolves them.
+    let mut resolved = HashMap::new();
+    for key in ["before", "since"] {
+        for value in filters.values(key).into_iter().flatten() {
+            match images::resolve(value).await {
+                Ok(found) => {
+                    resolved.insert(value.clone(), found);
+                }
+                Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+            }
+        }
+    }
+    match images::select(&all, &filters, &resolved) {
         Ok(selected) => json_response(
             StatusCode::OK,
             &Value::Array(selected.into_iter().map(images::summary_json).collect()),
@@ -1423,12 +1435,16 @@ fn list_images(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
     }
 }
 
-fn image_read(ctx: &Arc<Context>, name: &str, what: &str) -> Response<Body> {
+async fn image_read(ctx: &Arc<Context>, name: &str, what: &str) -> Response<Body> {
     let all = match images::list(ctx) {
         Ok(all) => all,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
-    let image = match images::find(&all, name) {
+    let resolved = match images::resolve(name).await {
+        Ok(resolved) => resolved,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    let image = match images::find(&all, name, resolved.as_ref()) {
         Ok(image) => image,
         Err(e) => return error(lookup_status(&e), e),
     };
