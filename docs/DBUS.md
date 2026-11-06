@@ -145,7 +145,7 @@ with their objects).
 | `memory`, `pids_limit` | t | bytes, processes; 0 for none |
 | `memory_swap` | x | memory and swap together, -1 without a bound on swap, 0 for as much again as memory |
 | `cpus` | d | CPUs, 0 for none |
-| `hostname`, `timezone`, `log_driver` | s | `""` for the defaults (the machine's name, systemd-nspawn's auto); local, journal or none |
+| `hostname`, `timezone`, `log_driver` | s | `""` for the defaults (the machine's name, auto); local, journal or none |
 | `cap_add`, `cap_drop`, `tmpfs`, `dns`, `dns_search`, `interfaces`, `gpus` | as | as the flags take them |
 | `extra_hosts` | as | `HOST:IP` |
 | `devices` | as | `HOST:CONTAINER:PERMISSIONS`, then the CDI device names |

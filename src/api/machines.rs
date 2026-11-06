@@ -905,6 +905,10 @@ pub async fn prepare(
         }
         true
     });
+    let host_link = std::fs::read_link("/etc/localtime").ok();
+    tuning.timezone = record.tuning.timezone_mode(host_link.as_deref(), |path| {
+        crate::backend::root_has(store, name, record.backend, path, |_| true)
+    });
     // CDI devices, looked up in the host's specs at every start: a driver update
     // rewrites them.
     let cdi = crate::cdi::plan(&record.tuning)?;

@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::path::Path;
 
 use anyhow::{bail, Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -156,7 +157,8 @@ pub struct Tuning {
     /// --secret: decrypted for the machine while it runs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<SecretRef>,
-    /// systemd-nspawn's Timezone= mode for /etc/localtime; None is its own default, auto.
+    /// systemd-nspawn's Timezone= mode for /etc/localtime; None is auto (see
+    /// `timezone_mode`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
     /// Where the program's output goes: None for nspawn's own journal namespace (local),
@@ -182,6 +184,18 @@ pub const JOURNAL_NAMESPACE: &str = "nspawn";
 /// machine's /etc/localtime alone, so a zone set inside survives a restart.
 pub const TIMEZONE_MODES: [&str; 5] = ["off", "copy", "bind", "symlink", "delete"];
 
+/// The zone a link to `../usr/share/zoneinfo/ZONE` or `/usr/share/zoneinfo/ZONE` names,
+/// the two forms systemd-nspawn links a machine's /etc/localtime from.
+fn linked_zone(target: &Path) -> Option<&str> {
+    let text = target.to_str()?;
+    let zone = text
+        .strip_prefix("../usr/share/zoneinfo/")
+        .or_else(|| text.strip_prefix("/usr/share/zoneinfo/"))?;
+    zone.split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..")
+        .then_some(zone)
+}
+
 impl Tuning {
     pub fn is_default(&self) -> bool {
         *self == Tuning::default()
@@ -201,6 +215,24 @@ impl Tuning {
     /// The log driver's name, the default spelled out.
     pub fn log_driver_name(&self) -> &str {
         self.log_driver.as_deref().unwrap_or("local")
+    }
+
+    /// The Timezone= mode the machine starts with. Unset, it is systemd-nspawn's auto,
+    /// which links /etc/localtime to the host's zone when the root's zone database has
+    /// it, and otherwise binds the host's file over it read-only, where a package that
+    /// writes /etc/localtime (tzdata) fails: a writable root gets a copy of the file
+    /// instead. `host_link` is the target of the host's /etc/localtime when it is a
+    /// link; `root_has` says whether a path is in the machine's root.
+    pub fn timezone_mode(
+        &self,
+        host_link: Option<&Path>,
+        root_has: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        if self.timezone.is_some() || self.read_only {
+            return self.timezone.clone();
+        }
+        let zone = host_link.and_then(linked_zone)?;
+        (!root_has(&format!("usr/share/zoneinfo/{zone}"))).then(|| "copy".to_string())
     }
 
     /// The [Exec] lines: Hostname=, Capability=, DropCapability=, OOMScoreAdjust=, the
@@ -1466,6 +1498,53 @@ mod tests {
             .exec_lines(false)
             .iter()
             .any(|l| l.starts_with("Timezone=")));
+    }
+
+    #[test]
+    fn auto_copies_the_host_zone_where_the_root_lacks_it() {
+        let link = Path::new("/usr/share/zoneinfo/America/Bogota");
+        let relative = Path::new("../usr/share/zoneinfo/Etc/UTC");
+        let lacks = |_: &str| false;
+        let has = |path: &str| path == "usr/share/zoneinfo/America/Bogota";
+        let auto = Tuning::default();
+        assert_eq!(
+            auto.timezone_mode(Some(link), lacks).as_deref(),
+            Some("copy")
+        );
+        assert_eq!(auto.timezone_mode(Some(link), has), None);
+        assert_eq!(
+            auto.timezone_mode(Some(relative), |p| p == "usr/share/zoneinfo/Etc/UTC"),
+            None
+        );
+        assert_eq!(
+            auto.timezone_mode(Some(relative), lacks).as_deref(),
+            Some("copy")
+        );
+        // Not a link into the zone database, or no link at all: systemd-nspawn's auto
+        // copies, deletes or leaves it alone without binding anything.
+        for other in [
+            "/etc/zones/UTC",
+            "/usr/share/zoneinfo/",
+            "/usr/share/zoneinfo/../x",
+        ] {
+            assert_eq!(
+                auto.timezone_mode(Some(Path::new(other)), lacks),
+                None,
+                "{other}"
+            );
+        }
+        assert_eq!(auto.timezone_mode(None, lacks), None);
+        // A read-only root takes the bind; a mode given is kept.
+        let read_only = Tuning {
+            read_only: true,
+            ..Tuning::default()
+        };
+        assert_eq!(read_only.timezone_mode(Some(link), lacks), None);
+        let off = Tuning {
+            timezone: Some("off".into()),
+            ..Tuning::default()
+        };
+        assert_eq!(off.timezone_mode(Some(link), lacks).as_deref(), Some("off"));
     }
 
     #[test]

@@ -377,17 +377,22 @@ More flags, remembered like the rest:
   nodes are allowed one by one, or a CDI name such as `nvidia.com/gpu=all` (see
   [GPUs and CDI devices](#gpus-and-cdi-devices)), and `--gpus`.
 - `--dns` and `--dns-search`; a search domain needs a letter and is 254 characters at
-  most, a trailing dot is dropped and `.` stands for no search domain.
+  most, a trailing dot is dropped and `.` stands for no search domain. `--dns-option`
+  (`--dns-opt`) and `--expose` are accepted and ignored with a warning: the
+  `resolv.conf` of a machine takes no options, and machines on a bridge network reach
+  all ports of each other.
 - `--add-host HOST:IP` or `HOST=IP`, with `host-gateway`, the IP in brackets or not; the
   name is anything without colons or whitespace.
 - `--ulimit NAME=SOFT[:HARD]`, numbers or `unlimited`.
 - `--oom-score-adj`.
 - `--stop-signal` and `--stop-timeout`, what `stop` uses unless `-t` says otherwise; -1
   for no SIGKILL at all.
-- `--timezone MODE`, systemd-nspawn's `Timezone=`: its default, `auto`, points
-  `/etc/localtime` at the host's zone at every start, and `off` leaves the machine's
-  own, so a zone set inside with `timedatectl` survives a restart. An app also takes
-  `-e TZ=`.
+- `--timezone MODE`, systemd-nspawn's `Timezone=`. The default, `auto`, points
+  `/etc/localtime` at the host's zone at every start: a link where the machine's zone
+  database has that zone, otherwise a copy of the host's file, which a package installed
+  inside may replace (a read-only root gets the host's file mounted over it). `off`
+  leaves the machine's own, so a zone set inside with `timedatectl` survives a restart.
+  An app also takes `-e TZ=`.
 - `--log-driver DRIVER`, see [Where the output goes](#where-the-output-goes).
 - `--init` and `--init=false`: the program under the stub init, which reaps orphans and
   turns a poweroff into SIGTERM, or as PID 1 (see

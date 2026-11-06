@@ -1534,7 +1534,26 @@ else
 fi
 $NSPAWN stop e2e-tz >/dev/null || fail "stop e2e-tz before auto"
 $NSPAWN start e2e-tz --timezone auto >/dev/null || fail "start e2e-tz with --timezone auto"
-grep -q "^Timezone=" /etc/systemd/nspawn/e2e-tz.nspawn && fail "--timezone auto left a Timezone= line: $(cat /etc/systemd/nspawn/e2e-tz.nspawn)"
+$NSPAWN inspect e2e-tz | python3 -c "import json,sys; d = json.load(sys.stdin)[0]; assert d['timezone'] == '', d" || fail "--timezone auto did not forget the mode"
+# auto: a root whose zone database lacks the host's zone (busybox has none) gets a copy
+# of the host's file, which a package such as tzdata replaces, instead of the read-only
+# bind systemd-nspawn would make; one that has it, systemd-nspawn's link.
+zone=$(readlink /etc/localtime | sed -n 's#^\(\.\./\|/\)usr/share/zoneinfo/##p')
+if [ -n "$zone" ]; then
+  grep -qx "Timezone=copy" /etc/systemd/nspawn/e2e-tz.nspawn || fail "auto on a root without $zone did not ask for a copy: $(cat /etc/systemd/nspawn/e2e-tz.nspawn)"
+  tz 'cat /proc/self/mountinfo' | grep_q " /etc/localtime " && fail "auto mounted the host's /etc/localtime over a root without $zone"
+  tz "mkdir -p /usr/share/zoneinfo/$(dirname "$zone") && cp /etc/localtime /usr/share/zoneinfo/$zone"
+  [ "$(tz 'ln -sf /usr/share/zoneinfo/Asia/Tokyo /etc/localtime && echo replaced')" = replaced ] || fail "auto left an /etc/localtime that cannot be replaced: $(tz 'ls -l /etc/localtime')"
+  $NSPAWN stop e2e-tz >/dev/null || fail "stop e2e-tz with $zone in its root"
+  $NSPAWN start e2e-tz >/dev/null || fail "start e2e-tz with $zone in its root"
+  grep -q "^Timezone=" /etc/systemd/nspawn/e2e-tz.nspawn && fail "auto on a root with $zone left a Timezone= line: $(cat /etc/systemd/nspawn/e2e-tz.nspawn)"
+  case "$(tz 'readlink /etc/localtime')" in
+    "../usr/share/zoneinfo/$zone" | "/usr/share/zoneinfo/$zone") ;;
+    *) fail "auto on a root with $zone did not link to it: $(tz 'ls -l /etc/localtime')" ;;
+  esac
+else
+  grep -q "^Timezone=" /etc/systemd/nspawn/e2e-tz.nspawn && fail "--timezone auto left a Timezone= line: $(cat /etc/systemd/nspawn/e2e-tz.nspawn)"
+fi
 $NSPAWN start e2e-tz --timezone utc 2>/dev/null && fail "an unknown --timezone mode was accepted"
 $NSPAWN rm -f e2e-tz >/dev/null || fail "rm e2e-tz"
 
