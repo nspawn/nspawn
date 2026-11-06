@@ -37,6 +37,7 @@ pub enum Error {
     NoSuchImage(String),
     NoSuchNetwork(String),
     NoSuchVolume(String),
+    NoSuchPath(String),
     Exists(String),
     InUse(String),
     NotRunning(String),
@@ -65,6 +66,7 @@ impl Error {
             Some(FailureKind::NoSuchImage) => Error::NoSuchImage(message),
             Some(FailureKind::NoSuchNetwork) => Error::NoSuchNetwork(message),
             Some(FailureKind::NoSuchVolume) => Error::NoSuchVolume(message),
+            Some(FailureKind::NoSuchPath) => Error::NoSuchPath(message),
             Some(FailureKind::Exists) => Error::Exists(message),
             Some(FailureKind::InUse) => Error::InUse(message),
             Some(FailureKind::NotRunning) => Error::NotRunning(message),
@@ -98,6 +100,41 @@ pub struct Manager {
 
 /// How many Events streams a user other than root holds at once.
 const STREAMS_PER_USER: usize = 64;
+
+/// CopyTo's options: contents, as `cp` writes a stream, or extract and the two that go
+/// with it, as the Docker API's archive writes one.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CopyToOptions {
+    contents: bool,
+    extract: bool,
+    owner: Option<String>,
+    no_overwrite_dir_non_dir: bool,
+}
+
+fn copy_to_options(dict: &HashMap<String, OwnedValue>) -> Result<CopyToOptions> {
+    let mut options = Options::new(dict);
+    let contents = options.bool("contents", false)?;
+    let extract = options.bool("extract", false)?;
+    let owner = options.string("owner")?;
+    let no_overwrite = options.maybe_bool("no_overwrite_dir_non_dir")?;
+    options.finish()?;
+    if !extract && (owner.is_some() || no_overwrite.is_some()) {
+        return Err(Error::invalid(
+            "options owner and no_overwrite_dir_non_dir go with extract",
+        ));
+    }
+    if extract && contents {
+        return Err(Error::invalid(
+            "options contents and extract exclude each other",
+        ));
+    }
+    Ok(CopyToOptions {
+        contents,
+        extract,
+        owner,
+        no_overwrite_dir_non_dir: no_overwrite.unwrap_or(false),
+    })
+}
 
 /// What a copy did, as the job's result.
 fn copy_result(stats: &api::copy::Stats) -> HashMap<String, OwnedValue> {
@@ -923,9 +960,32 @@ impl Manager {
         .await?)
     }
 
+    /// What lstat says of `path` inside the machine (running, or a stopped overlay or
+    /// flat one): name (s, the path's last element), size (t), mode (u, st_mode), mtime
+    /// (x, unix nanoseconds) and link_target (s: for a link, where it leads inside the
+    /// machine, every link followed; else empty). `NoSuchPath` when it is not there.
+    async fn stat_path(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        machine: String,
+        path: String,
+    ) -> Result<Dict> {
+        let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
+        let stat = api::copy::stat_path(self.ctx(), &machine, &path).await?;
+        Ok(HashMap::from([
+            ("name".to_string(), values::v(stat.name)),
+            ("size".to_string(), values::v(stat.size)),
+            ("mode".to_string(), values::v(stat.mode)),
+            ("mtime".to_string(), values::v(stat.mtime)),
+            ("link_target".to_string(), values::v(stat.link_target)),
+        ]))
+    }
+
     /// Like `cp NAME:PATH ...`: `path` of the machine (running, or a stopped overlay or
     /// flat one) as a tar stream on the returned pipe, owners as the machine sees them,
-    /// and a job that ends with its result (entries, bytes) or why it could not.
+    /// and a job that ends with its result (entries, bytes) or why it could not. Option
+    /// name (s): the name of the stream's top entry, the entries below it under it.
     async fn copy_from(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -935,7 +995,12 @@ impl Manager {
     ) -> Result<(zbus::zvariant::OwnedFd, OwnedObjectPath)> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;
-        Options::new(&options).finish()?;
+        let mut options = Options::new(&options);
+        let entry_name = options.string("name")?;
+        options.finish()?;
+        if let Some(name) = &entry_name {
+            api::copy::check_entry_name(name)?;
+        }
         let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
             .map_err(|e| Error::Failed(format!("creating a pipe: {e}")))?;
         let target = format!("{machine}:{path}");
@@ -946,9 +1011,15 @@ impl Manager {
             "cp",
             &target,
             move |ctx, reporter| async move {
-                let stats =
-                    api::copy::copy_from(&ctx, &machine, &path, write, jobs::report(&reporter))
-                        .await?;
+                let stats = api::copy::copy_from(
+                    &ctx,
+                    &machine,
+                    &path,
+                    entry_name.as_deref(),
+                    write,
+                    jobs::report(&reporter),
+                )
+                .await?;
                 Ok(copy_result(&stats))
             },
         )
@@ -958,7 +1029,11 @@ impl Manager {
 
     /// Like `cp ... NAME:PATH`: the tar stream read from `stream` unpacked at `path` of
     /// the machine by cp's rules, everything owned by root inside. Options:
-    /// contents (b), the source was written DIR/. and its contents go into `path`. A job.
+    /// contents (b), the source was written DIR/. and its contents go into `path`;
+    /// extract (b), the stream written beneath the existing directory `path` entry by
+    /// entry, as `api::copy::extract` writes it, checked before the job starts; with
+    /// extract, owner (s, USER[:GROUP] of the machine) and no_overwrite_dir_non_dir (b).
+    /// A job.
     async fn copy_to(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -969,9 +1044,24 @@ impl Manager {
     ) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;
-        let mut options = Options::new(&options);
-        let contents = options.bool("contents", false)?;
-        options.finish()?;
+        let request = copy_to_options(&options)?;
+        let contents = request.contents;
+        let extraction = if request.extract {
+            let quiet = |_: api::Event| {};
+            Some(
+                api::copy::prepare_extract(
+                    self.ctx(),
+                    &machine,
+                    &path,
+                    request.owner.as_deref(),
+                    request.no_overwrite_dir_non_dir,
+                    &quiet,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let input = std::os::fd::OwnedFd::from(stream);
         let target = format!("{machine}:{path}");
         Ok(jobs::spawn(
@@ -981,15 +1071,20 @@ impl Manager {
             "cp",
             &target,
             move |ctx, reporter| async move {
-                let stats = api::copy::copy_to(
-                    &ctx,
-                    &machine,
-                    &path,
-                    contents,
-                    input,
-                    jobs::report(&reporter),
-                )
-                .await?;
+                let stats = match extraction {
+                    Some(extraction) => extraction.run(input, jobs::report(&reporter)).await?,
+                    None => {
+                        api::copy::copy_to(
+                            &ctx,
+                            &machine,
+                            &path,
+                            contents,
+                            input,
+                            jobs::report(&reporter),
+                        )
+                        .await?
+                    }
+                };
                 Ok(copy_result(&stats))
             },
         )
@@ -997,7 +1092,7 @@ impl Manager {
     }
 
     /// Like `volume ls`: every named volume with name, path, used_by (the machines whose
-    /// records mount it) and created (unix seconds).
+    /// records mount it), created (unix seconds), labels (a{ss}) and anonymous (b).
     async fn list_volumes(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Vec<Dict>> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Inspect).await?;
@@ -1005,13 +1100,36 @@ impl Manager {
         Ok(volumes.iter().map(values::volume).collect())
     }
 
-    /// Like `volume create`: makes the volume's directory ahead of its first use and
-    /// returns its path. One that exists already is not an error.
-    async fn create_volume(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<String> {
+    /// Like `volume inspect`: one volume as ListVolumes lists it.
+    async fn get_volume(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<Dict> {
+        let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
+        Ok(values::volume(&api::volumes::get(
+            &self.ctx().store,
+            &name,
+        )?))
+    }
+
+    /// Like `volume create`: makes the volume's directory ahead of its first use, with
+    /// options labels (as, KEY=VALUE) and anonymous (b: made by the Docker API without a
+    /// name) kept beside it. An empty name makes one of 64 random hex digits. One that
+    /// exists already is not an error, and stays as it is. Returns the volume as
+    /// ListVolumes lists it.
+    async fn create_volume(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        name: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<Dict> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Manage).await?;
-        let path = api::volumes::create(self.ctx(), &name).await?;
-        Ok(path.to_string_lossy().into_owned())
+        let mut options = Options::new(&options);
+        let labels = crate::volume::parse_labels(&options.strings("labels")?)
+            .map_err(api::failure::invalid)?;
+        let anonymous = options.bool("anonymous", false)?;
+        options.finish()?;
+        let volume = api::volumes::create(self.ctx(), &name, labels, anonymous).await?;
+        Ok(values::volume(&volume))
     }
 
     /// Like `volume rm`: a job, since a big volume takes a while to delete. Every name is
@@ -1434,9 +1552,10 @@ impl Manager {
     }
 
     /// Like `network create`: options subnet (s, CIDR; the next free /24 of
-    /// network_pool otherwise), internal (b), labels (as, KEY=VALUE). The bridge comes up
-    /// at once. Returns the network as ListNetworks has it, and the notes made on the way
-    /// under "notes".
+    /// network_pool otherwise), internal (b), labels (as, KEY=VALUE), api_name (s: the
+    /// name the Docker API knows it by; with `name` empty the network's name is made of
+    /// it). The bridge comes up at once. Returns the network as ListNetworks has it, and
+    /// the notes made on the way under "notes".
     async fn create_network(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -1449,11 +1568,13 @@ impl Manager {
         let subnet = options.string("subnet")?;
         let internal = options.bool("internal", false)?;
         let labels = crate::volume::parse_labels(&options.strings("labels")?)?;
+        let api_name = options.string("api_name")?;
         options.finish()?;
         let notes = Notes::default();
         let spec = api::network::create(
             self.ctx(),
             &name,
+            api_name.as_deref(),
             subnet.as_deref(),
             internal,
             labels,
@@ -1749,10 +1870,11 @@ impl Manager {
     }
 
     /// Like `run` without -d. Options: StartMachine's (wait defaults to false), tty (b),
-    /// rows and cols (t, 24 x 80), term (s, xterm); descriptor stdin (the program's input
-    /// without tty). With tty an app's program gets a pseudo terminal whose master comes
-    /// back under "tty"; otherwise the output comes back under "stdout", a line at a
-    /// time. The process object's Signal reaches the program (a booted machine is
+    /// rows and cols (t, 24 x 80), term (s, xterm), straight (b); descriptor stdin (the
+    /// program's input without tty). With tty an app's program gets a pseudo terminal
+    /// whose master comes back under "tty"; otherwise the output comes back under
+    /// "stdout", a line at a time, or with straight as the program writes it, kept out
+    /// of the journal. The process object's Signal reaches the program (a booted machine is
     /// powered off), and its exit status is the one run exits with. Also returns the start's
     /// notes.
     async fn run_machine(
@@ -1770,6 +1892,7 @@ impl Manager {
         let owner = self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
         let tty = options.bool("tty", false)?;
+        let straight = options.bool("straight", false)?;
         let rows = options.u64("rows", 24)?.clamp(1, u16::MAX as u64) as u16;
         let cols = options.u64("cols", 80)?.clamp(1, u16::MAX as u64) as u16;
         let term = options
@@ -1790,6 +1913,7 @@ impl Manager {
             start: request,
             terminal: tty.then_some(api::run::Terminal { rows, cols, term }),
             stdin: if tty { None } else { stdin },
+            straight,
         };
         let mut attached = api::run::attach(self.ctx(), run, &notes.report()).await?;
         let mut handed = HashMap::new();
@@ -2428,6 +2552,43 @@ mod tests {
     use super::*;
     use crate::daemon::values::v;
     use zbus::DBusError as _;
+
+    #[test]
+    fn a_copy_in_takes_cp_s_options_or_extract_s() {
+        let read = |pairs: &[(&str, OwnedValue)]| {
+            let dict: HashMap<String, OwnedValue> = pairs
+                .iter()
+                .map(|(k, val)| (k.to_string(), val.try_clone().unwrap()))
+                .collect();
+            copy_to_options(&dict)
+        };
+        assert_eq!(read(&[]).unwrap(), CopyToOptions::default());
+        assert!(read(&[("contents", v(true))]).unwrap().contents);
+        assert_eq!(
+            read(&[
+                ("extract", v(true)),
+                ("owner", v("app:staff")),
+                ("no_overwrite_dir_non_dir", v(true)),
+            ])
+            .unwrap(),
+            CopyToOptions {
+                contents: false,
+                extract: true,
+                owner: Some("app:staff".to_string()),
+                no_overwrite_dir_non_dir: true,
+            }
+        );
+        for bad in [
+            vec![("owner", v("0:0"))],
+            vec![("no_overwrite_dir_non_dir", v(false))],
+            vec![("extract", v(true)), ("contents", v(true))],
+            vec![("extract", v("yes"))],
+            vec![("name", v("x"))],
+        ] {
+            let error = read(&bad).unwrap_err();
+            assert_eq!(error.name().as_str(), "org.nspawn.Error.Invalid", "{bad:?}");
+        }
+    }
 
     #[test]
     fn each_kind_of_failure_has_its_error_name_and_its_message() {

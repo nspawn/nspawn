@@ -37,6 +37,7 @@ pub mod label {
     pub const IMAGE: &str = "com.docker.compose.image";
     pub const VERSION: &str = "com.docker.compose.version";
     pub const NETWORK: &str = "com.docker.compose.network";
+    pub const VOLUME: &str = "com.docker.compose.volume";
 }
 
 /// The docker compose release nspawn compose stamps its machines with.

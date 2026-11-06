@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use zbus::zvariant::{OwnedObjectPath, Value as Bus};
 
 use super::containers::{check_platform, status_of, Answer};
-use super::images::{image_of, pinned, pulled_digest, tagged};
+use super::images::{by_digest, image_of, pinned, pulled_digest, tagged};
 use super::util::familiar;
 use super::{Body, Query};
 use crate::api::Context;
@@ -45,7 +45,8 @@ pub fn pull_reference(from_image: &str, tag: &str) -> Result<ImageRef, Answer> {
     }
     let base = ImageRef::normalized(from_image).map_err(bad)?;
     if tag.is_empty() {
-        return Ok(base);
+        // A digest names the image, and the pull keeps it as such.
+        return Ok(by_digest(base));
     }
     let text = if tag.contains(':') {
         format!("{}/{}@{tag}", base.registry, base.repository)
@@ -56,7 +57,9 @@ pub fn pull_reference(from_image: &str, tag: &str) -> Result<ImageRef, Answer> {
             .map_or(String::new(), |d| format!("@{d}"));
         format!("{}/{}:{tag}{digest}", base.registry, base.repository)
     };
-    ImageRef::parse(&text, &base.registry).map_err(bad)
+    ImageRef::parse(&text, &base.registry)
+        .map(by_digest)
+        .map_err(bad)
 }
 
 /// The engine's first message of a pull: the repository, and the tag or digest as its
@@ -373,6 +376,11 @@ mod tests {
         assert_eq!(
             full(&format!("alpine@{digest}"), "").unwrap(),
             format!("docker.io/library/alpine@{digest}")
+        );
+        // A tag beside a digest is left out, as the engine keeps the digest alone.
+        assert_eq!(
+            full(&format!("postgres:16@{digest}"), "").unwrap(),
+            format!("docker.io/library/postgres@{digest}")
         );
         // A repository without a tag is all of its tags.
         for every in ["alpine", "localhost:5000/app"] {

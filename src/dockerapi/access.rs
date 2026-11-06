@@ -63,9 +63,33 @@ impl Need {
     }
 }
 
+/// Who a client's share of a socket's limits is counted for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Holder {
+    /// Root on the host's socket: counted against no limit, so that users cannot keep it
+    /// out.
+    Root,
+    /// Another user on the host's socket (u32::MAX when its credentials could not be
+    /// read): a share of each limit, and the limit.
+    User(u32),
+    /// A machine's own socket: the limit alone.
+    Machine,
+}
+
+impl Holder {
+    pub fn of(profile: Profile, uid: Option<u32>) -> Holder {
+        match (profile, uid) {
+            (Profile::Host, Some(0)) => Holder::Root,
+            (Profile::Host, uid) => Holder::User(uid.unwrap_or(u32::MAX)),
+            (Profile::Machine { .. }, _) => Holder::Machine,
+        }
+    }
+}
+
 /// One connection's client, and the actions polkit allowed it so far.
 pub struct Client {
     profile: Profile,
+    pub holder: Holder,
     /// On the host's socket: the process that connected, if its credentials could be
     /// read.
     process: Option<Process>,
@@ -85,6 +109,7 @@ impl Client {
         };
         Client {
             profile,
+            holder: Holder::of(profile, peer.map(|(uid, _)| uid)),
             process,
             allowed: Mutex::new(HashSet::new()),
         }

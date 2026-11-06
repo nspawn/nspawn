@@ -726,6 +726,18 @@ pub fn host_pty(rows: u16, cols: u16) -> Result<(OwnedFd, OwnedFd)> {
     Ok((master, slave))
 }
 
+/// Sets the size of the pseudo terminal whose master is `master`: the program on it gets
+/// SIGWINCH.
+pub fn set_terminal_size(master: &impl AsFd, rows: u16, cols: u16) -> nix::Result<()> {
+    let size = Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    unsafe { tiocswinsz(master.as_fd().as_raw_fd(), &size) }.map(drop)
+}
+
 /// Writes a line to standard error with write(2): Rust's stderr lock may be held by a
 /// thread of the parent that did not come along with the fork.
 /// Writes a line to standard error with a plain write(2): safe in a child of a
@@ -1548,6 +1560,9 @@ mod tests {
         nix::ioctl_read_bad!(tiocgwinsz, libc::TIOCGWINSZ, Winsize);
         unsafe { tiocgwinsz(slave.as_raw_fd(), &mut size) }.unwrap();
         assert_eq!((size.ws_row, size.ws_col), (31, 111));
+        set_terminal_size(&master, 50, 132).unwrap();
+        unsafe { tiocgwinsz(slave.as_raw_fd(), &mut size) }.unwrap();
+        assert_eq!((size.ws_row, size.ws_col), (50, 132));
     }
 
     #[test]

@@ -833,15 +833,36 @@ pub(super) async fn volumes(e: &Engine<'_>) -> Result<()> {
             continue;
         }
         e.progress.volume(&name, "Creating", Status::Working);
+        let mut options = Options::new();
+        options.insert("labels", Bus::from(volume_labels(project, key, &def)?));
         e.client
             .manager
-            .create_volume(&name)
+            .create_volume(&name, options)
             .await
             .map_err(client::error)
             .with_context(|| format!("creating volume {name}"))?;
         e.progress.volume(&name, "Created", Status::Done);
     }
     Ok(())
+}
+
+/// The labels a volume of the project is made with: the file's, then compose's own,
+/// which win as compose adds them last.
+fn volume_labels(project: &Project, key: &str, def: &Map) -> Result<Vec<String>> {
+    let hash = crate::compose::config::volume_hash(&Value::Map(def.clone()))
+        .map_err(anyhow::Error::msg)?;
+    let mut labels: Vec<String> = match def.get("labels") {
+        Some(Value::Map(map)) => map.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        Some(Value::Seq(list)) => list.iter().map(|v| v.to_string()).collect(),
+        _ => Vec::new(),
+    };
+    labels.extend([
+        format!("{}={hash}", label::CONFIG_HASH),
+        format!("{}={}", label::PROJECT, project.name),
+        format!("{}={key}", label::VOLUME),
+        format!("{}={}", label::VERSION, super::compose_version()),
+    ]);
+    Ok(labels)
 }
 
 /// The secrets and configs with no file behind them, made as nspawn secrets.
@@ -1232,7 +1253,7 @@ pub(super) async fn anonymous_volumes(
                 .with_context(|| format!("removing the anonymous volume {name} a machine left"))?;
         }
         manager
-            .create_volume(name)
+            .create_volume(name, Options::new())
             .await
             .map_err(client::error)
             .with_context(|| format!("creating the anonymous volume {name}"))?;
@@ -1739,6 +1760,58 @@ pub async fn wait_running(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_volume_is_made_with_the_file_s_labels_and_compose_s() {
+        let p = convert::tests::project(
+            "vollabels",
+            "services:\n  db:\n    image: x\n    volumes: [data:/data]\nvolumes:\n  data:\n    labels:\n      team: a\n      com.docker.compose.project: mine\n",
+        );
+        let def = p.volumes["data"].as_map().cloned().unwrap();
+        let labels = volume_labels(&p, "data", &def).unwrap();
+        let hash = crate::compose::config::volume_hash(&p.volumes["data"]).unwrap();
+        assert_eq!(
+            labels,
+            [
+                "com.docker.compose.project=mine".to_string(),
+                "team=a".to_string(),
+                format!("com.docker.compose.config-hash={hash}"),
+                format!("com.docker.compose.project={}", p.name),
+                "com.docker.compose.volume=data".to_string(),
+                format!(
+                    "com.docker.compose.version={}",
+                    super::super::compose_version()
+                ),
+            ]
+        );
+        // The last of a key wins, as the service reads them.
+        let kept = crate::volume::parse_labels(&labels).unwrap();
+        assert_eq!(kept["com.docker.compose.project"], p.name);
+    }
+
+    #[test]
+    fn a_volume_s_hash_is_compose_s() {
+        use sha2::Digest as _;
+        let hash = |yaml: &str| {
+            let p = convert::tests::project(
+                "volhash",
+                &format!("name: volhash\nservices:\n  web:\n    image: x\n    volumes: [data:/data]\nvolumes:\n  data: {yaml}\n"),
+            );
+            crate::compose::config::volume_hash(&p.volumes["data"]).unwrap()
+        };
+        assert_eq!(
+            hash("{}"),
+            hash("{driver: local}"),
+            "local when none is named"
+        );
+        assert_ne!(hash("{}"), hash("{labels: {a: b}}"));
+        assert_eq!(
+            hash("{}"),
+            hex::encode(sha2::Sha256::digest(
+                br#"{"name":"volhash_data","driver":"local"}"#
+            ))
+        );
+    }
 
     #[test]
     fn a_network_s_hash_changes_with_its_definition() {

@@ -7,23 +7,91 @@ use std::path::PathBuf;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{bail, Context as _, Result};
+use serde::{Deserialize, Serialize};
 
+use crate::api::failure::invalid;
 use crate::api::images::Removal;
 use crate::api::{line, note, require_root, Context, Report};
 use crate::backend::is_mountpoint;
-use crate::store::{ImageRecord, Store};
+use crate::store::{now_unix, unique_suffix, ImageRecord, Store};
 use crate::volume::validate_volume_name;
 
 /// One named volume as `volume ls` shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VolumeInfo {
     pub name: String,
     pub path: PathBuf,
     /// The machines whose records mount it, sorted.
     pub used_by: Vec<String>,
-    /// Unix seconds the directory was made (its modification time where the file system
-    /// keeps no birth time).
+    /// Unix seconds it was made: as kept when it was made by a create, else the
+    /// directory's birth time (its modification time where the file system keeps none).
     pub created: u64,
+    /// KEY=VALUE, given when it was made by a create.
+    pub labels: BTreeMap<String, String>,
+    /// Made by the Docker API without a name: what the API's prune takes without `all`.
+    pub anonymous: bool,
+}
+
+/// What is kept of a volume made by a create, beside its directory and never inside
+/// it, where the machines that mount it could change it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct VolumeMeta {
+    created: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    anonymous: bool,
+}
+
+/// The file of `name` in the volumes' metadata directory: the name alone, so that any
+/// name a directory takes fits.
+fn meta_path(store: &Store, name: &str) -> PathBuf {
+    store.volume_meta_dir().join(name)
+}
+
+/// What was kept of `name`. One that cannot be read counts as none: it only adds to
+/// what the directory says.
+fn read_meta(store: &Store, name: &str) -> Option<VolumeMeta> {
+    let bytes = fs::read(meta_path(store, name)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Writes what is kept of `name` through a short temporary name and a rename, so that a
+/// crash leaves the old file or the new one, and a long volume name still fits.
+fn write_meta(store: &Store, name: &str, meta: &VolumeMeta) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let dir = store.volume_meta_dir();
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let path = meta_path(store, name);
+    let tmp = dir.join(format!(".tmp-{}", unique_suffix()));
+    let written = fs::File::create(&tmp).and_then(|mut file| {
+        std::io::Write::write_all(&mut file, &serde_json::to_vec(meta)?)?;
+        file.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("writing {}", path.display()));
+    }
+    fs::rename(&tmp, &path).with_context(|| format!("moving {} into place", path.display()))
+}
+
+/// Forgets what was kept of `name`; a volume without any is fine. A start that makes a
+/// volume's directory calls it too: what was kept is of a directory removed by hand,
+/// another volume.
+pub fn forget_meta(store: &Store, name: &str) -> Result<()> {
+    if validate_volume_name(name).is_err() {
+        return Ok(());
+    }
+    let path = meta_path(store, name);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
 }
 
 /// Which machines mount each named volume.
@@ -40,7 +108,7 @@ fn users(records: &[ImageRecord]) -> BTreeMap<String, BTreeSet<String>> {
     users
 }
 
-/// Every directory under the volumes directory, with the machines that use it. Names
+/// Every directory under the volumes directory, with the machines that use them. Names
 /// starting with a dot, plain files and symlinks are not volumes and are left out.
 pub fn list(store: &Store) -> Result<Vec<VolumeInfo>> {
     let dir = store.volumes_dir();
@@ -63,13 +131,17 @@ pub fn list(store: &Store) -> Result<Vec<VolumeInfo>> {
         if !meta.is_dir() {
             continue;
         }
-        let created = meta
-            .created()
-            .or_else(|_| meta.modified())
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let kept = read_meta(store, &name).unwrap_or_default();
+        let created = if kept.created > 0 {
+            kept.created
+        } else {
+            meta.created()
+                .or_else(|_| meta.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        };
         out.push(VolumeInfo {
             used_by: users
                 .get(&name)
@@ -78,49 +150,105 @@ pub fn list(store: &Store) -> Result<Vec<VolumeInfo>> {
             path: entry.path(),
             name,
             created,
+            labels: kept.labels,
+            anonymous: kept.anonymous,
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
 }
 
+fn no_volume(name: &str) -> anyhow::Error {
+    crate::api::FailureKind::NoSuchVolume.error(format!("no volume named {name}"))
+}
+
+/// One volume as `list` has it.
+pub fn get(store: &Store, name: &str) -> Result<VolumeInfo> {
+    if validate_volume_name(name).is_err() {
+        return Err(no_volume(name));
+    }
+    list(store)?
+        .into_iter()
+        .find(|v| v.name == name)
+        .ok_or_else(|| no_volume(name))
+}
+
+/// 64 random hex digits, the name of a volume made without one.
+fn random_name() -> Result<String> {
+    use std::io::Read as _;
+    let mut bytes = [0u8; 32];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .context("reading /dev/urandom")?;
+    Ok(hex::encode(bytes))
+}
+
 /// Makes a named volume ahead of its first use, the way `start` would: a directory
-/// owned by root, mode 0755. One that exists already is fine.
-pub async fn create(ctx: &Context, name: &str) -> Result<PathBuf> {
+/// owned by root, mode 0755, with `labels` and the `anonymous` mark kept beside it. An
+/// empty name makes one of 64 random hex digits. One that exists already is fine, and
+/// stays as it is, labels included.
+pub async fn create(
+    ctx: &Context,
+    name: &str,
+    labels: BTreeMap<String, String>,
+    anonymous: bool,
+) -> Result<VolumeInfo> {
     require_root("volume create")?;
     let store = &ctx.store;
+    let name = if name.is_empty() {
+        random_name()?
+    } else {
+        name.to_string()
+    };
     let _lock = store.lock().await?;
-    let new = !store.volumes_dir().join(name).is_dir();
-    let path = create_in(store, name)?;
+    let (path, new) = create_in(store, &name, labels, anonymous)?;
     if new {
         crate::api::events::emit(
             "volume",
             "create",
-            name,
+            &name,
             &[("path", &path.to_string_lossy())],
         );
     }
-    Ok(path)
+    get(store, &name)
 }
 
-fn create_in(store: &Store, name: &str) -> Result<PathBuf> {
-    validate_volume_name(name)?;
+/// The volume's directory, and whether it was made now.
+fn create_in(
+    store: &Store,
+    name: &str,
+    labels: BTreeMap<String, String>,
+    anonymous: bool,
+) -> Result<(PathBuf, bool)> {
+    validate_volume_name(name).map_err(invalid)?;
     let dir = store.volumes_dir();
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(name);
     match fs::create_dir(&path) {
-        Ok(()) => Ok(path),
+        Ok(()) => {
+            let kept = VolumeMeta {
+                created: now_unix(),
+                labels,
+                anonymous,
+            };
+            if let Err(e) = write_meta(store, name, &kept) {
+                // Empty still: nothing of anyone's goes with it.
+                let _ = fs::remove_dir(&path);
+                return Err(e);
+            }
+            Ok((path, true))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let meta = path
                 .symlink_metadata()
                 .with_context(|| format!("reading {}", path.display()))?;
             if meta.is_dir() {
-                Ok(path)
+                Ok((path, false))
             } else {
-                bail!(
+                Err(crate::api::FailureKind::Exists.error(format!(
                     "{} exists and is not a directory; it is not a volume",
                     path.display()
-                )
+                )))
             }
         }
         Err(e) => Err(e).with_context(|| format!("creating {}", path.display())),
@@ -163,10 +291,6 @@ fn remove_in(store: &Store, names: &[String], report: Report<'_>) -> Result<Remo
     Ok(removal)
 }
 
-fn no_volume(name: &str) -> anyhow::Error {
-    crate::api::FailureKind::NoSuchVolume.error(format!("no volume named {name}"))
-}
-
 fn remove_one(store: &Store, name: &str, users: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
     let path = store.volumes_dir().join(name);
     if validate_volume_name(name).is_err() {
@@ -199,7 +323,8 @@ fn remove_one(store: &Store, name: &str, users: &BTreeMap<String, BTreeSet<Strin
     if is_mountpoint(&path)? {
         bail!("{} is a mount point; unmount it first", path.display());
     }
-    crate::store::remove_tree(&path).with_context(|| format!("removing {}", path.display()))
+    crate::store::remove_tree(&path).with_context(|| format!("removing {}", path.display()))?;
+    forget_meta(store, name)
 }
 
 /// Removes every volume no machine uses. Mount points and directories that are not
@@ -251,6 +376,7 @@ fn prune_in(store: &Store, report: Report<'_>) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::FailureKind;
     use crate::backend::BackendChoice;
     use crate::oci::{Mode, RunSpec};
     use crate::settings::Network;
@@ -313,6 +439,11 @@ mod tests {
             .unwrap();
     }
 
+    /// A volume made by a create without labels.
+    fn make(store: &Store, name: &str) -> PathBuf {
+        create_in(store, name, BTreeMap::new(), false).unwrap().0
+    }
+
     #[test]
     fn the_store_has_a_volumes_directory() {
         let (_tmp, store) = store();
@@ -341,21 +472,31 @@ mod tests {
     #[test]
     fn a_volume_is_created_once_and_only_under_a_good_name() {
         let (_tmp, store) = store();
-        let path = create_in(&store, "data").unwrap();
-        assert!(path.is_dir());
-        assert_eq!(create_in(&store, "data").unwrap(), path, "again is fine");
+        let none = BTreeMap::new;
+        let (path, new) = create_in(&store, "data", none(), false).unwrap();
+        assert!(path.is_dir() && new);
+        assert_eq!(
+            create_in(&store, "data", none(), false).unwrap(),
+            (path, false),
+            "again is fine"
+        );
         for bad in ["", "..", ".x", "a/b", "a b"] {
-            assert!(create_in(&store, bad).is_err(), "{bad}");
+            let e = create_in(&store, bad, none(), false).unwrap_err();
+            assert_eq!(crate::api::kind_of(&e), Some(FailureKind::Invalid), "{bad}");
         }
         fs::write(store.volumes_dir().join("afile"), "x").unwrap();
-        assert!(create_in(&store, "afile").is_err());
+        assert!(create_in(&store, "afile", none(), false).is_err());
+        assert!(
+            !meta_path(&store, "afile").exists(),
+            "nothing is kept of what is no volume"
+        );
     }
 
     #[test]
     fn only_unused_volumes_nspawn_made_are_removed() {
         let (_tmp, store) = store();
-        create_in(&store, "used").unwrap();
-        create_in(&store, "free").unwrap();
+        make(&store, "used");
+        make(&store, "free");
         fs::write(store.volumes_dir().join("free/file"), "x").unwrap();
         fs::write(store.volumes_dir().join("afile"), "x").unwrap();
         std::os::unix::fs::symlink("/etc", store.volumes_dir().join("alink")).unwrap();
@@ -390,7 +531,7 @@ mod tests {
     fn prune_removes_what_nobody_uses() {
         let (_tmp, store) = store();
         for name in ["used", "free1", "free2"] {
-            create_in(&store, name).unwrap();
+            make(&store, name);
         }
         fs::create_dir(store.volumes_dir().join("bad name")).unwrap();
         machine(&store, "web", &["used:/srv"]);
@@ -403,10 +544,111 @@ mod tests {
     #[test]
     fn a_broken_record_stops_removal_rather_than_hide_a_user() {
         let (_tmp, store) = store();
-        create_in(&store, "data").unwrap();
+        make(&store, "data");
         fs::write(store.images_dir().join("broken.json"), "{").unwrap();
         assert!(remove_in(&store, &["data".to_string()], &quiet).is_err());
         assert!(prune_in(&store, &quiet).is_err());
         assert!(store.volumes_dir().join("data").is_dir());
+    }
+
+    #[test]
+    fn labels_and_the_anonymous_mark_are_kept_beside_the_volume() {
+        let (_tmp, store) = store();
+        let labels: BTreeMap<String, String> = [("team".to_string(), "a".to_string())].into();
+        let (path, _) = create_in(&store, "data", labels.clone(), true).unwrap();
+        assert_eq!(
+            fs::read_dir(&path).unwrap().count(),
+            0,
+            "nothing inside what a machine mounts"
+        );
+        assert!(meta_path(&store, "data").is_file());
+        let listed = get(&store, "data").unwrap();
+        assert_eq!(listed.labels, labels);
+        assert!(listed.anonymous);
+        assert!(listed.created > 0);
+        // One that exists is returned as it is.
+        create_in(&store, "data", BTreeMap::new(), false).unwrap();
+        let again = get(&store, "data").unwrap();
+        assert_eq!((again.labels, again.anonymous), (labels, true));
+        // Made by a start: nothing kept, and a name it has is not anonymous.
+        fs::create_dir(store.volumes_dir().join("plain")).unwrap();
+        let plain = get(&store, "plain").unwrap();
+        assert!(plain.labels.is_empty() && !plain.anonymous && plain.created > 0);
+        let text = fs::read_to_string(meta_path(&store, "data")).unwrap();
+        let kept: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(kept["labels"]["team"], "a");
+        assert_eq!(kept["anonymous"], true);
+        create_in(&store, "bare", BTreeMap::new(), false).unwrap();
+        let bare = fs::read_to_string(meta_path(&store, "bare")).unwrap();
+        assert!(
+            !bare.contains("labels") && !bare.contains("anonymous"),
+            "{bare}"
+        );
+    }
+
+    #[test]
+    fn what_was_kept_of_a_volume_removed_by_hand_is_not_another_s() {
+        let (_tmp, store) = store();
+        let labels: BTreeMap<String, String> = [("k".to_string(), "v".to_string())].into();
+        let (path, _) = create_in(&store, "data", labels, true).unwrap();
+        fs::remove_dir(&path).unwrap();
+        assert!(get(&store, "data").is_err());
+        // A create of the name keeps what it is given.
+        let labels: BTreeMap<String, String> = [("n".to_string(), "2".to_string())].into();
+        create_in(&store, "data", labels.clone(), false).unwrap();
+        let again = get(&store, "data").unwrap();
+        assert_eq!((again.labels, again.anonymous), (labels, false));
+        // A start that makes it again forgets it.
+        fs::remove_dir(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        forget_meta(&store, "data").unwrap();
+        let made = get(&store, "data").unwrap();
+        assert!(made.labels.is_empty() && !made.anonymous, "{made:?}");
+        forget_meta(&store, "data").unwrap();
+    }
+
+    #[test]
+    fn removal_and_prune_forget_what_was_kept() {
+        let (_tmp, store) = store();
+        make(&store, "gone");
+        make(&store, "pruned");
+        make(&store, "used");
+        machine(&store, "web", &["used:/srv"]);
+        let removal = remove_in(&store, &["gone".to_string()], &quiet).unwrap();
+        assert_eq!(removal.removed, ["gone"]);
+        assert!(!meta_path(&store, "gone").exists());
+        assert_eq!(prune_in(&store, &quiet).unwrap(), ["pruned"]);
+        assert!(!meta_path(&store, "pruned").exists());
+        assert!(
+            meta_path(&store, "used").exists(),
+            "a volume in use keeps it"
+        );
+    }
+
+    #[test]
+    fn a_volume_is_looked_up_by_its_name() {
+        let (_tmp, store) = store();
+        make(&store, "data");
+        assert_eq!(get(&store, "data").unwrap().name, "data");
+        for missing in ["nope", "bad name", "../x", ".hidden"] {
+            let e = get(&store, missing).unwrap_err();
+            assert_eq!(
+                crate::api::kind_of(&e),
+                Some(FailureKind::NoSuchVolume),
+                "{missing}"
+            );
+            assert_eq!(format!("{e:#}"), format!("no volume named {missing}"));
+        }
+    }
+
+    #[test]
+    fn a_volume_made_without_a_name_gets_64_hex_digits() {
+        let one = random_name().unwrap();
+        assert_eq!(one.len(), 64);
+        assert!(one
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(one, random_name().unwrap());
+        assert!(validate_volume_name(&one).is_ok());
     }
 }

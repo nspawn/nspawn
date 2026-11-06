@@ -875,6 +875,24 @@ pub fn network_hash(network: &Value) -> Result<String, String> {
     Ok(hex::encode(Sha256::digest(text.as_bytes())))
 }
 
+/// compose's VolumeHash: the volume as compact JSON, its driver `local` when it names
+/// none, then SHA-256.
+pub fn volume_hash(volume: &Value) -> Result<String, String> {
+    let mut volume = volume.clone();
+    if let Value::Map(map) = &mut volume {
+        if map
+            .get("driver")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            map.insert("driver".to_string(), Value::str("local"));
+        }
+    }
+    let out = model::encode(Some(&volume), &Ty::Struct(&types::VOLUME), Format::Json);
+    let text = emit::json_compact(&out)?;
+    Ok(hex::encode(Sha256::digest(text.as_bytes())))
+}
+
 const HASH_ORDER: &[&str] = &[
     "profiles",
     "annotations",

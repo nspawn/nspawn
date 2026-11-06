@@ -76,6 +76,22 @@ fn filters(values: &[String]) -> Result<(Vec<String>, Option<u64>)> {
     Ok((labels, until))
 }
 
+/// volume ls --filter: label=KEY or label=KEY=VALUE.
+pub fn label_filters(values: &[String]) -> Result<Vec<String>> {
+    values
+        .iter()
+        .map(|value| match value.split_once('=') {
+            Some(("label", label)) if !label.is_empty() => Ok(label.to_string()),
+            _ => bail!("invalid filter '{value}': label= is taken"),
+        })
+        .collect()
+}
+
+/// Whether a volume (as JSON) has every label of `labels`, KEY or KEY=VALUE.
+pub fn labelled(have: &serde_json::Value, labels: &[String]) -> bool {
+    selected(have, labels, None)
+}
+
 /// Whether a machine or network (as JSON) has every label of `labels` (KEY or
 /// KEY=VALUE) and was made before `until`.
 fn selected(have: &serde_json::Value, labels: &[String], until: Option<u64>) -> bool {
@@ -293,6 +309,37 @@ pub async fn networks_prune(client: &Client, filters: &[String]) -> Result<Vec<S
     Ok(client::strings(&result, "removed"))
 }
 
+/// The unused volumes made without a name (the API makes them), those `labels` select.
+async fn anonymous_volumes_prune(client: &Client, labels: &[String]) -> Result<Vec<String>> {
+    let volumes = client.manager.list_volumes().await.map_err(client::error)?;
+    let unused = anonymous_unused(
+        &volumes.iter().map(client::dict_to_json).collect::<Vec<_>>(),
+        labels,
+    );
+    if unused.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One a machine took meanwhile is refused by the service and stays.
+    let result = client::partly(
+        client
+            .run_job_silent(|| client.manager.remove_volumes(&unused), true)
+            .await,
+    )?;
+    Ok(client::strings(&result, "removed"))
+}
+
+fn anonymous_unused(volumes: &[serde_json::Value], labels: &[String]) -> Vec<String> {
+    volumes
+        .iter()
+        .filter(|v| {
+            v["anonymous"].as_bool() == Some(true)
+                && v["used_by"].as_array().is_some_and(Vec::is_empty)
+                && labelled(v, labels)
+        })
+        .filter_map(|v| v["name"].as_str().map(str::to_string))
+        .collect()
+}
+
 async fn prune_cache(
     client: &Client,
     all: bool,
@@ -423,6 +470,9 @@ fn prune_warning(all: bool, volumes: bool, filters: &[String]) -> String {
 
 pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
     let (labels, until) = filters(&args.filters)?;
+    if args.volumes && until.is_some() {
+        bail!(r#"ERROR: The "until" filter is not supported with "--volumes""#);
+    }
     let warning = prune_warning(args.all, args.volumes, &args.filters);
     if !confirm(&warning, args.force)? {
         return Ok(());
@@ -467,6 +517,16 @@ pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
             .await
             .unwrap_or_default()
     };
+    let volumes = if args.volumes {
+        anonymous_volumes_prune(client, &labels)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("warning: {e:#}");
+                Vec::new()
+            })
+    } else {
+        Vec::new()
+    };
     let (images, freed) = prune_images(client, args.all, &labels, until).await?;
     reclaimed += freed;
     // The build cache has no labels: a prune narrowed by them leaves it.
@@ -480,6 +540,7 @@ pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
     for (title, list, prefix) in [
         ("Deleted Containers:", &removed_machines, ""),
         ("Deleted Networks:", &networks, ""),
+        ("Deleted Volumes:", &volumes, ""),
         ("Deleted Images:", &images, "deleted: "),
         ("Deleted build cache objects:", &cache, ""),
     ] {
@@ -490,9 +551,6 @@ pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
             }
             println!();
         }
-    }
-    if args.volumes {
-        eprintln!("note: nspawn has no anonymous volumes; nspawn volume prune removes named ones no machine uses");
     }
     println!("Total reclaimed space: {}", human_size(reclaimed));
     Ok(())
@@ -539,6 +597,42 @@ mod tests {
         assert!(!selected(&have, &["a=x".into()], None));
         assert!(!selected(&have, &["d".into()], None));
         assert!(!selected(&have, &[], Some(50)));
+    }
+
+    #[test]
+    fn volumes_are_listed_by_label() {
+        assert_eq!(
+            label_filters(&["label=a=b".into(), "label=c".into()]).unwrap(),
+            ["a=b", "c"]
+        );
+        for bad in ["dangling=true", "label=", "label", "until=1"] {
+            let e = label_filters(&[bad.to_string()]).unwrap_err();
+            assert_eq!(
+                format!("{e:#}"),
+                format!("invalid filter '{bad}': label= is taken")
+            );
+        }
+        let have = serde_json::json!({ "labels": { "a": "b" }, "created": 50 });
+        assert!(labelled(&have, &[]));
+        assert!(labelled(&have, &["a".into(), "a=b".into()]));
+        assert!(!labelled(&have, &["a=c".into()]));
+        assert!(!labelled(
+            &serde_json::json!({ "name": "old" }),
+            &["a".into()]
+        ));
+    }
+
+    #[test]
+    fn system_prune_takes_unused_anonymous_volumes_only() {
+        let volumes = [
+            serde_json::json!({ "name": "anon", "anonymous": true, "used_by": [], "labels": { "a": "b" } }),
+            serde_json::json!({ "name": "anon-used", "anonymous": true, "used_by": ["m"], "labels": {} }),
+            serde_json::json!({ "name": "named", "anonymous": false, "used_by": [], "labels": { "a": "b" } }),
+            serde_json::json!({ "name": "anon-other", "anonymous": true, "used_by": [], "labels": { "a": "c" } }),
+        ];
+        assert_eq!(anonymous_unused(&volumes, &[]), ["anon", "anon-other"]);
+        assert_eq!(anonymous_unused(&volumes, &["a=b".into()]), ["anon"]);
+        assert!(anonymous_unused(&volumes, &["x".into()]).is_empty());
     }
 
     #[test]

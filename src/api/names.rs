@@ -107,6 +107,7 @@ mod tests {
                 internal: false,
                 created: 0,
                 labels: Default::default(),
+                api_name: None,
             })
             .unwrap();
         std::fs::create_dir_all(ctx.store.volumes_dir().join("pgdata")).unwrap();

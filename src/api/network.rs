@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
 
+use crate::api::create::validate_api_name;
 use crate::api::images::Removal;
 use crate::api::{line, machines, require_root, Context, Event, FailureKind, Report};
 use crate::backend::BackendChoice;
@@ -63,15 +64,104 @@ pub fn all(store: &Store, config: &Config) -> Result<Vec<NetSpec>> {
     Ok(out)
 }
 
+/// The network `name` names: the default one, the one the Docker API knows by that
+/// name, or the one of that name. A network's own name is no other's API name (`create`
+/// sees to it), so the network of the name is the one a lookup by API name would find
+/// first as well.
 pub fn find(store: &Store, config: &Config, name: &str) -> Result<NetSpec> {
     if name == DEFAULT_NETWORK {
         return Ok(config.default_network());
     }
-    store.load_network(name)?.ok_or_else(|| {
-        FailureKind::NoSuchNetwork.error(format!(
-            "network {name} does not exist; nspawn network create {name} makes it"
-        ))
-    })
+    let own = validate_network_name(name).is_ok();
+    if own {
+        if let Some(spec) = store.load_network(name)? {
+            return Ok(spec);
+        }
+    }
+    if validate_api_name(name).is_ok() {
+        if let Some(spec) = store
+            .list_networks()?
+            .into_iter()
+            .find(|n| n.api_name.as_deref() == Some(name))
+        {
+            return Ok(spec);
+        }
+    }
+    Err(FailureKind::NoSuchNetwork.error(if own {
+        format!("network {name} does not exist; nspawn network create {name} makes it")
+    } else {
+        format!("network {name} does not exist")
+    }))
+}
+
+/// The own name of the network `text` names among `networks` (the user-defined ones):
+/// by the name the Docker API knows it by first, then by its own.
+fn own_name<'a>(networks: &'a [NetSpec], text: &str) -> Option<&'a str> {
+    networks
+        .iter()
+        .find(|n| n.api_name.as_deref() == Some(text))
+        .or_else(|| networks.iter().find(|n| n.name == text))
+        .map(|n| n.name.as_str())
+}
+
+/// `--network` values with each network named by its own name: one the Docker API
+/// knows by another name becomes that. Kinds, `container:NAME` and names no network
+/// has stay as they are, for the checks that follow; a name only the API takes and no
+/// network has is refused here, as no network of that name can exist.
+pub fn resolve_choices(store: &Store, texts: &[String]) -> Result<Vec<String>> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let networks = store.list_networks()?;
+    texts
+        .iter()
+        .map(|text| resolve_choice(&networks, text))
+        .collect()
+}
+
+fn resolve_choice(networks: &[NetSpec], text: &str) -> Result<String> {
+    if RESERVED_NETWORKS.contains(&text) || text.starts_with("container:") {
+        return Ok(text.to_string());
+    }
+    if let Some(own) = own_name(networks, text) {
+        return Ok(own.to_string());
+    }
+    if validate_network_name(text).is_err() && validate_api_name(text).is_ok() {
+        return Err(FailureKind::NoSuchNetwork.error(format!("network {text} does not exist")));
+    }
+    Ok(text.to_string())
+}
+
+/// `NETWORK=VALUE` values (aliases, fixed addresses) with NETWORK by its own name, as
+/// `resolve_choices` has it; values without a network stay as they are.
+pub fn resolve_keyed(store: &Store, values: &[String]) -> Result<Vec<String>> {
+    if !values.iter().any(|v| v.contains('=')) {
+        return Ok(values.to_vec());
+    }
+    let networks = store.list_networks()?;
+    Ok(values.iter().map(|value| keyed(&networks, value)).collect())
+}
+
+fn keyed(networks: &[NetSpec], value: &str) -> String {
+    match value.split_once('=') {
+        Some((network, rest)) => match own_name(networks, network) {
+            Some(own) => format!("{own}={rest}"),
+            None => value.to_string(),
+        },
+        None => value.to_string(),
+    }
+}
+
+/// A start's options with the networks they name by their own names.
+pub fn resolve_start(
+    store: &Store,
+    request: &machines::StartRequest,
+) -> Result<machines::StartRequest> {
+    let mut out = request.clone();
+    out.network = resolve_choices(store, &request.network)?;
+    out.aliases = resolve_keyed(store, &request.aliases)?;
+    out.addresses = resolve_keyed(store, &request.addresses)?;
+    Ok(out)
 }
 
 /// The networks a record joins, the primary one first.
@@ -122,7 +212,7 @@ pub fn choices(texts: &[String]) -> Result<NetworkChoice> {
         "host" => choice.kind = Network::Host,
         "none" => choice.none = true,
         name => {
-            validate_network_name(name)?;
+            validate_network_reference(name)?;
             choice.name = Some(name.to_string());
         }
     }
@@ -138,7 +228,7 @@ pub fn choices(texts: &[String]) -> Result<NetworkChoice> {
                 bail!("--network {text} stands alone: the machine takes that network, and joins no other")
             }
             DEFAULT_NETWORK => {}
-            name => validate_network_name(name)?,
+            name => validate_network_reference(name)?,
         }
         if choice.name.as_deref().unwrap_or(DEFAULT_NETWORK) == text || choice.extras.contains(text)
         {
@@ -240,6 +330,15 @@ pub fn validate_alias(alias: &str) -> Result<()> {
     Ok(())
 }
 
+/// A network as `--network` names it: by its own name, or by the one the Docker API
+/// knows it by, which `resolve_choices` turns into its own.
+fn validate_network_reference(name: &str) -> Result<()> {
+    if !RESERVED_NETWORKS.contains(&name) && validate_api_name(name).is_ok() {
+        return Ok(());
+    }
+    validate_network_name(name)
+}
+
 /// Letters, digits, '_' and '-', and none of the names `--network` reserves.
 pub fn validate_network_name(name: &str) -> Result<()> {
     if RESERVED_NETWORKS.contains(&name) {
@@ -264,7 +363,7 @@ pub fn validate_network_name(name: &str) -> Result<()> {
 /// A network's event about a machine joining or leaving it: the network's metadata, and
 /// which machine of the name.
 fn emit_membership(action: &str, net: &NetSpec, record: &ImageRecord) {
-    let mut attributes = network_attributes(net).to_vec();
+    let mut attributes = network_attributes(net);
     attributes.push(("container", record.name.clone()));
     attributes.push(("container_created", record.created.to_string()));
     crate::api::events::emit("network", action, &net.name, &borrowed(&attributes));
@@ -311,11 +410,13 @@ pub async fn connect(
     // Looked up under the lock: a network rm may have gone first.
     let net = find(store, config, network)
         .map_err(|_| FailureKind::NoSuchNetwork.error(format!("network {network} not found")))?;
+    // The record names networks by their own names; messages by the one given.
+    let own = net.name.as_str();
     let mut record = store
         .load_image(machine)?
         .ok_or_else(|| FailureKind::NoSuchMachine.error(format!("No such container: {machine}")))?;
     joins_bridges(&record, "connected to")?;
-    if bridge::networks_of(&record).contains(&network) {
+    if bridge::networks_of(&record).contains(&own) {
         return Err(FailureKind::Exists.error(format!(
             "endpoint with name {machine} already exists in network {network}"
         )));
@@ -333,24 +434,24 @@ pub async fn connect(
             let mut used: Vec<Ipv4Addr> = store
                 .list_images_strict()?
                 .iter()
-                .filter_map(|r| bridge::address_on(r, network))
+                .filter_map(|r| bridge::address_on(r, own))
                 .collect();
             // What builds' steps hold on it too.
-            used.extend(bridge::build_addresses(store, network));
+            used.extend(bridge::build_addresses(store, own));
             net.subnet.allocate(&used)?
         }
         // A stopped machine gets one at its next start.
         None => Ipv4Addr::UNSPECIFIED,
     };
     record.extra_networks.push(crate::bridge::Attachment {
-        network: network.to_string(),
+        network: own.to_string(),
         address: (!addr.is_unspecified()).then_some(addr),
     });
     if address.is_some() {
-        record.fixed_addresses.insert(network.to_string());
+        record.fixed_addresses.insert(own.to_string());
     }
     if !aliases.is_empty() {
-        let list = record.aliases.entry(network.to_string()).or_default();
+        let list = record.aliases.entry(own.to_string()).or_default();
         for alias in aliases {
             if !list.contains(alias) {
                 list.push(alias.clone());
@@ -411,6 +512,7 @@ pub async fn disconnect(
     let _lock = store.lock().await?;
     let net = find(store, config, network)
         .map_err(|_| FailureKind::NoSuchNetwork.error(format!("network {network} not found")))?;
+    let own = net.name.as_str();
     let Some(mut record) = store.load_image(machine)? else {
         if force {
             return Ok(());
@@ -422,7 +524,7 @@ pub async fn disconnect(
         .into_iter()
         .map(str::to_string)
         .collect();
-    if !networks.iter().any(|n| n == network) {
+    if !networks.iter().any(|n| n == own) {
         if force {
             return Ok(());
         }
@@ -432,7 +534,7 @@ pub async fn disconnect(
         bail!("{network} is the only network of {machine}: nspawn network connect another one first, or start it with --network none");
     }
     let running = sd.machine_exists(machine).await?;
-    let primary_left = networks[0] == network;
+    let primary_left = networks[0] == own;
     if primary_left {
         // The next network becomes the primary one, with its address.
         let next = record.extra_networks.remove(0);
@@ -454,10 +556,10 @@ pub async fn disconnect(
             );
         }
     } else {
-        record.extra_networks.retain(|a| a.network != network);
+        record.extra_networks.retain(|a| a.network != own);
     }
-    record.aliases.remove(network);
-    record.fixed_addresses.remove(network);
+    record.aliases.remove(own);
+    record.fixed_addresses.remove(own);
     // A running machine leaves the network first: the record frees its address only once
     // no interface of it holds that address any more, or the next machine given it
     // would share it with this one.
@@ -571,28 +673,75 @@ pub fn list_networks(ctx: &Context) -> Result<Vec<NetworkSummary>> {
 
 pub async fn inspect(ctx: &Context, name: &str) -> Result<(NetSpec, Vec<NetworkEntry>)> {
     let spec = find(&ctx.store, &ctx.config, name)?;
-    Ok((spec, entries(ctx, name).await?))
+    let entries = entries(ctx, &spec.name).await?;
+    Ok((spec, entries))
+}
+
+/// What a create is refused for before anything is looked at: a name that is none. An
+/// empty `name` is made of `api_name`.
+pub fn check_create(name: &str, api_name: Option<&str>) -> Result<()> {
+    if let Some(api_name) = api_name {
+        if RESERVED_NETWORKS.contains(&api_name) {
+            return validate_network_name(api_name);
+        }
+        validate_api_name(api_name)?;
+    }
+    if !name.is_empty() || api_name.is_none() {
+        validate_network_name(name)?;
+    }
+    Ok(())
+}
+
+/// The network's own name: the one asked for, or without one the API name itself when
+/// it is a network name, else one made of it as a machine's is.
+fn network_name(name: &str, api_name: Option<&str>) -> String {
+    match api_name.filter(|_| name.is_empty()) {
+        Some(api_name) if validate_network_name(api_name).is_err() => {
+            crate::api::create::derived_machine_name(api_name)
+        }
+        Some(api_name) => api_name.to_string(),
+        None => name.to_string(),
+    }
+}
+
+/// Refuses names another network has, its own or its API name: every name a lookup
+/// takes leads to one network.
+fn check_taken(all: &[NetSpec], name: &str, api_name: Option<&str>) -> Result<()> {
+    for wanted in api_name.into_iter().chain([name]) {
+        if all
+            .iter()
+            .any(|n| n.name == wanted || n.api_name.as_deref() == Some(wanted))
+        {
+            return Err(FailureKind::Exists.error(format!("network {wanted} exists already")));
+        }
+    }
+    Ok(())
 }
 
 /// network create: a bridge and a subnet of its own (the next free /24 of
-/// network_pool unless given), brought up at once.
+/// network_pool unless given), brought up at once. `api_name` is kept when it is not
+/// the network's own name.
 pub async fn create(
     ctx: &Context,
     name: &str,
+    api_name: Option<&str>,
     subnet: Option<&str>,
     internal: bool,
     labels: BTreeMap<String, String>,
     report: Report<'_>,
 ) -> Result<NetSpec> {
     require_root("network create")?;
-    validate_network_name(name)?;
+    check_create(name, api_name)?;
     let sd = ctx.sd().await?;
     let store = &ctx.store;
+    // Names are chosen and checked under the lock: two creates of one API name make one
+    // network.
     let _lock = store.lock().await?;
     let mut all = all(store, &ctx.config)?;
-    if all.iter().any(|n| n.name == name) {
-        return Err(FailureKind::Exists.error(format!("network {name} exists already")));
-    }
+    let name = network_name(name, api_name);
+    let name = name.as_str();
+    let api_name = api_name.filter(|a| *a != name);
+    check_taken(&all, name, api_name)?;
     let interface = bridge::network_interface(name);
     if let Some(other) = all.iter().find(|n| n.interface == interface) {
         bail!(
@@ -629,6 +778,7 @@ pub async fn create(
         internal,
         created: now_unix(),
         labels,
+        api_name: api_name.map(str::to_string),
     };
     store.record_network(&spec)?;
     all.push(spec.clone());
@@ -657,7 +807,7 @@ pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Resu
             Ok(spec) => {
                 line(report, format!("removed {name}"));
                 let attributes = network_attributes(&spec);
-                crate::api::events::emit("network", "remove", name, &borrowed(&attributes));
+                crate::api::events::emit("network", "remove", &spec.name, &borrowed(&attributes));
                 removal.removed.push(name.clone());
             }
             Err(e) => removal.refuse(name, e),
@@ -677,7 +827,7 @@ async fn remove_one(
     }
     let store = &ctx.store;
     let spec = find(store, &ctx.config, name)?;
-    let users = users(records, name);
+    let users = users(records, &spec.name);
     if !users.is_empty() {
         return Err(FailureKind::InUse.error(format!(
             "network {name} is in use by {}; remove them or start them on another network first",
@@ -686,10 +836,10 @@ async fn remove_one(
     }
     let remaining: Vec<NetSpec> = all(store, &ctx.config)?
         .into_iter()
-        .filter(|n| n.name != name)
+        .filter(|n| n.name != spec.name)
         .collect();
     bridge::down(&spec, &remaining, sd).await?;
-    store.remove_network(name)?;
+    store.remove_network(&spec.name)?;
     Ok(spec)
 }
 
@@ -992,13 +1142,17 @@ fn ran_to_be_removed(record: &ImageRecord, kept_since: Option<u64>) -> bool {
 }
 
 /// What every event of a network says of it.
-fn network_attributes(spec: &NetSpec) -> [(&'static str, String); 4] {
-    [
+fn network_attributes(spec: &NetSpec) -> Vec<(&'static str, String)> {
+    let mut attributes = vec![
         ("subnet", spec.subnet.to_string()),
         ("interface", spec.interface.clone()),
         ("internal", spec.internal.to_string()),
         ("created", spec.created.to_string()),
-    ]
+    ];
+    if let Some(api_name) = &spec.api_name {
+        attributes.push(("api_name", api_name.clone()));
+    }
+    attributes
 }
 
 fn borrowed<'a>(attributes: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
@@ -1054,8 +1208,12 @@ mod tests {
         assert_eq!(one("host").unwrap().kind, Network::Host);
         assert!(one("none").unwrap().none);
         assert_eq!(one("backend").unwrap().name.as_deref(), Some("backend"));
-        for bad in ["default", "", "-x", "a b", "a/b", "a.b", &"x".repeat(65)] {
+        for bad in ["default", "", "-x", "a b", "a/b", ".x", &"x".repeat(1025)] {
             assert!(one(bad).is_err(), "{bad:?}");
+        }
+        // Names the Docker API gives a network, resolved before the choice is made.
+        for api in ["a.b", &"x".repeat(65)] {
+            assert_eq!(one(api).unwrap().name.as_deref(), Some(api));
         }
         let several = choices(&["front".into(), "bridge".into(), "back".into()]).unwrap();
         assert_eq!(several.name.as_deref(), Some("front"));
@@ -1193,6 +1351,7 @@ mod tests {
                 internal: false,
                 created: 0,
                 labels: BTreeMap::new(),
+                api_name: None,
             },
             NetSpec {
                 name: "front".into(),
@@ -1201,6 +1360,7 @@ mod tests {
                 internal: false,
                 created: 1,
                 labels: BTreeMap::new(),
+                api_name: None,
             },
         ];
         bridge::write_hosts_files(&store, &all).unwrap();
@@ -1256,5 +1416,163 @@ mod tests {
         assert_eq!(store.load_network("front").unwrap(), Some(all[1].clone()));
         store.remove_network("front").unwrap();
         assert!(store.list_networks().unwrap().is_empty());
+    }
+
+    fn spec(name: &str, api_name: Option<&str>) -> NetSpec {
+        NetSpec {
+            name: name.into(),
+            interface: bridge::network_interface(name),
+            subnet: "10.99.9.0/24".parse().unwrap(),
+            internal: false,
+            created: 1,
+            labels: BTreeMap::new(),
+            api_name: api_name.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_network_made_of_an_api_name_gets_a_name_of_its_own() {
+        for (name, api_name) in [("front", None), ("", Some("ci.net")), ("mine", Some("x_y"))] {
+            assert!(check_create(name, api_name).is_ok(), "{name} {api_name:?}");
+        }
+        for (name, api_name) in [
+            ("", None),
+            ("a.b", None),
+            ("", Some("bridge")),
+            ("", Some("default")),
+            ("", Some("host")),
+            ("", Some("_x")),
+            ("", Some(".x")),
+            ("", Some("a b")),
+            ("bad name", Some("ci.net")),
+        ] {
+            let e = check_create(name, api_name).unwrap_err();
+            assert_eq!(
+                crate::api::kind_of(&e),
+                Some(FailureKind::Invalid),
+                "{name:?} {api_name:?}"
+            );
+        }
+        assert_eq!(network_name("", Some("front")), "front");
+        assert_eq!(network_name("mine", Some("ci.net")), "mine");
+        let derived = network_name("", Some("ci.net"));
+        assert!(
+            derived.starts_with("ci-net-") && derived.len() == "ci-net-".len() + 8,
+            "{derived}"
+        );
+        assert_eq!(derived, crate::api::create::derived_machine_name("ci.net"));
+        let long = network_name("", Some(&"a".repeat(100)));
+        assert_eq!(long.len(), 64);
+        for made in [derived, long] {
+            assert!(validate_network_name(&made).is_ok(), "{made}");
+        }
+    }
+
+    #[test]
+    fn every_name_of_a_network_leads_to_it_alone() {
+        let all = vec![
+            spec(DEFAULT_NETWORK, None),
+            spec("front", None),
+            spec("ci-net-1a2b3c4d", Some("ci.net")),
+        ];
+        check_taken(&all, "back", None).unwrap();
+        check_taken(&all, "back", Some("back.net")).unwrap();
+        for (name, api_name, said) in [
+            ("front", None, "front"),
+            ("bridge", None, "bridge"),
+            ("ci-net-1a2b3c4d", None, "ci-net-1a2b3c4d"),
+            ("other", Some("front"), "front"),
+            ("other", Some("ci.net"), "ci.net"),
+            ("ci-net-1a2b3c4d", Some("ci.net"), "ci.net"),
+        ] {
+            let e = check_taken(&all, name, api_name).unwrap_err();
+            assert_eq!(crate::api::kind_of(&e), Some(FailureKind::Exists));
+            assert_eq!(format!("{e:#}"), format!("network {said} exists already"));
+        }
+    }
+
+    #[test]
+    fn machines_name_networks_by_either_name() {
+        let nets = vec![
+            spec("front", None),
+            spec("ci-net-1a2b3c4d", Some("ci.net")),
+            spec("x", Some("front2")),
+        ];
+        let resolve = |text: &str| resolve_choice(&nets, text);
+        assert_eq!(resolve("ci.net").unwrap(), "ci-net-1a2b3c4d");
+        assert_eq!(resolve("front").unwrap(), "front");
+        assert_eq!(resolve("front2").unwrap(), "x");
+        for kept in [
+            "bridge",
+            "host",
+            "none",
+            "veth",
+            "container:ci.net",
+            "nope",
+            "bad name",
+        ] {
+            assert_eq!(
+                resolve(kept).unwrap(),
+                kept,
+                "left to the checks that follow"
+            );
+        }
+        let e = resolve("no.such").unwrap_err();
+        assert_eq!(crate::api::kind_of(&e), Some(FailureKind::NoSuchNetwork));
+        assert_eq!(format!("{e:#}"), "network no.such does not exist");
+        assert_eq!(keyed(&nets, "ci.net=www"), "ci-net-1a2b3c4d=www");
+        assert_eq!(keyed(&nets, "front2=10.99.9.5"), "x=10.99.9.5");
+        assert_eq!(keyed(&nets, "www"), "www");
+        assert_eq!(keyed(&nets, "nope=www"), "nope=www");
+        // What --network takes: its own names and the API's.
+        let several = choices(&["ci.net".into(), "front".into()]).unwrap();
+        assert_eq!(several.name.as_deref(), Some("ci.net"));
+        assert!(choices(&[format!("a{}", "b".repeat(100))]).is_ok());
+    }
+
+    #[test]
+    fn a_network_is_found_by_its_api_name_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        store.init().unwrap();
+        let config = Config::merge(crate::config::FileConfig::default(), None, None).unwrap();
+        store
+            .record_network(&spec("ci-net-1a2b3c4d", Some("ci.net")))
+            .unwrap();
+        store.record_network(&spec("front", None)).unwrap();
+        for name in ["ci.net", "ci-net-1a2b3c4d"] {
+            assert_eq!(find(&store, &config, name).unwrap().name, "ci-net-1a2b3c4d");
+        }
+        assert_eq!(find(&store, &config, "front").unwrap().name, "front");
+        assert_eq!(
+            find(&store, &config, "bridge").unwrap().name,
+            DEFAULT_NETWORK
+        );
+        let e = find(&store, &config, "gone.net").unwrap_err();
+        assert_eq!(crate::api::kind_of(&e), Some(FailureKind::NoSuchNetwork));
+        assert_eq!(format!("{e:#}"), "network gone.net does not exist");
+        let e = find(&store, &config, &"x".repeat(300)).unwrap_err();
+        assert_eq!(crate::api::kind_of(&e), Some(FailureKind::NoSuchNetwork));
+        let e = find(&store, &config, "gone").unwrap_err();
+        assert_eq!(
+            format!("{e:#}"),
+            "network gone does not exist; nspawn network create gone makes it"
+        );
+        let resolved = resolve_choices(&store, &["ci.net".into(), "bridge".into()]).unwrap();
+        assert_eq!(resolved, ["ci-net-1a2b3c4d", "bridge"]);
+        assert_eq!(
+            resolve_keyed(&store, &["ci.net=www".into(), "db".into()]).unwrap(),
+            ["ci-net-1a2b3c4d=www", "db"]
+        );
+        let text = std::fs::read_to_string(store.networks_dir().join("front.json")).unwrap();
+        assert!(!text.contains("api_name"), "none kept where there is none");
+        let text =
+            std::fs::read_to_string(store.networks_dir().join("ci-net-1a2b3c4d.json")).unwrap();
+        assert!(text.contains(r#""api_name": "ci.net""#), "{text}");
+        let attributes = network_attributes(&spec("ci-net-1a2b3c4d", Some("ci.net")));
+        assert!(attributes.contains(&("api_name", "ci.net".to_string())));
+        assert!(!network_attributes(&spec("front", None))
+            .iter()
+            .any(|(k, _)| *k == "api_name"));
     }
 }

@@ -1048,7 +1048,7 @@ pub async fn volumes(e: &mut Engine<'_>, a: &VolumesArgs, out: &mut dyn Write) -
         .filter(|m| a.service.is_empty() || a.service.contains(&m.service))
         .map(|m| m.name)
         .collect();
-    let listed: Vec<(String, String)> = e
+    let listed: Vec<(String, String, BTreeMap<String, String>)> = e
         .client
         .manager
         .list_volumes()
@@ -1062,22 +1062,33 @@ pub async fn volumes(e: &mut Engine<'_>, a: &VolumesArgs, out: &mut dyn Write) -
                     .iter()
                     .any(|u| machines.contains(u))
         })
-        .map(|v| (client::string(v, "name"), client::string(v, "path")))
+        .map(|v| {
+            let labels = client::dict_to_json(v)["labels"]
+                .as_object()
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            (client::string(v, "name"), client::string(v, "path"), labels)
+        })
         .collect();
     if a.quiet {
-        for (v, _) in &listed {
+        for (v, _, _) in &listed {
             writeln!(out, "{v}")?;
         }
         return Ok(());
     }
     // A volume as --format templates see one.
-    let fields = |name: &str, path: &str| {
+    let fields = |name: &str, path: &str, labels: &BTreeMap<String, String>| {
         let na = || serde_json::Value::from("N/A");
+        let joined: Vec<String> = labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
         vec![
             ("Availability", na()),
             ("Driver", serde_json::Value::from("local")),
             ("Group", na()),
-            ("Labels", serde_json::Value::from("")),
+            ("Labels", serde_json::Value::from(joined.join(","))),
             ("Links", na()),
             ("Mountpoint", serde_json::Value::from(path)),
             ("Name", serde_json::Value::from(name)),
@@ -1088,13 +1099,13 @@ pub async fn volumes(e: &mut Engine<'_>, a: &VolumesArgs, out: &mut dyn Write) -
     };
     match a.format.as_deref() {
         Some("json") => {
-            for (name, path) in &listed {
-                writeln!(out, "{}", json_line(&fields(name, path)))?;
+            for (name, path, labels) in &listed {
+                writeln!(out, "{}", json_line(&fields(name, path, labels)))?;
             }
         }
         None | Some("table") => {
             let mut text = String::from("DRIVER\tVOLUME NAME\n");
-            for (v, _) in &listed {
+            for (v, _, _) in &listed {
                 text.push_str(&format!("local\t{v}\n"));
             }
             out.write_all(columns_table(&text, 10, 3).as_bytes())?;
@@ -1102,13 +1113,14 @@ pub async fn volumes(e: &mut Engine<'_>, a: &VolumesArgs, out: &mut dyn Write) -
         Some(format) => {
             let objects: Vec<serde_json::Value> = listed
                 .iter()
-                .map(|(name, path)| {
-                    let mut row: serde_json::Map<String, serde_json::Value> = fields(name, path)
-                        .into_iter()
-                        .map(|(k, v)| (k.to_string(), v))
-                        .collect();
-                    // nspawn's volumes have no labels: Label reads "".
-                    row.insert("LabelsMap".into(), serde_json::json!({}));
+                .map(|(name, path, labels)| {
+                    let mut row: serde_json::Map<String, serde_json::Value> =
+                        fields(name, path, labels)
+                            .into_iter()
+                            .map(|(k, v)| (k.to_string(), v))
+                            .collect();
+                    // What the rows' Label method reads.
+                    row.insert("LabelsMap".into(), serde_json::json!(labels));
                     serde_json::Value::Object(row)
                 })
                 .collect();

@@ -203,20 +203,23 @@ pub async fn fetch(
     })
 }
 
-/// With `image_only`, a record of `name` that ran as a machine is refused as taken: the
-/// caller chose to replace an image, not a machine.
+/// With `image_only`, a record of `name` that ran as a machine, or is starting as one, is
+/// refused as taken: the caller chose to replace an image, not a machine. Checked before
+/// whether it runs, so that a caller that gets this error can take another name.
 fn ensure_image_only(store: &crate::store::Store, name: &str, image_only: bool) -> Result<()> {
     if !image_only {
         return Ok(());
     }
-    match store.load_image(name)? {
-        Some(record) if !crate::api::disk::image_only(store, &record) => {
-            Err(crate::api::FailureKind::Exists.error(format!(
-                "{name} ran as a machine; it is not replaced as an image"
-            )))
-        }
-        _ => Ok(()),
+    let ran = match store.load_image(name)? {
+        Some(record) => !crate::api::disk::image_only(store, &record),
+        None => false,
+    };
+    if ran || store.is_starting(name) {
+        return Err(crate::api::FailureKind::Exists.error(format!(
+            "{name} ran as a machine; it is not replaced as an image"
+        )));
     }
+    Ok(())
 }
 
 pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> Result<Pulled> {
@@ -229,8 +232,8 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
     let sd = ctx.sd().await?;
     let store = &ctx.store;
     store.init()?;
-    ensure_replaceable(store, sd, &name, request.force).await?;
     ensure_image_only(store, &name, request.image_only)?;
+    ensure_replaceable(store, sd, &name, request.force).await?;
 
     let choice = if request.backend == BackendChoice::Auto {
         config.backend
@@ -246,8 +249,8 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
     // The store is locked only now. The name is checked again, the old image goes only
     // at this point.
     let _lock = store.lock().await?;
-    ensure_replaceable(store, sd, &name, request.force).await?;
     ensure_image_only(store, &name, request.image_only)?;
+    ensure_replaceable(store, sd, &name, request.force).await?;
     crate::install::stage_layers(store, backend, &fetched.manifest, request.mode, &name).await?;
     remove_existing(store, sd, &name, report).await?;
     // An update that was deciding about the machine replaced has nothing left to decide:
@@ -294,6 +297,37 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_only_pull_leaves_a_record_that_ran_or_is_starting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            crate::store::Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        store.init().unwrap();
+        let mut record: crate::store::ImageRecord = serde_json::from_value(serde_json::json!({
+            "name": "web", "reference": "docker.io/library/busybox:1.37", "manifest_digest": "sha256:m",
+            "layers": [], "backend": "overlay", "created": 1,
+        }))
+        .unwrap();
+        store.record_image(&record).unwrap();
+        ensure_image_only(&store, "web", true).unwrap();
+        ensure_image_only(&store, "none", true).unwrap();
+        let _starting = store.mark_starting("web").unwrap();
+        let e = ensure_image_only(&store, "web", true).unwrap_err();
+        assert_eq!(
+            crate::api::kind_of(&e),
+            Some(crate::api::FailureKind::Exists)
+        );
+        drop(_starting);
+        record.started = Some(2);
+        store.record_image(&record).unwrap();
+        let e = ensure_image_only(&store, "web", true).unwrap_err();
+        assert_eq!(
+            crate::api::kind_of(&e),
+            Some(crate::api::FailureKind::Exists)
+        );
+        ensure_image_only(&store, "web", false).unwrap();
+    }
 
     fn descriptor(digest: &str) -> OciDescriptor {
         OciDescriptor {

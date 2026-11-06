@@ -239,10 +239,13 @@ the host right after their init starts, since systemd-nspawn cannot idmap binds 
 managed user namespaces, which is what the unit waits for.
 
 Named volumes outlive the machines that use them: removing a machine keeps them and
-says so. `nspawn volume ls` lists them with the machines whose records mount them,
-`volume create NAME` makes one ahead of its first use, and `volume rm` and
+says so. `nspawn volume ls` lists them with the machines whose records mount them
+(`--filter label=KEY[=VALUE]` only those with the label), `volume create NAME` makes one
+ahead of its first use (`--label KEY=VALUE` labels it; one that exists keeps its own),
+`volume inspect` shows what nspawn keeps of them as JSON, and `volume rm` and
 `volume prune` remove the ones no machine uses; a volume still named by a machine is
-refused until that machine is started with other volumes (or `-v none`) or removed. A
+refused until that machine is started with other volumes (or `-v none`) or removed.
+Labels and the creation time are kept beside the volume's directory, never inside it. A
 volume made ahead is filled from the image of the first machine that takes it while it
 is empty, but not while another machine that mounts it runs: the service would be
 writing where that machine can change things under it.
@@ -528,7 +531,12 @@ sudo systemctl daemon-reload && sudo systemctl restart nspawn-api.socket
 The API answers in the shapes of docker's API 1.51, and of the versions down to 1.24
 that clients ask for: `_ping`, `version` and `info`, the machines as containers with
 their labels, networks and addresses, inspect with the environment, events as they
-happen, logs, stats and top, the networks, the images and the volumes. A record pulled
+happen, logs, stats and top, the networks, the images and the volumes. Clients make,
+start, attach to (their input too), exec in, copy files to and from, and remove
+containers, pull and remove images, and make, join and remove volumes and networks:
+GitLab Runner's docker executor runs its jobs through it, and the `docker` command works
+with `DOCKER_HOST` set to it. Builds, loads, tags, pushes and commits of images, swarm
+and plugins are not served. A record pulled
 or built that never ran is an image there, not a container, and a machine made from it
 is a container. Images are told apart by their config: an image's ID is its config's
 digest, its tags are the references its records were pulled or built as, and a
@@ -573,13 +581,96 @@ created container and then starts it, as `docker run` without `-d` does. The out
 comes from the journal, so a start from anywhere shows, as one stream for a container
 with a terminal and framed as standard output otherwise. A client that asks for an
 upgrade gets it (101), the others a 200 with the stream as its body, and a wait asked
-on the same socket answers once the attach has handed over what the run wrote. The
-container's input is not taken: `stdin` is refused, and so are a paused or restarting
-container and one whose log driver is none.
+on the same socket answers once the attach has handed over what the run wrote. A paused
+or restarting container is refused, and so is one whose log driver is none.
 
-Exec, archives, image removals and changes of volumes and networks are not served: they
-answer 501 with "not supported", as reads of swarm objects and of a plugin do; the list
-of plugins is empty.
+With `stdin`, an upgraded attach to an app container made with `OpenStdin` that does not
+run keeps the container's input for its next `start` (or `restart`) on that socket,
+which runs the machine as `nspawn run -i` does: what the client sends is the program's
+standard input, which ends when the client closes its writing half or hangs up (with
+`StdinOnce`; without it, when the run ends). GitLab Runner's docker executor sends its
+scripts this way, attaching and starting the same container for each stage. The run's
+output reaches that attach on the connection, byte for byte, instead of through the
+journal: standard output and error together as standard output, or, for a container
+with a terminal (`Tty`), the terminal it gets for that run, carried both ways and sized
+by the create's `ConsoleSize` or a resize before the start. `logs` and other attaches do
+not have that output, and what it writes once its client went is dropped. Until the run ends the server keeps the connection to the bus it was started
+on, one more beyond the limits below, and does not leave. `stdin` is ignored for a
+container made without `OpenStdin` and for a booted one, and refused with 501 for one
+that runs, whose input was not kept. `POST /containers/ID/resize` sets the size of that
+terminal; it does nothing for a container that runs without one, and is refused with
+409 for one that does not run, unless an attach keeps it a terminal.
+
+An exec (`POST /containers/ID/exec`, then `POST /exec/ID/start`) runs its command in a
+running container through the bus service's `Exec`, as `nspawn exec` does: as the user
+asked for (the container's own without one), in the working directory asked for (the
+container's without one), with the variables given added to the container's. Without a
+terminal the command's standard output and error are streams of their own; with one
+(`Tty`) the terminal carries both ways, sized by `ConsoleSize` or by `POST
+/exec/ID/resize`, before the start too. What the client sends goes to the command's
+input when the create attached it (`AttachStdin`), and the client's closing its writing
+half ends that input. The stream ends once the command exited, two seconds later at most
+when a process it left running still holds its output, which is then read and dropped,
+and `GET /exec/ID/json` has its exit code from then on; a command that cannot run exits 127 when it is not
+found and 126 otherwise. A start that asks for no upgrade gets the output as the body of
+a 200 and sends no input; a detached start (`Detach`) answers once the command runs. A
+command whose client went, or that was started detached, runs on, and the server stays,
+holding the connection to the bus the command was started on, until it exits.
+`Privileged` is taken and does nothing; `DetachKeys` is kept, and every byte of the
+input reaches the command: a client detaches on its own side. A socket's server keeps
+256 exec instances at most, those whose command exited for ten minutes, and stays while
+it keeps one; one more while all of them run is refused with 503.
+
+A container's files are reached as `nspawn cp` reaches them, in a running machine or a
+stopped overlay or flat one, through the bus service's `StatPath`, `CopyFrom` and
+`CopyTo`. `HEAD /containers/ID/archive?path=P` says what is at the path in the
+`X-Docker-Container-Path-Stat` header: its name, size, mode, modification time and, for
+a link, which is not followed, where it leads inside the container. `GET` sends the path
+as a tar stream, never compressed, its top entry named after the path's last element
+(`.` for `DIR/.`, `/` for the root); a copy that fails after its first block cuts the
+stream short. `PUT` writes a tar stream, plain or compressed with gzip, bzip2, xz or
+zstd, beneath an existing directory, each entry by its own name, with the owners and
+modes the stream gives, or the container's user with `copyUIDGID`; with
+`noOverwriteDirNonDir` a directory and anything else never replace each other. A path
+that is not there is 404; a `PUT` to what is not a directory, or into a read-only root
+or volume, is 400, and so is any of the three at or below a volume of a container that
+does not run, which is mounted only while it runs. All three ask for `org.nspawn.manage`, as the bus methods behind
+them do, and a socket bound with `:ro` refuses them with 403.
+
+Volumes are made, removed and pruned through the bus service, as `nspawn volume` does
+it. A create takes the local driver and no driver options, as a volume of nspawn is a
+directory of the host, and a name of `[a-zA-Z0-9][a-zA-Z0-9_.-]+`; its labels are kept
+and listed. One made without a name gets 64 random hex digits and the mark of an
+anonymous volume, shown as the label `com.docker.volume.anonymous`; a create of a name
+that exists answers the volume as it is. A removal with `force` of a volume that is not
+there succeeds; a volume a machine's record names, running or not, is in use (409). A
+prune removes the unused volumes made without a name, or every unused one with `all`
+(and for clients of API versions before 1.42), those `label` and `label!` select.
+
+Networks are made, joined, left, removed and pruned as `nspawn network` does it. A
+create takes the bridge driver, one IPv4 subnet (a gateway given must be its first
+address; an IP range must be the whole subnet), `Internal` and labels, and any name of
+`[a-zA-Z0-9][a-zA-Z0-9_.-]*`: one no nspawn network can take gets a name made of it,
+and the API shows and finds the network by the name it was given. Driver options are
+taken and named in the answer's `Warning`; another driver, IPv6, auxiliary addresses,
+a swarm scope, ingress and config-only networks are refused with 400, `bridge`, `host`,
+`none` and `default` with 403, `veth`, a network mode of nspawn's, with 400, and a name
+another network has with 409. A connect takes
+aliases and an IPv4 address; links and IPv6 addresses are refused with 400. A network a
+machine's record names, running or not, is in use, and its removal is refused with 403.
+A prune removes the unused networks `until`, `label` and `label!` select. The network
+mode `default` is nspawn's default network.
+
+`DELETE /images/REF` removes the records that hold the image under that reference,
+every record of the image by its ID, or the record of that name, and answers with what
+it untagged and deleted. A container made from the image keeps it from going without
+`force` (409) while the image has no other name; with `force` the records go and the
+containers keep their image, which stays listed under their references. `POST
+/images/prune` removes nothing by default, as nspawn keeps no images without a name;
+with `dangling=false` it removes every image no container was made from, those `label`
+and `until` select, and refuses `label!` with 400. Loads, imports, tags, pushes, commits
+and builds of images answer 501 with "not supported", as reads of swarm objects and of a
+plugin do; the list of plugins is empty.
 
 Each machine has its own socket, `/run/nspawn/api/NAME.sock`, opened by systemd
 (`nspawn-api@NAME.socket`) before the machine starts and closed after it stops; the
@@ -591,10 +682,12 @@ stays across restarts and updates. The tools that look for their own container i
 the socket.
 
 What one socket's clients hold at once is bounded: 64 connections (one more is closed at
-once; on the host's socket a user other than root holds 16 at most, and root's are not
-counted), 16 of them logs, events or attach streams, each running a `journalctl`, and 16
-waits and attaches, each holding a connection to the system bus (one more of either gets
-503). Stats streams count as connections only.
+once), 16 of them logs, events or attach streams, each running a `journalctl`, and 16
+waits and attaches, each holding a connection to the system bus, and 64 exec commands that
+run (one more of any of these gets 503). Stats streams count as connections only. On the
+host's socket a user other than root holds a quarter of the connections and of the exec
+commands and half of the streams and of the waits at most, and root's are not counted,
+so that no user keeps the others or root out.
 
 ### Updates of the image a tag names
 
@@ -721,7 +814,9 @@ for tools such as a reverse proxy that configures itself from them.
 ### cp
 
 `cp` copies files and directories between the host and a machine, running or not (a
-stopped mstack machine excepted: its tree only exists while it runs): an existing
+stopped mstack machine excepted: its tree only exists while it runs; in a stopped
+machine a path in one of its volumes is refused, as they are mounted only while it
+runs): an existing
 directory receives the source under its own name, anything else is the name of the
 copy, and `DIR/.` copies the contents of DIR. What goes in belongs to
 root inside the machine, whatever user namespace it runs in; what comes out belongs to
@@ -846,8 +941,10 @@ never has (a tag pulled or built again replaces its record). `system prune` remo
 stopped machines made from an image (by `create` or `run`), networks no machine uses and
 the build cache no image uses; with `-a` also the images no machine was made from and
 the whole build cache. A pulled or built image that was started is the image as well and
-stays. `--filter label=...` and `until=...` narrow what goes, networks included (a
-label filter leaves the build cache alone), and `-f` skips the question.
+stays. `--volumes` also removes the volumes no machine uses that were made without a
+name, which only the Docker API makes. `--filter label=...` and `until=...` narrow what
+goes, networks and volumes included (a label filter leaves the build cache alone, and
+`until` is refused with `--volumes`), and `-f` skips the question.
 
 ## Compose
 
@@ -1015,7 +1112,11 @@ another name on a network; `--network none` gives it no interface but `lo`.
 `network ls` lists the networks, `network rm` and `network prune` remove the ones no
 machine joins, bridge and rules included; `network create --label KEY=VALUE` tags one,
 and `network prune --filter label=KEY[=VALUE]` (or `until=`) removes only the unused
-ones it selects.
+ones it selects. A network made through the Docker API under a name no nspawn network
+can take (`ci.net`, or one longer than 64 characters) gets one made of it
+(`ci-net-` and eight hex digits), which `network ls` shows; `--network`,
+`--network-alias NETWORK=NAME`, `--ip NETWORK=IP`, `network inspect`, `rm`,
+`connect` and `disconnect` take either name.
 
 `--network container:NAME` puts an app machine in the network namespace of NAME: the
 same interfaces and address, NAME's hosts and resolv.conf files, nothing of its own, and

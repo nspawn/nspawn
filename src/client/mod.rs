@@ -94,6 +94,8 @@ pub trait Manager {
     #[zbus(allow_interactive_auth)]
     fn machine_stats(&self, names: &[String]) -> zbus::Result<Vec<Dict>>;
     #[zbus(allow_interactive_auth)]
+    fn stat_path(&self, machine: &str, path: &str) -> zbus::Result<Dict>;
+    #[zbus(allow_interactive_auth)]
     fn copy_from(
         &self,
         machine: &str,
@@ -119,7 +121,9 @@ pub trait Manager {
     #[zbus(allow_interactive_auth)]
     fn list_volumes(&self) -> zbus::Result<Vec<Dict>>;
     #[zbus(allow_interactive_auth)]
-    fn create_volume(&self, name: &str) -> zbus::Result<String>;
+    fn get_volume(&self, name: &str) -> zbus::Result<Dict>;
+    #[zbus(allow_interactive_auth)]
+    fn create_volume(&self, name: &str, options: Options<'_>) -> zbus::Result<Dict>;
     #[zbus(allow_interactive_auth)]
     fn remove_volumes(&self, names: &[String]) -> zbus::Result<OwnedObjectPath>;
     #[zbus(allow_interactive_auth)]
@@ -273,6 +277,8 @@ pub trait Process {
     fn state(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn exit_status(&self) -> zbus::Result<i32>;
+    #[zbus(property)]
+    fn pid(&self) -> zbus::Result<u32>;
     fn signal(&self, signal: i32) -> zbus::Result<()>;
     #[zbus(signal)]
     fn exited(&self, status: i32) -> zbus::Result<()>;
@@ -321,6 +327,11 @@ impl Ended {
             lost,
             owner,
         })
+    }
+
+    /// The process's PID on the host.
+    pub async fn pid(&self) -> Result<u32> {
+        self.proxy.pid().await.map_err(error)
     }
 
     /// Sends the process a signal (a run: its program, or a booted machine's poweroff).
@@ -716,6 +727,17 @@ impl std::fmt::Display for JobFailed {
 
 impl std::error::Error for JobFailed {}
 
+/// What a removal job that failed did before, when it says so (`removed`, even empty);
+/// the error as it came otherwise, a job that failed before it removed anything among
+/// them.
+pub fn removed_before(e: anyhow::Error) -> Result<Dict, anyhow::Error> {
+    match e.downcast::<JobFailed>() {
+        Ok(failed) if failed.result.contains_key("removed") => Ok(failed.result),
+        Ok(failed) => Err(anyhow::Error::new(failed)),
+        Err(e) => Err(e),
+    }
+}
+
 /// A job's result, also when it failed after part of its work: the failure is said,
 /// and what was done still counts.
 pub fn partly(outcome: Result<Dict>) -> Result<Dict> {
@@ -1005,6 +1027,26 @@ mod tests {
         let kept = super::partly(Err(failed.into())).unwrap();
         assert_eq!(super::strings(&kept, "removed"), ["a"]);
         assert!(super::partly(Err(anyhow::anyhow!("the service went away"))).is_err());
+    }
+
+    #[test]
+    fn a_removal_that_failed_before_removing_anything_is_an_error() {
+        let failed = |result: super::Dict| super::JobFailed {
+            error: super::ServiceError {
+                name: "org.nspawn.Error.Failed".to_string(),
+                message: "reading the records".to_string(),
+            },
+            result,
+        };
+        let empty =
+            zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::from(Vec::<String>::new()))
+                .unwrap();
+        let partial = super::Dict::from([("removed".to_string(), empty)]);
+        assert!(super::removed_before(failed(partial).into()).is_ok());
+        let e = super::removed_before(failed(super::Dict::new()).into()).unwrap_err();
+        assert_eq!(super::error_name(&e), Some("Failed"));
+        assert_eq!(format!("{e:#}"), "reading the records");
+        assert!(super::removed_before(anyhow::anyhow!("plain")).is_err());
     }
 
     #[test]

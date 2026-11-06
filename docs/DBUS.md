@@ -46,8 +46,8 @@ a client chooses the registry, never the policy.
 Every user may call; who may do what is polkit's answer. `ListImages`,
 `GetImage`, `Generate`, `ListMachines`, `GetMachine`, `MachineStats`,
 `MachineProcesses`, `WaitMachine`, `Events`, `ListNetworks`, `GetNetwork`,
-`ListVolumes`, `ListSecrets`, `GetSecret`, `DiskUsage` and `BuildCacheUsage` ask
-for `org.nspawn.inspect`. Every other method asks for `org.nspawn.manage`: those
+`ListVolumes`, `GetVolume`, `ListSecrets`, `GetSecret`, `DiskUsage` and
+`BuildCacheUsage` ask for `org.nspawn.inspect`. Every other method asks for `org.nspawn.manage`: those
 that change something, run something inside a machine, or use the registry
 credentials kept here, so `Logs`, `SearchImages`, `ListRepositories`,
 `ListTags` and `ImageDigest` among them. What inspect shows includes every
@@ -271,7 +271,7 @@ error that says so.
 | `ListMachines(b all) -> aa{sv}` | `ps`, `ps -a` | the machines that run (and, with `all`, every machine nspawn keeps a record of; a restarting one is listed without it too), each a record and its machine keys (see Records) |
 | `GetMachine(s name) -> a{sv}` | `inspect` | one machine as `ListMachines` has it, running or not; fails for a name that neither runs nor has a record |
 | `StartMachine(s name, a{sv} options) -> (s, as)` | `start` | the machine options (see Machine options); "started", "ended" (the program returned before the machine registered) or "restarting" (it ended and its restart policy brings it back), and the notes made on the way |
-| `RunMachine(s name, a{sv} options, a{sh} fds) -> (a{sh}, o, as)` | `run` without `-d` | starts, attached, a machine that `PullImage` or `CreateMachine` made; options those of `StartMachine` (wait defaults to false, remove is `--rm`), tty (b), rows and cols (t, 24 and 80), term (s, xterm); descriptor stdin for the program's input without tty. An app gets a pseudo terminal with tty, its master under "tty"; otherwise the machine's output, a line at a time, under "stdout". Returns the streams, a process object with the run's exit status (the program's, or 128 plus the signal it died of, 137 after SIGKILL), and the start's notes. A transient unit removes a `--rm` machine once the machine's unit is down |
+| `RunMachine(s name, a{sv} options, a{sh} fds) -> (a{sh}, o, as)` | `run` without `-d` | starts, attached, a machine that `PullImage` or `CreateMachine` made; options those of `StartMachine` (wait defaults to false, remove is `--rm`), tty (b), rows and cols (t, 24 and 80), term (s, xterm), straight (b, an app without tty); descriptor stdin for the program's input without tty. An app gets a pseudo terminal with tty, its master under "tty"; otherwise the machine's output, a line at a time, under "stdout", or with straight the program's standard output and error as it writes them, kept out of the journal, which drops empty lines. Returns the streams, a process object with the run's exit status (the program's, or 128 plus the signal it died of, 137 after SIGKILL), and the start's notes. A machine whose previous run is still going away (its unit stopping, machined listing it) is waited for, up to 30 seconds, as `StartMachine` does. A transient unit removes a `--rm` machine once the machine's unit is down |
 | `StopMachine(s name, a{sv} options) -> (s, as)` | `stop` | options force, wait (default true), timeout (seconds; the machine's stop_timeout by default, else 10; a day at most, or 18446744073709551615 to wait for as long as it takes, as `stop -t -1` asks), signal (s, a name or a number: sent first instead of the machine's stop signal, to an app's program or a booted machine's init, the timeout and SIGKILL after it); "stopped" or "was-not-running", and the notes (a program that had to be killed) |
 | `RestartMachine(s name, a{sv} options) -> (s, as)` | `restart` | options timeout, signal, as for `StopMachine`; the machine stopped when it runs (a paused one too) as `StopMachine` with wait stops it, then started with what it has as `StartMachine` with wait; `StartMachine`'s outcome, and the notes of both |
 | `WaitMachine(s name, a{sv} options) -> o` | `wait` | option condition (s): not-running (the default), next-exit or removed; a job of kind "wait" whose result is exit_code (i, the program's, or 128 plus the signal it died of). not-running ends at once for a machine that does not run, a restarting one included, with its last run's code (0 for one that never ran), and otherwise at the end of its run, whether its restart policy brings it back or not; next-exit at the end of its next run; removed once its record is gone, with the last run's code. The removal of the machine ends a wait of any condition, with that code. A name with no record and no machine is refused by the call itself. The job ends when its caller leaves the bus |
@@ -285,8 +285,9 @@ error that says so.
 | `AutoUpdate(as names, a{sv} options) -> o` | `auto-update` | the machines labelled org.nspawn.auto-update=registry (or io.containers.autoupdate=registry), or the ones named, are made anew from the image their reference names now at its registry, with every option they had, started when they ran, and put back when they do not come up (healthy, with a healthcheck). Option dry_run (b) only looks. A job; each machine's outcome is an `auto-update` event |
 | `Exec(s machine, as argv, s user, a{sv} options) -> (a{sh}, o)` | `exec` | user `""` for the machine's own (its --user, else its image's USER; root without either, and on a booted machine); options tty (default true), rows and cols (t, 24 and 80), env (as, the caller's `TERM=` among them; xterm otherwise on a terminal), workdir (s, instead of the machine's), detach (b: no streams come back, the output is discarded and the command runs on); returns the streams ("tty", or "stdin", "stdout", "stderr") and a process object |
 | `Shell(s machine, s user, a{sv} options) -> (h, s)` | `shell` | user `""` for root; the login session machined offers for a booted machine: its pseudo terminal and the terminal's path; options env, as for `Exec`; apps get `Exec` of a shell with a tty instead |
-| `CopyFrom(s machine, s path, a{sv} options) -> (h, o)` | `cp NAME:PATH ...` | a tar stream of `path` on the pipe, owners as the machine sees them, and a job with the outcome; a running machine, or a stopped overlay or flat one; options: none |
-| `CopyTo(s machine, s path, h stream, a{sv} options) -> o` | `cp ... NAME:PATH` | the tar stream read from `stream` unpacked at `path` by `cp`'s rules (see USAGE.md), everything root's inside; option contents (b: the source was `DIR/.`); a job |
+| `StatPath(s machine, s path) -> a{sv}` | | what lstat says of `path` inside a running machine, or a stopped overlay or flat one, its last component not followed unless `path` ends in `/`, `/.` or `/..`: name (s, the last element of `path`, slashes at the end left out: `/` for the root, `.` for `DIR/.`), size (t), mode (u, st_mode, its type bits included), mtime (x, unix nanoseconds), link_target (s: for a link, where it leads inside the machine as an absolute path, every link on the way followed and what is missing taken as written; empty for anything else); `NoSuchPath` when the path, or a directory on the way, is not there; `Invalid` for an empty path, and for a path at or below a volume of a stopped machine, which is mounted only while it runs |
+| `CopyFrom(s machine, s path, a{sv} options) -> (h, o)` | `cp NAME:PATH ...` | a tar stream of `path` on the pipe, owners as the machine sees them, and a job with the outcome; a running machine, or a stopped overlay or flat one; option name (s): the name of the stream's top entry, the entries below it named under it byte for byte and a directory with a slash after it: one name of a path, `.` (entries `./` and `./NAME`) or `/` (entries `/` and `/NAME`); without it the top is named as `cp` names it. A path that is not there fails the job with `NoSuchPath`; one at or below a volume of a stopped machine, mounted only while it runs, is `Invalid` |
+| `CopyTo(s machine, s path, h stream, a{sv} options) -> o` | `cp ... NAME:PATH` | the tar stream read from `stream` unpacked at `path` by `cp`'s rules (see USAGE.md), everything root's inside; option contents (b: the source was `DIR/.`); a job. Option extract (b), which excludes contents: the stream, plain or compressed with gzip, bzip2, xz or zstd, written beneath `path`, an existing directory once its links are followed (`NoSuchPath` when nothing is there, `Invalid` for anything else), each entry by its own name: a leading `/` dropped, a name or a relative link that leads above `path` refused, the directories an entry implies made with mode 0755 and root's owner, owners (those outside the machine's 65536 IDs as 65534) and modes from the headers, a directory of the stream merged into one that is there and giving it its owner and mode, anything else there replaced (a directory with all it holds, never across a mount); sockets, devices and fifos are left out with a note. With extract: owner (s, USER[:GROUP], each a name the machine's /etc/passwd or /etc/group lists or a number, as the user a container's files get: every entry's owner instead of its header's; empty is none) and no_overwrite_dir_non_dir (b: a directory never replaces anything else, nor anything else a directory). A read-only root where no writable volume is mounted over `path`, a volume mounted read-only there, or any read-only mount at `path`, is `Invalid`, and so is a path at or below a volume of a stopped machine (mounted only while it runs; an entry that would land there fails the job). These checks answer the call itself, before the job starts |
 | `Events(a{sv} options) -> (a{sh}, o)` | `events` | options since, until (journalctl's time syntax; without until it follows, and until needs since), filters (as: name= or machine=, type=, event= or action=, label=KEY or KEY=VALUE); under "stdout" one JSON event per line (see Events), journalctl's complaints under "stderr", and a process object for its end; a user other than root holds 64 streams at once at most |
 | `Logs(s machine, a{sv} options) -> (a{sh}, o)` | `logs` | options follow, lines, since, until (journalctl's time syntax; with until nothing is followed), timestamps, all, inside, json (b: journalctl's JSON entries, one a line, for a client that writes each line's time itself); journalctl's "stdout" and "stderr" and a process object for its exit status. Lines from before the machine was created (a removed machine of the same name) are left out; a local machine's lines come from nspawn's journal namespace and the system's journal interleaved; journalctl is stopped once nobody reads its output. A machine whose log_driver is none is refused unless inside is set |
 
@@ -303,8 +304,9 @@ devpts, so `tty` and everything that opens its terminal by name work there.
 
 | Method | Like | Notes |
 |---|---|---|
-| `ListVolumes() -> aa{sv}` | `volume ls` | name, path, used_by (the machines whose records mount it), created |
-| `CreateVolume(s name) -> s` | `volume create` | the volume's path; one that exists already is not an error |
+| `ListVolumes() -> aa{sv}` | `volume ls` | name, path, used_by (as, the machines whose records mount it), created (t, unix seconds: kept by `CreateVolume`, else the directory's birth time), labels (a{ss}, given to `CreateVolume`), anonymous (b, the mark `CreateVolume` gave) |
+| `GetVolume(s name) -> a{sv}` | `volume inspect` | one volume as `ListVolumes` lists it; `NoSuchVolume` for a name that is none |
+| `CreateVolume(s name, a{sv} options) -> a{sv}` | `volume create` | options labels (as, KEY=VALUE), anonymous (b: made by the Docker API without a name, which its prune takes without `all`), kept beside the volume's directory, never inside it; an empty name makes one of 64 random hex digits; one that exists already is not an error and stays as it is, labels and mark included; a name that is none is `Invalid`, a path of the name that is not a directory `Exists`; the volume as `ListVolumes` lists it |
 | `RemoveVolumes(as names) -> o` | `volume rm` | a job: every name is tried, and it fails at the end when one was in use, unknown or not a volume |
 | `PruneVolumes() -> o` | `volume prune` | a job removing every volume no machine uses |
 
@@ -321,14 +323,32 @@ devpts, so `tty` and everything that opens its terminal by name work there.
 
 | Method | Like | Notes |
 |---|---|---|
-| `ListNetworks() -> aa{sv}` | `network ls` | every network, the default one ("bridge") first: name, interface, subnet, gateway, internal, created, labels (a{ss}), machines (as, every machine joining it) |
+| `ListNetworks() -> aa{sv}` | `network ls` | every network, the default one ("bridge") first: name, interface, subnet, gateway, internal, created, labels (a{ss}), api_name (s, the name the Docker API knows it by, where it is not its own; absent otherwise), machines (as, every machine joining it) |
 | `GetNetwork(s name) -> (a{sv}, aa{sv})` | `network inspect` | the network as above without machines, and its machines (name, address on this network, aliases (as) on it, ports, running) |
-| `CreateNetwork(s name, a{sv} options) -> a{sv}` | `network create` | options subnet (CIDR; the next free /24 of network_pool otherwise), internal (b), labels (as, KEY=VALUE); the network as `GetNetwork`'s first value has it, plus notes (as) |
-| `RemoveNetworks(as names) -> o` | `network rm` | a job; a network in use, unknown or the default one is refused without stopping the others |
+| `CreateNetwork(s name, a{sv} options) -> a{sv}` | `network create` | options subnet (CIDR; the next free /24 of network_pool otherwise), internal (b), labels (as, KEY=VALUE), api_name (s, see below); the network as `GetNetwork`'s first value has it, plus notes (as) |
+| `RemoveNetworks(as names) -> o` | `network rm` | a job; a network in use, unknown or the default one is refused without stopping the others; the result's removed lists the names as given |
 | `PruneNetworks() -> o` | `network prune` | a job removing every user-defined network no machine names; it fails at the end when one could not go |
 | `ConnectNetwork(s network, s machine, a{sv} options) -> o` | `network connect` | the machine joins the network: at once when it runs, from its next start as any network it joins; options aliases (as), address (s, a fixed IPv4 address on a network made with `CreateNetwork`); a job |
 | `DisconnectNetwork(s network, s machine, a{sv} options) -> o` | `network disconnect` | the machine leaves the network, at once when it runs; option force (b: a machine or a membership that is not there is no error); a job |
 | `NetworkUp() -> a{sv}` | `network up` | every network's bridge comes up; the default network (bridge, subnet, gateway, host_name), networks (as, every network) and notes |
+
+A network has a name of its own, 1 to 64 letters, digits, `_` and `-` not
+starting with `-`, which its bridge and the machines' records use, and may have
+an API name, given as
+`CreateNetwork`'s option api_name: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, 1024 bytes at
+most, none of bridge, veth, host, none and default (`Invalid` otherwise). With
+`name` empty the network's name is made of it: the API name itself when it is a
+network name, else its runs of characters other than letters and digits each
+one `-`, cut to 55 bytes, `-` and the first 8 hex digits of its SHA-256, as a
+machine's is. Every name, own or API, leads to one network: a create whose own
+name or API name another network has, as either, is `Exists`. The API name is
+kept, and shown as api_name, only when it is not the own name. `GetNetwork`,
+`RemoveNetworks`, `ConnectNetwork` and `DisconnectNetwork` take a network by its
+API name first, then by its own; so do the options network, networks, and the
+NETWORK of aliases and addresses, of `CreateMachine`, `StartMachine` and
+`RunMachine`, which keep the network's own name in the record. A name only an
+API name can be (one with a `.`, or longer than 64 bytes) that no network has is
+`NoSuchNetwork`.
 
 ### Signals
 
@@ -364,7 +384,7 @@ entries are PID 1's about `systemd-nspawn@` units and nspawn's own (message ID
 | Type | Actions | Attributes of every action | The action's own |
 |---|---|---|---|
 | `machine` | `start`, `die`, `stop`, `restart`, `oom`, `fail` (systemd's, for every `systemd-nspawn@` unit), `pull`, `build`, `create`, `push`, `kill`, `update`, `pause`, `unpause`, `health_status`, `auto-update`, `remove` (nspawn's) | `image` (the record's reference), `created` (which machine of the name it was), `api_name` (nspawn's actions, when the record has one) | `die`: `code` (`exited`, `killed`, `dumped`), `exit_code` (that run's exit code, the program's or 128 plus its signal: from the signal nspawn sent to it while the record exists, from the status systemd logged once it is gone), `signal`; `restart`: `restarts`; `fail`: `result`; `pull`: `reference`, `signed_by` (when a signature was verified); `build`: `reference`; `create`: `from`, `reference`; `push`: `reference` (the destination); `kill`: `signal`; `health_status`: `status`; `auto-update`: `result`, `from`, `to` |
-| `network` | `create`, `remove`, `connect`, `disconnect` | `subnet`, `interface`, `internal`, `created` | `connect`, `disconnect`: `container`, `container_created` |
+| `network` | `create`, `remove`, `connect`, `disconnect` | `subnet`, `interface`, `internal`, `created`, `api_name` (when the network has one); the event's name is the network's own | `connect`, `disconnect`: `container`, `container_created` |
 | `volume` | `create`, `remove` | `path` | |
 | `secret` | `create`, `remove` | `size` (bytes of the plaintext) | |
 
@@ -378,11 +398,12 @@ prints.
 |---|---|
 | `Failed` | anything the others do not name |
 | `NotAuthorized` | polkit refused the caller |
-| `NoSuchMachine` | a machine method names nothing: no record and no machine (`GetMachine`, `StartMachine`, `RunMachine`, `StopMachine`, `RestartMachine`, `KillMachine`, `PauseMachine`, `UnpauseMachine`, `UpdateMachine`, `WaitMachine`, `MachineProcesses`, `Exec`, `Shell`, `Logs`, `CopyFrom`, `CopyTo`, `RemoveMachines`, the machine of `ConnectNetwork` and `DisconnectNetwork`) |
+| `NoSuchMachine` | a machine method names nothing: no record and no machine (`GetMachine`, `StartMachine`, `RunMachine`, `StopMachine`, `RestartMachine`, `KillMachine`, `PauseMachine`, `UnpauseMachine`, `UpdateMachine`, `WaitMachine`, `MachineProcesses`, `Exec`, `Shell`, `Logs`, `StatPath`, `CopyFrom`, `CopyTo`, `RemoveMachines`, the machine of `ConnectNetwork` and `DisconnectNetwork`) |
 | `NoSuchImage` | the source of `CreateMachine` is no local image; `GetImage` and `RemoveImages` of an image that is not there; `ImageDigest` of a reference its registry has nothing for |
 | `NoSuchNetwork` | a network named that does not exist |
-| `NoSuchVolume` | `RemoveVolumes` of a volume that does not exist |
-| `Exists` | a name taken: `CreateMachine` and `PullImage` without force, or with image_only over a record that ran, an API name in use, `CreateNetwork`, `CreateSecret`, a second `ConnectNetwork` |
+| `NoSuchVolume` | `RemoveVolumes` and `GetVolume` of a volume that does not exist |
+| `NoSuchPath` | a path inside a machine that is not there: `StatPath`, `CopyFrom` (its job), `CopyTo` with extract |
+| `Exists` | a name taken: `CreateMachine` and `PullImage` without force, or with image_only over a record that ran, an API name in use, `CreateNetwork` (an own or API name another network has), `CreateSecret`, a second `ConnectNetwork`, `CreateVolume` of a name whose path is not a directory |
 | `InUse` | a removal refused because something uses what it names: a machine that runs (without force) or that another one needs, a volume, a network or a secret a machine names |
 | `NotRunning` | what needs a running machine, of one that does not run (`KillMachine`, `PauseMachine`, `UnpauseMachine`, `MachineProcesses`, `Exec`, `Shell`) |
 | `AlreadyRunning` | `StartMachine` and `RunMachine` of a machine that runs, or is starting |

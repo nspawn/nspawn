@@ -130,6 +130,20 @@ cleanup_machines() {
     $NSPAWN rm -f "$m" >/dev/null 2>&1 || true
   done
   $NSPAWN images rm e2e-dk-cli e2e-dk-bb >/dev/null 2>&1 || true
+  # Its volumes and networks: by the run's label, or by the names it gave them.
+  for v in $($NSPAWN volume ls --json 2>/dev/null | python3 -c 'import json, sys
+for v in json.load(sys.stdin):
+    if (v.get("labels") or {}).get("e2e.dk") == "1" or v["name"].startswith("e2e-dk-"):
+        print(v["name"])'); do
+    $NSPAWN volume rm "$v" >/dev/null 2>&1 || true
+  done
+  for n in $($NSPAWN network ls --json 2>/dev/null | python3 -c 'import json, sys
+for n in json.load(sys.stdin):
+    names = (n["name"], n.get("api_name") or "")
+    if (n.get("labels") or {}).get("e2e.dk") == "1" or any(x.startswith(("e2e-dk-", "e2e_dk")) for x in names):
+        print(n["name"])'); do
+    $NSPAWN network rm "$n" >/dev/null 2>&1 || true
+  done
   rm -rf /tmp/e2e-dk.* /tmp/e2e-dk-missing-*
   rm -rf /tmp/e2e-compose-api
   $NSPAWN secret rm e2e-pw e2e-pw2 e2e-gen-pw >/dev/null 2>&1 || true
@@ -3247,15 +3261,16 @@ assert any(c["Names"] == ["/e2e-hapi-made"] and c["SizeRootFs"] > 0 for c in df[
 assert any(v["Name"] == "e2e-hapi-vol" and v["UsageData"]["RefCount"] == 0 for v in df["Volumes"])
 ' "$config" || fail "system df: $(echo "$out" | head -c 600)"
 # The drop-in the documentation gives links /run/docker.sock to it, on a host where that
-# path is free; stopping the socket takes the link away.
-if [ ! -e /run/docker.sock ]; then
+# path is free, not even a dangling link of the host's there; stopping the socket takes
+# the link away.
+if [ ! -e /run/docker.sock ] && [ ! -L /run/docker.sock ]; then
   dropin=/etc/systemd/system/nspawn-api.socket.d/e2e-docker.conf
   mkdir -p "$(dirname "$dropin")"
   printf '[Socket]\nSymlinks=/run/docker.sock\n' > "$dropin"
   systemctl daemon-reload && systemctl restart nspawn-api.socket
   [ "$(curl -sS --unix-socket /var/run/docker.sock http://docker/_ping 2>&1)" = OK ] || fail "_ping through the link the drop-in makes: $(journalctl -u nspawn-api.socket -n 3 --no-pager)"
   systemctl stop nspawn-api.socket
-  [ -e /run/docker.sock ] && fail "the link stayed after the socket stopped"
+  { [ -e /run/docker.sock ] || [ -L /run/docker.sock ]; } && fail "the link stayed after the socket stopped"
   rm -f "$dropin"
   rmdir "$(dirname "$dropin")" 2>/dev/null || true
   systemctl daemon-reload && systemctl start nspawn-api.socket
@@ -3309,9 +3324,9 @@ echo "$out" | grep_q "attached-$nonce" || fail "docker run in the foreground did
 retry 15 bash -c "! $NSPAWN ps -a | grep_q '^ *e2e-dk-f '" || fail "the --rm container of a foreground run stayed"
 out=$(timeout 120 "$dk_dir/dk" run --rm -t --label e2e.dk=1 e2e-dk-bb echo tty-$nonce 2>&1) || fail "docker run -t: $out"
 echo "$out" | grep_q "tty-$nonce" || fail "docker run -t did not show the output: $out"
-# The engine's client says no more of a refused upgrade than its status.
-out=$(dk run --rm -i --label e2e.dk=1 e2e-dk-bb true </dev/null 2>&1) && fail "an attach of the input succeeded"
-echo "$out" | grep_q "received 501" || fail "the refusal of an attach of the input: $out"
+# run -i: the input goes through the attach, and its end is the end of the program's.
+out=$(echo "in-$nonce" | timeout 120 "$dk_dir/dk" run --rm -i --label e2e.dk=1 e2e-dk-bb cat 2>&1) || fail "docker run -i: $out"
+[ "$out" = "in-$nonce" ] || fail "docker run -i did not give its input back: $out"
 # A client that does not upgrade reads the stream as the body of a 200, which ends with
 # the run; a wait answers once the output is out.
 cid=$(dk create --label e2e.dk=1 e2e-dk-bb sh -c "echo plain-$nonce") || fail "docker create for an attach"
@@ -3410,7 +3425,127 @@ out=$($NSPAWN run --rm -v /run/nspawn/api.sock:/var/run/docker.sock "$dockercli_
 out=$($NSPAWN run --rm -v /run/nspawn/api.sock:/var/run/docker.sock:ro "$dockercli_ref" docker rm -f e2e-dk-inner 2>&1) && fail "a read-only bind of the socket removed a container"
 echo "$out" | grep_q "binds nspawn's Docker API read-only" || fail "the read-only refusal: $out"
 dk rm -f e2e-dk-inner >/dev/null 2>&1
-rm -rf "$dk_dir" "/tmp/e2e-dk-missing-$nonce"
+rm -rf "/tmp/e2e-dk-missing-$nonce"
+
+step "Docker API: exec, input, cp, volumes, networks and image removal through the docker CLI"
+# The client, image and pull of the step above.
+dkt() { timeout 120 "$dk_dir/dk" "$@"; }
+dk run -d --name e2e-dk-x --label e2e.dk=1 e2e-dk-bb sleep 600 >/dev/null || fail "docker run -d e2e-dk-x"
+dk create --name e2e-dk-y --label e2e.dk=1 e2e-dk-bb true >/dev/null || fail "docker create e2e-dk-y"
+head -c 1048576 /dev/urandom > "$dk_dir/blob"
+sum=$(sha256sum < "$dk_dir/blob" | cut -d' ' -f1)
+# exec: the input to its end, the streams apart, exit codes, env, workdir, user, a terminal.
+out=$(echo "x-$nonce" | dkt exec -i e2e-dk-x cat 2>&1)
+[ "$out" = "x-$nonce" ] || fail "docker exec -i: $out"
+[ "$(dkt exec -i e2e-dk-x cat < "$dk_dir/blob" | sha256sum | cut -d' ' -f1)" = "$sum" ] || fail "docker exec -i did not carry 1 MiB both ways whole"
+dkt exec e2e-dk-x sh -c 'exit 3' >/dev/null 2>&1
+code=$?
+[ "$code" = 3 ] || fail "docker exec exited $code, not 3"
+out=$(dkt exec e2e-dk-x sh -c 'echo to-out; echo to-err >&2' 2>/dev/null)
+[ "$out" = to-out ] || fail "docker exec: stdout carried $out"
+out=$(dkt exec e2e-dk-x sh -c 'echo to-out; echo to-err >&2' 2>&1 >/dev/null)
+[ "$out" = to-err ] || fail "docker exec: stderr carried $out"
+out=$(dkt exec -e "E2E_A=two words" -w /tmp -u 1234:5678 e2e-dk-x sh -c 'echo "$E2E_A|$(pwd)|$(id -u):$(id -g)"' 2>&1)
+[ "$out" = "two words|/tmp|1234:5678" ] || fail "docker exec -e -w -u: $out"
+out=$(pyrun timeout --foreground 120 "$dk_dir/dk" exec -t e2e-dk-x sh -c 'tty; exit 5' </dev/null 2>&1)
+code=$?
+[ "$code" = 5 ] || fail "docker exec -t exited $code: $out"
+echo "$out" | grep_q /dev/pts/ || fail "docker exec -t has no terminal: $out"
+out=$(dkt exec e2e-dk-y true 2>&1) && fail "an exec in a container that does not run succeeded"
+echo "$out" | grep_q "is not running" || fail "exec in a container that does not run: $out"
+# run -i and start -ai: GitLab Runner's way, an attach of the input before every start of
+# a stopped container.
+[ "$(dkt run --rm -i --label e2e.dk=1 e2e-dk-bb wc -c < "$dk_dir/blob" | tr -d ' ')" = 1048576 ] || fail "docker run -i did not carry 1 MiB"
+# The output comes byte for byte: empty lines, NULs and a leading <N> too.
+[ "$(dkt run --rm -i --label e2e.dk=1 e2e-dk-bb cat < "$dk_dir/blob" | sha256sum | cut -d' ' -f1)" = "$sum" ] || fail "docker run -i did not carry 1 MiB both ways whole"
+out=$(printf 'a\n\n<3>b\n' | dkt run --rm -i --label e2e.dk=1 e2e-dk-bb cat | od -An -c | tr -s ' ')
+[ "$out" = " a \n \n < 3 > b \n" ] || fail "docker run -i changed the lines it gave back: $out"
+dkt run --rm -i --label e2e.dk=1 e2e-dk-bb true < "$dk_dir/blob" || fail "docker run -i of a program that reads none of its input"
+dk create -i --name e2e-dk-sai --label e2e.dk=1 e2e-dk-bb sh -c 'read l; echo "got-$l"; exit 4' >/dev/null || fail "docker create -i"
+for word in first second; do
+  out=$(echo "$word" | dkt start -ai e2e-dk-sai 2>&1)
+  code=$?
+  [ "$code:$out" = "4:got-$word" ] || fail "docker start -ai ($word) exited $code: $out"
+done
+out=$(printf 'tin\n' | pyrun timeout --foreground 120 "$dk_dir/dk" run --rm -it --label e2e.dk=1 e2e-dk-bb sh -c 'read l; echo "got-$l"' 2>&1 | tr -d '\r')
+echo "$out" | grep_q got-tin || fail "docker run -it: $out"
+# cp both ways: modes, owners, links, directories, a tar on stdout, a container that does
+# not run.
+h=$dk_dir/cp
+mkdir -p "$h/dir/sub" "$h/out"
+echo "file-$nonce" > "$h/f"
+chmod 640 "$h/f"
+chown 1234:1234 "$h/f"
+echo b > "$h/dir/sub/b"
+ln -s f "$h/lnk"
+dkt cp "$h/f" e2e-dk-x:/tmp/f >/dev/null || fail "docker cp of a file in"
+[ "$(dkt exec e2e-dk-x sh -c 'stat -c "%a %u:%g" /tmp/f; cat /tmp/f' 2>&1 | tr '\n' ' ')" = "640 1234:1234 file-$nonce " ] || fail "the file copied in: $(dkt exec e2e-dk-x ls -ln /tmp 2>&1)"
+dkt cp "$h/dir" e2e-dk-x:/tmp/ >/dev/null || fail "docker cp of a directory in"
+[ "$(dkt exec e2e-dk-x cat /tmp/dir/sub/b 2>&1)" = b ] || fail "the directory copied in"
+dkt cp "$h/lnk" e2e-dk-x:/tmp/lnk >/dev/null || fail "docker cp of a link in"
+[ "$(dkt exec e2e-dk-x readlink /tmp/lnk 2>&1)" = f ] || fail "a link copied in is not the link"
+dkt exec e2e-dk-x sh -c 'mkdir -p /tmp/src/sub && echo y > /tmp/src/sub/y && ln -s y /tmp/src/sub/ly' || fail "make /tmp/src in e2e-dk-x"
+dkt cp e2e-dk-x:/tmp/src "$h/out/" >/dev/null || fail "docker cp of a directory out"
+[ "$(cat "$h/out/src/sub/y" 2>&1) $(readlink "$h/out/src/sub/ly" 2>&1)" = "y y" ] || fail "the directory copied out: $(ls -lR "$h/out" 2>&1)"
+[ "$(dkt cp e2e-dk-x:/tmp/src/sub/y - | tar -tf - 2>&1)" = y ] || fail "docker cp to - did not write a tar of y"
+out=$(dkt cp e2e-dk-x:/no/such/path "$h/out/" 2>&1) && fail "docker cp of a path that is not there succeeded"
+echo "$out" | grep_q /no/such/path || fail "docker cp of a path that is not there: $out"
+dkt cp "$h/f" e2e-dk-y:/tmp/f >/dev/null || fail "docker cp into a container that does not run"
+dkt cp e2e-dk-y:/tmp/f "$h/out/from-y" >/dev/null || fail "docker cp out of a container that does not run"
+[ "$(cat "$h/out/from-y" 2>&1)" = "file-$nonce" ] || fail "the file copied out of e2e-dk-y"
+# Volumes: labels from both sides, an unnamed one, prune by label with and without --all.
+[ "$(dkt volume create --label e2e.dk=1 e2e-dk-v1 2>&1)" = e2e-dk-v1 ] || fail "docker volume create e2e-dk-v1"
+anon=$(dkt volume create --label e2e.dk=1 2>&1)
+[[ $anon =~ ^[0-9a-f]{64}$ ]] || fail "docker volume create without a name gave $anon"
+$NSPAWN volume create --label e2e.dk=1 --label e2e.kind=cli e2e-dk-v2 >/dev/null || fail "nspawn volume create --label"
+[ "$(dk volume inspect -f '{{index .Labels "e2e.kind"}}' e2e-dk-v2 2>&1)" = cli ] || fail "the label of nspawn volume create: $(dk volume inspect e2e-dk-v2 2>&1)"
+[ "$(dk volume ls -q --filter label=e2e.dk=1 | LC_ALL=C sort | tr '\n' ' ')" = "$(printf '%s\n' "$anon" e2e-dk-v1 e2e-dk-v2 | LC_ALL=C sort | tr '\n' ' ')" ] || fail "docker volume ls --filter label: $(dk volume ls 2>&1)"
+$NSPAWN volume ls --filter label=e2e.kind=cli | grep_q -w e2e-dk-v2 || fail "nspawn volume ls --filter label: $($NSPAWN volume ls 2>&1)"
+dkt run --rm --label e2e.dk=1 -v e2e-dk-v1:/data e2e-dk-bb sh -c "echo vol-$nonce > /data/f" || fail "a container writes to e2e-dk-v1"
+[ "$(dkt run --rm --label e2e.dk=1 -v e2e-dk-v1:/data:ro e2e-dk-bb cat /data/f 2>&1)" = "vol-$nonce" ] || fail "another container reads e2e-dk-v1"
+# A volume of a container that does not run is mounted only while it runs.
+dk create --name e2e-dk-vu --label e2e.dk=1 -v e2e-dk-v1:/data e2e-dk-bb true >/dev/null || fail "docker create e2e-dk-vu"
+out=$(dkt cp "$h/f" e2e-dk-vu:/data/f 2>&1) && fail "a copy into the volume of a container that does not run succeeded"
+echo "$out" | grep_q "mounted only while the machine runs" || fail "docker cp into the volume of a stopped container: $out"
+dk rm e2e-dk-vu >/dev/null || fail "docker rm e2e-dk-vu"
+out=$(dkt volume prune -f --filter label=e2e.dk=1 2>&1) || fail "docker volume prune: $out"
+echo "$out" | grep_q "$anon" || fail "docker volume prune left the unnamed volume: $out"
+dk volume inspect e2e-dk-v1 >/dev/null 2>&1 || fail "docker volume prune without --all took e2e-dk-v1"
+out=$(dkt volume prune -a -f --filter label=e2e.dk=1 2>&1) || fail "docker volume prune -a: $out"
+for v in e2e-dk-v1 e2e-dk-v2; do
+  $NSPAWN volume inspect "$v" >/dev/null 2>&1 && fail "$v stayed after docker volume prune -a"
+done
+# Networks: a name nspawn derives its own from, a label, an alias, connect and
+# disconnect, removal, prune by label, the predefined ones.
+dkt network create --label e2e.dk=1 e2e_dk.net >/dev/null || fail "docker network create e2e_dk.net"
+[ "$(dk network ls --filter label=e2e.dk=1 --format '{{.Name}}' 2>&1)" = e2e_dk.net ] || fail "docker network ls --filter label: $(dk network ls 2>&1)"
+dkt run -d --name e2e-dk-nb --network e2e_dk.net --label e2e.dk=1 e2e-dk-bb sleep 600 >/dev/null || fail "docker run --network e2e_dk.net"
+dkt network connect --alias e2e-dk-alias e2e_dk.net e2e-dk-x || fail "docker network connect --alias"
+retry 5 bash -c "'$dk_dir/dk' exec e2e-dk-nb cat /etc/hosts | grep_q -w e2e-dk-alias" || fail "the alias is not in the hosts of e2e-dk-nb: $(dk exec e2e-dk-nb cat /etc/hosts 2>&1)"
+dkt network disconnect e2e_dk.net e2e-dk-x || fail "docker network disconnect"
+dk network inspect -f '{{range .Containers}}{{.Name}} {{end}}' e2e_dk.net | grep_q -w e2e-dk-x && fail "e2e-dk-x is still on e2e_dk.net"
+dkt network rm e2e_dk.net >/dev/null 2>&1 && fail "a network in use was removed"
+dk rm -f e2e-dk-nb >/dev/null || fail "docker rm -f e2e-dk-nb"
+dkt network rm e2e_dk.net >/dev/null || fail "docker network rm e2e_dk.net"
+dkt network create --label e2e.dk=1 e2e-dk-n2 >/dev/null || fail "docker network create e2e-dk-n2"
+out=$(dkt network prune -f --filter label=e2e.dk=1 2>&1) || fail "docker network prune: $out"
+echo "$out" | grep_q e2e-dk-n2 || fail "docker network prune left e2e-dk-n2: $out"
+out=$(dkt network rm bridge 2>&1) && fail "the network bridge was removed"
+echo "$out" | grep_q pre-defined || fail "docker network rm bridge: $out"
+# rmi of the image the step above pulled: refused while a container was made from it.
+if [ -n "$pulled" ]; then
+  dk create --name e2e-dk-iu --label e2e.dk=1 busybox:1.37 true >/dev/null || fail "docker create of busybox:1.37"
+  out=$(dkt rmi busybox:1.37 2>&1) && fail "an image a container was made from was removed"
+  echo "$out" | grep_q conflict || fail "docker rmi of an image in use: $out"
+  dk rm e2e-dk-iu >/dev/null || fail "docker rm e2e-dk-iu"
+  id=$(dk image inspect -f '{{.Id}}' busybox:1.37 2>&1)
+  out=$(dkt rmi "$id" 2>&1) || fail "docker rmi by ID: $out"
+  dk image inspect busybox:1.37 >/dev/null 2>&1 && fail "busybox:1.37 stayed after docker rmi"
+  [ -n "$(of_hub_busybox)" ] && fail "a record of busybox:1.37 stayed after docker rmi: $(of_hub_busybox)"
+  pulled=
+fi
+dk rm -f e2e-dk-x e2e-dk-y e2e-dk-sai >/dev/null 2>&1
+rm -rf "$dk_dir"
 $NSPAWN images rm e2e-dk-cli e2e-dk-bb $pulled >/dev/null 2>&1
 
 step "auto-update: a labelled machine gets the image its tag names now, and goes back when it fails"

@@ -11,6 +11,8 @@ pub enum FailureKind {
     NoSuchImage,
     NoSuchNetwork,
     NoSuchVolume,
+    /// A path inside a machine that is not there.
+    NoSuchPath,
     /// A name taken already.
     Exists,
     /// A removal refused because something uses what it names.
@@ -29,11 +31,12 @@ pub enum FailureKind {
 
 impl FailureKind {
     #[cfg(test)]
-    pub const ALL: [FailureKind; 11] = [
+    pub const ALL: [FailureKind; 12] = [
         FailureKind::NoSuchMachine,
         FailureKind::NoSuchImage,
         FailureKind::NoSuchNetwork,
         FailureKind::NoSuchVolume,
+        FailureKind::NoSuchPath,
         FailureKind::Exists,
         FailureKind::InUse,
         FailureKind::NotRunning,
@@ -50,6 +53,7 @@ impl FailureKind {
             FailureKind::NoSuchImage => "NoSuchImage",
             FailureKind::NoSuchNetwork => "NoSuchNetwork",
             FailureKind::NoSuchVolume => "NoSuchVolume",
+            FailureKind::NoSuchPath => "NoSuchPath",
             FailureKind::Exists => "Exists",
             FailureKind::InUse => "InUse",
             FailureKind::NotRunning => "NotRunning",

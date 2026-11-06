@@ -333,8 +333,7 @@ fn in_use(err: &anyhow::Error) -> bool {
     format!("{err:#}").contains(" is in use by ")
 }
 
-/// The project's own volumes, with -v: nspawn's volumes carry no labels, so only a
-/// project loaded from its files knows them.
+/// The project's own volumes, with -v, as the project's files name them.
 /// How many volumes there were to remove.
 async fn volumes_down(e: &Engine<'_>) -> Result<usize> {
     let Some(project) = &e.project else {

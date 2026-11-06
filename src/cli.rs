@@ -272,15 +272,35 @@ pub struct VolumeArgs {
     pub command: VolumeCommand,
 }
 
+#[derive(Args, Debug)]
+pub struct VolumeLsArgs {
+    #[command(flatten)]
+    pub output: OutputArgs,
+    /// Only the volumes it selects: label=KEY or label=KEY=VALUE. Repeatable; every one
+    /// must hold.
+    #[arg(long = "filter", value_name = "FILTER")]
+    pub filters: Vec<String>,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum VolumeCommand {
     /// List named volumes with the machines that use them.
     #[command(alias = "list")]
-    Ls(OutputArgs),
+    Ls(VolumeLsArgs),
     /// Make a named volume ahead of its first use (start makes it otherwise).
     Create {
         /// Volume name: letters, digits, _ . and -.
         name: String,
+        /// Label the volume, KEY=VALUE. Repeatable. A volume that exists already keeps
+        /// its own.
+        #[arg(long, value_name = "KEY=VALUE")]
+        label: Vec<String>,
+    },
+    /// What nspawn keeps about volumes, as JSON: path, machines, creation time, labels.
+    Inspect {
+        /// Volume names.
+        #[arg(required = true, add = candidates(Kind::Volume))]
+        names: Vec<String>,
     },
     /// Remove named volumes no machine uses.
     Rm {
@@ -1667,6 +1687,36 @@ mod tests {
         ));
         // A flag of the list belongs before no subcommand.
         assert!(images(&["nspawn", "images", "--json", "rm", "web"]).is_err());
+    }
+
+    #[test]
+    fn volumes_take_labels_and_filters() {
+        let volume = |argv: &[&str]| match Cli::try_parse_from(argv).map(|c| c.command) {
+            Ok(Command::Volume(a)) => Ok(a.command),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e.kind()),
+        };
+        match volume(&[
+            "nspawn", "volume", "create", "data", "--label", "a=b", "--label", "c",
+        ]) {
+            Ok(VolumeCommand::Create { name, label }) => {
+                assert_eq!(name, "data");
+                assert_eq!(label, ["a=b", "c"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        match volume(&["nspawn", "volume", "ls", "--json", "--filter", "label=a"]) {
+            Ok(VolumeCommand::Ls(a)) => {
+                assert!(a.output.json);
+                assert_eq!(a.filters, ["label=a"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        match volume(&["nspawn", "volume", "inspect", "data", "cache"]) {
+            Ok(VolumeCommand::Inspect { names }) => assert_eq!(names, ["data", "cache"]),
+            other => panic!("{other:?}"),
+        }
+        assert!(volume(&["nspawn", "volume", "inspect"]).is_err());
     }
 
     #[test]

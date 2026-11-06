@@ -58,7 +58,7 @@ pub fn bad(message: impl Into<String>) -> Refusal {
 const EMPTY_CONFIG: &str = "Config cannot be empty in order to create a container";
 
 /// The kind of a JSON value, as Go's decoder names it in its errors.
-fn kind(value: &Value) -> String {
+pub(super) fn kind(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
         Value::Bool(_) => "bool".to_string(),

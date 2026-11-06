@@ -255,6 +255,9 @@ pub fn follower_arguments(
     let mut argv = vec![
         "--no-pager".to_string(),
         "--quiet".to_string(),
+        // --all: journalctl writes a field over 4096 bytes as null otherwise, and the
+        // long line would be lost.
+        "--all".to_string(),
         "--output=json".to_string(),
         "--follow".to_string(),
     ];
@@ -275,8 +278,10 @@ pub fn follower_arguments(
     argv
 }
 
-/// A journal entry's message as bytes, without the console's trailing CR. journalctl
-/// writes a message with control characters or invalid UTF-8 as an array of numbers.
+/// A journal entry's message as bytes. journalctl writes a message with control
+/// characters or invalid UTF-8 as an array of numbers. A line systemd-nspawn relays from
+/// a console's terminal ends in the one CR the terminal added before its newline, which
+/// goes; a program writing into the stream itself (--console=pipe) keeps its bytes.
 pub fn message_bytes(entry: &Value) -> Option<Vec<u8>> {
     let mut bytes = match entry.get("MESSAGE")? {
         Value::String(text) => text.clone().into_bytes(),
@@ -286,10 +291,24 @@ pub fn message_bytes(entry: &Value) -> Option<Vec<u8>> {
             .collect::<Option<Vec<u8>>>()?,
         _ => return None,
     };
-    while bytes.last() == Some(&b'\r') {
+    if entry.get("_COMM").and_then(Value::as_str) == Some("systemd-nspawn")
+        && entry.get("_LINE_BREAK").is_none()
+        && bytes.last() == Some(&b'\r')
+    {
         bytes.pop();
     }
     Some(bytes)
+}
+
+/// What ended a message's line in the stream: a newline, unless journald says it broke
+/// the line for another reason (a NUL, its line length limit, the stream's end, another
+/// writer), so that the output reads back byte for byte.
+pub fn line_end(entry: &Value) -> &'static [u8] {
+    match entry.get("_LINE_BREAK").and_then(Value::as_str) {
+        None => b"\n",
+        Some("nul") => b"\0",
+        Some(_) => b"",
+    }
 }
 
 /// Whether an entry is the machine's output rather than a hook's (`nspawn network`).
@@ -353,20 +372,11 @@ impl Follower {
                     Some(deadline) => (last_line + quiet).max(floor).min(deadline),
                     None => tokio::time::Instant::now() + Duration::from_secs(3600),
                 };
+                // The end is heard at once, and a line that is there goes before the
+                // quiet that would end the copy: a reader that is slow to take the lines
+                // makes no quiet.
                 tokio::select! {
-                    line = lines.next_line() => {
-                        let Ok(Some(line)) = line else { break };
-                        last_line = tokio::time::Instant::now();
-                        let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
-                        if !everything && !from_machine(&entry) {
-                            continue;
-                        }
-                        let Some(mut bytes) = message_bytes(&entry) else { continue };
-                        bytes.push(b'\n');
-                        if out.write_all(&bytes).await.is_err() {
-                            break;
-                        }
-                    }
+                    biased;
                     changed = stopping.changed(), if deadline.is_none() => {
                         let within = match changed {
                             Ok(()) => *stopping.borrow(),
@@ -378,6 +388,20 @@ impl Follower {
                             floor = now + Duration::from_millis(500);
                             last_line = now;
                         }
+                    }
+                    line = lines.next_line() => {
+                        let Ok(Some(line)) = line else { break };
+                        last_line = tokio::time::Instant::now();
+                        let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
+                        if !everything && !from_machine(&entry) {
+                            continue;
+                        }
+                        let Some(mut bytes) = message_bytes(&entry) else { continue };
+                        bytes.extend_from_slice(line_end(&entry));
+                        if out.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                        last_line = tokio::time::Instant::now();
                     }
                     _ = tokio::time::sleep_until(wait), if deadline.is_some() => break,
                 }
@@ -427,6 +451,10 @@ pub struct RunRequest {
     pub terminal: Option<Terminal>,
     /// The caller's standard input, for the program of an app (-i without -t).
     pub stdin: Option<OwnedFd>,
+    /// Without a terminal, the output goes to the caller as the program writes it rather
+    /// than through the journal, which drops empty lines and reads a leading `<N>` as a
+    /// priority.
+    pub straight: bool,
 }
 
 /// A machine started for an attached run.
@@ -466,7 +494,7 @@ pub async fn attach(
         ))
     })?;
     let app = record.mode == crate::oci::Mode::App;
-    if !app && (request.terminal.is_some() || request.stdin.is_some()) {
+    if !app && (request.terminal.is_some() || request.stdin.is_some() || request.straight) {
         bail!("{name} boots an init system; its console is shown without -i and -t, and a shell comes with -it");
     }
     // The log driver the start is about to set, the one given here among them.
@@ -478,6 +506,10 @@ pub async fn attach(
     }
     let sd = ctx.sd().await?;
     let unit = format!("systemd-nspawn@{name}.service");
+    // A run whose program ended keeps its machine until its unit's stop hooks are done,
+    // and a wait for its end answers before that: the next start waits for it, as a
+    // start without a run does.
+    crate::api::machines::wait_for_previous(sd, &name, &unit, record.under_stub_init()).await?;
     // Refused before binding: the socket would replace the one an earlier run waits on.
     if ctx.store.is_starting(&name) || sd.machine_exists(&name).await? {
         let kind = if crate::api::machines::frozen(sd, &name).await {
@@ -503,7 +535,7 @@ pub async fn attach(
                 Some(master),
             )
         }
-        (None, stdin) if drops => {
+        (None, stdin) if drops || request.straight => {
             let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
                 .context("creating the output's pipe")?;
             straight = Some(read);
@@ -917,6 +949,12 @@ mod tests {
     fn messages_are_read_back_as_they_were_written() {
         let text: Value = serde_json::json!({"MESSAGE": "hello\r", "_COMM": "systemd-nspawn"});
         assert_eq!(message_bytes(&text).unwrap(), b"hello");
+        // The terminal adds one CR: the program's own stays, and so does one before a
+        // break that is no newline of the terminal's.
+        let own = serde_json::json!({"MESSAGE": [104, 13, 13], "_COMM": "systemd-nspawn"});
+        assert_eq!(message_bytes(&own).unwrap(), b"h\r");
+        let cut = serde_json::json!({"MESSAGE": [104, 13], "_COMM": "systemd-nspawn", "_LINE_BREAK": "line-max"});
+        assert_eq!(message_bytes(&cut).unwrap(), b"h\r");
         assert!(from_machine(&text));
         assert!(from_machine(
             &serde_json::json!({"MESSAGE": "4", "_COMM": "wc"})
@@ -924,8 +962,24 @@ mod tests {
         assert!(!from_machine(
             &serde_json::json!({"MESSAGE": "note", "_COMM": "nspawn"})
         ));
-        let colours: Value = serde_json::json!({"MESSAGE": [27, 91, 51, 49, 109, 104, 105, 13]});
+        let colours: Value = serde_json::json!({
+            "MESSAGE": [27, 91, 51, 49, 109, 104, 105, 13],
+            "_COMM": "systemd-nspawn"
+        });
         assert_eq!(message_bytes(&colours).unwrap(), b"\x1b[31mhi");
+        // Written by the program itself: its CR is its own.
+        let piped: Value = serde_json::json!({"MESSAGE": [104, 105, 13], "_COMM": "cat"});
+        assert_eq!(message_bytes(&piped).unwrap(), b"hi\r");
+        assert_eq!(line_end(&piped), b"\n");
+        for (reason, end) in [
+            ("nul", &b"\0"[..]),
+            ("line-max", b""),
+            ("eof", b""),
+            ("pid-change", b""),
+        ] {
+            let entry = serde_json::json!({"MESSAGE": "x", "_LINE_BREAK": reason});
+            assert_eq!(line_end(&entry), end, "{reason}");
+        }
         assert_eq!(message_bytes(&serde_json::json!({"MESSAGE": [300]})), None);
         assert_eq!(message_bytes(&serde_json::json!({})), None);
     }

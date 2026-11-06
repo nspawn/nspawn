@@ -372,6 +372,7 @@ impl Config {
             internal: false,
             created: 0,
             labels: std::collections::BTreeMap::new(),
+            api_name: None,
         }
     }
 }

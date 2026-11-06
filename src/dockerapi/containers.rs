@@ -32,6 +32,7 @@ pub enum Act {
     Unpause,
     Wait,
     Update,
+    Resize,
 }
 
 impl Act {
@@ -44,6 +45,7 @@ impl Act {
             "unpause" => Act::Unpause,
             "wait" => Act::Wait,
             "update" => Act::Update,
+            "resize" => Act::Resize,
             _ => return None,
         })
     }
@@ -57,6 +59,8 @@ pub struct Sent {
     pub upgrade: Option<hyper::upgrade::OnUpgrade>,
     /// The API version its path names.
     pub version: Option<(u32, u32)>,
+    /// Whom its place in the socket's limits is counted for.
+    pub holder: super::access::Holder,
 }
 
 /// An answer that is no success: its status, and the engine's words unless it has none
@@ -100,7 +104,7 @@ fn failed(e: impl std::fmt::Display) -> Answer {
 /// The status of an error of the bus, by its name.
 pub fn status_of(kind: Option<&str>) -> StatusCode {
     match kind {
-        Some("NoSuchMachine" | "NoSuchImage" | "NoSuchNetwork" | "NoSuchVolume") => {
+        Some("NoSuchMachine" | "NoSuchImage" | "NoSuchNetwork" | "NoSuchVolume" | "NoSuchPath") => {
             StatusCode::NOT_FOUND
         }
         Some("Exists" | "InUse" | "NotRunning" | "Paused") => StatusCode::CONFLICT,
@@ -164,7 +168,7 @@ async fn connect() -> Result<Client, Answer> {
 }
 
 /// A request's body, up to what a request of the API ever holds.
-async fn read_body(body: Incoming) -> Result<Bytes, Answer> {
+pub(super) async fn read_body(body: Incoming) -> Result<Bytes, Answer> {
     const MOST: usize = 16 * 1024 * 1024;
     match http_body_util::Limited::new(body, MOST).collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
@@ -256,7 +260,8 @@ pub async fn act(
         Act::Pause => pause(ctx, key, true).await,
         Act::Unpause => pause(ctx, key, false).await,
         Act::Update => update(ctx, key, sent).await,
-        Act::Wait => wait(ctx, key, query).await,
+        Act::Wait => wait(ctx, key, query, sent.holder).await,
+        Act::Resize => resize(ctx, key, query).await,
     };
     served.unwrap_or_else(Answer::respond)
 }
@@ -279,6 +284,36 @@ pub fn start_not_needed(target: &Target) -> bool {
     target.restarting
 }
 
+/// Whether a start of `target` runs it with the input an attach keeps for it, if one
+/// does: any but a paused one, which is answered as such. One that looks running may be
+/// a run whose program ended, its machine going away, after a wait for that end
+/// answered: RunMachine waits for it, and answers one that runs as StartMachine does.
+pub fn takes_input(target: &Target) -> bool {
+    !target.paused
+}
+
+/// Whether a restart of `target` only starts it, with the input an attach keeps for it:
+/// one that does not run, or whose program ended (`program_ended`).
+pub fn restart_only_starts(target: &Target, program_ended: bool) -> bool {
+    !target.running || program_ended
+}
+
+/// Starts `name`: attached, with the input an attach of this server keeps for it, or
+/// with StartMachine.
+async fn start_one(client: &Client, name: &str, input: bool) -> anyhow::Result<()> {
+    if input {
+        if let Some(outcome) = super::attach::start_with_input(client, name).await {
+            return outcome;
+        }
+    }
+    client
+        .manager
+        .start_machine(name, Options::new())
+        .await
+        .map(drop)
+        .map_err(client::error)
+}
+
 async fn start(ctx: &Context, key: &str) -> Served {
     let target = target(ctx, key).await?;
     if start_not_needed(&target) {
@@ -292,15 +327,11 @@ async fn start(ctx: &Context, key: &str) -> Served {
         make_sources(ctx, &target.name)
     };
     let outcome = match made {
-        Ok(()) => client
-            .manager
-            .start_machine(&target.name, Options::new())
-            .await
-            .map_err(client::error),
+        Ok(()) => start_one(&client, &target.name, takes_input(&target)).await,
         Err(e) => Err(e),
     };
     match outcome {
-        Ok(_) => Ok(empty(StatusCode::NO_CONTENT)),
+        Ok(()) => Ok(empty(StatusCode::NO_CONTENT)),
         Err(e) => {
             let kind = client::error_name(&e);
             // A container removed when it ends goes when it cannot start, and a client
@@ -419,13 +450,131 @@ async fn restart(ctx: &Context, key: &str, query: &Query) -> Served {
     }
     let client = connect().await?;
     make_sources(ctx, &target.name).map_err(|e| restart_failed(None, key, &format!("{e:#}")))?;
-    client
-        .manager
-        .restart_machine(&target.name, options)
-        .await
-        .map_err(client::error)
-        .map_err(|e| restart_failed(client::error_name(&e), key, &format!("{e:#}")))?;
+    // A container that does not run, or whose program ended, is only started, with the
+    // input an attach keeps for it, as a start would.
+    let only_starts = super::attach::input_pending(&target.name)
+        && restart_only_starts(
+            &target,
+            target.running && super::attach::program_ended(ctx, &target.name).await,
+        );
+    let attached = if only_starts {
+        super::attach::start_with_input(&client, &target.name).await
+    } else {
+        None
+    };
+    match attached {
+        Some(outcome) => outcome,
+        None => client
+            .manager
+            .restart_machine(&target.name, options)
+            .await
+            .map(drop)
+            .map_err(client::error),
+    }
+    .map_err(|e| restart_failed(client::error_name(&e), key, &format!("{e:#}")))?;
     Ok(empty(StatusCode::NO_CONTENT))
+}
+
+/// `h` or `w` of a resize, as the engine reads it (Uint32Value), and its words for one
+/// that is no such number.
+pub fn resize_value(text: Option<&str>, what: &str) -> Result<u32, Answer> {
+    let raw = text.unwrap_or_default();
+    let bad = |why: &str| {
+        Answer::says(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid resize {what} {}: {why}",
+                crate::compose::gostr::quote(raw)
+            ),
+        )
+    };
+    let (digits, negative) = match raw.strip_prefix('-') {
+        Some(digits) => (digits, true),
+        None => (raw, false),
+    };
+    if digits.is_empty() || digits.starts_with('+') {
+        return Err(bad("invalid syntax"));
+    }
+    let mut value: u64 = 0;
+    for c in digits.bytes() {
+        if !c.is_ascii_digit() {
+            return Err(bad("invalid syntax"));
+        }
+        value = value * 10 + u64::from(c - b'0');
+        if value > u64::from(u32::MAX) {
+            return Err(bad("value out of range"));
+        }
+    }
+    if negative {
+        return Err(bad("value out of range"));
+    }
+    Ok(value as u32)
+}
+
+/// What a resize does with a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resizing {
+    /// It runs: the terminal this server holds of it gets the size, if it holds one.
+    Terminal,
+    /// It does not run, and an attach keeps it an input with a terminal: the size is the
+    /// start's.
+    Kept,
+    /// It does not run: the engine's 409.
+    NotRunning,
+}
+
+pub fn resizing(target: &Target, terminal_pending: bool) -> Resizing {
+    if target.running || target.paused {
+        Resizing::Terminal
+    } else if terminal_pending {
+        Resizing::Kept
+    } else {
+        Resizing::NotRunning
+    }
+}
+
+/// POST /containers/{id}/resize: the size of the terminal of its run, rows `h` and
+/// columns `w`.
+async fn resize(ctx: &Context, key: &str, query: &Query) -> Served {
+    let rows = resize_value(query.get("h"), "height")?;
+    let cols = resize_value(query.get("w"), "width")?;
+    let target = target(ctx, key).await?;
+    let clamp = |n: u32| u16::try_from(n).unwrap_or(u16::MAX);
+    let (rows, cols) = (clamp(rows), clamp(cols));
+    match resizing(&target, super::attach::terminal_pending(&target.name)) {
+        // One that runs without a terminal this server holds has nothing to resize.
+        Resizing::Terminal => {
+            super::attach::resize_terminal(&target.name, rows, cols).map_err(|e| {
+                failed(format!(
+                    "resizing the terminal of container {}: {e}",
+                    target.id
+                ))
+            })?;
+        }
+        Resizing::Kept => super::attach::remember_size(&target.name, rows, cols),
+        Resizing::NotRunning => {
+            return Err(Answer::says(
+                StatusCode::CONFLICT,
+                format!("container {} is not running", target.id),
+            ))
+        }
+    }
+    Ok(empty(StatusCode::OK))
+}
+
+/// The size a create gives the terminal of a container that has one: ConsoleSize, rows
+/// and columns, when neither is 0.
+pub fn console_size(body: &Value) -> Option<(u16, u16)> {
+    if body.get("Tty").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let size = body.pointer("/HostConfig/ConsoleSize")?.as_array()?;
+    let side = |n: Option<&Value>| {
+        n.and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+            .map(|n| u16::try_from(n).unwrap_or(u16::MAX))
+    };
+    Some((side(size.first())?, side(size.get(1))?))
 }
 
 /// What a failed pause answers.
@@ -598,10 +747,10 @@ pub fn wait_body(outcome: Result<i32, String>) -> String {
 /// POST /containers/{id}/wait: the headers once the bus took the wait, the body when
 /// the condition holds. The client going away drops the wait with the bus connection
 /// it was asked on.
-async fn wait(ctx: &Context, key: &str, query: &Query) -> Served {
+async fn wait(ctx: &Context, key: &str, query: &Query, holder: super::access::Holder) -> Served {
     let condition = wait_condition(query.get("condition"))?;
     let target = target(ctx, key).await?;
-    let Ok(permit) = super::WAITS.try_acquire() else {
+    let Some(permit) = super::WAITS.take(holder) else {
         return Err(Answer::says(
             StatusCode::SERVICE_UNAVAILABLE,
             "too many waits are open on this socket",
@@ -1036,6 +1185,9 @@ pub async fn create(ctx: &Arc<Context>, query: &Query, sent: Sent) -> Response<B
                     .ok()
                     .flatten()
                     .ok_or_else(|| failed(format!("the record of {machine} is missing")))?;
+                if let Some((rows, cols)) = console_size(&body) {
+                    super::attach::remember_size(&machine, rows, cols);
+                }
                 Ok(json_response(
                     StatusCode::CREATED,
                     &created_body(&container_id(&machine, record.created), &plan.warnings),
@@ -1164,12 +1316,123 @@ mod tests {
     }
 
     #[test]
+    fn a_start_takes_the_kept_input_of_a_container_that_does_not_run() {
+        assert!(takes_input(&target(LIFE, false, false)));
+        // Its program may have ended, its machine going away: RunMachine waits for it.
+        assert!(takes_input(&target(LIFE, true, false)));
+        assert!(!takes_input(&target(LIFE, true, true)));
+        // A restart stops one whose program runs, and only starts the others.
+        assert!(restart_only_starts(&target(LIFE, false, false), false));
+        assert!(restart_only_starts(&target(LIFE, true, false), true));
+        assert!(!restart_only_starts(&target(LIFE, true, false), false));
+    }
+
+    #[test]
+    fn resizes_answer_as_the_engine() {
+        use crate::dockerapi::{classify, Route};
+        assert_eq!(
+            classify(&hyper::Method::POST, "/containers/life/resize"),
+            Route::Lifecycle("life".into(), Act::Resize)
+        );
+        assert_eq!(
+            classify(&hyper::Method::POST, "/containers/life/resize").need(),
+            crate::dockerapi::access::Need::Manage
+        );
+        assert_eq!(resize_value(Some("24"), "height").unwrap(), 24);
+        assert_eq!(resize_value(Some("0"), "width").unwrap(), 0);
+        assert_eq!(resize_value(Some("4294967295"), "width").unwrap(), u32::MAX);
+        for (text, what, message) in [
+            (None, "height", "invalid resize height \"\": invalid syntax"),
+            (
+                Some("x"),
+                "height",
+                "invalid resize height \"x\": invalid syntax",
+            ),
+            (
+                Some("+3"),
+                "height",
+                "invalid resize height \"+3\": invalid syntax",
+            ),
+            (
+                Some("-"),
+                "width",
+                "invalid resize width \"-\": invalid syntax",
+            ),
+            (
+                Some("-3"),
+                "width",
+                "invalid resize width \"-3\": value out of range",
+            ),
+            (
+                Some("-x"),
+                "width",
+                "invalid resize width \"-x\": invalid syntax",
+            ),
+            (
+                Some("1x"),
+                "width",
+                "invalid resize width \"1x\": invalid syntax",
+            ),
+            (
+                Some("4294967296"),
+                "width",
+                "invalid resize width \"4294967296\": value out of range",
+            ),
+            (
+                Some("99999999999x"),
+                "width",
+                "invalid resize width \"99999999999x\": value out of range",
+            ),
+        ] {
+            assert_eq!(
+                resize_value(text, what).unwrap_err(),
+                Answer(StatusCode::BAD_REQUEST, Some(message.into())),
+                "{text:?}"
+            );
+        }
+        // A container that runs gets the size on the terminal this server holds, or
+        // nothing is done; one that does not is the engine's 409, unless an attach keeps
+        // it a terminal: then the size is its start's.
+        assert_eq!(
+            resizing(&target(LIFE, true, false), false),
+            Resizing::Terminal
+        );
+        assert_eq!(
+            resizing(&target(LIFE, true, true), false),
+            Resizing::Terminal
+        );
+        assert_eq!(resizing(&target(LIFE, false, false), true), Resizing::Kept);
+        assert_eq!(
+            resizing(&target(LIFE, false, false), false),
+            Resizing::NotRunning
+        );
+    }
+
+    #[test]
+    fn a_create_keeps_the_size_of_the_terminal() {
+        let body = json!({ "Tty": true, "HostConfig": { "ConsoleSize": [40, 120] } });
+        assert_eq!(console_size(&body), Some((40, 120)));
+        let huge = json!({ "Tty": true, "HostConfig": { "ConsoleSize": [70000, 120] } });
+        assert_eq!(console_size(&huge), Some((u16::MAX, 120)));
+        for body in [
+            json!({ "Tty": false, "HostConfig": { "ConsoleSize": [40, 120] } }),
+            json!({ "Tty": true, "HostConfig": { "ConsoleSize": [0, 0] } }),
+            json!({ "Tty": true, "HostConfig": { "ConsoleSize": [40] } }),
+            json!({ "Tty": true, "HostConfig": {} }),
+            json!({ "Tty": true }),
+        ] {
+            assert_eq!(console_size(&body), None, "{body}");
+        }
+    }
+
+    #[test]
     fn statuses_come_from_the_names_of_the_bus_errors() {
         for (kind, status) in [
             ("NoSuchMachine", 404),
             ("NoSuchImage", 404),
             ("NoSuchNetwork", 404),
             ("NoSuchVolume", 404),
+            ("NoSuchPath", 404),
             ("Exists", 409),
             ("InUse", 409),
             ("NotRunning", 409),

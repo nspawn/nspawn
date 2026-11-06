@@ -98,7 +98,9 @@ pub fn translate(event: &Event, networks: &[(String, String)]) -> Vec<Value> {
                 _ => return Vec::new(),
             };
             let mut attributes = Map::new();
-            attributes.insert("name".into(), json!(event.name));
+            // The name the API gave it, where it is not its own.
+            let shown = event.attributes.get("api_name").unwrap_or(&event.name);
+            attributes.insert("name".into(), json!(shown));
             attributes.insert("type".into(), json!("bridge"));
             if let (Some(machine), Some(created)) = (
                 event.attributes.get("container"),
@@ -297,6 +299,28 @@ mod tests {
         assert_eq!(start[0]["id"], json!(container_id("web", 100)));
         let f = Filters::parse(Some(r#"{"container":["my_web"]}"#)).unwrap();
         assert!(passes(&f, &start[0]));
+    }
+
+    #[test]
+    fn a_network_is_named_by_its_api_name() {
+        let mut made = event(
+            "network",
+            "create",
+            &[("created", "5"), ("api_name", "ci.net")],
+        );
+        made.name = "ci-net-0a1b2c3d".into();
+        let created = translate(&made, &[]);
+        assert_eq!(created[0]["Actor"]["Attributes"]["name"], "ci.net");
+        // The ID stays the one of its own name.
+        assert_eq!(
+            created[0]["Actor"]["ID"],
+            json!(network_id("ci-net-0a1b2c3d", 5))
+        );
+        made.attributes.remove("api_name");
+        assert_eq!(
+            translate(&made, &[])[0]["Actor"]["Attributes"]["name"],
+            "ci-net-0a1b2c3d"
+        );
     }
 
     #[test]

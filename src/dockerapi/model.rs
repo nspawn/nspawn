@@ -99,9 +99,14 @@ impl Snapshot {
         }
     }
 
+    /// A network by its ID, the name the API knows it by, its own name or a unique
+    /// prefix of its ID.
     pub fn network(&self, key: &str) -> Option<NetworkView<'_>> {
         let all = self.network_views();
         if let Some(n) = all.iter().find(|n| n.id == key) {
+            return Some(n.clone());
+        }
+        if let Some(n) = all.iter().find(|n| n.shown == key) {
             return Some(n.clone());
         }
         if let Some(n) = all.iter().find(|n| n.name == key) {
@@ -118,6 +123,7 @@ impl Snapshot {
             .map(|spec| NetworkView {
                 id: network_id(&spec.name, spec.created),
                 name: spec.name.clone(),
+                shown: shown_name(spec).to_string(),
                 spec: Some(spec),
             })
             .collect();
@@ -125,6 +131,7 @@ impl Snapshot {
             views.push(NetworkView {
                 id: network_id(name, 0),
                 name: name.to_string(),
+                shown: name.to_string(),
                 spec: None,
             });
         }
@@ -141,7 +148,7 @@ impl Snapshot {
         Some(
             specs
                 .iter()
-                .map(|s| (s.name.clone(), network_id(&s.name, s.created)))
+                .map(|s| (shown_name(s).to_string(), network_id(&s.name, s.created)))
                 .collect(),
         )
     }
@@ -149,6 +156,16 @@ impl Snapshot {
     fn spec(&self, name: &str) -> Option<&NetSpec> {
         self.networks.iter().find(|n| n.name == name)
     }
+
+    /// The name the API shows for the network whose own name is `name`.
+    pub fn shown<'s>(&'s self, name: &'s str) -> &'s str {
+        self.spec(name).map_or(name, shown_name)
+    }
+}
+
+/// The name the API knows a network by: the one it was given there, else its own.
+pub fn shown_name(spec: &NetSpec) -> &str {
+    spec.api_name.as_deref().unwrap_or(&spec.name)
 }
 
 fn unique_prefix<'a, T>(
@@ -167,9 +184,26 @@ fn unique_prefix<'a, T>(
 #[derive(Clone)]
 pub struct NetworkView<'a> {
     pub id: String,
+    /// Its own name, which records and the bus name it by.
     pub name: String,
+    /// The name the API shows.
+    pub shown: String,
     /// None for host and none.
     pub spec: Option<&'a NetSpec>,
+}
+
+/// A machine's ulimits as the API gives them, unlimited as -1, which a create takes back.
+pub fn ulimits_json(tuning: &crate::tuning::Tuning) -> Value {
+    let value = |n: u64| if n == u64::MAX { -1 } else { n as i64 };
+    Value::Array(
+        tuning
+            .ulimits
+            .iter()
+            .map(|(name, (soft, hard))| {
+                json!({ "Name": name, "Soft": value(*soft), "Hard": value(*hard) })
+            })
+            .collect(),
+    )
 }
 
 /// The API's name of a machine's log driver, which a create takes back as the same
@@ -275,7 +309,7 @@ impl Machine {
         match r.network {
             Network::Host => "host".to_string(),
             Network::Veth => "default".to_string(),
-            Network::Bridge => bridge::networks_of(r)[0].to_string(),
+            Network::Bridge => snapshot.shown(bridge::networks_of(r)[0]).to_string(),
         }
     }
 
@@ -338,7 +372,10 @@ impl Machine {
     fn networks(&self, snapshot: &Snapshot) -> Map<String, Value> {
         let mut out = Map::new();
         for (spec, address) in self.attachments(snapshot) {
-            out.insert(spec.name.clone(), self.endpoint(snapshot, spec, address));
+            out.insert(
+                shown_name(spec).to_string(),
+                self.endpoint(snapshot, spec, address),
+            );
         }
         if out.is_empty() {
             let mode = self.network_mode(snapshot);
@@ -589,7 +626,9 @@ impl Machine {
             "SecurityOpt": null,
             "UTSMode": "",
             "UsernsMode": "",
-            "ShmSize": t.shm_size.unwrap_or(64 * 1024 * 1024),
+            // 0 without a size of its own: systemd-nspawn's /dev/shm, which a create from
+            // this inspect keeps.
+            "ShmSize": t.shm_size.unwrap_or(0),
             "Runtime": "systemd-nspawn",
             "Isolation": "",
             "Memory": r.limits.memory,
@@ -601,7 +640,7 @@ impl Machine {
                 "PathInContainer": d.container,
                 "CgroupPermissions": d.permissions,
             })).collect::<Vec<_>>(),
-            "Ulimits": [],
+            "Ulimits": ulimits_json(t),
         });
         // What the API writes for the settings nspawn has no counterpart of.
         let unset = json!({
@@ -888,7 +927,7 @@ pub fn network_json(snapshot: &Snapshot, view: &NetworkView) -> Value {
         ),
     };
     json!({
-        "Name": view.name,
+        "Name": view.shown,
         "Id": view.id,
         "Created": rfc3339_nano(created * 1_000_000, false),
         "Scope": "local",
@@ -1037,6 +1076,37 @@ mod tests {
         assert!(!matches(&snapshot, "front"));
         let host_id = snapshot.network("host").unwrap().id;
         assert!(matches(&snapshot, &host_id[..12]));
+    }
+
+    #[test]
+    fn a_network_goes_by_the_name_the_api_gave_it() {
+        let (ctx, mut snapshot) = fixture();
+        snapshot.networks[1].api_name = Some("front.net".into());
+        let view = snapshot.network("front.net").unwrap();
+        assert_eq!(
+            (view.name.as_str(), view.shown.as_str()),
+            ("front", "front.net")
+        );
+        // Its own name and its ID still find it; the ID is of the own name.
+        assert_eq!(snapshot.network("front").unwrap().shown, "front.net");
+        assert_eq!(view.id, network_id("front", 5));
+        assert_eq!(network_json(&snapshot, &view)["Name"], "front.net");
+        let m = &snapshot.machines[0];
+        let inspect = m.inspect_json(&ctx, &snapshot, &ImageInfo::of(&ctx, &m.record));
+        assert_eq!(inspect["HostConfig"]["NetworkMode"], "front.net");
+        assert!(inspect["NetworkSettings"]["Networks"]["front.net"].is_object());
+        let summary = m.summary_json(&ctx, &snapshot, &ImageInfo::of(&ctx, &m.record));
+        assert_eq!(summary["HostConfig"]["NetworkMode"], "front.net");
+        let filter = |net: &str| {
+            crate::dockerapi::filters::Filters::parse(Some(&format!(r#"{{"network":["{net}"]}}"#)))
+                .unwrap()
+        };
+        for net in ["front.net", "front"] {
+            assert!(
+                crate::dockerapi::container_matches(&ctx, &snapshot, &filter(net), m),
+                "{net}"
+            );
+        }
     }
 
     /// `created` of the recorded run: made with -it --rm, never started; and a machine
@@ -1206,7 +1276,17 @@ mod tests {
                 true
             }
         }
-        let (ctx, snapshot) = fixture();
+        let (ctx, mut snapshot) = fixture();
+        snapshot.machines[0]
+            .record
+            .tuning
+            .ulimits
+            .insert("nofile".into(), (65535, 65535));
+        snapshot.machines[0]
+            .record
+            .tuning
+            .ulimits
+            .insert("memlock".into(), (u64::MAX, u64::MAX));
         let m = &snapshot.machines[0];
         let image = ImageInfo {
             id: "sha256:30ec".into(),
@@ -1214,6 +1294,17 @@ mod tests {
         };
         let inspect = m.inspect_json(&ctx, &snapshot, &image);
         assert_eq!(inspect["HostConfig"]["LogConfig"]["Type"], "local");
+        assert_eq!(
+            inspect["HostConfig"]["Ulimits"],
+            json!([
+                { "Name": "memlock", "Soft": -1, "Hard": -1 },
+                { "Name": "nofile", "Soft": 65535, "Hard": 65535 },
+            ])
+        );
+        assert_eq!(
+            inspect["HostConfig"]["ShmSize"], 0,
+            "systemd-nspawn's own /dev/shm"
+        );
         let mut body = inspect["Config"].clone();
         body["HostConfig"] = inspect["HostConfig"].clone();
         let plan = crate::dockerapi::create::translate(&body, &Anything)
@@ -1227,6 +1318,18 @@ mod tests {
             plan.warnings
         );
         assert!(!plan.opts.contains_key("log_driver"), "{:?}", plan.opts);
+        assert!(!plan.opts.contains_key("shm_size"), "{:?}", plan.opts);
+        match plan.opts.get("ulimits") {
+            Some(crate::dockerapi::create::Opt::Texts(limits)) => {
+                let mut taken = crate::tuning::Tuning::default();
+                for text in limits {
+                    let (name, values) = crate::tuning::ulimit(text).unwrap();
+                    taken.ulimits.insert(name, values);
+                }
+                assert_eq!(taken.ulimits, m.record.tuning.ulimits, "{limits:?}");
+            }
+            other => panic!("ulimits: {other:?}"),
+        }
         let mut tuning = crate::tuning::Tuning::default();
         assert_eq!(log_type(&tuning), "local");
         tuning.log_driver = Some("journal".into());

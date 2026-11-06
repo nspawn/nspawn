@@ -454,7 +454,7 @@ impl Store {
     /// Root's alone: layers hold setuid programs and device nodes that would work for any
     /// local user reaching them, records hold the machines' environment, volumes and
     /// builds their data.
-    fn private_dirs(&self) -> [PathBuf; 13] {
+    fn private_dirs(&self) -> [PathBuf; 14] {
         [
             self.layers_dir(Ownership::Root),
             self.layers_dir(Ownership::Foreign),
@@ -462,6 +462,7 @@ impl Store {
             self.images_dir(),
             self.manifests_dir(),
             self.volumes_dir(),
+            self.volume_meta_dir(),
             self.root.join("builds"),
             self.root.join("cache"),
             self.root.join("starting"),
@@ -615,6 +616,11 @@ impl Store {
     /// Named volumes (-v name:/path), one directory each.
     pub fn volumes_dir(&self) -> PathBuf {
         self.root.join("volumes")
+    }
+    /// What is kept of each named volume beside its directory (creation time, labels),
+    /// one file NAME each: a machine mounts the volume's directory, never this.
+    pub fn volume_meta_dir(&self) -> PathBuf {
+        self.root.join("volume-meta")
     }
     /// User-defined networks, one NAME.json each.
     pub fn networks_dir(&self) -> PathBuf {
@@ -3730,6 +3736,7 @@ mod tests {
             "images",
             "manifests",
             "volumes",
+            "volume-meta",
             "claims",
         ] {
             assert_eq!(mode(&state.join(private)), 0o700, "{private}");

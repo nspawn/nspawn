@@ -871,6 +871,7 @@ pub async fn prepare(
             }
             std::fs::create_dir_all(&source)
                 .with_context(|| format!("creating volume {}", source.display()))?;
+            crate::api::volumes::forget_meta(store, &volume.source)?;
         }
         let empty = || std::fs::read_dir(&source).is_ok_and(|mut d| d.next().is_none());
         // Another machine that runs with the volume could change it while the service
@@ -1279,8 +1280,10 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             if args.publish_all && r.run.exposed_ports.is_empty() {
                 r.run.exposed_ports = r.exposed_ports(store);
             }
-            apply_flags(r, args).map_err(invalid)?;
-            apply_addresses(store, config, r, &args.addresses).map_err(invalid)?;
+            // A network named as the Docker API knows it goes by its own name from here on.
+            let flags = crate::api::network::resolve_start(store, args)?;
+            apply_flags(r, &flags).map_err(invalid)?;
+            apply_addresses(store, config, r, &flags.addresses).map_err(invalid)?;
             crate::api::dependencies::check(
                 store,
                 &args.name,
@@ -2535,7 +2538,12 @@ fn stop_signals(record: Option<&ImageRecord>) -> Result<Vec<i32>> {
 /// Waits, within reason, until nothing of the previous run is left: a unit shutting
 /// down, a machine machined still lists, a release hook that would undo what the start
 /// prepares. A machine that really runs, or starts elsewhere, is an error.
-async fn wait_for_previous(sd: &Systemd, name: &str, unit: &str, stub: bool) -> Result<()> {
+pub(crate) async fn wait_for_previous(
+    sd: &Systemd,
+    name: &str,
+    unit: &str,
+    stub: bool,
+) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let state = sd.unit_status(unit).await?;

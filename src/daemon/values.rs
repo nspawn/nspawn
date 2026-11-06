@@ -386,6 +386,8 @@ pub fn volume(vol: &VolumeInfo) -> Dict {
         ),
         ("used_by".to_string(), strings(&vol.used_by)),
         ("created".to_string(), v(vol.created)),
+        ("labels".to_string(), map(&vol.labels)),
+        ("anonymous".to_string(), v(vol.anonymous)),
     ])
 }
 
@@ -419,9 +421,9 @@ pub fn bridge(b: &BridgeInfo) -> Dict {
 }
 
 /// A network: name, interface, subnet, gateway, internal, created (unix seconds, 0 for
-/// the default one), labels.
+/// the default one), labels, and api_name where the Docker API knows it by another name.
 pub fn network(n: &NetSpec) -> Dict {
-    HashMap::from([
+    let mut dict = HashMap::from([
         ("name".to_string(), v(n.name.as_str())),
         ("interface".to_string(), v(n.interface.as_str())),
         ("subnet".to_string(), v(n.subnet.to_string())),
@@ -429,7 +431,11 @@ pub fn network(n: &NetSpec) -> Dict {
         ("internal".to_string(), v(n.internal)),
         ("created".to_string(), v(n.created)),
         ("labels".to_string(), map(&n.labels)),
-    ])
+    ]);
+    if let Some(api_name) = &n.api_name {
+        dict.insert("api_name".to_string(), v(api_name.as_str()));
+    }
+    dict
 }
 
 /// A network with the machines it has, as `network ls` lists it.
@@ -821,5 +827,29 @@ mod tests {
         assert!(!bool::try_from(shown["interactive"].clone()).unwrap());
         assert!(bool::try_from(shown["stdin_once"].clone()).unwrap());
         assert!(bool::try_from(shown["remove"].clone()).unwrap());
+    }
+
+    #[test]
+    fn volumes_and_networks_show_their_labels_and_api_names() {
+        let volume = VolumeInfo {
+            name: "data".into(),
+            labels: [("team".to_string(), "a".to_string())].into(),
+            anonymous: true,
+            ..Default::default()
+        };
+        let shown = super::volume(&volume);
+        let labels: HashMap<String, String> = shown["labels"].clone().try_into().unwrap();
+        assert_eq!(labels["team"], "a");
+        assert!(bool::try_from(shown["anonymous"].clone()).unwrap());
+        let mut net: NetSpec = serde_json::from_value(serde_json::json!({
+            "name": "ci-net-1a2b3c4d", "interface": "nsbr-x", "subnet": "10.99.9.0/24",
+        }))
+        .unwrap();
+        assert!(!network(&net).contains_key("api_name"), "none given");
+        net.api_name = Some("ci.net".into());
+        assert_eq!(
+            String::try_from(network(&net)["api_name"].clone()).unwrap(),
+            "ci.net"
+        );
     }
 }

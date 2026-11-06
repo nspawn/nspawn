@@ -79,7 +79,7 @@ impl Image {
 static LAYER_SIZES: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 
 /// Runs a walk of the disk where it does not hold up the runtime's few threads.
-fn walking<T>(walk: impl FnOnce() -> T) -> T {
+pub(crate) fn walking<T>(walk: impl FnOnce() -> T) -> T {
     use tokio::runtime::{Handle, RuntimeFlavor};
     match Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
@@ -157,6 +157,10 @@ pub fn count(ctx: &Context) -> anyhow::Result<usize> {
 /// digest alone.
 fn full_tag(reference: &str, registry: &str) -> Option<String> {
     let parsed = ImageRef::parse(reference, registry).ok()?;
+    // One pulled by a digest is that digest's, whatever tag came with it.
+    if parsed.digest.is_some() {
+        return None;
+    }
     parsed.tag.as_ref()?;
     Some(
         ImageRef {
@@ -165,6 +169,18 @@ fn full_tag(reference: &str, registry: &str) -> Option<String> {
         }
         .to_string(),
     )
+}
+
+/// A reference as the engine looks it up: by its digest alone when it has one, the tag
+/// beside it left out.
+pub fn by_digest(reference: ImageRef) -> ImageRef {
+    match reference.digest {
+        Some(_) => ImageRef {
+            tag: None,
+            ..reference
+        },
+        None => reference,
+    }
 }
 
 /// `repository@digest` of the manifest a record was pulled by, in full; a built image
@@ -314,13 +330,10 @@ pub fn find<'a>(images: &'a [Image], key: &str) -> Result<&'a Image, String> {
     if key.is_empty() {
         return Err(missing());
     }
-    if let Ok(wanted) = ImageRef::normalized(key) {
+    if let Ok(wanted) = ImageRef::normalized(key).map(by_digest) {
         let wanted_text = wanted.to_string();
         let found = match &wanted.digest {
-            Some(_) if wanted.tag.is_none() => {
-                images.iter().find(|i| i.digests.contains(&wanted_text))
-            }
-            Some(_) => None,
+            Some(_) => images.iter().find(|i| i.digests.contains(&wanted_text)),
             None => images.iter().find(|i| i.tags.contains(&wanted_text)),
         };
         if let Some(image) = found {
@@ -357,7 +370,7 @@ pub fn source(
     load: impl Fn(&str) -> Option<ImageRecord>,
 ) -> Option<String> {
     let mut held = image.records.iter().chain(&image.containers);
-    if let Ok(wanted) = ImageRef::normalized(key) {
+    if let Ok(wanted) = ImageRef::normalized(key).map(by_digest) {
         let wanted = wanted.to_string();
         let named = |name: &&String| {
             load(name).is_some_and(|record| {
@@ -650,6 +663,405 @@ pub fn history_json(ctx: &Context, image: &Image) -> Value {
     json!(steps)
 }
 
+/// A change of images, by method and path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Call {
+    /// DELETE /images/{name}, the name with its slashes.
+    Remove(String),
+    /// POST /images/prune.
+    Prune,
+}
+
+impl Call {
+    pub fn of(method: &hyper::Method, parts: &[&str]) -> Option<Call> {
+        match parts {
+            ["images", "prune"] if *method == hyper::Method::POST => Some(Call::Prune),
+            ["images", name @ ..] if *method == hyper::Method::DELETE && !name.is_empty() => {
+                Some(Call::Remove(name.join("/")))
+            }
+            _ => None,
+        }
+    }
+}
+
+type Answer = super::containers::Answer;
+
+fn says(status: hyper::StatusCode, text: impl Into<String>) -> Answer {
+    super::containers::Answer(status, Some(text.into()))
+}
+
+fn failed(e: impl std::fmt::Display) -> Answer {
+    says(hyper::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+/// A container made from an image, as a removal of the image names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct User {
+    pub id: String,
+    pub running: bool,
+}
+
+/// What a removal of an image does: the records that go, and the engine's answer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Untag {
+    pub names: Vec<String>,
+    pub answer: Vec<Value>,
+}
+
+/// isImageIDPrefix: `key` begins the image's ID, with its algorithm or without.
+fn is_id_prefix(id: &str, key: &str) -> bool {
+    id.starts_with(key)
+        || id
+            .split_once(':')
+            .is_some_and(|(_, hex)| hex.starts_with(key))
+}
+
+fn untagged(reference: &str) -> Value {
+    json!({ "Untagged": familiar(reference) })
+}
+
+/// What DELETE /images/{key} does to `image`, whose records that are images are
+/// `records` and whose containers are `users`. By an ID every record of the image goes;
+/// by a reference the records of that reference; by a record's name that record. A
+/// container made from the image keeps it from going without force, as the engine
+/// refuses to leave a container's image without a name; with force the records go and
+/// the containers stay, each still holding the image, which the answer then does not
+/// say was deleted.
+pub fn removal(
+    image: &Image,
+    records: &[ImageRecord],
+    key: &str,
+    force: bool,
+    registry: &str,
+    users: &[User],
+) -> Result<Untag, Answer> {
+    use hyper::StatusCode;
+    let short =
+        |id: &str| super::util::short(id.split_once(':').map_or(id, |(_, hex)| hex)).to_string();
+    let id12 = short(&image.id);
+    let conflict = |text: String| says(StatusCode::CONFLICT, text);
+    let held: Vec<&ImageRecord> = records
+        .iter()
+        .filter(|r| image.records.contains(&r.name))
+        .collect();
+    // One tag at most: the engine's "single reference", which a container keeps.
+    let single = image.tags.len() <= 1;
+    if is_id_prefix(&image.id, key) {
+        if !force {
+            if let Some(user) = users.iter().find(|u| u.running) {
+                return Err(conflict(format!(
+                    "conflict: unable to delete {id12} (cannot be forced) - image is being used by running container {}",
+                    short(&user.id)
+                )));
+            }
+            if !single {
+                return Err(conflict(format!(
+                    "conflict: unable to delete {id12} (must be forced) - image is referenced in multiple repositories"
+                )));
+            }
+            if let Some(user) = users.first() {
+                return Err(conflict(format!(
+                    "conflict: unable to delete {id12} (must be forced) - image is being used by stopped container {}",
+                    short(&user.id)
+                )));
+            }
+        }
+        let mut answer: Vec<Value> = image
+            .tags
+            .iter()
+            .chain(&image.digests)
+            .map(|r| untagged(r))
+            .collect();
+        if users.is_empty() {
+            answer.push(json!({ "Deleted": image.id }));
+        }
+        return Ok(Untag {
+            names: held.iter().map(|r| r.name.clone()).collect(),
+            answer,
+        });
+    }
+    let wanted = ImageRef::normalized(key)
+        .map(by_digest)
+        .ok()
+        .map(|r| r.to_string());
+    let (chosen, asked, by_tag): (Vec<&ImageRecord>, String, bool) = match wanted {
+        Some(wanted) if image.tags.contains(&wanted) => (
+            held.iter()
+                .copied()
+                .filter(|r| full_tag(&r.reference, registry).as_deref() == Some(wanted.as_str()))
+                .collect(),
+            wanted,
+            true,
+        ),
+        Some(wanted) if image.digests.contains(&wanted) => (
+            held.iter()
+                .copied()
+                .filter(|r| full_digest(r, registry).as_deref() == Some(wanted.as_str()))
+                .collect(),
+            wanted,
+            false,
+        ),
+        _ => {
+            let Some(record) = held.iter().copied().find(|r| r.name == key) else {
+                return Err(says(StatusCode::NOT_FOUND, format!("No such image: {key}")));
+            };
+            match full_tag(&record.reference, registry) {
+                Some(tag) => (vec![record], tag, true),
+                None => (
+                    vec![record],
+                    full_digest(record, registry).unwrap_or_else(|| key.to_string()),
+                    false,
+                ),
+            }
+        }
+    };
+    if !force && single {
+        if let Some(user) = users.first() {
+            return Err(conflict(format!(
+                "conflict: unable to remove repository reference {key:?} (must force) - container {} is using its referenced image {id12}",
+                short(&user.id)
+            )));
+        }
+    }
+    let staying: Vec<&ImageRecord> = held
+        .iter()
+        .copied()
+        .filter(|r| !chosen.iter().any(|c| c.name == r.name))
+        .collect();
+    let mut answer = vec![untagged(&asked)];
+    // A tag that goes takes the digests it was pulled by along, unless what stays still
+    // has a tag.
+    if by_tag
+        && !staying
+            .iter()
+            .any(|r| full_tag(&r.reference, registry).is_some())
+    {
+        let mut digests: Vec<String> = chosen
+            .iter()
+            .filter_map(|r| full_digest(r, registry))
+            .filter(|d| {
+                !staying
+                    .iter()
+                    .any(|r| full_digest(r, registry).as_deref() == Some(d.as_str()))
+            })
+            .collect();
+        digests.sort();
+        digests.dedup();
+        answer.extend(digests.iter().map(|d| untagged(d)));
+    }
+    if staying.is_empty() && users.is_empty() && !chosen.is_empty() {
+        answer.push(json!({ "Deleted": image.id }));
+    }
+    Ok(Untag {
+        names: chosen.iter().map(|r| r.name.clone()).collect(),
+        answer,
+    })
+}
+
+/// DELETE /images/{key}: RemoveImages of the records `removal` picks.
+async fn remove(ctx: &Context, key: &str, force: bool) -> Result<Value, Answer> {
+    use hyper::StatusCode;
+    let all = list(ctx).map_err(|e| failed(format!("{e:#}")))?;
+    let image = find(&all, key).map_err(|e| says(super::lookup_status(&e), e))?;
+    let records: Vec<ImageRecord> = image
+        .records
+        .iter()
+        .filter_map(|name| ctx.store.load_image(name).ok().flatten())
+        .collect();
+    let snapshot = super::model::Snapshot::take(ctx)
+        .await
+        .map_err(|e| failed(format!("{e:#}")))?;
+    let users: Vec<User> = image
+        .containers
+        .iter()
+        .filter_map(|name| snapshot.machines.iter().find(|m| m.name() == name))
+        .map(|m| User {
+            id: m.id.clone(),
+            running: m.running(),
+        })
+        .collect();
+    let untag = removal(image, &records, key, force, &ctx.config.registry, &users)?;
+    if !untag.names.is_empty() {
+        let client = crate::client::Client::connect()
+            .await
+            .map_err(|e| failed(format!("{e:#}")))?;
+        let names = untag.names.clone();
+        if let Err(e) = client
+            .run_job_silent(|| client.manager.remove_images(&names), true)
+            .await
+        {
+            let kind = crate::client::error_name(&e);
+            return Err(match kind {
+                Some("NoSuchImage") | Some("NoSuchMachine") => {
+                    says(StatusCode::NOT_FOUND, format!("No such image: {key}"))
+                }
+                Some("InUse") => says(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "conflict: unable to delete {} (cannot be forced) - {e:#}",
+                        super::util::short(image.id.trim_start_matches("sha256:"))
+                    ),
+                ),
+                kind => says(super::containers::status_of(kind), format!("{e:#}")),
+            });
+        }
+    }
+    Ok(Value::Array(untag.answer))
+}
+
+/// The filters of POST /images/prune as PruneImages' options, or None when it prunes
+/// nothing: `dangling` (true unless said otherwise) names the images without a name,
+/// which nspawn's store does not keep, and false every image no container was made from.
+/// `label` narrows them, and `until` (a time or a duration before `now`); `label!` has
+/// nothing to narrow them with on the bus.
+pub fn prune_options(
+    filters: &Filters,
+    now: f64,
+    offset: i64,
+) -> Result<Option<super::create::Opts>, Answer> {
+    use super::create::Opt;
+    use hyper::StatusCode;
+    let bad = |text: String| says(StatusCode::BAD_REQUEST, text);
+    filters
+        .only(&["dangling", "label", "label!", "until"])
+        .map_err(|Invalid(text)| bad(text))?;
+    let dangling = match filters.values("dangling") {
+        None if filters.keys().any(|k| k == "dangling") => {
+            return Err(bad("invalid filter 'dangling'".to_string()))
+        }
+        None => true,
+        Some(values) => {
+            let off = values.contains("0") || values.contains("false");
+            let on = values.contains("1") || values.contains("true");
+            if off == on {
+                let listed: Vec<&str> = values.iter().map(String::as_str).collect();
+                return Err(bad(format!(
+                    "invalid filter 'dangling=[{}]'",
+                    listed.join(" ")
+                )));
+            }
+            on
+        }
+    };
+    let until = super::networks::prune_until(filters, now, offset)?;
+    if dangling {
+        return Ok(None);
+    }
+    if filters.values("label!").is_some() {
+        return Err(bad(
+            "invalid filter 'label!': not supported by nspawn's image prune, which takes label and until"
+                .to_string(),
+        ));
+    }
+    let mut opts = super::create::Opts::from([("all", Opt::Flag(true))]);
+    if let Some(labels) = filters.values("label") {
+        opts.insert("labels", Opt::Texts(labels.iter().cloned().collect()));
+    }
+    if let Some(until) = until {
+        opts.insert("until", Opt::Unsigned(until));
+    }
+    Ok(Some(opts))
+}
+
+/// The body of a prune that removed `removed` of `records`: an image's names untagged,
+/// and the image deleted once none of its records nor containers is left.
+pub fn pruned_body(
+    images: &[Image],
+    records: &[ImageRecord],
+    removed: &[String],
+    registry: &str,
+    reclaimed: u64,
+) -> Value {
+    let mut deleted = Vec::new();
+    for image in images {
+        let gone: Vec<&ImageRecord> = records
+            .iter()
+            .filter(|r| image.records.contains(&r.name) && removed.contains(&r.name))
+            .collect();
+        if gone.is_empty() {
+            continue;
+        }
+        let mut names: Vec<String> = Vec::new();
+        for name in gone
+            .iter()
+            .filter_map(|r| full_tag(&r.reference, registry))
+            .chain(gone.iter().filter_map(|r| full_digest(r, registry)))
+        {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        deleted.extend(names.iter().map(|n| untagged(n)));
+        if gone.len() == image.records.len() && image.containers.is_empty() {
+            deleted.push(json!({ "Deleted": image.id }));
+        }
+    }
+    json!({
+        "ImagesDeleted": if deleted.is_empty() { Value::Null } else { json!(deleted) },
+        "SpaceReclaimed": reclaimed,
+    })
+}
+
+/// POST /images/prune: PruneImages with every image the filters select.
+async fn prune(ctx: &Context, query: &super::Query) -> Result<Value, Answer> {
+    use hyper::StatusCode;
+    let filters = Filters::parse(query.get("filters"))
+        .map_err(|Invalid(text)| says(StatusCode::BAD_REQUEST, text))?;
+    let (now, offset) = super::networks::now_and_offset();
+    let Some(opts) = prune_options(&filters, now, offset)? else {
+        return Ok(json!({ "ImagesDeleted": null, "SpaceReclaimed": 0 }));
+    };
+    let images = list(ctx).map_err(|e| failed(format!("{e:#}")))?;
+    let records = ctx
+        .store
+        .list_images()
+        .map_err(|e| failed(format!("{e:#}")))?;
+    let client = crate::client::Client::connect()
+        .await
+        .map_err(|e| failed(format!("{e:#}")))?;
+    let outcome = client
+        .run_job_silent(
+            || client.manager.prune_images(super::create::to_bus(&opts)),
+            true,
+        )
+        .await;
+    let result = match outcome {
+        Ok(result) => result,
+        Err(e) => match crate::client::removed_before(e) {
+            Ok(result) => result,
+            Err(e) => {
+                return Err(says(
+                    super::containers::status_of(crate::client::error_name(&e)),
+                    format!("{e:#}"),
+                ))
+            }
+        },
+    };
+    Ok(pruned_body(
+        &images,
+        &records,
+        &crate::client::strings(&result, "removed"),
+        &ctx.config.registry,
+        crate::client::u64(&result, "reclaimed"),
+    ))
+}
+
+/// Serves a change of images.
+pub(super) async fn serve(
+    ctx: &std::sync::Arc<Context>,
+    call: Call,
+    query: &super::Query,
+) -> hyper::Response<super::Body> {
+    let served = match call {
+        Call::Remove(key) => remove(ctx, &key, query.flag("force", false)).await,
+        Call::Prune => prune(ctx, query).await,
+    };
+    match served {
+        Ok(body) => super::json_response(hyper::StatusCode::OK, &body),
+        Err(answer) => answer.respond(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -732,6 +1144,22 @@ mod tests {
             size: 4_421_246,
             pulled: 0,
         }
+    }
+
+    #[test]
+    fn a_reference_with_a_digest_is_looked_up_by_the_digest_alone() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let images = [busybox()];
+        let found = find(&images, &format!("busybox:1.37@{digest}")).unwrap();
+        assert_eq!(found.id, images[0].id);
+        assert!(find(&images, &format!("busybox:1.37@sha256:{}", "b".repeat(64))).is_err());
+        // A record pulled as tag and digest holds the digest, not the tag.
+        let pinned = format!("docker.io/library/postgres:16@{digest}");
+        assert_eq!(full_tag(&pinned, "hub.nspawn.org"), None);
+        assert_eq!(
+            full_tag("docker.io/library/postgres:16", "hub.nspawn.org").as_deref(),
+            Some("docker.io/library/postgres:16")
+        );
     }
 
     #[test]
@@ -972,5 +1400,289 @@ mod tests {
             ..record
         };
         assert_eq!(full_digest(&built, "docker.io"), None);
+    }
+}
+
+#[cfg(test)]
+mod changes {
+    use super::*;
+    use hyper::{Method, StatusCode};
+
+    const REGISTRY: &str = "hub.nspawn.org";
+
+    fn id() -> String {
+        format!("sha256:{}", "c".repeat(64))
+    }
+
+    fn digest() -> String {
+        format!("sha256:{}", "d".repeat(64))
+    }
+
+    fn record(name: &str, reference: &str) -> ImageRecord {
+        serde_json::from_value(json!({
+            "name": name, "reference": reference, "manifest_digest": digest(),
+            "layers": [], "backend": "overlay", "created": 1,
+        }))
+        .unwrap()
+    }
+
+    fn nginx(records: &[ImageRecord], containers: &[&str]) -> Image {
+        Image {
+            id: id(),
+            tags: records
+                .iter()
+                .filter_map(|r| full_tag(&r.reference, REGISTRY))
+                .collect(),
+            digests: records
+                .iter()
+                .filter_map(|r| full_digest(r, REGISTRY))
+                .collect(),
+            records: records.iter().map(|r| r.name.clone()).collect(),
+            containers: containers.iter().map(|c| c.to_string()).collect(),
+            config: json!({}),
+            layers: Vec::new(),
+            size: 0,
+            pulled: 0,
+        }
+    }
+
+    fn user(running: bool) -> User {
+        User {
+            id: "e".repeat(64),
+            running,
+        }
+    }
+
+    fn untag(names: &[&str]) -> Vec<Value> {
+        names.iter().map(|n| json!({ "Untagged": n })).collect()
+    }
+
+    #[test]
+    fn a_reference_goes_with_its_digests_and_the_image_when_nothing_holds_it() {
+        let records = [record("nginx", "docker.io/library/nginx:latest")];
+        let image = nginx(&records, &[]);
+        let pinned = format!("nginx@{}", digest());
+        let mut answer = untag(&["nginx:latest", &pinned]);
+        answer.push(json!({ "Deleted": id() }));
+        for key in ["nginx", "nginx:latest", "docker.io/library/nginx:latest"] {
+            assert_eq!(
+                removal(&image, &records, key, false, REGISTRY, &[]),
+                Ok(Untag {
+                    names: vec!["nginx".into()],
+                    answer: answer.clone(),
+                }),
+                "{key}"
+            );
+        }
+        // By the name of the record that holds it, as `nspawn images` lists it.
+        assert_eq!(
+            removal(&image, &records, "nginx", true, REGISTRY, &[])
+                .unwrap()
+                .names,
+            ["nginx"]
+        );
+        // By the digest: that reference alone is untagged.
+        let by_digest = removal(&image, &records, &pinned, false, REGISTRY, &[]).unwrap();
+        assert_eq!(by_digest.names, ["nginx"]);
+        assert_eq!(by_digest.answer[0], json!({ "Untagged": pinned }));
+        assert_eq!(
+            by_digest.answer.last().unwrap(),
+            &json!({ "Deleted": id() })
+        );
+    }
+
+    #[test]
+    fn a_container_keeps_its_image_unless_forced_and_then_stays() {
+        let records = [record("nginx", "docker.io/library/nginx:latest")];
+        let image = nginx(&records, &["web"]);
+        let stopped = [user(false)];
+        let (c12, i12) = ("e".repeat(12), "c".repeat(12));
+        assert_eq!(
+            removal(&image, &records, "nginx", false, REGISTRY, &stopped),
+            Err(says(
+                StatusCode::CONFLICT,
+                format!("conflict: unable to remove repository reference \"nginx\" (must force) - container {c12} is using its referenced image {i12}")
+            ))
+        );
+        // With force the record goes and the container keeps the image: not deleted.
+        let forced = removal(&image, &records, "nginx", true, REGISTRY, &stopped).unwrap();
+        assert_eq!(forced.names, ["nginx"]);
+        assert_eq!(
+            forced.answer,
+            untag(&["nginx:latest", &format!("nginx@{}", digest())])
+        );
+        // An image only a container holds: nothing to remove, the answer all the same.
+        let held = nginx(&[], &["web"]);
+        let mut only = held.clone();
+        only.tags = ["docker.io/library/nginx:latest".to_string()].into();
+        assert!(removal(&only, &[], "nginx", false, REGISTRY, &stopped).is_err());
+        let forced = removal(&only, &[], &id(), true, REGISTRY, &stopped).unwrap();
+        assert!(forced.names.is_empty());
+        assert_eq!(forced.answer, untag(&["nginx:latest"]));
+        // By ID, the engine's words for each conflict.
+        assert_eq!(
+            removal(&image, &records, &"c".repeat(8), false, REGISTRY, &[user(true)]),
+            Err(says(
+                StatusCode::CONFLICT,
+                format!("conflict: unable to delete {i12} (cannot be forced) - image is being used by running container {c12}")
+            ))
+        );
+        assert_eq!(
+            removal(&image, &records, &id(), false, REGISTRY, &stopped),
+            Err(says(
+                StatusCode::CONFLICT,
+                format!("conflict: unable to delete {i12} (must be forced) - image is being used by stopped container {c12}")
+            ))
+        );
+    }
+
+    #[test]
+    fn one_of_several_tags_is_untagged_alone() {
+        let records = [
+            record("nginx", "docker.io/library/nginx:latest"),
+            record("nginx-alt", "docker.io/library/nginx:1.27"),
+        ];
+        let image = nginx(&records, &["web"]);
+        // A container does not keep one of several names.
+        let one = removal(
+            &image,
+            &records,
+            "nginx:1.27",
+            false,
+            REGISTRY,
+            &[user(false)],
+        )
+        .unwrap();
+        assert_eq!(one.names, ["nginx-alt"]);
+        assert_eq!(one.answer, untag(&["nginx:1.27"]));
+        let by_record = removal(&image, &records, "nginx-alt", false, REGISTRY, &[]).unwrap();
+        assert_eq!(
+            by_record,
+            Untag {
+                names: vec!["nginx-alt".into()],
+                answer: untag(&["nginx:1.27"])
+            }
+        );
+        assert_eq!(
+            removal(&image, &records, &"c".repeat(12), false, REGISTRY, &[]),
+            Err(says(
+                StatusCode::CONFLICT,
+                format!("conflict: unable to delete {} (must be forced) - image is referenced in multiple repositories", "c".repeat(12))
+            ))
+        );
+        let all = removal(&nginx(&records, &[]), &records, &id(), true, REGISTRY, &[]).unwrap();
+        assert_eq!(all.names, ["nginx", "nginx-alt"]);
+        assert_eq!(all.answer.last().unwrap(), &json!({ "Deleted": id() }));
+        assert_eq!(all.answer.len(), 4, "two tags, a digest, the image");
+    }
+
+    #[test]
+    fn prunes_take_dangling_false_labels_and_until() {
+        use super::super::create::Opt;
+        let f = |text: &str| Filters::parse(Some(text)).unwrap();
+        let now = 1_000_000.0;
+        // The engine's default prunes the images without a name: nspawn keeps none.
+        assert_eq!(prune_options(&f("{}"), now, 0).unwrap(), None);
+        assert_eq!(
+            prune_options(&f(r#"{"dangling":["true"]}"#), now, 0).unwrap(),
+            None
+        );
+        let opts = prune_options(
+            &f(r#"{"dangling":["false"],"label":["a=b"],"until":["10m"]}"#),
+            now,
+            0,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(opts["all"], Opt::Flag(true));
+        assert_eq!(opts["labels"], Opt::Texts(vec!["a=b".into()]));
+        assert_eq!(opts["until"], Opt::Unsigned(1_000_000 - 600 + 1));
+        for (text, message) in [
+            (r#"{"nope":["1"]}"#, "invalid filter 'nope'"),
+            (
+                r#"{"dangling":["maybe"]}"#,
+                "invalid filter 'dangling=[maybe]'",
+            ),
+            (
+                r#"{"dangling":["0","1"]}"#,
+                "invalid filter 'dangling=[0 1]'",
+            ),
+            (r#"{"dangling":[]}"#, "invalid filter 'dangling'"),
+            (
+                r#"{"until":["1","2"]}"#,
+                "more than one until filter specified",
+            ),
+        ] {
+            assert_eq!(
+                prune_options(&f(text), now, 0).unwrap_err(),
+                says(StatusCode::BAD_REQUEST, message),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            prune_options(&f(r#"{"dangling":["false"],"label!":["a"]}"#), now, 0)
+                .unwrap_err()
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn a_prune_says_what_it_untagged_and_deleted() {
+        let records = [
+            record("nginx", "docker.io/library/nginx:latest"),
+            record("nginx-alt", "docker.io/library/nginx:1.27"),
+        ];
+        let image = nginx(&records, &[]);
+        let body = pruned_body(
+            std::slice::from_ref(&image),
+            &records,
+            &["nginx".into(), "nginx-alt".into()],
+            REGISTRY,
+            42,
+        );
+        let deleted = body["ImagesDeleted"].as_array().unwrap();
+        assert_eq!(deleted.last().unwrap(), &json!({ "Deleted": id() }));
+        assert!(deleted.contains(&json!({ "Untagged": "nginx:1.27" })));
+        assert_eq!(body["SpaceReclaimed"], 42);
+        // One of two records: untagged, not deleted.
+        let body = pruned_body(
+            std::slice::from_ref(&image),
+            &records,
+            &["nginx-alt".into()],
+            REGISTRY,
+            0,
+        );
+        assert!(!body["ImagesDeleted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.get("Deleted").is_some()));
+        let body = pruned_body(&[image], &records, &[], REGISTRY, 0);
+        assert_eq!(body, json!({ "ImagesDeleted": null, "SpaceReclaimed": 0 }));
+        let docker: Value =
+            serde_json::from_str(r#"{"ImagesDeleted":null,"SpaceReclaimed":0}"#).unwrap();
+        assert_eq!(
+            crate::dockerapi::shapes::diff(&body, &docker),
+            (vec![], vec![])
+        );
+    }
+
+    #[test]
+    fn the_routes_of_changes() {
+        fn parts(path: &str) -> Vec<&str> {
+            path.split('/').collect()
+        }
+        assert_eq!(
+            Call::of(&Method::DELETE, &parts("images/ghcr.io/x/y:1")),
+            Some(Call::Remove("ghcr.io/x/y:1".into()))
+        );
+        assert_eq!(
+            Call::of(&Method::POST, &parts("images/prune")),
+            Some(Call::Prune)
+        );
+        assert_eq!(Call::of(&Method::DELETE, &parts("images")), None);
+        assert_eq!(Call::of(&Method::GET, &parts("images/nginx/json")), None);
+        assert_eq!(Call::of(&Method::POST, &parts("images/nginx/tag")), None);
     }
 }

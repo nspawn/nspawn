@@ -44,12 +44,12 @@ hooks.
 | `api/secrets.rs` | secrets: systemd-creds around them, their files under the state directory, decrypted into a root-only tmpfs for a running machine and bind-mounted read-only |
 | `api/generate.rs` | `generate`: the `network create` and `run -d` commands that make machines again from their records, in the order of their dependencies, quoted for a shell |
 | `api/dependencies.rs` | `--depends-on`: the checks (machines of nspawn's, no cycle), the hook that waits for each condition (`await-dependencies`), the verdict on a dependency as its unit and healthcheck show it |
-| `api/copy.rs` | cp: tar streams packed and unpacked relative to directory descriptors, paths resolved with openat2 inside the machine's root, tried again when a `..` crossed a rename or mount on the host (EAGAIN) |
+| `api/copy.rs` | cp, and the Docker API's archive (`StatPath`, CopyTo's extract): tar streams packed and unpacked relative to directory descriptors, paths resolved with openat2 inside the machine's root, tried again when a `..` crossed a rename or mount on the host (EAGAIN) |
 | `api/disk.rs`, `commands/system.rs` | what is an image and what a machine (a record pulled or built and never started is an image only), sizes by kind for `system df`, the prunes of images and of stopped machines, and `system prune` on top of the prunes of the service |
 | `api/failure.rs` | the kinds of failure an error carries in its chain (no such machine, in use, not running, a bad argument and the others), which the service answers with as error names (`org.nspawn.Error.*`) and a job keeps as its `ErrorName` |
 | `api/wait.rs` | `WaitMachine`: the end of a machine's run from systemd's changes of its unit, the removal of its record from an inotify watch of the records' directory |
 | `api/recreate.rs`, `api/autoupdate.rs` | a machine made anew from a newer image with its options, and put back from its rollback when the new one does not come up; `auto-update`: candidates by label, the registry asked once per reference, dependents restarted |
-| `dockerapi/` | the Docker Engine API (`api-serve`), served on a machine's own socket and on the host's: who may do what (`access`: a machine's bind, polkit for a host client), routing and versions, containers, images, volumes and networks in docker's shapes, filters, events, logs, stats; the containers' changes through the service (`containers`: create, start, stop, restart, pause, wait, update, remove, prune; `create`: a create's settings as CreateMachine's options), a container's output from the journal until its run ends (`attach`, on the connection upgraded or as a body), pulls (`pull`: the registry's digest first, then PullImage into the image of the reference) |
+| `dockerapi/` | the Docker Engine API (`api-serve`), served on a machine's own socket and on the host's: who may do what (`access`: a machine's bind, polkit for a host client), routing and versions, containers, images, volumes and networks in docker's shapes, filters, events, logs, stats; the containers' changes through the service (`containers`: create, start, stop, restart, pause, wait, update, remove, prune; `create`: a create's settings as CreateMachine's options), a container's output from the journal until its run ends, and its input kept for its next start, which runs it with RunMachine and holds its terminal for resizes (`attach`, on the connection upgraded or as a body), commands run in a container (`exec`: instances kept in the server's memory, run with Exec, their streams on the connection, their terminals resized, their exit codes kept), a container's files (`archive`: StatPath for a HEAD and the stat header, CopyFrom for a GET, CopyTo's extract for a PUT), pulls (`pull`: the registry's digest first, then PullImage into the image of the reference), the changes of volumes (`volumes`: CreateVolume with labels and the anonymous mark, RemoveVolumes, a prune chosen from ListVolumes), networks (`networks`: CreateNetwork with the API's name, ConnectNetwork, DisconnectNetwork, RemoveNetworks, a prune chosen from the list) and images (`images`: RemoveImages of the records an image's reference or ID names, PruneImages) |
 | `build/dockerfile/`, `build/dispatch/` | ports of BuildKit's frontend: the parser, the shell lexer, instructions and flags; stages, build arguments, the steps with their history lines and the image's settings |
 | `build/plan.rs` | the stages and steps of a build, worked out before a step runs |
 | `build/ignore.rs`, `walk.rs`, `copy.rs`, `untar.rs` | the build context: `.dockerignore` patterns and their `!` exceptions, the walk of a context in lexical order without following symlinks, COPY and ADD with every path resolved inside its root, the context's tar and ADD's archives unpacked with every name resolved inside their destination |
@@ -106,11 +106,15 @@ hooks.
                      0700 with a writable layer, 0711 otherwise (an mstack
                      machine binds its files from inside its user namespace)
   volumes/NAME/      named volumes
+  volume-meta/NAME   what volume create keeps of a volume beside its directory
+                     (JSON): created, labels, the anonymous mark of the Docker
+                     API; forgotten when a start makes the directory anew
   secrets/NAME.cred  secrets encrypted with systemd-creds, NAME.json next to
                      each (created, size, labels); decrypted for a machine
                      into /run/nspawn/secrets/MACHINE while it runs
   networks/NAME.json user-defined networks: interface, subnet, internal,
-                     labels
+                     labels, api_name (the Docker API's name for it, where it
+                     is not NAME)
   starting/NAME      a start in progress, until the machine is registered:
                      nothing removes or replaces the image meanwhile; the
                      service removes every marker left when it starts
@@ -156,7 +160,8 @@ hooks.
   nspawn-overlay.conf  RequiresMountsFor= (overlay)
   nspawn-hooks.conf  ExecStartPre= (await-dependencies with --depends-on,
                      then network prepare), ExecStartPost= and ExecStopPost=
-                     calling nspawn, LogRateLimitIntervalSec=0; when set:
+                     calling nspawn, LogRateLimitIntervalSec=0,
+                     SyslogLevelPrefix=no; when set:
                      Restart= with its delays and StartLimitIntervalSec=0,
                      RestartForceExitStatus= (--rm), MemoryMax=,
                      MemorySwapMax=, CPUQuota=, TasksMax=, DeviceAllow=,
@@ -654,4 +659,6 @@ use and filled from what the image has at its target, owners included; one made
 ahead and still empty is filled at a machine's first start, unless another
 running machine has it. `api/volumes.rs` lists them with the records that name
 them and removes only the ones no record names, reading the records strictly so
-that one it cannot read never makes a volume look unused.
+that one it cannot read never makes a volume look unused. What `volume create`
+is given (labels, the Docker API's anonymous mark) and its time go to
+`volume-meta/NAME`, out of every machine's reach; a removal takes it along.

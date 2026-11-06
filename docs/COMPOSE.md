@@ -54,7 +54,9 @@ the networks, volumes, secrets and configs those use.
   so `nspawn run app` takes it; `user/app` stays Docker Hub's, where `build
   --push` sends it.
 - **Networks, volumes, secrets.** A network of the project is an nspawn network,
-  `PROJECT_KEY`, a volume an nspawn volume, `PROJECT_KEY` as well. A secret or config
+  `PROJECT_KEY`, a volume an nspawn volume, `PROJECT_KEY` as well, both made with the
+  file's labels and those docker compose puts on them (project, key, config hash,
+  version). A secret or config
   from a file is bound read-only where the service reads it, as docker binds it;
   one from the environment or written in the file is an nspawn secret,
   `PROJECT_secret_KEY` or `PROJECT_config_KEY`, removed by `down`.
@@ -424,7 +426,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.volumes.[].type`: `image` | no | an image is not mounted as a volume |
 | `services.*.volumes.[].type`: `npipe` | no | named pipes are for Windows containers |
 | `services.*.volumes.[].volume` | yes |  |
-| `services.*.volumes.[].volume.labels` and below | ignored | nspawn volumes have no labels |
+| `services.*.volumes.[].volume.labels` and below | ignored | the anonymous volume of a mount is made without labels; a volume of the project takes those of volumes.*.labels |
 | `services.*.volumes.[].volume.nocopy` | ignored | a new volume is filled from the image all the same |
 | `services.*.volumes.[].volume.subpath` | no | a volume is mounted whole |
 | `services.*.volumes_from` | no | a machine mounts the volumes of another one by naming them |
@@ -438,7 +440,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `volumes.*.driver_opts` and below | partly | type: none with o: bind (ro or rw beside it) and an absolute device binds that host directory, which down -v leaves; other options are refused |
 | `volumes.*.external` | yes |  |
 | `volumes.*.external.name` | yes |  |
-| `volumes.*.labels` and below | ignored | nspawn volumes have no labels |
+| `volumes.*.labels` and below | yes |  |
 | `volumes.*.name` | yes |  |
 
 ### Commands

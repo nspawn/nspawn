@@ -333,6 +333,17 @@ impl RecordWatch {
 
 /// Whether the record of `name` made at `created` is gone: none of the name, or another
 /// machine's.
+/// Whether what the watch saw is the removal of the machine made at `created`. A record
+/// written anew in place (an update's swap, a rollback) is deleted and written again under
+/// the store's lock, as a removal deletes it: once the lock is free, the record says which
+/// it was.
+async fn removed(store: &Store, name: &str, created: u64, seen: Seen) -> bool {
+    if seen == Seen::Gone {
+        let _ = store.lock().await;
+    }
+    record_gone(store, name, created)
+}
+
 fn record_gone(store: &Store, name: &str, created: u64) -> bool {
     match store.load_image(name) {
         Ok(record) => record.is_none_or(|r| r.created != created),
@@ -453,7 +464,7 @@ pub async fn wait(ctx: &Context, name: &str, condition: Condition) -> Result<i32
                 }
             }
             seen = removal => {
-                if seen? == Seen::Look && !record_gone(store, name, created) {
+                if !removed(store, name, created, seen?).await {
                     continue;
                 }
                 // An end said before the removal and not read yet is its last.
@@ -631,6 +642,39 @@ mod tests {
             "killed by SIGKILL"
         );
         assert_eq!(Main::of(|_| None), Main::default());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_record_written_anew_under_the_lock_is_no_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        store.init().unwrap();
+        let record: ImageRecord = serde_json::from_value(serde_json::json!({
+            "name": "web", "reference": "docker.io/library/busybox:1.37", "manifest_digest": "sha256:m",
+            "layers": [], "backend": "overlay", "created": 7,
+        }))
+        .unwrap();
+        store.record_image(&record).unwrap();
+        // An update's swap: deleted, then written again, under the lock.
+        let lock = store.lock().await.unwrap();
+        store.remove_record("web").unwrap();
+        let store2 = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let decided = tokio::spawn(async move { removed(&store2, "web", 7, Seen::Gone).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!decided.is_finished(), "it waits for the lock");
+        store.record_image(&record).unwrap();
+        drop(lock);
+        assert!(!decided.await.unwrap(), "the same machine is back");
+        // A removal, and a new machine of the name, are removals.
+        store.remove_record("web").unwrap();
+        assert!(removed(&store, "web", 7, Seen::Gone).await);
+        let newer = ImageRecord {
+            created: 8,
+            ..record
+        };
+        store.record_image(&newer).unwrap();
+        assert!(removed(&store, "web", 7, Seen::Look).await);
+        assert!(!removed(&store, "web", 8, Seen::Look).await);
     }
 
     #[tokio::test]

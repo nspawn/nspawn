@@ -141,6 +141,9 @@ pub struct NetSpec {
     /// KEY=VALUE, from network create --label.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// The name the Docker API knows the network by, where it is not `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_name: Option<String>,
 }
 
 /// A network a machine joins besides its primary one, and its address there.
@@ -2907,6 +2910,7 @@ mod tests {
             internal,
             created: 0,
             labels: BTreeMap::new(),
+            api_name: None,
         }
     }
 

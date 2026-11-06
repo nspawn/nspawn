@@ -19,11 +19,12 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{anyhow, bail, Context as _, Result};
 use nix::errno::Errno;
 use nix::fcntl::{openat, openat2, readlinkat, AtFlags, OFlag, OpenHow, ResolveFlag};
-use nix::sys::stat::{fchmod, fstat, fstatat, futimens, mkdirat, Mode, SFlag};
+use nix::sys::stat::{fchmod, fstat, fstatat, futimens, mkdirat, utimensat, Mode, SFlag};
+use nix::sys::stat::{FileStat, UtimensatFlags};
 use nix::sys::time::TimeSpec;
-use nix::unistd::{fchown, fchownat, symlinkat, unlinkat, Gid, Uid, UnlinkatFlags};
+use nix::unistd::{fchown, fchownat, linkat, symlinkat, unlinkat, Gid, Uid, UnlinkatFlags};
 
-use crate::api::{note, Context, Report};
+use crate::api::{note, Context, FailureKind, Report};
 use crate::backend::{is_mountpoint, BackendChoice};
 use crate::reference::validate_machine_name;
 
@@ -314,6 +315,18 @@ impl Ids {
             Ids::Shift(_) => 65534,
         }
     }
+
+    /// The host ID a file written for `id` inside the machine gets: the same with no
+    /// shift, beyond the machine's 65536 IDs nobody's; none with `Keep`, which writes
+    /// everything as whoever runs this.
+    fn inward(self, id: u64) -> Option<u32> {
+        match self {
+            Ids::Keep => None,
+            Ids::Shift(0) => Some(u32::try_from(id).unwrap_or(65534)),
+            Ids::Shift(base) if id < 65536 => Some(base + id as u32),
+            Ids::Shift(base) => Some(base + 65534),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -372,6 +385,16 @@ fn retry_on_eagain<T>(mut attempt: impl FnMut() -> nix::Result<T>) -> nix::Resul
         }
     }
     attempt()
+}
+
+/// `error`, a lookup's failure with `e`, as a path that is not there when it is one: the
+/// text stays.
+fn missing(e: Errno, error: anyhow::Error) -> anyhow::Error {
+    if e == Errno::ENOENT {
+        FailureKind::NoSuchPath.error(format!("{error:#}"))
+    } else {
+        error
+    }
 }
 
 /// Opens `path` beneath `root`, which it can never leave.
@@ -507,9 +530,33 @@ pub fn pack<W: Write>(
     ids: Ids,
     out: W,
 ) -> Result<Stats> {
+    pack_as(parent, leaf, top, Naming::Normalized, ids, out)
+}
+
+/// How the entries of a stream are named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Naming {
+    /// As the tar crate writes a path: `.` components left out, a directory without a
+    /// slash after it.
+    Normalized,
+    /// Byte for byte as the top and the tree give them, a directory with a slash after
+    /// it, as the engine names what it archives: a top named `.` makes `./` and
+    /// `./NAME`, one named `/` makes `/` and `/NAME`, which the other way cannot write.
+    Literal,
+}
+
+fn pack_as<W: Write>(
+    parent: BorrowedFd<'_>,
+    leaf: &OsStr,
+    top: &Path,
+    naming: Naming,
+    ids: Ids,
+    out: W,
+) -> Result<Stats> {
     let mut builder = tar::Builder::new(out);
     let mut stats = Stats::default();
-    if let Err(e) = pack_entry(&mut builder, parent, leaf, top, ids, &mut stats, 0) {
+    let walk = Walk { naming, ids };
+    if let Err(e) = pack_entry(&mut builder, parent, leaf, top, walk, &mut stats, 0) {
         // The builder ends the archive when dropped, and the other end would take a
         // clean end for the whole tree: a block that is no header breaks it instead.
         let _ = builder.get_mut().write_all(&[0xff; 512]);
@@ -522,15 +569,23 @@ pub fn pack<W: Write>(
     Ok(stats)
 }
 
+/// How a tree is packed: how its entries are named and whose they are.
+#[derive(Debug, Clone, Copy)]
+struct Walk {
+    naming: Naming,
+    ids: Ids,
+}
+
 fn pack_entry<W: Write>(
     builder: &mut tar::Builder<W>,
     dirfd: BorrowedFd<'_>,
     leaf: &OsStr,
     path: &Path,
-    ids: Ids,
+    walk: Walk,
     stats: &mut Stats,
     depth: usize,
 ) -> Result<()> {
+    let ids = walk.ids;
     let st = fstatat(dirfd, leaf, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(|e| nix_error(e, path))?;
     let mut header = tar::Header::new_gnu();
     header.set_mode(st.st_mode & 0o7777);
@@ -559,8 +614,7 @@ fn pack_entry<W: Write>(
         }
         header.set_entry_type(tar::EntryType::Directory);
         header.set_size(0);
-        builder
-            .append_data(&mut header, path, io::empty())
+        append_entry(builder, &mut header, path, None, io::empty(), walk.naming)
             .with_context(|| format!("writing {}", path.display()))?;
         stats.entries += 1;
         let listing = dir
@@ -582,7 +636,8 @@ fn pack_entry<W: Write>(
             let child = path.join(&name);
             // What goes or changes kind in a running machine between the listing and
             // its turn is left out, as the reference leaves it; anything else fails.
-            if let Err(e) = pack_entry(builder, dir.as_fd(), &name, &child, ids, stats, depth + 1) {
+            if let Err(e) = pack_entry(builder, dir.as_fd(), &name, &child, walk, stats, depth + 1)
+            {
                 if !went_meanwhile(&e) {
                     return Err(e);
                 }
@@ -613,8 +668,7 @@ fn pack_entry<W: Write>(
             left: size,
             failed: None,
         };
-        builder
-            .append_data(&mut header, path, &mut data)
+        append_entry(builder, &mut header, path, None, &mut data, walk.naming)
             .with_context(|| format!("writing {}", path.display()))?;
         if let Some(e) = data.failed {
             return Err(anyhow::Error::new(e).context(format!("reading {}", path.display())));
@@ -625,14 +679,83 @@ fn pack_entry<W: Write>(
         let target = readlinkat(dirfd, leaf).map_err(|e| nix_error(e, path))?;
         header.set_entry_type(tar::EntryType::Symlink);
         header.set_size(0);
-        builder
-            .append_link(&mut header, path, Path::new(&target))
-            .with_context(|| format!("writing {}", path.display()))?;
+        let target = Path::new(&target);
+        append_entry(
+            builder,
+            &mut header,
+            path,
+            Some(target),
+            io::empty(),
+            walk.naming,
+        )
+        .with_context(|| format!("writing {}", path.display()))?;
         stats.entries += 1;
     } else {
         stats.skipped.push(path.display().to_string());
     }
     Ok(())
+}
+
+/// The length of a header's name and link name fields.
+const NAME_FIELD: usize = 100;
+
+/// Appends an entry named `path`, with a link's target, as `naming` names it.
+fn append_entry<W: Write, R: Read>(
+    builder: &mut tar::Builder<W>,
+    header: &mut tar::Header,
+    path: &Path,
+    link: Option<&Path>,
+    data: R,
+    naming: Naming,
+) -> io::Result<()> {
+    match (naming, link) {
+        (Naming::Normalized, None) => builder.append_data(header, path, data),
+        (Naming::Normalized, Some(target)) => builder.append_link(header, path, target),
+        (Naming::Literal, link) => {
+            let mut name = path.as_os_str().as_bytes().to_vec();
+            if header.entry_type().is_dir() && !name.ends_with(b"/") {
+                name.push(b'/');
+            }
+            if let Some(target) = link {
+                let target = target.as_os_str().as_bytes();
+                if target.len() > NAME_FIELD {
+                    append_long(builder, tar::EntryType::GNULongLink, target)?;
+                }
+                set_field(&mut header.as_old_mut().linkname, target);
+            }
+            if name.len() > NAME_FIELD {
+                append_long(builder, tar::EntryType::GNULongName, &name)?;
+            }
+            set_field(&mut header.as_old_mut().name, &name);
+            header.set_cksum();
+            builder.append(header, data)
+        }
+    }
+}
+
+/// A GNU entry that carries the whole name or link target of the entry after it, whose
+/// own field holds what fits.
+fn append_long<W: Write>(
+    builder: &mut tar::Builder<W>,
+    kind: tar::EntryType,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let mut header = tar::Header::new_gnu();
+    set_field(&mut header.as_old_mut().name, b"././@LongLink");
+    header.set_mode(0o644);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_size(bytes.len() as u64 + 1);
+    header.set_entry_type(kind);
+    header.set_cksum();
+    builder.append(&header, bytes.chain(&[0u8][..]))
+}
+
+fn set_field(field: &mut [u8], bytes: &[u8]) {
+    field.fill(0);
+    let n = bytes.len().min(field.len());
+    field[..n].copy_from_slice(&bytes[..n]);
 }
 
 /// Whether an entry's error says it went or changed kind while the copy walked, as
@@ -781,58 +904,10 @@ pub fn unpack<R: Read>(
                 if is_dir_at(&parent, &leaf) {
                     bail!("{} is a directory; not replacing it", shown.display());
                 }
-                // Written beside its name and renamed over it once complete, so that a
-                // copy cut short leaves the file that was there, not half of the new one.
-                let staged = staged_leaf();
-                let file = openat(
-                    &parent,
-                    staged.as_os_str(),
-                    OFlag::O_WRONLY
-                        | OFlag::O_CREAT
-                        | OFlag::O_EXCL
-                        | OFlag::O_NOFOLLOW
-                        | OFlag::O_CLOEXEC,
-                    Mode::from_bits_truncate(0o600),
-                )
-                .map_err(|e| nix_error(e, &shown))?;
-                let mut file = File::from(file);
+                let staged = Staged::new(parent, leaf, shown);
                 let size = entry.header().entry_size().unwrap_or(0);
-                let written: Result<u64> = (|| {
-                    let bytes = io::copy(&mut entry, &mut file)
-                        .with_context(|| format!("writing {}", shown.display()))?;
-                    // A stream cut short ends an entry early without an error: the file
-                    // that was there stays.
-                    if bytes != size {
-                        bail!(
-                            "{}: the stream ended {} bytes short",
-                            shown.display(),
-                            size - bytes.min(size)
-                        );
-                    }
-                    if let Some((uid, gid)) = owner {
-                        fchown(&file, Some(uid), Some(gid)).map_err(|e| nix_error(e, &shown))?;
-                    }
-                    // After the chown, which clears setuid and setgid.
-                    fchmod(&file, mode).map_err(|e| nix_error(e, &shown))?;
-                    futimens(&file, &timespec(mtime), &timespec(mtime))
-                        .map_err(|e| nix_error(e, &shown))?;
-                    Ok(bytes)
-                })();
-                match written {
-                    Ok(bytes) => {
-                        stats.bytes += bytes;
-                        pending = Some(Staged {
-                            parent,
-                            staged,
-                            leaf,
-                            shown,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = unlinkat(&parent, staged.as_os_str(), UnlinkatFlags::NoRemoveDir);
-                        return Err(e);
-                    }
-                }
+                stats.bytes += staged.write(&mut entry, size, owner, mode, mtime)?;
+                pending = Some(staged);
             }
             tar::EntryType::Symlink => {
                 let link = entry
@@ -904,6 +979,62 @@ struct Staged {
 }
 
 impl Staged {
+    fn new(parent: OwnedFd, leaf: OsString, shown: PathBuf) -> Self {
+        Staged {
+            parent,
+            staged: staged_leaf(),
+            leaf,
+            shown,
+        }
+    }
+
+    /// Writes `size` bytes of `data` under the staged name, then gives the file its
+    /// owner, mode and time; what it wrote goes again when that fails. Written beside its
+    /// name and renamed over it once complete, so that a copy cut short leaves the file
+    /// that was there, not half of the new one.
+    fn write(
+        &self,
+        data: &mut dyn Read,
+        size: u64,
+        owner: Option<(Uid, Gid)>,
+        mode: Mode,
+        mtime: u64,
+    ) -> Result<u64> {
+        let shown = &self.shown;
+        let file = openat(
+            &self.parent,
+            self.staged.as_os_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )
+        .map_err(|e| nix_error(e, shown))?;
+        let mut file = File::from(file);
+        let written: Result<u64> = (|| {
+            let bytes = io::copy(data, &mut file)
+                .with_context(|| format!("writing {}", shown.display()))?;
+            // A stream cut short ends an entry early without an error: the file that was
+            // there stays.
+            if bytes != size {
+                bail!(
+                    "{}: the stream ended {} bytes short",
+                    shown.display(),
+                    size - bytes.min(size)
+                );
+            }
+            if let Some((uid, gid)) = owner {
+                fchown(&file, Some(uid), Some(gid)).map_err(|e| nix_error(e, shown))?;
+            }
+            // After the chown, which clears setuid and setgid.
+            fchmod(&file, mode).map_err(|e| nix_error(e, shown))?;
+            futimens(&file, &timespec(mtime), &timespec(mtime)).map_err(|e| nix_error(e, shown))?;
+            Ok(bytes)
+        })();
+        if written.is_err() {
+            self.discard();
+        }
+        written
+    }
+
     fn finish(self) -> Result<()> {
         let renamed = nix::fcntl::renameat(
             &self.parent,
@@ -981,6 +1112,48 @@ pub fn block_sigpipe() {
 pub struct Root {
     pub fd: OwnedFd,
     pub base: u32,
+    /// For a machine that does not run, where its volumes go, relative to the root as
+    /// written and with the tree's links followed, and each volume's target: they are
+    /// mounted only while it runs, and the tree has a bare directory there.
+    pub unmounted: Vec<(PathBuf, String)>,
+}
+
+impl Root {
+    /// Refuses `relative` (to the root, as given) when it is at or below a volume the
+    /// machine mounts only while it runs.
+    fn refuse_unmounted(&self, label: &str, relative: &Path) -> Result<()> {
+        if self.unmounted.is_empty() {
+            return Ok(());
+        }
+        let resolved = resolve_in(self.fd.as_fd(), relative).ok();
+        let covered = self.unmounted.iter().find(|(at, _)| {
+            relative.starts_with(at) || resolved.as_ref().is_some_and(|r| r.starts_with(at))
+        });
+        match covered {
+            Some((_, target)) => Err(FailureKind::Invalid.error(format!(
+                "{label}: the volume at {target} is mounted only while the machine runs; start it first"
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Where the volumes of a machine that does not run go in its tree (`Root::unmounted`).
+fn unmounted_volumes(
+    root: BorrowedFd<'_>,
+    volumes: &[crate::volume::Volume],
+) -> Vec<(PathBuf, String)> {
+    let mut out = Vec::new();
+    for volume in volumes {
+        let written = inside(&volume.target);
+        if let Ok(resolved) = resolve_in(root, &written) {
+            if resolved != written {
+                out.push((resolved, volume.target.clone()));
+            }
+        }
+        out.push((written, volume.target.clone()));
+    }
+    out
 }
 
 /// Writes from now on as `id` on this thread, with root's file capabilities kept, since
@@ -1038,7 +1211,11 @@ pub async fn open_root(ctx: &Context, name: &str, report: Report<'_>) -> Result<
         if managed {
             // The tree is mountfsd's idmapped mount: the owner of / as seen through it is
             // the range nsresourced gave the machine, which is what root inside is.
-            return Ok(Root { fd, base: seen });
+            return Ok(Root {
+                fd,
+                base: seen,
+                unmounted: Vec::new(),
+            });
         }
         let base = match sd.machine_uid_shift(name).await {
             Ok(shift) => {
@@ -1052,7 +1229,11 @@ pub async fn open_root(ctx: &Context, name: &str, report: Report<'_>) -> Result<
             }
             Err(_) => seen,
         };
-        return Ok(Root { fd, base });
+        return Ok(Root {
+            fd,
+            base,
+            unmounted: Vec::new(),
+        });
     }
     let record = store.load_image(name)?.ok_or_else(|| {
         crate::api::FailureKind::NoSuchMachine.error(format!("no machine or image named {name}"))
@@ -1078,20 +1259,28 @@ pub async fn open_root(ctx: &Context, name: &str, report: Report<'_>) -> Result<
     .map_err(|e| nix_error(e, &tree))?;
     // Root inside owns /: its owner is the shift, 0 before the first boot.
     let base = fstat(&fd).map_err(|e| nix_error(e, &tree))?.st_uid;
-    Ok(Root { fd, base })
+    let unmounted = unmounted_volumes(fd.as_fd(), &record.volumes);
+    Ok(Root {
+        fd,
+        base,
+        unmounted,
+    })
 }
 
-/// CopyFrom: `path` of the machine, packed into `out`.
+/// CopyFrom: `path` of the machine, packed into `out`; its top entry named `entry_name`
+/// when one is given (`check_entry_name`), else as `cp` names it.
 pub async fn copy_from(
     ctx: &Context,
     name: &str,
     path: &str,
+    entry_name: Option<&str>,
     out: OwnedFd,
     report: Report<'_>,
 ) -> Result<Stats> {
     let root = open_root(ctx, name, report).await?;
     let (source, _) = split_source(path);
     let relative = inside(&source);
+    root.refuse_unmounted(&format!("{name}:{source}"), &relative)?;
     let (parent_path, leaf) = split_leaf(&relative);
     // The name the copy takes: the leaf, or for a path that ends in .. the directory it
     // comes to, the machine's name for its root.
@@ -1116,31 +1305,42 @@ pub async fn copy_from(
     // resolution follows it there: the directory is packed under the name given.
     let trailing = path.ends_with('/') || path.ends_with("/.");
     let (parent, leaf) = if trailing && leaf != "." {
-        let dir = scoped(
+        let dir = scoped_raw(
             root.fd.as_fd(),
             &relative,
             OFlag::O_PATH | OFlag::O_DIRECTORY,
         )
-        .map_err(|e| anyhow!("{name}:{source}: {e:#}"))?;
+        .map_err(|e| missing(e, anyhow!("{name}:{source}: {:#}", nix_error(e, &relative))))?;
         (dir, OsString::from("."))
     } else {
-        let parent = scoped(
+        let parent = scoped_raw(
             root.fd.as_fd(),
             &parent_path,
             OFlag::O_PATH | OFlag::O_DIRECTORY,
         )
-        .map_err(|e| anyhow!("{name}:{source}: {e:#}"))?;
+        .map_err(|e| {
+            missing(
+                e,
+                anyhow!("{name}:{source}: {:#}", nix_error(e, &parent_path)),
+            )
+        })?;
         (parent, leaf)
     };
     if let Err(e) = fstatat(&parent, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
-        bail!("{}", nix_error(e, Path::new(&format!("{name}:{source}"))));
+        let error = nix_error(e, Path::new(&format!("{name}:{source}")));
+        return Err(missing(e, anyhow!("{error}")));
     }
+    let (top, naming) = match entry_name {
+        Some(given) => (OsString::from(given), Naming::Literal),
+        None => (top, Naming::Normalized),
+    };
     let base = root.base;
     let stats = on_thread(move || {
-        pack(
+        pack_as(
             parent.as_fd(),
             &leaf,
             Path::new(&top),
+            naming,
             Ids::Shift(base),
             File::from(out),
         )
@@ -1167,6 +1367,7 @@ pub async fn copy_to(
     let root = open_root(ctx, name, report).await?;
     let trailing_slash = path.len() > 1 && path.ends_with('/');
     let relative = destination_in(root.fd.as_fd(), &inside(path.trim_end_matches('/')))?;
+    root.refuse_unmounted(&format!("{name}:{path}"), &relative)?;
     let dst_kind = kind_in(root.fd.as_fd(), &relative)?;
     if dst_kind.is_none() {
         let (parent, _) = split_leaf(&relative);
@@ -1202,6 +1403,816 @@ pub async fn copy_to(
         );
     }
     Ok(stats)
+}
+
+/// A name CopyFrom's option `name` gives the top entry: `.`, `/`, or one name of a path
+/// that is neither `..` nor holds a slash or NUL.
+pub fn check_entry_name(name: &str) -> Result<()> {
+    let plain = !name.is_empty() && name != ".." && !name.contains(['/', '\0']);
+    if plain || name == "." || name == "/" {
+        return Ok(());
+    }
+    Err(FailureKind::Invalid.error(format!(
+        "option name {name:?}: expected one name of a path, . or /"
+    )))
+}
+
+/// What StatPath says of a path inside a machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathStat {
+    /// The path's last element (`base_name`).
+    pub name: String,
+    pub size: u64,
+    /// st_mode: the file's type and permissions.
+    pub mode: u32,
+    /// Unix nanoseconds.
+    pub mtime: i64,
+    /// Where a link leads inside the machine, every link on the way followed, as an
+    /// absolute path; empty for anything but a link.
+    pub link_target: String,
+}
+
+/// The last element of a path as filepath.Base reads it: slashes at the end do not
+/// count, the root is `/` and an empty path `.`.
+pub fn base_name(path: &str) -> String {
+    if path.is_empty() {
+        return ".".to_string();
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".to_string();
+    }
+    trimmed.rsplit('/').next().unwrap_or(trimmed).to_string()
+}
+
+/// `path` beneath `root` as lstat sees it there: its last component is not followed,
+/// unless the path ends in a slash, `.` or `..`, which the kernel resolves through it.
+/// `label` names the path in errors.
+pub fn stat_in(root: BorrowedFd<'_>, path: &str, label: &str) -> Result<PathStat> {
+    let relative = inside(path);
+    let shown = Path::new(label);
+    let last = path.rsplit('/').next().unwrap_or_default();
+    let st = if matches!(last, "" | "." | "..") {
+        let fd = scoped_raw(root, &relative, OFlag::O_PATH)
+            .map_err(|e| missing(e, nix_error(e, shown)))?;
+        fstat(&fd)
+    } else {
+        let (parent, leaf) = split_leaf(&relative);
+        let dir = scoped_raw(root, &parent, OFlag::O_PATH | OFlag::O_DIRECTORY)
+            .map_err(|e| missing(e, nix_error(e, shown)))?;
+        fstatat(&dir, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+    }
+    .map_err(|e| missing(e, nix_error(e, shown)))?;
+    let link_target = if is(st.st_mode, SFlag::S_IFLNK) {
+        let resolved = resolve_in(root, &relative).map_err(|e| anyhow!("{label}: {e:#}"))?;
+        Path::new("/").join(resolved).display().to_string()
+    } else {
+        String::new()
+    };
+    Ok(PathStat {
+        name: base_name(path),
+        size: st.st_size.max(0) as u64,
+        mode: st.st_mode,
+        mtime: mtime_nanos(&st),
+        link_target,
+    })
+}
+
+fn mtime_nanos(st: &FileStat) -> i64 {
+    st.st_mtime
+        .saturating_mul(1_000_000_000)
+        .saturating_add(st.st_mtime_nsec)
+}
+
+/// StatPath: `path` of the machine (running, or a stopped overlay or flat one), not
+/// followed when it is a link.
+pub async fn stat_path(ctx: &Context, name: &str, path: &str) -> Result<PathStat> {
+    if path.is_empty() {
+        return Err(FailureKind::Invalid.error("an empty path"));
+    }
+    let quiet = |_: crate::api::Event| {};
+    let root = open_root(ctx, name, &quiet).await?;
+    let label = format!("{name}:{path}");
+    root.refuse_unmounted(&label, &inside(path))?;
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || stat_in(root.fd.as_fd(), &path, &label))
+        .await
+        .context("the stat stopped")?
+}
+
+/// The owner USER[:GROUP] names inside a machine, as numbers, read as the engine reads
+/// the user a copy's files get: each part a name of /etc/passwd or /etc/group or a
+/// number; a user's group is the one passwd gives it, 0 for a number passwd does not
+/// list, and a part left empty is root's.
+pub fn resolve_owner(passwd: &str, group: &str, spec: &str) -> Result<(u32, u32)> {
+    fn entries(text: &str) -> impl Iterator<Item = Vec<&str>> {
+        text.lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| line.split(':').collect::<Vec<&str>>())
+            .filter(|fields| fields.len() >= 3)
+    }
+    // As the engine tells a number from a name: one that fits a signed 32-bit integer.
+    let number = |s: &str| s.parse::<u32>().ok().filter(|n| *n <= i32::MAX as u32);
+    let (user, wanted_group) = match spec.split_once(':') {
+        Some((user, group)) => (user, group),
+        None => (spec, ""),
+    };
+    let (mut uid, mut gid) = (0, 0);
+    if !user.is_empty() {
+        let found = match number(user) {
+            Some(n) => entries(passwd).find(|f| f.len() >= 4 && number(f[2]) == Some(n)),
+            None => entries(passwd).find(|f| f.len() >= 4 && f[0] == user),
+        };
+        (uid, gid) = match (found, number(user)) {
+            (Some(f), _) => (
+                f[2].parse()
+                    .map_err(|_| anyhow!("user {user}: a bad uid in /etc/passwd"))?,
+                f[3].parse()
+                    .map_err(|_| anyhow!("user {user}: a bad gid in /etc/passwd"))?,
+            ),
+            (None, Some(n)) => (n, 0),
+            (None, None) => bail!("no user {user} in the machine's /etc/passwd"),
+        };
+    }
+    if !wanted_group.is_empty() {
+        gid = match number(wanted_group) {
+            Some(n) => n,
+            None => entries(group)
+                .find(|f| f[0] == wanted_group)
+                .and_then(|f| f[2].parse().ok())
+                .ok_or_else(|| anyhow!("no group {wanted_group} in the machine's /etc/group"))?,
+        };
+    }
+    Ok((uid, gid))
+}
+
+/// A text file of the machine, read through its root; empty when it is not there. The
+/// machine may have put a fifo or a terminal there: only a regular file is read, and
+/// opening never waits for a writer.
+fn text_in(root: BorrowedFd<'_>, path: &str) -> Result<String> {
+    const MAX: u64 = 16 << 20;
+    let flags = OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOCTTY;
+    let file = match scoped_raw(root, Path::new(path), flags) {
+        Ok(fd) => File::from(fd),
+        Err(Errno::ENOENT) => return Ok(String::new()),
+        Err(e) => return Err(nix_error(e, Path::new(path))),
+    };
+    let st = fstat(&file).map_err(|e| nix_error(e, Path::new(path)))?;
+    if !is(st.st_mode, SFlag::S_IFREG) {
+        return Err(FailureKind::Invalid.error(format!("/{path} is not a regular file")));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading /{path}"))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Why the machine's settings keep a copy from writing in `dir` (relative to its root):
+/// a volume mounted read-only over it, or the read-only root where no volume is.
+fn read_only_setting(
+    volumes: &[crate::volume::Volume],
+    root_read_only: bool,
+    dir: &Path,
+) -> Option<String> {
+    let at = Path::new("/").join(dir);
+    let volume = volumes
+        .iter()
+        .filter(|v| at.starts_with(&v.target))
+        .max_by_key(|v| Path::new(&v.target).components().count());
+    match volume {
+        Some(v) if v.read_only => Some(format!("the volume at {} is mounted read-only", v.target)),
+        Some(_) => None,
+        None if root_read_only => Some("the machine's root is read-only".to_string()),
+        None => None,
+    }
+}
+
+/// CopyTo's extract, checked before any of its stream is read: the directory it writes
+/// in, and the owner its files get.
+pub struct Extraction {
+    root: Root,
+    /// Relative to the root, every link followed.
+    dir: PathBuf,
+    label: String,
+    owner: Option<(u32, u32)>,
+    no_overwrite_dir_non_dir: bool,
+}
+
+/// Checks an extract at `path` of the machine: an existing directory once its links are
+/// followed (`NoSuchPath` when there is nothing, `Invalid` for anything else) that
+/// neither the machine's settings nor its mounts keep read-only. `owner`, USER[:GROUP]
+/// of the machine (`resolve_owner`), is every file's owner when given and not empty.
+pub async fn prepare_extract(
+    ctx: &Context,
+    name: &str,
+    path: &str,
+    owner: Option<&str>,
+    no_overwrite_dir_non_dir: bool,
+    report: Report<'_>,
+) -> Result<Extraction> {
+    if path.is_empty() {
+        return Err(FailureKind::Invalid.error("an empty path"));
+    }
+    let root = open_root(ctx, name, report).await?;
+    let label = format!("{name}:{path}");
+    let fd = root.fd.as_fd();
+    let dir = resolve_in(fd, &inside(path)).map_err(|e| anyhow!("{label}: {e:#}"))?;
+    root.refuse_unmounted(&label, &dir)?;
+    match kind_in(fd, &dir).map_err(|e| anyhow!("{label}: {e:#}"))? {
+        Some(Kind::Directory) => {}
+        Some(_) => {
+            return Err(
+                FailureKind::Invalid.error(format!("{label}: extraction point is not a directory"))
+            )
+        }
+        None => {
+            return Err(FailureKind::NoSuchPath.error(format!("{label}: no such file or directory")))
+        }
+    }
+    if let Some(record) = ctx.store.load_image(name)? {
+        if let Some(why) = read_only_setting(&record.volumes, record.tuning.read_only, &dir) {
+            return Err(FailureKind::Invalid.error(format!("{label}: {why}")));
+        }
+    }
+    let at = scoped(fd, &dir, OFlag::O_PATH | OFlag::O_DIRECTORY)?;
+    let read_only = nix::sys::statvfs::fstatvfs(&at)
+        .is_ok_and(|s| s.flags().contains(nix::sys::statvfs::FsFlags::ST_RDONLY));
+    if read_only {
+        return Err(FailureKind::Invalid.error(format!("{label}: read-only file system")));
+    }
+    let owner = match owner.filter(|o| !o.is_empty()) {
+        Some(spec) => {
+            // Off the service's workers: the files are the machine's, on whatever it
+            // mounted there.
+            let copy = root.fd.try_clone().context("keeping the machine's root")?;
+            let (passwd, group) = tokio::task::spawn_blocking(move || {
+                Ok::<_, anyhow::Error>((
+                    text_in(copy.as_fd(), "etc/passwd")?,
+                    text_in(copy.as_fd(), "etc/group")?,
+                ))
+            })
+            .await
+            .context("reading the machine's users")??;
+            let ids = resolve_owner(&passwd, &group, spec)
+                .map_err(|e| FailureKind::Invalid.error(format!("{label}: {e:#}")))?;
+            Some(ids)
+        }
+        None => None,
+    };
+    Ok(Extraction {
+        root,
+        dir,
+        label,
+        owner,
+        no_overwrite_dir_non_dir,
+    })
+}
+
+impl Extraction {
+    /// The stream from `input`, plain or compressed, written beneath the directory
+    /// (`extract`).
+    pub async fn run(self, input: OwnedFd, report: Report<'_>) -> Result<Stats> {
+        let Extraction {
+            root,
+            dir,
+            label,
+            owner,
+            no_overwrite_dir_non_dir,
+        } = self;
+        let base = root.base;
+        let stats = on_thread(move || {
+            if base != 0 {
+                write_as(base)?;
+            }
+            let reader = decompressed(File::from(input))?;
+            let options = ExtractOptions {
+                owner,
+                no_overwrite_dir_non_dir,
+                unmounted: root.unmounted.clone(),
+            };
+            extract(reader, root.fd.as_fd(), &dir, Ids::Shift(base), options)
+                .with_context(|| label.clone())
+        })
+        .await?;
+        for skipped in &stats.skipped {
+            note(
+                report,
+                format!("note: {skipped} is not a file, directory or link; not copied"),
+            );
+        }
+        Ok(stats)
+    }
+}
+
+/// How `extract` writes over what is there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtractOptions {
+    /// Every entry's owner inside the machine, instead of the one its header gives.
+    pub owner: Option<(u32, u32)>,
+    /// A directory never takes the place of anything else, nor anything else of a
+    /// directory.
+    pub no_overwrite_dir_non_dir: bool,
+    /// Where no entry may go: the volumes of a machine that does not run
+    /// (`Root::unmounted`).
+    pub unmounted: Vec<(PathBuf, String)>,
+}
+
+/// The stream as it came, or decompressed when its first bytes say gzip, bzip2, xz or
+/// zstd, as the engine takes an archive to extract.
+fn decompressed(mut input: File) -> Result<Box<dyn Read>> {
+    use crate::build::untar::{detect, Compression};
+    // Read whole, not as the first read of a pipe happens to cut it.
+    let mut head = [0u8; 8];
+    let mut got = 0;
+    while got < head.len() {
+        match input.read(&mut head[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e).context("reading the stream"),
+        }
+    }
+    let kind = detect(&head[..got]);
+    let reader = io::BufReader::new(io::Cursor::new(head[..got].to_vec()).chain(input));
+    Ok(match kind {
+        Compression::None => Box::new(reader),
+        Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(reader)),
+        Compression::Bzip2 => Box::new(bzip2::read::MultiBzDecoder::new(reader)),
+        Compression::Zstd => Box::new(
+            zstd::stream::read::Decoder::with_buffer(reader).context("reading the stream")?,
+        ),
+        // Its decoder only writes: it runs on a thread of its own, into a pipe.
+        Compression::Xz => {
+            let (read, write) = nix::unistd::pipe2(OFlag::O_CLOEXEC).context("creating a pipe")?;
+            let mut reader = reader;
+            let decoder = std::thread::Builder::new()
+                .name("nspawn-xz".to_string())
+                .spawn(move || {
+                    block_sigpipe();
+                    let mut out = File::from(write);
+                    lzma_rs::xz_decompress(&mut reader, &mut out).map_err(|e| format!("{e:?}"))
+                })
+                .context("starting the xz decoder")?;
+            Box::new(Decoded {
+                pipe: File::from(read),
+                decoder: Some(decoder),
+            })
+        }
+    })
+}
+
+/// What a decoder on a thread of its own writes; its failure ends the stream with an
+/// error, never as a clean end.
+struct Decoded {
+    pipe: File,
+    decoder: Option<std::thread::JoinHandle<std::result::Result<(), String>>>,
+}
+
+impl Read for Decoded {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.pipe.read(buf)?;
+        if n == 0 {
+            if let Some(decoder) = self.decoder.take() {
+                match decoder.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(io::Error::other(format!("xz: {e}"))),
+                    Err(_) => return Err(io::Error::other("the xz decoder stopped")),
+                }
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// The names an entry's path takes beneath a directory, cleaned as filepath.Clean
+/// cleans them: `.` gone, each `..` taking the name before it; None when a `..` would
+/// climb above the directory. With `rooted`, a path that starts with a slash is rooted
+/// at the directory, and `..` stops there.
+fn beneath(path: &Path, rooted: bool) -> Option<Vec<OsString>> {
+    let stops = rooted && path.has_root();
+    let mut names: Vec<OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => names.push(name.to_os_string()),
+            Component::ParentDir => {
+                let above = names.pop().is_none();
+                if above && !stops {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(names)
+}
+
+/// Whether a link at `parent` (names relative to the root) to `target` leads above `dir`
+/// once joined and cleaned, as the engine refuses such a link: an absolute target never
+/// does, since the engine joins it below the link's directory too.
+fn link_leaves(dir: &Path, parent: &Path, target: &Path) -> bool {
+    if target.has_root() {
+        return false;
+    }
+    let floor: Vec<Component> = dir.components().collect();
+    let mut at: Vec<Component> = parent.components().collect();
+    for component in target.components() {
+        match component {
+            Component::ParentDir => {
+                at.pop();
+            }
+            Component::Normal(_) => at.push(component),
+            _ => {}
+        }
+    }
+    !at.starts_with(&floor)
+}
+
+/// What an entry of a stream to extract makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Made {
+    Directory,
+    File,
+    Symlink,
+    HardLink,
+}
+
+/// Writes the entries of a tar stream beneath `dir` (relative to `root`, every link of
+/// it followed) as the engine extracts an archive into a container: each entry by its
+/// own name, a leading slash dropped and a name that climbs above `dir` refused, the
+/// directories it implies made with mode 0755 and root's owner, owners and modes from the
+/// headers (owners with `Ids::Shift`, the option's owner instead when given), what is
+/// there replaced, a directory merged with one of the stream. Sockets, devices and fifos
+/// are left out, as `unpack` leaves them.
+pub fn extract<R: Read>(
+    reader: R,
+    root: BorrowedFd<'_>,
+    dir: &Path,
+    ids: Ids,
+    options: ExtractOptions,
+) -> Result<Stats> {
+    let mut archive = tar::Archive::new(reader);
+    let mut stats = Stats::default();
+    let mut directories: Vec<(PathBuf, u64)> = Vec::new();
+    let mut pending: Option<Staged> = None;
+    let root_owner = ids
+        .inward(0)
+        .map(|id| (Uid::from_raw(id), Gid::from_raw(id)));
+    let owner_of = |header: &tar::Header| -> Option<(Uid, Gid)> {
+        let (uid, gid) = match options.owner {
+            Some((uid, gid)) => (u64::from(uid), u64::from(gid)),
+            None => (header.uid().unwrap_or(0), header.gid().unwrap_or(0)),
+        };
+        Some((
+            Uid::from_raw(ids.inward(uid)?),
+            Gid::from_raw(ids.inward(gid)?),
+        ))
+    };
+    for entry in archive.entries().context("reading the stream")? {
+        let mut entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                if let Some(staged) = pending.take() {
+                    staged.discard();
+                }
+                return Err(e).context("reading the stream");
+            }
+        };
+        if let Some(staged) = pending.take() {
+            staged.finish()?;
+        }
+        let kind = entry.header().entry_type();
+        if kind.is_pax_global_extensions() {
+            continue;
+        }
+        let raw = entry.path_bytes().into_owned();
+        let name = Path::new(OsStr::from_bytes(&raw));
+        let mut names = beneath(name, true).ok_or_else(|| {
+            anyhow!(
+                "{}: the name leads out of the directory it is extracted into",
+                name.display()
+            )
+        })?;
+        let Some(leaf) = names.pop() else {
+            // The directory itself, which stays as it is.
+            if kind.is_dir() {
+                continue;
+            }
+            bail!(
+                "{}: only a directory can stand for the directory the stream is extracted into",
+                name.display()
+            );
+        };
+        // An old header's type 0 is a directory when its name ends in a slash.
+        let old_directory = entry.header().as_old().linkflag[0] == 0 && raw.ends_with(b"/");
+        let made = match kind {
+            tar::EntryType::Directory => Made::Directory,
+            tar::EntryType::Regular if old_directory => Made::Directory,
+            tar::EntryType::Regular | tar::EntryType::Continuous | tar::EntryType::GNUSparse => {
+                Made::File
+            }
+            tar::EntryType::Symlink => Made::Symlink,
+            tar::EntryType::Link => Made::HardLink,
+            _ => {
+                let at = dir.join(names.iter().collect::<PathBuf>()).join(&leaf);
+                stats
+                    .skipped
+                    .push(Path::new("/").join(at).display().to_string());
+                continue;
+            }
+        };
+        let lexical = dir.join(names.iter().collect::<PathBuf>()).join(&leaf);
+        if let Some((_, target)) = options
+            .unmounted
+            .iter()
+            .find(|(at, _)| lexical.starts_with(at))
+        {
+            bail!(
+                "{}: the volume at {target} is mounted only while the machine runs; start it first",
+                Path::new("/").join(&lexical).display()
+            );
+        }
+        let parent_path = implied_directories(root, dir, &names, root_owner)?;
+        let shown = Path::new("/").join(parent_path.join(&leaf));
+        if let Some((_, target)) = options
+            .unmounted
+            .iter()
+            .find(|(at, _)| parent_path.join(&leaf).starts_with(at))
+        {
+            bail!(
+                "{}: the volume at {target} is mounted only while the machine runs; start it first",
+                shown.display()
+            );
+        }
+        let parent = scoped(root, &parent_path, OFlag::O_PATH | OFlag::O_DIRECTORY)?;
+        let existing = fstatat(&parent, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+            .ok()
+            .map(|st| is(st.st_mode, SFlag::S_IFDIR));
+        let is_dir = made == Made::Directory;
+        if options.no_overwrite_dir_non_dir {
+            match existing {
+                Some(true) if !is_dir => bail!(
+                    "cannot overwrite directory {} with a non-directory",
+                    shown.display()
+                ),
+                Some(false) if is_dir => bail!(
+                    "cannot overwrite non-directory {} with a directory",
+                    shown.display()
+                ),
+                _ => {}
+            }
+        }
+        match (existing, made) {
+            (Some(true), Made::Directory) | (None, _) => {}
+            // Renamed over it once written.
+            (Some(false), Made::File) => {}
+            (Some(true), _) => remove_tree(parent.as_fd(), &leaf, &shown, 0)?,
+            (Some(false), _) => {
+                match unlinkat(&parent, leaf.as_os_str(), UnlinkatFlags::NoRemoveDir) {
+                    Ok(()) | Err(Errno::ENOENT) => {}
+                    Err(e) => return Err(nix_error(e, &shown)),
+                }
+            }
+        }
+        let header = entry.header();
+        let mode = Mode::from_bits_truncate(header.mode().unwrap_or(0o644) & 0o7777);
+        let mtime = header.mtime().unwrap_or(0);
+        let owner = owner_of(header);
+        match made {
+            Made::Directory => {
+                if existing != Some(true) {
+                    mkdirat(&parent, leaf.as_os_str(), Mode::from_bits_truncate(0o700))
+                        .map_err(|e| nix_error(e, &shown))?;
+                }
+                let made_dir = openat(
+                    &parent,
+                    leaf.as_os_str(),
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|e| nix_error(e, &shown))?;
+                if let Some((uid, gid)) = owner {
+                    fchown(&made_dir, Some(uid), Some(gid)).map_err(|e| nix_error(e, &shown))?;
+                }
+                fchmod(&made_dir, mode).map_err(|e| nix_error(e, &shown))?;
+                directories.push((parent_path.join(&leaf), mtime));
+            }
+            Made::File => {
+                let size = entry.size();
+                let staged = Staged::new(parent, leaf, shown);
+                stats.bytes += staged.write(&mut entry, size, owner, mode, mtime)?;
+                pending = Some(staged);
+            }
+            Made::Symlink => {
+                let target = entry
+                    .link_name_bytes()
+                    .ok_or_else(|| anyhow!("{}: a link without a target", shown.display()))?
+                    .into_owned();
+                let target = Path::new(OsStr::from_bytes(&target));
+                if link_leaves(dir, &parent_path, target) {
+                    bail!(
+                        "{} -> {}: the link leads out of the directory it is extracted into",
+                        shown.display(),
+                        target.display()
+                    );
+                }
+                symlinkat(target, &parent, leaf.as_os_str()).map_err(|e| nix_error(e, &shown))?;
+                if let Some((uid, gid)) = owner {
+                    fchownat(
+                        &parent,
+                        leaf.as_os_str(),
+                        Some(uid),
+                        Some(gid),
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                    )
+                    .map_err(|e| nix_error(e, &shown))?;
+                }
+                let _ = utimensat(
+                    &parent,
+                    leaf.as_os_str(),
+                    &timespec(mtime),
+                    &timespec(mtime),
+                    UtimensatFlags::NoFollowSymlink,
+                );
+            }
+            Made::HardLink => {
+                let target = entry
+                    .link_name_bytes()
+                    .ok_or_else(|| anyhow!("{}: a link without a target", shown.display()))?
+                    .into_owned();
+                let target = Path::new(OsStr::from_bytes(&target));
+                // Joined below the directory whatever it starts with, as the engine
+                // joins it.
+                let source = beneath(target, false)
+                    .filter(|names| !names.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "{} => {}: the link leads out of the directory it is extracted into",
+                            shown.display(),
+                            target.display()
+                        )
+                    })?;
+                let source = dir.join(source.iter().collect::<PathBuf>());
+                let (source_parent, source_leaf) = split_leaf(&source);
+                let from = scoped(root, &source_parent, OFlag::O_PATH | OFlag::O_DIRECTORY)?;
+                linkat(
+                    &from,
+                    source_leaf.as_os_str(),
+                    &parent,
+                    leaf.as_os_str(),
+                    AtFlags::empty(),
+                )
+                .map_err(|e| nix_error(e, &shown))?;
+                if let Some((uid, gid)) = owner {
+                    fchownat(
+                        &parent,
+                        leaf.as_os_str(),
+                        Some(uid),
+                        Some(gid),
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                    )
+                    .map_err(|e| nix_error(e, &shown))?;
+                }
+            }
+        }
+        stats.entries += 1;
+    }
+    // The stream ended cleanly after it.
+    if let Some(staged) = pending.take() {
+        staged.finish()?;
+    }
+    // What follows the archive's end (the padding of a record) is read too, so that its
+    // sender does not find the stream closed under it.
+    let _ = io::copy(&mut archive.into_inner().take(1 << 20), &mut io::sink());
+    // Last: writing into a directory changes its time. Set through its parent, which
+    // needs no read permission on it.
+    for (path, mtime) in directories.iter().rev() {
+        let (parent, leaf) = match (path.parent(), path.file_name()) {
+            (Some(parent), Some(leaf)) => (parent, leaf),
+            _ => continue,
+        };
+        let flags = OFlag::O_PATH | OFlag::O_DIRECTORY;
+        if let Ok(at) = scoped_raw(root, parent, flags) {
+            let _ = utimensat(
+                &at,
+                leaf,
+                &timespec(*mtime),
+                &timespec(*mtime),
+                UtimensatFlags::NoFollowSymlink,
+            );
+        }
+    }
+    Ok(stats)
+}
+
+/// The directory `names` lead to below `dir`, each one that is not there made with mode
+/// 0755 and `owner`, as the engine makes the directories an archive implies without
+/// carrying them.
+fn implied_directories(
+    root: BorrowedFd<'_>,
+    dir: &Path,
+    names: &[OsString],
+    owner: Option<(Uid, Gid)>,
+) -> Result<PathBuf> {
+    let flags = OFlag::O_PATH | OFlag::O_DIRECTORY;
+    let whole = dir.join(names.iter().collect::<PathBuf>());
+    match scoped_raw(root, &whole, flags) {
+        Ok(_) => return Ok(whole),
+        Err(Errno::ENOENT) => {}
+        Err(e) => return Err(nix_error(e, &Path::new("/").join(&whole))),
+    }
+    let mut path = dir.to_path_buf();
+    for name in names {
+        let next = path.join(name);
+        let shown = Path::new("/").join(&next);
+        match scoped_raw(root, &next, flags) {
+            Ok(_) => {}
+            Err(Errno::ENOENT) => {
+                let at = scoped(root, &path, flags)?;
+                mkdirat(&at, name.as_os_str(), Mode::from_bits_truncate(0o700))
+                    .map_err(|e| nix_error(e, &shown))?;
+                let made = openat(
+                    &at,
+                    name.as_os_str(),
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|e| nix_error(e, &shown))?;
+                if let Some((uid, gid)) = owner {
+                    fchown(&made, Some(uid), Some(gid)).map_err(|e| nix_error(e, &shown))?;
+                }
+                fchmod(&made, Mode::from_bits_truncate(0o755)).map_err(|e| nix_error(e, &shown))?;
+            }
+            Err(e) => return Err(nix_error(e, &shown)),
+        }
+        path = next;
+    }
+    Ok(path)
+}
+
+/// Removes the directory `leaf` of `parent` and everything in it, for an entry of
+/// another kind to take its place: links are removed, never followed, and a file system
+/// mounted anywhere in it stops the removal there.
+fn remove_tree(parent: BorrowedFd<'_>, leaf: &OsStr, shown: &Path, depth: usize) -> Result<()> {
+    if depth >= MAX_DEPTH {
+        bail!(
+            "{}: more than {MAX_DEPTH} directories deep; not removed",
+            shown.display()
+        );
+    }
+    let dir = retry_on_eagain(|| {
+        openat2(
+            parent,
+            leaf,
+            OpenHow::new()
+                .flags(OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC)
+                .resolve(
+                    ResolveFlag::RESOLVE_BENEATH
+                        | ResolveFlag::RESOLVE_NO_XDEV
+                        | ResolveFlag::RESOLVE_NO_SYMLINKS
+                        | ResolveFlag::RESOLVE_NO_MAGICLINKS,
+                ),
+        )
+    })
+    .map_err(|e| match e {
+        Errno::EXDEV => anyhow!(
+            "{}: a file system is mounted there; not replacing it",
+            shown.display()
+        ),
+        e => nix_error(e, shown),
+    })?;
+    let listing = dir
+        .try_clone()
+        .context("duplicating a directory descriptor")?;
+    let mut names: Vec<OsString> = Vec::new();
+    for entry in nix::dir::Dir::from_fd(listing)
+        .map_err(|e| nix_error(e, shown))?
+        .iter()
+    {
+        let entry = entry.map_err(|e| nix_error(e, shown))?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            names.push(OsStr::from_bytes(name).to_os_string());
+        }
+    }
+    for name in names {
+        let child = shown.join(&name);
+        match fstatat(&dir, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(st) if is(st.st_mode, SFlag::S_IFDIR) => {
+                remove_tree(dir.as_fd(), &name, &child, depth + 1)?
+            }
+            Ok(_) => match unlinkat(&dir, name.as_os_str(), UnlinkatFlags::NoRemoveDir) {
+                Ok(()) | Err(Errno::ENOENT) => {}
+                Err(e) => return Err(nix_error(e, &child)),
+            },
+            Err(Errno::ENOENT) => {}
+            Err(e) => return Err(nix_error(e, &child)),
+        }
+    }
+    match unlinkat(parent, leaf, UnlinkatFlags::RemoveDir) {
+        Ok(()) | Err(Errno::ENOENT) => Ok(()),
+        Err(e) => Err(nix_error(e, shown)),
+    }
 }
 
 #[cfg(test)]
@@ -1933,5 +2944,696 @@ mod tests {
         assert_eq!(Ids::Shift(100_000).outward(100_033), 33);
         assert_eq!(Ids::Shift(100_000).outward(0), 65534);
         assert_eq!(Ids::Shift(100_000).outward(100_000 + 65536), 65534);
+    }
+
+    #[test]
+    fn owners_are_shifted_on_the_way_in() {
+        assert_eq!(Ids::Keep.inward(1000), None);
+        assert_eq!(Ids::Shift(0).inward(1000), Some(1000));
+        assert_eq!(Ids::Shift(0).inward(u64::from(u32::MAX) + 1), Some(65534));
+        assert_eq!(Ids::Shift(100_000).inward(0), Some(100_000));
+        assert_eq!(Ids::Shift(100_000).inward(33), Some(100_033));
+        assert_eq!(Ids::Shift(100_000).inward(70_000), Some(165_534));
+    }
+
+    /// An entry written as a client writes it, its name and link name byte for byte:
+    /// absolute names and type `\0` included, which the tar crate itself never writes.
+    fn raw_entry(
+        stream: &mut tar::Builder<Vec<u8>>,
+        name: &str,
+        kind: u8,
+        link: &str,
+        data: &[u8],
+    ) {
+        let mut h = tar::Header::new_gnu();
+        h.set_mode(if kind == b'5' { 0o750 } else { 0o640 });
+        h.set_uid(u64::from(nix::unistd::getuid().as_raw()));
+        h.set_gid(u64::from(nix::unistd::getgid().as_raw()));
+        h.set_mtime(1_000_000);
+        h.set_size(data.len() as u64);
+        h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+        h.as_old_mut().linkname[..link.len()].copy_from_slice(link.as_bytes());
+        h.as_old_mut().linkflag[0] = kind;
+        h.set_cksum();
+        stream.append(&h, data).unwrap();
+    }
+
+    fn extracted(root: &Path, dir: &str, stream: &[u8], options: ExtractOptions) -> Result<Stats> {
+        let fd = open_dir(root);
+        extract(stream, fd.as_fd(), Path::new(dir), Ids::Keep, options)
+    }
+
+    fn stream_of(entries: &[(&str, u8, &str, &[u8])]) -> Vec<u8> {
+        let mut stream = tar::Builder::new(Vec::new());
+        for (name, kind, link, data) in entries {
+            raw_entry(&mut stream, name, *kind, link, data);
+        }
+        stream.into_inner().unwrap()
+    }
+
+    #[test]
+    fn users_are_read_from_a_regular_file_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("etc")).unwrap();
+        let fd = open_dir(root);
+        assert_eq!(text_in(fd.as_fd(), "etc/passwd").unwrap(), "");
+        fs::write(root.join("etc/group"), "app:x:7:\n").unwrap();
+        assert_eq!(text_in(fd.as_fd(), "etc/group").unwrap(), "app:x:7:\n");
+        // A fifo with no writer would hold an open for reading forever.
+        nix::unistd::mkfifo(&root.join("etc/passwd"), Mode::from_bits_truncate(0o600)).unwrap();
+        let e = text_in(fd.as_fd(), "etc/passwd").unwrap_err();
+        assert_eq!(crate::api::failure::kind_of(&e), Some(FailureKind::Invalid));
+        assert!(
+            e.to_string().contains("/etc/passwd is not a regular file"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn nothing_goes_where_a_volume_is_mounted_only_while_the_machine_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::create_dir_all(root.join("srv")).unwrap();
+        std::os::unix::fs::symlink("/data", root.join("link")).unwrap();
+        let fd = open_dir(root);
+        let volume = |target: &str| crate::volume::Volume {
+            source: "v".to_string(),
+            target: target.to_string(),
+            read_only: false,
+        };
+        let unmounted = unmounted_volumes(fd.as_fd(), &[volume("/data"), volume("/link/sub")]);
+        assert!(unmounted.contains(&(PathBuf::from("data"), "/data".to_string())));
+        // A target written through a link of the tree goes where the link leads.
+        assert!(unmounted.contains(&(PathBuf::from("data/sub"), "/link/sub".to_string())));
+        let options = ExtractOptions {
+            unmounted: unmounted.clone(),
+            ..ExtractOptions::default()
+        };
+        for name in ["data/f", "data/", "srv/../data/f"] {
+            let kind = if name.ends_with('/') { b'5' } else { b'0' };
+            let e = extracted(
+                root,
+                "",
+                &stream_of(&[(name, kind, "", b"x")]),
+                options.clone(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                e.contains("the volume at /data is mounted only while"),
+                "{name}: {e}"
+            );
+        }
+        assert!(!root.join("data/f").exists());
+        extracted(root, "", &stream_of(&[("srv/f", b'0', "", b"x")]), options).unwrap();
+        assert!(root.join("srv/f").exists());
+        let checked = Root {
+            fd: open_dir(root),
+            base: 0,
+            unmounted,
+        };
+        for path in ["data", "data/x", "link/x"] {
+            let e = checked
+                .refuse_unmounted("web:/x", Path::new(path))
+                .unwrap_err();
+            assert_eq!(
+                crate::api::failure::kind_of(&e),
+                Some(FailureKind::Invalid),
+                "{path}"
+            );
+        }
+        for path in ["", "srv", "database"] {
+            checked.refuse_unmounted("web:/x", Path::new(path)).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_extract_writes_each_entry_by_its_own_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("dst")).unwrap();
+        // Many top names, a directory the stream implies without carrying it, and a type
+        // `\0` file named absolutely, as Testcontainers writes one.
+        let stream = stream_of(&[
+            ("a.txt", b'0', "", b"alpha"),
+            ("b/", b'5', "", b""),
+            ("b/c.txt", b'0', "", b"gamma"),
+            ("d/e/f.txt", b'0', "", b"phi"),
+            ("/abs/x", 0, "", b"x"),
+            ("./dot", b'0', "", b"."),
+            ("olddir/", 0, "", b""),
+            ("/../up", b'0', "", b"rooted"),
+            ("rel", b'2', "a.txt", b""),
+            ("hard", b'1', "b/c.txt", b""),
+            ("fifo", b'6', "", b""),
+        ]);
+        let stats = extracted(root, "dst", &stream, ExtractOptions::default()).unwrap();
+        let dst = root.join("dst");
+        assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "alpha");
+        assert_eq!(fs::read_to_string(dst.join("b/c.txt")).unwrap(), "gamma");
+        assert_eq!(fs::read_to_string(dst.join("d/e/f.txt")).unwrap(), "phi");
+        assert_eq!(fs::read_to_string(dst.join("abs/x")).unwrap(), "x");
+        assert_eq!(fs::read_to_string(dst.join("dot")).unwrap(), ".");
+        assert!(dst.join("olddir").is_dir());
+        assert_eq!(fs::read_to_string(dst.join("up")).unwrap(), "rooted");
+        assert_eq!(fs::read_link(dst.join("rel")).unwrap(), Path::new("a.txt"));
+        let (c, hard) = (
+            fs::metadata(dst.join("b/c.txt")).unwrap(),
+            fs::metadata(dst.join("hard")).unwrap(),
+        );
+        assert_eq!(c.ino(), hard.ino(), "a hard link to what the stream wrote");
+        // The modes and times of the headers; implied directories get 0755.
+        let a = fs::metadata(dst.join("a.txt")).unwrap();
+        assert_eq!(a.mode() & 0o7777, 0o640);
+        assert_eq!(a.mtime(), 1_000_000);
+        assert_eq!(fs::metadata(dst.join("b")).unwrap().mode() & 0o7777, 0o750);
+        assert_eq!(fs::metadata(dst.join("b")).unwrap().mtime(), 1_000_000);
+        assert_eq!(fs::metadata(dst.join("d")).unwrap().mode() & 0o7777, 0o755);
+        assert_eq!(
+            fs::metadata(dst.join("d/e")).unwrap().mode() & 0o7777,
+            0o755
+        );
+        assert!(!dst.join("fifo").exists());
+        assert_eq!(stats.skipped, vec!["/dst/fifo".to_string()]);
+        assert_eq!(stats.entries, 10);
+        assert!(!root.join("up").exists());
+    }
+
+    #[test]
+    fn an_extract_at_the_root_takes_absolute_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A directory made at /, as a client asks for one before it copies into it; the
+        // root itself, as `.` or `/`, stays as it is.
+        let stream = stream_of(&[
+            ("./", b'5', "", b""),
+            ("/", b'5', "", b""),
+            ("/var/run/act/", b'5', "", b""),
+            ("/run/secrets/docker/config.json", b'0', "", b"{}"),
+        ]);
+        let mode = fs::metadata(root).unwrap().mode();
+        extracted(root, "", &stream, ExtractOptions::default()).unwrap();
+        assert!(root.join("var/run/act").is_dir());
+        assert_eq!(
+            fs::read_to_string(root.join("run/secrets/docker/config.json")).unwrap(),
+            "{}"
+        );
+        assert_eq!(fs::metadata(root).unwrap().mode(), mode);
+        // Nothing but a directory names the directory itself.
+        let file = stream_of(&[("./", b'0', "", b"")]);
+        assert!(extracted(root, "", &file, ExtractOptions::default()).is_err());
+        // An empty stream writes nothing and is no error.
+        let empty = tar::Builder::new(Vec::new()).into_inner().unwrap();
+        assert_eq!(
+            extracted(root, "", &empty, ExtractOptions::default())
+                .unwrap()
+                .entries,
+            0
+        );
+        assert!(extracted(root, "", &[], ExtractOptions::default()).is_ok());
+    }
+
+    #[test]
+    fn an_extract_never_leaves_its_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(root.join("srv/dst")).unwrap();
+        let refused = [
+            ("../escape", b'0', "", &b"x"[..]),
+            ("a/../../escape", b'0', "", b"x"),
+            // A link that leads above the directory, relative, and a hard link from
+            // above it.
+            ("up", b'2', "../../etc", b""),
+            ("sub/up", b'2', "../../escape", b""),
+            ("hard", b'1', "../escape", b""),
+            ("hard", b'1', "/../escape", b""),
+        ];
+        for entry in refused {
+            let stream = stream_of(&[entry]);
+            let e = extracted(&root, "srv/dst", &stream, ExtractOptions::default())
+                .expect_err(entry.0)
+                .to_string();
+            assert!(e.contains("leads out of the directory"), "{e}");
+        }
+        assert!(!root.join("srv/escape").exists());
+        assert!(!tmp.path().join("escape").exists());
+        // An absolute link is joined below the link's directory by the engine, and a
+        // relative one that climbs and comes back stays inside: both are written.
+        let stream = stream_of(&[
+            ("abs", b'2', "/etc", b""),
+            ("back", b'2', "../dst/abs", b""),
+        ]);
+        extracted(&root, "srv/dst", &stream, ExtractOptions::default()).unwrap();
+        assert_eq!(
+            fs::read_link(root.join("srv/dst/abs")).unwrap(),
+            Path::new("/etc")
+        );
+        // A link written by the stream leads, for the entries after it, where the
+        // machine resolves it: inside the root, never the host's /etc.
+        fs::create_dir_all(root.join("etc")).unwrap();
+        let stream = stream_of(&[
+            ("into", b'2', "/etc", b""),
+            ("into/written", b'0', "", b"inside"),
+        ]);
+        let fd = open_dir(&root);
+        if matches!(kind_in(fd.as_fd(), Path::new("etc")), Err(ref e) if e.to_string().contains("Linux 5.6"))
+        {
+            return;
+        }
+        extracted(&root, "srv/dst", &stream, ExtractOptions::default()).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join("etc/written")).unwrap(),
+            "inside"
+        );
+        assert!(!Path::new("/etc/written").exists());
+    }
+
+    #[test]
+    fn a_directory_and_a_file_replace_each_other_unless_told_not_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dst = root.join("dst");
+        let reset = || {
+            let _ = fs::remove_dir_all(&dst);
+            fs::create_dir_all(dst.join("dir/deep/er")).unwrap();
+            fs::write(dst.join("dir/deep/er/f"), "x").unwrap();
+            std::os::unix::fs::symlink("/nowhere", dst.join("dir/link")).unwrap();
+            fs::write(dst.join("file"), "old").unwrap();
+        };
+        let file_over_dir = stream_of(&[("dir", b'0', "", b"new")]);
+        let dir_over_file = stream_of(&[("file/", b'5', "", b"")]);
+        let keep = ExtractOptions {
+            no_overwrite_dir_non_dir: true,
+            ..ExtractOptions::default()
+        };
+        reset();
+        let e = extracted(root, "dst", &file_over_dir, keep.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("cannot overwrite directory /dst/dir"), "{e}");
+        let e = extracted(root, "dst", &dir_over_file, keep.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("cannot overwrite non-directory /dst/file"),
+            "{e}"
+        );
+        assert!(dst.join("dir/deep/er/f").exists());
+        assert_eq!(fs::read_to_string(dst.join("file")).unwrap(), "old");
+        // A file over a file, and a directory into a directory, are fine either way.
+        let merge = stream_of(&[
+            ("file", b'0', "", b"new"),
+            ("dir/", b'5', "", b""),
+            ("dir/more", b'0', "", b"m"),
+        ]);
+        extracted(root, "dst", &merge, keep).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("file")).unwrap(), "new");
+        assert!(dst.join("dir/deep/er/f").exists() && dst.join("dir/more").exists());
+        // The directory merged takes the header's mode, as the engine applies it.
+        assert_eq!(
+            fs::metadata(dst.join("dir")).unwrap().mode() & 0o7777,
+            0o750
+        );
+        // Without the option what is there makes way, a whole tree included.
+        reset();
+        extracted(root, "dst", &file_over_dir, ExtractOptions::default()).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("dir")).unwrap(), "new");
+        extracted(root, "dst", &dir_over_file, ExtractOptions::default()).unwrap();
+        assert!(dst.join("file").is_dir());
+        // A link over a directory, and a file over a link, which is replaced, not
+        // followed.
+        reset();
+        let link_over = stream_of(&[("dir", b'2', "file", b""), ("dir2", b'0', "", b"")]);
+        extracted(root, "dst", &link_over, ExtractOptions::default()).unwrap();
+        assert_eq!(fs::read_link(dst.join("dir")).unwrap(), Path::new("file"));
+        let file_over_link = stream_of(&[("dir", b'0', "", b"plain")]);
+        extracted(root, "dst", &file_over_link, ExtractOptions::default()).unwrap();
+        assert!(!fs::symlink_metadata(dst.join("dir")).unwrap().is_symlink());
+        assert_eq!(fs::read_to_string(dst.join("file")).unwrap(), "old");
+    }
+
+    #[test]
+    fn owners_come_from_the_headers_or_the_option() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("dst")).unwrap();
+        let me = (
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        );
+        let fd = open_dir(root);
+        let run = |stream: &[u8], owner: Option<(u32, u32)>| {
+            extract(
+                stream,
+                fd.as_fd(),
+                Path::new("dst"),
+                Ids::Shift(0),
+                ExtractOptions {
+                    owner,
+                    ..ExtractOptions::default()
+                },
+            )
+        };
+        // Headers that name this user: chowned to it, which any user may do.
+        let mine = stream_of(&[("mine", b'0', "", b"m"), ("mylink", b'2', "mine", b"")]);
+        run(&mine, None).unwrap();
+        let meta = fs::metadata(root.join("dst/mine")).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), me);
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        // A header that names root: only root may hand a file to it, so the header was
+        // read; the option takes its place.
+        let mut stream = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o644);
+        h.set_size(1);
+        h.set_uid(0);
+        h.set_gid(0);
+        stream.append_data(&mut h, "roots", &b"r"[..]).unwrap();
+        let stream = stream.into_inner().unwrap();
+        assert!(run(&stream, None).is_err());
+        assert!(!root.join("dst/roots").exists(), "the staged file went");
+        run(&stream, Some(me)).unwrap();
+        let meta = fs::metadata(root.join("dst/roots")).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), me);
+    }
+
+    #[test]
+    fn the_owner_option_is_read_as_the_engine_reads_a_user() {
+        let passwd = "root:x:0:0::/root:/bin/sh\n# comment\nwww-data:x:33:33::/var/www:/bin/false\napp:x:1000:1001::/:/bin/sh\n";
+        let group = "root:x:0:\nwww-data:x:33:\nstaff:x:50:app\n";
+        let owner = |spec: &str| resolve_owner(passwd, group, spec);
+        assert_eq!(owner("www-data").unwrap(), (33, 33));
+        assert_eq!(owner("app").unwrap(), (1000, 1001));
+        assert_eq!(owner("33").unwrap(), (33, 33), "a uid passwd lists");
+        assert_eq!(owner("12345").unwrap(), (12345, 0), "a uid it does not");
+        assert_eq!(owner("app:staff").unwrap(), (1000, 50));
+        assert_eq!(owner("1000:7").unwrap(), (1000, 7));
+        assert_eq!(owner(":33").unwrap(), (0, 33));
+        assert_eq!(owner("33:").unwrap(), (33, 33));
+        assert!(owner("nobody-here")
+            .unwrap_err()
+            .to_string()
+            .contains("no user nobody-here"));
+        assert!(owner("app:nogroup")
+            .unwrap_err()
+            .to_string()
+            .contains("no group nogroup"));
+        // Too large for the engine's number: a name, which nobody has.
+        assert!(owner("4294967295").is_err());
+    }
+
+    #[test]
+    fn a_compressed_stream_is_extracted_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("dst")).unwrap();
+        let plain = stream_of(&[("f", b'0', "", b"content")]);
+        let gzip = {
+            let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(&plain).unwrap();
+            e.finish().unwrap()
+        };
+        let bzip2 = {
+            let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+            e.write_all(&plain).unwrap();
+            e.finish().unwrap()
+        };
+        let zstd = zstd::encode_all(&plain[..], 3).unwrap();
+        let mut xz = Vec::new();
+        lzma_rs::xz_compress(&mut &plain[..], &mut xz).unwrap();
+        let fd = open_dir(root);
+        for (kind, bytes) in [
+            ("plain", plain.clone()),
+            ("gzip", gzip),
+            ("bzip2", bzip2),
+            ("zstd", zstd),
+            ("xz", xz.clone()),
+        ] {
+            let _ = fs::remove_file(root.join("dst/f"));
+            let (read, write) = nix::unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
+            let writer = std::thread::spawn(move || File::from(write).write_all(&bytes));
+            let reader = decompressed(File::from(read)).unwrap();
+            extract(
+                reader,
+                fd.as_fd(),
+                Path::new("dst"),
+                Ids::Keep,
+                ExtractOptions::default(),
+            )
+            .unwrap();
+            writer.join().unwrap().unwrap();
+            assert_eq!(
+                fs::read_to_string(root.join("dst/f")).unwrap(),
+                "content",
+                "{kind}"
+            );
+        }
+        // A broken xz stream is an error, not a clean end.
+        xz.truncate(xz.len() / 2);
+        let (read, write) = nix::unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
+        let writer = std::thread::spawn(move || File::from(write).write_all(&xz));
+        let reader = decompressed(File::from(read)).unwrap();
+        let result = extract(
+            reader,
+            fd.as_fd(),
+            Path::new("dst"),
+            Ids::Keep,
+            ExtractOptions::default(),
+        );
+        let _ = writer.join();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn names_beneath_a_directory_are_cleaned_as_the_engine_cleans_them() {
+        let names = |p: &str, rooted: bool| {
+            beneath(Path::new(p), rooted).map(|n| {
+                n.iter()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+        };
+        assert_eq!(names("a/./b/", true).as_deref(), Some("a/b"));
+        assert_eq!(names("/a/b", true).as_deref(), Some("a/b"));
+        assert_eq!(names("a/../b", true).as_deref(), Some("b"));
+        assert_eq!(names("/../../b", true).as_deref(), Some("b"));
+        assert_eq!(names("./", true).as_deref(), Some(""));
+        assert_eq!(names("../b", true), None);
+        assert_eq!(names("a/../../b", true), None);
+        // A hard link's target is joined below the directory, leading slash or not.
+        assert_eq!(names("/a", false).as_deref(), Some("a"));
+        assert_eq!(names("/../a", false), None);
+        let leaves = |parent: &str, target: &str| {
+            link_leaves(Path::new("srv/dst"), Path::new(parent), Path::new(target))
+        };
+        assert!(!leaves("srv/dst", "a"));
+        assert!(!leaves("srv/dst/sub", "../a"));
+        assert!(!leaves("srv/dst", "../dst/a"));
+        assert!(!leaves("srv/dst", "/etc"));
+        assert!(leaves("srv/dst", "../a"));
+        assert!(leaves("srv/dst/sub", "../../a"));
+        assert!(leaves("srv/dst", ".."));
+    }
+
+    #[test]
+    fn read_only_settings_keep_an_extract_out() {
+        let volume = |target: &str, read_only: bool| crate::volume::Volume {
+            source: "data".to_string(),
+            target: target.to_string(),
+            read_only,
+        };
+        let volumes = [volume("/data", false), volume("/data/ro", true)];
+        let why = |dir: &str, root_ro: bool| read_only_setting(&volumes, root_ro, Path::new(dir));
+        assert_eq!(why("srv", false), None);
+        assert_eq!(
+            why("srv", true).as_deref(),
+            Some("the machine's root is read-only")
+        );
+        assert_eq!(
+            why("data/x", true),
+            None,
+            "a writable volume over a read-only root"
+        );
+        assert_eq!(
+            why("data/ro/x", false).as_deref(),
+            Some("the volume at /data/ro is mounted read-only")
+        );
+        assert_eq!(
+            why("data/rox", false),
+            None,
+            "a name that only starts the same"
+        );
+        assert_eq!(
+            why("", true).as_deref(),
+            Some("the machine's root is read-only")
+        );
+    }
+
+    #[test]
+    fn a_stat_says_what_lstat_says_inside_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(root.join("etc/sub")).unwrap();
+        fs::write(root.join("etc/hosts"), "127.0.0.1 localhost\n").unwrap();
+        fs::set_permissions(root.join("etc/hosts"), fs::Permissions::from_mode(0o640)).unwrap();
+        let when = nix::sys::time::TimeVal::new(1_000_000, 250_000);
+        nix::sys::stat::utimes(&root.join("etc/hosts"), &when, &when).unwrap();
+        std::os::unix::fs::symlink("/etc/sub", root.join("etc/abs")).unwrap();
+        std::os::unix::fs::symlink("hosts", root.join("etc/rel")).unwrap();
+        std::os::unix::fs::symlink("/nowhere/x", root.join("dangling")).unwrap();
+        let fd = open_dir(&root);
+        let stat = |p: &str| stat_in(fd.as_fd(), p, &format!("web:{p}"));
+        if matches!(stat("/etc"), Err(ref e) if e.to_string().contains("Linux 5.6")) {
+            return;
+        }
+        let file = stat("/etc/hosts").unwrap();
+        assert_eq!(file.name, "hosts");
+        assert_eq!(file.size, 20);
+        assert_eq!(file.mode, 0o100640);
+        assert_eq!(file.mtime, 1_000_000_250_000_000);
+        assert_eq!(file.link_target, "");
+        let dir = stat("/etc").unwrap();
+        assert_eq!((dir.name.as_str(), dir.mode & 0o170000), ("etc", 0o040000));
+        // A link is the link itself, with where it leads inside the root.
+        let abs = stat("/etc/abs").unwrap();
+        assert_eq!(abs.mode & 0o170000, 0o120000);
+        assert_eq!(abs.link_target, "/etc/sub");
+        assert_eq!(stat("etc/rel").unwrap().link_target, "/etc/hosts");
+        assert_eq!(stat("/dangling").unwrap().link_target, "/nowhere/x");
+        // A slash or a dot at the end goes through it.
+        let through = stat("/etc/abs/").unwrap();
+        assert_eq!(
+            (through.name.as_str(), through.mode & 0o170000),
+            ("abs", 0o040000)
+        );
+        assert_eq!(through.link_target, "");
+        let dot = stat("/etc/abs/.").unwrap();
+        assert_eq!((dot.name.as_str(), dot.mode & 0o170000), (".", 0o040000));
+        let top = stat("/").unwrap();
+        assert_eq!((top.name.as_str(), top.mode & 0o170000), ("/", 0o040000));
+        // Missing: NoSuchPath, the path named.
+        for missing in ["/nope", "/nope/deeper", "/dangling/."] {
+            let e = stat(missing).unwrap_err();
+            assert_eq!(
+                crate::api::kind_of(&e),
+                Some(FailureKind::NoSuchPath),
+                "{missing}"
+            );
+            assert_eq!(
+                e.to_string(),
+                format!("web:{missing}: no such file or directory")
+            );
+        }
+        let e = stat("/etc/hosts/").unwrap_err();
+        assert_eq!(
+            crate::api::kind_of(&e),
+            None,
+            "not a directory is no missing path"
+        );
+    }
+
+    #[test]
+    fn base_names_are_read_as_filepath_base_reads_them() {
+        for (path, name) in [
+            ("/etc/hosts", "hosts"),
+            ("/etc/", "etc"),
+            ("/etc//", "etc"),
+            ("/etc/.", "."),
+            ("/", "/"),
+            ("//", "/"),
+            ("", "."),
+            ("hosts", "hosts"),
+            ("/a/..", ".."),
+        ] {
+            assert_eq!(base_name(path), name, "{path}");
+        }
+        for good in ["etc", ".", "/", "a b", "..."] {
+            assert!(check_entry_name(good).is_ok(), "{good}");
+        }
+        for bad in ["", "..", "a/b", "/etc", "a\0b"] {
+            let e = check_entry_name(bad).unwrap_err();
+            assert_eq!(crate::api::kind_of(&e), Some(FailureKind::Invalid), "{bad}");
+        }
+    }
+
+    /// The names and link names of a stream, as a reader takes them.
+    fn names_in(stream: &[u8]) -> Vec<(String, String)> {
+        let mut archive = tar::Archive::new(stream);
+        archive
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                let link = e
+                    .link_name_bytes()
+                    .map(|l| String::from_utf8_lossy(&l).into_owned())
+                    .unwrap_or_default();
+                (String::from_utf8_lossy(&e.path_bytes()).into_owned(), link)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_top_entry_takes_the_name_it_is_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), "alpha").unwrap();
+        let long = "n".repeat(150);
+        fs::write(src.join("sub").join(&long), "long").unwrap();
+        let far = format!("/{}", "t".repeat(120));
+        std::os::unix::fs::symlink(&far, src.join("link")).unwrap();
+        let packed = |top: &str, naming: Naming| {
+            let dir = open_dir(&src);
+            let mut stream = Vec::new();
+            pack_as(
+                dir.as_fd(),
+                OsStr::new("."),
+                Path::new(top),
+                naming,
+                Ids::Keep,
+                &mut stream,
+            )
+            .unwrap();
+            stream
+        };
+        let link = ("link".to_string(), far.clone());
+        let entries = |top: &str, prefix: &str| {
+            vec![
+                (top.to_string(), String::new()),
+                (format!("{prefix}a.txt"), String::new()),
+                (format!("{prefix}link"), far.clone()),
+                (format!("{prefix}sub/"), String::new()),
+                (format!("{prefix}sub/{long}"), String::new()),
+            ]
+        };
+        // As the engine names `DIR/.`, `/` and `DIR`.
+        assert_eq!(names_in(&packed(".", Naming::Literal)), entries("./", "./"));
+        assert_eq!(names_in(&packed("/", Naming::Literal)), entries("/", "/"));
+        assert_eq!(
+            names_in(&packed("etc", Naming::Literal)),
+            entries("etc/", "etc/")
+        );
+        // As `cp` names them, which the option leaves alone.
+        let cp = names_in(&packed("src", Naming::Normalized));
+        assert_eq!(cp[0], ("src".to_string(), String::new()));
+        assert_eq!(cp[2], (format!("src/{}", link.0), far.clone()));
+        assert_eq!(cp[3].0, "src/sub");
+        // What the literal names carry comes back whole.
+        let out = tmp.path().join("out");
+        fs::create_dir_all(&out).unwrap();
+        let stream = packed(".", Naming::Literal);
+        extracted(&out, "", &stream, ExtractOptions::default()).unwrap();
+        assert_eq!(
+            fs::read_to_string(out.join("sub").join(&long)).unwrap(),
+            "long"
+        );
+        assert_eq!(fs::read_link(out.join("link")).unwrap(), Path::new(&far));
     }
 }

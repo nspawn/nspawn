@@ -7,13 +7,16 @@
 //! changes something goes to the service, as the command line's requests do.
 
 pub mod access;
+mod archive;
 mod attach;
 mod containers;
 mod create;
 pub mod events;
+mod exec;
 pub mod filters;
 pub mod images;
 pub mod model;
+mod networks;
 mod pull;
 #[cfg(test)]
 pub(crate) mod shapes;
@@ -34,7 +37,7 @@ use hyper::body::{Frame, Incoming};
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{json, Value};
 
-use self::access::{Client, Need, Profile};
+use self::access::{Client, Holder, Need, Profile};
 use self::containers::{Act, Sent};
 use self::filters::Filters;
 use self::model::{ImageInfo, Snapshot};
@@ -52,31 +55,26 @@ pub fn socket_path(machine: &str) -> std::path::PathBuf {
 /// How long the server stays without a connection before it leaves.
 const IDLE: Duration = Duration::from_secs(60);
 
-/// What a machine may hold of the host at once: connections, and streams that run a
-/// journalctl (logs, events). A stats stream reads the cgroup once a second and is
-/// bounded by the connections alone: a dashboard keeps one per running machine.
-static CONNECTIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
-static STREAMS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
-/// Waits, each holding a connection to the system bus of its own until it ends, so that
-/// the service drops the wait when its client goes.
-pub static WAITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+/// A limit of what a socket's clients hold at once, and on the host's socket a share of
+/// it for each user other than root, so that none takes all of it; root's requests take
+/// from neither, so that users cannot keep it out.
+pub(crate) struct Pool {
+    whole: tokio::sync::Semaphore,
+    per_user: usize,
+    users: Mutex<BTreeMap<u32, usize>>,
+}
 
-/// On the host's socket, which every user may reach, the connections one user other than
-/// root holds at once, so that none takes all of them; root's are not counted, so that
-/// users cannot keep it out.
-const PER_USER: usize = 16;
-static USERS: Mutex<BTreeMap<u32, usize>> = Mutex::new(BTreeMap::new());
-
-/// What a connection holds of the limits while it lives.
-struct Admitted {
+/// A place taken in a pool, given back when it goes.
+pub(crate) struct Place {
+    pool: &'static Pool,
     _permit: Option<tokio::sync::SemaphorePermit<'static>>,
     user: Option<u32>,
 }
 
-impl Drop for Admitted {
+impl Drop for Place {
     fn drop(&mut self) {
         if let Some(uid) = self.user {
-            let mut users = USERS.lock().unwrap();
+            let mut users = self.pool.users.lock().unwrap();
             if let Some(count) = users.get_mut(&uid) {
                 *count -= 1;
                 if *count == 0 {
@@ -87,39 +85,63 @@ impl Drop for Admitted {
     }
 }
 
-/// A connection of `uid` (None when its credentials could not be read) on a socket of
-/// `profile`, within the limits, or None over them.
-fn admit(profile: Profile, uid: Option<u32>) -> Option<Admitted> {
-    if profile == Profile::Host && uid == Some(0) {
-        return Some(Admitted {
-            _permit: None,
-            user: None,
-        });
-    }
-    let user = match profile {
-        Profile::Host => {
-            let uid = uid.unwrap_or(u32::MAX);
-            let mut users = USERS.lock().unwrap();
-            let count = users.entry(uid).or_insert(0);
-            if *count >= PER_USER {
-                return None;
-            }
-            *count += 1;
-            Some(uid)
+impl Pool {
+    const fn new(whole: usize, per_user: usize) -> Pool {
+        Pool {
+            whole: tokio::sync::Semaphore::const_new(whole),
+            per_user,
+            users: Mutex::new(BTreeMap::new()),
         }
-        Profile::Machine { .. } => None,
-    };
-    // Built first, so that a refusal below gives the user's place back.
-    let mut admitted = Admitted {
-        _permit: None,
-        user,
-    };
-    admitted._permit = Some(CONNECTIONS.try_acquire().ok()?);
-    Some(admitted)
+    }
+
+    /// A place for `holder`, or None over the limit or its share.
+    pub(crate) fn take(&'static self, holder: Holder) -> Option<Place> {
+        let user = match holder {
+            Holder::Root => {
+                return Some(Place {
+                    pool: self,
+                    _permit: None,
+                    user: None,
+                })
+            }
+            Holder::User(uid) => {
+                let mut users = self.users.lock().unwrap();
+                let count = users.entry(uid).or_insert(0);
+                if *count >= self.per_user {
+                    return None;
+                }
+                *count += 1;
+                Some(uid)
+            }
+            Holder::Machine => None,
+        };
+        // Made first, so that a refusal below gives the user's share back.
+        let mut place = Place {
+            pool: self,
+            _permit: None,
+            user,
+        };
+        place._permit = Some(self.whole.try_acquire().ok()?);
+        Some(place)
+    }
 }
 
-/// Connections handed over to the stream of an attach, which hyper no longer serves:
-/// the server stays while one is open.
+/// What a socket's clients may hold of the host at once: connections, and streams that
+/// run a journalctl (logs, events, attaches). A stats stream reads the cgroup once a
+/// second and is bounded by the connections alone: a dashboard keeps one per running
+/// machine.
+static CONNECTIONS: Pool = Pool::new(64, 16);
+static STREAMS: Pool = Pool::new(16, 8);
+/// Waits and attaches, each holding a connection to the system bus of its own until it
+/// ends, so that the service drops the wait when its client goes.
+pub(crate) static WAITS: Pool = Pool::new(16, 8);
+/// Exec commands that run, each holding a connection to the system bus and its streams,
+/// some six descriptors, until it exits.
+pub(crate) static EXECS: Pool = Pool::new(64, 16);
+
+/// Connections handed over to the stream of an attach or an exec, which hyper no longer
+/// serves, and the commands and runs this server holds until they end: the server stays
+/// while one is there.
 static UPGRADED: AtomicUsize = AtomicUsize::new(0);
 
 /// An upgraded connection, counted while it lives.
@@ -143,11 +165,11 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `response`, its body written by `work`, or the error that there are too many
 /// streams.
-fn spawn_stream<F>(work: F, response: Response<Body>) -> Response<Body>
+fn spawn_stream<F>(work: F, response: Response<Body>, holder: Holder) -> Response<Body>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let Ok(permit) = STREAMS.try_acquire() else {
+    let Some(permit) = STREAMS.take(holder) else {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "too many streams are open on this socket",
@@ -193,7 +215,8 @@ pub async fn serve(machine: Option<&str>, config: Config) -> Result<()> {
                 };
                 let peer = stream.peer_cred().ok().map(|cred| (cred.uid(), cred.pid()));
                 // Over the limit the connection is closed right away.
-                let Some(permit) = admit(profile, peer.map(|(uid, _)| uid)) else { continue };
+                let holder = Holder::of(profile, peer.map(|(uid, _)| uid));
+                let Some(permit) = CONNECTIONS.take(holder) else { continue };
                 open.fetch_add(1, Ordering::SeqCst);
                 let client = Arc::new(Client::new(profile, peer));
                 let (ctx, open, last) = (ctx.clone(), open.clone(), last.clone());
@@ -218,6 +241,7 @@ pub async fn serve(machine: Option<&str>, config: Config) -> Result<()> {
                 if open.load(Ordering::SeqCst) == 0
                     && UPGRADED.load(Ordering::SeqCst) == 0
                     && last.lock().unwrap().elapsed() > IDLE
+                    && !exec::keeps_instances()
                 {
                     return Ok(());
                 }
@@ -392,6 +416,7 @@ async fn handle(ctx: Arc<Context>, client: &Client, request: Request<Incoming>) 
         body,
         upgrade: parts.extensions.remove::<hyper::upgrade::OnUpgrade>(),
         version,
+        holder: client.holder,
     };
     let mut response = match version {
         Some(v) if v < MIN_API_VERSION => respond(
@@ -461,6 +486,16 @@ enum Route {
     Remove(String),
     /// POST /containers/{id}/attach.
     Attach(String),
+    /// An exec's create, start, resize or inspect.
+    Exec(exec::Call),
+    /// HEAD, GET or PUT /containers/{id}/archive.
+    Archive(archive::Call),
+    /// A volume's create, removal or prune.
+    VolumeChange(volumes::Call),
+    /// A network's create, connect, disconnect, removal or prune.
+    NetworkChange(networks::Call),
+    /// An image's removal or prune.
+    ImageChange(images::Call),
     /// POST /images/create.
     Pull,
     /// The plugins, of which there are none.
@@ -489,7 +524,13 @@ impl Route {
             Route::Container(_, what) if what == "logs" => Need::Observe,
             // The output alone: a follow of the logs.
             Route::Kill(_) | Route::Attach(_) => Need::Observe,
+            Route::Exec(call) => call.need(),
+            // StatPath, CopyFrom and CopyTo ask org.nspawn.manage.
+            Route::Archive(_) => Need::Manage,
             Route::Pull => Need::Manage,
+            Route::VolumeChange(_) | Route::NetworkChange(_) | Route::ImageChange(_) => {
+                Need::Manage
+            }
             // WaitMachine asks org.nspawn.inspect.
             Route::Lifecycle(_, Act::Wait) => Need::Inspect,
             Route::Create | Route::Prune | Route::Lifecycle(..) | Route::Remove(_) => Need::Manage,
@@ -512,6 +553,21 @@ impl Route {
 
 fn classify(method: &Method, path: &str) -> Route {
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    if let Some(call) = exec::Call::of(method, &parts) {
+        return Route::Exec(call);
+    }
+    if let Some(call) = archive::Call::of(method, &parts) {
+        return Route::Archive(call);
+    }
+    if let Some(call) = volumes::Call::of(method, &parts) {
+        return Route::VolumeChange(call);
+    }
+    if let Some(call) = networks::Call::of(method, &parts) {
+        return Route::NetworkChange(call);
+    }
+    if let Some(call) = images::Call::of(method, &parts) {
+        return Route::ImageChange(call);
+    }
     let read = *method == Method::GET || *method == Method::HEAD;
     match (read, parts.as_slice()) {
         (true, ["_ping"]) => Route::Ping,
@@ -588,7 +644,12 @@ async fn route_request(
         | Route::Lifecycle(..)
         | Route::Remove(_)
         | Route::Attach(_)
+        | Route::Archive(_)
+        | Route::VolumeChange(_)
+        | Route::NetworkChange(_)
+        | Route::ImageChange(_)
         | Route::Pull => true,
+        Route::Exec(call) => call.parses_form(),
         Route::Container(_, what) => what != "json",
         _ => false,
     };
@@ -614,13 +675,29 @@ async fn route_request(
         },
         Route::DiskUsage => disk_usage(ctx, query).await,
         Route::Containers => list_containers(ctx, query).await,
-        Route::Container(id, what) => container_read(ctx, &id, &what, query).await,
+        Route::Container(id, what) => container_read(ctx, &id, &what, query, sent.holder).await,
         Route::Kill(id) => kill(ctx, &id, query).await,
         Route::Create => containers::create(ctx, query, sent).await,
         Route::Prune => containers::prune(ctx, query).await,
         Route::Lifecycle(id, act) => containers::act(ctx, &id, act, query, sent).await,
         Route::Remove(id) => containers::remove(ctx, &id, query).await,
-        Route::Attach(id) => attach::attach(ctx, &id, query, sent.upgrade, sent.version).await,
+        Route::Attach(id) => {
+            attach::attach(
+                ctx,
+                &id,
+                query,
+                sent.upgrade,
+                sent.version,
+                sent.holder,
+                client,
+            )
+            .await
+        }
+        Route::Exec(call) => exec::serve(ctx, call, query, sent).await,
+        Route::VolumeChange(call) => volumes::serve(ctx, call, query, sent).await,
+        Route::NetworkChange(call) => networks::serve(ctx, call, query, sent).await,
+        Route::ImageChange(call) => images::serve(ctx, call, query).await,
+        Route::Archive(call) => archive::serve(ctx, call, query, sent).await,
         Route::Pull => pull::create(ctx, query).await,
         Route::Plugins => json_response(StatusCode::OK, &json!([])),
         Route::Images => list_images(ctx, query),
@@ -641,7 +718,7 @@ async fn route_request(
             },
             Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         },
-        Route::Events => events(ctx, query),
+        Route::Events => events(ctx, query, sent.holder),
         // "not supported" in the words: the engine's clients take it for a kind of
         // object this end does not have, as `docker inspect` does going on to the next.
         Route::Unserved => error(
@@ -931,9 +1008,9 @@ fn container_matches(
     if let Some(nets) = filters.values("network") {
         let named = |n: &str| {
             nets.contains(n)
-                || snapshot
-                    .network(n)
-                    .is_some_and(|v| nets.iter().any(|w| v.id.starts_with(w.as_str())))
+                || snapshot.network(n).is_some_and(|v| {
+                    nets.contains(&v.shown) || nets.iter().any(|w| v.id.starts_with(w.as_str()))
+                })
         };
         // A machine on the host's network or on none is listed under host or none, as
         // its NetworkSettings say.
@@ -1015,7 +1092,13 @@ fn container_matches(
     true
 }
 
-async fn container_read(ctx: &Arc<Context>, id: &str, what: &str, query: &Query) -> Response<Body> {
+async fn container_read(
+    ctx: &Arc<Context>,
+    id: &str,
+    what: &str,
+    query: &Query,
+    holder: Holder,
+) -> Response<Body> {
     let snapshot = match Snapshot::take(ctx).await {
         Ok(s) => s,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
@@ -1047,9 +1130,9 @@ async fn container_read(ctx: &Arc<Context>, id: &str, what: &str, query: &Query)
                 Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
             }
         }
-        "logs" => logs(ctx, machine, query).await,
+        "logs" => logs(ctx, machine, query, holder).await,
         "stats" => stats(ctx, machine, query).await,
-        "changes" | "export" | "archive" => error(
+        "changes" | "export" => error(
             StatusCode::NOT_IMPLEMENTED,
             format!("/containers/{{id}}/{what} is not supported by nspawn's Docker API"),
         ),
@@ -1064,7 +1147,12 @@ fn journal_time(text: Option<&str>) -> Option<String> {
     seconds.parse::<u64>().ok().map(|s| format!("@{s}"))
 }
 
-async fn logs(ctx: &Arc<Context>, machine: &model::Machine, query: &Query) -> Response<Body> {
+async fn logs(
+    ctx: &Arc<Context>,
+    machine: &model::Machine,
+    query: &Query,
+    holder: Holder,
+) -> Response<Body> {
     let stdout = query.flag("stdout", false);
     let stderr = query.flag("stderr", false);
     if !stdout && !stderr {
@@ -1112,7 +1200,7 @@ async fn logs(ctx: &Arc<Context>, machine: &model::Machine, query: &Query) -> Re
         raw,
         request,
     };
-    spawn_stream(streams::logs(query, tx), response)
+    spawn_stream(streams::logs(query, tx), response, holder)
 }
 
 async fn stats(ctx: &Arc<Context>, machine: &model::Machine, query: &Query) -> Response<Body> {
@@ -1193,7 +1281,7 @@ async fn disk_usage(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
             .iter()
             .map(|m| {
                 let mut entry = m.summary_json(ctx, &snapshot, &ImageInfo::of(ctx, &m.record));
-                let rw = crate::api::disk::writable_size(&ctx.store, &m.record);
+                let rw = images::walking(|| crate::api::disk::writable_size(&ctx.store, &m.record));
                 let image = all
                     .iter()
                     .find(|i| i.containers.contains(&m.record.name))
@@ -1219,7 +1307,9 @@ async fn disk_usage(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
             .iter()
             .map(|v| {
                 let mut entry = volumes::json(v);
-                let size = crate::api::disk::tree_size(&v.path, &mut Default::default());
+                let size = images::walking(|| {
+                    crate::api::disk::tree_size(&v.path, &mut Default::default())
+                });
                 entry["UsageData"] = json!({ "Size": size, "RefCount": v.used_by.len() });
                 entry
             })
@@ -1324,7 +1414,7 @@ async fn list_networks(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
     json_response(StatusCode::OK, &Value::Array(list))
 }
 
-fn events(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
+fn events(ctx: &Arc<Context>, query: &Query, holder: Holder) -> Response<Body> {
     let filters = match Filters::parse(query.get("filters")) {
         Ok(f) => f,
         Err(filters::Invalid(message)) => return error(StatusCode::BAD_REQUEST, message),
@@ -1350,6 +1440,7 @@ fn events(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
     spawn_stream(
         streams::events(ctx.clone(), since, until, deadline, filters, tx),
         response,
+        holder,
     )
 }
 
@@ -1505,23 +1596,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_user_takes_all_of_the_host_socket_and_root_always_gets_in() {
-        let mine: Vec<Admitted> = (0..PER_USER)
-            .map(|_| admit(Profile::Host, Some(4242)).expect("within the user's share"))
+    fn no_user_takes_all_of_a_limit_and_root_always_gets_in() {
+        static POOL: Pool = Pool::new(6, 4);
+        let mine: Vec<Place> = (0..4)
+            .map(|_| {
+                POOL.take(Holder::User(4242))
+                    .expect("within the user's share")
+            })
             .collect();
-        assert!(admit(Profile::Host, Some(4242)).is_none());
-        assert!(
-            admit(Profile::Host, Some(4343)).is_some(),
-            "another user's share"
-        );
-        let root: Vec<Admitted> = (0..100)
-            .map(|_| admit(Profile::Host, Some(0)).expect("root"))
+        assert!(POOL.take(Holder::User(4242)).is_none(), "over the share");
+        let other: Vec<Place> = (0..2)
+            .map(|_| POOL.take(Holder::User(4343)).expect("another user's share"))
+            .collect();
+        assert!(POOL.take(Holder::User(4343)).is_none(), "over the limit");
+        assert!(POOL.take(Holder::Machine).is_none(), "over the limit");
+        let root: Vec<Place> = (0..100)
+            .map(|_| POOL.take(Holder::Root).expect("root"))
             .collect();
         drop(mine);
-        assert!(admit(Profile::Host, Some(4242)).is_some(), "given back");
-        assert!(USERS.lock().unwrap().get(&4242).is_none());
-        drop(root);
-        assert!(admit(Profile::Machine { write: true }, None).is_some());
+        assert!(POOL.take(Holder::User(4242)).is_some(), "given back");
+        assert!(POOL.users.lock().unwrap().get(&4242).is_none());
+        drop((other, root));
+        assert!(POOL.take(Holder::Machine).is_some());
+        assert_eq!(
+            Holder::of(Profile::Host, Some(0)),
+            Holder::Root,
+            "root of the host"
+        );
+        assert_eq!(Holder::of(Profile::Host, None), Holder::User(u32::MAX));
+        assert_eq!(
+            Holder::of(Profile::Machine { write: true }, Some(0)),
+            Holder::Machine
+        );
     }
 
     #[test]
@@ -1619,7 +1725,11 @@ mod tests {
         assert_eq!(classify(&Method::POST, "/containers/prune"), Route::Prune);
         assert_eq!(
             classify(&Method::POST, "/containers/web/exec"),
-            Route::Change
+            Route::Exec(exec::Call::Create("web".into()))
+        );
+        assert_eq!(
+            classify(&get, "/exec/ab/json"),
+            Route::Exec(exec::Call::Inspect("ab".into()))
         );
         assert_eq!(
             classify(&Method::DELETE, "/containers/web"),
@@ -1692,6 +1802,10 @@ mod tests {
             assert_eq!(need(Method::POST, path), Need::Manage, "{path}");
         }
         assert_eq!(need(Method::POST, "/containers/prune"), Need::Manage);
+        assert_eq!(need(Method::POST, "/containers/web/exec"), Need::Manage);
+        assert_eq!(need(Method::POST, "/exec/ab/start"), Need::Manage);
+        assert_eq!(need(Method::POST, "/exec/ab/resize"), Need::Manage);
+        assert_eq!(need(Method::GET, "/exec/ab/json"), Need::Inspect);
         // WaitMachine asks org.nspawn.inspect, as reads do.
         assert_eq!(need(Method::POST, "/containers/web/wait"), Need::Inspect);
     }

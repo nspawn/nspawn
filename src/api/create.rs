@@ -263,10 +263,12 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         bridge::publish_exposed(&mut ports, &source.exposed_ports(store));
     }
     bridge::assign_host_ports(store, sd, name, &mut ports).await?;
-    let network = if request.network.is_empty() {
+    // A network named as the Docker API knows it goes by its own name from here on.
+    let networks = crate::api::network::resolve_choices(store, &request.network)?;
+    let network = if networks.is_empty() {
         None
     } else {
-        Some(crate::api::network::choices(&request.network).map_err(invalid)?)
+        Some(crate::api::network::choices(&networks).map_err(invalid)?)
     };
     let env = volume::parse_env(&request.env).map_err(invalid)?;
     let volumes = volume::parse_volumes(&request.volume).map_err(invalid)?;
@@ -365,11 +367,12 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
                 "aliases are names on a bridge network; {name} joins none"
             )));
         }
-        draft.aliases =
-            crate::api::network::parse_aliases(&request.aliases, &bridge::networks_of(&draft))
-                .map_err(invalid)?;
+        let aliases = crate::api::network::resolve_keyed(store, &request.aliases)?;
+        draft.aliases = crate::api::network::parse_aliases(&aliases, &bridge::networks_of(&draft))
+            .map_err(invalid)?;
     }
-    crate::api::machines::apply_addresses(store, config, &mut draft, &request.addresses)
+    let addresses = crate::api::network::resolve_keyed(store, &request.addresses)?;
+    crate::api::machines::apply_addresses(store, config, &mut draft, &addresses)
         .map_err(invalid)?;
     if let Some(entrypoint) = &request.entrypoint {
         for arg in entrypoint {

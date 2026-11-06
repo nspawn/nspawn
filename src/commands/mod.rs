@@ -700,9 +700,16 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             Ok(())
         }
         Command::Volume(args) => match args.command {
-            VolumeCommand::Ls(output) => {
-                let volumes = manager.list_volumes().await.map_err(client::error)?;
-                if output.json {
+            VolumeCommand::Ls(args) => {
+                let labels = system::label_filters(&args.filters)?;
+                let volumes: Vec<_> = manager
+                    .list_volumes()
+                    .await
+                    .map_err(client::error)?
+                    .into_iter()
+                    .filter(|v| system::labelled(&client::dict_to_json(v), &labels))
+                    .collect();
+                if args.output.json {
                     client::print_json(&serde_json::Value::Array(
                         volumes.iter().map(client::dict_to_json).collect(),
                     ));
@@ -728,9 +735,24 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 println!("{}", table(&["VOLUME", "USED BY", "CREATED", "PATH"], rows));
                 Ok(())
             }
-            VolumeCommand::Create { name } => {
-                manager.create_volume(&name).await.map_err(client::error)?;
-                println!("{name}");
+            VolumeCommand::Create { name, label } => {
+                let mut options = Options::new();
+                put_all(&mut options, "labels", label);
+                let volume = manager
+                    .create_volume(&name, options)
+                    .await
+                    .map_err(client::error)?;
+                println!("{}", client::string(&volume, "name"));
+                Ok(())
+            }
+            VolumeCommand::Inspect { names } => {
+                let mut out = Vec::new();
+                for name in &names {
+                    out.push(client::dict_to_json(
+                        &manager.get_volume(name).await.map_err(client::error)?,
+                    ));
+                }
+                client::print_json(&serde_json::Value::Array(out));
                 Ok(())
             }
             VolumeCommand::Rm { names } => {

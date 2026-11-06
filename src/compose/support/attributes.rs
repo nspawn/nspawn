@@ -544,7 +544,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
     full("services.*.volumes.[].volume"),
     ignored(
         "services.*.volumes.[].volume.labels",
-        "nspawn volumes have no labels",
+        "the anonymous volume of a mount is made without labels; a volume of the project takes those of volumes.*.labels",
     )
     .and_below(),
     ignored(
@@ -640,7 +640,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
     .and_below(),
     full("volumes.*.external"),
     full("volumes.*.external.name"),
-    ignored("volumes.*.labels", "nspawn volumes have no labels").and_below(),
+    full("volumes.*.labels").and_below(),
     full("volumes.*.name"),
     // Secrets.
     full("secrets"),
