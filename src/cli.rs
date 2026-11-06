@@ -445,6 +445,9 @@ pub struct CreateArgs {
     /// Ports to publish on the host, like start -p.
     #[arg(long, short = 'p', value_name = "[IP:][HOST:]CONTAINER[/udp]")]
     pub publish: Vec<String>,
+    /// Publish each exposed port of the image to a free host port.
+    #[arg(long = "publish-all", short = 'P')]
+    pub publish_all: bool,
     /// Replace an existing machine with the same name.
     #[arg(long, short = 'f')]
     pub force: bool,
@@ -567,6 +570,17 @@ pub struct TuningArgs {
     /// "none" forgets them.
     #[arg(long, value_name = "DOMAIN")]
     pub dns_search: Vec<String>,
+    /// Accepted with a warning: the resolv.conf of a machine takes no options.
+    #[arg(
+        long = "dns-option",
+        alias = "dns-opt",
+        value_name = "OPT",
+        hide = true
+    )]
+    pub dns_option: Vec<String>,
+    /// Accepted with a warning: machines on a bridge network reach all ports of each other.
+    #[arg(long, value_name = "PORT", hide = true)]
+    pub expose: Vec<String>,
     /// A line for the machine's /etc/hosts, HOST:IP or HOST=IP, the IP in brackets or
     /// not; host-gateway is the host's address on the machine's network. Repeatable;
     /// "none" forgets them.
@@ -617,6 +631,25 @@ pub struct TuningArgs {
     /// Repeatable; "none" forgets them.
     #[arg(long, value_name = "NAME[:CONDITION][:optional]", add = candidates(Kind::Any))]
     pub depends_on: Vec<String>,
+}
+
+impl TuningArgs {
+    /// Warnings for the ignored flags.
+    pub fn warnings(&self) -> Vec<&'static str> {
+        [
+            (
+                !self.dns_option.is_empty(),
+                "--dns-option is ignored: the resolv.conf of a machine takes no options",
+            ),
+            (
+                !self.expose.is_empty(),
+                "--expose is ignored: machines on a bridge network reach all ports of each other; use -p to publish a port on the host",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(given, text)| given.then_some(text))
+        .collect()
+    }
 }
 
 /// The --health-* flags, on top of the image's HEALTHCHECK; remembered.
@@ -1338,6 +1371,9 @@ pub struct StartOptions {
     /// remembered for the image; "none" forgets them all.
     #[arg(long, short = 'p', value_name = "[IP:][HOST:]CONTAINER[/udp]")]
     pub publish: Vec<String>,
+    /// Publish each exposed port of the image to a free host port.
+    #[arg(long = "publish-all", short = 'P')]
+    pub publish_all: bool,
     /// Replace the image's entrypoint; an empty string runs the arguments alone.
     #[arg(long, value_name = "PROGRAM")]
     pub entrypoint: Option<String>,
@@ -2047,5 +2083,67 @@ mod tests {
         );
         assert_eq!(create.tuning.add_host, ["under_score..name=[::1]"]);
         assert_eq!(create.tuning.dns_search, [".", "example.test."]);
+    }
+
+    #[test]
+    fn publish_all_dns_option_and_expose_flags() {
+        for args in [
+            &[
+                "nspawn",
+                "run",
+                "-P",
+                "--dns-option",
+                "ndots:2",
+                "--dns-opt",
+                "timeout:1",
+                "--expose",
+                "8080",
+                "img",
+            ][..],
+            &[
+                "nspawn",
+                "create",
+                "--publish-all",
+                "--dns-option",
+                "ndots:2",
+                "--dns-opt",
+                "timeout:1",
+                "--expose",
+                "8080",
+                "img",
+                "m",
+            ][..],
+            &[
+                "nspawn",
+                "start",
+                "-P",
+                "--dns-option",
+                "ndots:2",
+                "--dns-opt",
+                "timeout:1",
+                "--expose",
+                "8080",
+                "m",
+            ][..],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let (publish_all, tuning) = match cli.command {
+                Command::Run(a) => (a.options.publish_all, a.options.tuning),
+                Command::Create(a) => (a.publish_all, a.tuning),
+                Command::Start(a) => (a.options.publish_all, a.options.tuning),
+                _ => panic!("{args:?}"),
+            };
+            assert!(publish_all, "{args:?}");
+            assert_eq!(tuning.dns_option, ["ndots:2", "timeout:1"], "{args:?}");
+            assert_eq!(tuning.expose, ["8080"], "{args:?}");
+            assert_eq!(
+                tuning.warnings(),
+                [
+                    "--dns-option is ignored: the resolv.conf of a machine takes no options",
+                    "--expose is ignored: machines on a bridge network reach all ports of each other; use -p to publish a port on the host",
+                ],
+                "{args:?}"
+            );
+        }
     }
 }

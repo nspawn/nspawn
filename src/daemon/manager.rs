@@ -184,7 +184,7 @@ async fn caller_gone(connection: zbus::Connection, name: Option<String>) {
 }
 
 /// What StartMachine and RunMachine are asked: wait (b, default `wait`), network (s) or
-/// networks (as), aliases (as), addresses (as, IP or NETWORK=IP), publish (as), entrypoint (s), env (as), volume (as),
+/// networks (as), aliases (as), addresses (as, IP or NETWORK=IP), publish (as), publish_all (b), entrypoint (s), env (as), volume (as),
 /// label (as), restart (s), memory (t), memory_swap (x), cpus (d), pids_limit (t),
 /// image_command (b), command (as), remove (b), and the flags of `health_overrides` and `tuning_overrides`.
 pub(crate) fn start_request(
@@ -199,6 +199,7 @@ pub(crate) fn start_request(
         aliases: options.strings("aliases")?,
         addresses: options.strings("addresses")?,
         publish: options.strings("publish")?,
+        publish_all: options.bool("publish_all", false)?,
         entrypoint: options.string("entrypoint")?,
         env: options.strings("env")?,
         volume: options.strings("volume")?,
@@ -427,7 +428,7 @@ impl Manager {
     }
 
     /// Like `create`. Options: backend (s), network (s) or networks (as), aliases (as),
-    /// addresses (as), publish (as), force (b), entrypoint (s), env (as), volume (as), label (as),
+    /// addresses (as), publish (as), publish_all (b), force (b), entrypoint (s), env (as), volume (as), label (as),
     /// restart (s), memory (t, bytes), memory_swap (x, bytes of memory and swap, -1 for
     /// no bound on swap), cpus (d), pids_limit (t), command (as), the flags of
     /// `health_overrides` and `tuning_overrides`, registry (s), ca_cert (s).
@@ -450,6 +451,7 @@ impl Manager {
             aliases: options.strings("aliases")?,
             addresses: options.strings("addresses")?,
             publish: options.strings("publish")?,
+            publish_all: options.bool("publish_all", false)?,
             force: options.bool("force", false)?,
             entrypoint: options.string("entrypoint")?,
             env: options.strings("env")?,

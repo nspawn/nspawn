@@ -5098,6 +5098,33 @@ for i in 1 2 3 4 5; do
   retry 5 bash -c "! $NSPAWN ps -a --format '{{.Names}}' | grep_q -x e2e-rv8-quick" || { fail "run --rm left e2e-rv8-quick after a quick exit"; break; }
 done
 
+step "review: -P/--publish-all publishes the image's exposed ports, and --dns-option and --expose warn"
+d=/tmp/e2e-rv/c8 && rm -rf $d && mkdir -p $d
+printf 'FROM %s\nEXPOSE 80 5353/udp\nCMD ["/bin/sh", "-c", "mkdir -p /www; echo c8-ok > /www/index.html; exec /bin/httpd -f -p 80 -h /www"]\n' "$rv" > $d/Dockerfile
+$NSPAWN build -t e2e-rv8-exp $d >/dev/null 2>&1 || fail "build e2e-rv8-exp"
+out=$($NSPAWN run -d --name e2e-rv8-pub -P -p 18195:80 --dns-option ndots:2 --dns-opt timeout:1 --expose 9000 e2e-rv8-exp 2>&1) || fail "run -P with --dns-option and --expose: $out"
+echo "$out" | grep_q "warning: --dns-option is ignored" || fail "--dns-option did not warn: $out"
+echo "$out" | grep_q "warning: --expose is ignored" || fail "--expose did not warn: $out"
+python3 - <($NSPAWN inspect e2e-rv8-pub) <<'PY' || fail "-P with -p did not publish the exposed ports as expected: $($NSPAWN inspect -f '{{json .ports}}' e2e-rv8-pub)"
+import json, sys
+ports = json.load(open(sys.argv[1]))[0]["ports"]
+assert len(ports) == 2 and "18195->80/tcp" in ports, ports
+udp = [p for p in ports if p.endswith("->5353/udp")]
+assert len(udp) == 1 and int(udp[0].split("->", 1)[0]) > 0, ports
+PY
+retry 5 bash -c "curl -sf -m 5 http://127.0.0.1:18195/ | grep_q c8-ok" || fail "-P with -p did not answer on the explicit port"
+$NSPAWN create e2e-rv8-exp e2e-rv8-pub2 -P >/dev/null 2>&1 || fail "create -P"
+python3 - <($NSPAWN inspect e2e-rv8-pub2) <<'PY' || fail "create -P did not assign free host ports: $($NSPAWN inspect -f '{{json .ports}}' e2e-rv8-pub2)"
+import json, sys
+ports = json.load(open(sys.argv[1]))[0]["ports"]
+assert len(ports) == 2, ports
+targets = {p.split("->", 1)[1]: int(p.split("->", 1)[0]) for p in ports}
+assert set(targets) == {"80/tcp", "5353/udp"} and all(h > 0 for h in targets.values()), ports
+PY
+$NSPAWN rm -f e2e-rv8-pub e2e-rv8-pub2 >/dev/null 2>&1
+$NSPAWN images rm e2e-rv8-exp >/dev/null 2>&1
+rm -rf $d
+
 step "compose config: the binary prints what docker compose printed for the cases"
 python3 "$(dirname "$0")/compose/binary.py" "$NSPAWN" || fail "nspawn compose config differs from docker compose on the cases"
 

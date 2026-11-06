@@ -306,6 +306,9 @@ fn put_opt(options: &mut Options<'_>, key: &'static str, value: Option<String>) 
 
 /// The per-machine settings as the service takes them.
 pub fn put_tuning(options: &mut Options<'_>, t: crate::cli::TuningArgs) {
+    for warning in t.warnings() {
+        eprintln!("warning: {warning}");
+    }
     put_opt(options, "hostname", t.hostname);
     put_opt(options, "user", t.user);
     put_opt(options, "working_dir", t.workdir);
@@ -561,6 +564,9 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             put_all(&mut options, "aliases", a.network_alias);
             put_all(&mut options, "addresses", a.ip);
             put_all(&mut options, "publish", a.publish);
+            if a.publish_all {
+                put(&mut options, "publish_all", true);
+            }
             put(&mut options, "force", a.force);
             put_opt(&mut options, "entrypoint", a.entrypoint);
             put_all(&mut options, "env", crate::volume::expand_env(&a.env)?);

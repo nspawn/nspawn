@@ -1121,6 +1121,8 @@ pub struct StartRequest {
     pub addresses: Vec<String>,
     /// HOST:CONTAINER[/udp]; "none" forgets them all.
     pub publish: Vec<String>,
+    /// Publish each exposed port of the image to a free host port (-P).
+    pub publish_all: bool,
     /// An empty string runs the arguments alone.
     pub entrypoint: Option<String>,
     /// VAR=value or VAR; "none" forgets them.
@@ -1161,6 +1163,7 @@ impl StartRequest {
             aliases: Vec::new(),
             addresses: Vec::new(),
             publish: Vec::new(),
+            publish_all: false,
             entrypoint: None,
             env: Vec::new(),
             volume: Vec::new(),
@@ -1225,6 +1228,9 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     let previous_policy = record.as_ref().map(|r| r.restart).unwrap_or_default();
     match record.as_mut() {
         Some(r) => {
+            if args.publish_all && r.run.exposed_ports.is_empty() {
+                r.run.exposed_ports = r.exposed_ports(store);
+            }
             apply_flags(r, args)?;
             apply_addresses(store, config, r, &args.addresses)?;
             crate::api::dependencies::check(
@@ -1239,6 +1245,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             || !args.aliases.is_empty()
             || !args.addresses.is_empty()
             || !args.publish.is_empty()
+            || args.publish_all
             || args.entrypoint.is_some()
             || !args.env.is_empty()
             || !args.volume.is_empty()
@@ -1484,6 +1491,9 @@ pub fn apply_flags(r: &mut ImageRecord, args: &StartRequest) -> Result<()> {
     }
     if !args.publish.is_empty() {
         r.ports = bridge::parse_publish(&args.publish)?;
+    }
+    if args.publish_all {
+        bridge::publish_exposed(&mut r.ports, &r.run.exposed_ports);
     }
     if args.image_command {
         r.entrypoint = None;
@@ -3548,5 +3558,26 @@ mod tests {
         let boot = check_logs_kept(&record("boot", Some("none")), false).unwrap_err();
         assert!(boot.to_string().contains("--inside"), "{boot}");
         assert!(check_logs_kept(&record("boot", Some("none")), true).is_ok());
+    }
+
+    #[test]
+    fn apply_flags_publishes_exposed_ports_when_asked() {
+        let mut r: ImageRecord = serde_json::from_str(
+            r#"{"name": "web", "reference": "r", "manifest_digest": "d", "layers": [], "backend": "overlay", "created": 0, "mode": "app", "run": {"cmd": ["/bin/sh"], "exposed_ports": ["80/tcp", "5353/udp"]}}"#,
+        )
+        .unwrap();
+        let mut req = StartRequest::keep("web");
+        req.publish = vec!["18080:80".into()];
+        req.publish_all = true;
+        apply_flags(&mut r, &req).unwrap();
+        assert_eq!(r.ports.len(), 2);
+        assert_eq!(
+            (r.ports[0].host, r.ports[0].container, r.ports[0].protocol),
+            (18080, 80, crate::bridge::Protocol::Tcp)
+        );
+        assert_eq!(
+            (r.ports[1].host, r.ports[1].container, r.ports[1].protocol),
+            (0, 5353, crate::bridge::Protocol::Udp)
+        );
     }
 }

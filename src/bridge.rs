@@ -564,6 +564,37 @@ pub fn parse_publish(values: &[String]) -> Result<Vec<PortMap>> {
     Ok(out)
 }
 
+/// Adds a free host port (`host: 0`) for each exposed port of the image (`80/tcp`,
+/// `53/udp`) that `ports` does not already publish.
+pub fn publish_exposed(ports: &mut Vec<PortMap>, exposed: &[String]) {
+    for entry in exposed {
+        let (port_str, proto_str) = entry.split_once('/').unwrap_or((entry, "tcp"));
+        let Ok(container) = port_str.parse::<u16>() else {
+            continue;
+        };
+        if container == 0 {
+            continue;
+        }
+        let protocol = match proto_str.to_ascii_lowercase().as_str() {
+            "tcp" | "" => Protocol::Tcp,
+            "udp" => Protocol::Udp,
+            _ => continue,
+        };
+        if !ports
+            .iter()
+            .any(|p| p.container == container && p.protocol == protocol)
+        {
+            ports.push(PortMap {
+                host_ip: None,
+                host: 0,
+                host_range: None,
+                container,
+                protocol,
+            });
+        }
+    }
+}
+
 /// A port the kernel hands out to bind to on `address`.
 fn ephemeral_port(address: SocketAddr, protocol: Protocol) -> std::io::Result<u16> {
     match protocol {
@@ -757,6 +788,54 @@ mod publish_form_tests {
         let mut full = parse_publish(&["18000-18001:80".to_string()]).unwrap();
         let e = pick_host_ports(&mut full, &used, |p| p.host != 18001).unwrap_err();
         assert_eq!(e.to_string(), "no free host port in 18000-18001 for 80/tcp");
+    }
+
+    #[test]
+    fn publish_exposed_adds_unmapped_ports_with_host_zero() {
+        let mut ports = parse_publish(&["18080:80".to_string()]).unwrap();
+        publish_exposed(
+            &mut ports,
+            &[
+                "80/tcp".to_string(),
+                "80/udp".to_string(),
+                "443/tcp".to_string(),
+                "9000".to_string(),
+                "132/sctp".to_string(),
+            ],
+        );
+        assert_eq!(
+            ports,
+            vec![
+                PortMap {
+                    host_ip: None,
+                    host: 18080,
+                    host_range: None,
+                    container: 80,
+                    protocol: Protocol::Tcp,
+                },
+                PortMap {
+                    host_ip: None,
+                    host: 0,
+                    host_range: None,
+                    container: 80,
+                    protocol: Protocol::Udp,
+                },
+                PortMap {
+                    host_ip: None,
+                    host: 0,
+                    host_range: None,
+                    container: 443,
+                    protocol: Protocol::Tcp,
+                },
+                PortMap {
+                    host_ip: None,
+                    host: 0,
+                    host_range: None,
+                    container: 9000,
+                    protocol: Protocol::Tcp,
+                },
+            ]
+        );
     }
 }
 

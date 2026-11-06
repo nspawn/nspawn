@@ -33,6 +33,8 @@ pub struct CreateRequest {
     pub addresses: Vec<String>,
     /// HOST:CONTAINER[/udp], like start -p.
     pub publish: Vec<String>,
+    /// Publish each exposed port of the image to a free host port (-P).
+    pub publish_all: bool,
     pub force: bool,
     /// Replaces the image's entrypoint; an empty string runs the arguments alone.
     pub entrypoint: Option<String>,
@@ -112,6 +114,9 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     // Everything given is checked before the old machine goes or the new one is
     // assembled.
     let mut ports = bridge::parse_publish(&request.publish)?;
+    if request.publish_all {
+        bridge::publish_exposed(&mut ports, &source.exposed_ports(store));
+    }
     bridge::assign_host_ports(store, sd, &request.name, &mut ports).await?;
     let network = if request.network.is_empty() {
         None

@@ -178,6 +178,23 @@ impl ImageRecord {
         labels.extend(self.labels.clone());
         labels
     }
+
+    /// The ports the image exposes: the record's, or the ones its config blob lists when
+    /// the record has none.
+    pub fn exposed_ports(&self, store: &Store) -> Vec<String> {
+        if !self.run.exposed_ports.is_empty() {
+            return self.run.exposed_ports.clone();
+        }
+        store
+            .load_manifest(&self.name)
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<oci_client::manifest::OciImageManifest>(&bytes).ok()
+            })
+            .and_then(|m| fs::read(store.blob_path(&m.config.digest)).ok())
+            .map(|blob| crate::oci::RunSpec::exposed_ports_of(&blob))
+            .unwrap_or_default()
+    }
 }
 
 impl ImageRecord {

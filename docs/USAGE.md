@@ -991,7 +991,8 @@ host range with one container port (`-p 8000-8010:80`) gets the first free port 
 range. `-p 8000-8010:8000-8010` publishes a range, one mapping per port, and `-p 80-82`
 one free host port per container port. The machine keeps the ports it got. The long
 form, `published=8080,target=80,protocol=udp,host_ip=127.0.0.1`, has the same fields,
-`target` the only one required.
+`target` the only one required. `-P`/`--publish-all` publishes each TCP and UDP port the
+image exposes (`EXPOSE`) that no `-p` publishes to a free port of the host.
 
 On IPv4 each one is a DNAT entry in the same nftables table, reachable from other hosts,
 from the host's own addresses and from 127.0.0.1, and it goes away when the machine

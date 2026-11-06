@@ -182,6 +182,7 @@ given is remembered for the machine.
 | `aliases` | as | `NAME` on the primary network or `NETWORK=NAME` |
 | `addresses` | as | `IP` on the primary network or `NETWORK=IP`: fixed addresses on networks made with `CreateNetwork` |
 | `publish` | as | `[IP:][HOST:]CONTAINER[/udp]` (an IPv6 IP in brackets: `[::1]:8080:80`; `0.0.0.0` every IPv4 address alone, `[::]` every IPv6 one, no IP both) or `published=HOST,target=CONTAINER[,protocol=udp][,host_ip=IP]`; no host port or 0 takes a free one, a host range with one container port the first free one in it, ranges of equal length one mapping per port |
+| `publish_all` | b | publish each port the image exposes to a free port of the host (`-P`/`--publish-all`) |
 | `entrypoint` | s | replaces the image's and drops its cmd; `""` runs the command alone |
 | `command` | as | replaces an app's cmd |
 | `image_command` | b | forgets the remembered entrypoint and command and runs the image's own |

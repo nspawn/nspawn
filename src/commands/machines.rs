@@ -471,6 +471,9 @@ fn start_options(mut args: StartOptions, command: Vec<String>) -> Result<Options
     if !args.publish.is_empty() {
         options.insert("publish", Value::from(args.publish));
     }
+    if args.publish_all {
+        options.insert("publish_all", Value::from(true));
+    }
     if let Some(entrypoint) = args.entrypoint {
         options.insert("entrypoint", Value::from(entrypoint));
     }
