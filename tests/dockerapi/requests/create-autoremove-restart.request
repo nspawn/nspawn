@@ -1,0 +1,4 @@
+POST /containers/create?name=never
+Content-Type: application/json
+
+{"Image":"busybox:1.37","HostConfig":{"AutoRemove":true,"RestartPolicy":{"Name":"always"}}}

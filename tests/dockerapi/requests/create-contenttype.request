@@ -1,0 +1,4 @@
+POST /containers/create?name=never
+Content-Type: text/plain
+
+{"Image":"busybox:1.37","Cmd":["sleep","3600"],"Labels":{"e2e":"lifecycle"}}

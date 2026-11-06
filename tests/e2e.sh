@@ -125,6 +125,12 @@ cleanup_machines() {
   rm -f /etc/cdi/e2e-nspawn.yaml /etc/cdi/e2e-nspawn-bad.yaml /var/run/cdi/e2e-nspawn-gpu.json /usr/local/bin/e2e-cdi-hook
   $NSPAWN network rm e2e-cdi_default e2e-cbind_default >/dev/null 2>&1 || true
   $NSPAWN images rm e2e-mirror e2e-api-curl >/dev/null 2>&1 || true
+  # What the docker client of the Docker API step made, under names of the API's.
+  for m in $($NSPAWN ps -a 2>/dev/null | awk '$1 ~ /^e2e-dk-/ {print $1}'); do
+    $NSPAWN rm -f "$m" >/dev/null 2>&1 || true
+  done
+  $NSPAWN images rm e2e-dk-cli e2e-dk-bb >/dev/null 2>&1 || true
+  rm -rf /tmp/e2e-dk.* /tmp/e2e-dk-missing-*
   rm -rf /tmp/e2e-compose-api
   $NSPAWN secret rm e2e-pw e2e-pw2 e2e-gen-pw >/dev/null 2>&1 || true
   rm -f /var/lib/nspawn/secrets/e2e-pw.cred /var/lib/nspawn/secrets/e2e-pw.json /var/lib/nspawn/secrets/e2e-pw2.cred /var/lib/nspawn/secrets/e2e-pw2.json
@@ -294,6 +300,8 @@ caddy_image=$(mirror docker.io/lucaslorentz/caddy-docker-proxy:2.13-alpine)
 # A curl of OCI media types: the test registry takes no others.
 curl_image=$(mirror docker.io/alpine/curl:8.22.0)
 alpine322_ref=$(mirror docker.io/library/alpine:3.22)
+# The engine's own command line client, which the Docker API step drives.
+dockercli_ref=$(mirror docker.io/library/docker:28.5.1-cli)
 $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1
 
 step "hub ls"
@@ -3257,6 +3265,103 @@ hapi /swarm | grep_q "not supported" || fail "an unserved read does not say it i
 $NSPAWN rm -f e2e-hapi-made >/dev/null 2>&1
 $NSPAWN images rm e2e-hapi-img >/dev/null 2>&1
 $NSPAWN volume rm e2e-hapi-vol >/dev/null 2>&1
+
+step "Docker API: the docker CLI creates, starts, stops, waits for, updates and removes machines"
+host_api_on
+# The engine's own client, copied out of its image, talks to the host's socket; its
+# configuration is a directory of the run's.
+$NSPAWN pull "$dockercli_ref" --name e2e-dk-cli --force >/dev/null || fail "pull the docker CLI's image"
+$NSPAWN create e2e-dk-cli e2e-dk-copy >/dev/null || fail "create e2e-dk-copy"
+dk_dir=$(mktemp -d /tmp/e2e-dk.XXXXXX)
+$NSPAWN cp e2e-dk-copy:/usr/local/bin/docker "$dk_dir/docker" >/dev/null || fail "copy the docker CLI out of its image"
+$NSPAWN rm -f e2e-dk-copy >/dev/null 2>&1
+# A program, not a function, so that timeout runs it.
+printf '#!/bin/sh\nDOCKER_HOST=unix:///run/nspawn/api.sock DOCKER_CONFIG=%s exec %s/docker "$@"\n' "$dk_dir" "$dk_dir" > "$dk_dir/dk"
+chmod +x "$dk_dir/dk"
+dk() { "$dk_dir/dk" "$@"; }
+$NSPAWN pull "$busybox_ref" --name e2e-dk-bb --force >/dev/null || fail "pull e2e-dk-bb"
+dk version --format '{{.Server.APIVersion}}' | grep_q '^1\.51$' || fail "docker version: $(dk version 2>&1 | tail -3)"
+# run -d: create, a wait sent before the start, start; the machine runs under its name.
+id=$(dk run -d --name e2e-dk-a --label e2e.dk=1 e2e-dk-bb sleep 600 2>&1) || fail "docker run -d: $id"
+[[ $id =~ ^[0-9a-f]{64}$ ]] || fail "docker run -d printed $id, not an ID"
+[ "$($NSPAWN inspect e2e-dk-a -f '{{.state}}' 2>&1)" = running ] || fail "e2e-dk-a does not run: $($NSPAWN inspect e2e-dk-a 2>&1 | head -5)"
+[ "$(dk inspect -f '{{.State.Status}} {{.Id}}' e2e-dk-a)" = "running $id" ] || fail "docker inspect: $(dk inspect -f '{{.State.Status}} {{.Id}}' e2e-dk-a 2>&1)"
+out=$(dk run -d --name e2e-dk-a e2e-dk-bb true 2>&1) && fail "a second container of one name was made"
+echo "$out" | grep_q 'Conflict. The container name "/e2e-dk-a" is already in use' || fail "the conflict of names: $out"
+# A name systemd does not take is kept for the API; the machine gets one derived from it.
+dk create --name e2e_dk_b --label e2e.dk=1 e2e-dk-bb sh -c 'exit 3' >/dev/null || fail "docker create e2e_dk_b"
+[ "$(dk ps -a --filter name=e2e_dk_b --format '{{.Names}} {{.State}}')" = "e2e_dk_b created" ] || fail "a created container: $(dk ps -a 2>&1)"
+machine=$($NSPAWN ps -a | awk '{print $1}' | grep -E '^e2e-dk-b-[0-9a-f]{8}$')
+[ -n "$machine" ] || fail "no machine of a name derived from e2e_dk_b: $($NSPAWN ps -a | grep e2e-dk)"
+[ "$($NSPAWN inspect "$machine" -f '{{.api_name}}' 2>&1)" = e2e_dk_b ] || fail "inspect does not give the API's name: $($NSPAWN inspect "$machine" 2>&1 | head -5)"
+dk start e2e_dk_b >/dev/null || fail "docker start e2e_dk_b"
+[ "$(timeout 60 "$dk_dir/dk" wait e2e_dk_b)" = 3 ] || fail "docker wait does not give the exit code 3"
+[ "$(dk inspect -f '{{.State.Status}} {{.State.ExitCode}}' e2e_dk_b)" = "exited 3" ] || fail "inspect after the end: $(dk inspect -f '{{.State.Status}} {{.State.ExitCode}}' e2e_dk_b 2>&1)"
+long=e2e-dk-$(printf 'x%.0s' $(seq 1 70))
+dk create --name "$long" --label e2e.dk=1 e2e-dk-bb true >/dev/null || fail "docker create of a name of 77 characters"
+dk inspect -f '{{.Name}}' "$long" | grep_q "^/$long\$" || fail "the long name is not the API's"
+# stop, a second stop, restart, pause twice, unpause, update, kill.
+dk stop -t 2 e2e-dk-a >/dev/null || fail "docker stop"
+dk stop e2e-dk-a >/dev/null || fail "a second docker stop is not a success"
+[ "$($NSPAWN inspect e2e-dk-a -f '{{.state}}' 2>&1)" = stopped ] || fail "e2e-dk-a runs after docker stop"
+dk restart -t 2 e2e-dk-a >/dev/null || fail "docker restart of a stopped container"
+dk restart -t 2 e2e-dk-a >/dev/null || fail "docker restart of a running container"
+[ "$(dk inspect -f '{{.State.Status}}' e2e-dk-a)" = running ] || fail "e2e-dk-a does not run after restart"
+# Another container finds one by the name the API gave it.
+dk run -d --name e2e_dk_n --label e2e.dk=1 e2e-dk-bb sleep 600 >/dev/null || fail "docker run -d e2e_dk_n"
+retry 5 bash -c "$NSPAWN exec e2e-dk-a -- cat /etc/hosts </dev/null | grep_q -w e2e_dk_n" || fail "e2e_dk_n is not in the hosts of e2e-dk-a: $($NSPAWN exec e2e-dk-a -- cat /etc/hosts </dev/null 2>&1)"
+dk rm -f e2e_dk_n >/dev/null || fail "docker rm -f e2e_dk_n"
+dk pause e2e-dk-a >/dev/null || fail "docker pause"
+out=$(dk pause e2e-dk-a 2>&1) && fail "a second pause succeeded"
+echo "$out" | grep_q "is already paused" || fail "a second pause: $out"
+out=$(dk start e2e-dk-a 2>&1) && fail "a paused container started"
+echo "$out" | grep_q "cannot start a paused container, try unpause instead" || fail "start of a paused container: $out"
+dk unpause e2e-dk-a >/dev/null || fail "docker unpause"
+out=$(dk unpause e2e-dk-a 2>&1) && fail "an unpause of a running container succeeded"
+echo "$out" | grep_q "is not paused" || fail "unpause of a running container: $out"
+dk update --memory 64m --memory-swap 128m e2e-dk-a >/dev/null || fail "docker update"
+[ "$(systemctl show -p MemoryMax --value systemd-nspawn@e2e-dk-a.service)" = 67108864 ] || fail "update did not reach the unit: $(systemctl show -p MemoryMax systemd-nspawn@e2e-dk-a.service)"
+out=$(dk rm e2e-dk-a 2>&1) && fail "a running container was removed without -f"
+echo "$out" | grep_q "stop the container before removing or force remove" || fail "rm of a running container: $out"
+dk kill e2e-dk-a >/dev/null || fail "docker kill"
+[ "$(timeout 60 "$dk_dir/dk" wait e2e-dk-a)" = 137 ] || fail "wait after a kill does not give 137"
+# rm -f of one that runs; --rm removes it when it ends.
+dk start e2e-dk-a >/dev/null || fail "docker start e2e-dk-a again"
+dk rm -f e2e-dk-a >/dev/null || fail "docker rm -f"
+$NSPAWN inspect e2e-dk-a >/dev/null 2>&1 && fail "e2e-dk-a stayed after docker rm -f"
+dk rm -f e2e-dk-a >/dev/null 2>&1 || fail "docker rm -f of a container that is gone does not exit 0"
+dk run -d --rm --name e2e-dk-c --label e2e.dk=1 e2e-dk-bb sleep 1 >/dev/null || fail "docker run -d --rm"
+retry 15 bash -c "! $NSPAWN ps -a | grep_q '^ *e2e-dk-c '" || fail "a --rm container stayed after its end"
+# A restart keeps a container removed at its end; its stop removes it.
+dk run -d --rm --name e2e-dk-r --label e2e.dk=1 e2e-dk-bb sleep 600 >/dev/null || fail "docker run -d --rm e2e-dk-r"
+dk restart -t 1 e2e-dk-r >/dev/null || fail "docker restart of a --rm container"
+$NSPAWN restart -t 1 e2e-dk-r >/dev/null || fail "nspawn restart of a --rm container"
+sleep 2
+[ "$(dk inspect -f '{{.State.Status}}' e2e-dk-r 2>&1)" = running ] || fail "a --rm container after its restart: $(dk inspect -f '{{.State.Status}}' e2e-dk-r 2>&1)"
+dk stop -t 1 e2e-dk-r >/dev/null || fail "docker stop e2e-dk-r"
+retry 15 bash -c "! $NSPAWN ps -a | grep_q '^ *e2e-dk-r '" || fail "a --rm container stayed after its stop"
+# A bind's host directory is made when it is missing, at the start; a create leaves none.
+missing=/tmp/e2e-dk-missing-$nonce/sub
+dk create --name e2e-dk-d --label e2e.dk=1 -v "$missing:/data" e2e-dk-bb true >/dev/null || fail "docker create with a missing bind source"
+[ -e "$missing" ] && fail "the create made the bind's source"
+dk start e2e-dk-d >/dev/null || fail "docker start with a missing bind source"
+[ -d "$missing" ] || fail "the bind's missing source was not made"
+[ "$(timeout 60 "$dk_dir/dk" wait e2e-dk-d)" = 0 ] || fail "e2e-dk-d did not end"
+# prune takes the stopped ones of the label, an image that never ran stays an image.
+out=$(dk container prune -f --filter label=e2e.dk=1 2>&1) || fail "docker container prune: $out"
+for name in e2e_dk_b "$long" e2e-dk-d; do
+  dk inspect "$name" >/dev/null 2>&1 && fail "$name stayed after prune"
+done
+$NSPAWN images ls | grep_q '^ *e2e-dk-bb ' || fail "prune took the image e2e-dk-bb"
+# A machine that binds the socket runs the same client against the API: read-write
+# creates, read-only is refused.
+out=$($NSPAWN run --rm -v /run/nspawn/api.sock:/var/run/docker.sock "$dockercli_ref" docker run -d --name e2e-dk-inner --label e2e.dk=1 e2e-dk-bb sleep 30 2>&1) || fail "docker run from a machine that binds the socket: $out"
+[ "$($NSPAWN inspect e2e-dk-inner -f '{{.state}}' 2>&1)" = running ] || fail "the machine made from inside does not run: $out"
+out=$($NSPAWN run --rm -v /run/nspawn/api.sock:/var/run/docker.sock:ro "$dockercli_ref" docker rm -f e2e-dk-inner 2>&1) && fail "a read-only bind of the socket removed a container"
+echo "$out" | grep_q "binds nspawn's Docker API read-only" || fail "the read-only refusal: $out"
+dk rm -f e2e-dk-inner >/dev/null 2>&1
+rm -rf "$dk_dir" "/tmp/e2e-dk-missing-$nonce"
+$NSPAWN images rm e2e-dk-cli e2e-dk-bb >/dev/null 2>&1
 
 step "auto-update: a labelled machine gets the image its tag names now, and goes back when it fails"
 repo=e2e/au-$nonce

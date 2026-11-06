@@ -1,6 +1,6 @@
 #!/bin/sh
 # Records what docker's own API answers and what the tools that read the docker socket
-# ask of it, which nspawn's read-only API is checked against:
+# ask of it, which nspawn's Docker API is checked against:
 #
 #   tests/dockerapi/oracle.sh record OUT_DIR
 #

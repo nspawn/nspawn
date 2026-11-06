@@ -269,6 +269,10 @@ pub async fn install(
         restart: Default::default(),
         limits: Default::default(),
         remove_on_exit: false,
+        api_name: None,
+        tty: false,
+        interactive: false,
+        stdin_once: false,
         extra_networks: Vec::new(),
         aliases: BTreeMap::new(),
         no_network: false,
@@ -296,9 +300,9 @@ pub async fn ensure_replaceable(
         return Ok(());
     }
     if !force {
-        anyhow::bail!(
+        return Err(crate::api::FailureKind::Exists.error(format!(
             "image {name} already exists; use --force to replace it or --name for another name"
-        );
+        )));
     }
     if store.is_starting(name) {
         anyhow::bail!("machine {name} is starting; wait for it or stop it first");

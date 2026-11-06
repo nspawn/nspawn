@@ -116,9 +116,22 @@ pub struct ImageRecord {
     /// --memory, --cpus and --pids-limit.
     #[serde(default)]
     pub limits: crate::policy::Limits,
-    /// run --rm: removed once its current run ends.
+    /// Removed once its run ends: run --rm, or the remove of the create that made it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub remove_on_exit: bool,
+    /// The name the Docker API knows the machine by, where it is not the machine's own:
+    /// the Docker Engine API takes names systemd refuses as machine names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_name: Option<String>,
+    /// Its program wants a terminal (the Docker API's Tty).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tty: bool,
+    /// Its program's input stays open (OpenStdin).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interactive: bool,
+    /// Its input closes once the client attached to it leaves (StdinOnce).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stdin_once: bool,
     /// Who signed the image, as the pull verified it: "key <hint>, keyless <identity>".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_by: Option<String>,
@@ -170,6 +183,11 @@ impl ImageRecord {
     /// Whether it mounts docker's socket, and so gets nspawn's Docker API.
     pub fn takes_api_socket(&self) -> bool {
         self.volumes.iter().any(Volume::is_api_socket)
+    }
+
+    /// The name the Docker API knows it by: the one given there, else its own.
+    pub fn effective_api_name(&self) -> &str {
+        self.api_name.as_deref().unwrap_or(&self.name)
     }
 
     /// The image's labels with the ones given to this machine on top.
@@ -348,6 +366,19 @@ pub struct Starting(PathBuf);
 impl Drop for Starting {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// A restart's marker, taken away with its machine's directory of markers once that is
+/// empty.
+pub struct Restarting(PathBuf);
+
+impl Drop for Restarting {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+        if let Some(dir) = self.0.parent() {
+            let _ = fs::remove_dir(dir);
+        }
     }
 }
 
@@ -819,14 +850,21 @@ impl Store {
         self.root.join("starting").join(name)
     }
 
-    /// Takes every start marker: only the service makes them, so at its own start any
-    /// left is one a service that stopped or was killed during a start could not take.
+    /// The directory of a machine's restart markers, one per restart under way.
+    fn restarting_dir(&self, name: &str) -> PathBuf {
+        self.root.join("restarting").join(name)
+    }
+
+    /// Takes every start and restart marker: only the service makes them, so at its own
+    /// start any left is one a service that stopped or was killed during a start could
+    /// not take.
     pub fn forget_starts(&self) {
         if let Ok(entries) = fs::read_dir(self.root.join("starting")) {
             for entry in entries.flatten() {
                 let _ = fs::remove_file(entry.path());
             }
         }
+        let _ = fs::remove_dir_all(self.root.join("restarting"));
     }
 
     fn claim_path(&self, name: &str) -> PathBuf {
@@ -877,6 +915,38 @@ impl Store {
             return false;
         }
         marked(&self.starting_path(name))
+    }
+
+    /// Marks `name` as restarting until the guard is dropped: the end of the run its
+    /// restart stops is not the end a removal at the end waits for. Each restart has a
+    /// marker of its own, so that one ending leaves another's.
+    pub fn mark_restarting(&self, name: &str) -> Result<Restarting> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        crate::reference::validate_entry_name(name)?;
+        let dir = self.restarting_dir(name);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("{}-{n}", std::process::id()));
+        // Another restart's end may take the directory away in between: once more.
+        let mut tries = 0;
+        loop {
+            fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+            match fs::write(&path, boot_id()) {
+                Ok(()) => return Ok(Restarting(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && tries < 3 => tries += 1,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("writing {}", path.display()));
+                }
+            }
+        }
+    }
+
+    /// Whether a restart of `name` is between its stop and its start.
+    pub fn is_restarting(&self, name: &str) -> bool {
+        if crate::reference::validate_entry_name(name).is_err() {
+            return false;
+        }
+        fs::read_dir(self.restarting_dir(name))
+            .is_ok_and(|entries| entries.flatten().any(|entry| marked(&entry.path())))
     }
 
     pub fn manifests_dir(&self) -> PathBuf {
@@ -3030,6 +3100,33 @@ mod tests {
     }
 
     #[test]
+    fn what_the_docker_api_gives_a_record_is_written_only_when_given() {
+        let old = r#"{"name": "web", "reference": "r", "manifest_digest": "d", "layers": [], "backend": "overlay", "created": 1}"#;
+        let mut record: ImageRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(record.api_name, None);
+        assert!(!record.tty && !record.interactive && !record.stdin_once);
+        assert_eq!(record.effective_api_name(), "web");
+        let written = serde_json::to_value(&record).unwrap();
+        for key in [
+            "api_name",
+            "tty",
+            "interactive",
+            "stdin_once",
+            "remove_on_exit",
+        ] {
+            assert!(written.get(key).is_none(), "{key} written: {written}");
+        }
+        record.api_name = Some("my_web".to_string());
+        record.interactive = true;
+        let written = serde_json::to_value(&record).unwrap();
+        assert_eq!(written["api_name"], "my_web");
+        assert_eq!(written["interactive"], true);
+        let back: ImageRecord = serde_json::from_value(written).unwrap();
+        assert_eq!(back.effective_api_name(), "my_web");
+        assert!(back.interactive);
+    }
+
+    #[test]
     fn records_round_trip_and_gc() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
@@ -3061,6 +3158,10 @@ mod tests {
             restart: Default::default(),
             limits: Default::default(),
             remove_on_exit: false,
+            api_name: None,
+            tty: false,
+            interactive: false,
+            stdin_once: false,
             extra_networks: Vec::new(),
             aliases: BTreeMap::new(),
             no_network: false,
@@ -3150,6 +3251,10 @@ mod tests {
             restart: Default::default(),
             limits: Default::default(),
             remove_on_exit: false,
+            api_name: None,
+            tty: false,
+            interactive: false,
+            stdin_once: false,
             extra_networks: Vec::new(),
             aliases: BTreeMap::new(),
             no_network: false,
@@ -3411,6 +3516,10 @@ mod tests {
             restart: Default::default(),
             limits: Default::default(),
             remove_on_exit: false,
+            api_name: None,
+            tty: false,
+            interactive: false,
+            stdin_once: false,
             extra_networks: Vec::new(),
             aliases: BTreeMap::new(),
             no_network: false,
@@ -3842,6 +3951,26 @@ mod tests {
         assert!(store.has_blob(&ours));
         assert!(!dead.exists());
         drop(hold);
+    }
+
+    #[test]
+    fn a_restart_is_marked_apart_from_a_start_until_it_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let mark = store.mark_restarting("web").unwrap();
+        assert!(store.is_restarting("web"));
+        assert!(!store.is_starting("web"), "a stop of a restart may go on");
+        // Two at once: the one that ends first leaves the other's.
+        let other = store.mark_restarting("web").unwrap();
+        drop(mark);
+        assert!(store.is_restarting("web"));
+        drop(other);
+        assert!(!store.is_restarting("web"));
+        assert!(!store.restarting_dir("web").exists(), "nothing left behind");
+        std::mem::forget(store.mark_restarting("left").unwrap());
+        store.forget_starts();
+        assert!(!store.is_restarting("left"));
+        assert!(store.mark_restarting("../x").is_err());
     }
 
     #[test]

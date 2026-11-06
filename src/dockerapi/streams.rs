@@ -47,7 +47,19 @@ pub struct LogsQuery {
     /// 1 for standard output, 2 for standard error: the console carries both as one,
     /// so everything goes as the first stream asked for.
     pub stream: u8,
+    /// The lines as they are, without frames: a container with a terminal has one
+    /// stream, which clients read raw.
+    pub raw: bool,
     pub request: LogsRequest,
+}
+
+/// A log line as it goes out: in a frame, or as it is for a container with a terminal.
+fn log_chunk(query: &LogsQuery, payload: Vec<u8>) -> Bytes {
+    if query.raw {
+        Bytes::from(payload)
+    } else {
+        frame(query.stream, &payload)
+    }
 }
 
 /// journalctl's entries as frames, until it ends or the client goes.
@@ -92,7 +104,7 @@ pub async fn logs(query: LogsQuery, tx: Sender<Bytes>) {
                 } else {
                     message
                 };
-                if tx.send(frame(query.stream, &payload)).await.is_err() {
+                if tx.send(log_chunk(&query, payload)).await.is_err() {
                     break;
                 }
             }
@@ -244,10 +256,11 @@ pub fn stats_json(
 }
 
 /// A reading every second, each object on its line, until the machine is gone or the
-/// client goes.
+/// client goes: of the machine `name`, shown as the container `shown`.
 pub async fn stats(
     ctx: Arc<Context>,
     name: String,
+    shown: String,
     id: String,
     pids_limit: u64,
     tx: Sender<Bytes>,
@@ -257,7 +270,7 @@ pub async fn stats(
         let now = Reading::take(&ctx, &name).await;
         let text = format!(
             "{}\n",
-            stats_json(&name, &id, pids_limit, now.as_ref(), before.as_ref())
+            stats_json(&shown, &id, pids_limit, now.as_ref(), before.as_ref())
         );
         if tx.send(Bytes::from(text)).await.is_err() {
             return;
@@ -314,24 +327,34 @@ fn forget_removed(
 /// record (a die after run --rm took it) gets the attributes and labels the machine had,
 /// one that says which machine it was replaces what is known of the name.
 fn complete(known: &mut BTreeMap<String, Known>, event: &mut crate::api::events::Event) {
-    match event.attributes.get("created") {
+    match event.attributes.get("created").cloned() {
         Some(created) => {
             // A remove carries which machine it was, but its record is gone with its
-            // labels: the ones known of that machine stay.
-            if event.labels.is_empty() {
-                if let Some((attributes, labels)) = known.get(&event.name) {
-                    if attributes.get("created") == Some(created) {
-                        event.labels.clone_from(labels);
-                    }
+            // labels and its API name: the ones known of that machine stay.
+            if let Some((attributes, labels)) = known
+                .get(&event.name)
+                .filter(|(attributes, _)| attributes.get("created") == Some(&created))
+            {
+                if event.labels.is_empty() {
+                    event.labels.clone_from(labels);
+                }
+                if let Some(api_name) = attributes.get("api_name") {
+                    event
+                        .attributes
+                        .entry("api_name".to_string())
+                        .or_insert_with(|| api_name.clone());
                 }
             }
-            let attributes = BTreeMap::from([
-                ("created".to_string(), created.clone()),
+            let mut attributes = BTreeMap::from([
+                ("created".to_string(), created),
                 (
                     "image".to_string(),
                     event.attributes.get("image").cloned().unwrap_or_default(),
                 ),
             ]);
+            if let Some(api_name) = event.attributes.get("api_name") {
+                attributes.insert("api_name".to_string(), api_name.clone());
+            }
             known.insert(event.name.clone(), (attributes, event.labels.clone()));
         }
         None => {
@@ -353,6 +376,29 @@ fn complete(known: &mut BTreeMap<String, Known>, event: &mut crate::api::events:
                 if event.labels.is_empty() {
                     event.labels.clone_from(labels);
                 }
+            }
+        }
+    }
+}
+
+/// The API name of a machine made after the stream began, from its record: the events
+/// of the systemd units carry none.
+fn api_name_of_new(
+    store: &crate::store::Store,
+    known: &BTreeMap<String, Known>,
+    event: &mut crate::api::events::Event,
+) {
+    let created = event.attributes.get("created");
+    let seen = known.get(&event.name).is_some_and(|(attributes, _)| {
+        created.is_none_or(|c| attributes.get("created") == Some(c))
+    });
+    if seen || event.attributes.contains_key("api_name") {
+        return;
+    }
+    if let Ok(Some(record)) = store.load_image(&event.name) {
+        if created.is_none_or(|c| *c == record.created.to_string()) {
+            if let Some(api_name) = record.api_name {
+                event.attributes.insert("api_name".to_string(), api_name);
             }
         }
     }
@@ -393,10 +439,13 @@ pub async fn events(
         .unwrap_or_default()
         .into_iter()
         .map(|r| {
-            let attributes = BTreeMap::from([
+            let mut attributes = BTreeMap::from([
                 ("created".to_string(), r.created.to_string()),
                 ("image".to_string(), r.reference.clone()),
             ]);
+            if let Some(api_name) = &r.api_name {
+                attributes.insert("api_name".to_string(), api_name.clone());
+            }
             (r.name.clone(), (attributes, r.effective_labels()))
         })
         .collect();
@@ -406,6 +455,7 @@ pub async fn events(
             event = follow.next(&ctx.store) => {
                 let Some(mut event) = event else { break };
                 if event.kind == "machine" {
+                    api_name_of_new(&ctx.store, &known, &mut event);
                     complete(&mut known, &mut event);
                     forget_removed(&mut known, &mut removed, &event);
                 }
@@ -480,6 +530,37 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_keeps_its_api_name_past_its_record() {
+        let event = |action: &str, attributes: &[(&str, &str)]| crate::api::events::Event {
+            time_usec: 10_000_000,
+            kind: "machine".into(),
+            action: action.into(),
+            name: "my-web-1a2b3c4d".into(),
+            attributes: attributes
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            labels: BTreeMap::new(),
+            run: None,
+        };
+        let mut known = BTreeMap::new();
+        let mut create = event("create", &[("created", "5"), ("api_name", "my_web")]);
+        complete(&mut known, &mut create);
+        // systemd's start says no more than the name.
+        let mut start = event("start", &[]);
+        complete(&mut known, &mut start);
+        assert_eq!(start.attributes["api_name"], "my_web");
+        // The removal comes once the record is gone.
+        let mut remove = event("remove", &[("created", "5")]);
+        complete(&mut known, &mut remove);
+        assert_eq!(remove.attributes["api_name"], "my_web");
+        // Another machine of the name has its own.
+        let mut other = event("remove", &[("created", "9")]);
+        complete(&mut known, &mut other);
+        assert!(!other.attributes.contains_key("api_name"));
+    }
+
+    #[test]
     fn a_removed_machine_is_forgotten_a_while_later() {
         let event = |action: &str, created: &str, at: u64| crate::api::events::Event {
             time_usec: at,
@@ -532,6 +613,23 @@ mod tests {
         assert!(
             [frame(1, b"bye\n").to_vec(), frame(2, b"oops\n").to_vec()].contains(&golden.to_vec()),
             "{golden:?}"
+        );
+    }
+
+    #[test]
+    fn a_terminal_s_lines_go_raw() {
+        let query = |raw| LogsQuery {
+            stream: 1,
+            raw,
+            request: Default::default(),
+        };
+        assert_eq!(
+            log_chunk(&query(true), b"bye\n".to_vec()).to_vec(),
+            b"bye\n"
+        );
+        assert_eq!(
+            log_chunk(&query(false), b"bye\n".to_vec()),
+            frame(1, b"bye\n")
         );
     }
 

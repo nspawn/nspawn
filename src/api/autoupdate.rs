@@ -427,6 +427,7 @@ async fn restart_dependents(ctx: &Context, record: &ImageRecord, report: Report<
             force: false,
             wait: true,
             timeout: None,
+            signal: None,
         };
         if let Err(e) = crate::api::machines::stop(ctx, &stop, report).await {
             note(report, format!("warning: stopping {}: {e:#}", other.name));

@@ -201,28 +201,35 @@ pub fn validate_entry_name(name: &str) -> Result<()> {
         || name.contains('/')
         || name.chars().any(char::is_control)
     {
-        bail!("invalid machine name {name:?}");
+        return Err(invalid_name(format!("invalid machine name {name:?}")));
     }
     Ok(())
+}
+
+/// A name refused: a bad argument to whatever was asked.
+fn invalid_name(message: String) -> anyhow::Error {
+    crate::api::FailureKind::Invalid.error(message)
 }
 
 /// A name systemd-nspawn takes for --machine, a host name: letters, digits and '-' in
 /// parts between dots, no part empty or starting or ending with '-', 64 bytes at most.
 pub fn validate_machine_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
-        bail!("invalid machine name {name:?}");
+        return Err(invalid_name(format!("invalid machine name {name:?}")));
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
     {
-        bail!("machine name {name:?} may only contain letters, digits, '.' and '-'");
+        return Err(invalid_name(format!(
+            "machine name {name:?} may only contain letters, digits, '.' and '-'"
+        )));
     }
     if name
         .split('.')
         .any(|label| label.is_empty() || label.starts_with('-') || label.ends_with('-'))
     {
-        bail!("machine name {name:?} is no host name: a part between dots is empty, or starts or ends with '-'");
+        return Err(invalid_name(format!("machine name {name:?} is no host name: a part between dots is empty, or starts or ends with '-'")));
     }
     Ok(())
 }
@@ -489,5 +496,19 @@ mod tests {
         assert!(validate_machine_name("fedora-44").is_ok());
         assert!(validate_machine_name(".hidden").is_err());
         assert!(validate_machine_name("a b").is_err());
+    }
+
+    #[test]
+    fn a_refused_name_is_a_bad_argument() {
+        let kind = |r: Result<()>| crate::api::kind_of(&r.unwrap_err());
+        let invalid = Some(crate::api::FailureKind::Invalid);
+        assert_eq!(kind(validate_machine_name("a_b")), invalid);
+        assert_eq!(kind(validate_machine_name("")), invalid);
+        assert_eq!(kind(validate_machine_name("-a")), invalid);
+        assert_eq!(kind(validate_entry_name("../x")), invalid);
+        assert_eq!(
+            validate_entry_name("../x").unwrap_err().to_string(),
+            "invalid machine name \"../x\""
+        );
     }
 }

@@ -11,7 +11,7 @@ use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
-use crate::api::{self, Context};
+use crate::api::{self, Context, FailureKind};
 use crate::auth::Credentials;
 use crate::backend::BackendChoice;
 use crate::daemon::jobs::{self, Dict};
@@ -23,7 +23,8 @@ use crate::nsenter;
 use crate::oci::Mode;
 use crate::search::SearchSource;
 
-/// Errors leave as org.nspawn.Error.Failed with the library's message.
+/// Errors leave with the library's message, named by the kind of failure the error says
+/// (`api::FailureKind`), org.nspawn.Error.Failed for any other.
 #[derive(Debug, zbus::DBusError)]
 #[zbus(prefix = "org.nspawn.Error")]
 pub enum Error {
@@ -32,11 +33,60 @@ pub enum Error {
     Failed(String),
     /// The caller is not allowed to do this: polkit said so.
     NotAuthorized(String),
+    NoSuchMachine(String),
+    NoSuchImage(String),
+    NoSuchNetwork(String),
+    NoSuchVolume(String),
+    Exists(String),
+    InUse(String),
+    NotRunning(String),
+    AlreadyRunning(String),
+    Paused(String),
+    NotPaused(String),
+    Invalid(String),
+}
+
+/// The prefix of the service's error names.
+pub const ERROR_PREFIX: &str = "org.nspawn.Error";
+
+/// The D-Bus name of a failure of `kind`, org.nspawn.Error.Failed without one.
+pub fn error_name(kind: Option<FailureKind>) -> String {
+    format!(
+        "{ERROR_PREFIX}.{}",
+        kind.map_or("Failed", FailureKind::name)
+    )
+}
+
+impl Error {
+    fn of(kind: Option<FailureKind>, message: String) -> Self {
+        match kind {
+            None => Error::Failed(message),
+            Some(FailureKind::NoSuchMachine) => Error::NoSuchMachine(message),
+            Some(FailureKind::NoSuchImage) => Error::NoSuchImage(message),
+            Some(FailureKind::NoSuchNetwork) => Error::NoSuchNetwork(message),
+            Some(FailureKind::NoSuchVolume) => Error::NoSuchVolume(message),
+            Some(FailureKind::Exists) => Error::Exists(message),
+            Some(FailureKind::InUse) => Error::InUse(message),
+            Some(FailureKind::NotRunning) => Error::NotRunning(message),
+            Some(FailureKind::AlreadyRunning) => Error::AlreadyRunning(message),
+            Some(FailureKind::Paused) => Error::Paused(message),
+            Some(FailureKind::NotPaused) => Error::NotPaused(message),
+            Some(FailureKind::Invalid) => Error::Invalid(message),
+        }
+    }
+
+    /// A bad argument the method itself found, before the library was asked.
+    fn invalid(message: impl Into<String>) -> Self {
+        Error::Invalid(message.into())
+    }
 }
 
 impl From<anyhow::Error> for Error {
     fn from(e: anyhow::Error) -> Self {
-        Error::Failed(crate::daemon::values::bus_text(&format!("{e:#}")))
+        Error::of(
+            api::kind_of(&e),
+            crate::daemon::values::bus_text(&format!("{e:#}")),
+        )
     }
 }
 
@@ -136,13 +186,51 @@ fn status_code(status: std::process::ExitStatus) -> i32 {
         .unwrap_or(126)
 }
 
+/// RemoveImages names images: a name with nothing behind it is no such image.
+fn images_named(e: anyhow::Error) -> anyhow::Error {
+    if api::kind_of(&e) == Some(FailureKind::NoSuchMachine) {
+        return FailureKind::NoSuchImage.error(format!("{e:#}"));
+    }
+    e
+}
+
+/// How a start went, as StartMachine and RestartMachine say it.
+fn start_outcome(outcome: api::machines::StartOutcome) -> &'static str {
+    match outcome {
+        api::machines::StartOutcome::Started => "started",
+        api::machines::StartOutcome::Ended => "ended",
+        api::machines::StartOutcome::Restarting => "restarting",
+    }
+}
+
+/// timeout (t): seconds between the stop signal and SIGKILL, a day at most, or
+/// u64::MAX for none.
+fn stop_timeout(options: &mut Options<'_>) -> anyhow::Result<Option<u64>> {
+    Ok(options.maybe_u64("timeout")?.map(|t| match t {
+        crate::policy::NO_STOP_TIMEOUT => t,
+        t => t.min(86_400),
+    }))
+}
+
+/// signal (s): a name such as TERM, SIGHUP or RTMIN+3, or a number.
+fn signal_option(options: &mut Options<'_>) -> anyhow::Result<Option<i32>> {
+    options
+        .string("signal")?
+        .map(|s| api::machines::signal_number(&s).map_err(api::failure::invalid))
+        .transpose()
+}
+
 fn backend_choice(text: Option<&str>) -> anyhow::Result<BackendChoice> {
     Ok(match text {
         None | Some("") | Some("auto") => BackendChoice::Auto,
         Some("overlay") => BackendChoice::Overlay,
         Some("flat") => BackendChoice::Flat,
         Some("mstack") => BackendChoice::Mstack,
-        Some(other) => anyhow::bail!("backend {other}: expected auto, overlay, flat or mstack"),
+        Some(other) => {
+            return Err(FailureKind::Invalid.error(format!(
+                "backend {other}: expected auto, overlay, flat or mstack"
+            )))
+        }
     })
 }
 
@@ -151,7 +239,11 @@ fn mode_choice(text: Option<&str>) -> anyhow::Result<Option<Mode>> {
         None | Some("") | Some("auto") => None,
         Some("boot") => Some(Mode::Boot),
         Some("app") => Some(Mode::App),
-        Some(other) => anyhow::bail!("mode {other}: expected auto, boot or app"),
+        Some(other) => {
+            return Err(
+                FailureKind::Invalid.error(format!("mode {other}: expected auto, boot or app"))
+            )
+        }
     })
 }
 
@@ -186,7 +278,8 @@ async fn caller_gone(connection: zbus::Connection, name: Option<String>) {
 /// What StartMachine and RunMachine are asked: wait (b, default `wait`), network (s) or
 /// networks (as), aliases (as), addresses (as, IP or NETWORK=IP), publish (as), publish_all (b), entrypoint (s), env (as), volume (as),
 /// label (as), restart (s), memory (t), memory_swap (x), cpus (d), pids_limit (t),
-/// image_command (b), command (as), remove (b), and the flags of `health_overrides` and `tuning_overrides`.
+/// image_command (b), command (as), remove (b: given, the machine is removed once it ends,
+/// or no more; absent, as it was), and the flags of `health_overrides` and `tuning_overrides`.
 pub(crate) fn start_request(
     name: String,
     options: &mut Options<'_>,
@@ -204,20 +297,25 @@ pub(crate) fn start_request(
         env: options.strings("env")?,
         volume: options.strings("volume")?,
         label: options.strings("label")?,
-        restart: options
-            .string("restart")?
-            .map(|r| crate::policy::Restart::parse(&r))
-            .transpose()?,
+        restart: restart_option(options)?,
         memory: options.maybe_u64("memory")?,
         memory_swap: options.i64("memory_swap")?,
         cpus: options.f64("cpus")?,
         pids_limit: options.maybe_u64("pids_limit")?,
         image_command: options.bool("image_command", false)?,
         command: options.strings("command")?,
-        remove: options.bool("remove", false)?,
+        remove: options.maybe_bool("remove")?,
         health: health_overrides(options)?,
         tuning: tuning_overrides(options)?,
     })
+}
+
+/// restart (s): no, on-failure[:N], always or unless-stopped, as --restart takes it.
+fn restart_option(options: &mut Options<'_>) -> anyhow::Result<Option<crate::policy::Restart>> {
+    options
+        .string("restart")?
+        .map(|r| crate::policy::parse_restart(&r).map_err(api::failure::invalid))
+        .transpose()
 }
 
 /// The --health-* flags: health_cmd (s), health_test (as, the whole test),
@@ -235,7 +333,8 @@ fn health_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::health::
         retries: options
             .maybe_u64("health_retries")?
             .map(|n| {
-                u32::try_from(n).map_err(|_| anyhow::anyhow!("option health_retries is too large"))
+                u32::try_from(n)
+                    .map_err(|_| FailureKind::Invalid.error("option health_retries is too large"))
             })
             .transpose()?,
         disable: options.bool("no_healthcheck", false)?,
@@ -272,7 +371,7 @@ fn tuning_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::tuning::
             .i64("oom_score_adj")?
             .map(|n| {
                 i32::try_from(n)
-                    .map_err(|_| anyhow::anyhow!("option oom_score_adj is out of range"))
+                    .map_err(|_| FailureKind::Invalid.error("option oom_score_adj is out of range"))
             })
             .transpose()?,
         stop_signal: options.string("stop_signal")?,
@@ -295,7 +394,7 @@ fn network_choice(one: Option<String>, several: Vec<String>) -> anyhow::Result<V
         one.filter(|t| !t.is_empty()).into_iter().collect()
     };
     if !texts.is_empty() {
-        api::network::choices(&texts)?;
+        api::network::choices(&texts).map_err(api::failure::invalid)?;
     }
     Ok(texts)
 }
@@ -356,7 +455,7 @@ impl Manager {
             .ctx()
             .store
             .load_image(&name)?
-            .ok_or_else(|| Error::Failed(format!("no image named {name}")))?;
+            .ok_or_else(|| Error::NoSuchImage(format!("no image named {name}")))?;
         Ok(values::record(&record))
     }
 
@@ -428,10 +527,14 @@ impl Manager {
     }
 
     /// Like `create`. Options: backend (s), network (s) or networks (as), aliases (as),
-    /// addresses (as), publish (as), publish_all (b), force (b), entrypoint (s), env (as), volume (as), label (as),
+    /// addresses (as), publish (as), publish_all (b), force (b), entrypoint (s, a program
+    /// alone, or as, the whole entrypoint), env (as), volume (as), label (as),
     /// restart (s), memory (t, bytes), memory_swap (x, bytes of memory and swap, -1 for
     /// no bound on swap), cpus (d), pids_limit (t), command (as), the flags of
-    /// `health_overrides` and `tuning_overrides`, registry (s), ca_cert (s).
+    /// `health_overrides` and `tuning_overrides`, registry (s), ca_cert (s), api_name (s:
+    /// the name the Docker API knows it by; with an empty `name`, the machine's name is
+    /// made of it), tty, interactive, stdin_once (b, kept for whoever attaches), remove
+    /// (b: removed once it ends). The job's result: name (the machine's), mode.
     async fn create_machine(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -446,6 +549,7 @@ impl Manager {
         let request = api::create::CreateRequest {
             source,
             name: name.clone(),
+            api_name: options.string("api_name")?,
             backend: backend_choice(options.string("backend")?.as_deref())?,
             network: network_choice(options.string("network")?, options.strings("networks")?)?,
             aliases: options.strings("aliases")?,
@@ -453,15 +557,12 @@ impl Manager {
             publish: options.strings("publish")?,
             publish_all: options.bool("publish_all", false)?,
             force: options.bool("force", false)?,
-            entrypoint: options.string("entrypoint")?,
+            entrypoint: options.argv("entrypoint")?,
             env: options.strings("env")?,
             unset_env: options.strings("unset_env")?,
             volume: options.strings("volume")?,
             label: options.strings("label")?,
-            restart: options
-                .string("restart")?
-                .map(|r| crate::policy::Restart::parse(&r))
-                .transpose()?,
+            restart: restart_option(&mut options)?,
             memory: options.maybe_u64("memory")?,
             memory_swap: options.i64("memory_swap")?,
             cpus: options.f64("cpus")?,
@@ -469,15 +570,25 @@ impl Manager {
             command: options.strings("command")?,
             health: health_overrides(&mut options)?,
             tuning: tuning_overrides(&mut options)?,
+            tty: options.bool("tty", false)?,
+            interactive: options.bool("interactive", false)?,
+            stdin_once: options.bool("stdin_once", false)?,
+            remove: options.bool("remove", false)?,
         };
         options.finish()?;
+        // Refused before a job: what a client sends wrong, it hears of at once.
+        api::create::check_request(&request)?;
+        let target = match &request.api_name {
+            Some(api_name) if name.is_empty() => api_name.clone(),
+            _ => name,
+        };
         let state = self.state.clone();
         Ok(jobs::spawn(
             &self.state,
             owner,
             ctx,
             "create",
-            &name,
+            &target,
             move |ctx, reporter| async move {
                 let created = api::create::create(&ctx, &request, jobs::report(&reporter)).await?;
                 if let Ok(emitter) = state.emitter() {
@@ -555,7 +666,9 @@ impl Manager {
                 .map(|item| {
                     item.split_once('=')
                         .map(|(k, v)| (k.to_string(), v.to_string()))
-                        .ok_or_else(|| anyhow::anyhow!("{what} {item}: KEY=VALUE"))
+                        .ok_or_else(|| {
+                            FailureKind::Invalid.error(format!("{what} {item}: KEY=VALUE"))
+                        })
                 })
                 .collect()
         };
@@ -564,7 +677,9 @@ impl Manager {
             Some("none") => crate::build::plan::Network::None,
             Some("host") => crate::build::plan::Network::Host,
             Some(other) => {
-                return Err(anyhow::anyhow!("--network {other}: default, none or host").into())
+                return Err(FailureKind::Invalid
+                    .error(format!("--network {other}: default, none or host"))
+                    .into())
             }
         };
         let mut allow_host_network = false;
@@ -572,12 +687,17 @@ impl Manager {
             match entitlement.as_str() {
                 "network.host" => allow_host_network = true,
                 "security.insecure" => {
-                    return Err(anyhow::anyhow!(
-                    "--allow security.insecure: steps run with the confinement of an app machine"
-                )
-                    .into())
+                    return Err(FailureKind::Invalid
+                        .error(
+                            "--allow security.insecure: steps run with the confinement of an app machine",
+                        )
+                        .into())
                 }
-                other => return Err(anyhow::anyhow!("--allow {other}: unknown entitlement").into()),
+                other => {
+                    return Err(FailureKind::Invalid
+                        .error(format!("--allow {other}: unknown entitlement"))
+                        .into())
+                }
             }
         }
         let add_hosts = options
@@ -593,7 +713,7 @@ impl Manager {
         let request = crate::build::exec::Request {
             dockerfile: options
                 .bytes("dockerfile")?
-                .ok_or_else(|| anyhow::anyhow!("option dockerfile is missing"))?,
+                .ok_or_else(|| FailureKind::Invalid.error("option dockerfile is missing"))?,
             context: PathBuf::new(),
             tags: options.strings("tags")?,
             options: crate::build::plan::Options {
@@ -750,7 +870,8 @@ impl Manager {
                 }
                 let result =
                     HashMap::from([("removed".to_string(), values::v(removal.removed.clone()))]);
-                if let Some(error) = removal.error() {
+                if let Some(error) = removal.failure() {
+                    let error = images_named(error);
                     return Err(jobs::Partly { result, error }.into());
                 }
                 Ok(result)
@@ -791,7 +912,7 @@ impl Manager {
                 }
                 let result =
                     HashMap::from([("removed".to_string(), values::v(removal.removed.clone()))]);
-                if let Some(error) = removal.error() {
+                if let Some(error) = removal.failure() {
                     return Err(jobs::Partly { result, error }.into());
                 }
                 Ok(result)
@@ -912,7 +1033,7 @@ impl Manager {
                 let removal = api::volumes::remove(&ctx, &names, jobs::report(&reporter)).await?;
                 let result =
                     HashMap::from([("removed".to_string(), values::v(removal.removed.clone()))]);
-                if let Some(error) = removal.error() {
+                if let Some(error) = removal.failure() {
                     return Err(jobs::Partly { result, error }.into());
                 }
                 Ok(result)
@@ -1010,6 +1131,57 @@ impl Manager {
                     ("removed".to_string(), values::v(pruned.removed)),
                     ("reclaimed".to_string(), values::v(pruned.reclaimed)),
                 ]))
+            },
+        )
+        .await?)
+    }
+
+    /// The machines of `system prune`: every machine that is stopped and is no image only
+    /// goes. Options until (t, unix seconds: those made before), labels (as, KEY or
+    /// KEY=VALUE: every one matches), labels_not (as: one that matches every one stays),
+    /// made (b: only those made from an image by create or run, as system prune takes
+    /// them). The job's result: removed (as), reclaimed (t, bytes of their writable
+    /// layers); it fails at the end when one could not go, its result still saying what
+    /// went.
+    async fn prune_machines(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<OwnedObjectPath> {
+        let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let mut options = Options::new(&options);
+        let prune = api::disk::MachinePrune {
+            until: options.maybe_u64("until")?,
+            labels: options.strings("labels")?,
+            labels_not: options.strings("labels_not")?,
+            made: options.bool("made", false)?,
+        };
+        options.finish()?;
+        let state = self.state.clone();
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "machine-prune",
+            "",
+            move |ctx, reporter| async move {
+                let (pruned, failure) =
+                    api::disk::prune_machines(&ctx, &prune, jobs::report(&reporter)).await?;
+                // As rm says it: a client following the images learns of these too.
+                for name in &pruned.removed {
+                    if let Ok(emitter) = state.emitter() {
+                        let _ = Manager::image_removed(&emitter, name).await;
+                    }
+                }
+                let result = HashMap::from([
+                    ("removed".to_string(), values::strings(&pruned.removed)),
+                    ("reclaimed".to_string(), values::v(pruned.reclaimed)),
+                ]);
+                if let Some(error) = failure {
+                    return Err(jobs::Partly { result, error }.into());
+                }
+                Ok(result)
             },
         )
         .await?)
@@ -1225,7 +1397,7 @@ impl Manager {
                 let removal = api::secrets::remove(&ctx, &names, jobs::report(&reporter)).await?;
                 let result =
                     HashMap::from([("removed".to_string(), values::v(removal.removed.clone()))]);
-                if let Some(error) = removal.error() {
+                if let Some(error) = removal.failure() {
                     return Err(jobs::Partly { result, error }.into());
                 }
                 Ok(result)
@@ -1311,7 +1483,7 @@ impl Manager {
                 let removal = api::network::remove(&ctx, &names, jobs::report(&reporter)).await?;
                 let result =
                     HashMap::from([("removed".to_string(), values::v(removal.removed.clone()))]);
-                if let Some(error) = removal.error() {
+                if let Some(error) = removal.failure() {
                     return Err(jobs::Partly { result, error }.into());
                 }
                 Ok(result)
@@ -1337,7 +1509,7 @@ impl Manager {
         let address = match options.string("address")?.filter(|a| !a.is_empty()) {
             Some(text) => Some(
                 text.parse::<std::net::Ipv4Addr>()
-                    .map_err(|_| Error::Failed(format!("{text} is not an IPv4 address")))?,
+                    .map_err(|_| Error::invalid(format!("{text} is not an IPv4 address")))?,
             ),
             None => None,
         };
@@ -1408,7 +1580,7 @@ impl Manager {
                 let removal = api::network::prune(&ctx, jobs::report(&reporter)).await?;
                 let result =
                     HashMap::from([("removed".to_string(), values::v(removal.removed.clone()))]);
-                if let Some(error) = removal.error() {
+                if let Some(error) = removal.failure() {
                     return Err(jobs::Partly { result, error }.into());
                 }
                 Ok(result)
@@ -1438,7 +1610,7 @@ impl Manager {
             "hub" => Some(SearchSource::Hub),
             "dockerhub" => Some(SearchSource::Dockerhub),
             other => {
-                return Err(Error::Failed(format!(
+                return Err(Error::invalid(format!(
                     "source {other}: expected hub, dockerhub or an empty string for both"
                 )))
             }
@@ -1570,12 +1742,8 @@ impl Manager {
         let request = start_request(name, &mut options, true)?;
         options.finish()?;
         let notes = Notes::default();
-        let outcome = match api::machines::start(self.ctx(), &request, &notes.report()).await? {
-            api::machines::StartOutcome::Started => "started",
-            api::machines::StartOutcome::Ended => "ended",
-            api::machines::StartOutcome::Restarting => "restarting",
-        };
-        Ok((outcome.to_string(), notes.into_lines()))
+        let outcome = api::machines::start(self.ctx(), &request, &notes.report()).await?;
+        Ok((start_outcome(outcome).to_string(), notes.into_lines()))
     }
 
     /// Like `run` without -d. Options: StartMachine's (wait defaults to false), tty (b),
@@ -1610,7 +1778,7 @@ impl Manager {
         options.finish()?;
         let stdin = fds.remove("stdin").map(std::os::fd::OwnedFd::from);
         if let Some(other) = fds.keys().next() {
-            return Err(Error::Failed(format!("unknown descriptor {other}")));
+            return Err(Error::invalid(format!("unknown descriptor {other}")));
         }
         if let Err(e) = api::network::remove_ended(self.ctx()).await {
             eprintln!("warning: removing the machines of run --rm that ended: {e:#}");
@@ -1657,8 +1825,9 @@ impl Manager {
 
     /// Like `stop`. Options: force (b), wait (b, default true), timeout (t, seconds
     /// before SIGKILL; the machine's stop_timeout by default, else 10; a day at most, or
-    /// u64::MAX for none). Returns "stopped" or "was-not-running", and the notes made on
-    /// the way (a program that had to be killed, say).
+    /// u64::MAX for none), signal (s, sent first instead of the machine's stop signal).
+    /// Returns "stopped" or "was-not-running", and the notes made on the way (a program
+    /// that had to be killed, say).
     async fn stop_machine(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -1672,11 +1841,8 @@ impl Manager {
             name,
             force: options.bool("force", false)?,
             wait: options.bool("wait", true)?,
-            // A day at most, or none at all.
-            timeout: options.maybe_u64("timeout")?.map(|t| match t {
-                crate::policy::NO_STOP_TIMEOUT => t,
-                t => t.min(86_400),
-            }),
+            timeout: stop_timeout(&mut options)?,
+            signal: signal_option(&mut options)?,
         };
         options.finish()?;
         let notes = Notes::default();
@@ -1685,6 +1851,67 @@ impl Manager {
             api::machines::StopOutcome::WasNotRunning => "was-not-running",
         };
         Ok((outcome.to_string(), notes.into_lines()))
+    }
+
+    /// Like `restart`: the machine stopped when it runs (a paused one too), as
+    /// StopMachine with wait stops it, then started as StartMachine with wait starts it,
+    /// with what it has. Options: timeout (t), signal (s), as for StopMachine. Returns
+    /// StartMachine's outcome and the notes of both.
+    async fn restart_machine(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        name: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<(String, Vec<String>)> {
+        let _busy = self.state.enter();
+        self.allow(&hdr, Action::Manage).await?;
+        let mut options = Options::new(&options);
+        let timeout = stop_timeout(&mut options)?;
+        let signal = signal_option(&mut options)?;
+        options.finish()?;
+        let notes = Notes::default();
+        let outcome =
+            api::machines::restart(self.ctx(), &name, timeout, signal, &notes.report()).await?;
+        Ok((start_outcome(outcome).to_string(), notes.into_lines()))
+    }
+
+    /// Like `wait`: a job of kind "wait" that ends with result exit_code (i) once the
+    /// condition (s) holds: not-running (the default) at once for a machine that does
+    /// not run, with its last run's exit code (0 for one that never ran), otherwise at
+    /// the end of its run, a restart of its policy coming after or not; next-exit at the
+    /// end of its next run; removed once its record is gone, with the last exit code.
+    /// A name with no record and no machine is refused by the call itself. The job ends
+    /// when its caller leaves the bus.
+    async fn wait_machine(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        name: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<OwnedObjectPath> {
+        let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Inspect).await?;
+        let mut options = Options::new(&options);
+        let condition = api::wait::Condition::parse(
+            options.string("condition")?.as_deref().unwrap_or_default(),
+        )?;
+        options.finish()?;
+        api::wait::check(self.ctx(), &name).await?;
+        let gone = caller_gone(self.state.connection().clone(), owner.name.clone());
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "wait",
+            &name.clone(),
+            move |ctx, _reporter| async move {
+                let code = tokio::select! {
+                    code = api::wait::wait(&ctx, &name, condition) => code?,
+                    _ = gone => anyhow::bail!("the caller of the wait left the bus"),
+                };
+                Ok(HashMap::from([("exit_code".to_string(), values::v(code))]))
+            },
+        )
+        .await?)
     }
 
     /// Like `update`: options restart (s), memory (t, bytes), memory_swap (x, bytes of
@@ -1703,10 +1930,7 @@ impl Manager {
         let mut options = Options::new(&options);
         let request = api::machines::UpdateRequest {
             name,
-            restart: options
-                .string("restart")?
-                .map(|r| crate::policy::Restart::parse(&r))
-                .transpose()?,
+            restart: restart_option(&mut options)?,
             memory: options.maybe_u64("memory")?,
             memory_swap: options.i64("memory_swap")?,
             cpus: options.f64("cpus")?,
@@ -1840,9 +2064,7 @@ impl Manager {
             }
         }
         let mut request = request;
-        api::machines::prepare_logs(self.ctx(), &mut request)
-            .await
-            .map_err(|e| Error::Failed(format!("{e:#}")))?;
+        api::machines::prepare_logs(self.ctx(), &mut request).await?;
         let argv = api::machines::journalctl_arguments(&request);
         let pipe = || {
             nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
@@ -1937,12 +2159,13 @@ impl Manager {
         let mut options = Options::new(&options);
         let since = options.string("since")?;
         let until = options.string("until")?;
-        let filters = api::events::Filters::parse(&options.strings("filters")?)?;
+        let filters = api::events::Filters::parse(&options.strings("filters")?)
+            .map_err(api::failure::invalid)?;
         options.finish()?;
         // A window of the past: without its start, it would read nothing and end.
         if until.is_some() && since.is_none() {
-            return Err(Error::Failed(
-                "until reads events back and needs since as well".to_string(),
+            return Err(Error::invalid(
+                "until reads events back and needs since as well",
             ));
         }
         let argv = api::events::journalctl_arguments(since.as_deref(), until.as_deref());
@@ -2196,4 +2419,107 @@ impl Manager {
 
     #[zbus(signal)]
     pub async fn machine_stopped(emitter: &SignalEmitter<'_>, name: &str) -> zbus::Result<()>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::values::v;
+    use zbus::DBusError as _;
+
+    #[test]
+    fn each_kind_of_failure_has_its_error_name_and_its_message() {
+        for kind in FailureKind::ALL {
+            let error = Error::from(kind.error("machine web is not running"));
+            assert_eq!(
+                error.name().as_str(),
+                format!("org.nspawn.Error.{}", kind.name()),
+                "{kind:?}"
+            );
+            assert_eq!(error.description(), Some("machine web is not running"));
+            assert_eq!(error_name(Some(kind)), error.name().as_str());
+        }
+        let plain = Error::from(anyhow::anyhow!("disk full").context("pulling web"));
+        assert_eq!(plain.name().as_str(), "org.nspawn.Error.Failed");
+        assert_eq!(plain.description(), Some("pulling web: disk full"));
+        assert_eq!(error_name(None), "org.nspawn.Error.Failed");
+    }
+
+    #[test]
+    fn a_start_keeps_the_removal_unless_it_is_given() {
+        let empty = HashMap::new();
+        let request = start_request("web".to_string(), &mut Options::new(&empty), true).unwrap();
+        assert_eq!(request.remove, None);
+        for given in [true, false] {
+            let dict = HashMap::from([("remove".to_string(), v(given))]);
+            let request = start_request("web".to_string(), &mut Options::new(&dict), true).unwrap();
+            assert_eq!(request.remove, Some(given));
+        }
+    }
+
+    #[test]
+    fn restart_policies_take_a_count_and_bad_ones_are_bad_arguments() {
+        let dict = HashMap::from([("restart".to_string(), v("on-failure:3"))]);
+        let request = start_request("web".to_string(), &mut Options::new(&dict), true).unwrap();
+        assert_eq!(request.restart, Some(crate::policy::Restart::OnFailure));
+        let dict = HashMap::from([("restart".to_string(), v("sometimes"))]);
+        let bad = start_request("web".to_string(), &mut Options::new(&dict), true).unwrap_err();
+        assert_eq!(api::kind_of(&bad), Some(FailureKind::Invalid));
+        let dict = HashMap::from([("network".to_string(), v("container:"))]);
+        let bad = start_request("web".to_string(), &mut Options::new(&dict), true).unwrap_err();
+        assert_eq!(api::kind_of(&bad), Some(FailureKind::Invalid));
+    }
+
+    #[test]
+    fn a_stop_takes_a_signal_by_name_or_number_and_a_bounded_timeout() {
+        let dict = HashMap::from([
+            ("signal".to_string(), v("SIGHUP")),
+            ("timeout".to_string(), v(1_000_000u64)),
+        ]);
+        let mut options = Options::new(&dict);
+        assert_eq!(signal_option(&mut options).unwrap(), Some(1));
+        assert_eq!(
+            stop_timeout(&mut options).unwrap(),
+            Some(86_400),
+            "a day at most"
+        );
+        options.finish().unwrap();
+        let dict = HashMap::from([
+            ("signal".to_string(), v("15")),
+            ("timeout".to_string(), v(crate::policy::NO_STOP_TIMEOUT)),
+        ]);
+        let mut options = Options::new(&dict);
+        assert_eq!(signal_option(&mut options).unwrap(), Some(15));
+        assert_eq!(
+            stop_timeout(&mut options).unwrap(),
+            Some(crate::policy::NO_STOP_TIMEOUT),
+            "none at all"
+        );
+        let dict = HashMap::from([("signal".to_string(), v("SIGNOPE"))]);
+        let bad = signal_option(&mut Options::new(&dict)).unwrap_err();
+        assert_eq!(api::kind_of(&bad), Some(FailureKind::Invalid));
+        assert_eq!(
+            signal_option(&mut Options::new(&HashMap::new())).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn values_out_of_range_are_bad_arguments() {
+        let dict = HashMap::from([("oom_score_adj".to_string(), v(3_000_000_000i64))]);
+        let bad = tuning_overrides(&mut Options::new(&dict)).unwrap_err();
+        assert_eq!(api::kind_of(&bad), Some(FailureKind::Invalid));
+        let dict = HashMap::from([("health_retries".to_string(), v(5_000_000_000u64))]);
+        let bad = health_overrides(&mut Options::new(&dict)).unwrap_err();
+        assert_eq!(api::kind_of(&bad), Some(FailureKind::Invalid));
+    }
+
+    #[test]
+    fn images_removed_by_name_are_no_such_image() {
+        let missing = images_named(FailureKind::NoSuchMachine.error("no machine or image named x"));
+        assert_eq!(api::kind_of(&missing), Some(FailureKind::NoSuchImage));
+        assert_eq!(missing.to_string(), "no machine or image named x");
+        let in_use = images_named(FailureKind::InUse.error("machine x is running"));
+        assert_eq!(api::kind_of(&in_use), Some(FailureKind::InUse));
+    }
 }

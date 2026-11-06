@@ -54,7 +54,9 @@ pub fn translate(event: &Event, networks: &[(String, String)]) -> Vec<Value> {
                 .map(|(k, v)| (k.clone(), json!(v)))
                 .collect();
             attributes.insert("image".into(), json!(image));
-            attributes.insert("name".into(), json!(event.name));
+            // The name the API knows the container by.
+            let name = event.attributes.get("api_name").unwrap_or(&event.name);
+            attributes.insert("name".into(), json!(name));
             if action == "die" {
                 if let Some(code) = event.attributes.get("exit_code") {
                     attributes.insert("exitCode".into(), json!(code));
@@ -278,6 +280,23 @@ mod tests {
         // Without its creation time no ID can be told.
         assert!(translate(&event("machine", "start", &[]), &[]).is_empty());
         assert!(translate(&event("secret", "create", &[]), &[]).is_empty());
+    }
+
+    #[test]
+    fn a_container_is_named_by_its_api_name() {
+        let start = translate(
+            &event(
+                "machine",
+                "start",
+                &[("created", "100"), ("api_name", "my_web")],
+            ),
+            &[],
+        );
+        assert_eq!(start[0]["Actor"]["Attributes"]["name"], "my_web");
+        // The ID stays the machine's.
+        assert_eq!(start[0]["id"], json!(container_id("web", 100)));
+        let f = Filters::parse(Some(r#"{"container":["my_web"]}"#)).unwrap();
+        assert!(passes(&f, &start[0]));
     }
 
     #[test]

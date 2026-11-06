@@ -398,6 +398,91 @@ pub async fn prune_images(
     })
 }
 
+/// What a prune of machines takes, besides their being stopped.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MachinePrune {
+    /// Only the machines made before (unix seconds), as their record says.
+    pub until: Option<u64>,
+    /// KEY or KEY=VALUE, the image's labels with the machine's on top: every one must
+    /// match.
+    pub labels: Vec<String>,
+    /// KEY or KEY=VALUE: a machine whose labels match every one stays.
+    pub labels_not: Vec<String>,
+    /// Only the machines made from an image by create or run: a pulled or built record
+    /// that ran is the image as well, which system prune leaves.
+    pub made: bool,
+}
+
+impl MachinePrune {
+    /// Whether the prune takes `record` once it is stopped: a machine, not an image only,
+    /// that the filters select.
+    pub fn selects(&self, store: &Store, record: &ImageRecord) -> bool {
+        let labels = record.effective_labels();
+        let has = |label: &String| match label.split_once('=') {
+            Some((key, value)) => labels.get(key).is_some_and(|v| v == value),
+            None => labels.contains_key(label.as_str()),
+        };
+        (!self.made || record.origin == "create")
+            && self.labels.iter().all(has)
+            && (self.labels_not.is_empty() || !self.labels_not.iter().all(has))
+            && self.until.is_none_or(|t| record.created < t)
+            && !image_only(store, record)
+    }
+}
+
+/// The prune of machines: the ones `prune` selects that are stopped (not running, nor
+/// starting, restarting or closing), removed. Returns their names in order with the bytes
+/// of their writable layers, measured before, and why the others selected stayed.
+pub async fn prune_machines(
+    ctx: &Context,
+    prune: &MachinePrune,
+    report: Report<'_>,
+) -> Result<(Pruned, Option<anyhow::Error>)> {
+    let store = &ctx.store;
+    let sd = ctx.sd().await?;
+    let records = store.list_images()?;
+    let running: HashSet<String> = sd
+        .list_machines()
+        .await?
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
+    let chosen: Vec<&ImageRecord> = records
+        .iter()
+        .filter(|r| {
+            !running.contains(&r.name)
+                && !store.is_starting(&r.name)
+                && !store.is_restarting(&r.name)
+        })
+        .filter(|r| prune.selects(store, r))
+        .collect();
+    let units: Vec<String> = chosen
+        .iter()
+        .map(|r| format!("systemd-nspawn@{}.service", r.name))
+        .collect();
+    let states = sd.unit_states(&units).await?;
+    let mut sizes = BTreeMap::new();
+    for (record, unit) in chosen.iter().zip(&units) {
+        let state = states
+            .get(unit)
+            .map(crate::api::machines::unit_word)
+            .unwrap_or("stopped");
+        if state == "stopped" {
+            sizes.insert(record.name.clone(), writable_size(store, record));
+        }
+    }
+    if sizes.is_empty() {
+        return Ok((Pruned::default(), None));
+    }
+    let names: Vec<String> = sizes.keys().cloned().collect();
+    // One that started since stays, and says so.
+    let removal = crate::api::images::remove_machines(ctx, &names, false, report).await?;
+    let mut removed = removal.removed.clone();
+    removed.sort();
+    let reclaimed = removed.iter().filter_map(|name| sizes.get(name)).sum();
+    Ok((Pruned { removed, reclaimed }, removal.failure()))
+}
+
 /// builder prune: the cache rows `prunable` selects removed, the blobs and layers
 /// nothing keeps any more with them; what it freed.
 pub async fn prune_build_cache(
@@ -493,6 +578,55 @@ mod tests {
         assert!(rows[0].size >= 4096, "{rows:?}");
         assert_eq!((kind.total, kind.active), (1, 1));
         assert!(kind.size >= 4096 && kind.reclaimable >= 4096, "{kind:?}");
+    }
+
+    #[test]
+    fn a_prune_of_machines_takes_machines_the_filters_select() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(&dir.path().join("m"), &dir.path().join("s"));
+        let made = record(serde_json::json!({
+            "name": "web", "origin": "create", "created": 100,
+            "labels": { "tier": "front" },
+            "run": { "labels": { "vendor": "acme" } },
+        }));
+        let ran = record(serde_json::json!({ "name": "pulled", "started": 50, "created": 100 }));
+        let image = record(serde_json::json!({ "name": "img" }));
+        let all = MachinePrune::default();
+        assert!(all.selects(&store, &made));
+        assert!(
+            all.selects(&store, &ran),
+            "a pulled record that ran is a machine"
+        );
+        assert!(!all.selects(&store, &image), "an image only is none");
+        let made_only = MachinePrune {
+            made: true,
+            ..Default::default()
+        };
+        assert!(made_only.selects(&store, &made));
+        assert!(!made_only.selects(&store, &ran), "it is its image as well");
+        let by = |labels: &[&str], not: &[&str], until: Option<u64>| MachinePrune {
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            labels_not: not.iter().map(|s| s.to_string()).collect(),
+            until,
+            made: false,
+        };
+        assert!(by(&["tier=front", "vendor"], &[], None).selects(&store, &made));
+        assert!(!by(&["tier=back"], &[], None).selects(&store, &made));
+        assert!(
+            !by(&[], &["vendor"], None).selects(&store, &made),
+            "the image's label counts"
+        );
+        assert!(by(&[], &["tier=back"], None).selects(&store, &made));
+        assert!(
+            by(&[], &["vendor", "tier=back"], None).selects(&store, &made),
+            "kept only when every one matches"
+        );
+        assert!(!by(&[], &["vendor", "tier=front"], None).selects(&store, &made));
+        assert!(by(&[], &[], Some(101)).selects(&store, &made));
+        assert!(
+            !by(&[], &[], Some(100)).selects(&store, &made),
+            "made before, not at"
+        );
     }
 
     #[test]

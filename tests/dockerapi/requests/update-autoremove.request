@@ -1,0 +1,4 @@
+POST /containers/created/update
+Content-Type: application/json
+
+{"RestartPolicy":{"Name":"always"}}

@@ -7,6 +7,8 @@
 //! changes something goes to the service, as the command line's requests do.
 
 pub mod access;
+mod containers;
+mod create;
 pub mod events;
 pub mod filters;
 pub mod images;
@@ -31,6 +33,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{json, Value};
 
 use self::access::{Client, Need, Profile};
+use self::containers::{Act, Sent};
 use self::filters::Filters;
 use self::model::{ImageInfo, Snapshot};
 use self::util::{split_version, version_text, API_VERSION, MIN_API_VERSION};
@@ -52,6 +55,9 @@ const IDLE: Duration = Duration::from_secs(60);
 /// bounded by the connections alone: a dashboard keeps one per running machine.
 static CONNECTIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
 static STREAMS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+/// Waits, each holding a connection to the system bus of its own until it ends, so that
+/// the service drops the wait when its client goes.
+pub static WAITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
 
 /// How long a client has to send a request's headers.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -261,9 +267,14 @@ impl Query {
 }
 
 async fn handle(ctx: Arc<Context>, client: &Client, request: Request<Incoming>) -> Response<Body> {
-    let method = request.method().clone();
-    let path = request.uri().path().to_string();
-    let query = query(request.uri().query().unwrap_or_default());
+    let (parts, body) = request.into_parts();
+    let method = parts.method.clone();
+    let path = parts.uri.path().to_string();
+    let query = query(parts.uri.query().unwrap_or_default());
+    let sent = Sent {
+        headers: parts.headers,
+        body,
+    };
     let (version, route) = split_version(&path);
     let mut response = match version {
         Some(v) if v < MIN_API_VERSION => respond(
@@ -283,7 +294,7 @@ async fn handle(ctx: Arc<Context>, client: &Client, request: Request<Incoming>) 
                 version_text(API_VERSION)
             ),
         ),
-        _ => route_request(&ctx, client, &method, route, &query).await,
+        _ => route_request(&ctx, client, &method, route, &query, sent).await,
     };
     let headers = response.headers_mut();
     headers.insert("Api-Version", version_text(API_VERSION).parse().unwrap());
@@ -323,6 +334,14 @@ enum Route {
     /// A container's json, top, logs, stats...
     Container(String, String),
     Kill(String),
+    /// POST /containers/create.
+    Create,
+    /// POST /containers/prune.
+    Prune,
+    /// A change of one container but its kill and removal.
+    Lifecycle(String, Act),
+    /// DELETE /containers/{id}.
+    Remove(String),
     /// The plugins, of which there are none.
     Plugins,
     Images,
@@ -348,6 +367,9 @@ impl Route {
             Route::Ping | Route::Version | Route::Unserved | Route::NotFound => Need::Nothing,
             Route::Container(_, what) if what == "logs" => Need::Observe,
             Route::Kill(_) => Need::Observe,
+            // WaitMachine asks org.nspawn.inspect.
+            Route::Lifecycle(_, Act::Wait) => Need::Inspect,
+            Route::Create | Route::Prune | Route::Lifecycle(..) | Route::Remove(_) => Need::Manage,
             Route::Info
             | Route::DiskUsage
             | Route::Containers
@@ -375,9 +397,16 @@ fn classify(method: &Method, path: &str) -> Route {
         (true, ["system", "df"]) => Route::DiskUsage,
         (true, ["containers", "json"]) => Route::Containers,
         (true, ["containers", id, what]) => Route::Container(id.to_string(), what.to_string()),
+        (false, ["containers", "create"]) if *method == Method::POST => Route::Create,
+        (false, ["containers", "prune"]) if *method == Method::POST => Route::Prune,
         (false, ["containers", id, "kill"]) if *method == Method::POST => {
             Route::Kill(id.to_string())
         }
+        (false, ["containers", id, what]) if *method == Method::POST => match Act::of(what) {
+            Some(act) => Route::Lifecycle(id.to_string(), act),
+            None => Route::Change,
+        },
+        (false, ["containers", id]) if *method == Method::DELETE => Route::Remove(id.to_string()),
         (true, ["images", "json"]) => Route::Images,
         (true, ["images", name @ .., what @ ("json" | "history")]) if !name.is_empty() => {
             Route::Image(name.join("/"), what.to_string())
@@ -404,10 +433,17 @@ async fn route_request(
     method: &Method,
     path: &str,
     query: &Query,
+    sent: Sent,
 ) -> Response<Body> {
     let route = classify(method, path);
     if let Err((status, text)) = client.allows(ctx, route.need()).await {
         return error(status, text);
+    }
+    // The engine looks at a start's body before anything else of it.
+    if let Route::Lifecycle(_, Act::Start) = &route {
+        if let Some(refusal) = containers::start_body(&sent.headers) {
+            return refusal.respond();
+        }
     }
     // The requests whose handlers docker starts with ParseForm, which answers a query
     // that does not decode.
@@ -419,7 +455,11 @@ async fn route_request(
         | Route::Networks
         | Route::Network(_)
         | Route::Events
-        | Route::DiskUsage => true,
+        | Route::DiskUsage
+        | Route::Create
+        | Route::Prune
+        | Route::Lifecycle(..)
+        | Route::Remove(_) => true,
         Route::Container(_, what) => what != "json",
         _ => false,
     };
@@ -447,6 +487,10 @@ async fn route_request(
         Route::Containers => list_containers(ctx, query).await,
         Route::Container(id, what) => container_read(ctx, &id, &what, query).await,
         Route::Kill(id) => kill(ctx, &id, query).await,
+        Route::Create => containers::create(ctx, query, sent).await,
+        Route::Prune => containers::prune(ctx, query).await,
+        Route::Lifecycle(id, act) => containers::act(ctx, &id, act, query, sent).await,
+        Route::Remove(id) => containers::remove(ctx, &id, query).await,
         Route::Plugins => json_response(StatusCode::OK, &json!([])),
         Route::Images => list_images(ctx, query),
         Route::Image(name, what) => image_read(ctx, &name, &what),
@@ -724,7 +768,9 @@ fn container_matches(
         return false;
     }
     // With the slash and without.
-    if !filters.matches("name", &format!("/{}", m.name())) && !filters.matches("name", m.name()) {
+    if !filters.matches("name", &format!("/{}", m.api_name()))
+        && !filters.matches("name", m.api_name())
+    {
         return false;
     }
     if !filters.matches("id", &m.id) {
@@ -922,9 +968,16 @@ async fn logs(ctx: &Arc<Context>, machine: &model::Machine, query: &Query) -> Re
     if let Err(e) = crate::api::machines::prepare_logs(ctx, &mut request).await {
         return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     }
-    let (response, tx) = streaming("application/vnd.docker.multiplexed-stream");
+    // A container with a terminal has one stream, which goes as it is.
+    let raw = machine.record.tty;
+    let (response, tx) = streaming(if raw {
+        "application/vnd.docker.raw-stream"
+    } else {
+        "application/vnd.docker.multiplexed-stream"
+    });
     let query = streams::LogsQuery {
         stream: if stdout { 1 } else { 2 },
+        raw,
         request,
     };
     spawn_stream(streams::logs(query, tx), response)
@@ -937,6 +990,7 @@ async fn stats(ctx: &Arc<Context>, machine: &model::Machine, query: &Query) -> R
         tokio::spawn(streams::stats(
             ctx.clone(),
             machine.name().to_string(),
+            machine.api_name().to_string(),
             machine.id.clone(),
             pids_limit,
             tx,
@@ -956,7 +1010,13 @@ async fn stats(ctx: &Arc<Context>, machine: &model::Machine, query: &Query) -> R
     let now = streams::Reading::take(ctx, name).await;
     json_response(
         StatusCode::OK,
-        &streams::stats_json(name, &machine.id, pids_limit, now.as_ref(), before.as_ref()),
+        &streams::stats_json(
+            machine.api_name(),
+            &machine.id,
+            pids_limit,
+            now.as_ref(),
+            before.as_ref(),
+        ),
     )
 }
 
@@ -1222,9 +1282,20 @@ fn lookup_status(error: &str) -> StatusCode {
     }
 }
 
-/// moby/sys/signal's ParseSignal, then ValidSignalForPlatform on Linux: a number but 0,
-/// or a name of its map with or without SIG, and only the signals of that map.
+/// moby/sys/signal's ParseSignal, then ValidSignalForPlatform on Linux: only the signals
+/// of its map.
 fn docker_signal(raw: &str) -> Result<i32, String> {
+    let (rtmin, rtmax) = (34, 64);
+    let number = parse_signal(raw)?;
+    if !(1..=31).contains(&number) && !(rtmin..=rtmax).contains(&number) {
+        return Err(format!("the linux daemon does not support signal {number}"));
+    }
+    Ok(number as i32)
+}
+
+/// moby/sys/signal's ParseSignal: a number but 0, or a name of its map with or without
+/// SIG.
+fn parse_signal(raw: &str) -> Result<i64, String> {
     const NAMES: [(&str, i32); 34] = [
         ("ABRT", 6),
         ("ALRM", 14),
@@ -1263,9 +1334,9 @@ fn docker_signal(raw: &str) -> Result<i32, String> {
     ];
     let (rtmin, rtmax) = (34, 64);
     let invalid = || format!("invalid signal: {raw}");
-    let number = match crate::compose::gostr::atoi(raw) {
-        Ok(0) => return Err(invalid()),
-        Ok(n) => n,
+    match crate::compose::gostr::atoi(raw) {
+        Ok(0) => Err(invalid()),
+        Ok(n) => Ok(n),
         Err(_) => {
             let upper = raw.to_uppercase();
             let name = upper.strip_prefix("SIG").unwrap_or(&upper);
@@ -1286,13 +1357,9 @@ fn docker_signal(raw: &str) -> Result<i32, String> {
                 .map(|(_, number)| i64::from(*number))
                 .or_else(|| offset("RTMIN", '+', 15).map(|n| rtmin + n))
                 .or_else(|| offset("RTMAX", '-', 14).map(|n| rtmax - n))
-                .ok_or_else(invalid)?
+                .ok_or_else(invalid)
         }
-    };
-    if !(1..=31).contains(&number) && !(rtmin..=rtmax).contains(&number) {
-        return Err(format!("the linux daemon does not support signal {number}"));
     }
-    Ok(number as i32)
 }
 
 /// killWithSignal: whether `signal` keeps a container from being restarted.
@@ -1396,12 +1463,39 @@ mod tests {
             classify(&Method::POST, "/containers/web/kill"),
             Route::Kill("web".into())
         );
-        assert_eq!(classify(&Method::POST, "/containers/create"), Route::Change);
+        assert_eq!(classify(&Method::POST, "/containers/create"), Route::Create);
+        assert_eq!(classify(&Method::POST, "/containers/prune"), Route::Prune);
         assert_eq!(
             classify(&Method::POST, "/containers/web/exec"),
             Route::Change
         );
-        assert_eq!(classify(&Method::DELETE, "/containers/web"), Route::Change);
+        assert_eq!(
+            classify(&Method::DELETE, "/containers/web"),
+            Route::Remove("web".into())
+        );
+        for (word, act) in [
+            ("start", Act::Start),
+            ("stop", Act::Stop),
+            ("restart", Act::Restart),
+            ("pause", Act::Pause),
+            ("unpause", Act::Unpause),
+            ("wait", Act::Wait),
+            ("update", Act::Update),
+        ] {
+            assert_eq!(
+                classify(&Method::POST, &format!("/containers/web/{word}")),
+                Route::Lifecycle("web".into(), act)
+            );
+        }
+        // A read of these is no change.
+        assert_eq!(
+            classify(&get, "/containers/web/start"),
+            Route::Container("web".into(), "start".into())
+        );
+        assert_eq!(
+            classify(&Method::PUT, "/containers/web/start"),
+            Route::Change
+        );
         assert_eq!(classify(&get, "/images/json"), Route::Images);
         assert_eq!(
             classify(&get, "/images/ghcr.io/x/y:1/json"),
@@ -1435,6 +1529,19 @@ mod tests {
         assert_eq!(need(Method::POST, "/containers/web/kill"), Need::Observe);
         assert_eq!(need(Method::POST, "/containers/create"), Need::Manage);
         assert_eq!(need(Method::DELETE, "/containers/web"), Need::Manage);
+        for path in [
+            "/containers/web/start",
+            "/containers/web/stop",
+            "/containers/web/restart",
+            "/containers/web/pause",
+            "/containers/web/unpause",
+            "/containers/web/update",
+        ] {
+            assert_eq!(need(Method::POST, path), Need::Manage, "{path}");
+        }
+        assert_eq!(need(Method::POST, "/containers/prune"), Need::Manage);
+        // WaitMachine asks org.nspawn.inspect, as reads do.
+        assert_eq!(need(Method::POST, "/containers/web/wait"), Need::Inspect);
     }
 
     #[test]

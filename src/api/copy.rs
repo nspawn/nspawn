@@ -1054,9 +1054,9 @@ pub async fn open_root(ctx: &Context, name: &str, report: Report<'_>) -> Result<
         };
         return Ok(Root { fd, base });
     }
-    let record = store
-        .load_image(name)?
-        .ok_or_else(|| anyhow!("no machine or image named {name}"))?;
+    let record = store.load_image(name)?.ok_or_else(|| {
+        crate::api::FailureKind::NoSuchMachine.error(format!("no machine or image named {name}"))
+    })?;
     let tree = store.machines_dir.join(name);
     match record.backend {
         BackendChoice::Mstack => bail!(

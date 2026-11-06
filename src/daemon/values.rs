@@ -73,7 +73,7 @@ pub fn image(i: &ImageSummary) -> Dict {
 
 /// Everything nspawn keeps about an image.
 pub fn record(r: &ImageRecord) -> Dict {
-    HashMap::from([
+    let mut dict = HashMap::from([
         ("name".to_string(), v(r.name.as_str())),
         ("reference".to_string(), v(r.reference.as_str())),
         ("digest".to_string(), v(r.manifest_digest.as_str())),
@@ -270,7 +270,15 @@ pub fn record(r: &ImageRecord) -> Dict {
                 .map(healthcheck)
                 .unwrap_or_default()),
         ),
-    ])
+        ("tty".to_string(), v(r.tty)),
+        ("interactive".to_string(), v(r.interactive)),
+        ("stdin_once".to_string(), v(r.stdin_once)),
+        ("remove".to_string(), v(r.remove_on_exit)),
+    ]);
+    if let Some(api_name) = &r.api_name {
+        dict.insert("api_name".to_string(), v(api_name.as_str()));
+    }
+    dict
 }
 
 /// A healthcheck: test (as), interval, timeout, start_period, start_interval (t,
@@ -457,6 +465,11 @@ pub fn hit(h: &Hit) -> Dict {
     ])
 }
 
+/// An option of the wrong type, or one nobody expects.
+fn invalid(message: String) -> anyhow::Error {
+    crate::api::FailureKind::Invalid.error(message)
+}
+
 /// Options a caller passed, read by name and type; a key nobody expects is an error, so
 /// that a typo does not pass as "default".
 pub struct Options<'a> {
@@ -481,7 +494,7 @@ impl<'a> Options<'a> {
         self.take(key)
             .map(|value| {
                 String::try_from(value.clone())
-                    .map_err(|_| anyhow::anyhow!("option {key} must be a string (s)"))
+                    .map_err(|_| invalid(format!("option {key} must be a string (s)")))
             })
             .transpose()
     }
@@ -491,10 +504,26 @@ impl<'a> Options<'a> {
             .take(key)
             .map(|value| {
                 Vec::<String>::try_from(value.clone())
-                    .map_err(|_| anyhow::anyhow!("option {key} must be an array of strings (as)"))
+                    .map_err(|_| invalid(format!("option {key} must be an array of strings (as)")))
             })
             .transpose()?
             .unwrap_or_default())
+    }
+
+    /// A program and its arguments when given: one string (s), a program alone and an
+    /// empty one none, or the whole list (as), an empty one none.
+    pub fn argv(&mut self, key: &'static str) -> anyhow::Result<Option<Vec<String>>> {
+        self.take(key)
+            .map(|value| match &**value {
+                Value::Str(s) if s.is_empty() => Ok(Vec::new()),
+                Value::Str(s) => Ok(vec![s.to_string()]),
+                _ => Vec::<String>::try_from(value.clone()).map_err(|_| {
+                    invalid(format!(
+                        "option {key} must be a string (s) or an array of strings (as)"
+                    ))
+                }),
+            })
+            .transpose()
     }
 
     /// Bytes (ay) when given.
@@ -502,7 +531,7 @@ impl<'a> Options<'a> {
         self.take(key)
             .map(|value| {
                 Vec::<u8>::try_from(value.clone())
-                    .map_err(|_| anyhow::anyhow!("option {key} must be bytes (ay)"))
+                    .map_err(|_| invalid(format!("option {key} must be bytes (ay)")))
             })
             .transpose()
     }
@@ -516,7 +545,7 @@ impl<'a> Options<'a> {
             .take(key)
             .map(|value| {
                 HashMap::<String, Vec<u8>>::try_from(value.clone())
-                    .map_err(|_| anyhow::anyhow!("option {key} must be bytes by name (a{{say}})"))
+                    .map_err(|_| invalid(format!("option {key} must be bytes by name (a{{say}})")))
             })
             .transpose()?
             .unwrap_or_default()
@@ -529,7 +558,7 @@ impl<'a> Options<'a> {
         self.take(key)
             .map(|value| {
                 bool::try_from(value.clone())
-                    .map_err(|_| anyhow::anyhow!("option {key} must be a boolean (b)"))
+                    .map_err(|_| invalid(format!("option {key} must be a boolean (b)")))
             })
             .transpose()
     }
@@ -545,8 +574,8 @@ impl<'a> Options<'a> {
                 Value::U16(n) => Ok(i64::from(*n)),
                 Value::U32(n) => Ok(i64::from(*n)),
                 Value::U64(n) => i64::try_from(*n)
-                    .map_err(|_| anyhow::anyhow!("option {key} is too large for an integer")),
-                _ => Err(anyhow::anyhow!("option {key} must be an integer (i)")),
+                    .map_err(|_| invalid(format!("option {key} is too large for an integer"))),
+                _ => Err(invalid(format!("option {key} must be an integer (i)"))),
             })
             .transpose()
     }
@@ -556,7 +585,7 @@ impl<'a> Options<'a> {
             .take(key)
             .map(|value| {
                 bool::try_from(value.clone())
-                    .map_err(|_| anyhow::anyhow!("option {key} must be a boolean (b)"))
+                    .map_err(|_| invalid(format!("option {key} must be a boolean (b)")))
             })
             .transpose()?
             .unwrap_or(default))
@@ -575,9 +604,9 @@ impl<'a> Options<'a> {
                 Value::U16(n) => Ok(*n as u64),
                 Value::U32(n) => Ok(*n as u64),
                 Value::U64(n) => Ok(*n),
-                _ => Err(anyhow::anyhow!(
+                _ => Err(invalid(format!(
                     "option {key} must be an unsigned integer (t, u, q or y)"
-                )),
+                ))),
             })
             .transpose()
     }
@@ -594,7 +623,7 @@ impl<'a> Options<'a> {
                 Value::I16(n) => Ok(*n as f64),
                 Value::I32(n) => Ok(*n as f64),
                 Value::I64(n) => Ok(*n as f64),
-                _ => Err(anyhow::anyhow!("option {key} must be a number (d)")),
+                _ => Err(invalid(format!("option {key} must be a number (d)"))),
             })
             .transpose()
     }
@@ -611,11 +640,11 @@ impl<'a> Options<'a> {
             return Ok(());
         }
         unknown.sort();
-        anyhow::bail!(
+        Err(invalid(format!(
             "unknown option(s) {}; known: {}",
             unknown.join(", "),
             self.known.join(", ")
-        )
+        )))
     }
 }
 
@@ -714,5 +743,83 @@ mod tests {
         typo.string("name").unwrap();
         let err = typo.finish().unwrap_err().to_string();
         assert!(err.contains("force") && err.contains("publish") && err.contains("timeout"));
+    }
+
+    #[test]
+    fn a_wrong_option_is_a_bad_argument() {
+        let invalid = Some(crate::api::FailureKind::Invalid);
+        let dict: HashMap<String, OwnedValue> = HashMap::from([
+            ("name".to_string(), v("web")),
+            ("force".to_string(), v("yes")),
+        ]);
+        let mut options = Options::new(&dict);
+        assert_eq!(
+            crate::api::kind_of(&options.bool("force", false).unwrap_err()),
+            invalid
+        );
+        assert_eq!(
+            crate::api::kind_of(&options.maybe_u64("name").unwrap_err()),
+            invalid
+        );
+        let unknown = Options::new(&dict).finish().unwrap_err();
+        assert_eq!(crate::api::kind_of(&unknown), invalid);
+    }
+
+    #[test]
+    fn a_program_is_one_string_or_the_whole_list() {
+        let dict: HashMap<String, OwnedValue> = HashMap::from([
+            ("one".to_string(), v("/bin/sh")),
+            ("none".to_string(), v("")),
+            (
+                "list".to_string(),
+                strings(&["/bin/sh".to_string(), "-c".to_string()]),
+            ),
+            ("empty".to_string(), strings(&[])),
+            ("number".to_string(), v(3u32)),
+        ]);
+        let mut options = Options::new(&dict);
+        assert_eq!(
+            options.argv("one").unwrap(),
+            Some(vec!["/bin/sh".to_string()])
+        );
+        assert_eq!(options.argv("none").unwrap(), Some(Vec::new()));
+        assert_eq!(
+            options.argv("list").unwrap(),
+            Some(vec!["/bin/sh".to_string(), "-c".to_string()])
+        );
+        assert_eq!(options.argv("empty").unwrap(), Some(Vec::new()));
+        assert_eq!(options.argv("absent").unwrap(), None);
+        let wrong = options.argv("number").unwrap_err();
+        assert_eq!(
+            crate::api::kind_of(&wrong),
+            Some(crate::api::FailureKind::Invalid)
+        );
+    }
+
+    #[test]
+    fn a_record_shows_what_the_docker_api_gave_it() {
+        let mut r: ImageRecord = serde_json::from_value(serde_json::json!({
+            "name": "e2e-dk-b-1a2b3c4d", "reference": "r", "manifest_digest": "d",
+            "layers": [], "backend": "overlay", "created": 1,
+        }))
+        .unwrap();
+        let shown = record(&r);
+        assert!(!shown.contains_key("api_name"), "none given");
+        for key in ["tty", "interactive", "stdin_once", "remove"] {
+            assert!(!bool::try_from(shown[key].clone()).unwrap(), "{key}");
+        }
+        r.api_name = Some("e2e_dk_b".to_string());
+        r.tty = true;
+        r.stdin_once = true;
+        r.remove_on_exit = true;
+        let shown = record(&r);
+        assert_eq!(
+            String::try_from(shown["api_name"].clone()).unwrap(),
+            "e2e_dk_b"
+        );
+        assert!(bool::try_from(shown["tty"].clone()).unwrap());
+        assert!(!bool::try_from(shown["interactive"].clone()).unwrap());
+        assert!(bool::try_from(shown["stdin_once"].clone()).unwrap());
+        assert!(bool::try_from(shown["remove"].clone()).unwrap());
     }
 }

@@ -1031,24 +1031,19 @@ async fn stop_one(
     Ok(outcome != "was-not-running")
 }
 
-/// restart: a stop and a start with the remembered options, each name in turn.
+/// restart: a stop and a start with the remembered options, each name in turn, by the
+/// service in one call, so that a machine removed at its end stays across it.
 pub async fn restart(args: RestartArgs, client: &Client) -> Result<()> {
     let mut failed = 0;
     for name in &args.names {
         let outcome: Result<()> = async {
-            stop_one(
-                client,
-                name,
-                false,
-                true,
-                args.timeout.map(crate::policy::stop_seconds),
-            )
-            .await?;
             let mut options = Options::new();
-            options.insert("wait", Value::from(true));
+            if let Some(timeout) = args.timeout.map(crate::policy::stop_seconds) {
+                options.insert("timeout", Value::from(timeout));
+            }
             let (_, notes) = client
                 .manager
-                .start_machine(name, options)
+                .restart_machine(name, options)
                 .await
                 .map_err(client::error)?;
             for note in &notes {
@@ -1213,10 +1208,13 @@ pub async fn wait(args: WaitArgs, client: &Client) -> Result<()> {
                         }
                         Ok(_) => {}
                         // Gone (a machine of run --rm): its last end seen is its end.
-                        Err(e) => match ends.iter().rev().find(|(n, _, _)| n == name) {
-                            Some((_, _, code)) => break *code,
-                            None => bail!("{:#}", client::error(e)),
-                        },
+                        Err(e) => {
+                            let e = client::error(e);
+                            match ends.iter().rev().find(|(n, _, _)| n == name) {
+                                Some((_, _, code)) if gone(&e) => break *code,
+                                _ => bail!("{e:#}"),
+                            }
+                        }
                     }
                 }
             }
@@ -1232,6 +1230,11 @@ pub async fn wait(args: WaitArgs, client: &Client) -> Result<()> {
         bail!("{}", failed.join("\n"));
     }
     Ok(())
+}
+
+/// Whether a lookup failed because the machine is gone, not for another reason.
+fn gone(e: &anyhow::Error) -> bool {
+    client::error_name(e) == Some("NoSuchMachine")
 }
 
 /// From which second an end is the one `wait` waits for. A machine that has not begun
@@ -1862,6 +1865,26 @@ mod tests {
         assert!(still_this_run(0, "restarting", 0));
         assert!(still_this_run(0, "starting", 0));
         assert!(!still_this_run(0, "running", 131));
+    }
+
+    #[test]
+    fn wait_takes_a_machine_for_gone_only_when_the_service_says_so() {
+        let answer = |name: &str, message: &str| -> anyhow::Error {
+            client::ServiceError {
+                name: name.to_string(),
+                message: message.to_string(),
+            }
+            .into()
+        };
+        assert!(gone(&answer(
+            "org.nspawn.Error.NoSuchMachine",
+            "no machine or image named web"
+        )));
+        assert!(!gone(&answer(
+            "org.nspawn.Error.NotAuthorized",
+            "org.nspawn.inspect needs an administrator"
+        )));
+        assert!(!gone(&anyhow::anyhow!("the bus connection closed")));
     }
 
     #[test]

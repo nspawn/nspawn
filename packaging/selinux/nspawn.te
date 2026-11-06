@@ -40,6 +40,7 @@ gen_require(`
 	type systemd_machined_t, systemd_machined_var_lib_t, systemd_networkd_unit_file_t, tmpfs_t;
 	type root_t, ifconfig_t;
 	type init_var_run_t, systemd_conf_t, unlabeled_t;
+	attribute non_security_file_type;
 ')
 
 allow nspawn_t self:capability { chown dac_override dac_read_search fowner fsetid kill mknod net_admin net_bind_service setfcap setgid setpcap setuid sys_admin sys_chroot sys_ptrace sys_resource };
@@ -145,6 +146,9 @@ files_getattr_all_dirs(nspawn_t)
 userdom_list_user_home_dirs(nspawn_t)
 userdom_read_user_home_content_files(nspawn_t)
 userdom_search_user_tmp_dirs(nspawn_t)
+# A missing directory a bind of the Docker API names is made when the container
+# starts, wherever it is: made, never removed or renamed.
+allow nspawn_t non_security_file_type:dir { add_name create getattr search write };
 
 # The bus: its own name, and the pipes and pseudo terminals it hands to its
 # clients, which the bus relays.

@@ -34,18 +34,6 @@ impl Restart {
         }
     }
 
-    pub fn parse(text: &str) -> Result<Self> {
-        Ok(match text {
-            "no" => Restart::No,
-            "on-failure" => Restart::OnFailure,
-            "always" => Restart::Always,
-            "unless-stopped" => Restart::UnlessStopped,
-            other => {
-                bail!("unknown restart policy {other}: no, on-failure, always or unless-stopped")
-            }
-        })
-    }
-
     /// The unit's Restart= for this policy, none for `no`.
     pub fn unit_setting(self) -> Option<&'static str> {
         match self {
@@ -359,7 +347,7 @@ mod tests {
             ),
         ] {
             assert_eq!(policy.name(), name);
-            assert_eq!(Restart::parse(name).unwrap(), policy);
+            assert_eq!(parse_restart(name).unwrap(), policy);
             assert_eq!(policy.unit_setting(), setting);
             assert_eq!(policy.enabled_at_boot(), boot);
             assert_eq!(
@@ -369,7 +357,7 @@ mod tests {
             let value = <Restart as clap::ValueEnum>::from_str(name, false).unwrap();
             assert_eq!(value, policy);
         }
-        assert!(Restart::parse("sometimes").is_err());
+        assert!(parse_restart("sometimes").is_err());
         assert_eq!(Restart::default(), Restart::No);
     }
 

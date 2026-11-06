@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{bail, Context as _, Result};
 
 use crate::api::images::Removal;
-use crate::api::{line, machines, require_root, Context, Event, Report};
+use crate::api::{line, machines, require_root, Context, Event, FailureKind, Report};
 use crate::backend::BackendChoice;
 use crate::bridge::{
     self, Attachment, NetSpec, PortMap, Subnet, DEFAULT_NETWORK, RESERVED_NETWORKS,
@@ -68,7 +68,9 @@ pub fn find(store: &Store, config: &Config, name: &str) -> Result<NetSpec> {
         return Ok(config.default_network());
     }
     store.load_network(name)?.ok_or_else(|| {
-        anyhow::anyhow!("network {name} does not exist; nspawn network create {name} makes it")
+        FailureKind::NoSuchNetwork.error(format!(
+            "network {name} does not exist; nspawn network create {name} makes it"
+        ))
     })
 }
 
@@ -231,7 +233,9 @@ pub fn validate_alias(alias: &str) -> Result<()> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
     {
-        bail!("alias {alias:?}: letters, digits, '.', '-' and '_', not starting with '-' or '.'");
+        return Err(FailureKind::Invalid.error(format!(
+            "alias {alias:?}: letters, digits, '.', '-' and '_', not starting with '-' or '.'"
+        )));
     }
     Ok(())
 }
@@ -239,7 +243,9 @@ pub fn validate_alias(alias: &str) -> Result<()> {
 /// Letters, digits, '_' and '-', and none of the names `--network` reserves.
 pub fn validate_network_name(name: &str) -> Result<()> {
     if RESERVED_NETWORKS.contains(&name) {
-        bail!("{name} is not a name a network can take: --network gives it a meaning of its own");
+        return Err(FailureKind::Invalid.error(format!(
+            "{name} is not a name a network can take: --network gives it a meaning of its own"
+        )));
     }
     if name.is_empty()
         || name.len() > 64
@@ -248,7 +254,9 @@ pub fn validate_network_name(name: &str) -> Result<()> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        bail!("network name {name:?}: 1 to 64 letters, digits, '_' and '-', not starting with '-'");
+        return Err(FailureKind::Invalid.error(format!(
+            "network name {name:?}: 1 to 64 letters, digits, '_' and '-', not starting with '-'"
+        )));
     }
     Ok(())
 }
@@ -301,14 +309,16 @@ pub async fn connect(
     let (store, config, sd) = (&ctx.store, &ctx.config, ctx.sd().await?);
     let _lock = store.lock().await?;
     // Looked up under the lock: a network rm may have gone first.
-    let net =
-        find(store, config, network).map_err(|_| anyhow::anyhow!("network {network} not found"))?;
+    let net = find(store, config, network)
+        .map_err(|_| FailureKind::NoSuchNetwork.error(format!("network {network} not found")))?;
     let mut record = store
         .load_image(machine)?
-        .ok_or_else(|| anyhow::anyhow!("No such container: {machine}"))?;
+        .ok_or_else(|| FailureKind::NoSuchMachine.error(format!("No such container: {machine}")))?;
     joins_bridges(&record, "connected to")?;
     if bridge::networks_of(&record).contains(&network) {
-        bail!("endpoint with name {machine} already exists in network {network}");
+        return Err(FailureKind::Exists.error(format!(
+            "endpoint with name {machine} already exists in network {network}"
+        )));
     }
     for alias in aliases {
         validate_alias(alias)?;
@@ -399,13 +409,13 @@ pub async fn disconnect(
     require_root("network disconnect")?;
     let (store, config, sd) = (&ctx.store, &ctx.config, ctx.sd().await?);
     let _lock = store.lock().await?;
-    let net =
-        find(store, config, network).map_err(|_| anyhow::anyhow!("network {network} not found"))?;
+    let net = find(store, config, network)
+        .map_err(|_| FailureKind::NoSuchNetwork.error(format!("network {network} not found")))?;
     let Some(mut record) = store.load_image(machine)? else {
         if force {
             return Ok(());
         }
-        bail!("No such container: {machine}");
+        return Err(FailureKind::NoSuchMachine.error(format!("No such container: {machine}")));
     };
     joins_bridges(&record, "disconnected from")?;
     let networks: Vec<String> = bridge::networks_of(&record)
@@ -581,7 +591,7 @@ pub async fn create(
     let _lock = store.lock().await?;
     let mut all = all(store, &ctx.config)?;
     if all.iter().any(|n| n.name == name) {
-        bail!("network {name} exists already");
+        return Err(FailureKind::Exists.error(format!("network {name} exists already")));
     }
     let interface = bridge::network_interface(name);
     if let Some(other) = all.iter().find(|n| n.interface == interface) {
@@ -650,7 +660,7 @@ pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Resu
                 crate::api::events::emit("network", "remove", name, &borrowed(&attributes));
                 removal.removed.push(name.clone());
             }
-            Err(e) => removal.failed.push((name.clone(), format!("{e:#}"))),
+            Err(e) => removal.refuse(name, e),
         }
     }
     Ok(removal)
@@ -669,10 +679,10 @@ async fn remove_one(
     let spec = find(store, &ctx.config, name)?;
     let users = users(records, name);
     if !users.is_empty() {
-        bail!(
+        return Err(FailureKind::InUse.error(format!(
             "network {name} is in use by {}; remove them or start them on another network first",
             users.join(", ")
-        );
+        )));
     }
     let remaining: Vec<NetSpec> = all(store, &ctx.config)?
         .into_iter()
@@ -905,9 +915,14 @@ pub async fn remove_after_exit(ctx: &Context, name: &str, invocation: &str) -> R
     loop {
         // Down: its stop hooks done too, which still read the record and its files. And
         // its start call returned: a program that ends sooner leaves the machine marked
-        // as starting, which a removal refuses.
+        // as starting, which a removal refuses. A restart's stop is no end: its start
+        // follows, which gives the unit another invocation.
         let state = sd.unit_status(&unit).await?;
-        if !state.busy() && !state.shutting_down() && !ctx.store.is_starting(name) {
+        if !state.busy()
+            && !state.shutting_down()
+            && !ctx.store.is_starting(name)
+            && !ctx.store.is_restarting(name)
+        {
             break;
         }
         if !invocation.is_empty() && sd.invocation_id(&unit).await? != invocation {
@@ -938,10 +953,14 @@ pub async fn remove_after_exit(ctx: &Context, name: &str, invocation: &str) -> R
 /// shutdown).
 pub async fn remove_ended(ctx: &Context) -> Result<()> {
     let sd = ctx.sd().await?;
+    let kept_since = ctx.store.starts_kept_since();
     let ended: Vec<String> = {
         let mut ended = Vec::new();
         for r in ctx.store.list_images()? {
-            if !r.remove_on_exit || ctx.store.is_starting(&r.name) {
+            if !ran_to_be_removed(&r, kept_since)
+                || ctx.store.is_starting(&r.name)
+                || ctx.store.is_restarting(&r.name)
+            {
                 continue;
             }
             let unit = format!("systemd-nspawn@{}.service", r.name);
@@ -964,6 +983,14 @@ pub async fn remove_ended(ctx: &Context) -> Result<()> {
     Ok(())
 }
 
+/// Whether a machine removed at its end has had a run that ended: one made with remove
+/// waits for its first. A record of a release that kept no first start says nothing, and
+/// is taken for one that ran.
+fn ran_to_be_removed(record: &ImageRecord, kept_since: Option<u64>) -> bool {
+    record.remove_on_exit
+        && (record.started.is_some() || kept_since.is_none_or(|kept| record.created < kept))
+}
+
 /// What every event of a network says of it.
 fn network_attributes(spec: &NetSpec) -> [(&'static str, String); 4] {
     [
@@ -981,6 +1008,34 @@ fn borrowed<'a>(attributes: &'a [(&'static str, String)]) -> Vec<(&'static str, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_machine_made_to_be_removed_waits_for_its_first_run() {
+        let record = |json: serde_json::Value| -> ImageRecord {
+            let mut base = serde_json::json!({
+                "name": "web", "reference": "r", "manifest_digest": "d", "layers": [],
+                "backend": "overlay", "created": 100, "origin": "create",
+                "remove_on_exit": true,
+            });
+            for (k, v) in json.as_object().unwrap() {
+                base[k] = v.clone();
+            }
+            serde_json::from_value(base).unwrap()
+        };
+        let made = record(serde_json::json!({}));
+        assert!(!ran_to_be_removed(&made, Some(50)), "never started");
+        assert!(ran_to_be_removed(
+            &record(serde_json::json!({ "started": 120 })),
+            Some(50)
+        ));
+        assert!(
+            ran_to_be_removed(&made, Some(150)),
+            "made before starts were kept: it may have run"
+        );
+        assert!(ran_to_be_removed(&made, None));
+        let kept = record(serde_json::json!({ "remove_on_exit": false, "started": 120 }));
+        assert!(!ran_to_be_removed(&kept, Some(50)));
+    }
 
     #[test]
     fn network_choices_and_names() {
@@ -1022,8 +1077,11 @@ mod tests {
         for bad in ["container:", "container:bad name", "container:a/b"] {
             assert!(choices(&[bad.into()]).is_err(), "{bad:?}");
         }
-        assert!(validate_network_name("bridge").is_err());
+        let bad = validate_network_name("bridge").unwrap_err();
+        assert_eq!(crate::api::kind_of(&bad), Some(FailureKind::Invalid));
         assert!(validate_network_name("front_end-2").is_ok());
+        let bad = validate_alias("-www").unwrap_err();
+        assert_eq!(crate::api::kind_of(&bad), Some(FailureKind::Invalid));
         let aliases = parse_aliases(
             &["www".into(), "back=api".into(), "www".into()],
             &["front", "back"],

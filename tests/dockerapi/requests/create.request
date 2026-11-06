@@ -1,0 +1,4 @@
+POST /containers/create?name=life
+Content-Type: application/json
+
+{"Image":"busybox:1.37","Cmd":["sleep","3600"],"Labels":{"e2e":"lifecycle"}}

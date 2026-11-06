@@ -880,23 +880,32 @@ pub async fn kill(e: &mut Engine<'_>, a: &KillArgs) -> Result<()> {
     Ok(())
 }
 
+/// The machines pause freezes (those that run and are not frozen) or unpause thaws (the
+/// frozen ones), so that a project paused in part is paused or thawed whole.
+fn pauses(m: &Machine, on: bool) -> bool {
+    if on {
+        m.running() && m.state != "paused"
+    } else {
+        m.state == "paused"
+    }
+}
+
 pub async fn pause(e: &mut Engine<'_>, services: &[String], on: bool) -> Result<()> {
     let machines = selected(e, e.machines().await?, services)?;
-    for m in machines.iter().filter(|m| m.running()) {
+    for m in machines.iter().filter(|m| pauses(m, on)) {
         let manager = &e.client.manager;
-        if on {
-            manager
-                .pause_machine(&m.name)
-                .await
-                .map_err(client::error)?;
-            e.progress.container(&m.name, "Paused", Status::Done);
+        let (done, outcome) = if on {
+            ("Paused", manager.pause_machine(&m.name).await)
         } else {
-            manager
-                .unpause_machine(&m.name)
-                .await
-                .map_err(client::error)?;
-            e.progress.container(&m.name, "Unpaused", Status::Done);
+            ("Unpaused", manager.unpause_machine(&m.name).await)
+        };
+        // One paused or thawed since it was listed is as asked.
+        if let Err(err) = outcome.map_err(client::error) {
+            if !matches!(client::error_name(&err), Some("Paused" | "NotPaused")) {
+                return Err(err);
+            }
         }
+        e.progress.container(&m.name, done, Status::Done);
     }
     Ok(())
 }
@@ -1050,6 +1059,29 @@ mod tests {
         assert!(!kills(&m("starting"), false));
         assert!(kills(&m("starting"), true));
         assert!(!kills(&m("stopped"), true));
+    }
+
+    #[test]
+    fn pause_and_unpause_take_only_what_they_change() {
+        let m = |state: &str| Machine {
+            name: "m".to_string(),
+            service: "s".to_string(),
+            number: 1,
+            oneoff: false,
+            state: state.to_string(),
+            health: String::new(),
+            exit_code: None,
+            labels: BTreeMap::new(),
+            created: 0,
+            started: 0,
+            dict: Default::default(),
+        };
+        assert!(pauses(&m("running"), true));
+        assert!(!pauses(&m("paused"), true), "paused already");
+        assert!(!pauses(&m("stopped"), true));
+        assert!(pauses(&m("paused"), false));
+        assert!(!pauses(&m("running"), false), "not paused");
+        assert!(!pauses(&m("stopped"), false));
     }
 
     #[test]

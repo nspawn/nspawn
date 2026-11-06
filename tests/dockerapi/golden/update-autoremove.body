@@ -1,0 +1,1 @@
+{"message":"Cannot update container 1ae0f847e93332d9f2c616b045a2a0b84e937c2b64ff57b35efcfb70b95aa2a4: Restart policy cannot be updated because AutoRemove is enabled for the container"}

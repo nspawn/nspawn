@@ -2184,11 +2184,11 @@ pub fn write_hosts_files(store: &Store, all: &[NetSpec]) -> Result<()> {
         list.sort_by(|a, b| a.name.cmp(b.name));
         let mut taken: std::collections::BTreeSet<&str> = list.iter().map(|m| m.name).collect();
         for member in list.iter_mut() {
-            let aliases = records
-                .iter()
-                .find(|r| r.name == member.name)
-                .and_then(|r| r.aliases.get(*network));
-            for alias in aliases.into_iter().flatten() {
+            let record = records.iter().find(|r| r.name == member.name);
+            // The name the Docker Engine API knows it by, before its aliases.
+            let api_name = record.and_then(|r| r.api_name.as_ref());
+            let aliases = record.and_then(|r| r.aliases.get(*network));
+            for alias in api_name.into_iter().chain(aliases.into_iter().flatten()) {
                 if taken.insert(alias.as_str()) {
                     member.aliases.push(alias.clone());
                 }
@@ -2934,6 +2934,40 @@ mod tests {
         write_hosts_files(&store, &[default]).unwrap();
         let hosts = fs::read_to_string(store.machine_files_dir("web").join("hosts")).unwrap();
         assert!(hosts.contains("10.99.0.2"), "{hosts}");
+    }
+
+    #[test]
+    fn a_machine_is_found_by_the_name_the_docker_api_gave_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        store.init().unwrap();
+        for (name, api_name, address) in [
+            ("reaper-1-1a2b3c4d", Some("reaper_1"), "10.99.0.2"),
+            ("web", None, "10.99.0.3"),
+        ] {
+            let record: ImageRecord = serde_json::from_value(serde_json::json!({
+                "name": name,
+                "api_name": api_name,
+                "reference": "r",
+                "manifest_digest": "d",
+                "layers": [],
+                "backend": "overlay",
+                "created": 0,
+                "network": "bridge",
+                "address": address,
+            }))
+            .unwrap();
+            store.record_image(&record).unwrap();
+            fs::create_dir_all(store.machine_files_dir(name)).unwrap();
+        }
+        let default = net(DEFAULT_NETWORK, "nspawn0", "10.99.0.0/24", false);
+        write_hosts_files(&store, &[default]).unwrap();
+        let hosts = fs::read_to_string(store.machine_files_dir("web").join("hosts")).unwrap();
+        let line = hosts
+            .lines()
+            .find(|l| l.starts_with("10.99.0.2"))
+            .unwrap_or_else(|| panic!("{hosts}"));
+        assert!(line.split_whitespace().any(|n| n == "reaper_1"), "{line}");
     }
 
     #[test]

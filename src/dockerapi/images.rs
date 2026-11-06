@@ -237,6 +237,35 @@ pub fn find<'a>(images: &'a [Image], key: &str) -> Result<&'a Image, String> {
         .ok_or_else(missing)
 }
 
+/// The record a container of `image` is made from, `key` being how it was asked for:
+/// the one the reference names, ranked as `list` ranks them (an image before a
+/// container, the last made first), so that the container keeps that reference; the
+/// record of that name for a record's name; the image's first record otherwise.
+pub fn source(
+    image: &Image,
+    key: &str,
+    registry: &str,
+    load: impl Fn(&str) -> Option<ImageRecord>,
+) -> Option<String> {
+    let mut held = image.records.iter().chain(&image.containers);
+    if let Ok(wanted) = ImageRef::normalized(key) {
+        let wanted = wanted.to_string();
+        let named = |name: &&String| {
+            load(name).is_some_and(|record| {
+                full_tag(&record.reference, registry).as_deref() == Some(&wanted)
+                    || full_digest(&record, registry).as_deref() == Some(&wanted)
+            })
+        };
+        if let Some(name) = held.clone().find(named) {
+            return Some(name.clone());
+        }
+    }
+    if let Some(name) = held.clone().find(|name| *name == key) {
+        return Some(name.clone());
+    }
+    held.next().cloned()
+}
+
 /// The keys GET /images/json takes.
 const FILTERS: &[&str] = &[
     "before",
@@ -558,6 +587,66 @@ mod tests {
             size: 4_421_246,
             pulled: 0,
         }
+    }
+
+    #[test]
+    fn a_container_is_made_from_the_record_its_reference_names() {
+        let record = |name: &str, reference: &str, digest: &str| -> ImageRecord {
+            serde_json::from_value(json!({
+                "name": name,
+                "reference": reference,
+                "manifest_digest": digest,
+                "layers": [],
+                "backend": "overlay",
+                "created": 0,
+            }))
+            .unwrap()
+        };
+        let stable = format!("sha256:{}", "b".repeat(64));
+        let pinned = format!("sha256:{}", "c".repeat(64));
+        let records = [
+            record("nginxstable", "docker.io/library/nginx:stable", &stable),
+            record("nginx127", "docker.io/library/nginx:1.27", &stable),
+            record(
+                "pinned",
+                &format!("docker.io/library/nginx@{pinned}"),
+                &pinned,
+            ),
+            record("web", "docker.io/library/nginx:1.27", &stable),
+        ];
+        let load = |name: &str| records.iter().find(|r| r.name == name).cloned();
+        let image = Image {
+            records: vec!["nginxstable".into(), "nginx127".into(), "pinned".into()],
+            containers: vec!["web".into()],
+            ..busybox()
+        };
+        let source = |key: &str| source(&image, key, "docker.io", load);
+        assert_eq!(source("nginx:1.27").as_deref(), Some("nginx127"));
+        assert_eq!(
+            source("docker.io/library/nginx:stable").as_deref(),
+            Some("nginxstable")
+        );
+        assert_eq!(
+            source(&format!("nginx@{pinned}")).as_deref(),
+            Some("pinned"),
+            "a digest stays pinned"
+        );
+        assert_eq!(
+            source("pinned").as_deref(),
+            Some("pinned"),
+            "a record's name"
+        );
+        assert_eq!(source(&image.id).as_deref(), Some("nginxstable"), "an ID");
+        // Only a container holds the reference: its record it is.
+        let image = Image {
+            records: vec!["nginxstable".into()],
+            containers: vec!["web".into()],
+            ..busybox()
+        };
+        assert_eq!(
+            super::source(&image, "nginx:1.27", "docker.io", load).as_deref(),
+            Some("web")
+        );
     }
 
     fn context() -> (tempfile::TempDir, Context) {

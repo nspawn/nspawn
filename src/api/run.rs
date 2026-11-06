@@ -32,7 +32,7 @@ pub const CLD_EXITED: i32 = 1;
 const CLD_KILLED: i32 = 2;
 const CLD_DUMPED: i32 = 3;
 /// What systemd-nspawn exits with when the machine asked for a reboot.
-const REBOOT: i32 = 133;
+pub(crate) const REBOOT: i32 = 133;
 
 /// The exit code: the program's, or 128 plus the signal it died of. Under the stub init
 /// (`stub`) systemd-nspawn reports 255 for any signal that killed the program; a program
@@ -49,6 +49,14 @@ pub fn exit_code(ending: &Ending, sent: Option<i32>, stub: bool) -> i32 {
         CLD_KILLED | CLD_DUMPED => 128 + ending.status,
         _ => 125,
     }
+}
+
+/// Whether a unit's ActiveState and SubState say it stopped: inactive or failed, and not
+/// on its way to a restart, which systemd passes through as dead-before-auto-restart or
+/// failed-before-auto-restart.
+pub fn unit_stopped(active: Option<&str>, sub: Option<&str>) -> bool {
+    matches!(active, Some("inactive" | "failed"))
+        && !sub.is_some_and(|sub| sub.ends_with("-before-auto-restart"))
 }
 
 /// A task aborted when this goes.
@@ -106,10 +114,8 @@ impl MainProcess {
 
     /// A change of the unit's Unit interface: the end of a reboot the unit did not follow.
     fn unit_changed(&self, changed: &Changed<'_>) -> Option<Ending> {
-        let active = changed
-            .get("ActiveState")
-            .and_then(|v| <&str>::try_from(v).ok());
-        (self.rebooting && matches!(active, Some("inactive" | "failed"))).then(|| Ending {
+        let state = |key: &str| changed.get(key).and_then(|v| <&str>::try_from(v).ok());
+        (self.rebooting && unit_stopped(state("ActiveState"), state("SubState"))).then(|| Ending {
             code: CLD_EXITED,
             status: REBOOT,
             result: self.result.clone(),
@@ -427,10 +433,11 @@ pub async fn attach(
 ) -> Result<Attached> {
     let name = request.start.name.clone();
     crate::reference::validate_machine_name(&name)?;
-    let record = ctx
-        .store
-        .load_image(&name)?
-        .with_context(|| format!("no machine named {name}; nspawn run makes one from an image"))?;
+    let record = ctx.store.load_image(&name)?.ok_or_else(|| {
+        crate::api::FailureKind::NoSuchMachine.error(format!(
+            "no machine named {name}; nspawn run makes one from an image"
+        ))
+    })?;
     let app = record.mode == crate::oci::Mode::App;
     if !app && (request.terminal.is_some() || request.stdin.is_some()) {
         bail!("{name} boots an init system; its console is shown without -i and -t, and a shell comes with -it");
@@ -446,7 +453,12 @@ pub async fn attach(
     let unit = format!("systemd-nspawn@{name}.service");
     // Refused before binding: the socket would replace the one an earlier run waits on.
     if ctx.store.is_starting(&name) || sd.machine_exists(&name).await? {
-        bail!("machine {name} is already running");
+        let kind = if crate::api::machines::frozen(sd, &name).await {
+            crate::api::FailureKind::Paused
+        } else {
+            crate::api::FailureKind::AlreadyRunning
+        };
+        return Err(kind.error(format!("machine {name} is already running")));
     }
     let mut straight = None;
     let (mode, handed, keep, terminal) = match (&request.terminal, request.stdin) {
@@ -538,6 +550,7 @@ pub async fn attach(
                 force: true,
                 wait: true,
                 timeout: Some(0),
+                signal: None,
             };
             let _ = crate::api::machines::stop(ctx, &stop, report).await;
             bail!("{name} did not get its terminal or input ({reason}); was its unit changed by hand?");
@@ -612,6 +625,7 @@ impl Attached {
                     force: false,
                     wait: true,
                     timeout: None,
+                    signal: None,
                 };
                 let _ = crate::api::machines::stop(&ctx, &stop, &|_| {}).await;
                 self.watch.ended().await
@@ -769,6 +783,38 @@ mod tests {
             .service_changed(&service(12, 600, CLD_EXITED, 0))
             .unwrap();
         assert_eq!(end.status, 0);
+    }
+
+    #[test]
+    fn a_reboot_ends_the_run_when_the_unit_stops_not_on_its_way_to_the_restart() {
+        let unit = |active: &str, sub: &str| {
+            HashMap::from([
+                (
+                    "ActiveState",
+                    zbus::zvariant::Value::from(active.to_string()),
+                ),
+                ("SubState", zbus::zvariant::Value::from(sub.to_string())),
+            ])
+        };
+        let mut main = MainProcess::default();
+        assert!(main.service_changed(&service(9, 500, 0, 0)).is_none());
+        assert!(main
+            .service_changed(&service(9, 500, CLD_EXITED, REBOOT))
+            .is_none());
+        // systemd 254 and later pass through an inactive state before the restart.
+        assert!(main
+            .unit_changed(&unit("inactive", "dead-before-auto-restart"))
+            .is_none());
+        assert!(main
+            .unit_changed(&unit("failed", "failed-before-auto-restart"))
+            .is_none());
+        assert!(main
+            .unit_changed(&unit("activating", "auto-restart"))
+            .is_none());
+        let end = main.unit_changed(&unit("inactive", "dead")).unwrap();
+        assert_eq!((end.code, end.status), (CLD_EXITED, REBOOT));
+        assert!(unit_stopped(Some("failed"), None));
+        assert!(!unit_stopped(Some("active"), Some("running")));
     }
 
     fn ending(code: i32, status: i32, result: &str) -> Ending {

@@ -30,16 +30,38 @@ const ENDED_KEPT: usize = 100;
 #[derive(Debug)]
 pub struct Partly {
     pub result: Dict,
-    pub error: String,
+    pub error: anyhow::Error,
 }
 
 impl std::fmt::Display for Partly {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.error)
+        write!(f, "{:#}", self.error)
     }
 }
 
 impl std::error::Error for Partly {}
+
+/// What a job that failed keeps: what it did before (a removal's), why it failed, and
+/// the name of its error, as a method would have answered it.
+struct Failed {
+    result: Option<Dict>,
+    message: String,
+    name: String,
+}
+
+impl Failed {
+    fn of(e: anyhow::Error) -> Failed {
+        let (result, e) = match e.downcast::<Partly>() {
+            Ok(partly) => (Some(partly.result), partly.error),
+            Err(e) => (None, e),
+        };
+        Failed {
+            result,
+            message: crate::daemon::values::bus_text(&format!("{e:#}")),
+            name: crate::daemon::manager::error_name(crate::api::kind_of(&e)),
+        }
+    }
+}
 
 /// One event of a job's work: a line or a note kept in its Output and sent as
 /// JobOutput, a progress sent alone.
@@ -171,6 +193,8 @@ pub struct JobState {
     pub state: Mutex<String>,
     pub output: Mutex<VecDeque<String>>,
     pub error: Mutex<String>,
+    /// The D-Bus name of the error of a failed job, as a method would have answered it.
+    pub error_name: Mutex<String>,
     pub result: Mutex<Dict>,
     /// Its end went out: only then may it be retired, its client still to read it.
     pub announced: AtomicBool,
@@ -289,6 +313,16 @@ impl Job {
         Ok(self.job.error.lock().unwrap().clone())
     }
 
+    /// The error's name, org.nspawn.Error.NoSuchMachine say, when it failed; "" otherwise.
+    #[zbus(property)]
+    async fn error_name(
+        &self,
+        #[zbus(header)] hdr: Option<Header<'_>>,
+    ) -> zbus::fdo::Result<String> {
+        self.readable(hdr.as_ref()).await?;
+        Ok(self.job.error_name.lock().unwrap().clone())
+    }
+
     /// What it produced, when it is done; what a removal did before it failed.
     #[zbus(property)]
     async fn result(&self, #[zbus(header)] hdr: Option<Header<'_>>) -> zbus::fdo::Result<Dict> {
@@ -322,6 +356,7 @@ where
         state: Mutex::new("running".to_string()),
         output: Mutex::default(),
         error: Mutex::new(String::new()),
+        error_name: Mutex::new(String::new()),
         result: Mutex::new(Dict::new()),
         announced: AtomicBool::new(false),
     });
@@ -381,14 +416,12 @@ where
                 "done"
             }
             Err(e) => {
-                let e = match e.downcast::<Partly>() {
-                    Ok(partly) => {
-                        *job.result.lock().unwrap() = partly.result;
-                        anyhow::anyhow!(partly.error)
-                    }
-                    Err(e) => e,
-                };
-                *job.error.lock().unwrap() = crate::daemon::values::bus_text(&format!("{e:#}"));
+                let failed = Failed::of(e);
+                if let Some(result) = failed.result {
+                    *job.result.lock().unwrap() = result;
+                }
+                *job.error.lock().unwrap() = failed.message;
+                *job.error_name.lock().unwrap() = failed.name;
                 state.jobs.end(&job, "failed");
                 "failed"
             }
@@ -403,6 +436,7 @@ where
                 let job = iface.get().await;
                 let _ = job.state_changed(&emitter).await;
                 let _ = job.error_changed(&emitter).await;
+                let _ = job.error_name_changed(&emitter).await;
                 let _ = job.result_changed(&emitter).await;
             }
         }
@@ -442,6 +476,7 @@ mod tests {
             state: Mutex::new(state.to_string()),
             output: Mutex::default(),
             error: Mutex::new(String::new()),
+            error_name: Mutex::new(String::new()),
             result: Mutex::new(Dict::new()),
             announced: AtomicBool::new(state != "running"),
         })
@@ -499,6 +534,37 @@ mod tests {
             "it ended last"
         );
         assert!(jobs.retire().is_empty(), "nothing more to retire");
+    }
+
+    #[test]
+    fn a_failed_job_names_its_error_as_a_method_would() {
+        use crate::api::FailureKind;
+        let failed = Failed::of(
+            FailureKind::NoSuchMachine
+                .error("no machine or image named web")
+                .context("removing"),
+        );
+        assert_eq!(failed.name, "org.nspawn.Error.NoSuchMachine");
+        assert_eq!(failed.message, "removing: no machine or image named web");
+        assert!(failed.result.is_none());
+        let plain = Failed::of(anyhow::anyhow!("disk full"));
+        assert_eq!(plain.name, "org.nspawn.Error.Failed");
+        // A removal that failed for some names keeps what it removed, and the kind its
+        // failures share.
+        let result = Dict::from([(
+            "removed".to_string(),
+            crate::daemon::values::v(vec!["a".to_string()]),
+        )]);
+        let partly = Failed::of(
+            Partly {
+                result,
+                error: FailureKind::InUse.error("machine b is running; stop it first"),
+            }
+            .into(),
+        );
+        assert_eq!(partly.name, "org.nspawn.Error.InUse");
+        assert_eq!(partly.message, "machine b is running; stop it first");
+        assert!(partly.result.is_some_and(|r| r.contains_key("removed")));
     }
 
     #[test]

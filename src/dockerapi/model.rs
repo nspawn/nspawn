@@ -71,15 +71,20 @@ impl Snapshot {
         Ok(Snapshot { machines, networks })
     }
 
-    /// By ID, by name with or without the API's leading slash, or by a unique prefix of
-    /// the ID, in that order.
-    /// A container by its ID, its name or a prefix of its ID, as GetContainer
-    /// finds it, and its words when there is none.
+    /// A container by its ID, its name with or without the API's leading slash, or a
+    /// unique prefix of its ID, as GetContainer finds it, and its words when there is
+    /// none. The name is the one the API knows it by, then the machine's.
     pub fn find(&self, key: &str) -> Result<&Machine, String> {
         if let Some(m) = self.machines.iter().find(|m| m.id == key) {
             return Ok(m);
         }
         let name = key.strip_prefix('/').unwrap_or(key);
+        // A name given through the API before a machine's own: a pulled record that ran
+        // is a container under its name, which another container may have been given.
+        let given = |m: &&Machine| m.record.api_name.as_deref() == Some(name);
+        if let Some(m) = self.machines.iter().find(given) {
+            return Ok(m);
+        }
         if let Some(m) = self.machines.iter().find(|m| m.record.name == name) {
             return Ok(m);
         }
@@ -168,8 +173,14 @@ pub struct NetworkView<'a> {
 }
 
 impl Machine {
+    /// The machine's name, which the bus knows it by.
     pub fn name(&self) -> &str {
         &self.record.name
+    }
+
+    /// The name the API shows and finds it by.
+    pub fn api_name(&self) -> &str {
+        self.record.effective_api_name()
     }
 
     pub fn running(&self) -> bool {
@@ -242,8 +253,10 @@ impl Machine {
         let r = &self.record;
         if let Some(owner) = bridge::shares_network(r) {
             let id = snapshot
-                .find(owner)
-                .map_or_else(|_| owner.to_string(), |m| m.id.clone());
+                .machines
+                .iter()
+                .find(|m| m.name() == owner)
+                .map_or_else(|| owner.to_string(), |m| m.id.clone());
             return format!("container:{id}");
         }
         if r.no_network {
@@ -389,7 +402,7 @@ impl Machine {
     pub fn summary_json(&self, ctx: &Context, snapshot: &Snapshot, image: &ImageInfo) -> Value {
         json!({
             "Id": self.id,
-            "Names": [format!("/{}", self.name())],
+            "Names": [format!("/{}", self.api_name())],
             "Image": familiar(&self.record.reference),
             "ImageID": image.id,
             "Command": self.command_line(),
@@ -483,9 +496,9 @@ impl Machine {
             "AttachStdin": false,
             "AttachStdout": false,
             "AttachStderr": false,
-            "Tty": false,
-            "OpenStdin": false,
-            "StdinOnce": false,
+            "Tty": r.tty,
+            "OpenStdin": r.interactive,
+            "StdinOnce": r.stdin_once,
             "Env": env,
             "Cmd": list(r.effective_cmd()),
             "Image": familiar(&r.reference),
@@ -670,7 +683,7 @@ impl Machine {
             "HostnamePath": "",
             "HostsPath": machine_dir.join("hosts").to_string_lossy(),
             "LogPath": "",
-            "Name": format!("/{}", r.name),
+            "Name": format!("/{}", self.api_name()),
             "RestartCount": self.restarts,
             "Driver": format!("{:?}", r.backend).to_lowercase(),
             "Platform": "linux",
@@ -821,7 +834,7 @@ pub fn network_json(snapshot: &Snapshot, view: &NetworkView) -> Value {
                     containers.insert(
                         m.id.clone(),
                         json!({
-                            "Name": m.name(),
+                            "Name": m.api_name(),
                             "EndpointID": endpoint_id(m.name(), &spec.name),
                             "MacAddress": m.mac(address),
                             "IPv4Address": format!("{address}/{}", spec.subnet.prefix),
@@ -835,7 +848,7 @@ pub fn network_json(snapshot: &Snapshot, view: &NetworkView) -> Value {
                     containers.insert(
                         m.id.clone(),
                         json!({
-                            "Name": m.name(),
+                            "Name": m.api_name(),
                             "EndpointID": "",
                             "MacAddress": "",
                             "IPv4Address": "",
@@ -1014,6 +1027,159 @@ mod tests {
         assert!(!matches(&snapshot, "front"));
         let host_id = snapshot.network("host").unwrap().id;
         assert!(matches(&snapshot, &host_id[..12]));
+    }
+
+    /// `created` of the recorded run: made with -it --rm, never started; and a machine
+    /// whose API name is none systemd takes.
+    fn created() -> (Context, Snapshot) {
+        let (ctx, mut snapshot) = fixture();
+        let record: ImageRecord = serde_json::from_value(json!({
+            "name": "created", "reference": "docker.io/library/busybox:1.37", "manifest_digest": "sha256:aa",
+            "layers": [], "backend": "overlay", "created": 1_793_849_746u64, "mode": "app", "origin": "create",
+            "run": { "cmd": ["sh"], "env": ["PATH=/bin"] }, "cmd": ["sh"],
+            "network": "bridge", "labels": { "e2e": "lifecycle" }, "remove_on_exit": true,
+            "tty": true, "interactive": true, "stdin_once": true,
+        }))
+        .unwrap();
+        let summary = MachineSummary {
+            name: "created".into(),
+            record: Some(record.clone()),
+            state: "stopped".into(),
+            started: None,
+            leader: None,
+            os: None,
+            health: None,
+            exit_code: None,
+            finished: None,
+        };
+        let mut named = record.clone();
+        named.name = "my-app-1a2b3c4d".into();
+        named.api_name = Some("my_app".into());
+        named.created += 1;
+        let named_summary = MachineSummary {
+            name: named.name.clone(),
+            record: Some(named.clone()),
+            ..summary.clone()
+        };
+        snapshot.machines.push(Machine {
+            id: container_id("created", record.created),
+            record,
+            summary,
+            finished_usec: None,
+            restarts: 0,
+        });
+        snapshot.machines.push(Machine {
+            id: container_id(&named.name, named.created),
+            record: named,
+            summary: named_summary,
+            finished_usec: None,
+            restarts: 0,
+        });
+        (ctx, snapshot)
+    }
+
+    #[test]
+    fn a_container_never_started_reads_as_created() {
+        let (ctx, snapshot) = created();
+        let m = snapshot.find("created").unwrap();
+        let image = ImageInfo {
+            id: "sha256:30ec".into(),
+            exposed_ports: Vec::new(),
+        };
+        assert_eq!(m.state(), "created");
+        assert_eq!(m.status(now_unix()), "Created");
+        let inspect = m.inspect_json(&ctx, &snapshot, &image);
+        assert_eq!(inspect["State"]["Status"], "created");
+        assert_eq!(inspect["State"]["StartedAt"], ZERO_TIME);
+        for key in ["Tty", "OpenStdin", "StdinOnce"] {
+            assert_eq!(inspect["Config"][key], true, "{key}");
+        }
+        assert_eq!(inspect["HostConfig"]["AutoRemove"], true);
+        assert_eq!(inspect["NetworkSettings"]["Ports"], json!({}));
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../tests/dockerapi/golden/inspect-created.body"
+        ))
+        .unwrap();
+        let (extra, missing) = diff(&inspect, &golden);
+        assert!(
+            extra.is_empty() && missing.is_empty(),
+            "inspect: extra {extra:?}, missing {missing:?}"
+        );
+        for key in ["Tty", "OpenStdin", "StdinOnce"] {
+            assert_eq!(inspect["Config"][key], golden["Config"][key], "{key}");
+        }
+        assert_eq!(inspect["State"], golden["State"]);
+        let summary = m.summary_json(&ctx, &snapshot, &image);
+        let golden: Value = serde_json::from_str(include_str!(
+            "../../tests/dockerapi/golden/containers-created.body"
+        ))
+        .unwrap();
+        let (extra, missing) = diff(&summary, &golden[0]);
+        assert!(
+            extra.is_empty() && missing.is_empty(),
+            "summary: extra {extra:?}, missing {missing:?}"
+        );
+        for key in ["State", "Status", "Ports", "Labels", "Command"] {
+            assert_eq!(summary[key], golden[0][key], "{key}");
+        }
+    }
+
+    #[test]
+    fn a_container_goes_by_its_api_name() {
+        let (ctx, snapshot) = created();
+        let image = ImageInfo {
+            id: "sha256:30ec".into(),
+            exposed_ports: Vec::new(),
+        };
+        let m = snapshot.find("my_app").unwrap();
+        assert_eq!(m.name(), "my-app-1a2b3c4d");
+        assert_eq!(snapshot.find("/my_app").unwrap().id, m.id);
+        // The machine's own name finds it too.
+        assert_eq!(snapshot.find("my-app-1a2b3c4d").unwrap().id, m.id);
+        assert_eq!(
+            m.summary_json(&ctx, &snapshot, &image)["Names"],
+            json!(["/my_app"])
+        );
+        assert_eq!(m.inspect_json(&ctx, &snapshot, &image)["Name"], "/my_app");
+        let filter =
+            crate::dockerapi::filters::Filters::parse(Some(r#"{"name":["^/my_app$"]}"#)).unwrap();
+        assert!(crate::dockerapi::container_matches(
+            &ctx, &snapshot, &filter, m
+        ));
+        assert_eq!(
+            snapshot.find("nope").err().unwrap(),
+            "No such container: nope"
+        );
+    }
+
+    #[test]
+    fn a_name_given_through_the_api_goes_before_a_record_s_own() {
+        let (_ctx, mut snapshot) = created();
+        let base = &snapshot.machines[0];
+        let machine = |name: &str, api_name: Option<&str>| {
+            let mut record = base.record.clone();
+            record.name = name.into();
+            record.api_name = api_name.map(str::to_string);
+            Machine {
+                id: container_id(name, record.created),
+                record,
+                summary: base.summary.clone(),
+                finished_usec: None,
+                restarts: 0,
+            }
+        };
+        let pulled = machine("nginx", None);
+        let made = machine("nginx-1a2b3c4d", Some("nginx"));
+        let (pulled_id, made_id) = (pulled.id.clone(), made.id.clone());
+        snapshot.machines.insert(0, pulled);
+        snapshot.machines.push(made);
+        assert_eq!(snapshot.find("nginx").unwrap().id, made_id);
+        assert_eq!(snapshot.find("/nginx").unwrap().id, made_id);
+        assert_eq!(
+            snapshot.find(&pulled_id).unwrap().id,
+            pulled_id,
+            "by its ID"
+        );
     }
 
     #[test]

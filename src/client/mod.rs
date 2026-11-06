@@ -151,6 +151,16 @@ pub trait Manager {
     fn stop_machine(&self, name: &str, options: Options<'_>)
         -> zbus::Result<(String, Vec<String>)>;
     #[zbus(allow_interactive_auth)]
+    fn restart_machine(
+        &self,
+        name: &str,
+        options: Options<'_>,
+    ) -> zbus::Result<(String, Vec<String>)>;
+    #[zbus(allow_interactive_auth)]
+    fn wait_machine(&self, name: &str, options: Options<'_>) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
+    fn prune_machines(&self, options: Options<'_>) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn kill_machine(&self, name: &str, options: Options<'_>) -> zbus::Result<Vec<String>>;
     #[zbus(allow_interactive_auth)]
     fn pause_machine(&self, name: &str) -> zbus::Result<()>;
@@ -247,6 +257,8 @@ pub trait Job {
     fn state(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn error(&self) -> zbus::Result<String>;
+    #[zbus(property)]
+    fn error_name(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn result(&self) -> zbus::Result<Dict>;
 }
@@ -597,8 +609,18 @@ impl JobWatch {
         if result == "done" {
             Ok(proxy.result().await.map_err(error)?)
         } else {
+            // A service without the property names no failure but Failed.
+            let name = proxy
+                .error_name()
+                .await
+                .ok()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| FAILED.to_string());
             Err(JobFailed {
-                error: proxy.error().await.map_err(error)?,
+                error: ServiceError {
+                    name,
+                    message: proxy.error().await.map_err(error)?,
+                },
                 result: proxy.result().await.unwrap_or_default(),
             }
             .into())
@@ -606,16 +628,52 @@ impl JobWatch {
     }
 }
 
+/// The name of a failure the service gives no other name.
+const FAILED: &str = "org.nspawn.Error.Failed";
+
+/// An error the service answered with: its D-Bus name, org.nspawn.Error.NoSuchMachine
+/// say, and its message, which alone is what it reads like.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceError {
+    pub name: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for ServiceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ServiceError {}
+
+/// The short name of the service's error anywhere in `e`'s chain ("NoSuchMachine", the
+/// last part of the D-Bus name), for a client that answers each kind its own way.
+pub fn error_name(e: &anyhow::Error) -> Option<&str> {
+    e.chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<ServiceError>()
+                .or_else(|| cause.downcast_ref::<JobFailed>().map(|j| &j.error))
+        })
+        .map(|service| {
+            service
+                .name
+                .rsplit_once('.')
+                .map_or(service.name.as_str(), |(_, short)| short)
+        })
+}
+
 /// A job that failed; its result says what it did before, as a removal's `removed`.
 #[derive(Debug)]
 pub struct JobFailed {
-    pub error: String,
+    pub error: ServiceError,
     pub result: Dict,
 }
 
 impl std::fmt::Display for JobFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.error)
+        self.error.fmt(f)
     }
 }
 
@@ -732,24 +790,35 @@ pub fn version_warning(service: &str, client: &str) -> Option<String> {
 }
 
 /// What the service's error reads like here: the message alone for the service's own
-/// errors, and a word of advice when the service is not there or refuses the caller.
+/// errors, and a word of advice when the service is not there or refuses the caller. An
+/// error the bus answered carries its name too (`ServiceError`, `error_name`).
 pub fn error(e: zbus::Error) -> anyhow::Error {
     const NO_SERVICE: &str =
         "the nspawn service is not on the system bus; run: sudo nspawn daemon --install";
     const REFUSED: &str =
         "the bus refused the call; see the policy in /usr/share/dbus-1/system.d/org.nspawn.conf";
+    let named = |name: &str, message: String| {
+        anyhow::Error::new(ServiceError {
+            name: name.to_string(),
+            message,
+        })
+    };
     match &e {
         zbus::Error::MethodError(name, message, _) => match name.as_str() {
-            "org.freedesktop.DBus.Error.ServiceUnknown" => anyhow!(NO_SERVICE),
-            "org.freedesktop.DBus.Error.AccessDenied" => anyhow!(REFUSED),
-            _ => anyhow!("{}", message.clone().unwrap_or_else(|| name.to_string())),
+            "org.freedesktop.DBus.Error.ServiceUnknown" => named(name, NO_SERVICE.to_string()),
+            "org.freedesktop.DBus.Error.AccessDenied" => named(name, REFUSED.to_string()),
+            _ => named(name, message.clone().unwrap_or_else(|| name.to_string())),
         },
         // A property read (the version, first thing every command does) fails this way.
-        zbus::Error::FDO(fdo) => match **fdo {
-            zbus::fdo::Error::ServiceUnknown(_) => anyhow!(NO_SERVICE),
-            zbus::fdo::Error::AccessDenied(_) => anyhow!(REFUSED),
-            _ => anyhow!("{e}"),
-        },
+        zbus::Error::FDO(fdo) => {
+            use zbus::DBusError as _;
+            let name = fdo.name().to_string();
+            match **fdo {
+                zbus::fdo::Error::ServiceUnknown(_) => named(&name, NO_SERVICE.to_string()),
+                zbus::fdo::Error::AccessDenied(_) => named(&name, REFUSED.to_string()),
+                _ => named(&name, e.to_string()),
+            }
+        }
         _ => anyhow!("{e}"),
     }
 }
@@ -890,7 +959,10 @@ mod tests {
             zbus::zvariant::OwnedValue::try_from(zbus::zvariant::Value::from(vec!["a"])).unwrap(),
         )]);
         let failed = super::JobFailed {
-            error: "b is in use".to_string(),
+            error: super::ServiceError {
+                name: "org.nspawn.Error.InUse".to_string(),
+                message: "b is in use".to_string(),
+            },
             result,
         };
         let kept = super::partly(Err(failed.into())).unwrap();
@@ -1009,6 +1081,47 @@ mod tests {
             .starts_with("org.nspawn.manage needs an administrator"));
         let nameless = error(method_error("org.example.Odd", None));
         assert_eq!(nameless.to_string(), "org.example.Odd");
+    }
+
+    #[test]
+    fn the_service_s_errors_carry_their_names_and_read_as_before() {
+        let missing = error(method_error(
+            "org.nspawn.Error.NoSuchMachine",
+            Some("no machine or image named web"),
+        ));
+        assert_eq!(missing.to_string(), "no machine or image named web");
+        assert_eq!(format!("{missing:#}"), "no machine or image named web");
+        assert_eq!(error_name(&missing), Some("NoSuchMachine"));
+        let wrapped = missing.context("inspecting web");
+        assert_eq!(
+            error_name(&wrapped),
+            Some("NoSuchMachine"),
+            "under a context"
+        );
+        let absent = error(method_error(
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            Some("The name org.nspawn was not provided by any .service files"),
+        ));
+        assert_eq!(error_name(&absent), Some("ServiceUnknown"));
+        let property = error(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
+            "no".to_string(),
+        ))));
+        assert_eq!(error_name(&property), Some("AccessDenied"));
+        assert_eq!(error_name(&anyhow!("the bus connection closed")), None);
+        // A job that failed says its name the same way, its message alone.
+        let failed: anyhow::Error = JobFailed {
+            error: ServiceError {
+                name: "org.nspawn.Error.InUse".to_string(),
+                message: "machine web is running; stop it first".to_string(),
+            },
+            result: Dict::new(),
+        }
+        .into();
+        assert_eq!(error_name(&failed), Some("InUse"));
+        assert_eq!(
+            format!("{failed:#}"),
+            "machine web is running; stop it first"
+        );
     }
 
     #[test]

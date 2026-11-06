@@ -89,7 +89,9 @@ its own, both kept for the next record) and keeps docker's answers under
 replacing what tells of the host. For caddy-docker-proxy, Traefik, nginx-proxy,
 acme-companion, homepage and Dozzle it keeps every request each made of the socket
 under `tests/dockerapi/requests/` (`logproxy.py` sits between them), which `cargo
-test` routes to see that each is served.
+test` routes to see that each is served. The cases that create, start, stop, pause,
+wait for, update, remove and prune containers keep there the request each sends, as
+`NAME.request`.
 
 ### The Dockerfile builder
 

@@ -171,7 +171,10 @@ pub async fn create(
     let _lock = store.lock().await?;
     if blob_path(store, name).exists() {
         match replace {
-            Replace::Refuse => bail!("secret {name} exists already; remove it first"),
+            Replace::Refuse => {
+                return Err(crate::api::FailureKind::Exists
+                    .error(format!("secret {name} exists already; remove it first")))
+            }
             Replace::Always => {}
             // One that cannot be read back (its key gone with the host it was made on)
             // cannot hold the same content: it is replaced.
@@ -226,7 +229,7 @@ pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Resu
                 crate::api::events::emit("secret", "remove", name, &[("size", &size)]);
                 removal.removed.push(name.clone());
             }
-            Err(e) => removal.failed.push((name.clone(), format!("{e:#}"))),
+            Err(e) => removal.refuse(name, e),
         }
     }
     Ok(removal)
@@ -238,10 +241,10 @@ fn remove_one(store: &Store, name: &str, users: &BTreeMap<String, BTreeSet<Strin
     }
     if let Some(machines) = users.get(name) {
         let machines: Vec<&str> = machines.iter().map(String::as_str).collect();
-        bail!(
+        return Err(crate::api::FailureKind::InUse.error(format!(
             "secret {name} is in use by {}; start them with --secret none (or other secrets) first",
             machines.join(", ")
-        );
+        )));
     }
     for path in [blob_path(store, name), meta_path(store, name)] {
         if let Err(e) = fs::remove_file(&path) {

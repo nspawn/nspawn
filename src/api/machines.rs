@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context as _, Result};
 use nix::libc;
 
-use crate::api::{note, Context, Report};
+use crate::api::failure::invalid;
+use crate::api::{note, Context, FailureKind, Report};
 use crate::backend::{BackendChoice, MANAGED_NS_SOCKETS};
 use crate::bridge;
 use crate::config::Config;
@@ -113,6 +114,45 @@ pub async fn refuse_foreign(sd: &Systemd, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// "machine NAME is not running", said of a machine that does not run, or of a name
+/// nothing has: nspawn keeps no record of it, and machined no image.
+pub(crate) async fn not_running(sd: &Systemd, store: &Store, name: &str) -> anyhow::Error {
+    let known = store.load_image(name).ok().flatten().is_some()
+        || sd
+            .list_images()
+            .await
+            .is_ok_and(|images| images.iter().any(|i| i.name == name));
+    not_running_error(name, known)
+}
+
+fn not_running_error(name: &str, known: bool) -> anyhow::Error {
+    let kind = if known {
+        FailureKind::NotRunning
+    } else {
+        FailureKind::NoSuchMachine
+    };
+    kind.error(format!("machine {name} is not running"))
+}
+
+/// A start refused because the machine runs: paused, or not.
+async fn running_already(sd: &Systemd, name: &str) -> anyhow::Error {
+    let kind = if frozen(sd, name).await {
+        FailureKind::Paused
+    } else {
+        FailureKind::AlreadyRunning
+    };
+    kind.error(format!("machine {name} is already running"))
+}
+
+/// Whether the cgroup of the machine's unit is frozen, or on its way to be.
+pub(crate) async fn frozen(sd: &Systemd, name: &str) -> bool {
+    let unit = format!("systemd-nspawn@{name}.service");
+    matches!(
+        sd.freezer_state(&unit).await.ok().as_deref(),
+        Some("frozen" | "freezing")
+    )
+}
+
 pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
     validate_entry_name(name)?;
     let sd = ctx.sd().await?;
@@ -166,7 +206,7 @@ pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
                 finished,
             })
         }
-        None => bail!("no machine or image named {name}"),
+        None => Err(FailureKind::NoSuchMachine.error(format!("no machine or image named {name}"))),
     }
 }
 
@@ -1149,8 +1189,8 @@ pub struct StartRequest {
     pub image_command: bool,
     /// Replaces an app image's cmd.
     pub command: Vec<String>,
-    /// run --rm.
-    pub remove: bool,
+    /// Removed once it ends (run --rm), or no more; None keeps what the machine has.
+    pub remove: Option<bool>,
     /// The --health-* flags.
     pub health: crate::health::Overrides,
     /// hostname, user, capabilities and the rest.
@@ -1179,7 +1219,7 @@ impl StartRequest {
             pids_limit: None,
             image_command: false,
             command: Vec::new(),
-            remove: false,
+            remove: None,
             health: Default::default(),
             tuning: Default::default(),
         }
@@ -1199,11 +1239,11 @@ pub enum StartOutcome {
 pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Result<StartOutcome> {
     let config = &ctx.config;
     if args.name.contains(':') || args.name.contains('/') {
-        bail!(
+        return Err(FailureKind::Invalid.error(format!(
             "{} looks like an image reference; machines are started by name. Pull it (nspawn pull {}) or make a machine from a local image (nspawn create IMAGE NAME)",
             args.name,
             args.name
-        );
+        )));
     }
     validate_machine_name(&args.name)?;
     let sd = ctx.sd().await?;
@@ -1216,15 +1256,19 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     let lock = store.lock().await?;
     // Again under the lock: another start may be preparing it, or it may be up by now.
     if store.is_starting(&args.name) {
-        bail!("machine {} is starting already", args.name);
+        return Err(
+            FailureKind::AlreadyRunning.error(format!("machine {} is starting already", args.name))
+        );
     }
     if sd.machine_exists(&args.name).await? {
-        bail!("machine {} is already running", args.name);
+        return Err(running_already(sd, &args.name).await);
     }
     // systemd may have begun it meanwhile (machinectl start, the Wants= of a machine
     // that depends on it): its own hooks prepare it, and this pass would tear that down.
     if sd.unit_status(&unit).await?.busy() || sd.start_queued(&unit).await? {
-        bail!("machine {} is starting already", args.name);
+        return Err(
+            FailureKind::AlreadyRunning.error(format!("machine {} is starting already", args.name))
+        );
     }
     let _starting = store.mark_starting(&args.name)?;
     let mut record = store.load_image(&args.name)?;
@@ -1235,45 +1279,47 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             if args.publish_all && r.run.exposed_ports.is_empty() {
                 r.run.exposed_ports = r.exposed_ports(store);
             }
-            apply_flags(r, args)?;
-            apply_addresses(store, config, r, &args.addresses)?;
+            apply_flags(r, args).map_err(invalid)?;
+            apply_addresses(store, config, r, &args.addresses).map_err(invalid)?;
             crate::api::dependencies::check(
                 store,
                 &args.name,
                 &r.tuning.depends_on,
                 r.network_container.as_deref(),
-            )?;
-        }
-        None if !args.command.is_empty()
-            || !args.network.is_empty()
-            || !args.aliases.is_empty()
-            || !args.addresses.is_empty()
-            || !args.publish.is_empty()
-            || args.publish_all
-            || args.entrypoint.is_some()
-            || !args.env.is_empty()
-            || !args.volume.is_empty()
-            || !args.label.is_empty()
-            || args.restart.is_some()
-            || args.memory.is_some()
-            || args.memory_swap.is_some()
-            || args.cpus.is_some()
-            || args.pids_limit.is_some()
-            || !args.health.is_empty()
-            || !args.tuning.is_empty()
-            || args.remove =>
-        {
-            bail!(
-                "{} is not an image managed by nspawn; a command, network, ports, variables, volumes, labels, a restart policy, limits or a healthcheck need one",
-                args.name
             )
+            .map_err(invalid)?;
         }
+        // A name that names nothing is that, whatever the start asks for.
         None => {
             if !sd.list_images().await?.iter().any(|i| i.name == args.name) {
-                bail!(
+                return Err(FailureKind::NoSuchMachine.error(format!(
                     "no image named {}; see nspawn images ls, or pull one",
                     args.name
-                );
+                )));
+            }
+            if !args.command.is_empty()
+                || !args.network.is_empty()
+                || !args.aliases.is_empty()
+                || !args.addresses.is_empty()
+                || !args.publish.is_empty()
+                || args.publish_all
+                || args.entrypoint.is_some()
+                || !args.env.is_empty()
+                || !args.volume.is_empty()
+                || !args.label.is_empty()
+                || args.restart.is_some()
+                || args.memory.is_some()
+                || args.memory_swap.is_some()
+                || args.cpus.is_some()
+                || args.pids_limit.is_some()
+                || !args.health.is_empty()
+                || !args.tuning.is_empty()
+                || args.remove == Some(true)
+            {
+                return Err(FailureKind::Invalid.error(format!(
+                    "{} is not an image managed by nspawn; a command, network, ports, variables, volumes, labels, a restart policy, limits or a healthcheck need one",
+                    args.name
+                )));
             }
         }
     }
@@ -1564,11 +1610,12 @@ pub fn apply_flags(r: &mut ImageRecord, args: &StartRequest) -> Result<()> {
     if r.mode == Mode::App && r.effective_command().is_empty() {
         bail!("{}", no_command(&args.name));
     }
-    // Set on every start, so that a start without --rm keeps the machine.
-    if args.remove && r.restart != Restart::No {
-        bail!("--rm and a restart policy exclude each other: a machine removed when it ends cannot be restarted (--restart no)");
+    if let Some(remove) = args.remove {
+        r.remove_on_exit = remove;
     }
-    r.remove_on_exit = args.remove;
+    if r.remove_on_exit && r.restart != Restart::No {
+        bail!("{}", crate::api::create::REMOVE_AND_RESTART);
+    }
     Ok(())
 }
 
@@ -1636,13 +1683,17 @@ async fn wait_for_init(sd: &Systemd, name: &str) -> Result<StartOutcome> {
     }
 }
 
-/// The machine's cgroup frozen, every process in it with it, or thawed.
+/// The machine's cgroup frozen, every process in it with it, or thawed. A pause of a
+/// paused machine and an unpause of one that is not are refused.
 pub async fn pause(ctx: &Context, name: &str, on: bool) -> Result<()> {
     validate_entry_name(name)?;
     let sd = ctx.sd().await?;
     refuse_foreign(sd, name).await?;
     if !sd.machine_exists(name).await? {
-        bail!("machine {name} is not running");
+        return Err(not_running(sd, &ctx.store, name).await);
+    }
+    if let Some(refusal) = pause_refused(name, on, frozen(sd, name).await) {
+        return Err(refusal);
     }
     let unit = format!("systemd-nspawn@{name}.service");
     if on {
@@ -1664,6 +1715,20 @@ pub async fn pause(ctx: &Context, name: &str, on: bool) -> Result<()> {
     Ok(())
 }
 
+/// Why a pause (`on`) or an unpause of a running machine is refused: it is paused
+/// already, or it is not.
+fn pause_refused(name: &str, on: bool, frozen: bool) -> Option<anyhow::Error> {
+    match (on, frozen) {
+        (true, true) => {
+            Some(FailureKind::Paused.error(format!("machine {name} is already paused")))
+        }
+        (false, false) => {
+            Some(FailureKind::NotPaused.error(format!("machine {name} is not paused")))
+        }
+        _ => None,
+    }
+}
+
 /// A process of a running machine, as top shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Process {
@@ -1681,7 +1746,7 @@ pub async fn processes(ctx: &Context, name: &str) -> Result<Vec<Process>> {
     let sd = ctx.sd().await?;
     refuse_foreign(sd, name).await?;
     if !sd.machine_exists(name).await? {
-        bail!("machine {name} is not running");
+        return Err(not_running(sd, &ctx.store, name).await);
     }
     let leader = sd.machine_leader(name).await?;
     let shift = sd.machine_uid_shift(name).await.unwrap_or(0);
@@ -1832,6 +1897,9 @@ pub struct StopRequest {
     /// Seconds between an app's stop signal and SIGKILL; None for the machine's own
     /// --stop-timeout, 10 without one.
     pub timeout: Option<u64>,
+    /// Sent first instead of the machine's stop signal (a booted machine's poweroff
+    /// request among them), the timeout and SIGKILL after it as for an app.
+    pub signal: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1903,7 +1971,7 @@ async fn stop_gone(
     // is done, so nothing is released beside it.
     let state = sd.unit_status(unit).await?;
     if !stoppable_when_gone(record.is_some(), &state) {
-        bail!("machine {} is not running", args.name);
+        return Err(not_running(sd, store, &args.name).await);
     }
     sd.stop_unit_job(unit).await?.wait().await?;
     {
@@ -1949,7 +2017,17 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         return stop_gone(sd, store, args, record.as_ref(), &unit).await;
     }
     let mode = record.as_ref().map(|r| r.mode);
-    let latch = latch(policy, args.force, mode);
+    // A signal asked for goes first, as an app's stop signal does: a stop job queued
+    // before it would have a booted machine powered off instead.
+    let latch = latch(
+        policy,
+        args.force,
+        if args.signal.is_some() {
+            Some(Mode::App)
+        } else {
+            mode
+        },
+    );
     let mut job = None;
     if latch == Latch::BeforeSignal {
         job = Some(sd.stop_unit_job(&unit).await?);
@@ -1973,44 +2051,68 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         }
     } else {
         match mode {
-            // The image's stop signal, then SIGKILL after the timeout.
-            Some(Mode::App) => {
+            // The image's stop signal, or the one asked for, then SIGKILL after the
+            // timeout. A booted machine asked for a signal of its own gets it at its init,
+            // the same way.
+            _ if mode == Some(Mode::App) || args.signal.is_some() => {
                 // One nspawn cannot read is SIGTERM, as the settings make it.
-                let number = stop_signals(record.as_ref())?
-                    .first()
-                    .copied()
-                    .unwrap_or(libc::SIGTERM);
+                let number = match args.signal {
+                    Some(signal) => signal,
+                    None => stop_signals(record.as_ref())?
+                        .first()
+                        .copied()
+                        .unwrap_or(libc::SIGTERM),
+                };
                 let signal =
                     signal_name(&number.to_string()).unwrap_or_else(|_| number.to_string());
                 let timeout = args
                     .timeout
                     .or_else(|| record.as_ref().and_then(|r| r.tuning.stop_timeout))
                     .unwrap_or(10);
-                let pid1 = record.as_ref().is_some_and(ImageRecord::program_is_pid1);
-                let (leader, payload) = match wait_for_payload(sd, &args.name, pid1).await {
-                    Ok(found) => found,
-                    // It ended since it was looked at: nothing is left to signal.
-                    Err(_) if !sd.machine_exists(&args.name).await? => {
-                        return stop_gone(sd, store, args, record.as_ref(), &unit).await;
-                    }
-                    Err(e) => return Err(e),
-                };
-                mark_signal(sd, store, &args.name, number).await?;
-                match payload {
-                    Some(payload) => {
-                        if let Err(e) =
-                            signal_payload(sd, &args.name, leader, payload, pid1, number).await
-                        {
-                            note(report, format!("note: could not send {signal} to PID {payload} of {}: {e:#}", args.name));
+                if mode == Some(Mode::App) {
+                    let pid1 = record.as_ref().is_some_and(ImageRecord::program_is_pid1);
+                    let (leader, payload) = match wait_for_payload(sd, &args.name, pid1).await {
+                        Ok(found) => found,
+                        // It ended since it was looked at: nothing is left to signal.
+                        Err(_) if !sd.machine_exists(&args.name).await? => {
+                            return stop_gone(sd, store, args, record.as_ref(), &unit).await;
                         }
-                    }
-                    None => note(
-                        report,
-                        format!(
-                            "note: {} has no program running under its init (leader PID {leader}); waiting for it to end",
-                            args.name
+                        Err(e) => return Err(e),
+                    };
+                    mark_signal(sd, store, &args.name, number).await?;
+                    match payload {
+                        Some(payload) => {
+                            if let Err(e) =
+                                signal_payload(sd, &args.name, leader, payload, pid1, number).await
+                            {
+                                note(report, format!("note: could not send {signal} to PID {payload} of {}: {e:#}", args.name));
+                            }
+                        }
+                        None => note(
+                            report,
+                            format!(
+                                "note: {} has no program running under its init (leader PID {leader}); waiting for it to end",
+                                args.name
+                            ),
                         ),
-                    ),
+                    }
+                } else {
+                    // Only nspawn's machines have a place for marks.
+                    if record.is_some() {
+                        mark_signal(sd, store, &args.name, number).await?;
+                    }
+                    if let Err(e) = sd.kill_machine(&args.name, "leader", number).await {
+                        if !sd.machine_exists(&args.name).await? {
+                            return stop_gone(sd, store, args, record.as_ref(), &unit).await;
+                        }
+                        note(
+                            report,
+                            format!(
+                                "note: could not send {signal} to the init of {}: {e:#}",
+                                args.name
+                            ),
+                        );
+                    }
                 }
                 if latch == Latch::AfterSignal && !args.wait {
                     job = Some(sd.stop_unit_job(&unit).await?);
@@ -2089,6 +2191,34 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
     Ok(StopOutcome::Stopped)
 }
 
+/// restart: the machine stopped as `stop` with wait stops it, when it runs (a paused one
+/// too), then started with what it has.
+pub async fn restart(
+    ctx: &Context,
+    name: &str,
+    timeout: Option<u64>,
+    signal: Option<i32>,
+    report: Report<'_>,
+) -> Result<StartOutcome> {
+    let request = StopRequest {
+        name: name.to_string(),
+        force: false,
+        wait: true,
+        timeout,
+        signal,
+    };
+    // Held until the start is under way: the removal a machine made with remove starts
+    // at its end waits for it, and finds the next run.
+    let _restarting = ctx.store.mark_restarting(name)?;
+    match stop(ctx, &request, report).await {
+        Ok(_) => {}
+        // An image machined has that never ran as a machine of nspawn's: nothing to stop.
+        Err(e) if crate::api::kind_of(&e) == Some(FailureKind::NotRunning) => {}
+        Err(e) => return Err(e),
+    }
+    start(ctx, &StartRequest::keep(name), report).await
+}
+
 /// Whether a machine stopped is still down: not registered, no start preparing it, and
 /// its unit neither running nor about to.
 async fn still_down(sd: &Systemd, store: &Store, name: &str, unit: &str) -> Result<bool> {
@@ -2137,7 +2267,7 @@ pub struct KillRequest {
 /// machine it ends (through the mark the release hook reads).
 pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Result<()> {
     validate_entry_name(&args.name)?;
-    let signal = signal_number(&args.signal)?;
+    let signal = signal_number(&args.signal).map_err(invalid)?;
     let sd = ctx.sd().await?;
     refuse_foreign(sd, &args.name).await?;
     let unit = format!("systemd-nspawn@{}.service", args.name);
@@ -2145,7 +2275,7 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
     // Between two runs of a restart policy, or still starting (waiting for what it
     // depends on), only SIGKILL means something: it ends the restarts or the start.
     if !registered && !(signal == libc::SIGKILL && kill_ends(&sd.unit_status(&unit).await?)) {
-        bail!("machine {} is not running", args.name);
+        return Err(not_running(sd, &ctx.store, &args.name).await);
     }
     if signal == libc::SIGKILL {
         let request = StopRequest {
@@ -2153,6 +2283,7 @@ pub async fn kill(ctx: &Context, args: &KillRequest, report: Report<'_>) -> Resu
             force: true,
             wait: true,
             timeout: Some(0),
+            signal: None,
         };
         stop(ctx, &request, report).await?;
         // Between two runs no process got it, and nothing is said.
@@ -2266,19 +2397,19 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
         && args.pids_limit.is_none()
         && args.health.is_empty()
     {
-        bail!(
-            "nothing to update; give --memory, --memory-swap, --cpus, --pids-limit, --restart or a --health flag"
-        );
+        return Err(FailureKind::Invalid.error(
+            "nothing to update; give --memory, --memory-swap, --cpus, --pids-limit, --restart or a --health flag",
+        ));
     }
     let sd = ctx.sd().await?;
     refuse_foreign(sd, &args.name).await?;
     let store = &ctx.store;
     let _lock = store.lock().await?;
-    let mut record = store.load_image(&args.name)?.with_context(|| {
-        format!(
+    let mut record = store.load_image(&args.name)?.ok_or_else(|| {
+        FailureKind::NoSuchMachine.error(format!(
             "{} is not an image managed by nspawn; a restart policy or limits need one",
             args.name
-        )
+        ))
     })?;
     let unit = format!("systemd-nspawn@{}.service", args.name);
     let state = sd.unit_status(&unit).await?;
@@ -2295,10 +2426,10 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
     let previous_policy = record.restart;
     if let Some(restart) = args.restart {
         if record.remove_on_exit && restart != Restart::No {
-            bail!(
-                "{} was started with --rm: a machine removed when it ends cannot be restarted",
+            return Err(FailureKind::Invalid.error(format!(
+                "the restart policy of {} cannot change: it is removed when it ends",
                 args.name
-            );
+            )));
         }
         record.restart = restart;
     }
@@ -2308,10 +2439,14 @@ pub async fn update(ctx: &Context, args: &UpdateRequest) -> Result<bool> {
         args.memory_swap,
         args.cpus,
         args.pids_limit,
-    )?;
-    record.limits.check(record.mode)?;
+    )
+    .map_err(invalid)?;
+    record.limits.check(record.mode).map_err(invalid)?;
     if !args.health.is_empty() {
-        let hc = args.health.apply(record.effective_healthcheck())?;
+        let hc = args
+            .health
+            .apply(record.effective_healthcheck())
+            .map_err(invalid)?;
         record.healthcheck = Some(hc);
     }
     // The drop-in keeps the cgroup's access to the CDI nodes of a running machine:
@@ -2412,14 +2547,17 @@ async fn wait_for_previous(sd: &Systemd, name: &str, unit: &str, stub: bool) -> 
         // Its unit runs the hooks of a start already, which may wait for the machines it
         // depends on for as long as they take.
         if active == "activating" && state.sub == "start-pre" && !registered {
-            bail!("machine {name} is already starting; see journalctl -u {unit}");
+            return Err(FailureKind::AlreadyRunning.error(format!(
+                "machine {name} is already starting; see journalctl -u {unit}"
+            )));
         }
         match active.as_str() {
             "active" | "activating" if registered && machine_alive(sd, name, stub).await => {
                 if active == "activating" {
-                    bail!("machine {name} is already starting");
+                    return Err(FailureKind::AlreadyRunning
+                        .error(format!("machine {name} is already starting")));
                 }
-                bail!("machine {name} is already running");
+                return Err(running_already(sd, name).await);
             }
             "active" | "activating" | "reloading" | "deactivating" => {}
             _ if registered => {}
@@ -2678,12 +2816,14 @@ pub async fn spawn_in_namespaces(
     let sd = ctx.sd().await?;
     refuse_foreign(sd, machine).await?;
     if !sd.machine_exists(machine).await? {
-        bail!("machine {machine} is not running");
+        return Err(not_running(sd, &ctx.store, machine).await);
     }
     // A process cannot join a frozen cgroup and run: it would wait for the thaw.
     let unit = format!("systemd-nspawn@{machine}.service");
     if sd.freezer_state(&unit).await.ok().as_deref() == Some("frozen") {
-        bail!("machine {machine} is paused; unpause it before running a command in it");
+        return Err(FailureKind::Paused.error(format!(
+            "machine {machine} is paused; unpause it before running a command in it"
+        )));
     }
     let record = ctx.store.load_image(machine)?;
     let record = record.as_ref();
@@ -2745,7 +2885,7 @@ pub async fn open_shell(
     let sd = ctx.sd().await?;
     refuse_foreign(sd, machine).await?;
     if !sd.machine_exists(machine).await? {
-        bail!("machine {machine} is not running");
+        return Err(not_running(sd, &ctx.store, machine).await);
     }
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -2801,7 +2941,9 @@ pub async fn prepare_logs(ctx: &Context, request: &mut LogsRequest) -> Result<()
         {
             return Ok(());
         }
-        bail!("no machine named {}", request.machine);
+        return Err(
+            FailureKind::NoSuchMachine.error(format!("no machine named {}", request.machine))
+        );
     };
     check_logs_kept(&record, request.inside)?;
     if let Some(namespace) = record.tuning.journal_namespace() {
@@ -3562,6 +3704,77 @@ mod tests {
         let boot = check_logs_kept(&record("boot", Some("none")), false).unwrap_err();
         assert!(boot.to_string().contains("--inside"), "{boot}");
         assert!(check_logs_kept(&record("boot", Some("none")), true).is_ok());
+    }
+
+    #[test]
+    fn a_start_keeps_the_removal_at_the_end_unless_it_says_otherwise() {
+        let app = || -> ImageRecord {
+            serde_json::from_str(
+                r#"{"name": "web", "reference": "r", "manifest_digest": "d", "layers": [], "backend": "overlay", "created": 0, "mode": "app", "run": {"cmd": ["/bin/sh"]}}"#,
+            )
+            .unwrap()
+        };
+        // Made with remove: a start without the option keeps it.
+        let mut r = app();
+        r.remove_on_exit = true;
+        apply_flags(&mut r, &StartRequest::keep("web")).unwrap();
+        assert!(r.remove_on_exit);
+        let mut req = StartRequest::keep("web");
+        req.remove = Some(false);
+        apply_flags(&mut r, &req).unwrap();
+        assert!(!r.remove_on_exit, "given, it is set");
+        req.remove = Some(true);
+        apply_flags(&mut r, &req).unwrap();
+        assert!(r.remove_on_exit);
+        // With a restart policy, given now or had already, it is refused.
+        let mut req = StartRequest::keep("web");
+        req.restart = Some(Restart::Always);
+        let e = apply_flags(&mut r, &req).unwrap_err();
+        assert!(e.to_string().contains("exclude each other"), "{e}");
+        let mut policy = app();
+        policy.restart = Restart::OnFailure;
+        let mut req = StartRequest::keep("web");
+        req.remove = Some(true);
+        assert!(apply_flags(&mut policy, &req).is_err());
+        let mut policy = app();
+        policy.restart = Restart::OnFailure;
+        apply_flags(&mut policy, &StartRequest::keep("web")).unwrap();
+        assert!(!policy.remove_on_exit);
+    }
+
+    #[test]
+    fn a_second_pause_and_an_unpause_of_a_running_machine_are_refused() {
+        let kind = |e: Option<anyhow::Error>| e.map(|e| crate::api::kind_of(&e));
+        assert_eq!(
+            kind(pause_refused("web", true, true)),
+            Some(Some(FailureKind::Paused))
+        );
+        assert_eq!(
+            kind(pause_refused("web", false, false)),
+            Some(Some(FailureKind::NotPaused))
+        );
+        assert!(pause_refused("web", true, false).is_none());
+        assert!(pause_refused("web", false, true).is_none());
+        assert_eq!(
+            pause_refused("web", true, true).unwrap().to_string(),
+            "machine web is already paused"
+        );
+        assert_eq!(
+            pause_refused("web", false, false).unwrap().to_string(),
+            "machine web is not paused"
+        );
+    }
+
+    #[test]
+    fn not_running_says_whether_there_is_anything_of_the_name() {
+        let known = not_running_error("web", true);
+        assert_eq!(crate::api::kind_of(&known), Some(FailureKind::NotRunning));
+        let unknown = not_running_error("web", false);
+        assert_eq!(
+            crate::api::kind_of(&unknown),
+            Some(FailureKind::NoSuchMachine)
+        );
+        assert_eq!(unknown.to_string(), "machine web is not running");
     }
 
     #[test]

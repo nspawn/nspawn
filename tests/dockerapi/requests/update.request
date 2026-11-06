@@ -1,0 +1,4 @@
+POST /containers/life/update
+Content-Type: application/json
+
+{"Memory":67108864,"MemorySwap":134217728,"NanoCpus":500000000,"PidsLimit":-1,"RestartPolicy":{"Name":"on-failure","MaximumRetryCount":3}}

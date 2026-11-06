@@ -45,9 +45,9 @@ a client chooses the registry, never the policy.
 
 Every user may call; who may do what is polkit's answer. `ListImages`,
 `GetImage`, `Generate`, `ListMachines`, `GetMachine`, `MachineStats`,
-`MachineProcesses`, `Events`, `ListNetworks`, `GetNetwork`, `ListVolumes`,
-`ListSecrets`, `GetSecret`, `DiskUsage` and `BuildCacheUsage` ask for
-`org.nspawn.inspect`. Every other method asks for `org.nspawn.manage`: those
+`MachineProcesses`, `WaitMachine`, `Events`, `ListNetworks`, `GetNetwork`,
+`ListVolumes`, `ListSecrets`, `GetSecret`, `DiskUsage` and `BuildCacheUsage` ask
+for `org.nspawn.inspect`. Every other method asks for `org.nspawn.manage`: those
 that change something, run something inside a machine, or use the registry
 credentials kept here, so `Logs`, `SearchImages`, `ListRepositories`,
 `ListTags` and `ImageDigest` among them. What inspect shows includes every
@@ -118,8 +118,8 @@ type; `cpus` takes `d` or any integer. A list option given as `["none"]`
 forgets what the machine had, and an empty string forgets a string option
 (`hostname`, `user`, `working_dir`, `stop_signal`). Times are unix seconds
 unless a key says otherwise, durations of a healthcheck microseconds. Errors
-come back as `org.nspawn.Error.Failed` with the same message the command line
-prints.
+come back with the message the command line prints, under a name that says what
+failed (see Errors).
 
 Properties: `Version` (the command line compares it with its own and warns when
 they differ, since the service keeps running the binary it started with),
@@ -164,6 +164,9 @@ with their objects).
 | `depends_on` | as | `NAME:CONDITION` or `NAME:CONDITION:optional`, the condition started, healthy or completed |
 | `image_volumes` | as | what the image declares as volumes |
 | `healthcheck` | a{sv} | test (as), interval, timeout, start_period, start_interval (t, microseconds, 0 for the default: 30 s, 30 s, none and 5 s), retries (u, 0 for 3); empty without one |
+| `api_name` | s | the name the Docker API knows the machine by, where it is not the machine's own; absent otherwise |
+| `tty`, `interactive`, `stdin_once` | b | its program wants a terminal, its input stays open, the input closes once the client attached to it leaves; as `CreateMachine` was given them |
+| `remove` | b | removed once its run ends (`run --rm`, or `CreateMachine`'s remove) |
 
 A machine of `ListMachines` and `GetMachine` adds:
 
@@ -189,7 +192,7 @@ given is remembered for the machine.
 | `addresses` | as | `IP` on the primary network or `NETWORK=IP`: fixed addresses on networks made with `CreateNetwork` |
 | `publish` | as | `[IP:][HOST:]CONTAINER[/udp]` (an IPv6 IP in brackets: `[::1]:8080:80`; `0.0.0.0` every IPv4 address alone, `[::]` every IPv6 one, no IP both) or `published=HOST,target=CONTAINER[,protocol=udp][,host_ip=IP]`; no host port or 0 takes a free one, a host range with one container port the first free one in it, ranges of equal length one mapping per port |
 | `publish_all` | b | publish each port the image exposes to a free port of the host (`-P`/`--publish-all`) |
-| `entrypoint` | s | replaces the image's and drops its cmd; `""` runs the command alone |
+| `entrypoint` | s | replaces the image's and drops its cmd; `""` runs the command alone. `CreateMachine` also takes as: the whole entrypoint, program and arguments, `[]` for none |
 | `command` | as | replaces an app's cmd |
 | `image_command` | b | forgets the remembered entrypoint and command and runs the image's own |
 | `env`, `volume`, `label` | as | `VAR=value` or `VAR`; `SOURCE:TARGET[:ro]`; `KEY=VALUE` on top of the image's labels |
@@ -214,9 +217,19 @@ given is remembered for the machine.
 | `oom_score_adj` | x | |
 
 `StartMachine` adds `wait` (b, default true: wait for a booted machine's init)
-and `remove` (b, `run -d --rm`: removed once it ends). `CreateMachine` takes
-no `image_command`, and adds `backend` and `force`, and `registry` and
-`ca_cert` for a source it has to pull.
+and `remove` (b, `run -d --rm`: true has the machine removed once it ends, false
+keeps it; absent, the machine keeps what it had). A machine removed once it ends
+takes no restart policy but no. `CreateMachine` takes no `image_command`, and
+adds `backend` and `force`, `registry` and `ca_cert` for a source it has to
+pull, and:
+
+| Option | Type | Meaning |
+|---|---|---|
+| `api_name` | s | the name the Docker API knows the machine by: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, 1024 bytes at most, one machine's among those that are no images only (`Exists` otherwise, as for a machine named as another's API name). With `name` empty the machine's name is made of it: itself when it is a machine name no record holds, else its runs of characters other than letters and digits each one `-`, cut to 55 bytes, `-` and the first 8 hex digits of its SHA-256 |
+| `tty`, `interactive`, `stdin_once` | b | kept in the record for whoever attaches |
+| `remove` | b | removed once its run ends, from its first start on |
+
+The job's result `name` is the machine's name.
 
 ### Images
 
@@ -259,10 +272,13 @@ error that says so.
 | `GetMachine(s name) -> a{sv}` | `inspect` | one machine as `ListMachines` has it, running or not; fails for a name that neither runs nor has a record |
 | `StartMachine(s name, a{sv} options) -> (s, as)` | `start` | the machine options (see Machine options); "started", "ended" (the program returned before the machine registered) or "restarting" (it ended and its restart policy brings it back), and the notes made on the way |
 | `RunMachine(s name, a{sv} options, a{sh} fds) -> (a{sh}, o, as)` | `run` without `-d` | starts, attached, a machine that `PullImage` or `CreateMachine` made; options those of `StartMachine` (wait defaults to false, remove is `--rm`), tty (b), rows and cols (t, 24 and 80), term (s, xterm); descriptor stdin for the program's input without tty. An app gets a pseudo terminal with tty, its master under "tty"; otherwise the machine's output, a line at a time, under "stdout". Returns the streams, a process object with the run's exit status (the program's, or 128 plus the signal it died of, 137 after SIGKILL), and the start's notes. A transient unit removes a `--rm` machine once the machine's unit is down |
-| `StopMachine(s name, a{sv} options) -> (s, as)` | `stop` | options force, wait (default true), timeout (seconds; the machine's stop_timeout by default, else 10; a day at most, or 18446744073709551615 to wait for as long as it takes, as `stop -t -1` asks); "stopped" or "was-not-running", and the notes (a program that had to be killed) |
+| `StopMachine(s name, a{sv} options) -> (s, as)` | `stop` | options force, wait (default true), timeout (seconds; the machine's stop_timeout by default, else 10; a day at most, or 18446744073709551615 to wait for as long as it takes, as `stop -t -1` asks), signal (s, a name or a number: sent first instead of the machine's stop signal, to an app's program or a booted machine's init, the timeout and SIGKILL after it); "stopped" or "was-not-running", and the notes (a program that had to be killed) |
+| `RestartMachine(s name, a{sv} options) -> (s, as)` | `restart` | options timeout, signal, as for `StopMachine`; the machine stopped when it runs (a paused one too) as `StopMachine` with wait stops it, then started with what it has as `StartMachine` with wait; `StartMachine`'s outcome, and the notes of both |
+| `WaitMachine(s name, a{sv} options) -> o` | `wait` | option condition (s): not-running (the default), next-exit or removed; a job of kind "wait" whose result is exit_code (i, the program's, or 128 plus the signal it died of). not-running ends at once for a machine that does not run, a restarting one included, with its last run's code (0 for one that never ran), and otherwise at the end of its run, whether its restart policy brings it back or not; next-exit at the end of its next run; removed once its record is gone, with the last run's code. The removal of the machine ends a wait of any condition, with that code. A name with no record and no machine is refused by the call itself. The job ends when its caller leaves the bus |
+| `PruneMachines(a{sv} options) -> o` | `system prune` (its machines) | every machine that is stopped and is no image only goes; options until (t: only those made before), labels (as, KEY or KEY=VALUE: every one matches, the image's labels with the machine's on top), labels_not (as: a machine that matches every one of them stays), made (b: only machines made from an image by create or run, as `system prune` takes them); a job of kind "machine-prune" |
 | `KillMachine(s name, a{sv} options) -> as` | `kill` | option signal (a name such as KILL, SIGHUP or RTMIN+3, or a number; SIGKILL by default). SIGKILL is `StopMachine` with force; other signals go to an app's program (waited for a few seconds right after a start) or to a booted machine's init. A signal that stops the machine keeps its restart policy from bringing it back: SIGKILL, any signal to an app without a stop signal of its own, an app's own stop signal, or SIGRTMIN+3 and SIGRTMIN+4 (halt, poweroff) to a booted init; other signals leave the policy in charge. Fails for a machine that does not run, except SIGKILL, which also ends one between two runs of its restart policy or still waiting to start. Returns the notes |
-| `PauseMachine(s name)`, `UnpauseMachine(s name)` | `pause`, `unpause` | the machine's cgroup frozen and thawed; fail for a machine that does not run |
-| `UpdateMachine(s name, a{sv} options) -> b` | `update` | options restart, memory, memory_swap, cpus, pids_limit, no_healthcheck and the health_* ones, as for `StartMachine` (0 removes a limit, absent keeps it); a running machine gets the limits at once and its probes start over; true when it was running |
+| `PauseMachine(s name)`, `UnpauseMachine(s name)` | `pause`, `unpause` | the machine's cgroup frozen and thawed; fail for a machine that does not run (`NotRunning`), a pause of a paused one (`Paused`) and an unpause of one that is not (`NotPaused`) |
+| `UpdateMachine(s name, a{sv} options) -> b` | `update` | options restart, memory, memory_swap, cpus, pids_limit, no_healthcheck and the health_* ones, as for `StartMachine` (0 removes a limit, absent keeps it); a running machine gets the limits at once and its probes start over; true when it was running. A machine removed once it ends takes no restart policy but no |
 | `MachineStats(as names) -> aa{sv}` | `stats` | one sample of each named machine that runs (every running container when none is named; names that do not run are left out): name, time_usec (CLOCK_MONOTONIC), cpu_usec, memory (memory.current without inactive_file), memory_limit (the host's memory without a limit), pids, io_read, io_write, net_rx, net_tx; a counter that cannot be read is left out, the network ones on the host's network; rates come from two samples |
 | `MachineProcesses(s name) -> aa{sv}` | `top` | the processes in the machine's PID namespace, from its cgroup: pid (u), user (s, the uid as the machine sees it, root for 0), time (s, CPU time HH:MM:SS), command (s) |
 | `Generate(as names, a{sv} options) -> s` | `generate` | a shell script that makes the named machines again, every machine of nspawn's when none is named: `network create` for the networks they join, then `run -d` with every flag a machine keeps (`pull` for an image without flags of its own), each after the machines it depends on or takes its network from, which come along; what the flags cannot carry (secrets, host directories, images built on this host, a healthcheck in exec form) as comments at the top; options: none (any key is an error) |
@@ -347,10 +363,32 @@ entries are PID 1's about `systemd-nspawn@` units and nspawn's own (message ID
 
 | Type | Actions | Attributes of every action | The action's own |
 |---|---|---|---|
-| `machine` | `start`, `die`, `stop`, `restart`, `oom`, `fail` (systemd's, for every `systemd-nspawn@` unit), `pull`, `build`, `create`, `push`, `kill`, `update`, `pause`, `unpause`, `health_status`, `auto-update`, `remove` (nspawn's) | `image` (the record's reference), `created` (which machine of the name it was) | `die`: `code` (`exited`, `killed`, `dumped`), `exit_code` (that run's exit code, the program's or 128 plus its signal: from the signal nspawn sent to it while the record exists, from the status systemd logged once it is gone), `signal`; `restart`: `restarts`; `fail`: `result`; `pull`: `reference`, `signed_by` (when a signature was verified); `build`: `reference`; `create`: `from`, `reference`; `push`: `reference` (the destination); `kill`: `signal`; `health_status`: `status`; `auto-update`: `result`, `from`, `to` |
+| `machine` | `start`, `die`, `stop`, `restart`, `oom`, `fail` (systemd's, for every `systemd-nspawn@` unit), `pull`, `build`, `create`, `push`, `kill`, `update`, `pause`, `unpause`, `health_status`, `auto-update`, `remove` (nspawn's) | `image` (the record's reference), `created` (which machine of the name it was), `api_name` (nspawn's actions, when the record has one) | `die`: `code` (`exited`, `killed`, `dumped`), `exit_code` (that run's exit code, the program's or 128 plus its signal: from the signal nspawn sent to it while the record exists, from the status systemd logged once it is gone), `signal`; `restart`: `restarts`; `fail`: `result`; `pull`: `reference`, `signed_by` (when a signature was verified); `build`: `reference`; `create`: `from`, `reference`; `push`: `reference` (the destination); `kill`: `signal`; `health_status`: `status`; `auto-update`: `result`, `from`, `to` |
 | `network` | `create`, `remove`, `connect`, `disconnect` | `subnet`, `interface`, `internal`, `created` | `connect`, `disconnect`: `container`, `container_created` |
 | `volume` | `create`, `remove` | `path` | |
 | `secret` | `create`, `remove` | `size` (bytes of the plaintext) | |
+
+### Errors
+
+A method that fails, and a job that failed (its `ErrorName`), say what failed
+with a name under `org.nspawn.Error`; the message is the one the command line
+prints.
+
+| Name | When |
+|---|---|
+| `Failed` | anything the others do not name |
+| `NotAuthorized` | polkit refused the caller |
+| `NoSuchMachine` | a machine method names nothing: no record and no machine (`GetMachine`, `StartMachine`, `RunMachine`, `StopMachine`, `RestartMachine`, `KillMachine`, `PauseMachine`, `UnpauseMachine`, `UpdateMachine`, `WaitMachine`, `MachineProcesses`, `Exec`, `Shell`, `Logs`, `CopyFrom`, `CopyTo`, `RemoveMachines`, the machine of `ConnectNetwork` and `DisconnectNetwork`) |
+| `NoSuchImage` | the source of `CreateMachine` is no local image; `GetImage` and `RemoveImages` of an image that is not there |
+| `NoSuchNetwork` | a network named that does not exist |
+| `NoSuchVolume` | `RemoveVolumes` of a volume that does not exist |
+| `Exists` | a name taken: `CreateMachine` and `PullImage` without force, an API name in use, `CreateNetwork`, `CreateSecret`, a second `ConnectNetwork` |
+| `InUse` | a removal refused because something uses what it names: a machine that runs (without force) or that another one needs, a volume, a network or a secret a machine names |
+| `NotRunning` | what needs a running machine, of one that does not run (`KillMachine`, `PauseMachine`, `UnpauseMachine`, `MachineProcesses`, `Exec`, `Shell`) |
+| `AlreadyRunning` | `StartMachine` and `RunMachine` of a machine that runs, or is starting |
+| `Paused` | `StartMachine` and `RunMachine` of a paused machine, `PauseMachine` of one, and `Exec` into one |
+| `NotPaused` | `UnpauseMachine` of a machine that is not paused |
+| `Invalid` | a bad argument or option: a wrong type, an unknown option, a value that is none (a name, a restart policy, a signal, a condition), options that exclude each other |
 
 ## org.nspawn.Names at /org/nspawn
 
@@ -386,15 +424,20 @@ A job is returned by the long operations and keeps what happened. Properties:
 
 - `Kind`: pull, create, push, build, rm, cp, volume-rm, volume-prune, secret-rm,
   network-rm, network-connect, network-disconnect, network-prune, image-prune,
-  builder-prune or auto-update.
-- `Target`: the image name, reference or tag it works on, `MACHINE:PATH` for cp,
-  the machine for network-connect and network-disconnect, the names joined by
-  spaces for a removal, empty for the prunes and auto-update.
+  machine-prune, builder-prune, auto-update or wait.
+- `Target`: the image name, reference or tag it works on (the API name of a
+  create whose machine's name is made of it), `MACHINE:PATH` for cp, the machine
+  for network-connect, network-disconnect and wait, the names joined by spaces
+  for a removal, empty for the prunes and auto-update.
 - `State`: running, done or failed. A removal or prune that failed for some
   names is failed with its `Result` still listing what it removed.
 - `Output`: its last thousand lines, at most 1 MiB of them; lines that come
   faster than they go out as `JobOutput` are dropped, and a note says how many.
 - `Error`: the message of a failed job.
+- `ErrorName`: the name of a failed job's error, as a method would have answered
+  with it (see Errors), `""` while it runs or when it is done. A removal or
+  prune that failed for some names has the name their failures share, else
+  `org.nspawn.Error.Failed`.
 - `Result`, a dictionary:
 
 | Kind | Result |
@@ -406,6 +449,8 @@ A job is returned by the long operations and keeps what happened. Properties:
 | create | name, mode |
 | rm, volume-rm, volume-prune, secret-rm, network-rm, network-prune | removed (as) |
 | image-prune, builder-prune | removed (as), reclaimed (t, bytes) |
+| machine-prune | removed (as), reclaimed (t, bytes of their writable layers, as `DiskUsage` counts them) |
+| wait | exit_code (i) |
 | auto-update | machines (aa{ss}: name, image, policy, updated (false, pending, true, failed, rolled back or skipped), reason, from, to) |
 | cp | entries, bytes |
 | network-connect, network-disconnect | empty |

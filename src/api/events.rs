@@ -59,15 +59,19 @@ pub fn emit_machine(
     name: &str,
     attributes: &[(&str, &str)],
 ) {
-    let created = store
-        .load_image(name)
-        .ok()
-        .flatten()
-        .map(|r| r.created.to_string());
+    let record = store.load_image(name).ok().flatten();
+    let created = record.as_ref().map(|r| r.created.to_string());
     let mut all: Vec<(&str, &str)> = attributes.to_vec();
     if let Some(created) = created.as_deref() {
         if !attributes.iter().any(|(k, _)| *k == "created") {
             all.push(("created", created));
+        }
+    }
+    // The name the Docker Engine API knows it by, which a reader of the event may no
+    // longer find in a record.
+    if let Some(api_name) = record.as_ref().and_then(|r| r.api_name.as_deref()) {
+        if !attributes.iter().any(|(k, _)| *k == "api_name") {
+            all.push(("api_name", api_name));
         }
     }
     emit("machine", action, name, &all);

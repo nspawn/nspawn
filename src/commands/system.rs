@@ -1,7 +1,7 @@
 //! images prune, system df and system prune, their prompts and output as scripts that
 //! read them expect.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use anyhow::{bail, Result};
 use zbus::zvariant::{OwnedValue, Value};
@@ -429,47 +429,30 @@ pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
     }
     let manager = &client.manager;
     // Stopped machines made from an image: a pulled or built record is the image too.
-    let usage = manager.disk_usage().await.map_err(client::error)?;
-    let stopped: HashMap<String, u64> = rows(&usage, "container_rows")
-        .iter()
-        .filter(|r| client::bool(r, "made") && !client::bool(r, "running"))
-        .map(|r| (client::string(r, "name"), client::u64(r, "size")))
-        .collect();
-    let mut names: Vec<String> = Vec::new();
-    if !stopped.is_empty() {
-        let known: HashSet<&String> = stopped.keys().collect();
-        for machine in manager.list_machines(true).await.map_err(client::error)? {
-            let name = client::string(&machine, "name");
-            if !known.contains(&name) || client::string(&machine, "state") != "stopped" {
-                continue;
-            }
-            if selected(&client::dict_to_json(&machine), &labels, until) {
-                names.push(name);
-            }
-        }
+    let mut options = Options::new();
+    options.insert("made", Value::from(true));
+    if !labels.is_empty() {
+        options.insert("labels", Value::from(labels.clone()));
     }
-    let mut reclaimed = 0;
-    let mut removed_machines = Vec::new();
-    if !names.is_empty() {
-        let result = client
-            .run_job_silent(|| manager.remove_machines(&names, Options::new()), true)
-            .await;
-        // What could not go stays; the rest of the prune goes on.
-        if let Err(e) = &result {
+    if let Some(until) = until {
+        options.insert("until", Value::from(until));
+    }
+    let pruned = client::partly(
+        client
+            .run_job_silent(|| manager.prune_machines(options), true)
+            .await,
+    );
+    // What could not go stays; the rest of the prune goes on.
+    let (removed_machines, mut reclaimed) = match pruned {
+        Ok(result) => (
+            client::strings(&result, "removed"),
+            client::u64(&result, "reclaimed"),
+        ),
+        Err(e) => {
             eprintln!("warning: {e:#}");
+            (Vec::new(), 0)
         }
-        let left: HashSet<String> = manager
-            .list_machines(true)
-            .await
-            .map_err(client::error)?
-            .iter()
-            .map(|m| client::string(m, "name"))
-            .collect();
-        for name in names.iter().filter(|n| !left.contains(*n)) {
-            reclaimed += stopped.get(name).copied().unwrap_or(0);
-            removed_machines.push(name.clone());
-        }
-    }
+    };
     // The service prunes every unused network; with filters, the ones they select.
     let networks = if args.filters.is_empty() {
         client::partly(

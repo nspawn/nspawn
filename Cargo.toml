@@ -20,6 +20,7 @@ nix = { version = "0.31", features = [
     "user",
     "fs",
     "dir",
+    "inotify",
     "ioctl",
     "signal",
     "sched",

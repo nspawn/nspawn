@@ -221,6 +221,7 @@ async fn update(
             force: false,
             wait: true,
             timeout: None,
+            signal: None,
         };
         crate::api::machines::stop(ctx, &stop, report).await?;
     }
@@ -325,6 +326,7 @@ async fn update(
                 force: true,
                 wait: true,
                 timeout: Some(0),
+                signal: None,
             };
             let _ = crate::api::machines::stop(ctx, &force, report).await;
             {

@@ -157,10 +157,14 @@ fn remove_in(store: &Store, names: &[String], report: Report<'_>) -> Result<Remo
                 );
                 removal.removed.push(name.clone());
             }
-            Err(e) => removal.failed.push((name.clone(), format!("{e:#}"))),
+            Err(e) => removal.refuse(name, e),
         }
     }
     Ok(removal)
+}
+
+fn no_volume(name: &str) -> anyhow::Error {
+    crate::api::FailureKind::NoSuchVolume.error(format!("no volume named {name}"))
 }
 
 fn remove_one(store: &Store, name: &str, users: &BTreeMap<String, BTreeSet<String>>) -> Result<()> {
@@ -172,11 +176,11 @@ fn remove_one(store: &Store, name: &str, users: &BTreeMap<String, BTreeSet<Strin
                 path.display()
             );
         }
-        bail!("no volume named {name}");
+        return Err(no_volume(name));
     }
     let meta = match path.symlink_metadata() {
         Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("no volume named {name}"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(no_volume(name)),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
     if !meta.is_dir() {
@@ -187,10 +191,10 @@ fn remove_one(store: &Store, name: &str, users: &BTreeMap<String, BTreeSet<Strin
     }
     if let Some(machines) = users.get(name) {
         let machines: Vec<&str> = machines.iter().map(String::as_str).collect();
-        bail!(
+        return Err(crate::api::FailureKind::InUse.error(format!(
             "volume {name} is in use by {}; start them with -v none (or other volumes) first",
             machines.join(", ")
-        );
+        )));
     }
     if is_mountpoint(&path)? {
         bail!("{} is a mount point; unmount it first", path.display());
@@ -293,6 +297,10 @@ mod tests {
                 restart: Default::default(),
                 limits: Default::default(),
                 remove_on_exit: false,
+                api_name: None,
+                tty: false,
+                interactive: false,
+                stdin_once: false,
                 extra_networks: Vec::new(),
                 aliases: BTreeMap::new(),
                 no_network: false,

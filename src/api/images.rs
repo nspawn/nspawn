@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
-use crate::api::{line, note, require_root, Context, Report};
+use crate::api::failure::common_kind;
+use crate::api::{kind_of, line, note, require_root, Context, FailureKind, Report};
 use crate::backend::{Assembler, BackendChoice};
 use crate::bridge;
 
@@ -120,9 +121,38 @@ fn still_needed(
 pub struct Removal {
     pub removed: Vec<String>,
     pub failed: Vec<(String, String)>,
+    /// The kind of each failure that says one, by name.
+    kinds: Vec<(String, FailureKind)>,
 }
 
 impl Removal {
+    /// `name` stays, for the reason `e` gives.
+    pub fn refuse(&mut self, name: &str, e: anyhow::Error) {
+        if let Some(kind) = kind_of(&e) {
+            self.kinds.push((name.to_string(), kind));
+        }
+        self.failed.push((name.to_string(), format!("{e:#}")));
+    }
+
+    /// The failures as one error, of the kind they all share, if they share one.
+    pub fn failure(&self) -> Option<anyhow::Error> {
+        let message = self.error()?;
+        let kinds: Vec<Option<FailureKind>> = self
+            .failed
+            .iter()
+            .map(|(name, _)| {
+                self.kinds
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, kind)| *kind)
+            })
+            .collect();
+        Some(match common_kind(&kinds) {
+            Some(kind) => kind.error(message),
+            None => anyhow::anyhow!(message),
+        })
+    }
+
     /// The failures as one message, when there were any.
     pub fn error(&self) -> Option<String> {
         if self.failed.is_empty() {
@@ -185,7 +215,7 @@ pub async fn remove_machines_if(
     // A name is joined to paths below: one that is not a plain entry is refused first.
     for name in names {
         if let Err(e) = crate::reference::validate_entry_name(name) {
-            removal.failed.push((name.clone(), format!("{e:#}")));
+            removal.refuse(name, e);
             skip.insert(name.clone());
         }
     }
@@ -193,7 +223,7 @@ pub async fn remove_machines_if(
     // lock, as a machine may have come to need one meanwhile.
     let records = store.list_images()?;
     for (name, why) in still_needed(&records, names, &skip) {
-        removal.failed.push((name.clone(), why));
+        removal.refuse(&name, FailureKind::InUse.error(why));
         skip.insert(name);
     }
     if force {
@@ -230,9 +260,10 @@ pub async fn remove_machines_if(
                 force: true,
                 wait: true,
                 timeout: Some(0),
+                signal: None,
             };
             if let Err(e) = crate::api::machines::stop(ctx, &stop, report).await {
-                removal.failed.push((name.clone(), format!("{e:#}")));
+                removal.refuse(name, e);
                 skip.insert(name.clone());
             }
         }
@@ -240,7 +271,7 @@ pub async fn remove_machines_if(
     let _lock = store.lock().await?;
     let records = store.list_images()?;
     for (name, why) in still_needed(&records, names, &skip) {
-        removal.failed.push((name.clone(), why));
+        removal.refuse(&name, FailureKind::InUse.error(why));
         skip.insert(name);
     }
     for name in names {
@@ -248,7 +279,7 @@ pub async fn remove_machines_if(
             continue;
         }
         if let Some(why) = keep(store, &records, name) {
-            removal.failed.push((name.clone(), why));
+            removal.refuse(name, FailureKind::InUse.error(why));
             skip.insert(name.clone());
         }
     }
@@ -261,7 +292,7 @@ pub async fn remove_machines_if(
     // stays keeps them.
     let order = crate::api::dependencies::removal_order(&records, names);
     for name in order.iter().filter(|n| !skip.contains(*n)) {
-        let outcome: Result<Option<(String, u64)>> = async {
+        let outcome: Result<Option<(String, u64, Option<String>)>> = async {
             let staying = crate::api::dependencies::holders(&records, name, &removal.removed);
             if !staying.is_empty() {
                 let (stays, needs) = if staying.len() == 1 {
@@ -269,19 +300,22 @@ pub async fn remove_machines_if(
                 } else {
                     ("stay", "need")
                 };
-                bail!(
+                return Err(FailureKind::InUse.error(format!(
                     "{} {stays} and {needs} {name} (--depends-on or --network container:); {name} stays with it",
                     staying.join(", ")
-                );
+                )));
             }
             if store.is_starting(name) {
-                bail!("machine {name} is starting; wait for it or stop it first");
+                return Err(FailureKind::InUse.error(format!(
+                    "machine {name} is starting; wait for it or stop it first"
+                )));
             }
             if sd.machine_exists(name).await? {
-                bail!("machine {name} is running; stop it first{hint}");
+                return Err(FailureKind::InUse
+                    .error(format!("machine {name} is running; stop it first{hint}")));
             }
             if let Some(why) = crate::api::machines::unit_busy(sd, name).await? {
-                bail!("{why}{hint}");
+                return Err(FailureKind::InUse.error(format!("{why}{hint}")));
             }
             match store.load_image(name)? {
                 Some(rec) => {
@@ -303,7 +337,7 @@ pub async fn remove_machines_if(
                             ),
                         );
                     }
-                    Ok(Some((rec.reference, rec.created)))
+                    Ok(Some((rec.reference, rec.created, rec.api_name)))
                 }
                 None => {
                     // Not recorded: an image machined knows, or leftovers of ours. A name
@@ -321,7 +355,8 @@ pub async fn remove_machines_if(
                         found = true;
                     }
                     if !found {
-                        bail!("no machine or image named {name}");
+                        return Err(FailureKind::NoSuchMachine
+                            .error(format!("no machine or image named {name}")));
                     }
                     Ok(None)
                 }
@@ -333,16 +368,19 @@ pub async fn remove_machines_if(
                 line(report, format!("removed {name}"));
                 // The record is gone: what the event says of the machine has to travel
                 // with it.
-                let created = image.as_ref().map(|(_, c)| c.to_string());
+                let created = image.as_ref().map(|(_, c, _)| c.to_string());
                 let mut attributes: Vec<(&str, &str)> = Vec::new();
-                if let (Some((reference, _)), Some(created)) = (&image, &created) {
+                if let (Some((reference, _, api_name)), Some(created)) = (&image, &created) {
                     attributes.push(("image", reference.as_str()));
                     attributes.push(("created", created.as_str()));
+                    if let Some(api_name) = api_name {
+                        attributes.push(("api_name", api_name.as_str()));
+                    }
                 }
                 crate::api::events::emit("machine", "remove", name, &attributes);
                 removal.removed.push(name.clone());
             }
-            Err(e) => removal.failed.push((name.clone(), format!("{e:#}"))),
+            Err(e) => removal.refuse(name, e),
         }
     }
     // Whatever happened above, what was removed must not pin anything, and a machine that
@@ -402,6 +440,35 @@ mod tests {
         assert!(needed[1].1.contains("network of torrent"));
         // Going together, nothing stays behind them.
         assert!(still_needed(&records, &names(&["db", "web"]), &none).is_empty());
+    }
+
+    #[test]
+    fn removal_failures_have_a_kind_when_they_share_one() {
+        let mut removal = Removal::default();
+        assert!(removal.failure().is_none());
+        removal.refuse(
+            "a",
+            FailureKind::InUse.error("machine a is running; stop it first"),
+        );
+        removal.refuse("b", FailureKind::InUse.error("b stays and needs c"));
+        let failure = removal.failure().unwrap();
+        assert_eq!(kind_of(&failure), Some(FailureKind::InUse));
+        assert_eq!(
+            failure.to_string(),
+            "machine a is running; stop it first; b stays and needs c"
+        );
+        removal.refuse(
+            "d",
+            FailureKind::NoSuchMachine.error("no machine or image named d"),
+        );
+        assert_eq!(kind_of(&removal.failure().unwrap()), None, "kinds differ");
+        let mut plain = Removal::default();
+        plain.refuse("web", anyhow::anyhow!("Permission denied"));
+        assert_eq!(kind_of(&plain.failure().unwrap()), None);
+        assert_eq!(
+            plain.failure().unwrap().to_string(),
+            "web: Permission denied"
+        );
     }
 
     #[test]

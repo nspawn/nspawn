@@ -1,7 +1,8 @@
 #!/bin/sh
 # Runs inside the oracle (docker in docker, see oracle.sh): makes the containers the
-# golden answers describe, records the answers of the API into $OUT/golden and what each
-# tool asks of it into $OUT/requests (one request line per call, through logproxy.py).
+# golden answers describe, records the answers of the API into $OUT/golden and into
+# $OUT/requests what each tool asks of it (one request line per call, through
+# logproxy.py) and the request of each lifecycle case (NAME.request).
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 OUT=${OUT:-/out}
@@ -25,13 +26,31 @@ save() {
     name=$1
     shift
     curl -sS --unix-socket $S -D "$G/$name.headers" -o "$G/$name.body" -w '%{http_code}\n' "$@" > "$G/$name.status" || true
+    # curl writes no file for an answer that cannot have a body (304).
+    [ -e "$G/$name.body" ] || : > "$G/$name.body"
+}
+
+# call NAME METHOD PATH [CONTENT_TYPE BODY]: save of a lifecycle case, which also keeps
+# the request in $R/NAME.request: its request line and, when it has a body, the
+# Content-Type header, an empty line and the body as sent.
+call() {
+    printf '%s %s\n' "$2" "$3" > "$R/$1.request"
+    if [ $# -ge 5 ]; then
+        printf 'Content-Type: %s\n\n%s' "$4" "$5" >> "$R/$1.request"
+        save "$1" -X "$2" -H "Content-Type: $4" --data-binary "$5" "http://d$3"
+    else
+        save "$1" -X "$2" "http://d$3"
+    fi
 }
 
 busybox=busybox:1.37
 docker pull -q $busybox >/dev/null
+# since counts whole seconds: the pull's event stays out of the events case, the
+# network's and the volume's are in.
+sleep 1
+t0=$(date +%s)
 docker network create --label e2e=yes front >/dev/null
 docker volume create data >/dev/null
-t0=$(date +%s)
 docker run -d --name web --network front --network-alias www -p 8080:80 -e GREETING=hello \
     -l caddy=http://web.test -l 'caddy.reverse_proxy={{upstreams 80}}' -l traefik.enable=true \
     -l 'traefik.http.routers.web.rule=Host(`web.test`)' -e VIRTUAL_HOST=web.test \
@@ -180,4 +199,47 @@ save system-df http://d/system/df
 for what in plugins swarm services secrets configs nodes tasks; do
     save $what http://d/$what
 done
+
+# The lifecycle of containers through the API's writes. keep goes first, so that the
+# containers listed, waited for and pruned are these alone: life runs sleep as PID 1,
+# which ignores SIGTERM, so that a stop takes its timeout and ends in SIGKILL; created
+# is made as `docker create -it --rm` makes it and never starts; exited ends with 3
+# while a wait for it blocks. rm removes life, the prune the other two.
+docker rm -f keep >/dev/null
+life='{"Image":"busybox:1.37","Cmd":["sleep","3600"],"Labels":{"e2e":"lifecycle"}}'
+call create POST '/containers/create?name=life' application/json "$life"
+# The engine reads the body, then checks the settings, the image and the name in that
+# order: each of these fails at one step alone.
+call create-badname POST '/containers/create?name=-life' application/json "$life"
+call create-conflict POST '/containers/create?name=life' application/json "$life"
+call create-noimage POST '/containers/create?name=never' application/json '{"Image":"docker.io/library/nope"}'
+call create-badjson POST '/containers/create?name=never' application/json '{"Image":"busybox:1.37"'
+call create-contenttype POST '/containers/create?name=never' text/plain "$life"
+call create-autoremove-restart POST '/containers/create?name=never' application/json \
+    '{"Image":"busybox:1.37","HostConfig":{"AutoRemove":true,"RestartPolicy":{"Name":"always"}}}'
+call start POST /containers/life/start
+call start-again POST /containers/life/start
+docker create --name created -it --rm -l e2e=lifecycle $busybox sh >/dev/null
+call inspect-created GET /containers/created/json
+call containers-created GET '/containers/json?all=1&filters=%7B%22status%22%3A%5B%22created%22%5D%7D'
+call wait-created POST /containers/created/wait
+call update-autoremove POST /containers/created/update application/json '{"RestartPolicy":{"Name":"always"}}'
+call pause POST /containers/life/pause
+call pause-again POST /containers/life/pause
+call unpause POST /containers/life/unpause
+call unpause-again POST /containers/life/unpause
+call stop POST '/containers/life/stop?t=1'
+call stop-again POST '/containers/life/stop?t=1'
+call pause-stopped POST /containers/life/pause
+call restart POST '/containers/life/restart?t=1'
+call update POST /containers/life/update application/json \
+    '{"Memory":67108864,"MemorySwap":134217728,"NanoCpus":500000000,"PidsLimit":-1,"RestartPolicy":{"Name":"on-failure","MaximumRetryCount":3}}'
+call rm-running DELETE /containers/life
+call rm DELETE '/containers/life?force=1'
+call rm-missing DELETE /containers/life
+docker run -d --name exited -l e2e=lifecycle $busybox sh -c 'head -c 4096 /dev/zero > /written; sleep 2; exit 3' >/dev/null
+call wait-exited POST /containers/exited/wait
+call wait-badcondition POST '/containers/exited/wait?condition=bogus'
+call wait-missing POST /containers/nope/wait
+call prune POST '/containers/prune?filters=%7B%22label%22%3A%5B%22e2e%3Dlifecycle%22%5D%7D'
 echo "recorded into $OUT"

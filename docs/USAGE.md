@@ -512,8 +512,8 @@ export DOCKER_HOST=unix:///run/nspawn/api.sock
 ```
 
 Every user may connect, and polkit decides what each one may do, with the actions of
-the bus service ([DBUS.md](DBUS.md)): reads ask for `org.nspawn.inspect`, logs and
-changes for `org.nspawn.manage`, `_ping` and `version` for nothing. polkit is never
+the bus service ([DBUS.md](DBUS.md)): reads and waits ask for `org.nspawn.inspect`, logs
+and changes for `org.nspawn.manage`, `_ping` and `version` for nothing. polkit is never
 asked to prompt, since nothing on a socket answers an authentication agent: a user who
 is not root needs a rule, such as the example the packages ship. Root may do
 everything. On a host without docker, clients that only look at `/run/docker.sock` or
@@ -532,9 +532,34 @@ happen, logs, stats and top, the networks, the images and the volumes. A record 
 or built that never ran is an image there, not a container, and a machine made from it
 is a container. Images are told apart by their config: an image's ID is its config's
 digest, its tags are the references its records were pulled or built as, and a
-reference names the image of the last record pulled with it. The one change the API
-makes is `POST /containers/ID/kill`, which sends a signal as `nspawn kill` does; other
-changes, and reads of swarm objects and plugins, answer 501 with "not supported".
+reference names the image of the last record pulled with it.
+
+Containers are made and run through the bus service, as the command line's requests
+are: `POST /containers/create`, `start`, `stop`, `restart`, `kill`, `pause`, `unpause`,
+`wait`, `update`, `DELETE /containers/ID` and `POST /containers/prune`. A create takes
+its image by reference (one without a registry is Docker Hub's, as clients mean it), by
+its ID or a prefix of it, or as `repository@digest`, and pulls nothing: a missing image
+is 404, which clients answer with a pull. Its name follows the API's rule,
+`[a-zA-Z0-9][a-zA-Z0-9_.-]+`; one that is no machine name, such as `reaper_1`, stays the
+container's name in the API, and its machine gets one made of it (`reaper-1-` and eight
+hex digits), which `nspawn ps` shows; the machines of its networks reach it by either. Without a name, the container is named after its
+image and eight random hex digits. A create's settings become the machine's options.
+What nspawn has no use for is taken and named in the answer's `Warnings` (`CpuShares`,
+`SecurityOpt`, a logging driver other than `json-file`, `local`, `journald` or `none`,
+anonymous volumes, among others); what would change what the container does is refused
+with 400 (`PidMode`, `IpcMode` or `UTSMode` of the host, a user namespace mode, another
+runtime, `VolumesFrom`, `GroupAdd`, an IPv6 address). A missing host directory of
+`Binds` is made, mode 0755, when the container starts; a bind of `Mounts` needs its
+source unless it asks to have it made. A bare `NAME` in `Env` takes the image's variable of that name away.
+`AutoRemove` removes the machine once its run ends, or at once when its start fails. An
+update sets the memory, swap, CPUs, processes and restart policy, and names the rest in
+its `Warnings`; a prune removes the stopped containers made from an image that `until`,
+`label` and `label!` select, and leaves a pulled or built record that ran, which is the
+image as well.
+
+Exec, attach, archives, pulls, image removals and changes of volumes and networks are
+not served: they answer 501 with "not supported", as reads of swarm objects and plugins
+do.
 
 Each machine has its own socket, `/run/nspawn/api/NAME.sock`, opened by systemd
 (`nspawn-api@NAME.socket`) before the machine starts and closed after it stops; the
@@ -546,8 +571,9 @@ stays across restarts and updates. The tools that look for their own container i
 the socket.
 
 What one socket's clients hold at once is bounded: 64 connections (one more is closed at
-once), 16 of them logs or events streams, each running a `journalctl` (one more gets
-503). Stats streams count as connections only.
+once), 16 of them logs or events streams, each running a `journalctl`, and 16 waits,
+each holding a connection to the system bus (one more of either gets 503). Stats
+streams count as connections only.
 
 ### Updates of the image a tag names
 

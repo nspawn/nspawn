@@ -1,0 +1,1 @@
+POST /containers/prune?filters=%7B%22label%22%3A%5B%22e2e%3Dlifecycle%22%5D%7D

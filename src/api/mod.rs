@@ -10,6 +10,7 @@ pub mod create;
 pub mod dependencies;
 pub mod disk;
 pub mod events;
+pub mod failure;
 pub mod generate;
 pub mod hub;
 pub mod images;
@@ -25,6 +26,9 @@ pub mod search;
 pub mod secrets;
 pub mod stats;
 pub mod volumes;
+pub mod wait;
+
+pub use failure::{kind_of, FailureKind};
 
 use anyhow::{bail, Context as _, Result};
 use tokio::sync::OnceCell;
