@@ -87,6 +87,8 @@ install -D -m 0644 packaging/systemd/%{name}.service %{buildroot}%{_unitdir}/%{n
 install -D -m 0644 packaging/systemd/journald@%{name}.conf %{buildroot}%{_prefix}/lib/systemd/journald@%{name}.conf
 install -D -m 0644 packaging/systemd/%{name}-api@.socket %{buildroot}%{_unitdir}/%{name}-api@.socket
 install -D -m 0644 packaging/systemd/%{name}-api@.service %{buildroot}%{_unitdir}/%{name}-api@.service
+install -D -m 0644 packaging/systemd/%{name}-api.socket %{buildroot}%{_unitdir}/%{name}-api.socket
+install -D -m 0644 packaging/systemd/%{name}-api.service %{buildroot}%{_unitdir}/%{name}-api.service
 install -D -m 0644 packaging/systemd/%{name}-auto-update.service %{buildroot}%{_unitdir}/%{name}-auto-update.service
 install -D -m 0644 packaging/systemd/%{name}-auto-update.timer %{buildroot}%{_unitdir}/%{name}-auto-update.timer
 install -D -m 0644 packaging/dbus/org.nspawn.service %{buildroot}%{_datadir}/dbus-1/system-services/org.nspawn.service
@@ -105,14 +107,14 @@ install -d -m 0711 %{buildroot}%{_sharedstatedir}/%{name}
 cargo test --release --offline
 
 %post
-%systemd_post %{name}.service %{name}-auto-update.timer
+%systemd_post %{name}.service %{name}-auto-update.timer %{name}-api.socket
 
 %preun
-%systemd_preun %{name}.service %{name}-auto-update.timer
+%systemd_preun %{name}.service %{name}-auto-update.timer %{name}-api.socket
 
 %postun
 %systemd_postun_with_restart %{name}.service
-%systemd_postun %{name}-auto-update.timer
+%systemd_postun %{name}-auto-update.timer %{name}-api.socket
 
 %pre selinux
 %selinux_relabel_pre -s %{selinuxtype}
@@ -122,7 +124,7 @@ if [ $1 -eq 0 ]; then
     # Before the module goes: a process of nspawn left running would be in a domain the
     # policy no longer defines, where every access is denied and not even systemd can
     # signal it.
-    systemctl stop %{name}.service '%{name}-api@*.service' '%{name}-health-*.service' %{name}-auto-update.service >/dev/null 2>&1 || :
+    systemctl stop %{name}.service %{name}-api.service '%{name}-api@*.service' '%{name}-health-*.service' %{name}-auto-update.service >/dev/null 2>&1 || :
     %selinux_relabel_pre -s %{selinuxtype}
 fi
 
@@ -148,6 +150,8 @@ fi
 %{_prefix}/lib/systemd/journald@%{name}.conf
 %{_unitdir}/%{name}-api@.socket
 %{_unitdir}/%{name}-api@.service
+%{_unitdir}/%{name}-api.socket
+%{_unitdir}/%{name}-api.service
 %{_unitdir}/%{name}-auto-update.service
 %{_unitdir}/%{name}-auto-update.timer
 %{_datadir}/dbus-1/system-services/org.nspawn.service

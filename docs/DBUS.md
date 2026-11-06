@@ -22,6 +22,7 @@ ran the command, and reloads systemd and the bus:
 | `/usr/share/dbus-1/system-services/org.nspawn.service` | bus activation: `SystemdService=nspawn.service` |
 | `/etc/systemd/system/nspawn.service` | `Type=dbus` unit running `nspawn daemon` |
 | `/etc/systemd/system/nspawn-api@.socket`, `nspawn-api@.service` | a machine's Docker API, activated on demand |
+| `/etc/systemd/system/nspawn-api.socket`, `nspawn-api.service` | the host's Docker API, written but not enabled |
 | `/etc/systemd/system/nspawn-auto-update.service`, `.timer` | `nspawn auto-update`, its timer written but not enabled |
 | `/usr/lib/systemd/journald@nspawn.conf` | the size of the journal namespace machines write their output to (1 GiB) |
 
@@ -69,6 +70,11 @@ job or a command (`JobOutput`, `JobProgress`, `JobRemoved`, `Exited` and the
 `PropertiesChanged` of their objects) go to the client that started it and to
 nobody else; `ImageAdded`, `ImageRemoved`, `MachineStarted` and
 `MachineStopped` reach everyone listening.
+
+The host's Docker API socket (`/run/nspawn/api.sock`) asks polkit the same two
+actions about each of its clients, by the process that connected, never letting it
+prompt: what a request needs is what the method behind it asks for, so its logs ask
+for `org.nspawn.manage`.
 
 An administrator hands either action to a group with a rule of their own,
 which is how to drive nspawn without a password. The packages ship one as an

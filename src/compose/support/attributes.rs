@@ -501,7 +501,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
     full("services.*.ulimits").and_below(),
     partly(
         "services.*.use_api_socket",
-        "nspawn's Docker API, which reads but does not change machines (a kill aside), and no registry credentials with it",
+        "nspawn's Docker API, which reads machines, images and volumes and changes them only by a kill, and no registry credentials with it",
     ),
     partly("services.*.user", BOOTED),
     ignored(

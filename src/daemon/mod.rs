@@ -185,8 +185,13 @@ pub async fn run(config: Config, idle_exit: Option<Duration>) -> Result<()> {
 
 /// The lock of the one service, held while it lives.
 fn alone() -> Result<nix::fcntl::Flock<std::fs::File>> {
+    use std::os::unix::fs::PermissionsExt;
     let dir = std::path::Path::new("/run/nspawn");
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    // The host's Docker API socket is in it, for every user: a socket unit that made it
+    // first may have made it closed.
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("setting the mode of {}", dir.display()))?;
     let path = dir.join("service.lock");
     let file =
         std::fs::File::create(&path).with_context(|| format!("opening {}", path.display()))?;

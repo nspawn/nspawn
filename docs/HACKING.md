@@ -36,7 +36,8 @@ a machine; an aarch64 build can be tried without such a host under `qemu-aarch64
 
 The parts of nspawn that follow docker are checked against docker's own releases,
 run for real. Docker, git and python3 are all they need on the host: Go runs in a
-container.
+container. The Docker API's oracle needs nspawn instead, which runs docker in a
+machine.
 The containers that run docker compose, go-yaml, Go's tables, the Docker API
 scenario and the builder's cases get 2 GiB of memory at most: docker compose sets no
 limit on what aliases expand to, and a file that expands without end takes what it
@@ -82,7 +83,8 @@ gets.
 
 The Docker API (`src/dockerapi`) is checked against what docker answers.
 `tests/dockerapi/oracle.sh record DIR` runs `scenario.sh` in a docker-in-docker
-container of the release it follows and keeps docker's answers under
+machine of the release it follows (`--privileged`, `/var/lib/docker` on a volume of
+its own, both kept for the next record) and keeps docker's answers under
 `tests/dockerapi/golden/`: the shapes `cargo test` compares, with `sanitize.py`
 replacing what tells of the host. For caddy-docker-proxy, Traefik, nginx-proxy,
 acme-companion, homepage and Dozzle it keeps every request each made of the socket

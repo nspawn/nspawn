@@ -488,36 +488,65 @@ record, and lack them once it is removed. `events` reads the journal, so machine
 started by `machinectl`, at boot or by a restart policy are there too, and so is what
 happened while nobody watched.
 
-### The Docker API for proxies and dashboards
+### The Docker API
 
-Tools that follow containers through docker's socket, reverse proxies routing by
-labels (caddy-docker-proxy, Traefik, nginx-proxy with docker-gen and acme-companion),
-dashboards (homepage) and log viewers (Dozzle), find nspawn's machines the same way: a
-machine that mounts `/var/run/docker.sock` or `/run/docker.sock` from the host (`-v
+nspawn serves the Docker Engine API to machines and to clients on the host.
+
+A machine that mounts `/var/run/docker.sock`, `/run/docker.sock` or the host's own
+socket of the API, `/run/nspawn/api.sock`, from the host (`-v
 /var/run/docker.sock:/var/run/docker.sock[:ro]`, or compose's `use_api_socket`) gets
-nspawn's Docker API there instead of the host's docker.
+nspawn's Docker API there instead of the host's docker. Tools that follow containers
+through it find nspawn's machines the same way: reverse proxies routing by labels
+(caddy-docker-proxy, Traefik, nginx-proxy with docker-gen and acme-companion),
+dashboards (homepage) and log viewers (Dozzle). Only root inside can connect, and it
+sees every machine and their `-e` variables (`--secret` values never show). Bound with
+`:ro`, the socket reads, follows logs and kills, and refuses any other change with 403;
+bound read-write, it takes every request the API serves.
 
-It answers in the shapes of docker's API 1.51, and of the versions down to 1.24 that
-clients ask for: `_ping`, `version` and `info`, the machines as containers with their
-labels, networks and addresses, inspect with the environment, events as they happen,
-logs, stats and top, and the networks. Reads of images, volumes and swarm objects get
-501. It changes nothing, with one exception: `POST /containers/ID/kill` sends a signal
-as `nspawn kill` does, so that docker-gen and acme-companion can have nginx read new
-configuration and certificates. Any other write (create, exec, pull...) is refused with
-403. A machine that has it sees every machine and their `-e` variables (`--secret`
-values never show), and only root inside can connect.
+Clients on the host use `/run/nspawn/api.sock`, opened by `nspawn-api.socket` once it is
+turned on:
 
-Each such machine has its own socket, `/run/nspawn/api/NAME.sock`, opened by systemd
+```
+sudo systemctl enable --now nspawn-api.socket
+export DOCKER_HOST=unix:///run/nspawn/api.sock
+```
+
+Every user may connect, and polkit decides what each one may do, with the actions of
+the bus service ([DBUS.md](DBUS.md)): reads ask for `org.nspawn.inspect`, logs and
+changes for `org.nspawn.manage`, `_ping` and `version` for nothing. polkit is never
+asked to prompt, since nothing on a socket answers an authentication agent: a user who
+is not root needs a rule, such as the example the packages ship. Root may do
+everything. On a host without docker, clients that only look at `/run/docker.sock` or
+`/var/run/docker.sock` find the socket there with a drop-in:
+
+```
+sudo mkdir -p /etc/systemd/system/nspawn-api.socket.d
+printf '[Socket]\nSymlinks=/run/docker.sock\n' | sudo tee /etc/systemd/system/nspawn-api.socket.d/docker.conf
+sudo systemctl daemon-reload && sudo systemctl restart nspawn-api.socket
+```
+
+The API answers in the shapes of docker's API 1.51, and of the versions down to 1.24
+that clients ask for: `_ping`, `version` and `info`, the machines as containers with
+their labels, networks and addresses, inspect with the environment, events as they
+happen, logs, stats and top, the networks, the images and the volumes. A record pulled
+or built that never ran is an image there, not a container, and a machine made from it
+is a container. Images are told apart by their config: an image's ID is its config's
+digest, its tags are the references its records were pulled or built as, and a
+reference names the image of the last record pulled with it. The one change the API
+makes is `POST /containers/ID/kill`, which sends a signal as `nspawn kill` does; other
+changes, and reads of swarm objects and plugins, answer 501 with "not supported".
+
+Each machine has its own socket, `/run/nspawn/api/NAME.sock`, opened by systemd
 (`nspawn-api@NAME.socket`) before the machine starts and closed after it stops; the
-server behind it starts when something connects and leaves after a minute without a
-connection. A container ID is derived from the machine's name and creation time, so it
+server behind a socket starts when something connects and leaves after a minute without
+a connection. A container ID is derived from the machine's name and creation time, so it
 stays across restarts and updates. The tools that look for their own container in
 `/proc/self/mountinfo` find it, as nspawn binds the machine's `/etc/hostname` from
 `docker/containers/ID/hostname`, ID being its container ID. mstack machines cannot take
 the socket.
 
-What one machine's clients hold at once is bounded: 64 connections (one more is closed
-at once), 16 of them logs or events streams, each running a `journalctl` (one more gets
+What one socket's clients hold at once is bounded: 64 connections (one more is closed at
+once), 16 of them logs or events streams, each running a `journalctl` (one more gets
 503). Stats streams count as connections only.
 
 ### Updates of the image a tag names

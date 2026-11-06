@@ -47,7 +47,7 @@ hooks.
 | `api/copy.rs` | cp: tar streams packed and unpacked relative to directory descriptors, paths resolved with openat2 inside the machine's root, tried again when a `..` crossed a rename or mount on the host (EAGAIN) |
 | `api/disk.rs`, `commands/system.rs` | what is an image and what a machine (a record pulled or built and never started is an image only), sizes by kind for `system df`, `images prune`, and `system prune` on top of the removals and prunes of the service |
 | `api/recreate.rs`, `api/autoupdate.rs` | a machine made anew from a newer image with its options, and put back from its rollback when the new one does not come up; `auto-update`: candidates by label, the registry asked once per reference, dependents restarted |
-| `dockerapi/` | the read-only Docker Engine API (`api-serve`), served on a machine's own socket: routing and versions, containers and networks in docker's shapes, filters, events, logs, stats; the one write is a kill through the service |
+| `dockerapi/` | the Docker Engine API (`api-serve`), served on a machine's own socket and on the host's: who may do what (`access`: a machine's bind, polkit for a host client), routing and versions, containers, images, volumes and networks in docker's shapes, filters, events, logs, stats; the one write is a kill through the service |
 | `build/dockerfile/`, `build/dispatch/` | ports of BuildKit's frontend: the parser, the shell lexer, instructions and flags; stages, build arguments, the steps with their history lines and the image's settings |
 | `build/plan.rs` | the stages and steps of a build, worked out before a step runs |
 | `build/ignore.rs`, `walk.rs`, `copy.rs`, `untar.rs` | the build context: `.dockerignore` patterns and their `!` exceptions, the walk of a context in lexical order without following symlinks, COPY and ADD with every path resolved inside its root, the context's tar and ADD's archives unpacked with every name resolved inside their destination |
@@ -175,8 +175,11 @@ hooks.
 /run/nspawn/attach/NAME.sock  where an attached run waits for its machine's
                      systemd-nspawn (0700 directory)
 /run/nspawn/api/NAME.sock     a machine's Docker API, opened by
-                     nspawn-api@NAME.socket (0600, 0700 directory) and bound
-                     where the machine mounts docker's socket
+                     nspawn-api@NAME.socket (0600) and bound where the
+                     machine mounts docker's socket
+/run/nspawn/api.sock          the host's Docker API, opened by
+                     nspawn-api.socket (0666; polkit decides for each
+                     client); /run/nspawn is 0755 for it
 /run/nspawn/health/NAME.json  the verdict and the last probes of a healthcheck
 /run/nspawn/firewalld/NAME    the interfaces of a veth machine bound to
                      firewalld's trusted zone, for the release hook to unbind

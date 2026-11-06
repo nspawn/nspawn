@@ -1,0 +1,1 @@
+[{"Containers":1,"Created":1727386302,"Id":"sha256:30ecbe1509090b38ef3260f3609d64d8261230464eaa4d235901db496e9647fb","Labels":null,"ParentId":"","RepoDigests":["busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec"],"RepoTags":["busybox:1.37"],"SharedSize":-1,"Size":4421246}]

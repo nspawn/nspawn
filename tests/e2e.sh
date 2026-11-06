@@ -119,7 +119,7 @@ cleanup_machines() {
   ip link del e2e-dummy0 >/dev/null 2>&1 || true
   rmmod mac80211_hwsim >/dev/null 2>&1 || true
   $NSPAWN network rm e2e-na e2e-nb e2e-nc e2e-nd e2e-ne e2e-nf e2e-gn e2e-api e2e-capi_default e2e-au-net >/dev/null 2>&1 || true
-  $NSPAWN volume rm e2e-au-vol e2e-cli-vol >/dev/null 2>&1 || true
+  $NSPAWN volume rm e2e-au-vol e2e-cli-vol e2e-hapi-vol >/dev/null 2>&1 || true
   $NSPAWN network rm e2e-cli-net e2e-cli-pnet e2e-ip-net e2e-ip-net2 e2e-cip_fixed e2e-v6net >/dev/null 2>&1 || true
   rm -rf /tmp/e2e-cli /tmp/e2e-cdi
   rm -f /etc/cdi/e2e-nspawn.yaml /etc/cdi/e2e-nspawn-bad.yaml /var/run/cdi/e2e-nspawn-gpu.json /usr/local/bin/e2e-cdi-hook
@@ -201,12 +201,23 @@ cleanup_service() {
     rm -f /etc/systemd/system/nspawn.service.d/50-e2e.conf /etc/nspawn/e2e.toml /etc/nspawn/e2e-cosign.pub
     rmdir /etc/systemd/system/nspawn.service.d 2>/dev/null || true
   else
-    rm -f /etc/dbus-1/system.d/org.nspawn.conf /usr/share/dbus-1/system-services/org.nspawn.service /usr/share/polkit-1/actions/org.nspawn.policy /usr/lib/systemd/journald@nspawn.conf /etc/systemd/system/nspawn.service /etc/systemd/system/nspawn-api@.socket /etc/systemd/system/nspawn-api@.service /etc/systemd/system/nspawn-auto-update.service /etc/systemd/system/nspawn-auto-update.timer /etc/nspawn/e2e.toml /etc/nspawn/e2e-cosign.pub
+    rm -f /etc/dbus-1/system.d/org.nspawn.conf /usr/share/dbus-1/system-services/org.nspawn.service /usr/share/polkit-1/actions/org.nspawn.policy /usr/lib/systemd/journald@nspawn.conf /etc/systemd/system/nspawn.service /etc/systemd/system/nspawn-api@.socket /etc/systemd/system/nspawn-api@.service /etc/systemd/system/nspawn-api.socket /etc/systemd/system/nspawn-api.service /etc/systemd/system/nspawn-auto-update.service /etc/systemd/system/nspawn-auto-update.timer /etc/nspawn/e2e.toml /etc/nspawn/e2e-cosign.pub
   fi
   systemctl daemon-reload >/dev/null 2>&1 || true
 }
 cleanup() {
   cleanup_machines
+  # The host's Docker API socket, as the host had it.
+  if [ -e /etc/systemd/system/nspawn-api.socket.d/e2e-docker.conf ]; then
+    systemctl stop nspawn-api.socket >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/nspawn-api.socket.d/e2e-docker.conf
+    rmdir /etc/systemd/system/nspawn-api.socket.d 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl start nspawn-api.socket >/dev/null 2>&1 || true
+  fi
+  if [ "${host_api_enabled:-}" = yes ]; then
+    systemctl disable --now nspawn-api.socket >/dev/null 2>&1 || true
+  fi
   # The claim goes once none of the names it claims is left, or the next run would take
   # an image left here for the host's own.
   local left
@@ -2902,6 +2913,14 @@ done
 ls /var/lib/nspawn/blobs/ | grep_q "^\.part-\|^\.hold-" && fail "leftovers in the blob store after two pulls: $(ls -a /var/lib/nspawn/blobs/ | grep '^\.')"
 $NSPAWN start e2e-twin-b >/dev/null && $NSPAWN exec e2e-twin-b -- /usr/bin/true </dev/null && $NSPAWN stop e2e-twin-b >/dev/null || fail "a machine pulled alongside another does not run"
 
+# The host's Docker API socket, on for the steps that use it; cleanup leaves it as the
+# host had it.
+host_api_on() {
+  [ "$(systemctl is-enabled nspawn-api.socket 2>/dev/null)" = enabled ] && return
+  systemctl enable --now nspawn-api.socket >/dev/null 2>&1 || fail "enable nspawn-api.socket"
+  host_api_enabled=yes
+}
+
 step "polkit: a user who is not root, with and without a rule"
 who=${SUDO_USER:-}
 rules=/etc/polkit-1/rules.d/50-nspawn-e2e.rules
@@ -2921,6 +2940,14 @@ else
   [ $rc -ne 0 ] || fail "$who could list machines with no rule in place"
   echo "$out" | grep_q "org.nspawn.inspect" || fail "the refusal does not name the action: $out"
   echo "$out" | grep_q "polkit rule" || fail "the refusal does not say how to allow it: $out"
+  # The host's Docker API asks polkit about each client, the same actions, never
+  # interactively; _ping and version are for everyone.
+  host_api_on
+  uapi() { sudo -u "$who" curl -sS --unix-socket /run/nspawn/api.sock "http://docker$1" "${@:2}"; }
+  [ "$(uapi /_ping)" = OK ] || fail "_ping on the host's Docker API is not for $who: $(uapi /_ping 2>&1)"
+  uapi /version | grep_q '"ApiVersion"' || fail "version on the host's Docker API is not for $who"
+  out=$(uapi /containers/json 2>&1)
+  echo "$out" | grep_q "org.nspawn.inspect needs an administrator, and a socket cannot ask for a password" || fail "the host's Docker API answered $who with no rule in place: $out"
   cat > "$rules" <<RULE
 polkit.addRule(function (action, subject) {
     if (action.id.startsWith("org.nspawn.") && subject.isInGroup("$group")) {
@@ -2929,6 +2956,8 @@ polkit.addRule(function (action, subject) {
 });
 RULE
   retry 5 bash -c "sudo -u $who $NSPAWN ps >/dev/null 2>&1" || fail "$who still cannot list machines with the rule in place: $(sudo -u "$who" $NSPAWN ps 2>&1 | tail -2)"
+  uapi '/containers/json?all=1' | grep_q '"Names":\["/e2e-twin-b"\]' || fail "$who cannot list the containers on the host's Docker API with the rule in place: $(uapi '/containers/json?all=1' 2>&1 | head -c 300)"
+  uapi /containers/e2e-none/kill -X POST | grep_q 'No such container: e2e-none' || fail "$who cannot reach a kill on the host's Docker API with the rule in place"
   sudo -u "$who" $NSPAWN logout "$NSPAWN_REGISTRY" >/dev/null 2>&1 || fail "$who cannot run a command that changes things with the rule in place"
   cpd=$(mktemp -d /tmp/e2e-cp-user.XXXXXX); chown "$who" "$cpd"
   sudo -u "$who" $NSPAWN cp e2e-twin-b:/etc/passwd "$cpd/" || fail "$who cannot copy out of a machine"
@@ -2957,6 +2986,7 @@ RULE
   rm -rf "$closed" "$cbind"
   rm -f "$rules"
   retry 5 bash -c "! sudo -u $who $NSPAWN ps >/dev/null 2>&1" || fail "$who can still list machines after the rule went"
+  retry 5 bash -c "sudo -u $who curl -sS --unix-socket /run/nspawn/api.sock http://docker/containers/json | grep -q org.nspawn.inspect" || fail "$who can still list the containers on the host's Docker API after the rule went"
   # Root never needs any of this.
   $NSPAWN ps >/dev/null || fail "root cannot list machines"
 fi
@@ -3100,10 +3130,10 @@ api e2e-api-caddy /containers/json | grep_q '"Names":\["/e2e-api-web"\]' || fail
 retry 30 bash -c "curl -fsS -H 'Host: e2e-api-web.e2e.test' http://127.0.0.1:18110/ | grep_q e2e-api-web-$nonce" || fail "caddy did not route to the labelled machine: $($NSPAWN logs e2e-api-caddy 2>&1 | tail -20)"
 backend e2e-api-web2
 retry 30 bash -c "curl -fsS -H 'Host: e2e-api-web2.e2e.test' http://127.0.0.1:18110/ | grep_q e2e-api-web2-$nonce" || fail "caddy did not pick up a machine started later: $($NSPAWN logs e2e-api-caddy 2>&1 | tail -20)"
-# Read-only but for a kill: a write is refused, a signal goes through as nspawn kill.
+# A socket bound read-write takes writes; a kill goes through as nspawn kill.
 out=$(api e2e-api-caddy /containers/create -X POST)
 code=$(api e2e-api-caddy /containers/create -X POST -o /dev/null -w '%{http_code}')
-[ "$code" = 403 ] && echo "$out" | grep_q "read-only" || fail "a write through the Docker API was not refused: $code $out"
+[ "$code" != 403 ] || fail "the socket e2e-api-caddy binds read-write refused a write: $code $out"
 [ "$(api e2e-api-caddy '/containers/e2e-api-web2/kill?signal=HUP' -X POST -o /dev/null -w '%{http_code}')" = 204 ] || fail "kill through the Docker API"
 sleep 2
 $NSPAWN ps | grep_q '^ *e2e-api-web2 ' || fail "the HUP the API sent ended e2e-api-web2"
@@ -3118,6 +3148,11 @@ out=$($NSPAWN run --rm --network none -u 0 -v /var/run/docker.sock:/var/run/dock
 echo "$out" | grep_q "E2E_ENV=$nonce" || fail "inspect through the Docker API lacks the machine's environment: $out"
 out=$($NSPAWN run --rm --network none -u 100 -v /var/run/docker.sock:/var/run/docker.sock "$curl_image" \
   -- -sS --unix-socket /var/run/docker.sock http://docker/_ping 2>&1) && fail "a user other than root reached the Docker API: $out"
+# One that mounts the host's socket, as a client of it does for a container it makes,
+# gets a socket of its own as well.
+out=$($NSPAWN run --rm --network none -u 0 -v /run/nspawn/api.sock:/var/run/docker.sock "$curl_image" \
+  -- -sS --unix-socket /var/run/docker.sock http://docker/containers/e2e-api-web/json 2>&1) || fail "curl from a machine that mounts the host's socket: $out"
+echo "$out" | grep_q '"Name":"/e2e-api-web"' || fail "a machine that mounts the host's socket does not reach the Docker API: $out"
 # A booted machine takes it at /run/docker.sock.
 $NSPAWN create "$IMAGE" e2e-api-boot -v /run/docker.sock:/run/docker.sock >/dev/null || fail "create e2e-api-boot"
 $NSPAWN start e2e-api-boot >/dev/null || fail "start e2e-api-boot"
@@ -3150,10 +3185,78 @@ $NSPAWN compose -f /tmp/e2e-compose-api/compose.yaml -p e2e-capi up -d >/dev/nul
 [ -S /run/nspawn/api/e2e-capi-a-1.sock ] && [ -S /run/nspawn/api/e2e-capi-b-1.sock ] || fail "compose's machines have no Docker API socket"
 [ -d /var/run/docker.sock ] && fail "compose made a directory where docker's socket would be"
 api e2e-capi-a-1 /containers/json | grep_q '"com.docker.compose.project":"e2e-capi"' || fail "the compose labels are not on the Docker API"
+# Bound read-only, the socket reads, follows logs and kills, and refuses the rest.
+out=$(api e2e-capi-b-1 /containers/create -X POST)
+code=$(api e2e-capi-b-1 /containers/create -X POST -o /dev/null -w '%{http_code}')
+[ "$code" = 403 ] && echo "$out" | grep_q "read-only" || fail "a write through a socket bound read-only was not refused: $code $out"
+[ "$(api e2e-capi-b-1 '/containers/e2e-capi-a-1/kill?signal=WINCH' -X POST -o /dev/null -w '%{http_code}')" = 204 ] || fail "kill through a socket bound read-only"
+[ "$(api e2e-capi-b-1 '/containers/e2e-capi-a-1/logs?stdout=1' -o /dev/null -w '%{http_code}')" = 200 ] || fail "logs through a socket bound read-only"
 $NSPAWN compose -f /tmp/e2e-compose-api/compose.yaml -p e2e-capi down >/dev/null 2>&1 || fail "compose down of e2e-capi"
 for m in e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot; do $NSPAWN rm -f $m >/dev/null 2>&1; done
 $NSPAWN network rm e2e-api >/dev/null || fail "network rm e2e-api"
 $NSPAWN images rm e2e-api-curl >/dev/null 2>&1
+
+step "Docker API on the host: nspawn-api.socket, images, volumes, records that never ran"
+host_api_on
+hapi() { curl -sS --unix-socket /run/nspawn/api.sock "http://docker$1" "${@:2}"; }
+hcode() { curl -sS -o /dev/null -w '%{http_code}' --unix-socket /run/nspawn/api.sock "http://docker$1" "${@:2}"; }
+[ "$(stat -c %a /run/nspawn/api.sock)" = 666 ] || fail "the host's Docker API socket is $(stat -c %a /run/nspawn/api.sock), not 666"
+[ "$(stat -c %a /run/nspawn)" = 755 ] || fail "/run/nspawn is $(stat -c %a /run/nspawn): users cannot reach the host's socket"
+[ "$(hapi /_ping)" = OK ] || fail "_ping on the host's Docker API: $(hapi /_ping 2>&1)"
+# A record pulled and never run is an image, not a container; one made from it is a
+# container. The image's ID is its config's digest.
+$NSPAWN pull "$busybox_ref" --name e2e-hapi-img --force >/dev/null || fail "pull e2e-hapi-img"
+hapi '/containers/json?all=1' | grep_q '"/e2e-hapi-img"' && fail "a record that never ran is listed as a container"
+[ "$(hcode /containers/e2e-hapi-img/json)" = 404 ] || fail "a record that never ran inspects as a container"
+$NSPAWN create e2e-hapi-img e2e-hapi-made >/dev/null || fail "create e2e-hapi-made"
+hapi '/containers/json?all=1' | grep_q '"/e2e-hapi-made"' || fail "a created machine is not a container on the host's Docker API"
+config=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["config"]["digest"])' /var/lib/nspawn/manifests/e2e-hapi-img.json)
+out=$(hapi "/images/$busybox_ref/json")
+echo "$out" | grep_q "\"Id\":\"$config\"" || fail "image inspect by reference: $out"
+for key in "${config#sha256:}" "${config:7:12}" e2e-hapi-img; do
+  [ "$(hcode "/images/$key/json")" = 200 ] || fail "image inspect by $key: $(hapi "/images/$key/json")"
+done
+out=$(hapi "/images/e2e-none-$nonce/json")
+[ "$(hcode "/images/e2e-none-$nonce/json")" = 404 ] && echo "$out" | grep_q "No such image: e2e-none-$nonce" || fail "a missing image: $out"
+hapi /images/json | grep_q "\"Id\":\"$config\"" || fail "images/json misses the image: $(hapi /images/json | head -c 300)"
+out=$(hapi /images/json -G --data-urlencode 'filters={"dangling":["true"]}')
+[ "${out:0:1}" = "[" ] || fail "images/json with a dangling filter: $out"
+echo "$out" | grep_q "\"Id\":\"$config\"" && fail "a tagged image is listed as dangling"
+hapi "/images/$config/history" | grep_q "\"Id\":\"$config\"" || fail "image history: $(hapi "/images/$config/history" | head -c 300)"
+$NSPAWN volume create e2e-hapi-vol >/dev/null || fail "volume create e2e-hapi-vol"
+hapi /volumes | grep_q '"Name":"e2e-hapi-vol"' || fail "volumes misses e2e-hapi-vol: $(hapi /volumes | head -c 300)"
+hapi /volumes/e2e-hapi-vol | grep_q '"Driver":"local"' || fail "volume inspect: $(hapi /volumes/e2e-hapi-vol)"
+[ "$(hcode "/volumes/e2e-none-$nonce")" = 404 ] || fail "a missing volume is not 404"
+# system df counts the image with its container, the container's own layer, the volume.
+out=$(hapi /system/df)
+echo "$out" | python3 -c '
+import json, sys
+df, config = json.load(sys.stdin), sys.argv[1]
+image = [i for i in df["Images"] if i["Id"] == config]
+assert df["LayersSize"] > 0, "no layers counted"
+assert image and image[0]["Containers"] == 1, image
+assert any(c["Names"] == ["/e2e-hapi-made"] and c["SizeRootFs"] > 0 for c in df["Containers"])
+assert any(v["Name"] == "e2e-hapi-vol" and v["UsageData"]["RefCount"] == 0 for v in df["Volumes"])
+' "$config" || fail "system df: $(echo "$out" | head -c 600)"
+# The drop-in the documentation gives links /run/docker.sock to it, on a host where that
+# path is free; stopping the socket takes the link away.
+if [ ! -e /run/docker.sock ]; then
+  dropin=/etc/systemd/system/nspawn-api.socket.d/e2e-docker.conf
+  mkdir -p "$(dirname "$dropin")"
+  printf '[Socket]\nSymlinks=/run/docker.sock\n' > "$dropin"
+  systemctl daemon-reload && systemctl restart nspawn-api.socket
+  [ "$(curl -sS --unix-socket /var/run/docker.sock http://docker/_ping 2>&1)" = OK ] || fail "_ping through the link the drop-in makes: $(journalctl -u nspawn-api.socket -n 3 --no-pager)"
+  systemctl stop nspawn-api.socket
+  [ -e /run/docker.sock ] && fail "the link stayed after the socket stopped"
+  rm -f "$dropin"
+  rmdir "$(dirname "$dropin")" 2>/dev/null || true
+  systemctl daemon-reload && systemctl start nspawn-api.socket
+fi
+# What it does not serve says so: docker inspect goes on to the next kind of object.
+hapi /swarm | grep_q "not supported" || fail "an unserved read does not say it is not supported: $(hapi /swarm)"
+$NSPAWN rm -f e2e-hapi-made >/dev/null 2>&1
+$NSPAWN images rm e2e-hapi-img >/dev/null 2>&1
+$NSPAWN volume rm e2e-hapi-vol >/dev/null 2>&1
 
 step "auto-update: a labelled machine gets the image its tag names now, and goes back when it fails"
 repo=e2e/au-$nonce

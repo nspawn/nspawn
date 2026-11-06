@@ -1,6 +1,15 @@
 HEAD /_ping
 GET /v1.51/events?filters=%7B%22scope%22%3A%7B%22local%22%3Atrue%2C%22swarm%22%3Atrue%7D%2C%22type%22%3A%7B%22config%22%3Atrue%2C%22container%22%3Atrue%2C%22network%22%3Atrue%2C%22service%22%3Atrue%7D%7D
-GET /v1.51/containers/7d9790a4a796d7ae3b435dae7232c2dff12011077951b6f203ac44812be3f0d4/json
-GET /v1.51/networks/b90b4b9f430e7ac244ba7212451819f4cfda5814b6ba70b92f55fc7afd7187ab
+GET /v1.51/containers/d77560ff95efbe2a45965662686201469ea333868b7c68bea1019ac38b81160c/json
+GET /v1.51/networks/4922e517f75827408576f8ba5653050307bd66126b9f31c7170e78e9bcf2c85e
 GET /v1.51/info
+GET /v1.51/containers/json
+GET /v1.51/containers/d77560ff95efbe2a45965662686201469ea333868b7c68bea1019ac38b81160c/json
+GET /v1.51/networks/4922e517f75827408576f8ba5653050307bd66126b9f31c7170e78e9bcf2c85e
+GET /v1.51/containers/json
+GET /v1.51/containers/d77560ff95efbe2a45965662686201469ea333868b7c68bea1019ac38b81160c/json
+GET /v1.51/networks/4922e517f75827408576f8ba5653050307bd66126b9f31c7170e78e9bcf2c85e
+GET /v1.51/containers/json
+GET /v1.51/containers/d77560ff95efbe2a45965662686201469ea333868b7c68bea1019ac38b81160c/json
+GET /v1.51/networks/4922e517f75827408576f8ba5653050307bd66126b9f31c7170e78e9bcf2c85e
 GET /v1.51/containers/json

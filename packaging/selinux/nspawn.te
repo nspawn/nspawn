@@ -1,4 +1,4 @@
-policy_module(nspawn, 2.1.0)
+policy_module(nspawn, 2.2.0)
 
 ########################################
 #
@@ -123,6 +123,11 @@ allow init_t nspawn_t:fifo_file { getattr ioctl read };
 files_pid_filetrans(init_t, nspawn_var_run_t, dir, "nspawn")
 manage_dirs_pattern(init_t, nspawn_var_run_t, nspawn_var_run_t)
 manage_sock_files_pattern(init_t, nspawn_var_run_t, nspawn_var_run_t)
+# A drop-in of nspawn-api.socket may have systemd link /run/docker.sock to the host's
+# Docker API socket: the link is nspawn's, made when the socket starts and taken away
+# when it stops.
+files_pid_filetrans(init_t, nspawn_var_run_t, lnk_file, "docker.sock")
+allow init_t nspawn_var_run_t:lnk_file { create getattr read unlink };
 # machined lists the images and reads os-release inside the machines' trees.
 list_dirs_pattern(systemd_machined_t, nspawn_var_lib_t, nspawn_var_lib_t)
 read_files_pattern(systemd_machined_t, nspawn_var_lib_t, nspawn_var_lib_t)

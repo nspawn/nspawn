@@ -122,9 +122,10 @@ pub enum Command {
     #[command(hide = true)]
     HealthRun { name: String },
     /// From nspawn-api@NAME.socket: serves the Docker API on the socket a machine mounts
-    /// from /var/run/docker.sock or /run/docker.sock.
+    /// from /var/run/docker.sock or /run/docker.sock; without a name, from
+    /// nspawn-api.socket, on the host's.
     #[command(hide = true)]
-    ApiServe { name: String },
+    ApiServe { name: Option<String> },
     /// ExecStartPre of a machine with --depends-on: waits until the other machines are
     /// what it asks of them.
     #[command(hide = true)]

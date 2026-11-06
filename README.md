@@ -78,11 +78,12 @@ and usage examples.
   user, working directory and stop signal of its OCI config. Both take the same flags
   and join the same networks.
 - **docker's socket for the tools that read it.** A machine that mounts
-  `/var/run/docker.sock` gets a read-only Docker API there, so reverse proxies that
+  `/var/run/docker.sock` gets nspawn's Docker API there, and clients on the host get it
+  at `/run/nspawn/api.sock`, with polkit deciding for each user, so reverse proxies that
   route by labels (caddy-docker-proxy, Traefik, nginx-proxy) and dashboards find the
-  machines as containers; `auto-update` gives labelled machines the image their tag
-  names now and puts them back when the new one does not come up, with a timer to run
-  it daily.
+  machines as containers and the images and volumes; `auto-update` gives labelled
+  machines the image their tag names now and puts them back when the new one does not
+  come up, with a timer to run it daily.
 - **Per-machine flags and commands.** `run`, `create` and `start` take `-e`, `-v`, `-p`,
   `--restart`, `-m`, `--cpus`, `--pids-limit`, the `--health-*` flags, `--secret`,
   `--label`, `--hostname`, `-u`, `-w`, `--cap-add`, `--cap-drop`, `--privileged`,

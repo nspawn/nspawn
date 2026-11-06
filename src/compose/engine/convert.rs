@@ -487,7 +487,7 @@ fn volumes(spec: &Spec, service: &Map, made: &mut Made) -> Result<()> {
                     .is_none_or(|v| v != &Value::Bool(false));
                 // A machine's Docker API socket is nspawn's: a host without one of its own
                 // must not get a directory there.
-                let api = crate::volume::API_SOCKET_PATHS.contains(&source);
+                let api = crate::volume::is_api_socket_path(source);
                 if create && !api && absent(source) {
                     made.host_paths.push(source.to_string());
                 }

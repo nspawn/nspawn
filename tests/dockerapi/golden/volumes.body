@@ -1,0 +1,1 @@
+{"Volumes":[{"CreatedAt":"2026-11-04T21:51:32Z","Driver":"local","Labels":{"e2e":"yes","tier":"data"},"Mountpoint":"/var/lib/docker/volumes/kept/_data","Name":"kept","Options":null,"Scope":"local"},{"CreatedAt":"2026-11-04T21:51:32Z","Driver":"local","Labels":null,"Mountpoint":"/var/lib/docker/volumes/loose/_data","Name":"loose","Options":null,"Scope":"local"}],"Warnings":null}

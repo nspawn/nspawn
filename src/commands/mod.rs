@@ -100,7 +100,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             removed
         }
         Command::HealthRun { name } => crate::health::run(&Context::new(config), &name).await,
-        Command::ApiServe { name } => crate::dockerapi::serve(&name, config).await,
+        Command::ApiServe { name } => crate::dockerapi::serve(name.as_deref(), config).await,
         Command::PortProxy { name } => crate::portproxy::serve(&Context::new(config), &name).await,
         Command::AwaitDependencies { name } => {
             api::dependencies::await_all(&Context::new(config), &name).await

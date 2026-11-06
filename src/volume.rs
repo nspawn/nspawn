@@ -221,6 +221,18 @@ pub struct Volume {
 /// either from the host gets nspawn's Docker API there.
 pub const API_SOCKET_PATHS: [&str; 2] = ["/var/run/docker.sock", "/run/docker.sock"];
 
+/// The host's socket of the Docker API, which nspawn-api.socket opens.
+pub const HOST_API_SOCKET: &str = "/run/nspawn/api.sock";
+
+/// Whether a bind's source is a socket of the Docker API, which the machine gets its
+/// own of instead: docker's paths, or the host's socket itself, which a client of it
+/// mounts into a container it makes (Testcontainers' reaper does).
+pub fn is_api_socket_path(source: &str) -> bool {
+    API_SOCKET_PATHS.contains(&source)
+        || source == HOST_API_SOCKET
+        || source.strip_prefix("/var") == Some(HOST_API_SOCKET)
+}
+
 impl Volume {
     pub fn is_named(&self) -> bool {
         !self.source.starts_with('/')
@@ -228,7 +240,7 @@ impl Volume {
 
     /// A bind of docker's socket, which becomes the machine's Docker API socket.
     pub fn is_api_socket(&self) -> bool {
-        API_SOCKET_PATHS.contains(&self.source.as_str())
+        is_api_socket_path(&self.source)
     }
 
     /// Where the volume lives on the host.
@@ -507,6 +519,25 @@ pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn docker_s_paths_and_the_host_s_socket_are_the_api_s() {
+        for source in [
+            "/var/run/docker.sock",
+            "/run/docker.sock",
+            "/run/nspawn/api.sock",
+            "/var/run/nspawn/api.sock",
+        ] {
+            assert!(super::is_api_socket_path(source), "{source}");
+        }
+        for source in [
+            "/run/nspawn/api/web.sock",
+            "/srv/docker.sock",
+            "/run/nspawn",
+        ] {
+            assert!(!super::is_api_socket_path(source), "{source}");
+        }
+    }
 
     #[test]
     fn only_a_regular_file_is_opened() {

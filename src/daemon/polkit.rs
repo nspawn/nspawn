@@ -19,7 +19,7 @@ pub struct Caller {
 }
 
 /// What a method needs from its caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     /// Reading what is there: the images, the machines, the network.
     Inspect,
@@ -44,8 +44,9 @@ impl Action {
     gen_blocking = false
 )]
 trait Authority {
-    /// The subject is ("system-bus-name", {"name": <the caller's unique name>}), the
-    /// flags are 1 for AllowUserInteraction. Returns whether it is authorized, whether
+    /// The subject is ("system-bus-name", {"name": <the caller's unique name>}) or
+    /// ("unix-process", {"pid", "start-time", "uid"}), the flags are 1 for
+    /// AllowUserInteraction. Returns whether it is authorized, whether
     /// a challenge is pending, and details.
     fn check_authorization(
         &self,
@@ -70,30 +71,10 @@ pub async fn allows(
     if caller_uid(connection, sender).await == Some(0) {
         return Ok(());
     }
-    let authority = AuthorityProxy::new(connection)
-        .await
-        .map_err(|e| format!("reaching polkit: {e}"))?;
     let mut name = HashMap::new();
     name.insert("name", Value::from(sender));
-    let subject = ("system-bus-name", name);
-    let (authorized, challenge, _) = authority
-        .check_authorization(
-            &subject,
-            action.id(),
-            HashMap::new(),
-            u32::from(interactive),
-            "",
-        )
-        .await
-        .map_err(|e| {
-            // Building the proxy asks nothing of the bus: polkit's absence shows here.
-            if e.to_string().contains("ServiceUnknown") {
-                "polkit is not on this bus, so only root can be authorized; run the command as root"
-                    .to_string()
-            } else {
-                format!("asking polkit about {}: {e}", action.id())
-            }
-        })?;
+    let (authorized, challenge) =
+        check(connection, ("system-bus-name", name), action, interactive).await?;
     if authorized {
         return Ok(());
     }
@@ -113,6 +94,99 @@ pub async fn allows(
             action.id()
         )
     })
+}
+
+/// A process on the other end of a socket, as polkit names it: its pid, the time it
+/// started (which tells it from a later process of the same pid) and its uid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Process {
+    pub pid: u32,
+    pub start_time: u64,
+    pub uid: u32,
+}
+
+impl Process {
+    /// The process `pid` of `uid`, if it is still there to read its start time from.
+    pub fn of(pid: u32, uid: u32) -> Option<Process> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        Some(Process {
+            pid,
+            start_time: start_time(&stat)?,
+            uid,
+        })
+    }
+}
+
+/// The start time in /proc/PID/stat: the 22nd field, counted after the command name,
+/// which may hold spaces and parentheses itself.
+fn start_time(stat: &str) -> Option<u64> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Whether `process` may do `action`, never asking: a client of a socket, which an
+/// authentication agent cannot reach. Root is allowed without asking.
+pub async fn allows_process(
+    connection: &Connection,
+    process: Process,
+    action: Action,
+) -> Result<(), String> {
+    if process.uid == 0 {
+        return Ok(());
+    }
+    let mut details = HashMap::new();
+    details.insert("pid", Value::from(process.pid));
+    details.insert("start-time", Value::from(process.start_time));
+    // polkit's unix-process takes the uid signed.
+    details.insert("uid", Value::from(process.uid as i32));
+    let (authorized, challenge) =
+        check(connection, ("unix-process", details), action, false).await?;
+    if authorized {
+        return Ok(());
+    }
+    Err(if challenge {
+        format!(
+            "{} needs an administrator, and a socket cannot ask for a password; use it as root, or let your group through with a polkit rule (see docs/DBUS.md)",
+            action.id()
+        )
+    } else {
+        format!(
+            "{} is not allowed for you; use the socket as root, or let your group through with a polkit rule (see docs/DBUS.md)",
+            action.id()
+        )
+    })
+}
+
+/// polkit's answer about `subject`: whether it is authorized, and whether it would be
+/// after a challenge.
+async fn check(
+    connection: &Connection,
+    subject: (&str, HashMap<&str, Value<'_>>),
+    action: Action,
+    interactive: bool,
+) -> Result<(bool, bool), String> {
+    let authority = AuthorityProxy::new(connection)
+        .await
+        .map_err(|e| format!("reaching polkit: {e}"))?;
+    let (authorized, challenge, _) = authority
+        .check_authorization(
+            &subject,
+            action.id(),
+            HashMap::new(),
+            u32::from(interactive),
+            "",
+        )
+        .await
+        .map_err(|e| {
+            // Building the proxy asks nothing of the bus: polkit's absence shows here.
+            if e.to_string().contains("ServiceUnknown") {
+                "polkit is not on this bus, so only root can be authorized; run the command as root"
+                    .to_string()
+            } else {
+                format!("asking polkit about {}: {e}", action.id())
+            }
+        })?;
+    Ok((authorized, challenge))
 }
 
 /// The uid behind a bus name, as the bus itself reports it.
@@ -176,6 +250,14 @@ mod tests {
             !may_read(1000, Reader::Unknown),
             "nor someone the bus cannot name"
         );
+    }
+
+    #[test]
+    fn the_start_time_is_read_past_a_command_name_with_spaces() {
+        let stat = "4242 (a b) c) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 10 18446744073709551615";
+        assert_eq!(start_time(stat), Some(987654));
+        assert_eq!(start_time("4242 (short) S 1"), None);
+        assert_eq!(start_time("no parenthesis"), None);
     }
 
     #[test]

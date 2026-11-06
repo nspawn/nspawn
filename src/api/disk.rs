@@ -136,7 +136,8 @@ pub struct Usage {
     pub volume_rows: Vec<VolumeRow>,
 }
 
-fn layer_size(store: &Store, digest: &str, sizes: &mut BTreeMap<String, u64>) -> u64 {
+/// Bytes of a layer as extracted, in either layer store, counted once into `sizes`.
+pub fn layer_size(store: &Store, digest: &str, sizes: &mut BTreeMap<String, u64>) -> u64 {
     if let Some(size) = sizes.get(digest) {
         return *size;
     }
@@ -151,7 +152,7 @@ fn layer_size(store: &Store, digest: &str, sizes: &mut BTreeMap<String, u64>) ->
 
 /// What a machine wrote, where its backend keeps it: the overlay's upper layer, the
 /// mstack's rw tree, a flat machine's whole tree, which is its image as well.
-fn writable_size(store: &Store, record: &ImageRecord) -> u64 {
+pub fn writable_size(store: &Store, record: &ImageRecord) -> u64 {
     let path = match record.backend {
         BackendChoice::Overlay => store
             .machines_private_dir()

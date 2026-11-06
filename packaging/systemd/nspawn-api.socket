@@ -1,0 +1,13 @@
+[Unit]
+Description=Docker API of nspawn for the host
+Documentation=https://nspawn.org/docs/docker-api/
+
+[Socket]
+ListenStream=/run/nspawn/api.sock
+# Every user may connect; polkit decides what each one may do.
+SocketMode=0666
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

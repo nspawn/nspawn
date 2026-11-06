@@ -48,6 +48,10 @@ impl Snapshot {
             let Some(record) = summary.record.clone() else {
                 continue;
             };
+            // A record pulled or built and never run is an image here, not a container.
+            if summary.state == "stopped" && crate::api::disk::image_only(&ctx.store, &record) {
+                continue;
+            }
             let unit = format!("systemd-nspawn@{}.service", record.name);
             let finished_usec = if ended(&summary.state) {
                 sd.exec_main_exit_usec(&unit).await.ok().filter(|t| *t > 0)
@@ -883,46 +887,7 @@ pub fn network_json(snapshot: &Snapshot, view: &NetworkView) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
-
-    /// The key paths of a JSON document, an array's elements under `[]`.
-    fn paths(value: &Value, prefix: &str, out: &mut BTreeSet<String>) {
-        match value {
-            Value::Object(map) => {
-                for (k, v) in map {
-                    // Keys that are names (labels, networks, ports) are not the shape.
-                    let key = if [
-                        "Labels",
-                        "Networks",
-                        "Ports",
-                        "Containers",
-                        "PortBindings",
-                        "ExposedPorts",
-                        "Volumes",
-                        "Options",
-                        "Tmpfs",
-                        "Sysctls",
-                    ]
-                    .iter()
-                    .any(|p| prefix.ends_with(p))
-                    {
-                        "*"
-                    } else {
-                        k.as_str()
-                    };
-                    let path = format!("{prefix}.{key}");
-                    out.insert(path.clone());
-                    paths(v, &path, out);
-                }
-            }
-            Value::Array(list) => {
-                for v in list.iter().take(1) {
-                    paths(v, &format!("{prefix}[]"), out);
-                }
-            }
-            _ => {}
-        }
-    }
+    use crate::dockerapi::shapes::diff;
 
     fn fixture() -> (Context, Snapshot) {
         let record: ImageRecord = serde_json::from_value(json!({
@@ -1049,16 +1014,6 @@ mod tests {
         assert!(!matches(&snapshot, "front"));
         let host_id = snapshot.network("host").unwrap().id;
         assert!(matches(&snapshot, &host_id[..12]));
-    }
-
-    fn diff(ours: &Value, docker: &Value) -> (Vec<String>, Vec<String>) {
-        let (mut a, mut b) = (BTreeSet::new(), BTreeSet::new());
-        paths(ours, "", &mut a);
-        paths(docker, "", &mut b);
-        (
-            a.difference(&b).cloned().collect(),
-            b.difference(&a).cloned().collect(),
-        )
     }
 
     #[test]

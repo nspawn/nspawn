@@ -527,8 +527,12 @@ mod tests {
             [1, 0, 0, 0, 0, 0, 0, 4, b'b', b'y', b'e', b'\n']
         );
         let golden = include_bytes!("../../tests/dockerapi/golden/logs-done-tail.body");
-        // The last line of the golden run, "bye" on standard output.
-        assert_eq!(golden.to_vec(), frame(1, b"bye\n").to_vec());
+        // The last line of the golden run, `echo bye; echo oops >&2`: either one, as
+        // the engine's copiers of the two streams race to the log.
+        assert!(
+            [frame(1, b"bye\n").to_vec(), frame(2, b"oops\n").to_vec()].contains(&golden.to_vec()),
+            "{golden:?}"
+        );
     }
 
     #[test]

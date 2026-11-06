@@ -17,6 +17,8 @@ for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
 docker rm -f $(docker ps -aq) >/dev/null 2>&1 || true
 docker network rm front >/dev/null 2>&1 || true
 docker volume rm data >/dev/null 2>&1 || true
+docker volume rm kept loose >/dev/null 2>&1 || true
+docker rmi labelled:1 >/dev/null 2>&1 || true
 
 # save NAME [CURL ARGS...] PATH: headers, body and status of one call.
 save() {
@@ -65,6 +67,8 @@ save inspect-done http://d/containers/done/json
 save inspect-fresh http://d/containers/fresh/json
 save inspect-missing http://d/containers/nope/json
 save top-web http://d/containers/web/top
+# web writes to its disk, so that its stats have block I/O whatever the page cache holds.
+docker exec web sh -c 'dd if=/dev/zero of=/tmp/io bs=4k count=256 conv=fsync' >/dev/null 2>&1
 save stats-web 'http://d/containers/web/stats?stream=false'
 save stats-web-oneshot 'http://d/containers/web/stats?stream=false&one-shot=true'
 save logs-done 'http://d/containers/done/logs?stdout=1&stderr=1&timestamps=1'
@@ -144,4 +148,36 @@ docker rm -f dozzle >/dev/null
 kill $(jobs -p) 2>/dev/null || true
 docker images --digests --format '{{.Repository}}:{{.Tag}} {{.Digest}}' > "$OUT/images.txt"
 docker version --format '{{.Server.Version}} {{.Server.APIVersion}}' > "$OUT/docker-version.txt"
+
+# Images, volumes and disk usage, read on busybox alone with one container made from it,
+# so that the answers do not follow the tools' tags: their containers, volumes and
+# images go first. The container keeps one volume with labels; the other is dangling.
+docker rm -f $(docker ps -aq) >/dev/null
+docker volume prune -af >/dev/null
+save volumes-empty http://d/volumes
+docker volume create --label e2e=yes --label tier=data kept >/dev/null
+docker volume create loose >/dev/null
+docker create --name keep -v kept:/kept $busybox true >/dev/null
+docker image prune -af >/dev/null
+docker commit -c 'LABEL e2e=yes' keep labelled:1 >/dev/null
+image=$(docker image inspect -f '{{.Id}}' $busybox)
+save images http://d/images/json
+save images-all 'http://d/images/json?all=1'
+save images-reference 'http://d/images/json?filters=%7B%22reference%22%3A%5B%22busybox%22%5D%7D'
+save images-dangling 'http://d/images/json?filters=%7B%22dangling%22%3A%5B%22true%22%5D%7D'
+save images-label 'http://d/images/json?filters=%7B%22label%22%3A%5B%22e2e%22%5D%7D'
+save image-busybox http://d/images/$busybox/json
+save image-busybox-id "http://d/images/$image/json"
+save image-busybox-short "http://d/images/$(echo $image | cut -c8-19)/json"
+save image-missing http://d/images/nope/json
+save history-busybox http://d/images/$busybox/history
+save volumes http://d/volumes
+save volumes-dangling 'http://d/volumes?filters=%7B%22dangling%22%3A%5B%22true%22%5D%7D'
+save volume-kept http://d/volumes/kept
+save volume-missing http://d/volumes/nope
+save system-df http://d/system/df
+# What a daemon outside a swarm answers of the swarm and plugin reads.
+for what in plugins swarm services secrets configs nodes tasks; do
+    save $what http://d/$what
+done
 echo "recorded into $OUT"

@@ -1,15 +1,21 @@
-//! The Docker Engine API, read-only, for the machines that mount its socket:
-//! reverse proxies that follow container labels, dashboards and log viewers find nspawn's
-//! machines through it. It is served by `nspawn api-serve NAME`, which systemd starts
-//! from the machine's own socket (`nspawn-api@NAME.socket`) when something connects, and
-//! which leaves once nothing has for a minute. Nothing here changes a machine but a kill,
-//! which goes to the service as `nspawn kill` does.
+//! The Docker Engine API, for the machines that mount its socket and for clients on the
+//! host: reverse proxies that follow container labels, dashboards and log viewers find
+//! nspawn's machines through it. It is served by `nspawn api-serve NAME` from a
+//! machine's own socket (`nspawn-api@NAME.socket`), and by `nspawn api-serve` from the
+//! host's (`nspawn-api.socket`), which systemd starts when something connects and which
+//! leave once nothing has for a minute. What a client may do is `access`'s answer; what
+//! changes something goes to the service, as the command line's requests do.
 
+pub mod access;
 pub mod events;
 pub mod filters;
+pub mod images;
 pub mod model;
+#[cfg(test)]
+pub(crate) mod shapes;
 pub(crate) mod streams;
 pub mod util;
+pub mod volumes;
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -24,6 +30,7 @@ use hyper::body::{Frame, Incoming};
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{json, Value};
 
+use self::access::{Client, Need, Profile};
 use self::filters::Filters;
 use self::model::{ImageInfo, Snapshot};
 use self::util::{split_version, version_text, API_VERSION, MIN_API_VERSION};
@@ -68,14 +75,24 @@ where
     response
 }
 
-pub async fn serve(machine: &str, config: Config) -> Result<()> {
-    let fd = crate::nsenter::listen_fd().with_context(|| {
-        format!("no socket was handed over; nspawn api-serve runs from nspawn-api@{machine}.socket")
+/// Serves the socket systemd hands over: `machine`'s, or the host's without one.
+pub async fn serve(machine: Option<&str>, config: Config) -> Result<()> {
+    let fd = crate::nsenter::listen_fd().with_context(|| match machine {
+        Some(machine) => format!(
+            "no socket was handed over; nspawn api-serve runs from nspawn-api@{machine}.socket"
+        ),
+        None => {
+            "no socket was handed over; nspawn api-serve runs from nspawn-api.socket".to_string()
+        }
     })?;
     let listener = std::os::unix::net::UnixListener::from(fd);
     listener.set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(listener)?;
     let ctx = Arc::new(Context::new(config));
+    let profile = match machine {
+        Some(machine) => Profile::of_machine(&ctx.store, machine),
+        None => Profile::Host,
+    };
     let open = Arc::new(AtomicUsize::new(0));
     let last = Arc::new(Mutex::new(Instant::now()));
     loop {
@@ -92,12 +109,14 @@ pub async fn serve(machine: &str, config: Config) -> Result<()> {
                 // Over the limit the connection is closed right away.
                 let Ok(permit) = CONNECTIONS.try_acquire() else { continue };
                 open.fetch_add(1, Ordering::SeqCst);
+                let peer = stream.peer_cred().ok().map(|cred| (cred.uid(), cred.pid()));
+                let client = Arc::new(Client::new(profile, peer));
                 let (ctx, open, last) = (ctx.clone(), open.clone(), last.clone());
                 tokio::spawn(async move {
                     let _permit = permit;
                     let service = hyper::service::service_fn(move |request| {
-                        let ctx = ctx.clone();
-                        async move { Ok::<_, Infallible>(handle(ctx, request).await) }
+                        let (ctx, client) = (ctx.clone(), client.clone());
+                        async move { Ok::<_, Infallible>(handle(ctx, &client, request).await) }
                     });
                     let _ = hyper::server::conn::http1::Builder::new()
                         .timer(hyper_util::rt::TokioTimer::new())
@@ -212,6 +231,14 @@ struct Query {
 }
 
 impl Query {
+    /// Every value of `key`, in order.
+    fn all<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.pairs
+            .iter()
+            .filter(move |(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
     fn get(&self, key: &str) -> Option<&str> {
         self.pairs
             .iter()
@@ -233,7 +260,7 @@ impl Query {
     }
 }
 
-async fn handle(ctx: Arc<Context>, request: Request<Incoming>) -> Response<Body> {
+async fn handle(ctx: Arc<Context>, client: &Client, request: Request<Incoming>) -> Response<Body> {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let query = query(request.uri().query().unwrap_or_default());
@@ -256,7 +283,7 @@ async fn handle(ctx: Arc<Context>, request: Request<Incoming>) -> Response<Body>
                 version_text(API_VERSION)
             ),
         ),
-        _ => route_request(&ctx, &method, route, &query).await,
+        _ => route_request(&ctx, client, &method, route, &query).await,
     };
     let headers = response.headers_mut();
     headers.insert("Api-Version", version_text(API_VERSION).parse().unwrap());
@@ -276,9 +303,7 @@ async fn handle(ctx: Arc<Context>, request: Request<Incoming>) -> Response<Body>
 
 /// The reads docker serves that this API has no answer for.
 const UNSERVED: &[&str] = &[
-    "/images/json",
-    "/volumes",
-    "/plugins",
+    "/plugins/",
     "/swarm",
     "/services",
     "/tasks",
@@ -298,14 +323,46 @@ enum Route {
     /// A container's json, top, logs, stats...
     Container(String, String),
     Kill(String),
+    /// The plugins, of which there are none.
+    Plugins,
+    Images,
+    /// An image's json or history, by the name or ID it was asked by.
+    Image(String, String),
+    Volumes,
+    Volume(String),
     Networks,
     Network(String),
     Events,
     /// A read docker serves and this API does not.
     Unserved,
     NotFound,
-    /// Anything that would change something, but a kill.
-    ReadOnly,
+    /// A change this API does not make.
+    Change,
+}
+
+impl Route {
+    /// What the request asks of its client: the action the bus asks about the method
+    /// behind it.
+    fn need(&self) -> Need {
+        match self {
+            Route::Ping | Route::Version | Route::Unserved | Route::NotFound => Need::Nothing,
+            Route::Container(_, what) if what == "logs" => Need::Observe,
+            Route::Kill(_) => Need::Observe,
+            Route::Info
+            | Route::DiskUsage
+            | Route::Containers
+            | Route::Container(..)
+            | Route::Plugins
+            | Route::Images
+            | Route::Image(..)
+            | Route::Volumes
+            | Route::Volume(_)
+            | Route::Networks
+            | Route::Network(_)
+            | Route::Events => Need::Inspect,
+            Route::Change => Need::Manage,
+        }
+    }
 }
 
 fn classify(method: &Method, path: &str) -> Route {
@@ -321,6 +378,13 @@ fn classify(method: &Method, path: &str) -> Route {
         (false, ["containers", id, "kill"]) if *method == Method::POST => {
             Route::Kill(id.to_string())
         }
+        (true, ["images", "json"]) => Route::Images,
+        (true, ["images", name @ .., what @ ("json" | "history")]) if !name.is_empty() => {
+            Route::Image(name.join("/"), what.to_string())
+        }
+        (true, ["plugins"]) => Route::Plugins,
+        (true, ["volumes"]) => Route::Volumes,
+        (true, ["volumes", name]) => Route::Volume(name.to_string()),
         (true, ["networks"]) => Route::Networks,
         (true, ["networks", id]) => Route::Network(id.to_string()),
         (true, ["events"]) => Route::Events,
@@ -330,22 +394,28 @@ fn classify(method: &Method, path: &str) -> Route {
             Route::Unserved
         }
         (true, _) => Route::NotFound,
-        (false, _) => Route::ReadOnly,
+        (false, _) => Route::Change,
     }
 }
 
 async fn route_request(
     ctx: &Arc<Context>,
+    client: &Client,
     method: &Method,
     path: &str,
     query: &Query,
 ) -> Response<Body> {
     let route = classify(method, path);
+    if let Err((status, text)) = client.allows(ctx, route.need()).await {
+        return error(status, text);
+    }
     // The requests whose handlers docker starts with ParseForm, which answers a query
     // that does not decode.
     let parses_form = match &route {
         Route::Containers
         | Route::Kill(_)
+        | Route::Images
+        | Route::Volumes
         | Route::Networks
         | Route::Network(_)
         | Route::Events
@@ -373,13 +443,21 @@ async fn route_request(
             Ok(snapshot) => json_response(StatusCode::OK, &info(ctx, &snapshot)),
             Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         },
-        Route::DiskUsage => json_response(
-            StatusCode::OK,
-            &json!({ "LayersSize": 0, "Images": [], "Containers": [], "Volumes": [], "BuildCache": [] }),
-        ),
+        Route::DiskUsage => disk_usage(ctx, query).await,
         Route::Containers => list_containers(ctx, query).await,
         Route::Container(id, what) => container_read(ctx, &id, &what, query).await,
         Route::Kill(id) => kill(ctx, &id, query).await,
+        Route::Plugins => json_response(StatusCode::OK, &json!([])),
+        Route::Images => list_images(ctx, query),
+        Route::Image(name, what) => image_read(ctx, &name, &what),
+        Route::Volumes => list_volumes(ctx, query),
+        Route::Volume(name) => match crate::api::volumes::list(&ctx.store) {
+            Ok(all) => match all.iter().find(|v| v.name == name) {
+                Some(volume) => json_response(StatusCode::OK, &volumes::json(volume)),
+                None => error(StatusCode::NOT_FOUND, format!("get {name}: no such volume")),
+            },
+            Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        },
         Route::Networks => list_networks(ctx, query).await,
         Route::Network(id) => match Snapshot::take(ctx).await {
             Ok(snapshot) => match snapshot.network(&id) {
@@ -389,14 +467,16 @@ async fn route_request(
             Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         },
         Route::Events => events(ctx, query),
+        // "not supported" in the words: the engine's clients take it for a kind of
+        // object this end does not have, as `docker inspect` does going on to the next.
         Route::Unserved => error(
             StatusCode::NOT_IMPLEMENTED,
-            format!("{path} is not served by nspawn's Docker API"),
+            format!("{path} is not supported by nspawn's Docker API"),
         ),
         Route::NotFound => error(StatusCode::NOT_FOUND, "page not found"),
-        Route::ReadOnly => error(
-            StatusCode::FORBIDDEN,
-            format!("nspawn's Docker API is read-only: {method} {path} is not served"),
+        Route::Change => error(
+            StatusCode::NOT_IMPLEMENTED,
+            format!("{method} {path} is not supported by nspawn's Docker API"),
         ),
     }
 }
@@ -470,11 +550,7 @@ fn info(ctx: &Context, snapshot: &Snapshot) -> Value {
     } else {
         machine_id
     };
-    let images = snapshot
-        .machines
-        .iter()
-        .filter(|m| m.record.origin != "create")
-        .count();
+    let images = images::list(ctx).map(|all| all.len()).unwrap_or(0);
     let mut info = json!({
         "ID": id,
         "Containers": total,
@@ -797,7 +873,7 @@ async fn container_read(ctx: &Arc<Context>, id: &str, what: &str, query: &Query)
         "stats" => stats(ctx, machine, query).await,
         "changes" | "export" | "archive" => error(
             StatusCode::NOT_IMPLEMENTED,
-            format!("/containers/{{id}}/{what} is not served by nspawn's Docker API"),
+            format!("/containers/{{id}}/{what} is not supported by nspawn's Docker API"),
         ),
         _ => error(StatusCode::NOT_FOUND, "page not found"),
     }
@@ -882,6 +958,140 @@ async fn stats(ctx: &Arc<Context>, machine: &model::Machine, query: &Query) -> R
         StatusCode::OK,
         &streams::stats_json(name, &machine.id, pids_limit, now.as_ref(), before.as_ref()),
     )
+}
+
+/// GET /system/df: what each kind of object takes, the kinds `type` names or all.
+async fn disk_usage(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
+    let types: Vec<&str> = query.all("type").collect();
+    if let Some(bad) = types
+        .iter()
+        .find(|t| !["container", "image", "volume", "build-cache"].contains(t))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("unknown object type: {bad}"),
+        );
+    }
+    let wants = |kind: &str| types.is_empty() || types.contains(&kind);
+    let failed = |e: anyhow::Error| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
+    let mut out = json!({
+        "LayersSize": 0,
+        "Images": null,
+        "Containers": null,
+        "Volumes": null,
+        "BuildCache": null,
+    });
+    if wants("image") {
+        let all = match images::list(ctx) {
+            Ok(all) => all,
+            Err(e) => return failed(e),
+        };
+        let (entries, total) = images::disk_usage(ctx, &all);
+        out["Images"] = json!(entries);
+        out["LayersSize"] = json!(total);
+    }
+    if wants("container") {
+        let snapshot = match Snapshot::take(ctx).await {
+            Ok(s) => s,
+            Err(e) => return failed(e),
+        };
+        let all = images::list(ctx).unwrap_or_default();
+        let entries: Vec<Value> = snapshot
+            .machines
+            .iter()
+            .map(|m| {
+                let mut entry = m.summary_json(ctx, &snapshot, &ImageInfo::of(ctx, &m.record));
+                let rw = crate::api::disk::writable_size(&ctx.store, &m.record);
+                let image = all
+                    .iter()
+                    .find(|i| i.containers.contains(&m.record.name))
+                    .map_or(0, |i| i.size);
+                // As the engine gives them: none that is 0.
+                if rw > 0 {
+                    entry["SizeRw"] = json!(rw);
+                }
+                if rw + image > 0 {
+                    entry["SizeRootFs"] = json!(rw + image);
+                }
+                entry
+            })
+            .collect();
+        out["Containers"] = json!(entries);
+    }
+    if wants("volume") {
+        let all = match crate::api::volumes::list(&ctx.store) {
+            Ok(all) => all,
+            Err(e) => return failed(e),
+        };
+        let entries: Vec<Value> = all
+            .iter()
+            .map(|v| {
+                let mut entry = volumes::json(v);
+                let size = crate::api::disk::tree_size(&v.path, &mut Default::default());
+                entry["UsageData"] = json!({ "Size": size, "RefCount": v.used_by.len() });
+                entry
+            })
+            .collect();
+        out["Volumes"] = json!(entries);
+    }
+    if wants("build-cache") {
+        out["BuildCache"] = json!([]);
+    }
+    json_response(StatusCode::OK, &out)
+}
+
+fn list_images(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
+    let filters = match Filters::parse(query.get("filters")) {
+        Ok(f) => f,
+        Err(filters::Invalid(message)) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    let all = match images::list(ctx) {
+        Ok(all) => all,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    match images::select(&all, &filters) {
+        Ok(selected) => json_response(
+            StatusCode::OK,
+            &Value::Array(selected.into_iter().map(images::summary_json).collect()),
+        ),
+        Err(filters::Invalid(message)) => error(StatusCode::BAD_REQUEST, message),
+    }
+}
+
+fn image_read(ctx: &Arc<Context>, name: &str, what: &str) -> Response<Body> {
+    let all = match images::list(ctx) {
+        Ok(all) => all,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    let image = match images::find(&all, name) {
+        Ok(image) => image,
+        Err(e) => return error(lookup_status(&e), e),
+    };
+    match what {
+        "history" => json_response(StatusCode::OK, &images::history_json(ctx, image)),
+        _ => json_response(StatusCode::OK, &images::inspect_json(&ctx.store, image)),
+    }
+}
+
+fn list_volumes(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
+    let filters = match Filters::parse(query.get("filters")) {
+        Ok(f) => f,
+        Err(filters::Invalid(message)) => return error(StatusCode::BAD_REQUEST, message),
+    };
+    let all = match crate::api::volumes::list(&ctx.store) {
+        Ok(all) => all,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+    };
+    match volumes::select(&all, &filters) {
+        Ok(selected) => json_response(
+            StatusCode::OK,
+            &json!({
+                "Volumes": selected.into_iter().map(volumes::json).collect::<Vec<_>>(),
+                "Warnings": null,
+            }),
+        ),
+        Err(filters::Invalid(message)) => error(StatusCode::BAD_REQUEST, message),
+    }
 }
 
 async fn list_networks(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
@@ -1160,7 +1370,7 @@ mod tests {
             let method: Method = method.parse().unwrap();
             let route = classify(&method, path);
             assert!(
-                !matches!(route, Route::NotFound | Route::Unserved | Route::ReadOnly),
+                !matches!(route, Route::NotFound | Route::Unserved | Route::Change),
                 "{line}: {route:?}"
             );
             if let Route::Container(_, what) = &route {
@@ -1186,21 +1396,45 @@ mod tests {
             classify(&Method::POST, "/containers/web/kill"),
             Route::Kill("web".into())
         );
-        assert_eq!(
-            classify(&Method::POST, "/containers/create"),
-            Route::ReadOnly
-        );
+        assert_eq!(classify(&Method::POST, "/containers/create"), Route::Change);
         assert_eq!(
             classify(&Method::POST, "/containers/web/exec"),
-            Route::ReadOnly
+            Route::Change
+        );
+        assert_eq!(classify(&Method::DELETE, "/containers/web"), Route::Change);
+        assert_eq!(classify(&get, "/images/json"), Route::Images);
+        assert_eq!(
+            classify(&get, "/images/ghcr.io/x/y:1/json"),
+            Route::Image("ghcr.io/x/y:1".into(), "json".into())
         );
         assert_eq!(
-            classify(&Method::DELETE, "/containers/web"),
-            Route::ReadOnly
+            classify(&get, "/images/busybox/history"),
+            Route::Image("busybox".into(), "history".into())
         );
-        assert_eq!(classify(&get, "/images/json"), Route::Unserved);
-        assert_eq!(classify(&get, "/volumes"), Route::Unserved);
+        assert_eq!(classify(&get, "/images/busybox/get"), Route::Unserved);
+        assert_eq!(classify(&get, "/volumes"), Route::Volumes);
+        assert_eq!(
+            classify(&get, "/volumes/data"),
+            Route::Volume("data".into())
+        );
         assert_eq!(classify(&get, "/nothing/here"), Route::NotFound);
+    }
+
+    #[test]
+    fn each_route_asks_what_its_method_on_the_bus_asks() {
+        let need = |method: Method, path| classify(&method, path).need();
+        assert_eq!(need(Method::GET, "/_ping"), Need::Nothing);
+        assert_eq!(need(Method::GET, "/version"), Need::Nothing);
+        assert_eq!(need(Method::GET, "/info"), Need::Inspect);
+        assert_eq!(need(Method::GET, "/containers/json"), Need::Inspect);
+        assert_eq!(need(Method::GET, "/containers/web/json"), Need::Inspect);
+        assert_eq!(need(Method::GET, "/containers/web/stats"), Need::Inspect);
+        assert_eq!(need(Method::GET, "/events"), Need::Inspect);
+        // Logs ask org.nspawn.manage on the bus; a read-only socket serves them.
+        assert_eq!(need(Method::GET, "/containers/web/logs"), Need::Observe);
+        assert_eq!(need(Method::POST, "/containers/web/kill"), Need::Observe);
+        assert_eq!(need(Method::POST, "/containers/create"), Need::Manage);
+        assert_eq!(need(Method::DELETE, "/containers/web"), Need::Manage);
     }
 
     #[test]
