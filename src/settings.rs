@@ -11,6 +11,7 @@ use crate::oci::{Mode, RunSpec};
 use crate::policy::{Limits, Restart};
 use crate::systemd::Systemd;
 use crate::tuning::Tuning;
+use crate::volume;
 
 pub const SETTINGS_DIR: &str = "/etc/systemd/nspawn";
 
@@ -134,14 +135,17 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
                 "Boot=no\nProcessTwo=yes\n"
             });
             if !s.command.is_empty() {
-                let quoted: Vec<String> = written(s.command).iter().map(|a| quote(a)).collect();
+                let quoted: Vec<String> = written(s.command, &shell_env(s))
+                    .iter()
+                    .map(|a| quote(a))
+                    .collect();
                 out.push_str(&format!("Parameters={}\n", quoted.join(" ")));
             }
             // systemd-nspawn's NOTIFY_SOCKET stays: an empty one is EINVAL to libsystemd's
             // and Rust's sd_notify, and Environment= cannot unset it. A later assignment of
             // the same variable wins, so -e comes after the image's.
-            for var in s.run.env.iter().chain(s.extra_env) {
-                out.push_str(&format!("Environment={}\n", quote(var)));
+            for var in written_env(s) {
+                out.push_str(&format!("Environment={}\n", quote(&var)));
             }
             if let Some(dir) = s
                 .tuning
@@ -374,6 +378,9 @@ pub fn hook_argv(config: &crate::config::Config) -> Result<Vec<String>> {
     Ok(argv)
 }
 
+/// The journal's rate limit of a machine's unit, as good as none.
+const RATE_LIMIT: &str = "LogRateLimitIntervalSec=1us\nLogRateLimitBurst=1000000\n";
+
 /// The argv systemd has loaded for the ExecStart= the drop-in rewrites behind
 /// `nspawn attach-exec` (`exec_start_override`): an app machine's always, a booted
 /// machine's when its output goes to nspawn's journal namespace. None otherwise.
@@ -461,9 +468,11 @@ pub fn render_hooks(
         text.push_str(&format!("ExecStartPre={command} await-dependencies %i\n"));
     }
     // Logs and attached runs read the machine's output from the journal: no rate limit,
-    // and a line that starts with <N> keeps it rather than becoming its priority.
+    // and a line that starts with <N> keeps it rather than becoming its priority. systemd
+    // hands journald no interval of 0, which would turn the limit off, so the interval is
+    // one microsecond, too short for any burst to fill.
     text.push_str(&format!(
-        "ExecStartPre={command} network prepare %i\nExecStartPost={command} network publish %i\nExecStopPost=-{command} network release %i\nLogRateLimitIntervalSec=0\nSyslogLevelPrefix=no\n"
+        "ExecStartPre={command} network prepare %i\nExecStartPost={command} network publish %i\nExecStopPost=-{command} network release %i\n{RATE_LIMIT}SyslogLevelPrefix=no\n"
     ));
     // A healthcheck to pass or a program to end may take longer than the template's two
     // minutes; the hook fails the start when the other machine fails.
@@ -616,28 +625,84 @@ pub fn needs_shell(command: &[String]) -> bool {
     command.iter().any(|arg| arg.contains('\n'))
 }
 
+/// Whether the program starts through the image's /bin/sh: an argument or a variable
+/// holds a line break, which the settings file cannot carry.
+pub fn starts_through_shell(command: &[String], env: &[String]) -> bool {
+    needs_shell(command) || env.iter().any(|var| volume::breaks_line(var))
+}
+
+/// The names of the variables whose values hold a line break: the settings file carries
+/// them encoded, and the image's /bin/sh decodes them before the program runs.
+fn shell_env(s: &MachineSettings) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for var in s.run.env.iter().chain(s.extra_env) {
+        let name = var.split_once('=').map_or(var.as_str(), |(n, _)| n);
+        // A later assignment wins, encoded or not.
+        names.retain(|n| n != name);
+        if volume::breaks_line(var) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+/// The variables as the settings file carries them, those with a line break encoded
+/// as `handover` encodes an argument.
+fn written_env(s: &MachineSettings) -> Vec<String> {
+    s.run
+        .env
+        .iter()
+        .chain(s.extra_env)
+        .map(|var| {
+            if volume::breaks_line(var) {
+                encoded(var)
+            } else {
+                var.clone()
+            }
+        })
+        .collect()
+}
+
+/// Backslashes doubled and line breaks written \n and \r, which printf's %b turns back.
+fn encoded(text: &str) -> String {
+    text.replace('\\', r"\\")
+        .replace('\n', r"\n")
+        .replace('\r', r"\r")
+}
+
 /// Decodes each argument with printf's %b in order and execs them, so that the program
 /// gets them as given and keeps the PID the shell had. The x keeps the newlines a
 /// command substitution would take off the end.
 const HANDOVER: &str =
     r#"for a in "$@"; do shift; d=$(printf '%bx' "$a"); set -- "$@" "${d%x}"; done; exec "$@""#;
 
-/// The program's arguments as the settings file carries them.
-fn written(command: &[String]) -> Vec<String> {
-    if needs_shell(command) {
-        handover(command)
+/// The same, after it decoded the variables named before `--` and exported them.
+const HANDOVER_ENV: &str = r#"while [ "$1" != -- ]; do eval "v=\${$1}"; d=$(printf '%bx' "$v"); export "$1=${d%x}"; shift; done; shift; for a in "$@"; do shift; d=$(printf '%bx' "$a"); set -- "$@" "${d%x}"; done; exec "$@""#;
+
+/// The program's arguments as the settings file carries them, given the variables the
+/// shell decodes (`shell_env`).
+fn written(command: &[String], env: &[String]) -> Vec<String> {
+    if !env.is_empty() {
+        handover(HANDOVER_ENV, env, command)
+    } else if needs_shell(command) {
+        handover(HANDOVER, &[], command)
     } else {
         command.to_vec()
     }
 }
 
-/// `command` as /bin/sh runs it with `HANDOVER`: backslashes doubled and newlines
-/// written \n, which %b turns back.
-fn handover(command: &[String]) -> Vec<String> {
-    let mut argv: Vec<String> = ["/bin/sh", "-c", HANDOVER, "sh"]
+/// `command` as /bin/sh runs it with `script`, after the names of the variables it
+/// decodes and `--`, if any: backslashes doubled and newlines written \n.
+fn handover(script: &str, env: &[String], command: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = ["/bin/sh", "-c", script, "sh"]
         .iter()
         .map(|s| s.to_string())
         .collect();
+    if !env.is_empty() {
+        argv.extend(env.iter().cloned());
+        argv.push("--".to_string());
+    }
+    // An argument has its newlines encoded; any other control character is refused.
     argv.extend(
         command
             .iter()
@@ -658,13 +723,21 @@ pub fn write(s: &MachineSettings, route: &NamespaceRoute) -> Result<()> {
 pub fn check_plain(s: &MachineSettings) -> Result<()> {
     let mut values: Vec<(&str, String)> = Vec::new();
     let mut quoted: Vec<(&str, String)> = Vec::new();
-    // The command and the environment are written in quotes: a tab there is kept. The
-    // command is checked as it is written, a newline of it encoded (`written`).
-    for arg in written(s.command) {
+    // The command and the environment are written in quotes: a tab there is kept. Both
+    // are checked as they are written, a line break of them encoded (`written`).
+    for arg in written(s.command, &shell_env(s)) {
         quoted.push(("the command", arg));
     }
-    for var in s.run.env.iter().chain(s.extra_env) {
-        quoted.push(("the environment", var.clone()));
+    for var in written_env(s) {
+        quoted.push(("the environment", var));
+    }
+    for name in shell_env(s) {
+        if !volume::is_shell_name(&name) {
+            anyhow::bail!(
+                "the variable {name} of {} holds a line break, which reaches the program through /bin/sh, and /bin/sh takes names of letters, digits and underscores only",
+                s.name
+            );
+        }
     }
     let mut take = |what: &'static str, value: &str| values.push((what, value.to_string()));
     for dir in s.run.working_dir.iter().chain(&s.tuning.working_dir) {
@@ -1111,8 +1184,14 @@ mod tests {
         let mut bad = run.clone();
         bad.working_dir = Some("/srv\nBind=/:/host".into());
         assert!(!plain(&[], &bad, &none));
+        // A line break of a variable goes encoded too, under a name /bin/sh takes.
+        let mut broken = run.clone();
+        broken.env = vec!["A=1\nBind=/:/x\r".into()];
+        assert!(plain(&[], &broken, &none));
+        broken.env = vec!["a.b=1\nBind=/:/x".into()];
+        assert!(!plain(&[], &broken, &none));
         let mut bad = run.clone();
-        bad.env = vec!["A=1\nBind=/:/x".into()];
+        bad.env = vec!["A=1\x0bBind=/:/x".into()];
         assert!(!plain(&[], &bad, &none));
         let mut bad = run.clone();
         bad.user = Some("nginx\nPrivateUsers=no".into());
@@ -1156,6 +1235,22 @@ mod tests {
             .lines()
             .find_map(|l| l.strip_prefix("Parameters="))
             .unwrap();
+        words_of(line)
+    }
+
+    /// The variables of the Environment= lines, as systemd-nspawn reads them.
+    fn environment(file: &str) -> Vec<(String, String)> {
+        file.lines()
+            .filter_map(|l| l.strip_prefix("Environment="))
+            .flat_map(words_of)
+            .map(|var| {
+                let (name, value) = var.split_once('=').unwrap();
+                (name.to_string(), value.to_string())
+            })
+            .collect()
+    }
+
+    fn words_of(line: &str) -> Vec<String> {
         let mut words = Vec::new();
         let (mut word, mut quote, mut any) = (String::new(), None, false);
         for c in line.chars() {
@@ -1181,6 +1276,60 @@ mod tests {
             words.push(word);
         }
         words
+    }
+
+    #[test]
+    fn a_variable_with_a_line_break_reaches_the_program_through_the_shell() {
+        let run = RunSpec {
+            env: vec!["PATH=/usr/bin:/bin".into(), "MSG=image".into()],
+            ..RunSpec::default()
+        };
+        let extra: Vec<String> = vec![
+            "MSG=Fix x\n\nbody \\n \\c it's\r\n".into(),
+            "PLAIN=a\\nb".into(),
+            "LATER=x\ny".into(),
+            "LATER=z".into(),
+        ];
+        let command: Vec<String> = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            r#"printf '[%s][%s][%s][%s]' "$MSG" "$PLAIN" "$LATER" "$1""#.into(),
+            "sh".into(),
+            "arg".into(),
+        ];
+        let file = render(&MachineSettings {
+            name: "web",
+            managed_userns: false,
+            mode: Mode::App,
+            pid1: false,
+            run: &run,
+            command: &command,
+            extra_env: &extra,
+            binds: &[],
+            volume_units: None,
+            network: Network::Bridge,
+            no_network: false,
+            hostname_file: None,
+            tuning: &Tuning::default(),
+            bridge: None,
+        });
+        assert!(!file.lines().any(|l| l.starts_with("body")), "{file}");
+        let argv = parameters(&file);
+        assert_eq!(
+            argv[..6],
+            ["/bin/sh", "-c", HANDOVER_ENV, "sh", "MSG", "--"]
+        );
+        let out = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .env_clear()
+            .envs(environment(&file))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "[Fix x\n\nbody \\n \\c it's\r\n][a\\nb][z][arg]"
+        );
     }
 
     #[test]
@@ -1586,7 +1735,7 @@ mod tests {
         );
         assert_eq!(
             plain,
-            "# Generated by nspawn; do not edit.\n[Service]\nExecStartPre=/usr/bin/nspawn network prepare %i\nExecStartPost=/usr/bin/nspawn network publish %i\nExecStopPost=-/usr/bin/nspawn network release %i\nLogRateLimitIntervalSec=0\nSyslogLevelPrefix=no\n",
+            "# Generated by nspawn; do not edit.\n[Service]\nExecStartPre=/usr/bin/nspawn network prepare %i\nExecStartPost=/usr/bin/nspawn network publish %i\nExecStopPost=-/usr/bin/nspawn network release %i\nLogRateLimitIntervalSec=1us\nLogRateLimitBurst=1000000\nSyslogLevelPrefix=no\n",
             "a booted machine without a policy or limits, writing to the system's journal: the hooks alone"
         );
         // The default, local: journald's namespace listens first, and the machine's
@@ -1628,7 +1777,7 @@ mod tests {
         );
         assert!(
             quiet.ends_with(
-                "LogRateLimitIntervalSec=0\nSyslogLevelPrefix=no\nStandardOutput=null\nStandardError=journal\n"
+                "LogRateLimitIntervalSec=1us\nLogRateLimitBurst=1000000\nSyslogLevelPrefix=no\nStandardOutput=null\nStandardError=journal\n"
             ),
             "{quiet}"
         );
@@ -1705,7 +1854,7 @@ mod tests {
             },
         );
         assert!(only_cpus.ends_with(
-            "network release %i\nLogRateLimitIntervalSec=0\nSyslogLevelPrefix=no\nCPUQuota=33.3%\n"
+            "network release %i\nLogRateLimitIntervalSec=1us\nLogRateLimitBurst=1000000\nSyslogLevelPrefix=no\nCPUQuota=33.3%\n"
         ));
         let argv: Vec<String> = [
             "systemd-nspawn",
@@ -1774,14 +1923,14 @@ mod tests {
         };
         assert_eq!(
             render(&tuning(&["db", "cache:optional"])),
-            "# Generated by nspawn; do not edit.\n[Unit]\nWants=systemd-nspawn@db.service\nAfter=systemd-nspawn@db.service\nWants=systemd-nspawn@cache.service\nAfter=systemd-nspawn@cache.service\n[Service]\nExecStartPre=/usr/bin/nspawn await-dependencies %i\nExecStartPre=/usr/bin/nspawn network prepare %i\nExecStartPost=/usr/bin/nspawn network publish %i\nExecStopPost=-/usr/bin/nspawn network release %i\nLogRateLimitIntervalSec=0\nSyslogLevelPrefix=no\n",
+            "# Generated by nspawn; do not edit.\n[Unit]\nWants=systemd-nspawn@db.service\nAfter=systemd-nspawn@db.service\nWants=systemd-nspawn@cache.service\nAfter=systemd-nspawn@cache.service\n[Service]\nExecStartPre=/usr/bin/nspawn await-dependencies %i\nExecStartPre=/usr/bin/nspawn network prepare %i\nExecStartPost=/usr/bin/nspawn network publish %i\nExecStopPost=-/usr/bin/nspawn network release %i\nLogRateLimitIntervalSec=1us\nLogRateLimitBurst=1000000\nSyslogLevelPrefix=no\n",
             "started: systemd's ordering is enough, the template's timeout stays"
         );
         for waiting in ["db:healthy", "migrate:completed"] {
             let text = render(&tuning(&["cache", waiting]));
             assert!(
                 text.contains(
-                    "LogRateLimitIntervalSec=0\nSyslogLevelPrefix=no\nTimeoutStartSec=infinity\n"
+                    "LogRateLimitIntervalSec=1us\nLogRateLimitBurst=1000000\nSyslogLevelPrefix=no\nTimeoutStartSec=infinity\n"
                 ),
                 "{text}"
             );

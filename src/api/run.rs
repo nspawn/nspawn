@@ -658,6 +658,7 @@ impl Attached {
                     // until it ends: by a unit of its own, as a reader in the service
                     // would end with a restart of the service, and the program with it at
                     // its next write. Here only when systemd takes no such unit.
+                    blocking(&drain);
                     let outside = match ctx.sd().await {
                         Ok(sd) => drain_outside(sd, &self.name, drain).await,
                         Err(_) => Err(drain),
@@ -679,6 +680,7 @@ impl Attached {
                     return 0;
                 };
                 // What the machine still writes is read and dropped, or it would block.
+                blocking(&keep);
                 std::thread::spawn(move || {
                     let mut file = std::fs::File::from(keep);
                     let mut buf = [0u8; 4096];
@@ -707,6 +709,18 @@ impl Attached {
             Ok(ending) => exit_code(&ending, sent, self.app && !self.pid1),
             Err(_) => 125,
         }
+    }
+}
+
+/// Clears O_NONBLOCK on a descriptor whose client is gone. The client read its copy
+/// without blocking, and the flag belongs to the open file description the copies
+/// share: a reader that drops the output would stop at the first empty read, and the
+/// program die or block at its next write.
+fn blocking(fd: &OwnedFd) {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    if let Ok(flags) = fcntl(fd, FcntlArg::F_GETFL) {
+        let flags = OFlag::from_bits_truncate(flags) - OFlag::O_NONBLOCK;
+        let _ = fcntl(fd, FcntlArg::F_SETFL(flags));
     }
 }
 
@@ -761,6 +775,28 @@ pub fn transient_service(description: &str, argv: &[String]) -> Vec<(String, Own
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pipe_its_client_read_without_blocking_is_drained_to_its_end() {
+        use std::io::{Read, Write};
+        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
+        let drain = read.try_clone().unwrap();
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        let flags = OFlag::from_bits_truncate(fcntl(&read, FcntlArg::F_GETFL).unwrap());
+        fcntl(&read, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+        drop(read);
+        super::blocking(&drain);
+        let mut write = std::fs::File::from(write);
+        let reader = std::thread::spawn(move || {
+            let mut file = std::fs::File::from(drain);
+            let mut all = Vec::new();
+            file.read_to_end(&mut all).map(|_| all)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        write.write_all(b"later").unwrap();
+        drop(write);
+        assert_eq!(reader.join().unwrap().unwrap(), b"later");
+    }
+
     use super::*;
 
     #[tokio::test]

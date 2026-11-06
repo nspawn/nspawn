@@ -292,7 +292,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.env_file.[].format` | yes |  |
 | `services.*.env_file.[].path` | yes |  |
 | `services.*.env_file.[].required` | yes |  |
-| `services.*.environment` and below | partly | refused for an image that boots, whose init runs as it is; a value with a newline or another control character but a tab is refused, as the settings file that carries it is read a line at a time |
+| `services.*.environment` and below | partly | refused for an image that boots, whose init runs as it is; a value with a line break needs a /bin/sh in the image, which hands it over, and a name of letters, digits and underscores; another control character but a tab is refused, as the settings file that carries it is read a line at a time |
 | `services.*.expose` | yes |  |
 | `services.*.extends` | yes |  |
 | `services.*.extends.file` | partly | files on this host: a git or oci:// address is refused |

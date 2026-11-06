@@ -123,6 +123,7 @@ async fn copy_out(client: &Client, name: &str, path: &str, destination: &str) ->
                     root: open_dir(&plan.dir)?,
                     base: PathBuf::new(),
                     top: plan.top,
+                    unmounted: Vec::new(),
                 })
             },
             Ids::Keep,

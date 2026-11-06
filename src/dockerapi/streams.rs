@@ -62,56 +62,93 @@ fn log_chunk(query: &LogsQuery, payload: Vec<u8>) -> Bytes {
     }
 }
 
-/// journalctl's entries as frames, until it ends or the client goes.
-pub async fn logs(query: LogsQuery, tx: Sender<Bytes>) {
-    let argv = crate::api::machines::journalctl_arguments(&query.request);
-    let Ok(mut child) = tokio::process::Command::new("journalctl")
-        .args(&argv)
+/// Whether machined has `machine` registered, which it is while it runs.
+pub fn registered(machine: &str) -> bool {
+    std::path::Path::new("/run/systemd/machines")
+        .join(machine)
+        .exists()
+}
+
+/// The journalctl of a logs request, started before the answer so that one that cannot
+/// run is an error rather than an empty stream.
+pub fn logs_journal(
+    request: &crate::api::machines::LogsRequest,
+) -> std::io::Result<tokio::process::Child> {
+    tokio::process::Command::new("journalctl")
+        .args(crate::api::machines::journalctl_arguments(request))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
-    else {
-        return;
-    };
-    let Some(stdout) = child.stdout.take() else {
+}
+
+/// How long the lines left in the journal have to come once a followed machine is gone.
+const QUIET: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The entries `journal` writes as frames, until it ends or the client goes.
+pub async fn logs(query: LogsQuery, mut journal: tokio::process::Child, tx: Sender<Bytes>) {
+    let Some(stdout) = journal.stdout.take() else {
         return;
     };
     let mut lines = tokio::io::BufReader::new(stdout).lines();
     // A follow ends with the machine: machined's file of it goes when it stops.
-    let registered = std::path::Path::new("/run/systemd/machines").join(&query.request.machine);
     let mut ticks = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut gone = 0;
     loop {
         tokio::select! {
             _ = ticks.tick(), if query.request.follow => {
-                gone = if registered.exists() { 0 } else { gone + 1 };
-                // A tick of grace for its last lines.
+                gone = if registered(&query.request.machine) { 0 } else { gone + 1 };
+                // A tick of grace, then what journalctl still has to write.
                 if gone > 1 {
+                    while let Ok(Ok(Some(line))) = tokio::time::timeout(QUIET, lines.next_line()).await {
+                        if !send_log_line(&query, &tx, &line).await {
+                            break;
+                        }
+                    }
                     break;
                 }
             }
             line = lines.next_line() => {
                 let Ok(Some(line)) = line else { break };
-                let Ok(entry) = serde_json::from_str::<Value>(&line) else { continue };
-                let Some((mut message, usec)) = entry_line(&entry) else { continue };
-                message.push(b'\n');
-                let payload = if query.request.timestamps {
-                    let mut stamped = format!("{} ", rfc3339_nano(usec, true)).into_bytes();
-                    stamped.extend_from_slice(&message);
-                    stamped
-                } else {
-                    message
-                };
-                if tx.send(log_chunk(&query, payload)).await.is_err() {
+                if !send_log_line(&query, &tx, &line).await {
                     break;
                 }
             }
             _ = tx.closed() => break,
         }
     }
-    let _ = child.kill().await;
+    let _ = journal.kill().await;
+}
+
+/// Sends one of journalctl's lines as the machine wrote it; false once the client went.
+async fn send_log_line(query: &LogsQuery, tx: &Sender<Bytes>, line: &str) -> bool {
+    let Ok(entry) = serde_json::from_str::<Value>(line) else {
+        return true;
+    };
+    let Some(payload) = log_payload(&entry, query.request.timestamps) else {
+        return true;
+    };
+    tx.send(log_chunk(query, payload)).await.is_ok()
+}
+
+/// An entry's line as the machine wrote it, with its time first when asked: the console's
+/// CR dropped and journald's line breaks given back, as an attach reads them. Lines of
+/// the unit's hooks are not the machine's.
+fn log_payload(entry: &Value, timestamps: bool) -> Option<Vec<u8>> {
+    if entry.get("_COMM").and_then(Value::as_str) == Some("nspawn") {
+        return None;
+    }
+    let (_, usec) = entry_line(entry)?;
+    let mut message = crate::api::run::message_bytes(entry)?;
+    message.extend_from_slice(crate::api::run::line_end(entry));
+    Some(if timestamps {
+        let mut stamped = format!("{} ", rfc3339_nano(usec, true)).into_bytes();
+        stamped.extend_from_slice(&message);
+        stamped
+    } else {
+        message
+    })
 }
 
 /// Total CPU time of the host in nanoseconds, from /proc/stat, as the API reports it:
@@ -404,24 +441,16 @@ fn api_name_of_new(
     }
 }
 
+/// The events `follow` reads, until `deadline` or the client goes; nothing without it.
 pub async fn events(
     ctx: Arc<Context>,
-    since: Option<String>,
-    until: Option<String>,
+    follow: Option<crate::api::events::Follow>,
     deadline: Option<std::time::Duration>,
     filters: Filters,
     tx: Sender<Bytes>,
 ) {
-    if deadline == Some(std::time::Duration::ZERO) {
+    let Some(mut follow) = follow else {
         return;
-    }
-    let mut follow = match crate::api::events::Follow::spawn(
-        since.as_deref(),
-        until.as_deref(),
-        std::process::Stdio::null(),
-    ) {
-        Ok(follow) => follow,
-        Err(_) => return,
     };
     let ends = async {
         match deadline {
@@ -482,6 +511,29 @@ pub async fn events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_line_reads_as_the_machine_wrote_it() {
+        let entry = |fields: Value| {
+            let mut entry = serde_json::json!({"__REALTIME_TIMESTAMP": "1000000"});
+            entry
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            entry
+        };
+        let console = entry(serde_json::json!({"MESSAGE": "hi\r", "_COMM": "systemd-nspawn"}));
+        assert_eq!(log_payload(&console, false).unwrap(), b"hi\n");
+        let nul = entry(serde_json::json!({"MESSAGE": "a", "_COMM": "sh", "_LINE_BREAK": "nul"}));
+        assert_eq!(log_payload(&nul, false).unwrap(), b"a\0");
+        let cut =
+            entry(serde_json::json!({"MESSAGE": "long", "_COMM": "sh", "_LINE_BREAK": "line-max"}));
+        assert_eq!(log_payload(&cut, false).unwrap(), b"long");
+        let hook = entry(serde_json::json!({"MESSAGE": "warning", "_COMM": "nspawn"}));
+        assert_eq!(log_payload(&hook, false), None);
+        let stamped = log_payload(&console, true).unwrap();
+        assert_eq!(stamped, b"1970-01-01T00:00:01.000000000Z hi\n");
+    }
 
     #[test]
     fn cpu_counts_as_docker_counts_it() {

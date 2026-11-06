@@ -459,7 +459,6 @@ pub fn spawn(
         .collect::<Result<_, _>>()?;
     let mut env: Vec<CString> = image_env
         .iter()
-        .filter(|v| !v.starts_with("HOME="))
         .map(|v| CString::new(v.as_str()))
         .collect::<Result<_, _>>()?;
     if !image_env.iter().any(|v| v.starts_with("PATH=")) {
@@ -988,7 +987,10 @@ fn grandchild(
         }
     }
     let mut env: Vec<CString> = env.to_vec();
+    // The user's home, unless the machine's variables or the command's name one.
+    let has_home = names_home(&env);
     match user {
+        None if has_home => {}
         None => env.push(CString::new("HOME=/root").expect("no NUL")),
         Some(user) => {
             let Some((uid, gid, home, groups)) = resolve_user(user) else {
@@ -1003,13 +1005,15 @@ fn grandchild(
                 return 126;
             }
             // A home with a NUL, from the image's passwd, is no home to give.
-            let Ok(home) = CString::new(format!("HOME={home}")) else {
-                complain(&format!(
-                    "error: the home of {user} inside the machine is not a path"
-                ));
-                return 126;
-            };
-            env.push(home);
+            if !has_home {
+                let Ok(home) = CString::new(format!("HOME={home}")) else {
+                    complain(&format!(
+                        "error: the home of {user} inside the machine is not a path"
+                    ));
+                    return 126;
+                };
+                env.push(home);
+            }
         }
     }
     // With SELinux the command belongs to the machine's domain, not to the domain of
@@ -1251,6 +1255,11 @@ fn find_program(name: &CStr, env: &[CString]) -> Option<CString> {
 /// Looks a user up in the machine's /etc/passwd and /etc/group (we are inside its mount
 /// namespace): uid, gid, home and supplementary groups, for USER[:GROUP] by name or by
 /// number.
+/// Whether `env` has a HOME of its own.
+fn names_home(env: &[CString]) -> bool {
+    env.iter().any(|v| v.as_bytes().starts_with(b"HOME="))
+}
+
 fn resolve_user(user: &str) -> Option<(Uid, Gid, String, Vec<Gid>)> {
     let passwd = std::fs::read_to_string("/etc/passwd").unwrap_or_default();
     let group = std::fs::read_to_string("/etc/group").unwrap_or_default();
@@ -1352,6 +1361,15 @@ fn exit_code(status: WaitStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_home_the_variables_give_is_kept() {
+        let env = |vars: &[&str]| -> Vec<CString> {
+            vars.iter().map(|v| CString::new(*v).unwrap()).collect()
+        };
+        assert!(names_home(&env(&["PATH=/bin", "HOME=/srv/app"])));
+        assert!(!names_home(&env(&["PATH=/bin", "HOMEDIR=/x"])));
+    }
 
     #[test]
     fn a_frozen_cgroup_is_seen_before_a_helper_joins_it() {

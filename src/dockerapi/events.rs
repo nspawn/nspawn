@@ -6,6 +6,15 @@ use super::filters::Filters;
 use super::util::{container_id, familiar, network_id};
 use crate::api::events::Event;
 
+/// A reference without its tag or digest, as the engine names the image of an event.
+fn repository_of(reference: &str) -> &str {
+    let reference = reference.split_once('@').map_or(reference, |(r, _)| r);
+    match reference.rfind(':') {
+        Some(colon) if !reference[colon..].contains('/') => &reference[..colon],
+        _ => reference,
+    }
+}
+
 /// The API's events for one of nspawn's: none for what it has no word for, more for a
 /// start or an end on bridge networks (the machine's own and a network connect or
 /// disconnect for each network, given as name and ID).
@@ -23,12 +32,30 @@ pub fn translate(event: &Event, networks: &[(String, String)]) -> Vec<Value> {
         })
     };
     match event.kind.as_str() {
+        // A record pulled, or one that never ran removed, is an image to the API.
+        "machine" if event.action == "pull" || event.attributes.contains_key("image_id") => {
+            let reference = event
+                .attributes
+                .get("image")
+                .map(|i| familiar(i))
+                .unwrap_or_default();
+            let (action, id) = match event.attributes.get("image_id") {
+                Some(image_id) if event.action == "remove" => ("untag", image_id.clone()),
+                _ if event.action == "pull" => ("pull", reference.clone()),
+                _ => return Vec::new(),
+            };
+            let mut attributes = Map::new();
+            attributes.insert("name".into(), json!(repository_of(&reference)));
+            let mut message = base("image", action, &id, attributes);
+            message["status"] = json!(action);
+            message["id"] = json!(id);
+            vec![message]
+        }
         "machine" => {
             let action = match event.action.as_str() {
                 "create" | "start" | "die" | "stop" | "kill" | "pause" | "unpause" | "oom"
                 | "update" => event.action.clone(),
                 "remove" => "destroy".to_string(),
-                "pull" => "create".to_string(),
                 "health_status" => format!(
                     "health_status: {}",
                     event.attributes.get("status").map_or("", String::as_str)
@@ -282,6 +309,40 @@ mod tests {
         // Without its creation time no ID can be told.
         assert!(translate(&event("machine", "start", &[]), &[]).is_empty());
         assert!(translate(&event("secret", "create", &[]), &[]).is_empty());
+    }
+
+    #[test]
+    fn images_pulled_and_removed_are_images() {
+        let image = "docker.io/library/busybox:1.37";
+        let pull = translate(
+            &event("machine", "pull", &[("image", image), ("created", "100")]),
+            &[],
+        );
+        assert_eq!(pull.len(), 1);
+        assert_eq!(pull[0]["Type"], "image");
+        assert_eq!(pull[0]["Action"], "pull");
+        assert_eq!(pull[0]["Actor"]["ID"], "busybox:1.37");
+        assert_eq!(pull[0]["Actor"]["Attributes"]["name"], "busybox");
+        let untag = translate(
+            &event(
+                "machine",
+                "remove",
+                &[
+                    ("image", image),
+                    ("created", "100"),
+                    ("image_id", "sha256:ab"),
+                ],
+            ),
+            &[],
+        );
+        assert_eq!(untag[0]["Type"], "image");
+        assert_eq!(untag[0]["Action"], "untag");
+        assert_eq!(untag[0]["Actor"]["ID"], "sha256:ab");
+        assert_eq!(
+            repository_of("localhost:5000/app@sha256:00"),
+            "localhost:5000/app"
+        );
+        assert_eq!(repository_of("localhost:5000/app"), "localhost:5000/app");
     }
 
     #[test]

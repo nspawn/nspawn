@@ -325,18 +325,20 @@ pub struct Pruned {
 }
 
 /// images prune: removes what `prunable` names, matching `labels` (KEY or KEY=VALUE, all
-/// of them) and made before `until` (unix seconds) when given.
+/// of them), made before `until` (unix seconds) when given, and among `only` when given.
 pub async fn prune_images(
     ctx: &Context,
     all: bool,
     labels: &[String],
     until: Option<u64>,
+    only: Option<&[String]>,
     report: Report<'_>,
 ) -> Result<Pruned> {
     let store = &ctx.store;
     let records = store.list_images()?;
     let names: Vec<String> = prunable(store, &records, all)
         .into_iter()
+        .filter(|name| only.is_none_or(|only| only.contains(name)))
         .filter(|name| {
             let Some(r) = records.iter().find(|r| &r.name == name) else {
                 return false;

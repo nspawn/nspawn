@@ -342,14 +342,17 @@ command, and then removes it after them.
 `--env-file FILE` and `--label-file FILE` read variables and labels from files of
 KEY=VALUE lines (no quoting, no expansion, `#` comments, a KEY alone copied from here
 for a variable and left out for a label), before the `-e` and `--label` that follow and
-win. A variable's value may hold a tab but no newline or other control character: the
-settings file that carries the machine's variables is read a line at a time. A label's
+win. A variable's value may hold a tab and line breaks but no other control character:
+the settings file that carries the machine's variables is read a line at a time, so a
+variable with a line break goes in encoded and reaches the program through the image's
+`/bin/sh`, as an argument with a newline does, and its name is then one of letters,
+digits and underscores. A label's
 value holds no control character either, tabs included, as labels are printed on
 terminals.
 
 `--mount type=bind|volume|tmpfs,source=...,target=...` is the long form of `-v` and
-`--tmpfs` (`readonly`, `tmpfs-size`, `tmpfs-mode`). A volume needs its name, since nspawn
-has no anonymous volumes; image, cluster and npipe mounts, `volume-subpath`, driver
+`--tmpfs` (`readonly`, `tmpfs-size`, `tmpfs-mode`). A volume needs its name: a mount
+makes no anonymous volume; image, cluster and npipe mounts, `volume-subpath`, driver
 options and a source or target with `:` are refused.
 
 `--ip ADDRESS` fixes the address on the primary network, `--ip NETWORK=ADDRESS` on
@@ -419,8 +422,8 @@ Each flag becomes a line of the machine's settings file or of its unit; `inspect
 them all. A path inside the machine, the target of a volume or a secret, a `--tmpfs` or
 a `--device` path, must be plain: a `.` or `..` component is refused, since it would
 land elsewhere once mounted. A path the image declares as a volume and nothing is
-mounted over gets a note at start: nspawn has no anonymous volumes, so what is written
-there goes with the machine.
+mounted over gets a note at start: no anonymous volume is made for it, so what is
+written there goes with the machine.
 
 ### GPUs and CDI devices
 
@@ -484,7 +487,8 @@ exit code), `stop`, `restart`, `oom` and `fail`, and nspawn's own `pull`, `build
 
 nspawn's own events of a type carry the same attributes whatever the action, so a
 `remove` says as much as a `create`: `image=` and `created=` (which machine of the name
-it was) on a machine's, with its labels while it has a record; `subnet=`,
+it was) on a machine's, with its labels while it has a record, and `image_id=` on the
+`remove` of one that never ran; `subnet=`,
 `interface=`, `internal=` and `created=` on a network's; `path=` on a volume's; `size=`
 on a secret's. systemd's take `image=`, `created=` and the labels from the machine's
 record, and lack them once it is removed. `events` reads the journal, so machines
@@ -609,11 +613,14 @@ terminal the command's standard output and error are streams of their own; with 
 (`Tty`) the terminal carries both ways, sized by `ConsoleSize` or by `POST
 /exec/ID/resize`, before the start too. What the client sends goes to the command's
 input when the create attached it (`AttachStdin`), and the client's closing its writing
-half ends that input. The stream ends once the command exited, two seconds later at most
+half ends that input; on a terminal, the end of the input or the client's hangup sends
+the command SIGHUP, as a terminal hangs up. The stream ends once the command exited, two seconds later at most
 when a process it left running still holds its output, which is then read and dropped,
 and `GET /exec/ID/json` has its exit code from then on; a command that cannot run exits 127 when it is not
 found and 126 otherwise. A start that asks for no upgrade gets the output as the body of
-a 200 and sends no input; a detached start (`Detach`) answers once the command runs. A
+a 200 and sends no input; a detached start (`Detach`) answers once the command runs.
+A second start of an exec gets 409 when detached, and otherwise a stream that says the
+command already runs or ran. A
 command whose client went, or that was started detached, runs on, and the server stays,
 holding the connection to the bus the command was started on, until it exits.
 `Privileged` is taken and does nothing; `DetachKeys` is kept, and every byte of the
@@ -666,11 +673,13 @@ every record of the image by its ID, or the record of that name, and answers wit
 it untagged and deleted. A container made from the image keeps it from going without
 `force` (409) while the image has no other name; with `force` the records go and the
 containers keep their image, which stays listed under their references. `POST
-/images/prune` removes nothing by default, as nspawn keeps no images without a name;
-with `dangling=false` it removes every image no container was made from, those `label`
-and `until` select, and refuses `label!` with 400. Loads, imports, tags, pushes, commits
-and builds of images answer 501 with "not supported", as reads of swarm objects and of a
-plugin do; the list of plugins is empty.
+/images/prune` removes by default the images without a tag no container was made from
+(pulled by digest alone, or whose tag went to a newer image), with `dangling=false`
+every image no container was made from; `label` and `until` (counted from the pull or
+the build on this host) narrow them, and `label!` is refused with 400. `POST
+/build/prune` removes nothing, as the build cache the API shows is empty. Loads,
+imports, tags, pushes, commits and builds of images answer 501 with "not supported", as
+reads of swarm objects and of a plugin do; the list of plugins is empty.
 
 Each machine has its own socket, `/run/nspawn/api/NAME.sock`, opened by systemd
 (`nspawn-api@NAME.socket`) before the machine starts and closed after it stops; the
@@ -687,7 +696,8 @@ waits and attaches, each holding a connection to the system bus, and 64 exec com
 run (one more of any of these gets 503). Stats streams count as connections only. On the
 host's socket a user other than root holds a quarter of the connections and of the exec
 commands and half of the streams and of the waits at most, and root's are not counted,
-so that no user keeps the others or root out.
+so that no user keeps the others or root out; root has 16 streams of its own. A follow
+of the logs of a container that does not run gives what there is and ends.
 
 ### Updates of the image a tag names
 
@@ -815,8 +825,8 @@ for tools such as a reverse proxy that configures itself from them.
 
 `cp` copies files and directories between the host and a machine, running or not (a
 stopped mstack machine excepted: its tree only exists while it runs; in a stopped
-machine a path in one of its volumes is refused, as they are mounted only while it
-runs): an existing
+machine a path in one of its volumes, or a source that holds one, is refused, as they
+are mounted only while it runs): an existing
 directory receives the source under its own name, anything else is the name of the
 copy, and `DIR/.` copies the contents of DIR. What goes in belongs to
 root inside the machine, whatever user namespace it runs in; what comes out belongs to

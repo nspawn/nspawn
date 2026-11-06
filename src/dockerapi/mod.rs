@@ -57,11 +57,13 @@ const IDLE: Duration = Duration::from_secs(60);
 
 /// A limit of what a socket's clients hold at once, and on the host's socket a share of
 /// it for each user other than root, so that none takes all of it; root's requests take
-/// from neither, so that users cannot keep it out.
+/// from neither, so that users cannot keep it out, and from a limit of their own where
+/// what they hold costs the server's processes.
 pub(crate) struct Pool {
     whole: tokio::sync::Semaphore,
     per_user: usize,
     users: Mutex<BTreeMap<u32, usize>>,
+    root: Option<tokio::sync::Semaphore>,
 }
 
 /// A place taken in a pool, given back when it goes.
@@ -91,6 +93,16 @@ impl Pool {
             whole: tokio::sync::Semaphore::const_new(whole),
             per_user,
             users: Mutex::new(BTreeMap::new()),
+            root: None,
+        }
+    }
+
+    const fn with_root(whole: usize, per_user: usize, root: usize) -> Pool {
+        Pool {
+            whole: tokio::sync::Semaphore::const_new(whole),
+            per_user,
+            users: Mutex::new(BTreeMap::new()),
+            root: Some(tokio::sync::Semaphore::const_new(root)),
         }
     }
 
@@ -98,11 +110,15 @@ impl Pool {
     pub(crate) fn take(&'static self, holder: Holder) -> Option<Place> {
         let user = match holder {
             Holder::Root => {
+                let permit = match &self.root {
+                    Some(root) => Some(root.try_acquire().ok()?),
+                    None => None,
+                };
                 return Some(Place {
                     pool: self,
-                    _permit: None,
+                    _permit: permit,
                     user: None,
-                })
+                });
             }
             Holder::User(uid) => {
                 let mut users = self.users.lock().unwrap();
@@ -127,11 +143,11 @@ impl Pool {
 }
 
 /// What a socket's clients may hold of the host at once: connections, and streams that
-/// run a journalctl (logs, events, attaches). A stats stream reads the cgroup once a
-/// second and is bounded by the connections alone: a dashboard keeps one per running
-/// machine.
+/// run a journalctl (logs, events, attaches), root's among them, as the server's
+/// TasksMax counts their processes. A stats stream reads the cgroup once a second and is
+/// bounded by the connections alone: a dashboard keeps one per running machine.
 static CONNECTIONS: Pool = Pool::new(64, 16);
-static STREAMS: Pool = Pool::new(16, 8);
+pub(crate) static STREAMS: Pool = Pool::with_root(16, 8, 16);
 /// Waits and attaches, each holding a connection to the system bus of its own until it
 /// ends, so that the service drops the wait when its client goes.
 pub(crate) static WAITS: Pool = Pool::new(16, 8);
@@ -163,20 +179,21 @@ impl Drop for Upgraded {
 /// How long a client has to send a request's headers.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// `response`, its body written by `work`, or the error that there are too many
-/// streams.
-fn spawn_stream<F>(work: F, response: Response<Body>, holder: Holder) -> Response<Body>
+/// The answer when `holder` has no place left for a stream.
+fn too_many_streams() -> Response<Body> {
+    error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "too many streams are open on this socket",
+    )
+}
+
+/// `response`, its body written by `work`, which holds `place` until it ends.
+fn spawn_stream<F>(work: F, response: Response<Body>, place: Place) -> Response<Body>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let Some(permit) = STREAMS.take(holder) else {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "too many streams are open on this socket",
-        );
-    };
     tokio::spawn(async move {
-        let _permit = permit;
+        let _place = place;
         work.await;
     });
     response
@@ -498,6 +515,8 @@ enum Route {
     ImageChange(images::Call),
     /// POST /images/create.
     Pull,
+    /// POST /build/prune: the build cache the API shows is empty, and stays so.
+    BuildPrune,
     /// The plugins, of which there are none.
     Plugins,
     Images,
@@ -533,7 +552,11 @@ impl Route {
             }
             // WaitMachine asks org.nspawn.inspect.
             Route::Lifecycle(_, Act::Wait) => Need::Inspect,
-            Route::Create | Route::Prune | Route::Lifecycle(..) | Route::Remove(_) => Need::Manage,
+            Route::Create
+            | Route::Prune
+            | Route::BuildPrune
+            | Route::Lifecycle(..)
+            | Route::Remove(_) => Need::Manage,
             Route::Info
             | Route::DiskUsage
             | Route::Containers
@@ -585,6 +608,7 @@ fn classify(method: &Method, path: &str) -> Route {
             Route::Attach(id.to_string())
         }
         (false, ["images", "create"]) if *method == Method::POST => Route::Pull,
+        (false, ["build", "prune"]) if *method == Method::POST => Route::BuildPrune,
         (false, ["containers", id, what]) if *method == Method::POST => match Act::of(what) {
             Some(act) => Route::Lifecycle(id.to_string(), act),
             None => Route::Change,
@@ -679,6 +703,10 @@ async fn route_request(
         Route::Kill(id) => kill(ctx, &id, query).await,
         Route::Create => containers::create(ctx, query, sent).await,
         Route::Prune => containers::prune(ctx, query).await,
+        Route::BuildPrune => json_response(
+            StatusCode::OK,
+            &serde_json::json!({ "CachesDeleted": null, "SpaceReclaimed": 0 }),
+        ),
         Route::Lifecycle(id, act) => containers::act(ctx, &id, act, query, sent).await,
         Route::Remove(id) => containers::remove(ctx, &id, query).await,
         Route::Attach(id) => {
@@ -908,6 +936,17 @@ const STATES: &[&str] = &[
     "dead",
 ];
 
+/// The refusal of an exited filter whose value is no number, as the engine words it.
+fn bad_exit_code(filters: &Filters) -> Option<String> {
+    let bad = filters
+        .values("exited")?
+        .iter()
+        .find(|c| c.parse::<i32>().is_err())?;
+    Some(format!(
+        "invalid filter 'exited={bad}': strconv.Atoi: parsing {bad:?}: invalid syntax"
+    ))
+}
+
 async fn list_containers(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
     let filters = match Filters::parse(query.get("filters")) {
         Ok(f) => f,
@@ -935,10 +974,21 @@ async fn list_containers(ctx: &Arc<Context>, query: &Query) -> Response<Body> {
             );
         }
     }
+    if let Some(message) = bad_exit_code(&filters) {
+        return error(StatusCode::BAD_REQUEST, message);
+    }
     let snapshot = match Snapshot::take(ctx).await {
         Ok(s) => s,
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
     };
+    // The containers before and since name are looked up as any other.
+    for key in ["before", "since"] {
+        for value in filters.values(key).into_iter().flatten() {
+            if let Err(e) = snapshot.find(value) {
+                return error(lookup_status(&e), e);
+            }
+        }
+    }
     let limit = query
         .get("limit")
         .and_then(|l| l.parse::<usize>().ok())
@@ -1141,6 +1191,22 @@ async fn container_read(
 }
 
 /// A time of the API (unix seconds, with a fraction maybe) as journalctl takes it.
+/// The engine's refusal of a window of events whose start comes after its end.
+fn window_refusal(since: Option<&str>, until: Option<&str>) -> Option<String> {
+    let time = |t: Option<&str>| {
+        t.filter(|t| !t.is_empty() && *t != "0")
+            .and_then(|t| t.parse::<f64>().ok())
+    };
+    let (start, end) = (time(since)?, time(until)?);
+    (start > end).then(|| {
+        format!(
+            "`since` time ({}) cannot be after `until` time ({})",
+            since.unwrap_or_default(),
+            until.unwrap_or_default()
+        )
+    })
+}
+
 fn journal_time(text: Option<&str>) -> Option<String> {
     let text = text.filter(|t| !t.is_empty() && *t != "0")?;
     let seconds = text.split('.').next().unwrap_or(text);
@@ -1185,9 +1251,26 @@ async fn logs(
             "configured logging driver does not support reading",
         );
     }
+    // A follow of a container that does not run reads what there is and ends.
+    if request.follow && !streams::registered(machine.name()) {
+        request.follow = false;
+    }
+    // Taken before the journal is read for the start, which runs a journalctl too.
+    let Some(place) = STREAMS.take(holder) else {
+        return too_many_streams();
+    };
     if let Err(e) = crate::api::machines::prepare_logs(ctx, &mut request).await {
         return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     }
+    let journal = match streams::logs_journal(&request) {
+        Ok(journal) => journal,
+        Err(e) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("running journalctl: {e}"),
+            )
+        }
+    };
     // A container with a terminal has one stream, which goes as it is.
     let raw = machine.record.tty;
     let (response, tx) = streaming(if raw {
@@ -1200,7 +1283,7 @@ async fn logs(
         raw,
         request,
     };
-    spawn_stream(streams::logs(query, tx), response, holder)
+    spawn_stream(streams::logs(query, journal, tx), response, place)
 }
 
 async fn stats(ctx: &Arc<Context>, machine: &model::Machine, query: &Query) -> Response<Body> {
@@ -1421,8 +1504,11 @@ fn events(ctx: &Arc<Context>, query: &Query, holder: Holder) -> Response<Body> {
     };
     // docker takes any key here, and uses those it knows.
     let since = journal_time(query.get("since"));
+    if let Some(message) = window_refusal(query.get("since"), query.get("until")) {
+        return error(StatusCode::BAD_REQUEST, message);
+    }
     // An end still to come is waited for while the events follow; one gone by ends a
-    // window of the past, which without a start has nothing in it.
+    // window of the past, which without a start is the last events before it.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
@@ -1432,15 +1518,30 @@ fn events(ctx: &Arc<Context>, query: &Query, holder: Holder) -> Response<Body> {
         .and_then(|t| t.split('.').next().unwrap_or(t).parse::<u64>().ok());
     let (until, deadline) = match end {
         Some(end) if end > now => (None, Some(Duration::from_secs(end - now))),
-        Some(end) if since.is_some() => (Some(format!("@{end}")), None),
-        Some(_) => (None, Some(Duration::ZERO)),
+        Some(end) => (Some(format!("@{end}")), None),
         None => (None, None),
+    };
+    let Some(place) = STREAMS.take(holder) else {
+        return too_many_streams();
+    };
+    // Started before the answer, so that a journalctl that cannot run is an error.
+    let follow = if deadline == Some(Duration::ZERO) {
+        None
+    } else {
+        match crate::api::events::Follow::spawn(
+            since.as_deref(),
+            until.as_deref(),
+            std::process::Stdio::null(),
+        ) {
+            Ok(follow) => Some(follow),
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
+        }
     };
     let (response, tx) = streaming("application/json");
     spawn_stream(
-        streams::events(ctx.clone(), since, until, deadline, filters, tx),
+        streams::events(ctx.clone(), follow, deadline, filters, tx),
         response,
-        holder,
+        place,
     )
 }
 
@@ -1631,6 +1732,46 @@ mod tests {
     }
 
     #[test]
+    fn a_window_of_events_starts_before_it_ends() {
+        assert_eq!(window_refusal(Some("100"), Some("200")), None);
+        assert_eq!(window_refusal(None, Some("200")), None);
+        assert_eq!(window_refusal(Some("100"), Some("0")), None);
+        assert_eq!(
+            window_refusal(Some("200.5"), Some("200")).unwrap(),
+            "`since` time (200.5) cannot be after `until` time (200)"
+        );
+    }
+
+    #[test]
+    fn an_exited_filter_takes_numbers_only() {
+        let parsed = |text: &str| Filters::parse(Some(text)).ok().unwrap();
+        assert_eq!(bad_exit_code(&parsed(r#"{"exited":["0","137"]}"#)), None);
+        assert_eq!(
+            bad_exit_code(&parsed(r#"{"exited":["abc"]}"#)).unwrap(),
+            "invalid filter 'exited=abc': strconv.Atoi: parsing \"abc\": invalid syntax"
+        );
+    }
+
+    #[test]
+    fn root_s_streams_have_a_limit_of_their_own() {
+        static POOL: Pool = Pool::with_root(2, 2, 3);
+        let users: Vec<Place> = (0..2)
+            .map(|_| POOL.take(Holder::User(4242)).expect("the user's share"))
+            .collect();
+        let root: Vec<Place> = (0..3)
+            .map(|_| POOL.take(Holder::Root).expect("root's own"))
+            .collect();
+        assert!(POOL.take(Holder::Root).is_none(), "over root's limit");
+        drop(users);
+        assert!(
+            POOL.take(Holder::Root).is_none(),
+            "users' places are not root's"
+        );
+        drop(root);
+        assert!(POOL.take(Holder::Root).is_some(), "given back");
+    }
+
+    #[test]
     fn kill_takes_the_signals_docker_takes() {
         for (raw, number) in [
             ("9", 9),
@@ -1723,6 +1864,8 @@ mod tests {
         );
         assert_eq!(classify(&Method::POST, "/containers/create"), Route::Create);
         assert_eq!(classify(&Method::POST, "/containers/prune"), Route::Prune);
+        assert_eq!(classify(&Method::POST, "/build/prune"), Route::BuildPrune);
+        assert_eq!(classify(&Method::POST, "/build"), Route::Change);
         assert_eq!(
             classify(&Method::POST, "/containers/web/exec"),
             Route::Exec(exec::Call::Create("web".into()))

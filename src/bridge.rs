@@ -1589,31 +1589,32 @@ fn ports_into(json: &str, nsid: i64) -> Vec<String> {
 /// An address asked for on `net` (--ip): on a network made with network create only,
 /// inside its subnet, and not another machine's; the errors read as scripts expect.
 pub fn check_requested(store: &Store, net: &NetSpec, machine: &str, addr: Ipv4Addr) -> Result<()> {
+    use crate::api::FailureKind;
     if net.name == DEFAULT_NETWORK {
-        bail!("user specified IP address is supported on user defined networks only");
+        return Err(FailureKind::Invalid
+            .error("user specified IP address is supported on user defined networks only"));
     }
     if addr == net.subnet.gateway() {
-        bail!(
+        return Err(FailureKind::InUse.error(format!(
             "Address already in use: {addr} is the gateway of network {}",
             net.name
-        );
+        )));
     }
     if !net.subnet.usable(addr) {
-        bail!(
+        return Err(FailureKind::Invalid.error(format!(
             "invalid config for network {}: invalid endpoint settings:\nno configured subnet or ip-range contain the IP address {addr}",
             net.name
-        );
+        )));
     }
     if let Some(other) = store
         .list_images_strict()?
         .iter()
         .find(|r| r.name != machine && address_on(r, &net.name) == Some(addr))
     {
-        bail!(
+        return Err(FailureKind::InUse.error(format!(
             "Address already in use: {addr} is the address of {} on network {}",
-            other.name,
-            net.name
-        );
+            other.name, net.name
+        )));
     }
     Ok(())
 }
@@ -2912,6 +2913,23 @@ mod tests {
             labels: BTreeMap::new(),
             api_name: None,
         }
+    }
+
+    #[test]
+    fn an_address_asked_for_is_refused_with_its_kind() {
+        use crate::api::{kind_of, FailureKind};
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        store.init().unwrap();
+        let own = net("front", "nspawn-front", "10.77.0.0/24", false);
+        let kind = |net: &NetSpec, addr: &str| {
+            kind_of(&check_requested(&store, net, "web", addr.parse().unwrap()).unwrap_err())
+        };
+        let default = net(DEFAULT_NETWORK, "nspawn0", "10.88.0.0/16", false);
+        assert_eq!(kind(&default, "10.88.0.9"), Some(FailureKind::Invalid));
+        assert_eq!(kind(&own, "10.78.0.9"), Some(FailureKind::Invalid));
+        assert_eq!(kind(&own, "10.77.0.1"), Some(FailureKind::InUse));
+        check_requested(&store, &own, "web", "10.77.0.9".parse().unwrap()).unwrap();
     }
 
     #[test]

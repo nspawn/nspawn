@@ -186,7 +186,8 @@ pub fn by_digest(reference: ImageRef) -> ImageRef {
 /// `repository@digest` of the manifest a record was pulled by, in full; a built image
 /// was pulled by none.
 fn full_digest(record: &ImageRecord, registry: &str) -> Option<String> {
-    if record.origin == "build" {
+    // A built image, and a container made from one, has no digest a registry knows.
+    if record.origin == "build" || record.built {
         return None;
     }
     let parsed = ImageRef::parse(&record.reference, registry).ok()?;
@@ -317,8 +318,9 @@ pub fn list(ctx: &Context) -> anyhow::Result<Vec<Image>> {
     Ok(out)
 }
 
-/// The image `key` names, as the engine looks one up: a reference, then the config's
-/// digest or a prefix of it, then the name of a record that is an image.
+/// The image `key` names, as the engine looks one up: a reference, then the name of a
+/// record that is an image (nspawn's own way, which a name of hex digits would otherwise
+/// lose to an ID that starts with them), then the config's digest or a prefix of it.
 pub fn find<'a>(images: &'a [Image], key: &str) -> Result<&'a Image, String> {
     // Named as the engine names it: a reference with its tag, short.
     let missing = || match ImageRef::normalized(key) {
@@ -340,6 +342,9 @@ pub fn find<'a>(images: &'a [Image], key: &str) -> Result<&'a Image, String> {
             return Ok(image);
         }
     }
+    if let Some(image) = images.iter().find(|i| i.records.iter().any(|r| r == key)) {
+        return Ok(image);
+    }
     let hex = key.strip_prefix("sha256:").unwrap_or(key);
     if !hex.is_empty() && hex.len() <= 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         let mut found = images
@@ -353,10 +358,7 @@ pub fn find<'a>(images: &'a [Image], key: &str) -> Result<&'a Image, String> {
             _ => {}
         }
     }
-    images
-        .iter()
-        .find(|i| i.records.iter().any(|r| r == key))
-        .ok_or_else(missing)
+    Err(missing())
 }
 
 /// The record a container of `image` is made from, `key` being how it was asked for:
@@ -746,7 +748,8 @@ pub fn removal(
         .collect();
     // One tag at most: the engine's "single reference", which a container keeps.
     let single = image.tags.len() <= 1;
-    if is_id_prefix(&image.id, key) {
+    // A record's name is the record, even made of hex digits as an ID is.
+    if is_id_prefix(&image.id, key) && !image.records.iter().any(|r| r == key) {
         if !force {
             if let Some(user) = users.iter().find(|u| u.running) {
                 return Err(conflict(format!(
@@ -909,16 +912,11 @@ async fn remove(ctx: &Context, key: &str, force: bool) -> Result<Value, Answer> 
     Ok(Value::Array(untag.answer))
 }
 
-/// The filters of POST /images/prune as PruneImages' options, or None when it prunes
-/// nothing: `dangling` (true unless said otherwise) names the images without a name,
-/// which nspawn's store does not keep, and false every image no container was made from.
-/// `label` narrows them, and `until` (a time or a duration before `now`); `label!` has
-/// nothing to narrow them with on the bus.
-pub fn prune_options(
-    filters: &Filters,
-    now: f64,
-    offset: i64,
-) -> Result<Option<super::create::Opts>, Answer> {
+/// The filters of POST /images/prune as PruneImages' options: `dangling` (true unless
+/// said otherwise) names the images without a tag no container was made from, false
+/// every image no container was made from. `label` narrows them, and `until` (a time or
+/// a duration before `now`); `label!` has nothing to narrow them with on the bus.
+pub fn prune_options(filters: &Filters, now: f64, offset: i64) -> Result<Prune, Answer> {
     use super::create::Opt;
     use hyper::StatusCode;
     let bad = |text: String| says(StatusCode::BAD_REQUEST, text);
@@ -944,9 +942,6 @@ pub fn prune_options(
         }
     };
     let until = super::networks::prune_until(filters, now, offset)?;
-    if dangling {
-        return Ok(None);
-    }
     if filters.values("label!").is_some() {
         return Err(bad(
             "invalid filter 'label!': not supported by nspawn's image prune, which takes label and until"
@@ -960,7 +955,25 @@ pub fn prune_options(
     if let Some(until) = until {
         opts.insert("until", Opt::Unsigned(until));
     }
-    Ok(Some(opts))
+    Ok(Prune { opts, dangling })
+}
+
+/// What an image prune asks PruneImages for: with `dangling`, the images without a tag
+/// alone (`dangling_records`).
+#[derive(Debug)]
+pub struct Prune {
+    pub opts: super::create::Opts,
+    pub dangling: bool,
+}
+
+/// The records of the images a dangling prune takes: those without a tag that no
+/// container was made from, pulled by digest alone or whose tag went to a newer image.
+fn dangling_records(images: &[Image]) -> Vec<String> {
+    images
+        .iter()
+        .filter(|i| i.dangling() && i.containers.is_empty())
+        .flat_map(|i| i.records.iter().cloned())
+        .collect()
 }
 
 /// The body of a prune that removed `removed` of `records`: an image's names untagged,
@@ -1008,10 +1021,15 @@ async fn prune(ctx: &Context, query: &super::Query) -> Result<Value, Answer> {
     let filters = Filters::parse(query.get("filters"))
         .map_err(|Invalid(text)| says(StatusCode::BAD_REQUEST, text))?;
     let (now, offset) = super::networks::now_and_offset();
-    let Some(opts) = prune_options(&filters, now, offset)? else {
-        return Ok(json!({ "ImagesDeleted": null, "SpaceReclaimed": 0 }));
-    };
+    let Prune { mut opts, dangling } = prune_options(&filters, now, offset)?;
     let images = list(ctx).map_err(|e| failed(format!("{e:#}")))?;
+    if dangling {
+        let names = dangling_records(&images);
+        if names.is_empty() {
+            return Ok(json!({ "ImagesDeleted": null, "SpaceReclaimed": 0 }));
+        }
+        opts.insert("names", super::create::Opt::Texts(names));
+    }
     let records = ctx
         .store
         .list_images()
@@ -1106,7 +1124,7 @@ mod tests {
         );
     }
 
-    fn image(id: &str, tags: &[&str], created: &str) -> Image {
+    pub(super) fn image(id: &str, tags: &[&str], created: &str) -> Image {
         Image {
             id: id.to_string(),
             tags: tags.iter().map(|t| t.to_string()).collect(),
@@ -1316,6 +1334,10 @@ mod tests {
             .unwrap_err()
             .starts_with("multiple IDs"));
         assert_eq!(find(&images, &format!("rec-{b}")).unwrap().id, b);
+        // A record named with hex digits is that record, not the ID they start.
+        let mut named = images.clone();
+        named[1].records.push("aaaa".to_string());
+        assert_eq!(find(&named, "aaaa").unwrap().id, b);
         assert_eq!(
             find(&images, "busybox").unwrap_err(),
             "No such image: busybox:latest"
@@ -1581,19 +1603,21 @@ mod changes {
         use super::super::create::Opt;
         let f = |text: &str| Filters::parse(Some(text)).unwrap();
         let now = 1_000_000.0;
-        // The engine's default prunes the images without a name: nspawn keeps none.
-        assert_eq!(prune_options(&f("{}"), now, 0).unwrap(), None);
-        assert_eq!(
-            prune_options(&f(r#"{"dangling":["true"]}"#), now, 0).unwrap(),
-            None
+        // The engine's default prunes the images without a tag.
+        assert!(prune_options(&f("{}"), now, 0).unwrap().dangling);
+        assert!(
+            prune_options(&f(r#"{"dangling":["true"]}"#), now, 0)
+                .unwrap()
+                .dangling
         );
-        let opts = prune_options(
+        let prune = prune_options(
             &f(r#"{"dangling":["false"],"label":["a=b"],"until":["10m"]}"#),
             now,
             0,
         )
-        .unwrap()
         .unwrap();
+        assert!(!prune.dangling);
+        let opts = prune.opts;
         assert_eq!(opts["all"], Opt::Flag(true));
         assert_eq!(opts["labels"], Opt::Texts(vec!["a=b".into()]));
         assert_eq!(opts["until"], Opt::Unsigned(1_000_000 - 600 + 1));
@@ -1625,6 +1649,30 @@ mod changes {
                 .0,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn a_dangling_prune_takes_the_images_without_a_tag_or_a_container() {
+        let tagged = super::tests::image("sha256:aa", &["docker.io/library/busybox:1.37"], "2024");
+        let bare = super::tests::image("sha256:bb", &[], "2024");
+        let mut used = super::tests::image("sha256:cc", &[], "2024");
+        used.containers.push("c".into());
+        assert_eq!(
+            dangling_records(&[tagged, bare, used]),
+            vec!["rec-sha256:bb".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_built_image_and_its_containers_have_no_repository_digest() {
+        let mut built = record("ci", "docker.io/library/ci-image:latest");
+        built.origin = "build".into();
+        assert_eq!(full_digest(&built, REGISTRY), None);
+        built.origin = "create".into();
+        built.built = true;
+        assert_eq!(full_digest(&built, REGISTRY), None);
+        built.built = false;
+        assert!(full_digest(&built, REGISTRY).is_some());
     }
 
     #[test]

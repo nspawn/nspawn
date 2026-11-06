@@ -308,9 +308,11 @@ pub enum Ids {
 }
 
 impl Ids {
+    /// The ID inside the machine of a file the host sees owned by `id`: the same with no
+    /// shift, nobody's for one outside the machine's 65536 IDs.
     fn outward(self, id: u32) -> u32 {
         match self {
-            Ids::Keep => id,
+            Ids::Keep | Ids::Shift(0) => id,
             Ids::Shift(base) if id >= base && id - base < 65536 => id - base,
             Ids::Shift(_) => 65534,
         }
@@ -779,6 +781,9 @@ pub struct Target {
     /// Relative to `root`.
     pub base: PathBuf,
     pub top: Option<OsString>,
+    /// Where the volumes of a machine that does not run go (`Root::unmounted`): no
+    /// entry is written there.
+    pub unmounted: Vec<(PathBuf, String)>,
 }
 
 /// The components of an entry's path, all of them plain names.
@@ -855,6 +860,7 @@ pub fn unpack<R: Read>(
         };
         let parent_path: PathBuf = target.base.join(relative.iter().collect::<PathBuf>());
         let shown = parent_path.join(&leaf);
+        refuse_unmounted_entry(&target.unmounted, target.root.as_fd(), &parent_path, &leaf)?;
         let parent = scoped(
             target.root.as_fd(),
             &parent_path,
@@ -1122,19 +1128,65 @@ impl Root {
     /// Refuses `relative` (to the root, as given) when it is at or below a volume the
     /// machine mounts only while it runs.
     fn refuse_unmounted(&self, label: &str, relative: &Path) -> Result<()> {
+        self.refuse(label, relative, false)
+    }
+
+    /// Refuses `relative` when it is at or below a volume the machine mounts only while
+    /// it runs, or holds one: what is read of it would leave the volume out.
+    fn refuse_holding_unmounted(&self, label: &str, relative: &Path) -> Result<()> {
+        self.refuse(label, relative, true)
+    }
+
+    fn refuse(&self, label: &str, relative: &Path, holding: bool) -> Result<()> {
         if self.unmounted.is_empty() {
             return Ok(());
         }
-        let resolved = resolve_in(self.fd.as_fd(), relative).ok();
+        let paths = [
+            Some(clean(relative, true)),
+            resolve_in(self.fd.as_fd(), relative).ok(),
+        ];
         let covered = self.unmounted.iter().find(|(at, _)| {
-            relative.starts_with(at) || resolved.as_ref().is_some_and(|r| r.starts_with(at))
+            paths
+                .iter()
+                .flatten()
+                .any(|path| path.starts_with(at) || (holding && at.starts_with(path)))
         });
         match covered {
-            Some((_, target)) => Err(FailureKind::Invalid.error(format!(
-                "{label}: the volume at {target} is mounted only while the machine runs; start it first"
-            ))),
+            Some((_, target)) => Err(unmounted_error(label, target)),
             None => Ok(()),
         }
+    }
+}
+
+fn unmounted_error(label: &str, target: &str) -> anyhow::Error {
+    FailureKind::Invalid.error(format!(
+        "{label}: the volume at {target} is mounted only while the machine runs; start it first"
+    ))
+}
+
+/// Refuses an entry of a stream written as `leaf` in `parent` (relative to the root) when
+/// it lands at or below a volume the machine mounts only while it runs: by its names, or
+/// through the links of the tree, the stream's own among them.
+fn refuse_unmounted_entry(
+    unmounted: &[(PathBuf, String)],
+    root: BorrowedFd<'_>,
+    parent: &Path,
+    leaf: &OsStr,
+) -> Result<()> {
+    if unmounted.is_empty() {
+        return Ok(());
+    }
+    let lexical = clean(&parent.join(leaf), true);
+    let resolved = resolve_in(root, parent).ok().map(|p| p.join(leaf));
+    let covered = unmounted.iter().find(|(at, _)| {
+        lexical.starts_with(at) || resolved.as_ref().is_some_and(|r| r.starts_with(at))
+    });
+    match covered {
+        Some((_, target)) => Err(unmounted_error(
+            &Path::new("/").join(&lexical).display().to_string(),
+            target,
+        )),
+        None => Ok(()),
     }
 }
 
@@ -1280,7 +1332,7 @@ pub async fn copy_from(
     let root = open_root(ctx, name, report).await?;
     let (source, _) = split_source(path);
     let relative = inside(&source);
-    root.refuse_unmounted(&format!("{name}:{source}"), &relative)?;
+    root.refuse_holding_unmounted(&format!("{name}:{source}"), &relative)?;
     let (parent_path, leaf) = split_leaf(&relative);
     // The name the copy takes: the leaf, or for a path that ends in .. the directory it
     // comes to, the machine's name for its root.
@@ -1390,6 +1442,7 @@ pub async fn copy_to(
                     root: root.fd,
                     base: plan.dir,
                     top: plan.top,
+                    unmounted: root.unmounted,
                 })
             },
             Ids::Shift(base),
@@ -1921,29 +1974,14 @@ pub fn extract<R: Read>(
                 continue;
             }
         };
-        let lexical = dir.join(names.iter().collect::<PathBuf>()).join(&leaf);
-        if let Some((_, target)) = options
-            .unmounted
-            .iter()
-            .find(|(at, _)| lexical.starts_with(at))
-        {
-            bail!(
-                "{}: the volume at {target} is mounted only while the machine runs; start it first",
-                Path::new("/").join(&lexical).display()
-            );
-        }
+        refuse_unmounted_entry(
+            &options.unmounted,
+            root,
+            &dir.join(names.iter().collect::<PathBuf>()),
+            &leaf,
+        )?;
         let parent_path = implied_directories(root, dir, &names, root_owner)?;
         let shown = Path::new("/").join(parent_path.join(&leaf));
-        if let Some((_, target)) = options
-            .unmounted
-            .iter()
-            .find(|(at, _)| parent_path.join(&leaf).starts_with(at))
-        {
-            bail!(
-                "{}: the volume at {target} is mounted only while the machine runs; start it first",
-                shown.display()
-            );
-        }
         let parent = scoped(root, &parent_path, OFlag::O_PATH | OFlag::O_DIRECTORY)?;
         let existing = fstatat(&parent, leaf.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
             .ok()
@@ -2496,6 +2534,7 @@ mod tests {
                     root: root.try_clone().unwrap(),
                     base: plan.dir,
                     top: plan.top,
+                    unmounted: Vec::new(),
                 })
             },
             Ids::Keep,
@@ -2526,6 +2565,7 @@ mod tests {
                     root: root.try_clone().unwrap(),
                     base: PathBuf::new(),
                     top: Some("f".into()),
+                    unmounted: Vec::new(),
                 })
             },
             Ids::Keep,
@@ -2584,6 +2624,7 @@ mod tests {
                     root: root.try_clone().unwrap(),
                     base: PathBuf::new(),
                     top: Some("f".into()),
+                    unmounted: Vec::new(),
                 })
             },
             Ids::Keep,
@@ -2621,6 +2662,7 @@ mod tests {
                     root: root.try_clone().unwrap(),
                     base: PathBuf::new(),
                     top: Some("drop".into()),
+                    unmounted: Vec::new(),
                 })
             },
             Ids::Keep,
@@ -2653,6 +2695,7 @@ mod tests {
                     root: root.try_clone().unwrap(),
                     base: PathBuf::new(),
                     top: Some("top".into()),
+                    unmounted: Vec::new(),
                 })
             },
             Ids::Keep,
@@ -2735,6 +2778,7 @@ mod tests {
                     root: fd.try_clone().unwrap(),
                     base: PathBuf::from("dst/out"),
                     top: Some(OsString::from("top")),
+                    unmounted: Vec::new(),
                 })
             },
             Ids::Keep,
@@ -2783,6 +2827,7 @@ mod tests {
                         root: fd.try_clone().unwrap(),
                         base: PathBuf::from("dst"),
                         top: Some(OsString::from("top2")),
+                        unmounted: Vec::new(),
                     })
                 },
                 Ids::Keep,
@@ -2944,6 +2989,8 @@ mod tests {
         assert_eq!(Ids::Shift(100_000).outward(100_033), 33);
         assert_eq!(Ids::Shift(100_000).outward(0), 65534);
         assert_eq!(Ids::Shift(100_000).outward(100_000 + 65536), 65534);
+        // Without a user namespace every ID is the machine's own.
+        assert_eq!(Ids::Shift(0).outward(1_000_650_000), 1_000_650_000);
     }
 
     #[test]
@@ -3031,7 +3078,7 @@ mod tests {
             unmounted: unmounted.clone(),
             ..ExtractOptions::default()
         };
-        for name in ["data/f", "data/", "srv/../data/f"] {
+        for name in ["data/f", "data/", "srv/../data/f", "link/f"] {
             let kind = if name.ends_with('/') { b'5' } else { b'0' };
             let e = extracted(
                 root,
@@ -3046,14 +3093,54 @@ mod tests {
                 "{name}: {e}"
             );
         }
+        // Through a link the stream made itself.
+        let e = extracted(
+            root,
+            "",
+            &stream_of(&[("made", b'2', "/data", b""), ("made/f", b'0', "", b"x")]),
+            options.clone(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("/made/f: the volume at /data"), "{e}");
         assert!(!root.join("data/f").exists());
         extracted(root, "", &stream_of(&[("srv/f", b'0', "", b"x")]), options).unwrap();
         assert!(root.join("srv/f").exists());
+        // A copy into a parent of a volume writes nothing there either.
+        let e = unpack(
+            stream_of(&[("www/", b'5', "", b""), ("www/f", b'0', "", b"x")]).as_slice(),
+            |_, _| {
+                Ok(Target {
+                    root: open_dir(root),
+                    base: PathBuf::new(),
+                    top: Some("data".into()),
+                    unmounted: unmounted.clone(),
+                })
+            },
+            Ids::Keep,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("/data: the volume at /data"), "{e}");
         let checked = Root {
             fd: open_dir(root),
             base: 0,
             unmounted,
         };
+        // A copy out of a directory that holds a volume would leave the volume out.
+        for path in ["", "link", "data/sub/.."] {
+            let e = checked
+                .refuse_holding_unmounted("web:/x", Path::new(path))
+                .unwrap_err();
+            assert_eq!(
+                crate::api::failure::kind_of(&e),
+                Some(FailureKind::Invalid),
+                "{path}"
+            );
+        }
+        checked
+            .refuse_holding_unmounted("web:/x", Path::new("srv"))
+            .unwrap();
         for path in ["data", "data/x", "link/x"] {
             let e = checked
                 .refuse_unmounted("web:/x", Path::new(path))
@@ -3064,7 +3151,7 @@ mod tests {
                 "{path}"
             );
         }
-        for path in ["", "srv", "database"] {
+        for path in ["", "srv", "database", "data/../srv"] {
             checked.refuse_unmounted("web:/x", Path::new(path)).unwrap();
         }
     }

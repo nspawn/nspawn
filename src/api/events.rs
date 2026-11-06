@@ -94,15 +94,21 @@ fn attribute_field(key: &str) -> String {
 /// journalctl's arguments. Only entries from uid 0 (PID 1's and nspawn's) count: journald
 /// sets _UID and _PID itself, so nobody else can forge them. Field matches only: a unit
 /// glob is expanded once at start, and fails before any machine ran.
+/// How many of the journal's entries a window of events without a start looks back at.
+const HISTORY: u32 = 1024;
+
 pub fn journalctl_arguments(since: Option<&str>, until: Option<&str>) -> Vec<String> {
     let mut argv = vec![
         "--no-pager".to_string(),
         "--quiet".to_string(),
         "--output=json".to_string(),
     ];
-    match since {
-        Some(since) => argv.push(format!("--since={since}")),
-        None => argv.push("--lines=0".to_string()),
+    match (since, until) {
+        (Some(since), _) => argv.push(format!("--since={since}")),
+        // A window that ends without a start: the last events before its end, as many
+        // as a short history holds.
+        (None, Some(_)) => argv.push(format!("--lines={HISTORY}")),
+        (None, None) => argv.push("--lines=0".to_string()),
     }
     match until {
         Some(until) => argv.push(format!("--until={until}")),
@@ -646,6 +652,10 @@ mod tests {
         assert!(window.contains(&"--since=-1h".to_string()));
         assert!(window.contains(&"--until=now".to_string()));
         assert!(!window.contains(&"--follow".to_string()));
+        // An end alone looks back at the last events before it.
+        let past = journalctl_arguments(None, Some("@100"));
+        assert!(past.contains(&format!("--lines={HISTORY}")));
+        assert!(past.contains(&"--until=@100".to_string()));
     }
 
     #[test]

@@ -296,7 +296,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
     full("services.*.env_file.[].required"),
     partly(
         "services.*.environment",
-        "refused for an image that boots, whose init runs as it is; a value with a newline or another control character but a tab is refused, as the settings file that carries it is read a line at a time",
+        "refused for an image that boots, whose init runs as it is; a value with a line break needs a /bin/sh in the image, which hands it over, and a name of letters, digits and underscores; another control character but a tab is refused, as the settings file that carries it is read a line at a time",
     )
     .and_below(),
     full("services.*.expose"),

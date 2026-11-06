@@ -30,7 +30,8 @@ pub struct MachineSummary {
     pub record: Option<ImageRecord>,
     /// machined's state ("opening", "running", "closing"), or "stopped".
     pub state: String,
-    /// Unix seconds, for running machines.
+    /// Unix seconds, for running machines; the Docker API's snapshot fills it in for a
+    /// run that ended, too, from `last_started`.
     pub started: Option<u64>,
     /// The machine's init, as the host sees it.
     pub leader: Option<u32>,
@@ -42,6 +43,22 @@ pub struct MachineSummary {
     pub exit_code: Option<i32>,
     /// When that run ended, unix seconds, when that is known.
     pub finished: Option<u64>,
+    /// When that run started, unix seconds, for a stopped or restarting machine, when
+    /// that is known.
+    pub last_started: Option<u64>,
+}
+
+/// When the last run of a machine that does not run started, unix seconds: as its start
+/// hook noted it, else as systemd still has it while the unit is loaded.
+async fn last_started(sd: &Systemd, store: &Store, record: &ImageRecord) -> Option<u64> {
+    if let Some(started) = store.last_start(&record.name) {
+        return Some(started);
+    }
+    sd.exec_main_start_usec(&format!("systemd-nspawn@{}.service", record.name))
+        .await
+        .ok()
+        .filter(|t| *t > 0)
+        .map(|t| t / 1_000_000)
 }
 
 /// The exit code of the machine's last run, as an attached run would have given it.
@@ -178,6 +195,7 @@ pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
             health: crate::health::read_status(name),
             exit_code: None,
             finished: None,
+            last_started: None,
         });
     }
     let unit = sd
@@ -186,13 +204,18 @@ pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
     match record {
         Some(record) => {
             let state = unit_word(&unit).to_string();
-            let (exit_code, finished) = if state == "stopped" || state == "restarting" {
-                match last_exit(sd, &ctx.store, &record).await {
-                    Some((code, finished)) => (Some(code), finished),
-                    None => (None, None),
-                }
-            } else {
-                (None, None)
+            let (exit_code, finished) =
+                if matches!(state.as_str(), "stopped" | "restarting" | "starting") {
+                    match last_exit(sd, &ctx.store, &record).await {
+                        Some((code, finished)) => (Some(code), finished),
+                        None => (None, None),
+                    }
+                } else {
+                    (None, None)
+                };
+            let last_started = match (state.as_str(), exit_code) {
+                ("stopped" | "restarting", Some(_)) => last_started(sd, &ctx.store, &record).await,
+                _ => None,
             };
             Ok(MachineSummary {
                 name: name.to_string(),
@@ -204,6 +227,7 @@ pub async fn get(ctx: &Context, name: &str) -> Result<MachineSummary> {
                 health: None,
                 exit_code,
                 finished,
+                last_started,
             })
         }
         None => Err(FailureKind::NoSuchMachine.error(format!("no machine or image named {name}"))),
@@ -243,6 +267,7 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
             health: crate::health::read_status(&m.name),
             exit_code: None,
             finished: None,
+            last_started: None,
         });
     }
     // Records machined does not list. Those between two runs of a restart policy show
@@ -267,13 +292,18 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
             .to_string();
         if listed(all, &state) {
             // Between two runs, the code of the run that ended.
-            let (exit_code, finished) = if state == "stopped" || state == "restarting" {
-                match last_exit(sd, &ctx.store, r).await {
-                    Some((code, finished)) => (Some(code), finished),
-                    None => (None, None),
-                }
-            } else {
-                (None, None)
+            let (exit_code, finished) =
+                if matches!(state.as_str(), "stopped" | "restarting" | "starting") {
+                    match last_exit(sd, &ctx.store, r).await {
+                        Some((code, finished)) => (Some(code), finished),
+                        None => (None, None),
+                    }
+                } else {
+                    (None, None)
+                };
+            let last_started = match (state.as_str(), exit_code) {
+                ("stopped" | "restarting", Some(_)) => last_started(sd, &ctx.store, r).await,
+                _ => None,
             };
             summaries.push(MachineSummary {
                 name: r.name.clone(),
@@ -285,6 +315,7 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
                 health: None,
                 exit_code,
                 finished,
+                last_started,
             });
         }
     }
@@ -685,6 +716,7 @@ pub async fn prepare(
     // A new run: the marks `kill` and `stop` left for the last one go.
     store.take_exit_on_next(name)?;
     store.forget_signal(name)?;
+    store.mark_start(name)?;
     // A run that ended without its release hook may have left them in a namespace
     // this pass makes anew.
     return_interfaces(name, hook_interfaces(&record));
@@ -798,8 +830,8 @@ pub async fn prepare(
         store.record_image(&record)?;
         None
     };
-    // nspawn has no anonymous volumes: what the image expects a volume at lives in the
-    // machine, and a recreate loses it.
+    // No anonymous volume is made for an image's: what the image expects a volume at
+    // lives in the machine, and a recreate loses it.
     for path in &record.run.volumes {
         if !record.volumes.iter().any(|v| v.target == *path) {
             note(
@@ -1011,12 +1043,13 @@ pub async fn prepare(
     if record.mode == Mode::App {
         binds.extend(crate::getent::shim(store, name, &record)?);
         crate::backend::ensure_usr(store, name, record.backend)?;
-        if settings::needs_shell(&record.effective_command())
+        let env = volume::merge_env(&record.run.env, &record.env);
+        if settings::starts_through_shell(&record.effective_command(), &env)
             && !crate::backend::root_has(store, name, record.backend, "bin/sh", |m| {
                 !m.is_file() || m.len() > 0
             })
         {
-            bail!("{name}: an argument of its program holds a newline, which the settings file cannot carry and nspawn hands over through /bin/sh, and the image has none");
+            bail!("{name}: an argument or a variable of its program holds a line break, which the settings file cannot carry and nspawn hands over through /bin/sh, and the image has none");
         }
     }
     if record.tuning.read_only && record.backend == BackendChoice::Mstack {

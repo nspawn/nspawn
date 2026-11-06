@@ -160,8 +160,10 @@ hooks.
   nspawn-overlay.conf  RequiresMountsFor= (overlay)
   nspawn-hooks.conf  ExecStartPre= (await-dependencies with --depends-on,
                      then network prepare), ExecStartPost= and ExecStopPost=
-                     calling nspawn, LogRateLimitIntervalSec=0,
-                     SyslogLevelPrefix=no; when set:
+                     calling nspawn, LogRateLimitIntervalSec=1us and
+                     LogRateLimitBurst=1000000 (no rate limit: systemd
+                     hands journald no interval of 0), SyslogLevelPrefix=no;
+                     when set:
                      Restart= with its delays and StartLimitIntervalSec=0,
                      RestartForceExitStatus= (--rm), MemoryMax=,
                      MemorySwapMax=, CPUQuota=, TasksMax=, DeviceAllow=,
@@ -325,8 +327,10 @@ stub init (`ProcessTwo=yes`), with the OCI config's environment, working
 directory, user and stop signal. An argument with a newline, which the settings
 file cannot carry, goes in encoded: `Parameters=` then runs the image's `/bin/sh`
 with a fixed script that turns each argument back with printf's `%b` and execs
-the program with them, which keeps the shell's PID. An image without `/bin/sh`
-cannot take such an argument.
+the program with them, which keeps the shell's PID. A variable whose value holds a
+line break goes in `Environment=` encoded the same way, and the script, given its
+name, turns it back and exports it first. An image without `/bin/sh` cannot take
+such an argument or variable.
 
 An image that carries s6-overlay (found at install, across the layers, and kept
 as `pid1` in the record) has its program run as PID 1 instead (`Boot=no` alone,

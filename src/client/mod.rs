@@ -339,6 +339,11 @@ impl Ended {
         self.proxy.signal(signal).await.map_err(error)
     }
 
+    /// The process's object, for signals sent while its end is awaited.
+    pub fn process(&self) -> ProcessProxy<'static> {
+        self.proxy.clone()
+    }
+
     /// The exit status, once the process has ended.
     pub async fn status(mut self) -> Result<i32> {
         // The service sets the state before it sends the signal: "running" here means
@@ -1163,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn the_service_s_errors_carry_their_names_and_read_as_before() {
+    fn the_service_s_errors_carry_their_names_and_read_as_their_message() {
         let missing = error(method_error(
             "org.nspawn.Error.NoSuchMachine",
             Some("no machine or image named web"),

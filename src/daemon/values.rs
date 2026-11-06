@@ -312,6 +312,7 @@ pub fn machine(m: &MachineSummary) -> Dict {
         dict.insert("exit_code".to_string(), v(code));
     }
     dict.insert("finished".to_string(), v(m.finished.unwrap_or(0)));
+    dict.insert("last_started".to_string(), v(m.last_started.unwrap_or(0)));
     if let Some(health) = &m.health {
         dict.insert("health".to_string(), v(health.status.as_str()));
         dict.insert(
@@ -506,14 +507,17 @@ impl<'a> Options<'a> {
     }
 
     pub fn strings(&mut self, key: &'static str) -> anyhow::Result<Vec<String>> {
-        Ok(self
-            .take(key)
+        Ok(self.maybe_strings(key)?.unwrap_or_default())
+    }
+
+    /// An array of strings when one was given: absent and empty are not the same here.
+    pub fn maybe_strings(&mut self, key: &'static str) -> anyhow::Result<Option<Vec<String>>> {
+        self.take(key)
             .map(|value| {
                 Vec::<String>::try_from(value.clone())
                     .map_err(|_| invalid(format!("option {key} must be an array of strings (as)")))
             })
-            .transpose()?
-            .unwrap_or_default())
+            .transpose()
     }
 
     /// A program and its arguments when given: one string (s), a program alone and an
@@ -800,6 +804,27 @@ mod tests {
             crate::api::kind_of(&wrong),
             Some(crate::api::FailureKind::Invalid)
         );
+    }
+
+    #[test]
+    fn a_stopped_machine_shows_when_its_last_run_started_and_ended() {
+        let m = MachineSummary {
+            name: "web".into(),
+            record: None,
+            state: "stopped".into(),
+            started: None,
+            leader: None,
+            os: None,
+            health: None,
+            exit_code: Some(3),
+            finished: Some(200),
+            last_started: Some(100),
+        };
+        let shown = machine(&m);
+        assert_eq!(u64::try_from(shown["started"].clone()).unwrap(), 0);
+        assert_eq!(u64::try_from(shown["last_started"].clone()).unwrap(), 100);
+        assert_eq!(u64::try_from(shown["finished"].clone()).unwrap(), 200);
+        assert_eq!(i32::try_from(shown["exit_code"].clone()).unwrap(), 3);
     }
 
     #[test]

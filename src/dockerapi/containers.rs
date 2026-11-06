@@ -167,9 +167,11 @@ async fn connect() -> Result<Client, Answer> {
         .map_err(|e| failed(format!("{e:#}")))
 }
 
-/// A request's body, up to what a request of the API ever holds.
+/// A request's body, up to what a request of the API ever holds. Its JSON is read whole
+/// into values some thirty times its size, under the server's MemoryMax: a megabyte is
+/// more than a program's whole environment can be.
 pub(super) async fn read_body(body: Incoming) -> Result<Bytes, Answer> {
-    const MOST: usize = 16 * 1024 * 1024;
+    const MOST: usize = 1024 * 1024;
     match http_body_util::Limited::new(body, MOST).collect().await {
         Ok(collected) => Ok(collected.to_bytes()),
         Err(e) => Err(Answer::says(

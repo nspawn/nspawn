@@ -292,7 +292,10 @@ pub async fn remove_machines_if(
     // stays keeps them.
     let order = crate::api::dependencies::removal_order(&records, names);
     for name in order.iter().filter(|n| !skip.contains(*n)) {
-        let outcome: Result<Option<(String, u64, Option<String>)>> = async {
+        // The removed record's reference, making, API name and, for an image that never
+        // ran, its ID.
+        type Removed = (String, u64, Option<String>, Option<String>);
+        let outcome: Result<Option<Removed>> = async {
             let staying = crate::api::dependencies::holders(&records, name, &removal.removed);
             if !staying.is_empty() {
                 let (stays, needs) = if staying.len() == 1 {
@@ -319,6 +322,17 @@ pub async fn remove_machines_if(
             }
             match store.load_image(name)? {
                 Some(rec) => {
+                    // An image that never ran goes as an image, under the ID of its config.
+                    let image_id = crate::api::disk::image_only(store, &rec)
+                        .then(|| store.load_manifest(name).ok())
+                        .flatten()
+                        .and_then(|bytes| {
+                            serde_json::from_slice::<oci_client::manifest::OciImageManifest>(
+                                &bytes,
+                            )
+                            .ok()
+                        })
+                        .map(|m| m.config.digest);
                     assembler.remove(name, rec.backend).await?;
                     store.remove_machine_files(name)?;
                     crate::api::machines::release_machine(name, Some(&rec))?;
@@ -337,7 +351,7 @@ pub async fn remove_machines_if(
                             ),
                         );
                     }
-                    Ok(Some((rec.reference, rec.created, rec.api_name)))
+                    Ok(Some((rec.reference, rec.created, rec.api_name, image_id)))
                 }
                 None => {
                     // Not recorded: an image machined knows, or leftovers of ours. A name
@@ -368,13 +382,18 @@ pub async fn remove_machines_if(
                 line(report, format!("removed {name}"));
                 // The record is gone: what the event says of the machine has to travel
                 // with it.
-                let created = image.as_ref().map(|(_, c, _)| c.to_string());
+                let created = image.as_ref().map(|(_, c, _, _)| c.to_string());
                 let mut attributes: Vec<(&str, &str)> = Vec::new();
-                if let (Some((reference, _, api_name)), Some(created)) = (&image, &created) {
+                if let (Some((reference, _, api_name, image_id)), Some(created)) =
+                    (&image, &created)
+                {
                     attributes.push(("image", reference.as_str()));
                     attributes.push(("created", created.as_str()));
                     if let Some(api_name) = api_name {
                         attributes.push(("api_name", api_name.as_str()));
+                    }
+                    if let Some(image_id) = image_id {
+                        attributes.push(("image_id", image_id.as_str()));
                     }
                 }
                 crate::api::events::emit("machine", "remove", name, &attributes);

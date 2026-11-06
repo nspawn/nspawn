@@ -725,6 +725,32 @@ impl Store {
         self.machine_files_dir(name).join("last-signal")
     }
 
+    fn start_path(&self, name: &str) -> PathBuf {
+        self.machine_files_dir(name).join("last-start")
+    }
+
+    /// Notes that a run of `name` starts now, for when it has ended: systemd forgets an
+    /// unloaded unit's times.
+    pub fn mark_start(&self, name: &str) -> Result<()> {
+        crate::reference::validate_entry_name(name)?;
+        let path = self.start_path(name);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        fs::write(&path, now_unix().to_string())
+            .with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// When the last run of `name` started, in unix seconds, as `mark_start` noted it.
+    pub fn last_start(&self, name: &str) -> Option<u64> {
+        crate::reference::validate_entry_name(name).ok()?;
+        fs::read_to_string(self.start_path(name))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
     /// Remembers the signal nspawn sent the machine's current run (kill, stop), and
     /// which run that is (its unit's InvocationID), which the exit code of the run is made
     /// of: systemd-nspawn only says 255 when its program died of one, 1 when the whole
@@ -4076,6 +4102,17 @@ mod tests {
         store.forget_signal("web").unwrap();
         store.forget_signal("web").unwrap();
         assert_eq!(store.last_signal("web"), None);
+    }
+
+    #[test]
+    fn the_start_of_the_last_run_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        assert_eq!(store.last_start("web"), None);
+        let before = now_unix();
+        store.mark_start("web").unwrap();
+        assert!(store.last_start("web").is_some_and(|t| t >= before));
+        assert!(store.mark_start("../x").is_err());
     }
 
     #[test]

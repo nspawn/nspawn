@@ -316,6 +316,7 @@ pub async fn attach(
             let input = Input {
                 sink: Sink::Terminal(handed),
                 alive,
+                ended: None,
             };
             return deliver(
                 rx,
@@ -347,7 +348,11 @@ pub async fn attach(
                     ..pending
                 },
             );
-            let input = Input { sink, alive };
+            let input = Input {
+                sink,
+                alive,
+                ended: None,
+            };
             return deliver(
                 rx,
                 upgrade,
@@ -377,6 +382,15 @@ pub async fn attach(
         if let Err(e) = prepare_logs(ctx, &mut request).await {
             return error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
         }
+        let journal = match super::streams::logs_journal(&request) {
+            Ok(journal) => journal,
+            Err(e) => {
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("running journalctl: {e}"),
+                )
+            }
+        };
         let query = LogsQuery {
             stream: match shape {
                 Shape::Framed(stream) => stream,
@@ -387,7 +401,7 @@ pub async fn attach(
         };
         tokio::spawn(async move {
             let _held = permit;
-            super::streams::logs(query, tx).await;
+            super::streams::logs(query, journal, tx).await;
         });
     }
     deliver(rx, upgrade, kind, (), None)
@@ -471,10 +485,13 @@ async fn carry<R, W, H>(
     let out = write_out(writer, rx, hangup);
     match input {
         None => out.await,
-        Some(Input { sink, alive }) => {
+        Some(Input { sink, alive, ended }) => {
             let _alive = alive;
             tokio::pin!(out);
-            let fed = feed(sink, early, &mut reader);
+            let fed = async {
+                feed(sink, early, &mut reader).await;
+                drop(ended);
+            };
             tokio::pin!(fed);
             let mut feeding = true;
             loop {
@@ -559,6 +576,8 @@ pub(super) struct Input {
     /// Kept as long as the attach: the start takes an input only from an attach that is
     /// still there.
     pub(super) alive: Arc<()>,
+    /// Dropped once the input ended, by the client's end of it or its hangup.
+    pub(super) ended: Option<oneshot::Sender<()>>,
 }
 
 /// Where an attach's input goes.
@@ -865,12 +884,17 @@ async fn hold_run(
     server: super::Upgraded,
 ) {
     let _held = (connection, server, pending.held);
+    let output = pending.output;
+    // The run's end marks the attach as draining whatever its client's pace, as the
+    // output's end would only once a slow client read up to it.
+    let state = output.as_ref().map(|out| out.state.clone());
     let end = async {
         if let Some(ended) = ended {
-            let _ = ended.status().await;
+            if let (Ok(_), Some(state)) = (ended.status().await, &state) {
+                run_ended(state);
+            }
         }
     };
-    let output = pending.output;
     let carried = async {
         if let Some(terminal) = &terminal {
             carry_output(&terminal.master, output).await;
@@ -954,7 +978,7 @@ async fn carry_output(from: &AsyncFd<OwnedFd>, mut output: Option<RunOutput>) {
 }
 
 /// A task aborted when this goes.
-struct Aborted(tokio::task::JoinHandle<()>);
+pub(super) struct Aborted(pub(super) tokio::task::JoinHandle<()>);
 
 impl Drop for Aborted {
     fn drop(&mut self) {
@@ -1355,6 +1379,7 @@ mod tests {
         let input = Input {
             sink,
             alive: Arc::new(()),
+            ended: None,
         };
         let carried = tokio::spawn(carry(
             reader,
@@ -1371,6 +1396,46 @@ mod tests {
         let read = tokio::task::spawn_blocking(move || read_to_end(program));
         assert_eq!(read.await.unwrap(), b"in");
         // The output goes on after the input's end, and its end ends the attach.
+        tx.send(Bytes::from_static(b"out")).await.unwrap();
+        drop(tx);
+        let mut got = Vec::new();
+        client_reads.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"out");
+        carried.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_end_of_an_input_is_told_while_the_output_goes_on() {
+        let (Pending { stdin, .. }, sink) = input_pipe(true).unwrap();
+        let _program = stdin.unwrap();
+        let (client, server) = UnixStream::pair().unwrap();
+        let (reader, writer) = server.into_split();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (ended, mut input_ended) = oneshot::channel();
+        let input = Input {
+            sink,
+            alive: Arc::new(()),
+            ended: Some(ended),
+        };
+        let carried = tokio::spawn(carry(
+            reader,
+            Bytes::new(),
+            writer,
+            rx,
+            None,
+            Some(input),
+            (),
+        ));
+        let (mut client_reads, mut client_writes) = client.into_split();
+        assert!(input_ended
+            .try_recv()
+            .is_err_and(|e| e == oneshot::error::TryRecvError::Empty));
+        client_writes.shutdown().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), &mut input_ended)
+                .await
+                .is_ok()
+        );
         tx.send(Bytes::from_static(b"out")).await.unwrap();
         drop(tx);
         let mut got = Vec::new();
@@ -1424,6 +1489,7 @@ mod tests {
         let input = Input {
             sink,
             alive: Arc::new(()),
+            ended: None,
         };
         let carried = tokio::spawn(carry(
             reader,

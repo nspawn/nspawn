@@ -490,6 +490,40 @@ pub fn expand_env(values: &[String]) -> Result<Vec<String>> {
         .collect()
 }
 
+/// Whether a variable's value holds a line break, which the settings file cannot carry:
+/// such a variable reaches the program through the image's /bin/sh
+/// (`settings::shell_env`).
+pub fn breaks_line(var: &str) -> bool {
+    var.contains(['\n', '\r'])
+}
+
+/// A name /bin/sh takes for a variable: letters, digits and underscores, not a digit
+/// first.
+pub fn is_shell_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Refuses a variable the settings file cannot carry: a control character other than a
+/// tab, or a line break in its value where its name is not one /bin/sh takes.
+fn reject_env_control_characters(var: &str) -> Result<()> {
+    let (name, value) = var.split_once('=').unwrap_or((var, ""));
+    reject_control_characters_but_tab(name)?;
+    if value
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+    {
+        bail!("{var:?}: control characters other than tabs and line breaks are not allowed");
+    }
+    if breaks_line(value) && !is_shell_name(name) {
+        bail!("{name}: a variable whose value holds a line break reaches the program through /bin/sh, which takes names of letters, digits and underscores only");
+    }
+    Ok(())
+}
+
 /// Parses the -e values: VAR=value as given, VAR alone copied from this environment.
 /// "none" alone clears the list; a later value of the same variable wins.
 pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
@@ -498,7 +532,6 @@ pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
     }
     let mut out: Vec<String> = Vec::new();
     for value in values {
-        reject_control_characters_but_tab(value)?;
         let (name, assignment) = match value.split_once('=') {
             Some((name, _)) => (name, value.clone()),
             None => match std::env::var(value) {
@@ -506,6 +539,7 @@ pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
                 Err(_) => bail!("{value} has no value here; give it as {value}=VALUE"),
             },
         };
+        reject_env_control_characters(&assignment)?;
         // Any name but an empty one: Elasticsearch reads discovery.type, and the
         // settings file carries such names as they are.
         if name.is_empty() {
@@ -706,10 +740,17 @@ mod tests {
         assert!(parse_env(&["=x".into()]).is_err());
         assert!(parse_env(&["none".into()]).unwrap().is_empty());
         assert_eq!(parse_env(&["X=a=b".into()]).unwrap(), vec!["X=a=b"]);
-        assert!(
-            parse_env(&["X=line\nbreak".into()]).is_err(),
-            "a newline would be another directive"
+        assert_eq!(
+            parse_env(&["X=line\nbreak\r\n".into()]).unwrap(),
+            ["X=line\nbreak\r\n"],
+            "carried encoded, through the shell"
         );
+        assert!(
+            parse_env(&["a.b=line\nbreak".into()]).is_err(),
+            "no shell name"
+        );
+        assert!(parse_env(&["X=bell\x07".into()]).is_err());
+        assert!(parse_env(&["X\n=1".into()]).is_err());
     }
 
     #[test]
@@ -732,7 +773,7 @@ mod tests {
             parse_env(&["DEPS=a\tb".to_string()]).unwrap(),
             ["DEPS=a\tb"]
         );
-        assert!(parse_env(&["A=1\nB=2".to_string()]).is_err());
+        assert!(parse_env(&["A=1\x0bB=2".to_string()]).is_err());
     }
 
     #[test]

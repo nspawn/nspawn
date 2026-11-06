@@ -99,6 +99,32 @@ impl Main {
     }
 }
 
+/// How long the answer of an end waits for the unit's hooks after it.
+const SETTLING: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a unit whose run ended is done with it: stopped, waiting to restart, or
+/// starting anew, its hooks after the end (ExecStopPost=) gone by.
+fn hooks_done(active: &str, sub: &str) -> bool {
+    matches!(active, "inactive" | "failed" | "activating") || sub.contains("auto-restart")
+}
+
+/// What a change of the unit's Unit interface says of `hooks_done`, if it is one.
+fn run_over(change: &zbus::fdo::PropertiesChanged) -> Option<bool> {
+    let args = change.args().ok()?;
+    if args.interface_name().as_str() != "org.freedesktop.systemd1.Unit" {
+        return None;
+    }
+    let changed = args.changed_properties();
+    let state = |key: &str| {
+        changed
+            .get(key)
+            .and_then(|v| <&str>::try_from(v).ok())
+            .map(str::to_string)
+    };
+    let active = state("ActiveState")?;
+    Some(hooks_done(&active, &state("SubState").unwrap_or_default()))
+}
+
 /// Whether the unit runs a machine, or is about to: a start under way, or a main process
 /// that has not ended. Between two runs of its restart policy it does not.
 fn runs_now(active: &str, sub: &str, main: &Main) -> bool {
@@ -442,6 +468,11 @@ pub async fn wait(ctx: &Context, name: &str, condition: Condition) -> Result<i32
             _ => None,
         }
     };
+    // An end is answered once the unit's hooks after it are done, for a while at most:
+    // until then the machine reads as running, and a removal is refused.
+    let mut answer: Option<i32> = None;
+    let settling = tokio::time::sleep(SETTLING);
+    tokio::pin!(settling);
     loop {
         let removal = async {
             match records.as_mut() {
@@ -455,17 +486,35 @@ pub async fn wait(ctx: &Context, name: &str, condition: Condition) -> Result<i32
                 let Some(change) = change else {
                     bail!("lost the signals of {unit}");
                 };
+                let over = run_over(&change);
                 if let Some(ending) = ended(change) {
                     let code = code_of(ending);
-                    if condition != Condition::Removed {
-                        return Ok(code);
+                    if condition == Condition::Removed {
+                        last = Some(code);
+                    } else {
+                        answer = Some(code);
+                        settling
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + SETTLING);
+                        let now = sd.unit_status(&unit).await.ok();
+                        if now.is_none_or(|s| hooks_done(&s.active, &s.sub)) {
+                            return Ok(code);
+                        }
                     }
-                    last = Some(code);
                 }
+                if let (Some(code), Some(true)) = (answer, over) {
+                    return Ok(code);
+                }
+            }
+            () = &mut settling, if answer.is_some() => {
+                return Ok(answer.unwrap_or(0));
             }
             seen = removal => {
                 if !removed(store, name, created, seen?).await {
                     continue;
+                }
+                if let Some(code) = answer {
+                    return Ok(code);
                 }
                 // An end said before the removal and not read yet is its last.
                 while let Some(Some(change)) = changes.next().now_or_never() {
@@ -516,6 +565,17 @@ mod tests {
         let bad = Condition::parse("stopped").unwrap_err();
         assert_eq!(crate::api::kind_of(&bad), Some(FailureKind::Invalid));
         assert!(bad.to_string().contains("\"stopped\""), "{bad}");
+    }
+
+    #[test]
+    fn an_end_is_answered_once_the_hooks_after_it_are_done() {
+        assert!(!hooks_done("deactivating", "stop-post"), "its release hook");
+        assert!(!hooks_done("deactivating", "stop-sigterm"));
+        assert!(hooks_done("inactive", "dead"));
+        assert!(hooks_done("failed", "failed"));
+        assert!(hooks_done("activating", "auto-restart"), "between two runs");
+        assert!(hooks_done("inactive", "dead-before-auto-restart"));
+        assert!(hooks_done("activating", "start-pre"), "the next run");
     }
 
     #[test]

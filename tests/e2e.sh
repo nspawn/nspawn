@@ -3453,6 +3453,18 @@ code=$?
 echo "$out" | grep_q /dev/pts/ || fail "docker exec -t has no terminal: $out"
 out=$(dkt exec e2e-dk-y true 2>&1) && fail "an exec in a container that does not run succeeded"
 echo "$out" | grep_q "is not running" || fail "exec in a container that does not run: $out"
+# A second start of an exec says in its stream that the command ran.
+eid=$(hapi /containers/e2e-dk-x/exec -X POST -H 'Content-Type: application/json' -d '{"Cmd":["true"],"AttachStdout":true}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["Id"])')
+hapi "/exec/$eid/start" -X POST -H 'Content-Type: application/json' -d '{}' >/dev/null || fail "exec start of $eid"
+code=$(curl -sS -o "$dk_dir/again.out" -w '%{http_code}' --unix-socket /run/nspawn/api.sock -X POST -H 'Content-Type: application/json' -d '{}' "http://docker/exec/$eid/start")
+[ "$code" = 200 ] && grep -aq "has already run" "$dk_dir/again.out" || fail "a second start of an exec answered $code: $(tr -d '\0' < "$dk_dir/again.out")"
+# A console whose client goes is hung up, as a terminal is.
+pyrun timeout -s KILL 5 "$dk_dir/dk" exec -it e2e-dk-x sh -c 'echo $$ > /tmp/hup.pid; exec cat' </dev/null >/dev/null 2>&1
+sleep 2
+[ "$(dkt exec e2e-dk-x sh -c 'kill -0 "$(cat /tmp/hup.pid)" 2>/dev/null && echo alive || echo gone' 2>&1)" = gone ] || fail "the command of a console whose client went still runs"
+# A variable with line breaks reaches the program as it was given.
+out=$(dkt run --rm --label e2e.dk=1 -e "E2E_ML=$(printf 'one\n\ntwo\r')" e2e-dk-bb sh -c 'printf %s "$E2E_ML" | od -An -c | tr -s " "' 2>&1)
+[ "$out" = " o n e \n \n t w o \r" ] || fail "a variable with line breaks: $out"
 # run -i and start -ai: GitLab Runner's way, an attach of the input before every start of
 # a stopped container.
 [ "$(dkt run --rm -i --label e2e.dk=1 e2e-dk-bb wc -c < "$dk_dir/blob" | tr -d ' ')" = 1048576 ] || fail "docker run -i did not carry 1 MiB"
@@ -3469,6 +3481,22 @@ for word in first second; do
 done
 out=$(printf 'tin\n' | pyrun timeout --foreground 120 "$dk_dir/dk" run --rm -it --label e2e.dk=1 e2e-dk-bb sh -c 'read l; echo "got-$l"' 2>&1 | tr -d '\r')
 echo "$out" | grep_q got-tin || fail "docker run -it: $out"
+# A wait answers once the container reads as stopped: its times, and a removal at once.
+dk run -d --name e2e-dk-w --label e2e.dk=1 e2e-dk-bb sh -c 'sleep 1; exit 3' >/dev/null || fail "docker run -d e2e-dk-w"
+[ "$(dkt wait e2e-dk-w 2>&1)" = 3 ] || fail "docker wait e2e-dk-w"
+out=$(dk inspect -f '{{.State.Status}} {{.State.ExitCode}} {{.State.StartedAt}} {{.State.FinishedAt}}' e2e-dk-w 2>&1)
+case $out in "exited 3 "*0001-*) fail "the times of a container that ended: $out" ;; "exited 3 "*) ;; *) fail "the state of a container that ended: $out" ;; esac
+dk rm e2e-dk-w >/dev/null || fail "docker rm right after docker wait"
+# A follow of the logs of a container that ended gives all of them and ends.
+dk run -d --name e2e-dk-lg --label e2e.dk=1 e2e-dk-bb seq 1 50000 >/dev/null || fail "docker run -d e2e-dk-lg"
+dkt wait e2e-dk-lg >/dev/null
+[ "$(timeout 60 "$dk_dir/dk" logs -f e2e-dk-lg 2>&1 | wc -l)" = 50000 ] || fail "docker logs -f of a container that ended: $(dk logs e2e-dk-lg 2>&1 | wc -l) lines without -f"
+dk rm e2e-dk-lg >/dev/null || fail "docker rm e2e-dk-lg"
+# No rate limit of the journal takes lines away, on the journald driver either.
+dk run -d --name e2e-dk-lj --log-driver journald --label e2e.dk=1 e2e-dk-bb seq 1 50000 >/dev/null || fail "docker run -d e2e-dk-lj"
+dkt wait e2e-dk-lj >/dev/null
+[ "$(timeout 60 "$dk_dir/dk" logs e2e-dk-lj 2>&1 | wc -l)" = 50000 ] || fail "docker logs of the journald driver lost lines: $(dk logs e2e-dk-lj 2>&1 | wc -l)"
+dk rm e2e-dk-lj >/dev/null || fail "docker rm e2e-dk-lj"
 # cp both ways: modes, owners, links, directories, a tar on stdout, a container that does
 # not run.
 h=$dk_dir/cp
@@ -3507,6 +3535,8 @@ dkt run --rm --label e2e.dk=1 -v e2e-dk-v1:/data e2e-dk-bb sh -c "echo vol-$nonc
 dk create --name e2e-dk-vu --label e2e.dk=1 -v e2e-dk-v1:/data e2e-dk-bb true >/dev/null || fail "docker create e2e-dk-vu"
 out=$(dkt cp "$h/f" e2e-dk-vu:/data/f 2>&1) && fail "a copy into the volume of a container that does not run succeeded"
 echo "$out" | grep_q "mounted only while the machine runs" || fail "docker cp into the volume of a stopped container: $out"
+out=$(dkt cp e2e-dk-vu:/ - 2>&1 >/dev/null) && fail "a copy of a tree that holds the volume of a container that does not run succeeded"
+echo "$out" | grep_q "mounted only while the machine runs" || fail "docker cp of a tree that holds the volume of a stopped container: $out"
 dk rm e2e-dk-vu >/dev/null || fail "docker rm e2e-dk-vu"
 out=$(dkt volume prune -f --filter label=e2e.dk=1 2>&1) || fail "docker volume prune: $out"
 echo "$out" | grep_q "$anon" || fail "docker volume prune left the unnamed volume: $out"
@@ -3533,7 +3563,11 @@ echo "$out" | grep_q e2e-dk-n2 || fail "docker network prune left e2e-dk-n2: $ou
 out=$(dkt network rm bridge 2>&1) && fail "the network bridge was removed"
 echo "$out" | grep_q pre-defined || fail "docker network rm bridge: $out"
 # rmi of the image the step above pulled: refused while a container was made from it.
-if [ -n "$pulled" ]; then
+# Docker Hub's busybox:1.37 may be the very image the mirror of busybox:latest holds,
+# whose tags and containers the checks would then count too.
+if [ -n "$pulled" ] && [ "$(dk image inspect -f '{{.Id}}' busybox:1.37 2>/dev/null)" = "$(dk image inspect -f '{{.Id}}' e2e-dk-bb 2>/dev/null)" ]; then
+  echo "busybox:1.37 is the image e2e-dk-bb holds here: the rmi checks skipped"
+elif [ -n "$pulled" ]; then
   dk create --name e2e-dk-iu --label e2e.dk=1 busybox:1.37 true >/dev/null || fail "docker create of busybox:1.37"
   out=$(dkt rmi busybox:1.37 2>&1) && fail "an image a container was made from was removed"
   echo "$out" | grep_q conflict || fail "docker rmi of an image in use: $out"
@@ -3544,6 +3578,9 @@ if [ -n "$pulled" ]; then
   [ -n "$(of_hub_busybox)" ] && fail "a record of busybox:1.37 stayed after docker rmi: $(of_hub_busybox)"
   pulled=
 fi
+# system prune, narrowed to the step's own, to its last part, the build cache.
+out=$(dkt system prune -f --filter label=e2e.dk=1 2>&1) || fail "docker system prune: $out"
+echo "$out" | grep_q "Total reclaimed space" || fail "docker system prune: $out"
 dk rm -f e2e-dk-x e2e-dk-y e2e-dk-sai >/dev/null 2>&1
 rm -rf "$dk_dir"
 $NSPAWN images rm e2e-dk-cli e2e-dk-bb $pulled >/dev/null 2>&1
@@ -5473,7 +5510,7 @@ $NSPAWN start e2e-rv6-ko -- version >/dev/null 2>&1 || fail "start of a ko image
 retry 10 bash -c "$NSPAWN logs e2e-rv6-ko 2>&1 | tr -d '\r' | grep_q -E '^v?[0-9]+\.[0-9]+'" || fail "a ko image's program did not run: $($NSPAWN logs e2e-rv6-ko 2>&1)"
 out=$($NSPAWN start e2e-rv6-ko -- 'a
 b' 2>&1) && fail "an argument with a newline started without /bin/sh in the image: $out"
-echo "$out" | grep_q "holds a newline.*/bin/sh, and the image has none" || fail "the refusal without /bin/sh: $out"
+echo "$out" | grep_q "holds a line break.*/bin/sh, and the image has none" || fail "the refusal without /bin/sh: $out"
 $NSPAWN rm -f e2e-rv6-ko >/dev/null 2>&1
 
 step "review: flags read as the reference reads them: -v ./DIR:z, --tmpfs options, --label KEY, --restart always:0, --pids-limit -1, capabilities, inspect -f json"

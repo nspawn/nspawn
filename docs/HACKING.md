@@ -124,10 +124,11 @@ The VM needs:
   copies there only images published with OCI media types), on which the user
   `tester` with password `s3cret` may log in and push;
 - access to Docker Hub: the images the steps use (busybox, alpine, memcached,
-  caddy-docker-proxy and curl) are copied once into the test registry and taken from
-  there, since Docker Hub limits anonymous pulls by address and the hosts of the
-  suite share one, but the compose steps pull `busybox:1.36` from Docker Hub and
-  `config --resolve-image-digests` asks it;
+  caddy-docker-proxy, curl and the docker command line) are copied once into the test
+  registry and taken from there, since Docker Hub limits anonymous pulls by address
+  and the hosts of the suite share one, but the compose steps pull `busybox:1.36` from
+  Docker Hub, `config --resolve-image-digests` asks it, and the Docker API step pulls
+  `busybox:1.37` through the API and asks it for a tag it does not have;
 - access to lscr.io (linuxserver.io's s6-overlay bases), to hub.nspawn.org (a signed
   image is pulled from it), and to the internet from the machines
   (`download.opensuse.org`, `detectportal.firefox.com`);

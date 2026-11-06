@@ -31,7 +31,7 @@ use tokio::sync::mpsc::{self, Sender};
 use zbus::zvariant::Value as Bus;
 
 use super::access::Need;
-use super::attach::{content_type, deliver, read_some, set_nonblocking, Input, Sink};
+use super::attach::{content_type, deliver, read_some, set_nonblocking, Aborted, Input, Sink};
 use super::containers::{check_json, read_body, status_of, Answer, Sent};
 use super::create::{self, Object, Refusal};
 use super::model::Snapshot;
@@ -564,10 +564,7 @@ async fn create(ctx: &Arc<Context>, key: &str, sent: Sent) -> Served {
     }
     let keys = escape_keys(&config.detach_keys)
         .map_err(|e| Answer(StatusCode::INTERNAL_SERVER_ERROR, Some(e)))?;
-    let shown_user = match config.user.as_str() {
-        "" => machine.record.effective_user().unwrap_or("").to_string(),
-        user => user.to_string(),
-    };
+    let shown_user = shown_user(&machine.record, &config.user);
     let id = new_id().map_err(internal)?;
     let instance = Instance {
         id: id.clone(),
@@ -656,13 +653,27 @@ async fn start(ctx: &Arc<Context>, id: &str, sent: Sent) -> Served {
             Some("too many exec commands run on this socket".to_string()),
         )
     })?;
-    let (machine, config, size) = table(|t| {
+    let begun = table(|t| {
         let instance = t.get(id).ok_or_else(|| no_such_exec(id))?;
         instance.begin()?;
         // A resize is the latest word on the terminal's size.
         let size = instance.size.or(options.size).or(instance.config.size);
         Ok::<_, Answer>((instance.machine.clone(), instance.config.clone(), size))
-    })?;
+    });
+    let (machine, config, size) = match begun {
+        Ok(begun) => begun,
+        // A start with a stream has it before the command is started, as the engine's
+        // does, and a command already started is said in it: a client may start an exec
+        // it attached to once more, and reads the stream to its end.
+        Err(Answer(StatusCode::CONFLICT, Some(text))) if !options.detach => {
+            let (tx, rx) = mpsc::channel::<Bytes>(1);
+            let _ = tx.try_send(said_in_stream(&text, options.tty));
+            drop(tx);
+            let kind = content_type(options.tty, upgrade.is_some(), version);
+            return Ok(deliver(rx, upgrade, kind, (), None));
+        }
+        Err(refused) => return Err(refused),
+    };
     let begun = Begun(Some(id));
     let launched = launch(&machine, &config, options.detach, size).await;
     let (client, mut fds, ended) = match launched {
@@ -713,8 +724,30 @@ async fn start(ctx: &Arc<Context>, id: &str, sent: Sent) -> Served {
     let kind = content_type(options.tty, upgrade.is_some(), version);
     let (tx, rx) = mpsc::channel::<Bytes>(64);
     let input = streams.input;
-    tokio::spawn(watcher.wait(Some((streams.output, outlet, tx))));
+    tokio::spawn(watcher.wait(Some((streams.output, outlet, tx, streams.hangup))));
     Ok(deliver(rx, upgrade, kind, (), input))
+}
+
+/// The user an exec runs as, as its inspect shows it: the one asked for, else an app's
+/// own; a booted machine's commands run as root.
+fn shown_user(record: &crate::store::ImageRecord, asked: &str) -> String {
+    match asked {
+        "" if record.mode == crate::oci::Mode::App => {
+            record.effective_user().unwrap_or("").to_string()
+        }
+        "" => String::new(),
+        user => user.to_string(),
+    }
+}
+
+/// A refusal said in a start's stream: a line on the standard output.
+fn said_in_stream(text: &str, tty: bool) -> Bytes {
+    let line = format!("{text}\r\n");
+    if tty {
+        Bytes::from(line)
+    } else {
+        frame(1, line.as_bytes())
+    }
 }
 
 /// Calls Exec for `config` in `machine`: the bus connection it was called on, which alone
@@ -772,6 +805,8 @@ struct Streams {
     input: Option<Input>,
     /// The terminal, for resizes.
     terminal: Option<Arc<OwnedFd>>,
+    /// The end of the input on a terminal, which hangs the command up.
+    hangup: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 impl Streams {
@@ -785,21 +820,25 @@ impl Streams {
         if let Some(master) = take("tty") {
             set_nonblocking(&master)?;
             let terminal = Arc::new(master.try_clone()?);
-            let input = if config.stdin {
+            let (input, hangup) = if config.stdin {
                 let (handing, handed) = tokio::sync::oneshot::channel();
                 let _ = handing.send(master.try_clone()?);
-                Some(Input {
+                let (ended, hangup) = tokio::sync::oneshot::channel();
+                let input = Input {
                     sink: Sink::Terminal(handed),
                     alive: Arc::new(()),
-                })
+                    ended: Some(ended),
+                };
+                (Some(input), Some(hangup))
             } else {
-                None
+                (None, None)
             };
             let output = Output::Terminal(AsyncFd::with_interest(master, Interest::READABLE)?);
             return Ok(Streams {
                 output,
                 input,
                 terminal: Some(terminal),
+                hangup,
             });
         }
         let (Some(stdin), Some(stdout), Some(stderr)) =
@@ -810,6 +849,7 @@ impl Streams {
         let input = config.stdin.then(|| Input {
             sink: Sink::Pipe(stdin),
             alive: Arc::new(()),
+            ended: None,
         });
         Ok(Streams {
             output: Output::Pipes {
@@ -818,6 +858,7 @@ impl Streams {
             },
             input,
             terminal: None,
+            hangup: None,
         })
     }
 }
@@ -859,6 +900,15 @@ struct Watcher {
     place: super::Place,
 }
 
+/// A command's output on its way to the client: where it comes from, how it goes, where
+/// to, and the end of its terminal's input.
+type Carried = (
+    Output,
+    Outlet,
+    Sender<Bytes>,
+    Option<tokio::sync::oneshot::Receiver<()>>,
+);
+
 /// How long the output may take to reach its end once the command exited: what it wrote
 /// comes at once, and a process it left running may hold the output for as long as it
 /// lives.
@@ -868,7 +918,7 @@ impl Watcher {
     /// Carries the command's output to the client until it ends, keeps its exit code, and
     /// only then lets the client's stream end. Without a client, or once it went, the
     /// output is read all the same: the command would block on a full pipe.
-    async fn wait(self, output: Option<(Output, Outlet, Sender<Bytes>)>) {
+    async fn wait(self, output: Option<Carried>) {
         let Watcher {
             id,
             ended,
@@ -876,16 +926,26 @@ impl Watcher {
             server,
             place,
         } = self;
-        let Some((output, outlet, tx)) = output else {
+        let Some((output, outlet, tx, hangup)) = output else {
             finish(&id, ended.status().await.unwrap_or(-1));
             drop((client, server, place));
             return;
         };
         let cut = Arc::new(tokio::sync::Notify::new());
         let mut pumping = tokio::spawn(pump(output, outlet, Some(tx), cut.clone()));
+        // A terminal whose input is gone, the client's end of it or its hangup, hangs up:
+        // a shell left on it would wait for input forever.
+        let hanging = hangup.map(|input_ended| {
+            let process = ended.process();
+            Aborted(tokio::spawn(async move {
+                let _ = input_ended.await;
+                let _ = process.signal(nix::libc::SIGHUP).await;
+            }))
+        });
         // An end the bus cannot say is no success: -1, as the engine's command line
         // reads an exit code it could not get.
         let code = ended.status().await.unwrap_or(-1);
+        drop(hanging);
         finish(&id, code);
         match tokio::time::timeout(AFTER_EXIT, &mut pumping).await {
             // The output's end, and with it the client's stream.
@@ -1337,6 +1397,33 @@ mod tests {
             assert!(full.add(instance(&format!("r{n}"), running, start)));
         }
         assert!(!full.add(instance("more", Phase::Created, start)));
+    }
+
+    #[test]
+    fn a_booted_machine_s_commands_are_shown_as_root_s() {
+        let mut record: crate::store::ImageRecord = serde_json::from_value(json!({
+            "name": "web", "reference": "r", "manifest_digest": "sha256:00",
+            "layers": [], "backend": "overlay", "created": 1,
+        }))
+        .unwrap();
+        record.run.user = Some("app".into());
+        record.mode = crate::oci::Mode::App;
+        assert_eq!(shown_user(&record, ""), "app");
+        assert_eq!(shown_user(&record, "1000"), "1000");
+        record.mode = crate::oci::Mode::Boot;
+        assert_eq!(shown_user(&record, ""), "");
+        assert_eq!(shown_user(&record, "app"), "app");
+    }
+
+    #[test]
+    fn a_start_with_a_stream_says_its_refusal_in_it() {
+        assert_eq!(
+            said_in_stream("exec command ab is already running", true),
+            Bytes::from_static(b"exec command ab is already running\r\n")
+        );
+        let framed = said_in_stream("exec command ab has already run", false);
+        assert_eq!(&framed[..8], &[1, 0, 0, 0, 0, 0, 0, 33]);
+        assert_eq!(&framed[8..], b"exec command ab has already run\r\n");
     }
 
     #[test]

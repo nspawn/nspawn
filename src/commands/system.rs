@@ -310,22 +310,33 @@ pub async fn networks_prune(client: &Client, filters: &[String]) -> Result<Vec<S
 }
 
 /// The unused volumes made without a name (the API makes them), those `labels` select.
-async fn anonymous_volumes_prune(client: &Client, labels: &[String]) -> Result<Vec<String>> {
+/// The unused anonymous volumes removed, and what they held.
+async fn anonymous_volumes_prune(client: &Client, labels: &[String]) -> Result<(Vec<String>, u64)> {
     let volumes = client.manager.list_volumes().await.map_err(client::error)?;
     let unused = anonymous_unused(
         &volumes.iter().map(client::dict_to_json).collect::<Vec<_>>(),
         labels,
     );
     if unused.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
+    // Measured before they go.
+    let sizes: HashMap<String, u64> = match client.manager.disk_usage().await {
+        Ok(usage) => rows(&usage, "volume_rows")
+            .iter()
+            .map(|r| (client::string(r, "name"), client::u64(r, "size")))
+            .collect(),
+        Err(_) => HashMap::new(),
+    };
     // One a machine took meanwhile is refused by the service and stays.
     let result = client::partly(
         client
             .run_job_silent(|| client.manager.remove_volumes(&unused), true)
             .await,
     )?;
-    Ok(client::strings(&result, "removed"))
+    let removed = client::strings(&result, "removed");
+    let freed = removed.iter().filter_map(|name| sizes.get(name)).sum();
+    Ok((removed, freed))
 }
 
 fn anonymous_unused(volumes: &[serde_json::Value], labels: &[String]) -> Vec<String> {
@@ -471,7 +482,7 @@ fn prune_warning(all: bool, volumes: bool, filters: &[String]) -> String {
 pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
     let (labels, until) = filters(&args.filters)?;
     if args.volumes && until.is_some() {
-        bail!(r#"ERROR: The "until" filter is not supported with "--volumes""#);
+        bail!(r#"The "until" filter is not supported with "--volumes""#);
     }
     let warning = prune_warning(args.all, args.volumes, &args.filters);
     if !confirm(&warning, args.force)? {
@@ -518,12 +529,14 @@ pub async fn prune(args: SystemPruneArgs, client: &Client) -> Result<()> {
             .unwrap_or_default()
     };
     let volumes = if args.volumes {
-        anonymous_volumes_prune(client, &labels)
+        let (removed, freed) = anonymous_volumes_prune(client, &labels)
             .await
             .unwrap_or_else(|e| {
                 eprintln!("warning: {e:#}");
-                Vec::new()
-            })
+                (Vec::new(), 0)
+            });
+        reclaimed += freed;
+        removed
     } else {
         Vec::new()
     };

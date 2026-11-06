@@ -7,7 +7,8 @@
 //! `nspawn login`.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use bytes::Bytes;
 use hyper::{Response, StatusCode};
@@ -99,6 +100,41 @@ pub fn progress_message(event: JobEvent<'_>) -> Value {
                 None => json!({ "status": line }),
             }
         }
+    }
+}
+
+/// How long a pull's stream goes without a word before the last progress is said again.
+const QUIET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a pull's stream said last with a progress detail, and when it last said anything.
+struct Said {
+    last: Bytes,
+    at: Instant,
+}
+
+impl Said {
+    /// Before any progress: a wait under the id of `first`, the pull's first message.
+    fn new(first: &Value, now: Instant) -> Said {
+        Said {
+            last: line(&json!({ "status": "Waiting", "progressDetail": {}, "id": first["id"] })),
+            at: now,
+        }
+    }
+
+    fn note(&mut self, message: &Value, said: &Bytes, now: Instant) {
+        self.at = now;
+        if message.get("progressDetail").is_some() {
+            self.last = said.clone();
+        }
+    }
+
+    /// The last progress again, once the stream has been quiet for `QUIET`.
+    fn again(&mut self, now: Instant) -> Option<Bytes> {
+        if now.duration_since(self.at) < QUIET {
+            return None;
+        }
+        self.at = now;
+        Some(self.last.clone())
     }
 }
 
@@ -272,10 +308,35 @@ async fn pull(ctx: &Arc<Context>, query: &Query) -> Result<Response<Body>, Answe
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
     let _ = tx.send(line(&first));
     let ctx = ctx.clone();
-    tokio::spawn(async move {
+    // The last word with a progress detail, said again while the job is quiet: a pull
+    // waits for the store and extracts its layers without one, and clients take a long
+    // silence for a pull that hangs.
+    let progress = Arc::new(Mutex::new(Said::new(&first, Instant::now())));
+    let keeping = {
+        let (tx, progress) = (tx.clone(), progress.clone());
+        super::attach::Aborted(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(QUIET).await;
+                let again = progress.lock().unwrap().again(Instant::now());
+                if let Some(again) = again {
+                    if tx.send(again).is_err() {
+                        return;
+                    }
+                }
+            }
+        }))
+    };
+    let gone = tx.clone();
+    let work = async move {
+        let _keeping = keeping;
         let say = |event: JobEvent<'_>| {
             for message in progress_messages(event) {
-                let _ = tx.send(line(&message));
+                let said = line(&message);
+                progress
+                    .lock()
+                    .unwrap()
+                    .note(&message, &said, Instant::now());
+                let _ = tx.send(said);
             }
         };
         let mut into = found.into.clone();
@@ -320,6 +381,14 @@ async fn pull(ctx: &Arc<Context>, query: &Query) -> Result<Response<Body>, Answe
         for message in messages {
             let _ = tx.send(line(&message));
         }
+    };
+    // A client that went takes nothing of this server with it: the pull goes on in the
+    // service without a follower here.
+    tokio::spawn(async move {
+        tokio::select! {
+            () = work => {}
+            () = gone.closed() => {}
+        }
     });
     Ok(super::streaming_from(rx, "application/json"))
 }
@@ -327,6 +396,30 @@ async fn pull(ctx: &Arc<Context>, query: &Query) -> Result<Response<Body>, Answe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quiet_pull_says_its_last_progress_again() {
+        let start = Instant::now();
+        let first = json!({ "status": "Pulling from library/busybox", "id": "1.37" });
+        let mut said = Said::new(&first, start);
+        assert_eq!(said.again(start + QUIET / 2), None);
+        let waiting = said.again(start + QUIET).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&waiting).unwrap(),
+            json!({ "status": "Waiting", "progressDetail": {}, "id": "1.37" })
+        );
+        let blob = progress_message(JobEvent::Line {
+            kind: "line",
+            line: "blob 0123456789ab: downloaded",
+        });
+        let later = start + QUIET * 2;
+        said.note(&blob, &line(&blob), later);
+        // A word without a progress detail counts as a word, and is not said again.
+        let plain = json!({ "status": "Digest: sha256:00" });
+        said.note(&plain, &line(&plain), later + QUIET / 2);
+        assert_eq!(said.again(later + QUIET), None);
+        assert_eq!(said.again(later + QUIET * 2).unwrap(), line(&blob));
+    }
 
     fn record(name: &str, reference: &str, created: u64) -> ImageRecord {
         serde_json::from_value(json!({

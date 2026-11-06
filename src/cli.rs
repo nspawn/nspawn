@@ -1001,7 +1001,7 @@ pub enum ImagesCommand {
     /// Remove local images (and the layers nobody uses any more).
     Rm(ImagesRmArgs),
     /// Remove images no machine uses: with -a every image no machine was made from;
-    /// without, the dangling ones, which nspawn's store has none of.
+    /// without, none (an image keeps the name it was pulled or built under).
     Prune(ImagesPruneArgs),
 }
 
@@ -1047,7 +1047,7 @@ pub struct SystemPruneArgs {
     /// Every image no machine was made from, not only the dangling ones.
     #[arg(long, short = 'a')]
     pub all: bool,
-    /// Anonymous volumes too, which nspawn has none of: accepted with a note.
+    /// The unused volumes made without a name too, which only the Docker API makes.
     #[arg(long)]
     pub volumes: bool,
     /// Do not ask.

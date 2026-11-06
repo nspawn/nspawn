@@ -1229,6 +1229,7 @@ impl Manager {
         let all = options.bool("all", false)?;
         let labels = options.strings("labels")?;
         let until = options.maybe_u64("until")?;
+        let only = options.maybe_strings("names")?;
         options.finish()?;
         let state = self.state.clone();
         Ok(jobs::spawn(
@@ -1238,9 +1239,15 @@ impl Manager {
             "image-prune",
             "",
             move |ctx, reporter| async move {
-                let pruned =
-                    api::disk::prune_images(&ctx, all, &labels, until, jobs::report(&reporter))
-                        .await?;
+                let pruned = api::disk::prune_images(
+                    &ctx,
+                    all,
+                    &labels,
+                    until,
+                    only.as_deref(),
+                    jobs::report(&reporter),
+                )
+                .await?;
                 // As rm says it: a client following the images learns of these too.
                 for name in &pruned.removed {
                     if let Ok(emitter) = state.emitter() {
@@ -1484,7 +1491,8 @@ impl Manager {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Manage).await?;
         let mut options = Options::new(&options);
-        let labels = crate::volume::parse_labels(&options.strings("labels")?)?;
+        let labels = crate::volume::parse_labels(&options.strings("labels")?)
+            .map_err(api::failure::invalid)?;
         let replace = match (
             options.bool("replace", false)?,
             options.bool("replace_if_changed", false)?,
@@ -1567,7 +1575,8 @@ impl Manager {
         let mut options = Options::new(&options);
         let subnet = options.string("subnet")?;
         let internal = options.bool("internal", false)?;
-        let labels = crate::volume::parse_labels(&options.strings("labels")?)?;
+        let labels = crate::volume::parse_labels(&options.strings("labels")?)
+            .map_err(api::failure::invalid)?;
         let api_name = options.string("api_name")?;
         options.finish()?;
         let notes = Notes::default();

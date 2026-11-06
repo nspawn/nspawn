@@ -44,7 +44,7 @@ impl Snapshot {
     pub async fn take(ctx: &Context) -> Result<Snapshot> {
         let sd = ctx.sd().await?;
         let mut machines = Vec::new();
-        for summary in crate::api::machines::list(ctx, true).await? {
+        for mut summary in crate::api::machines::list(ctx, true).await? {
             let Some(record) = summary.record.clone() else {
                 continue;
             };
@@ -53,8 +53,17 @@ impl Snapshot {
                 continue;
             }
             let unit = format!("systemd-nspawn@{}.service", record.name);
+            // The times of a run that ended: its start as the machine's summary has it,
+            // its end as the unit has it while systemd keeps it loaded, else as the
+            // summary has it from the journal.
             let finished_usec = if ended(&summary.state) {
-                sd.exec_main_exit_usec(&unit).await.ok().filter(|t| *t > 0)
+                if summary.started.is_none() {
+                    summary.started = summary.last_started;
+                }
+                match sd.exec_main_exit_usec(&unit).await.ok().filter(|t| *t > 0) {
+                    Some(usec) => Some(usec),
+                    None => summary.finished.map(|s| s * 1_000_000),
+                }
             } else {
                 None
             };
@@ -240,6 +249,8 @@ impl Machine {
             "running" | "opening" | "closing" => "running",
             "paused" => "paused",
             "restarting" => "restarting",
+            // A start of its restart policy, its hooks before the program.
+            "starting" if self.restarts > 0 => "restarting",
             "stopped" if self.summary.exit_code.is_some() => "exited",
             _ => "created",
         }
@@ -983,6 +994,7 @@ mod tests {
             }),
             exit_code: None,
             finished: None,
+            last_started: None,
         };
         let front: NetSpec = serde_json::from_value(json!({
             "name": "front", "interface": "nsbr-front", "subnet": "10.99.1.0/24", "created": 5, "labels": { "e2e": "yes" },
@@ -1057,6 +1069,19 @@ mod tests {
             snapshot.machines[0].status(now),
             "Restarting (1) 3 seconds ago"
         );
+        // The hooks of a start its policy makes: still restarting.
+        snapshot.machines[0].summary.state = "starting".into();
+        assert_eq!(snapshot.machines[0].state(), "created");
+        snapshot.machines[0].restarts = 2;
+        assert_eq!(snapshot.machines[0].state(), "restarting");
+        // A run that ended has both of its times, which clients read to see it ended.
+        snapshot.machines[0].summary.state = "stopped".into();
+        snapshot.machines[0].summary.started = Some(now - 10);
+        let m = &snapshot.machines[0];
+        let state = &m.inspect_json(&ctx, &snapshot, &image)["State"];
+        assert_eq!(state["Running"], false);
+        assert_ne!(state["StartedAt"], ZERO_TIME);
+        assert_ne!(state["FinishedAt"], ZERO_TIME);
     }
 
     #[test]
@@ -1131,6 +1156,7 @@ mod tests {
             health: None,
             exit_code: None,
             finished: None,
+            last_started: None,
         };
         let mut named = record.clone();
         named.name = "my-app-1a2b3c4d".into();

@@ -1003,6 +1003,7 @@ mod tests {
                 health: None,
                 exit_code: None,
                 finished: None,
+                last_started: None,
             },
             record,
             finished_usec: None,
