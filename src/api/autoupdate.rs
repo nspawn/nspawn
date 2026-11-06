@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context as _, Result};
 
-use crate::api::machines::{StartRequest, StopRequest};
+use crate::api::machines::StartRequest;
 use crate::api::pull::Fetched;
 use crate::api::recreate::COMPOSE_IMAGE;
 use crate::api::{line, note, Context, Report};
@@ -422,21 +422,9 @@ async fn restart_dependents(ctx: &Context, record: &ImageRecord, report: Report<
             report,
             format!("{}: restarting, it depends on {}", other.name, record.name),
         );
-        let stop = StopRequest {
-            name: other.name.clone(),
-            force: false,
-            wait: true,
-            timeout: None,
-            signal: None,
-        };
-        if let Err(e) = crate::api::machines::stop(ctx, &stop, report).await {
-            note(report, format!("warning: stopping {}: {e:#}", other.name));
-            continue;
-        }
-        if let Err(e) =
-            crate::api::machines::start(ctx, &StartRequest::keep(&other.name), report).await
-        {
-            note(report, format!("warning: starting {}: {e:#}", other.name));
+        // As a restart, so that one removed at its end is kept for the next run.
+        if let Err(e) = crate::api::machines::restart(ctx, &other.name, None, None, report).await {
+            note(report, format!("warning: restarting {}: {e:#}", other.name));
         }
     }
 }

@@ -53,6 +53,10 @@ impl Act {
 pub struct Sent {
     pub headers: HeaderMap,
     pub body: Incoming,
+    /// The connection, for a request that asked to upgrade it.
+    pub upgrade: Option<hyper::upgrade::OnUpgrade>,
+    /// The API version its path names.
+    pub version: Option<(u32, u32)>,
 }
 
 /// An answer that is no success: its status, and the engine's words unless it has none
@@ -125,6 +129,8 @@ pub struct Target {
     /// Running as the engine says it: paused or between two runs too.
     pub running: bool,
     pub paused: bool,
+    /// Between two runs of its restart policy.
+    pub restarting: bool,
     pub remove_on_exit: bool,
 }
 
@@ -135,6 +141,7 @@ impl Target {
             id: m.id.clone(),
             running: m.running() || m.state() == "restarting",
             paused: m.state() == "paused",
+            restarting: m.state() == "restarting",
             remove_on_exit: m.record.remove_on_exit,
         }
     }
@@ -266,8 +273,17 @@ pub fn start_failed(kind: Option<&str>, key: &str, message: &str) -> Answer {
     }
 }
 
+/// Whether a start has nothing to do: the engine counts a container between two runs of
+/// its restart policy as running.
+pub fn start_not_needed(target: &Target) -> bool {
+    target.restarting
+}
+
 async fn start(ctx: &Context, key: &str) -> Served {
     let target = target(ctx, key).await?;
+    if start_not_needed(&target) {
+        return Err(Answer(StatusCode::NOT_MODIFIED, None));
+    }
     let client = connect().await?;
     // One that runs or is paused is answered as such, its binds made at its own start.
     let made = if target.running || target.paused {
@@ -605,10 +621,14 @@ async fn wait(ctx: &Context, key: &str, query: &Query) -> Served {
         .map_err(client::error)
         .map_err(|e| wait_failed(client::error_name(&e), key, &format!("{e:#}")))?;
     let (response, tx) = super::streaming("application/json");
+    let name = target.name.clone();
     tokio::spawn(async move {
         let _held = (client, permit);
         tokio::select! {
             outcome = watch.finish(job) => {
+                // The output first, as the engine gives it: an attach of this socket
+                // hands over what the run wrote before the code comes.
+                super::attach::drained(&name).await;
                 let outcome = outcome
                     .map(|result| {
                         result
@@ -656,6 +676,12 @@ pub fn remove_failed(
     }
 }
 
+/// Whether a forced removal that found nothing to remove did what it was asked: a
+/// container removed when its run ends goes on its own once the removal stops it.
+pub fn gone_at_its_end(kind: Option<&str>, target: &Target, force: bool) -> bool {
+    force && target.running && target.remove_on_exit && kind == Some("NoSuchMachine")
+}
+
 /// DELETE /containers/{id}: RemoveMachines, with force when asked. `v` asks for the
 /// container's anonymous volumes to go too, and nspawn makes none; `link` asks for a
 /// legacy link of that name instead, and nspawn has none: the answer is the engine's
@@ -673,18 +699,15 @@ pub async fn remove(ctx: &Arc<Context>, key: &str, query: &Query) -> Response<Bo
         let force = query.flag("force", false);
         let mut options = Options::new();
         options.insert("force", Bus::from(force));
-        client
+        let removal = client
             .run_job_silent(|| client.manager.remove_machines(&names, options), true)
-            .await
-            .map_err(|e| {
-                remove_failed(
-                    client::error_name(&e),
-                    &target,
-                    key,
-                    force,
-                    &format!("{e:#}"),
-                )
-            })?;
+            .await;
+        if let Err(e) = removal {
+            let kind = client::error_name(&e);
+            if !gone_at_its_end(kind, &target, force) {
+                return Err(remove_failed(kind, &target, key, force, &format!("{e:#}")));
+            }
+        }
         Ok(empty(StatusCode::NO_CONTENT))
     }
     .await;
@@ -1121,8 +1144,23 @@ mod tests {
             id: id.into(),
             running,
             paused,
+            restarting: false,
             remove_on_exit: false,
         }
+    }
+
+    #[test]
+    fn a_start_between_two_runs_of_a_restart_policy_has_nothing_to_do() {
+        let restarting = Target {
+            restarting: true,
+            ..target(LIFE, true, false)
+        };
+        assert!(start_not_needed(&restarting));
+        assert!(!start_not_needed(&target(LIFE, false, false)));
+        assert_eq!(
+            Answer(StatusCode::NOT_MODIFIED, None).respond().status(),
+            StatusCode::NOT_MODIFIED
+        );
     }
 
     #[test]
@@ -1333,7 +1371,32 @@ mod tests {
             )),
             case("rm-missing")
         );
+        // One removed at its end that the forced stop already took is gone, as asked.
+        let removed_at_end = Target {
+            remove_on_exit: true,
+            ..life.clone()
+        };
+        assert!(gone_at_its_end(
+            Some("NoSuchMachine"),
+            &removed_at_end,
+            true
+        ));
+        assert!(!gone_at_its_end(
+            Some("NoSuchMachine"),
+            &removed_at_end,
+            false
+        ));
+        assert!(!gone_at_its_end(Some("NoSuchMachine"), &life, true));
+        assert!(!gone_at_its_end(Some("InUse"), &removed_at_end, true));
         let stopped = target(LIFE, false, false);
+        assert!(!gone_at_its_end(
+            Some("NoSuchMachine"),
+            &Target {
+                remove_on_exit: true,
+                ..stopped.clone()
+            },
+            true
+        ));
         assert_eq!(
             remove_failed(Some("InUse"), &stopped, "life", false, "web needs it"),
             Answer(

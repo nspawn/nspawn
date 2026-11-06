@@ -28,6 +28,9 @@ pub struct PullRequest {
     pub mode: Option<Mode>,
     /// Replace an existing image of that name.
     pub force: bool,
+    /// With force: replace the record of the name only while it is an image that never
+    /// ran; one that ran as a machine meanwhile stays.
+    pub image_only: bool,
     /// Check the image's signature as the registry's policy says; off with --no-verify.
     pub verify: bool,
 }
@@ -200,6 +203,22 @@ pub async fn fetch(
     })
 }
 
+/// With `image_only`, a record of `name` that ran as a machine is refused as taken: the
+/// caller chose to replace an image, not a machine.
+fn ensure_image_only(store: &crate::store::Store, name: &str, image_only: bool) -> Result<()> {
+    if !image_only {
+        return Ok(());
+    }
+    match store.load_image(name)? {
+        Some(record) if !crate::api::disk::image_only(store, &record) => {
+            Err(crate::api::FailureKind::Exists.error(format!(
+                "{name} ran as a machine; it is not replaced as an image"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> Result<Pulled> {
     require_root("pull")?;
     let config = &ctx.config;
@@ -211,6 +230,7 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
     let store = &ctx.store;
     store.init()?;
     ensure_replaceable(store, sd, &name, request.force).await?;
+    ensure_image_only(store, &name, request.image_only)?;
 
     let choice = if request.backend == BackendChoice::Auto {
         config.backend
@@ -227,6 +247,7 @@ pub async fn pull(ctx: &Context, request: &PullRequest, report: Report<'_>) -> R
     // at this point.
     let _lock = store.lock().await?;
     ensure_replaceable(store, sd, &name, request.force).await?;
+    ensure_image_only(store, &name, request.image_only)?;
     crate::install::stage_layers(store, backend, &fetched.manifest, request.mode, &name).await?;
     remove_existing(store, sd, &name, report).await?;
     // An update that was deciding about the machine replaced has nothing left to decide:

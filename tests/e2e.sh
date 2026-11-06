@@ -99,7 +99,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc e2e-v6 e2e-v6b e2e-v6c e2e-v6d e2e-v6u e2e-v6low e2e-notify e2e-fwd e2e-cbind-w-1; do
+  for m in e2e-hapi-made e2e-hapi-img e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc e2e-v6 e2e-v6b e2e-v6c e2e-v6d e2e-v6u e2e-v6low e2e-notify e2e-fwd e2e-cbind-w-1; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -3300,6 +3300,52 @@ dk start e2e_dk_b >/dev/null || fail "docker start e2e_dk_b"
 long=e2e-dk-$(printf 'x%.0s' $(seq 1 70))
 dk create --name "$long" --label e2e.dk=1 e2e-dk-bb true >/dev/null || fail "docker create of a name of 77 characters"
 dk inspect -f '{{.Name}}' "$long" | grep_q "^/$long\$" || fail "the long name is not the API's"
+# docker run without -d: attached on the upgraded connection before the start, the
+# output framed, the exit code from the wait; --rm removes it.
+out=$(timeout 120 "$dk_dir/dk" run --rm --name e2e-dk-f --label e2e.dk=1 e2e-dk-bb sh -c "echo attached-$nonce; exit 4" 2>&1)
+code=$?
+[ "$code" = 4 ] || fail "docker run in the foreground exited $code: $out"
+echo "$out" | grep_q "attached-$nonce" || fail "docker run in the foreground did not show the output: $out"
+retry 15 bash -c "! $NSPAWN ps -a | grep_q '^ *e2e-dk-f '" || fail "the --rm container of a foreground run stayed"
+out=$(timeout 120 "$dk_dir/dk" run --rm -t --label e2e.dk=1 e2e-dk-bb echo tty-$nonce 2>&1) || fail "docker run -t: $out"
+echo "$out" | grep_q "tty-$nonce" || fail "docker run -t did not show the output: $out"
+# The engine's client says no more of a refused upgrade than its status.
+out=$(dk run --rm -i --label e2e.dk=1 e2e-dk-bb true </dev/null 2>&1) && fail "an attach of the input succeeded"
+echo "$out" | grep_q "received 501" || fail "the refusal of an attach of the input: $out"
+# A client that does not upgrade reads the stream as the body of a 200, which ends with
+# the run; a wait answers once the output is out.
+cid=$(dk create --label e2e.dk=1 e2e-dk-bb sh -c "echo plain-$nonce") || fail "docker create for an attach"
+timeout 60 curl -sS -N -D "$dk_dir/attach.h" -o "$dk_dir/attach.out" --unix-socket /run/nspawn/api.sock \
+  -X POST "http://docker/v1.51/containers/$cid/attach?stream=1&stdout=1&stderr=1" &
+apid=$!
+retry 10 test -s "$dk_dir/attach.h" || fail "the attach did not answer"
+dk start "$cid" >/dev/null || fail "docker start of the attached container"
+[ "$(timeout 60 "$dk_dir/dk" wait "$cid")" = 0 ] || fail "docker wait of the attached container"
+grep_q -a "plain-$nonce" "$dk_dir/attach.out" || fail "the wait answered before the attach had the output"
+wait $apid || fail "the attach did not end with the run"
+grep_q '^HTTP/1.1 200' "$dk_dir/attach.h" || fail "the attach without an upgrade: $(cat "$dk_dir/attach.h")"
+grep_q -a "plain-$nonce" "$dk_dir/attach.out" || fail "the attach without an upgrade did not carry the output"
+dk rm "$cid" >/dev/null || fail "docker rm of the attached container"
+# A pull through the API, then up to date. A host with a record of its own of the
+# reference is left alone: the pull would replace it.
+of_hub_busybox() {
+  $NSPAWN images ls --json 2>/dev/null | python3 -c 'import json, sys
+print("\n".join(i["name"] for i in json.load(sys.stdin) if i.get("reference") == "docker.io/library/busybox:1.37"))'
+}
+pulled=
+if [ -n "$(of_hub_busybox)" ]; then
+  echo "this host has docker.io/library/busybox:1.37 of its own: the pull through the API is not tried"
+else
+  out=$(dk pull busybox:1.37 2>&1) || fail "docker pull through the API: $out"
+  echo "$out" | grep_q "Status: Downloaded newer image for busybox:1.37" || fail "docker pull said: $out"
+  pulled=$(of_hub_busybox)
+  [ -n "$pulled" ] || fail "no record of docker.io/library/busybox:1.37 after the pull: $($NSPAWN images ls 2>&1)"
+  out=$(dk pull busybox:1.37 2>&1) || fail "a second docker pull: $out"
+  echo "$out" | grep_q "Status: Image is up to date for busybox:1.37" || fail "a second docker pull was not up to date: $out"
+  [ "$(dk image inspect -f '{{index .RepoTags 0}}' busybox:1.37 2>&1)" = busybox:1.37 ] || fail "the pulled image: $(dk image inspect busybox:1.37 2>&1 | head -5)"
+  # A reference the registry does not have is 404 before anything is pulled.
+  [ "$(hcode "/v1.51/images/create?fromImage=docker.io/library/busybox&tag=no-such-tag-$nonce" -X POST)" = 404 ] || fail "a pull of a missing tag is not 404"
+fi
 # stop, a second stop, restart, pause twice, unpause, update, kill.
 dk stop -t 2 e2e-dk-a >/dev/null || fail "docker stop"
 dk stop e2e-dk-a >/dev/null || fail "a second docker stop is not a success"
@@ -3332,6 +3378,10 @@ $NSPAWN inspect e2e-dk-a >/dev/null 2>&1 && fail "e2e-dk-a stayed after docker r
 dk rm -f e2e-dk-a >/dev/null 2>&1 || fail "docker rm -f of a container that is gone does not exit 0"
 dk run -d --rm --name e2e-dk-c --label e2e.dk=1 e2e-dk-bb sleep 1 >/dev/null || fail "docker run -d --rm"
 retry 15 bash -c "! $NSPAWN ps -a | grep_q '^ *e2e-dk-c '" || fail "a --rm container stayed after its end"
+# rm -f of a --rm container that runs: the stop removes it, and so does the rm.
+dk run -d --rm --name e2e-dk-k --label e2e.dk=1 e2e-dk-bb sleep 600 >/dev/null || fail "docker run -d --rm e2e-dk-k"
+out=$(dk rm -f e2e-dk-k 2>&1) || fail "docker rm -f of a running --rm container: $out"
+retry 15 bash -c "! $NSPAWN ps -a | grep_q '^ *e2e-dk-k '" || fail "e2e-dk-k stayed after docker rm -f"
 # A restart keeps a container removed at its end; its stop removes it.
 dk run -d --rm --name e2e-dk-r --label e2e.dk=1 e2e-dk-bb sleep 600 >/dev/null || fail "docker run -d --rm e2e-dk-r"
 dk restart -t 1 e2e-dk-r >/dev/null || fail "docker restart of a --rm container"
@@ -3361,7 +3411,7 @@ out=$($NSPAWN run --rm -v /run/nspawn/api.sock:/var/run/docker.sock:ro "$dockerc
 echo "$out" | grep_q "binds nspawn's Docker API read-only" || fail "the read-only refusal: $out"
 dk rm -f e2e-dk-inner >/dev/null 2>&1
 rm -rf "$dk_dir" "/tmp/e2e-dk-missing-$nonce"
-$NSPAWN images rm e2e-dk-cli e2e-dk-bb >/dev/null 2>&1
+$NSPAWN images rm e2e-dk-cli e2e-dk-bb $pulled >/dev/null 2>&1
 
 step "auto-update: a labelled machine gets the image its tag names now, and goes back when it fails"
 repo=e2e/au-$nonce

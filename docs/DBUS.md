@@ -225,7 +225,7 @@ pull, and:
 
 | Option | Type | Meaning |
 |---|---|---|
-| `api_name` | s | the name the Docker API knows the machine by: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, 1024 bytes at most, one machine's among those that are no images only (`Exists` otherwise, as for a machine named as another's API name). With `name` empty the machine's name is made of it: itself when it is a machine name no record holds, else its runs of characters other than letters and digits each one `-`, cut to 55 bytes, `-` and the first 8 hex digits of its SHA-256 |
+| `api_name` | s | the name the Docker API knows the machine by: `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, 1024 bytes at most, one machine's among those that are no images only (`Exists` otherwise, as for a machine named as another's API name). With `name` empty the machine's name is made of it: itself when it is a machine name that no record, and no image or machine machined lists, holds, else its runs of characters other than letters and digits each one `-`, cut to 55 bytes, `-` and the first 8 hex digits of its SHA-256 |
 | `tty`, `interactive`, `stdin_once` | b | kept in the record for whoever attaches |
 | `remove` | b | removed once its run ends, from its first start on |
 
@@ -237,7 +237,7 @@ The job's result `name` is the machine's name.
 |---|---|---|
 | `ListImages() -> aa{sv}` | `images ls` | name, kind, size, read_only (b, machined's read-only flag), and for the images nspawn installed backend, origin, reference, signed_by, image_only (b: a record pulled or built that never ran as a machine, which pulls and prunes may replace), created (t: when the image was made, as its config says; 0 when it says nothing), pulled (t: when it was pulled or built here, the record's created) |
 | `GetImage(s name) -> a{sv}` | | the record (see Records) |
-| `PullImage(s reference, a{sv} options) -> o` | `pull` | options name, backend (auto, overlay, flat, mstack), mode (auto, boot, app), force, verify (b, default true: the signature check the registry's policy asks for; `--no-verify` sends false), registry, ca_cert; a job |
+| `PullImage(s reference, a{sv} options) -> o` | `pull` | options name, backend (auto, overlay, flat, mstack), mode (auto, boot, app), force, image_only (b: with force, the record of the name is replaced only while it never ran, `Exists` once it did), verify (b, default true: the signature check the registry's policy asks for; `--no-verify` sends false), registry, ca_cert; a job |
 | `CreateMachine(s source, s name, a{sv} options) -> o` | `create` | the machine options (see Machine options); a job |
 | `PushImage(s image, a{sv} options) -> o` | `push` | options to, registry, ca_cert; a job |
 | `BuildImage(s directory, s tag, a{sv} options) -> o` | mkosi `build` | options name, distribution, release, profile, backend, mode, force, keep_output, mkosi_args, registry, ca_cert; a job whose output includes mkosi's |
@@ -256,7 +256,7 @@ The job's result `name` is the machine's name.
 | `SearchImages(s term, s source, u limit, a{sv} options) -> (aa{sv}, as)` | `search` | source `""` (both), "hub" or "dockerhub", limit per source; the hits (source, name, description, stars (t), official (b)) and the notes (a source that could not be reached); options registry, ca_cert |
 | `ListRepositories(s filter, b with_tags, a{sv} options) -> aa{sv}` | `hub ls` | name, tags (as, empty without `with_tags`); options registry, ca_cert |
 | `ListTags(s repository, a{sv} options) -> as` | `hub tags` | options registry, ca_cert |
-| `ImageDigest(s reference, a{sv} options) -> s` | `compose config --resolve-image-digests` | the digest the reference names on its registry now (an index's for a tag of several platforms), asked without pulling it, with the credentials of `login`; options registry, ca_cert |
+| `ImageDigest(s reference, a{sv} options) -> s` | `compose config --resolve-image-digests` | the digest the reference names on its registry now (an index's for a tag of several platforms), asked without pulling it, with the credentials of `login`; `NoSuchImage` when the registry has no such repository or manifest, or refuses it; options registry, ca_cert |
 | `Login(s registry, s username, s password, a{sv} options) -> a{sv}` | `login` | `""` for the configured registry; options registry (the one `""` stands for), ca_cert; registry, username, asked (b, whether the registry asked for credentials) |
 | `Logout(s registry) -> b` | `logout` | true when credentials were stored and removed |
 
@@ -379,10 +379,10 @@ prints.
 | `Failed` | anything the others do not name |
 | `NotAuthorized` | polkit refused the caller |
 | `NoSuchMachine` | a machine method names nothing: no record and no machine (`GetMachine`, `StartMachine`, `RunMachine`, `StopMachine`, `RestartMachine`, `KillMachine`, `PauseMachine`, `UnpauseMachine`, `UpdateMachine`, `WaitMachine`, `MachineProcesses`, `Exec`, `Shell`, `Logs`, `CopyFrom`, `CopyTo`, `RemoveMachines`, the machine of `ConnectNetwork` and `DisconnectNetwork`) |
-| `NoSuchImage` | the source of `CreateMachine` is no local image; `GetImage` and `RemoveImages` of an image that is not there |
+| `NoSuchImage` | the source of `CreateMachine` is no local image; `GetImage` and `RemoveImages` of an image that is not there; `ImageDigest` of a reference its registry has nothing for |
 | `NoSuchNetwork` | a network named that does not exist |
 | `NoSuchVolume` | `RemoveVolumes` of a volume that does not exist |
-| `Exists` | a name taken: `CreateMachine` and `PullImage` without force, an API name in use, `CreateNetwork`, `CreateSecret`, a second `ConnectNetwork` |
+| `Exists` | a name taken: `CreateMachine` and `PullImage` without force, or with image_only over a record that ran, an API name in use, `CreateNetwork`, `CreateSecret`, a second `ConnectNetwork` |
 | `InUse` | a removal refused because something uses what it names: a machine that runs (without force) or that another one needs, a volume, a network or a secret a machine names |
 | `NotRunning` | what needs a running machine, of one that does not run (`KillMachine`, `PauseMachine`, `UnpauseMachine`, `MachineProcesses`, `Exec`, `Shell`) |
 | `AlreadyRunning` | `StartMachine` and `RunMachine` of a machine that runs, or is starting |

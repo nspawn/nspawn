@@ -78,20 +78,79 @@ impl Image {
 /// counted stays for as long as the server runs.
 static LAYER_SIZES: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
 
+/// Runs a walk of the disk where it does not hold up the runtime's few threads.
+fn walking<T>(walk: impl FnOnce() -> T) -> T {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(walk)
+        }
+        _ => walk(),
+    }
+}
+
+/// Bytes of each of `layers`: what was counted already, the rest counted now without
+/// holding the cache, so that the walk of a big layer holds up no other request.
+fn layer_sizes<'a>(
+    store: &Store,
+    layers: impl IntoIterator<Item = &'a String>,
+) -> BTreeMap<String, u64> {
+    let mut sizes = BTreeMap::new();
+    let mut missing = Vec::new();
+    {
+        let known = LAYER_SIZES.lock().unwrap();
+        for layer in layers {
+            match known.get(layer) {
+                Some(size) => {
+                    sizes.insert(layer.clone(), *size);
+                }
+                None => missing.push(layer.clone()),
+            }
+        }
+    }
+    if !missing.is_empty() {
+        let counted = walking(|| {
+            let mut counted = BTreeMap::new();
+            for layer in &missing {
+                crate::api::disk::layer_size(store, layer, &mut counted);
+            }
+            counted
+        });
+        LAYER_SIZES.lock().unwrap().extend(counted.clone());
+        sizes.extend(counted);
+    }
+    sizes
+}
+
 /// Bytes of a record's image: its layers, or the tree of a flat one, whose layers are
 /// kept nowhere else.
 fn image_size(store: &Store, record: &ImageRecord) -> u64 {
     use crate::backend::BackendChoice;
     if matches!(record.backend, BackendChoice::Flat | BackendChoice::Auto) {
         let tree = store.machines_dir.join(&record.name);
-        return crate::api::disk::tree_size(&tree, &mut std::collections::HashSet::new());
+        return walking(|| {
+            crate::api::disk::tree_size(&tree, &mut std::collections::HashSet::new())
+        });
     }
-    let mut sizes = LAYER_SIZES.lock().unwrap();
-    record
-        .layers
-        .iter()
-        .map(|digest| crate::api::disk::layer_size(store, digest, &mut sizes))
-        .sum()
+    let sizes = layer_sizes(store, &record.layers);
+    record.layers.iter().filter_map(|d| sizes.get(d)).sum()
+}
+
+/// How many images there are, as `list` makes them, without their sizes.
+pub fn count(ctx: &Context) -> anyhow::Result<usize> {
+    let store = &ctx.store;
+    let mut configs = BTreeSet::new();
+    for record in store.list_images()? {
+        let Ok(bytes) = store.load_manifest(&record.name) else {
+            continue;
+        };
+        if let Ok(manifest) =
+            serde_json::from_slice::<oci_client::manifest::OciImageManifest>(&bytes)
+        {
+            configs.insert(manifest.config.digest);
+        }
+    }
+    Ok(configs.len())
 }
 
 /// A record's reference in full, the way it names an image: None for one pinned by a
@@ -127,6 +186,56 @@ fn full_digest(record: &ImageRecord, registry: &str) -> Option<String> {
         }
         .to_string(),
     )
+}
+
+/// The record a reference with a tag names (`wanted` in full), ranked as `list` ranks
+/// them: the last pulled of the records that are images, else of the containers.
+pub fn tagged<'a>(
+    records: &'a [ImageRecord],
+    wanted: &str,
+    registry: &str,
+    is_image: impl Fn(&ImageRecord) -> bool,
+) -> Option<&'a ImageRecord> {
+    records
+        .iter()
+        .filter(|r| full_tag(&r.reference, registry).as_deref() == Some(wanted))
+        .max_by_key(|r| (is_image(r), r.created))
+}
+
+/// The last pulled record of a reference with a tag (`wanted` in full) that is an
+/// image, which a pull of the reference replaces.
+pub fn image_of<'a>(
+    records: &'a [ImageRecord],
+    wanted: &str,
+    registry: &str,
+    is_image: impl Fn(&ImageRecord) -> bool,
+) -> Option<&'a ImageRecord> {
+    records
+        .iter()
+        .filter(|r| is_image(r) && full_tag(&r.reference, registry).as_deref() == Some(wanted))
+        .max_by_key(|r| r.created)
+}
+
+/// A record pulled by the digest `wanted` (`repository@digest` in full) names, as
+/// `find` looks one up: by the digest its reference named, an index's for a tag of
+/// several platforms.
+pub fn pinned<'a>(
+    records: &'a [ImageRecord],
+    wanted: &str,
+    registry: &str,
+) -> Option<&'a ImageRecord> {
+    records
+        .iter()
+        .find(|r| full_digest(r, registry).as_deref() == Some(wanted))
+}
+
+/// The digest a record's reference named when it was pulled: its index's, or its
+/// manifest's.
+pub fn pulled_digest(record: &ImageRecord) -> &str {
+    record
+        .index_digest
+        .as_deref()
+        .unwrap_or(&record.manifest_digest)
 }
 
 /// Every image, the last made first, as the engine lists them.
@@ -398,11 +507,8 @@ pub fn disk_usage(ctx: &Context, images: &[Image]) -> (Vec<Value>, u64) {
         }
         layers_of.push(layers);
     }
-    let mut sizes = LAYER_SIZES.lock().unwrap();
-    let total = users
-        .keys()
-        .map(|layer| crate::api::disk::layer_size(store, layer, &mut sizes))
-        .sum();
+    let sizes = layer_sizes(store, users.keys());
+    let total = sizes.values().sum();
     let entries = images
         .iter()
         .zip(&layers_of)
@@ -412,7 +518,7 @@ pub fn disk_usage(ctx: &Context, images: &[Image]) -> (Vec<Value>, u64) {
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .filter(|layer| users.get(*layer).is_some_and(|n| *n > 1))
-                .map(|layer| crate::api::disk::layer_size(store, layer, &mut sizes))
+                .filter_map(|layer| sizes.get(layer))
                 .sum();
             let mut entry = summary_json(image);
             entry["SharedSize"] = json!(shared);
@@ -499,8 +605,7 @@ fn layer_dirs(store: &Store, layers: &[String]) -> Value {
 /// GET /images/{name}/history: the config's history, the last step first, each step
 /// that made a layer with that layer's size.
 pub fn history_json(ctx: &Context, image: &Image) -> Value {
-    let store = &ctx.store;
-    let mut sizes = LAYER_SIZES.lock().unwrap();
+    let sizes = layer_sizes(&ctx.store, &image.layers);
     let mut layer = image.layers.iter();
     let mut steps: Vec<Value> = image
         .config
@@ -516,7 +621,7 @@ pub fn history_json(ctx: &Context, image: &Image) -> Value {
             } else {
                 layer
                     .next()
-                    .map(|d| crate::api::disk::layer_size(store, d, &mut sizes))
+                    .and_then(|d| sizes.get(d).copied())
                     .unwrap_or(0)
             };
             json!({
@@ -548,6 +653,46 @@ pub fn history_json(ctx: &Context, image: &Image) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn images_are_counted_without_their_sizes_and_layers_walked_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config =
+            crate::config::Config::merge(crate::config::FileConfig::default(), None, None).unwrap();
+        config.machines_dir = tmp.path().join("machines");
+        config.state_dir = tmp.path().join("state");
+        let ctx = Context::new(config);
+        ctx.store.init().unwrap();
+        let manifest = |config: &str| {
+            format!(
+                r#"{{"schemaVersion": 2, "config": {{"mediaType": "application/vnd.oci.image.config.v1+json", "digest": "{config}", "size": 2}}, "layers": []}}"#
+            )
+        };
+        for (name, config) in [("a", "sha256:c1"), ("b", "sha256:c1"), ("c", "sha256:c2")] {
+            let record: ImageRecord = serde_json::from_value(json!({
+                "name": name, "reference": "docker.io/library/x:1", "manifest_digest": "sha256:m",
+                "layers": [], "backend": "overlay", "created": 0,
+            }))
+            .unwrap();
+            ctx.store.record_image(&record).unwrap();
+            ctx.store
+                .save_manifest(name, manifest(config).as_bytes())
+                .unwrap();
+        }
+        assert_eq!(count(&ctx).unwrap(), 2, "one image per config");
+        let layer = "sha256:counted-once-e2e".to_string();
+        let dir = ctx.store.layer_dir(&layer, crate::store::Ownership::Root);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f"), vec![0u8; 4096]).unwrap();
+        let first = layer_sizes(&ctx.store, [&layer])[&layer];
+        assert!(first >= 4096, "{first}");
+        std::fs::write(dir.join("g"), vec![0u8; 4096]).unwrap();
+        assert_eq!(
+            layer_sizes(&ctx.store, [&layer])[&layer],
+            first,
+            "from the cache"
+        );
+    }
 
     fn image(id: &str, tags: &[&str], created: &str) -> Image {
         Image {

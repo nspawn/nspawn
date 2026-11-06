@@ -536,10 +536,11 @@ reference names the image of the last record pulled with it.
 
 Containers are made and run through the bus service, as the command line's requests
 are: `POST /containers/create`, `start`, `stop`, `restart`, `kill`, `pause`, `unpause`,
-`wait`, `update`, `DELETE /containers/ID` and `POST /containers/prune`. A create takes
-its image by reference (one without a registry is Docker Hub's, as clients mean it), by
-its ID or a prefix of it, or as `repository@digest`, and pulls nothing: a missing image
-is 404, which clients answer with a pull. Its name follows the API's rule,
+`wait`, `attach`, `update`, `DELETE /containers/ID` and `POST /containers/prune`, and
+images are pulled with `POST /images/create`. A create takes its image by reference
+(one without a registry is Docker Hub's, as clients mean it), by its ID or a prefix of
+it, or as `repository@digest`, and pulls nothing: a missing image is 404, which clients
+answer with a pull. Its name follows the API's rule,
 `[a-zA-Z0-9][a-zA-Z0-9_.-]+`; one that is no machine name, such as `reaper_1`, stays the
 container's name in the API, and its machine gets one made of it (`reaper-1-` and eight
 hex digits), which `nspawn ps` shows; the machines of its networks reach it by either. Without a name, the container is named after its
@@ -557,9 +558,28 @@ its `Warnings`; a prune removes the stopped containers made from an image that `
 `label` and `label!` select, and leaves a pulled or built record that ran, which is the
 image as well.
 
-Exec, attach, archives, pulls, image removals and changes of volumes and networks are
-not served: they answer 501 with "not supported", as reads of swarm objects and plugins
-do.
+A pull asks the registry for the tag's digest first: an image that has it is up to
+date and is not pulled again, and a reference the registry does not have (or refuses)
+answers 404 before anything is pulled. Otherwise it replaces the record of the reference that
+never ran, or makes a new one under a free name (`busybox-1.37-2`), as `compose pull`
+does, and the containers made from an image keep it. Its messages are the engine's
+progress stream; the credentials are those of `nspawn login`, and `X-Registry-Auth` is
+not read. A pull of every tag of a repository, an import (`fromSrc`) and a platform
+other than the host's are refused.
+
+An attach streams what the container writes from then on (from its creation with
+`logs`) until its run ends, the one under way or the next: a client attaches to a
+created container and then starts it, as `docker run` without `-d` does. The output
+comes from the journal, so a start from anywhere shows, as one stream for a container
+with a terminal and framed as standard output otherwise. A client that asks for an
+upgrade gets it (101), the others a 200 with the stream as its body, and a wait asked
+on the same socket answers once the attach has handed over what the run wrote. The
+container's input is not taken: `stdin` is refused, and so are a paused or restarting
+container and one whose log driver is none.
+
+Exec, archives, image removals and changes of volumes and networks are not served: they
+answer 501 with "not supported", as reads of swarm objects and of a plugin do; the list
+of plugins is empty.
 
 Each machine has its own socket, `/run/nspawn/api/NAME.sock`, opened by systemd
 (`nspawn-api@NAME.socket`) before the machine starts and closed after it stops; the
@@ -571,9 +591,10 @@ stays across restarts and updates. The tools that look for their own container i
 the socket.
 
 What one socket's clients hold at once is bounded: 64 connections (one more is closed at
-once), 16 of them logs or events streams, each running a `journalctl`, and 16 waits,
-each holding a connection to the system bus (one more of either gets 503). Stats
-streams count as connections only.
+once; on the host's socket a user other than root holds 16 at most, and root's are not
+counted), 16 of them logs, events or attach streams, each running a `journalctl`, and 16
+waits and attaches, each holding a connection to the system bus (one more of either gets
+503). Stats streams count as connections only.
 
 ### Updates of the image a tag names
 

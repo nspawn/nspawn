@@ -161,6 +161,29 @@ impl fmt::Display for ImageRef {
     }
 }
 
+/// The longest machine name systemd-nspawn takes.
+pub const MAX_MACHINE_NAME: usize = 64;
+
+/// `base`, or `base-2`, `base-3`... when a record has it, the base cut so that the
+/// name stays a machine name.
+pub fn free_name(base: &str, taken: &std::collections::BTreeSet<String>) -> String {
+    if !taken.contains(base) {
+        return base.to_string();
+    }
+    (2u64..)
+        .map(|n| {
+            let suffix = format!("-{n}");
+            let mut cut = base.len().min(MAX_MACHINE_NAME - suffix.len());
+            while !base.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let stem = base[..cut].trim_end_matches(['-', '.']);
+            format!("{stem}{suffix}")
+        })
+        .find(|name| !taken.contains(name))
+        .expect("a free name")
+}
+
 fn looks_like_registry(component: &str) -> bool {
     component == "localhost" || component.contains('.') || component.contains(':')
 }
@@ -187,7 +210,7 @@ pub fn sanitize_machine_name(name: &str) -> String {
             .join(".")
     };
     let mut out = tidy(&mapped);
-    out.truncate(64);
+    out.truncate(MAX_MACHINE_NAME);
     tidy(&out)
 }
 
@@ -214,7 +237,7 @@ fn invalid_name(message: String) -> anyhow::Error {
 /// A name systemd-nspawn takes for --machine, a host name: letters, digits and '-' in
 /// parts between dots, no part empty or starting or ending with '-', 64 bytes at most.
 pub fn validate_machine_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.len() > 64 {
+    if name.is_empty() || name.len() > MAX_MACHINE_NAME {
         return Err(invalid_name(format!("invalid machine name {name:?}")));
     }
     if !name
@@ -256,6 +279,27 @@ pub fn valid_tag(tag: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_free_name_stays_a_machine_name() {
+        use std::collections::BTreeSet;
+        let base = format!("{}xyz", "a".repeat(61));
+        assert_eq!(base.len(), 64);
+        let taken: BTreeSet<String> = [base.clone()].into();
+        let free = free_name(&base, &taken);
+        assert_eq!(free.len(), 64, "{free}");
+        assert!(free.ends_with("-2"), "{free}");
+        validate_machine_name(&free).unwrap();
+        // A cut that ends on a dash or a dot leaves neither before the number.
+        let dashed = format!("{}-x", "b".repeat(61));
+        let taken: BTreeSet<String> = [dashed.clone()].into();
+        let free = free_name(&dashed, &taken);
+        validate_machine_name(&free).unwrap();
+        assert!(!free.contains("--"), "{free}");
+        let taken: BTreeSet<String> = ["web".to_string(), "web-2".to_string()].into();
+        assert_eq!(free_name("web", &taken), "web-3");
+        assert_eq!(free_name("db", &taken), "db");
+    }
 
     const HUB: &str = "hub.nspawn.org";
 

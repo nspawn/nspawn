@@ -1365,12 +1365,22 @@ pub const PRIVATE: u32 = 0o700;
 /// Root's, and passable by anyone who knows a name inside.
 pub const PASSAGE: u32 = 0o711;
 
-/// Creates a directory with `mode`, its missing parents too.
-/// A directory of root's alone, its parents too.
+/// A directory of root's alone under /run/nspawn, whose missing parents are made open
+/// to read and pass: /run/nspawn holds the host's socket of the Docker API too.
 pub fn create_private_dir(dir: &str) -> Result<()> {
-    create_dir_with_mode(Path::new(dir), PRIVATE)
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = Path::new(dir);
+    if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    create_dir_with_mode(dir, PRIVATE)
 }
 
+/// Creates a directory with `mode`, its missing parents too.
 fn create_dir_with_mode(dir: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new()
@@ -2305,6 +2315,24 @@ fn lock_blocking(root: &Path, wait: Option<std::time::Duration>) -> Result<Store
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_private_directory_leaves_its_parents_passable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run-nspawn");
+        let secrets = run.join("secrets");
+        create_private_dir(&secrets.to_string_lossy()).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&secrets), 0o700);
+        // As open as a directory made 0755 under the same umask.
+        let open = tmp.path().join("open");
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o755).create(&open).unwrap();
+        }
+        assert_eq!(mode(&run), mode(&open));
+    }
 
     #[test]
     fn an_entrypoint_given_drops_the_images_command() {

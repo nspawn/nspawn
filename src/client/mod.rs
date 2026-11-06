@@ -536,16 +536,52 @@ pub struct JobWatch {
     lost: zbus::fdo::NameOwnerChangedStream,
 }
 
+/// What a job sends while it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobEvent<'a> {
+    /// A line of its output, of a kind: "line", "note"...
+    Line { kind: &'a str, line: &'a str },
+    /// How far a transfer of `item` got: `done` bytes of `total` (0 when unknown).
+    Progress {
+        item: &'a str,
+        done: u64,
+        total: u64,
+    },
+}
+
 impl JobWatch {
     /// Follows `job` to its end: its lines go to the terminal as they arrive, a bar shows
     /// how far a transfer got when stderr is a terminal, and its result comes back, or
     /// its error.
-    pub async fn finish(mut self, job: OwnedObjectPath) -> Result<Dict> {
-        let owner = service_owner(&self.connection).await;
+    pub async fn finish(self, job: OwnedObjectPath) -> Result<Dict> {
         let mut transfers = Transfers::new(
             (self.bars && std::io::IsTerminal::is_terminal(&std::io::stderr()))
                 .then_some(indicatif::ProgressDrawTarget::stderr),
         );
+        let (silent, to_stderr) = (self.silent, self.lines_to_stderr);
+        let result = self
+            .follow(job, |event| match event {
+                JobEvent::Progress { item, done, total } => transfers.progress(item, done, total),
+                JobEvent::Line { .. } if silent => {}
+                JobEvent::Line { kind, line } => transfers.print(|| match kind {
+                    _ if to_stderr => eprintln!("{line}"),
+                    "note" => eprintln!("{line}"),
+                    _ => println!("{line}"),
+                }),
+            })
+            .await;
+        transfers.clear();
+        result
+    }
+
+    /// Follows `job` to its end, each line and each transfer's progress handed to `on`
+    /// as they arrive, and gives its result, or its error.
+    pub async fn follow(
+        mut self,
+        job: OwnedObjectPath,
+        mut on: impl FnMut(JobEvent<'_>),
+    ) -> Result<Dict> {
+        let owner = service_owner(&self.connection).await;
         let result = loop {
             // The lines come first: the service sends every JobOutput before JobRemoved,
             // and a random poll order would let the end be seen before the last lines.
@@ -560,21 +596,23 @@ impl JobWatch {
                     while let Some(Some(signal)) = self.progress.next().now_or_never() {
                         let Ok(args) = signal.args() else { continue };
                         if *args.job() == job {
-                            transfers.progress(args.item(), *args.done(), *args.total());
+                            on(JobEvent::Progress {
+                                item: args.item(),
+                                done: *args.done(),
+                                total: *args.total(),
+                            });
                         }
                     }
-                    if self.silent { continue }
-                    let to_stderr = self.lines_to_stderr;
-                    transfers.print(|| match args.kind().as_str() {
-                        _ if to_stderr => eprintln!("{}", args.line()),
-                        "note" => eprintln!("{}", args.line()),
-                        _ => println!("{}", args.line()),
-                    });
+                    on(JobEvent::Line { kind: args.kind(), line: args.line() });
                 }
                 Some(signal) = self.progress.next() => {
                     let Ok(args) = signal.args() else { continue };
                     if *args.job() != job { continue }
-                    transfers.progress(args.item(), *args.done(), *args.total());
+                    on(JobEvent::Progress {
+                        item: args.item(),
+                        done: *args.done(),
+                        total: *args.total(),
+                    });
                 }
                 Some(signal) = self.removed.next() => {
                     let Ok(args) = signal.args() else { continue };
@@ -589,7 +627,6 @@ impl JobWatch {
                 else => anyhow::bail!("the bus connection closed while the job ran"),
             }
         };
-        transfers.clear();
         // Streams nobody reads any more would fill up with other jobs' signals and hold
         // up the replies below.
         let JobWatch {

@@ -474,7 +474,8 @@ impl Manager {
         Ok(api::generate::generate(self.ctx(), &names)?.render())
     }
 
-    /// Like `pull`. Options: name (s), backend (s), mode (s), force (b), verify (b, default
+    /// Like `pull`. Options: name (s), backend (s), mode (s), force (b), image_only (b: with
+    /// force, only over a record that never ran), verify (b, default
     /// true: the signature check the registry's policy asks for), registry (s), ca_cert
     /// (s). The job's result carries name, reference, mode and signed_by.
     async fn pull_image(
@@ -493,6 +494,7 @@ impl Manager {
             backend: backend_choice(options.string("backend")?.as_deref())?,
             mode: mode_choice(options.string("mode")?.as_deref())?,
             force: options.bool("force", false)?,
+            image_only: options.bool("image_only", false)?,
             verify: options.bool("verify", true)?,
         };
         options.finish()?;

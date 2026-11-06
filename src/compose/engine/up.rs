@@ -486,17 +486,6 @@ pub(super) fn string_to_bool(text: &str) -> bool {
     )
 }
 
-/// `base`, or `base-2`, `base-3`... when a record has it.
-fn free_name(base: &str, taken: &BTreeSet<String>) -> String {
-    if !taken.contains(base) {
-        return base.to_string();
-    }
-    (2..)
-        .map(|n| format!("{base}-{n}"))
-        .find(|name| !taken.contains(name))
-        .expect("a free name")
-}
-
 /// The local image of each service, pulled or built where compose would: an image a
 /// service names is pulled as its policy says, its failure only a warning when a
 /// service of the project builds that image; then each image a build section makes is
@@ -577,12 +566,17 @@ pub async fn images(
         // stays, and the image comes under a name of its own.
         let (into, force) = match existing {
             Some(l) if l.image_only => (l.name.clone(), true),
-            _ => (free_name(&reference.local_name(), &names), false),
+            _ => (
+                crate::reference::free_name(&reference.local_name(), &names),
+                false,
+            ),
         };
         names.insert(into.clone());
         let mut options = Options::new();
         options.insert("name", Bus::from(into));
         options.insert("force", Bus::from(force));
+        // Unless it ran as a machine meanwhile.
+        options.insert("image_only", Bus::from(force));
         let manager = &e.client.manager;
         let result = e
             .client
@@ -2076,8 +2070,11 @@ mod tests {
         let taken: BTreeSet<String> = ["postgres-16".to_string(), "postgres-16-2".to_string()]
             .into_iter()
             .collect();
-        assert_eq!(free_name("postgres-16", &taken), "postgres-16-3");
-        assert_eq!(free_name("redis-7", &taken), "redis-7");
+        assert_eq!(
+            crate::reference::free_name("postgres-16", &taken),
+            "postgres-16-3"
+        );
+        assert_eq!(crate::reference::free_name("redis-7", &taken), "redis-7");
     }
 
     #[test]

@@ -7,12 +7,14 @@
 //! changes something goes to the service, as the command line's requests do.
 
 pub mod access;
+mod attach;
 mod containers;
 mod create;
 pub mod events;
 pub mod filters;
 pub mod images;
 pub mod model;
+mod pull;
 #[cfg(test)]
 pub(crate) mod shapes;
 pub(crate) mod streams;
@@ -58,6 +60,83 @@ static STREAMS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
 /// Waits, each holding a connection to the system bus of its own until it ends, so that
 /// the service drops the wait when its client goes.
 pub static WAITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+
+/// On the host's socket, which every user may reach, the connections one user other than
+/// root holds at once, so that none takes all of them; root's are not counted, so that
+/// users cannot keep it out.
+const PER_USER: usize = 16;
+static USERS: Mutex<BTreeMap<u32, usize>> = Mutex::new(BTreeMap::new());
+
+/// What a connection holds of the limits while it lives.
+struct Admitted {
+    _permit: Option<tokio::sync::SemaphorePermit<'static>>,
+    user: Option<u32>,
+}
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        if let Some(uid) = self.user {
+            let mut users = USERS.lock().unwrap();
+            if let Some(count) = users.get_mut(&uid) {
+                *count -= 1;
+                if *count == 0 {
+                    users.remove(&uid);
+                }
+            }
+        }
+    }
+}
+
+/// A connection of `uid` (None when its credentials could not be read) on a socket of
+/// `profile`, within the limits, or None over them.
+fn admit(profile: Profile, uid: Option<u32>) -> Option<Admitted> {
+    if profile == Profile::Host && uid == Some(0) {
+        return Some(Admitted {
+            _permit: None,
+            user: None,
+        });
+    }
+    let user = match profile {
+        Profile::Host => {
+            let uid = uid.unwrap_or(u32::MAX);
+            let mut users = USERS.lock().unwrap();
+            let count = users.entry(uid).or_insert(0);
+            if *count >= PER_USER {
+                return None;
+            }
+            *count += 1;
+            Some(uid)
+        }
+        Profile::Machine { .. } => None,
+    };
+    // Built first, so that a refusal below gives the user's place back.
+    let mut admitted = Admitted {
+        _permit: None,
+        user,
+    };
+    admitted._permit = Some(CONNECTIONS.try_acquire().ok()?);
+    Some(admitted)
+}
+
+/// Connections handed over to the stream of an attach, which hyper no longer serves:
+/// the server stays while one is open.
+static UPGRADED: AtomicUsize = AtomicUsize::new(0);
+
+/// An upgraded connection, counted while it lives.
+pub(crate) struct Upgraded;
+
+impl Upgraded {
+    pub(crate) fn hold() -> Upgraded {
+        UPGRADED.fetch_add(1, Ordering::SeqCst);
+        Upgraded
+    }
+}
+
+impl Drop for Upgraded {
+    fn drop(&mut self) {
+        UPGRADED.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// How long a client has to send a request's headers.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -112,10 +191,10 @@ pub async fn serve(machine: Option<&str>, config: Config) -> Result<()> {
                         continue;
                     }
                 };
-                // Over the limit the connection is closed right away.
-                let Ok(permit) = CONNECTIONS.try_acquire() else { continue };
-                open.fetch_add(1, Ordering::SeqCst);
                 let peer = stream.peer_cred().ok().map(|cred| (cred.uid(), cred.pid()));
+                // Over the limit the connection is closed right away.
+                let Some(permit) = admit(profile, peer.map(|(uid, _)| uid)) else { continue };
+                open.fetch_add(1, Ordering::SeqCst);
                 let client = Arc::new(Client::new(profile, peer));
                 let (ctx, open, last) = (ctx.clone(), open.clone(), last.clone());
                 tokio::spawn(async move {
@@ -124,17 +203,22 @@ pub async fn serve(machine: Option<&str>, config: Config) -> Result<()> {
                         let (ctx, client) = (ctx.clone(), client.clone());
                         async move { Ok::<_, Infallible>(handle(ctx, &client, request).await) }
                     });
+                    // Upgraded for an attach, which streams on the connection itself.
                     let _ = hyper::server::conn::http1::Builder::new()
                         .timer(hyper_util::rt::TokioTimer::new())
                         .header_read_timeout(HEADER_TIMEOUT)
                         .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .with_upgrades()
                         .await;
                     *last.lock().unwrap() = Instant::now();
                     open.fetch_sub(1, Ordering::SeqCst);
                 });
             }
             _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                if open.load(Ordering::SeqCst) == 0 && last.lock().unwrap().elapsed() > IDLE {
+                if open.load(Ordering::SeqCst) == 0
+                    && UPGRADED.load(Ordering::SeqCst) == 0
+                    && last.lock().unwrap().elapsed() > IDLE
+                {
                     return Ok(());
                 }
             }
@@ -164,6 +248,37 @@ fn error(status: StatusCode, message: impl AsRef<str>) -> Response<Body> {
 /// A body written as it goes, by a task that gets the channel's other end.
 fn streaming(content_type: &str) -> (Response<Body>, tokio::sync::mpsc::Sender<Bytes>) {
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+    (streaming_rx(rx, content_type, ()), tx)
+}
+
+/// A body written as it goes from what `rx` receives, until its senders are gone;
+/// `held` goes once it is all written, or the client went.
+fn streaming_rx<H: Send + Sync + 'static>(
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+    content_type: &str,
+    held: H,
+) -> Response<Body> {
+    let stream = futures_util::stream::unfold((rx, Some(held)), |(mut rx, mut held)| async move {
+        match rx.recv().await {
+            Some(bytes) => Some((Ok::<_, Infallible>(Frame::data(bytes)), (rx, held))),
+            None => {
+                held.take();
+                None
+            }
+        }
+    });
+    let mut response = Response::new(StreamBody::new(stream).boxed());
+    response
+        .headers_mut()
+        .insert("Content-Type", content_type.parse().unwrap());
+    response
+}
+
+/// `streaming_rx` for a channel whose senders cannot wait.
+fn streaming_from(
+    rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    content_type: &str,
+) -> Response<Body> {
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         rx.recv()
             .await
@@ -173,7 +288,7 @@ fn streaming(content_type: &str) -> (Response<Body>, tokio::sync::mpsc::Sender<B
     response
         .headers_mut()
         .insert("Content-Type", content_type.parse().unwrap());
-    (response, tx)
+    response
 }
 
 /// The query string's parameters, percent-decoded as Go's ParseQuery decodes them: a
@@ -267,15 +382,17 @@ impl Query {
 }
 
 async fn handle(ctx: Arc<Context>, client: &Client, request: Request<Incoming>) -> Response<Body> {
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let method = parts.method.clone();
     let path = parts.uri.path().to_string();
     let query = query(parts.uri.query().unwrap_or_default());
+    let (version, route) = split_version(&path);
     let sent = Sent {
         headers: parts.headers,
         body,
+        upgrade: parts.extensions.remove::<hyper::upgrade::OnUpgrade>(),
+        version,
     };
-    let (version, route) = split_version(&path);
     let mut response = match version {
         Some(v) if v < MIN_API_VERSION => respond(
             StatusCode::BAD_REQUEST,
@@ -342,6 +459,10 @@ enum Route {
     Lifecycle(String, Act),
     /// DELETE /containers/{id}.
     Remove(String),
+    /// POST /containers/{id}/attach.
+    Attach(String),
+    /// POST /images/create.
+    Pull,
     /// The plugins, of which there are none.
     Plugins,
     Images,
@@ -366,7 +487,9 @@ impl Route {
         match self {
             Route::Ping | Route::Version | Route::Unserved | Route::NotFound => Need::Nothing,
             Route::Container(_, what) if what == "logs" => Need::Observe,
-            Route::Kill(_) => Need::Observe,
+            // The output alone: a follow of the logs.
+            Route::Kill(_) | Route::Attach(_) => Need::Observe,
+            Route::Pull => Need::Manage,
             // WaitMachine asks org.nspawn.inspect.
             Route::Lifecycle(_, Act::Wait) => Need::Inspect,
             Route::Create | Route::Prune | Route::Lifecycle(..) | Route::Remove(_) => Need::Manage,
@@ -402,6 +525,10 @@ fn classify(method: &Method, path: &str) -> Route {
         (false, ["containers", id, "kill"]) if *method == Method::POST => {
             Route::Kill(id.to_string())
         }
+        (false, ["containers", id, "attach"]) if *method == Method::POST => {
+            Route::Attach(id.to_string())
+        }
+        (false, ["images", "create"]) if *method == Method::POST => Route::Pull,
         (false, ["containers", id, what]) if *method == Method::POST => match Act::of(what) {
             Some(act) => Route::Lifecycle(id.to_string(), act),
             None => Route::Change,
@@ -459,7 +586,9 @@ async fn route_request(
         | Route::Create
         | Route::Prune
         | Route::Lifecycle(..)
-        | Route::Remove(_) => true,
+        | Route::Remove(_)
+        | Route::Attach(_)
+        | Route::Pull => true,
         Route::Container(_, what) => what != "json",
         _ => false,
     };
@@ -491,6 +620,8 @@ async fn route_request(
         Route::Prune => containers::prune(ctx, query).await,
         Route::Lifecycle(id, act) => containers::act(ctx, &id, act, query, sent).await,
         Route::Remove(id) => containers::remove(ctx, &id, query).await,
+        Route::Attach(id) => attach::attach(ctx, &id, query, sent.upgrade, sent.version).await,
+        Route::Pull => pull::create(ctx, query).await,
         Route::Plugins => json_response(StatusCode::OK, &json!([])),
         Route::Images => list_images(ctx, query),
         Route::Image(name, what) => image_read(ctx, &name, &what),
@@ -594,7 +725,7 @@ fn info(ctx: &Context, snapshot: &Snapshot) -> Value {
     } else {
         machine_id
     };
-    let images = images::list(ctx).map(|all| all.len()).unwrap_or(0);
+    let images = images::count(ctx).unwrap_or(0);
     let mut info = json!({
         "ID": id,
         "Containers": total,
@@ -625,7 +756,8 @@ fn info(ctx: &Context, snapshot: &Snapshot) -> Value {
                 .map_or(0, |d| d.as_micros() as u64),
             false,
         ),
-        "LoggingDriver": "journald",
+        // What a container gets without a LogConfig: nspawn's journal namespace.
+        "LoggingDriver": "local",
         "CgroupDriver": "systemd",
         "CgroupVersion": "2",
         "NEventsListener": 0,
@@ -1371,6 +1503,26 @@ fn ends_restarts(stop_signal: Option<&str>, signal: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_user_takes_all_of_the_host_socket_and_root_always_gets_in() {
+        let mine: Vec<Admitted> = (0..PER_USER)
+            .map(|_| admit(Profile::Host, Some(4242)).expect("within the user's share"))
+            .collect();
+        assert!(admit(Profile::Host, Some(4242)).is_none());
+        assert!(
+            admit(Profile::Host, Some(4343)).is_some(),
+            "another user's share"
+        );
+        let root: Vec<Admitted> = (0..100)
+            .map(|_| admit(Profile::Host, Some(0)).expect("root"))
+            .collect();
+        drop(mine);
+        assert!(admit(Profile::Host, Some(4242)).is_some(), "given back");
+        assert!(USERS.lock().unwrap().get(&4242).is_none());
+        drop(root);
+        assert!(admit(Profile::Machine { write: true }, None).is_some());
+    }
 
     #[test]
     fn kill_takes_the_signals_docker_takes() {

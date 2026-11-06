@@ -172,6 +172,16 @@ pub struct NetworkView<'a> {
     pub spec: Option<&'a NetSpec>,
 }
 
+/// The API's name of a machine's log driver, which a create takes back as the same
+/// driver: local for nspawn's own journal namespace, journald for the system's journal.
+pub fn log_type(tuning: &crate::tuning::Tuning) -> &'static str {
+    match tuning.log_driver.as_deref() {
+        Some("none") => "none",
+        Some("journal") => "journald",
+        _ => "local",
+    }
+}
+
 impl Machine {
     /// The machine's name, which the bus knows it by.
     pub fn name(&self) -> &str {
@@ -553,7 +563,7 @@ impl Machine {
         let host_config = json!({
             "Binds": if binds.is_empty() { Value::Null } else { json!(binds) },
             "ContainerIDFile": "",
-            "LogConfig": { "Type": if t.log_driver.as_deref() == Some("none") { "none" } else { "journald" }, "Config": {} },
+            "LogConfig": { "Type": log_type(t), "Config": {} },
             "NetworkMode": self.network_mode(snapshot),
             "PortBindings": port_bindings,
             "RestartPolicy": { "Name": restart, "MaximumRetryCount": 0 },
@@ -1180,6 +1190,49 @@ mod tests {
             pulled_id,
             "by its ID"
         );
+    }
+
+    #[test]
+    fn an_inspect_makes_the_container_again_with_its_log_driver() {
+        struct Anything;
+        impl crate::dockerapi::create::World for Anything {
+            fn container(&self, _: &str) -> Option<crate::dockerapi::create::Linked> {
+                None
+            }
+            fn network(&self, key: &str) -> Option<String> {
+                Some(key.to_string())
+            }
+            fn exists(&self, _: &str) -> bool {
+                true
+            }
+        }
+        let (ctx, snapshot) = fixture();
+        let m = &snapshot.machines[0];
+        let image = ImageInfo {
+            id: "sha256:30ec".into(),
+            exposed_ports: vec!["80/tcp".into()],
+        };
+        let inspect = m.inspect_json(&ctx, &snapshot, &image);
+        assert_eq!(inspect["HostConfig"]["LogConfig"]["Type"], "local");
+        let mut body = inspect["Config"].clone();
+        body["HostConfig"] = inspect["HostConfig"].clone();
+        let plan = crate::dockerapi::create::translate(&body, &Anything)
+            .unwrap_or_else(|r| panic!("{}", r.message));
+        assert!(
+            !plan
+                .warnings
+                .iter()
+                .any(|w| w.contains("Runtime") || w.contains("LogConfig")),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(!plan.opts.contains_key("log_driver"), "{:?}", plan.opts);
+        let mut tuning = crate::tuning::Tuning::default();
+        assert_eq!(log_type(&tuning), "local");
+        tuning.log_driver = Some("journal".into());
+        assert_eq!(log_type(&tuning), "journald");
+        tuning.log_driver = Some("none".into());
+        assert_eq!(log_type(&tuning), "none");
     }
 
     #[test]

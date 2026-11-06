@@ -236,11 +236,20 @@ pub async fn journal_cursor(namespace: Option<&str>) -> Option<String> {
         .map(|c| c.trim().to_string())
 }
 
-/// journalctl's arguments for what a unit's processes write, from `cursor` on, in the
+/// Where a follower starts reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowFrom<'a> {
+    /// After a cursor, or at the journal's end without one.
+    After(Option<&'a str>),
+    /// At a time, unix microseconds.
+    Since(u64),
+}
+
+/// journalctl's arguments for what a unit's processes write, from `from` on, in the
 /// system's journal or in `namespace`.
 pub fn follower_arguments(
     unit: &str,
-    cursor: Option<&str>,
+    from: FollowFrom<'_>,
     namespace: Option<&str>,
 ) -> Vec<String> {
     let mut argv = vec![
@@ -252,9 +261,14 @@ pub fn follower_arguments(
     if let Some(namespace) = namespace {
         argv.push(format!("--namespace={namespace}"));
     }
-    match cursor {
-        Some(cursor) => argv.push(format!("--after-cursor={cursor}")),
-        None => argv.push("--lines=0".to_string()),
+    match from {
+        FollowFrom::After(Some(cursor)) => argv.push(format!("--after-cursor={cursor}")),
+        FollowFrom::After(None) => argv.push("--lines=0".to_string()),
+        FollowFrom::Since(usec) => argv.push(format!(
+            "--since=@{}.{:06}",
+            usec / 1_000_000,
+            usec % 1_000_000
+        )),
     }
     argv.push(format!("_SYSTEMD_UNIT={unit}"));
     argv.push("_TRANSPORT=stdout".to_string());
@@ -289,7 +303,8 @@ fn from_machine(entry: &Value) -> bool {
 /// journalctl can take long to start on a big journal, and a quick program would end
 /// before it read anything.
 pub struct Follower {
-    stop: tokio::sync::watch::Sender<bool>,
+    /// How long the copy may go on after the end, once it is told of it.
+    stop: tokio::sync::watch::Sender<Option<Duration>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -307,7 +322,7 @@ impl Follower {
     /// system's journal.
     pub fn start(
         unit: &str,
-        cursor: Option<&str>,
+        from: FollowFrom<'_>,
         namespace: Option<&str>,
         out: OwnedFd,
     ) -> Result<Self> {
@@ -315,7 +330,7 @@ impl Follower {
         let mut out = tokio::net::unix::pipe::Sender::from_owned_fd(out)
             .context("preparing the output's pipe")?;
         let mut child = tokio::process::Command::new("journalctl")
-            .args(follower_arguments(unit, cursor, namespace))
+            .args(follower_arguments(unit, from, namespace))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -323,11 +338,12 @@ impl Follower {
             .spawn()
             .context("running journalctl")?;
         let entries = child.stdout.take().context("journalctl has no output")?;
-        let (stop, mut stopping) = tokio::sync::watch::channel(false);
+        let (stop, mut stopping) = tokio::sync::watch::channel(None);
         let task = tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(entries).lines();
             // After the end: at least half a second, for what journald still has to take
-            // from the stream, then until 300 ms pass without a line; three at most.
+            // from the stream, then until 300 ms pass without a line, within the time
+            // the end allows.
             let quiet = Duration::from_millis(300);
             let mut last_line = tokio::time::Instant::now();
             let mut floor = tokio::time::Instant::now();
@@ -352,9 +368,13 @@ impl Follower {
                         }
                     }
                     changed = stopping.changed(), if deadline.is_none() => {
-                        if changed.is_err() || *stopping.borrow() {
+                        let within = match changed {
+                            Ok(()) => *stopping.borrow(),
+                            Err(_) => Some(Duration::from_secs(3)),
+                        };
+                        if let Some(within) = within {
                             let now = tokio::time::Instant::now();
-                            deadline = Some(now + Duration::from_secs(3));
+                            deadline = Some(now + within);
                             floor = now + Duration::from_millis(500);
                             last_line = now;
                         }
@@ -370,9 +390,16 @@ impl Follower {
         })
     }
 
-    /// Ends the copy once the output has been quiet for a moment, and closes the pipe.
-    pub async fn finish(mut self) {
-        let _ = self.stop.send(true);
+    /// Ends the copy once the output has been quiet for a moment, three seconds at
+    /// most, and closes the pipe.
+    pub async fn finish(self) {
+        self.finish_within(Duration::from_secs(3)).await;
+    }
+
+    /// `finish`, the copy going on for at most `within`: what journalctl still has to
+    /// read of a long output.
+    pub async fn finish_within(mut self, within: Duration) {
+        let _ = self.stop.send(Some(within));
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
@@ -531,7 +558,12 @@ pub async fn attach(
         let cursor = journal_cursor(namespace).await;
         let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
             .context("creating the output's pipe")?;
-        let follower = Follower::start(&unit, cursor.as_deref(), namespace, write)?;
+        let follower = Follower::start(
+            &unit,
+            FollowFrom::After(cursor.as_deref()),
+            namespace,
+            write,
+        )?;
         (Some(read), Some(follower))
     } else {
         (None, None)
@@ -899,13 +931,21 @@ mod tests {
     }
 
     #[test]
-    fn the_follower_reads_the_unit_after_the_cursor() {
-        let argv = follower_arguments("systemd-nspawn@web.service", Some("s=1;i=2"), None);
+    fn the_follower_reads_the_unit_after_the_cursor_or_since_a_time() {
+        let after = FollowFrom::After(Some("s=1;i=2"));
+        let argv = follower_arguments("systemd-nspawn@web.service", after, None);
         assert!(argv.contains(&"--after-cursor=s=1;i=2".to_string()));
         assert!(argv.contains(&"_SYSTEMD_UNIT=systemd-nspawn@web.service".to_string()));
         assert!(argv.contains(&"--follow".to_string()));
-        assert!(follower_arguments("u", None, None).contains(&"--lines=0".to_string()));
-        assert!(follower_arguments("u", None, Some("nspawn"))
+        let end = FollowFrom::After(None);
+        assert!(follower_arguments("u", end, None).contains(&"--lines=0".to_string()));
+        assert!(follower_arguments("u", end, Some("nspawn"))
             .contains(&"--namespace=nspawn".to_string()));
+        let since = follower_arguments("u", FollowFrom::Since(1_700_000_000_000_042), None);
+        assert!(
+            since.contains(&"--since=@1700000000.000042".to_string()),
+            "{since:?}"
+        );
+        assert!(!since.iter().any(|a| a == "--lines=0"), "{since:?}");
     }
 }

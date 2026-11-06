@@ -770,7 +770,8 @@ fn read_host(host: &Object, config: &Object, plan: &mut Plan) -> Result<(), Refu
         }
     }
     match host.text("Runtime")?.as_str() {
-        "" => {}
+        // What inspect reports, which a client making a container again sends back.
+        "" | "systemd-nspawn" => {}
         "runc" => plan.warn("Runtime runc is ignored: containers run under systemd-nspawn"),
         other => {
             return Err(bad(format!(
@@ -890,11 +891,17 @@ fn read_host(host: &Object, config: &Object, plan: &mut Plan) -> Result<(), Refu
         }
     }
     let publish_all = host.flag("PublishAllPorts")?;
-    if publish_all {
-        for port in config.set("ExposedPorts")? {
-            if !bound.iter().any(|(p, _)| same_port(p, &port)) {
-                publish.push(publish_spec("", "", &port));
-            }
+    for port in config.set("ExposedPorts")? {
+        if bound.iter().any(|(p, _)| same_port(p, &port)) {
+            continue;
+        }
+        if publish_all {
+            publish.push(publish_spec("", "", &port));
+        } else {
+            // As --expose: inspect shows the image's exposed ports and the published ones.
+            plan.warn(format!(
+                "ExposedPorts {port} is ignored: machines on a bridge network reach all ports of each other; publish it to reach it from the host"
+            ));
         }
     }
     plan.texts("publish", publish);
@@ -1073,6 +1080,8 @@ fn read_network(
             }
             plan.opts.remove("publish");
             plan.opts.remove("publish_all");
+            // Nor ports that only a bridge would keep apart from the host.
+            plan.warnings.retain(|w| !w.starts_with("ExposedPorts "));
         }
     }
     Ok(())
@@ -1684,6 +1693,27 @@ mod tests {
             json!({ "Image": "x", "HostConfig": { "RestartPolicy": { "Name": "sometimes" } } })
         )
         .starts_with("invalid restart policy: unknown policy 'sometimes'"));
+    }
+
+    #[test]
+    fn a_port_exposed_and_not_published_is_said_to_be_ignored() {
+        let exposed = json!({ "3000/tcp": {}, "80/tcp": {} });
+        let ports = json!({ "80/tcp": [{ "HostPort": "8080" }] });
+        let p = plan(
+            json!({ "Image": "x", "ExposedPorts": exposed, "HostConfig": { "PortBindings": ports } }),
+        );
+        assert_eq!(
+            p.warnings,
+            ["ExposedPorts 3000/tcp is ignored: machines on a bridge network reach all ports of each other; publish it to reach it from the host"]
+        );
+        let all = plan(
+            json!({ "Image": "x", "ExposedPorts": exposed, "HostConfig": { "PublishAllPorts": true } }),
+        );
+        assert!(all.warnings.is_empty(), "{:?}", all.warnings);
+        let host = plan(
+            json!({ "Image": "x", "ExposedPorts": exposed, "HostConfig": { "NetworkMode": "host" } }),
+        );
+        assert!(host.warnings.is_empty(), "{:?}", host.warnings);
     }
 
     #[test]

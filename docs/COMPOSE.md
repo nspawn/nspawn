@@ -403,7 +403,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.tmpfs` | yes |  |
 | `services.*.tty` | yes |  |
 | `services.*.ulimits` and below | yes |  |
-| `services.*.use_api_socket` | partly | nspawn's Docker API, which reads machines, images and volumes and changes them only by a kill, and no registry credentials with it |
+| `services.*.use_api_socket` | partly | nspawn's Docker API, bound read-write, which takes every request the API serves (a `:ro` bind of the socket in `volumes` reads, follows logs and kills only), and no registry credentials with it |
 | `services.*.user` | partly | refused for an image that boots, whose init runs as it is |
 | `services.*.userns_mode` | ignored | a machine always has a user namespace of its own |
 | `services.*.uts` | ignored | a machine always has a UTS namespace of its own |
