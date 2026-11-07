@@ -45,13 +45,13 @@ impl Snapshot {
         let sd = ctx.sd().await?;
         let mut machines = Vec::new();
         for mut summary in crate::api::machines::list(ctx, true).await? {
+            // A record pulled or built and never run is an image here, not a container.
+            if !crate::api::machines::is_machine(&ctx.store, &summary) {
+                continue;
+            }
             let Some(record) = summary.record.clone() else {
                 continue;
             };
-            // A record pulled or built and never run is an image here, not a container.
-            if summary.state == "stopped" && crate::api::disk::image_only(&ctx.store, &record) {
-                continue;
-            }
             let unit = format!("systemd-nspawn@{}.service", record.name);
             // The times of a run that ended: its start as the machine's summary has it,
             // its end as the unit has it while systemd keeps it loaded, else as the

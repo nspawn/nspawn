@@ -123,6 +123,22 @@ pub fn overlay_supported() -> bool {
     listed()
 }
 
+/// `overlay_supported` without loading the module: what a pull with auto would find,
+/// for a caller that only looks.
+pub fn overlay_available() -> bool {
+    let listed = fs::read_to_string("/proc/filesystems")
+        .map(|text| filesystem_listed(&text, "overlay"))
+        .unwrap_or(false);
+    listed
+        || std::process::Command::new("modprobe")
+            .args(["-n", "-q", "overlay"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+}
+
 /// Whether /proc/filesystems names `name`.
 fn filesystem_listed(text: &str, name: &str) -> bool {
     text.lines()

@@ -14,6 +14,7 @@ pub mod failure;
 pub mod generate;
 pub mod hub;
 pub mod images;
+pub mod info;
 pub mod login;
 pub mod machines;
 pub mod names;

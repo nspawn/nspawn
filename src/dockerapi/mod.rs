@@ -693,8 +693,13 @@ async fn route_request(
             response
         }
         Route::Version => json_response(StatusCode::OK, &version()),
-        Route::Info => match Snapshot::take(ctx).await {
-            Ok(snapshot) => json_response(StatusCode::OK, &info(ctx, &snapshot)),
+        Route::Info => match service_info().await {
+            Ok(service) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_micros() as u64);
+                json_response(StatusCode::OK, &info(&service, now))
+            }
             Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
         },
         Route::DiskUsage => disk_usage(ctx, query).await,
@@ -794,31 +799,24 @@ fn version() -> Value {
     })
 }
 
-fn info(ctx: &Context, snapshot: &Snapshot) -> Value {
-    let read = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
-    let running = snapshot
-        .machines
-        .iter()
-        .filter(|m| m.state() == "running")
-        .count();
-    let paused = snapshot
-        .machines
-        .iter()
-        .filter(|m| m.state() == "paused")
-        .count();
-    let total = snapshot.machines.len();
-    let os = read("/etc/os-release")
-        .lines()
-        .find_map(|l| l.strip_prefix("PRETTY_NAME="))
-        .map(|v| v.trim_matches('"').to_string())
-        .unwrap_or_else(|| "Linux".to_string());
-    let mem_total: u64 = read("/proc/meminfo")
-        .lines()
-        .find_map(|l| l.strip_prefix("MemTotal:"))
-        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-        .map_or(0, |kb| kb * 1024);
-    let machine_id = read("/etc/machine-id").trim().to_string();
-    let id = if machine_id.len() == 32 {
+/// Info as the service answers it (`api::info`), which this end only reads.
+async fn service_info() -> Result<crate::client::Dict> {
+    let client = crate::client::Client::connect().await?;
+    client
+        .manager
+        .info()
+        .await
+        .map_err(crate::client::error)
+        .context("asking the service for its info")
+}
+
+/// GET /info: the service's Info in the Engine's shape, at `now_usec`.
+fn info(service: &crate::client::Dict, now_usec: u64) -> Value {
+    use crate::client::{string, u64 as number};
+    let machines = crate::client::numbers(service, "machines");
+    let count = |key: &str| machines.get(key).copied().unwrap_or(0);
+    let machine_id = string(service, "machine_id");
+    let id = if machine_id.len() == 32 && machine_id.is_ascii() {
         format!(
             "{}-{}-{}-{}-{}",
             &machine_id[..8],
@@ -830,14 +828,13 @@ fn info(ctx: &Context, snapshot: &Snapshot) -> Value {
     } else {
         machine_id
     };
-    let images = images::count(ctx).unwrap_or(0);
     let mut info = json!({
         "ID": id,
-        "Containers": total,
-        "ContainersRunning": running,
-        "ContainersPaused": paused,
-        "ContainersStopped": total - running - paused,
-        "Images": images,
+        "Containers": count("total"),
+        "ContainersRunning": count("running"),
+        "ContainersPaused": count("paused"),
+        "ContainersStopped": count("stopped"),
+        "Images": number(service, "images"),
         "Driver": "overlay",
         "DriverStatus": [],
         "Plugins": { "Volume": ["local"], "Network": ["bridge", "host", "null"], "Authorization": null, "Log": ["journald"] },
@@ -855,35 +852,30 @@ fn info(ctx: &Context, snapshot: &Snapshot) -> Value {
         "NFd": 0,
         "OomKillDisable": false,
         "NGoroutines": 0,
-        "SystemTime": util::rfc3339_nano(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_micros() as u64),
-            false,
-        ),
+        "SystemTime": util::rfc3339_nano(now_usec, false),
         // What a container gets without a LogConfig: nspawn's journal namespace.
-        "LoggingDriver": "local",
+        "LoggingDriver": string(service, "log_driver"),
         "CgroupDriver": "systemd",
         "CgroupVersion": "2",
         "NEventsListener": 0,
-        "KernelVersion": read("/proc/sys/kernel/osrelease").trim(),
-        "OperatingSystem": os,
+        "KernelVersion": string(service, "kernel"),
+        "OperatingSystem": string(service, "os"),
         "OSVersion": "",
         "OSType": "linux",
-        "Architecture": std::env::consts::ARCH,
+        "Architecture": string(service, "architecture"),
         "IndexServerAddress": "https://index.docker.io/v1/",
         "RegistryConfig": null,
-        "NCPU": std::thread::available_parallelism().map_or(1, |n| n.get()),
-        "MemTotal": mem_total,
+        "NCPU": number(service, "cpus"),
+        "MemTotal": number(service, "memory"),
         "GenericResources": null,
-        "DockerRootDir": ctx.config.state_dir.to_string_lossy(),
+        "DockerRootDir": string(service, "state_dir"),
         "HttpProxy": "",
         "HttpsProxy": "",
         "NoProxy": "",
-        "Name": read("/proc/sys/kernel/hostname").trim(),
+        "Name": string(service, "hostname"),
         "Labels": [],
         "ExperimentalBuild": false,
-        "ServerVersion": env!("CARGO_PKG_VERSION"),
+        "ServerVersion": string(service, "version"),
         "Runtimes": { "systemd-nspawn": { "path": "systemd-nspawn" } },
         "DefaultRuntime": "systemd-nspawn",
         "Swarm": {
@@ -1711,6 +1703,109 @@ fn ends_restarts(stop_signal: Option<&str>, signal: i32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Info as the service hands it out for a host of four machines, two running.
+    fn service_answer() -> crate::client::Dict {
+        let answer = crate::api::info::Info {
+            version: "3.0.0".into(),
+            machines: crate::api::info::Machines {
+                total: 4,
+                running: 2,
+                paused: 0,
+                stopped: 2,
+            },
+            images: 1,
+            machines_dir: "/var/lib/machines".into(),
+            state_dir: "/var/lib/nspawn".into(),
+            backend: "auto".into(),
+            auto_backend: "overlay".into(),
+            log_driver: "local".into(),
+            registry: "hub.nspawn.org".into(),
+            architecture: "x86_64".into(),
+            systemd_version: "259 (259.7-1.fc44)".into(),
+            host: crate::api::info::Host {
+                hostname: "oracle".into(),
+                machine_id: "0123456789abcdef0123456789abcdef".into(),
+                kernel: "6.0.0".into(),
+                os: "Fedora Linux 44 (Server Edition)".into(),
+                cpus: 4,
+                memory: 8589934592,
+            },
+        };
+        crate::daemon::values::info(&answer)
+    }
+
+    #[test]
+    fn info_is_the_service_s_answer_in_the_engine_s_shape() {
+        let ours = info(&service_answer(), 1_792_344_103_000_000);
+        let mut expected: Value = serde_json::from_str(concat!(
+            r#"{"ID":"01234567-89ab-cdef-0123-456789abcdef","Containers":4,"ContainersRunning":2,"#,
+            r#""ContainersPaused":0,"ContainersStopped":2,"Images":1,"Driver":"overlay","#,
+            r#""DriverStatus":[],"Plugins":{"Volume":["local"],"Network":["bridge","host","#,
+            r#""null"],"Authorization":null,"Log":["journald"]},"MemoryLimit":true,"SwapLimit":true,"#,
+            r#""CpuCfsPeriod":true,"CpuCfsQuota":true,"CPUShares":true,"CPUSet":true,"#,
+            r#""PidsLimit":true,"IPv4Forwarding":true,"Debug":false,"NFd":0,"OomKillDisable":false,"#,
+            r#""NGoroutines":0,"SystemTime":"","LoggingDriver":"local","CgroupDriver":"systemd","#,
+            r#""CgroupVersion":"2","NEventsListener":0,"KernelVersion":"6.0.0","OperatingSystem":"Fedora Linux 44 (Server Edition)","#,
+            r#""OSVersion":"","OSType":"linux","Architecture":"x86_64","IndexServerAddress":"https://index.docker.io/v1/","#,
+            r#""RegistryConfig":null,"NCPU":4,"MemTotal":8589934592,"GenericResources":null,"#,
+            r#""DockerRootDir":"/var/lib/nspawn","HttpProxy":"","HttpsProxy":"","NoProxy":"","#,
+            r#""Name":"oracle","Labels":[],"ExperimentalBuild":false,"ServerVersion":"3.0.0","#,
+            r#""Runtimes":{"systemd-nspawn":{"path":"systemd-nspawn"}},"DefaultRuntime":"systemd-nspawn","#,
+            r#""Swarm":{"NodeID":"","NodeAddr":"","LocalNodeState":"inactive","ControlAvailable":false,"#,
+            r#""Error":"","RemoteManagers":null},"LiveRestoreEnabled":false,"Isolation":"","#,
+            r#""InitBinary":"","SecurityOptions":[],"CDISpecDirs":["/etc/cdi","/var/run/cdi"],"#,
+            r#""Warnings":null}"#,
+        ))
+        .unwrap();
+        expected["SystemTime"] = json!(util::rfc3339_nano(1_792_344_103_000_000, false));
+        assert_eq!(ours, expected);
+        // Every key answered is one the engine answers, with its type: the counts and
+        // the host's values where its golden answer has them.
+        let recorded = shapes::golden(include_str!("../../tests/dockerapi/golden/info.body"));
+        let (extra, _) = shapes::diff(&ours, &recorded);
+        assert_eq!(
+            extra,
+            [".Runtimes.systemd-nspawn", ".Runtimes.systemd-nspawn.path"]
+        );
+        for (key, value) in ours.as_object().unwrap() {
+            let theirs = &recorded[key.as_str()];
+            let same_kind = matches!(
+                (value, theirs),
+                (Value::Null, _)
+                    | (_, Value::Null)
+                    | (Value::Bool(_), Value::Bool(_))
+                    | (Value::Number(_), Value::Number(_))
+                    | (Value::String(_), Value::String(_))
+                    | (Value::Array(_), Value::Array(_))
+                    | (Value::Object(_), Value::Object(_))
+            );
+            assert!(same_kind, "{key}: {value} against {theirs}");
+        }
+        for key in [
+            "ContainersRunning",
+            "ContainersStopped",
+            "NCPU",
+            "MemTotal",
+            "Name",
+            "KernelVersion",
+        ] {
+            assert_eq!(ours[key], recorded[key], "{key}");
+        }
+    }
+
+    #[test]
+    fn a_machine_id_that_is_no_uuid_is_given_as_it_is() {
+        let mut answer = service_answer();
+        answer.insert(
+            "machine_id".into(),
+            crate::daemon::values::v("uninitialized"),
+        );
+        assert_eq!(info(&answer, 0)["ID"], "uninitialized");
+        // An answer without the counts says 0, not an error.
+        answer.remove("machines");
+        assert_eq!(info(&answer, 0)["Containers"], 0);
+    }
 
     #[test]
     fn no_user_takes_all_of_a_limit_and_root_always_gets_in() {

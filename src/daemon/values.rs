@@ -412,6 +412,37 @@ pub fn secret(s: &crate::api::secrets::SecretInfo) -> Dict {
     ])
 }
 
+/// Info: version, machines (a{st}: total, running, paused, stopped), images,
+/// machines_dir, state_dir, backend, auto_backend, log_driver, registry, architecture,
+/// systemd_version, and the host's hostname, machine_id, kernel, os, cpus and memory.
+pub fn info(i: &crate::api::info::Info) -> Dict {
+    let machines = HashMap::from([
+        ("total".to_string(), i.machines.total),
+        ("running".to_string(), i.machines.running),
+        ("paused".to_string(), i.machines.paused),
+        ("stopped".to_string(), i.machines.stopped),
+    ]);
+    HashMap::from([
+        ("version".to_string(), v(i.version.as_str())),
+        ("machines".to_string(), v(machines)),
+        ("images".to_string(), v(i.images)),
+        ("machines_dir".to_string(), v(i.machines_dir.as_str())),
+        ("state_dir".to_string(), v(i.state_dir.as_str())),
+        ("backend".to_string(), v(i.backend.as_str())),
+        ("auto_backend".to_string(), v(i.auto_backend.as_str())),
+        ("log_driver".to_string(), v(i.log_driver.as_str())),
+        ("registry".to_string(), v(i.registry.as_str())),
+        ("architecture".to_string(), v(i.architecture.as_str())),
+        ("systemd_version".to_string(), v(i.systemd_version.as_str())),
+        ("hostname".to_string(), v(i.host.hostname.as_str())),
+        ("machine_id".to_string(), v(i.host.machine_id.as_str())),
+        ("kernel".to_string(), v(i.host.kernel.as_str())),
+        ("os".to_string(), v(i.host.os.as_str())),
+        ("cpus".to_string(), v(i.host.cpus)),
+        ("memory".to_string(), v(i.host.memory)),
+    ])
+}
+
 pub fn bridge(b: &BridgeInfo) -> Dict {
     HashMap::from([
         ("bridge".to_string(), v(b.bridge.as_str())),

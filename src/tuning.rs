@@ -174,7 +174,10 @@ pub struct Tuning {
 /// from the system's journal, which `logs` and an attached `run` read), journal (the
 /// system's journal) or none (dropped; an attached run gets it straight from the
 /// program).
-pub const LOG_DRIVERS: [&str; 3] = ["local", "journal", "none"];
+pub const LOG_DRIVERS: [&str; 3] = [DEFAULT_LOG_DRIVER, "journal", "none"];
+
+/// The log driver of a machine started without --log-driver.
+pub const DEFAULT_LOG_DRIVER: &str = "local";
 
 /// The journald namespace the output of local machines goes to, with limits of its own
 /// (journald@nspawn.conf).
@@ -214,7 +217,7 @@ impl Tuning {
 
     /// The log driver's name, the default spelled out.
     pub fn log_driver_name(&self) -> &str {
-        self.log_driver.as_deref().unwrap_or("local")
+        self.log_driver.as_deref().unwrap_or(DEFAULT_LOG_DRIVER)
     }
 
     /// The Timezone= mode the machine starts with. Unset, it is systemd-nspawn's auto,

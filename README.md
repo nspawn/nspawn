@@ -29,9 +29,10 @@ nspawn compose up -d                # the services of this directory's compose.y
 nspawn compose down -v
 ```
 
-`nspawn --help` lists the rest: `login`, `hub ls`, `inspect`, `update`, `stats`, `top`,
-`cp`, `kill`, `restart`, `pause`, `wait`, `port`, `volume`, `secret`, `network` (with
-`connect` and `disconnect`), `system df` and `system prune`, `images prune`, `builder`
+`nspawn --help` lists the rest: `login`, `hub ls`, `inspect`, `info` (the service's
+version and state), `update`, `stats`, `top`, `cp`, `kill`, `restart`, `pause`, `wait`,
+`port`, `volume`, `secret`, `network` (with `connect` and `disconnect`), `system df` and
+`system prune`, `images prune`, `builder`
 (the build cache), `auto-update` (moves labelled machines to the image their tag names
 now), `generate` (the commands that make the same machines on another host), and
 `completions` for the shells, which complete the names of machines, images, networks

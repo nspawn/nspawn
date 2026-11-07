@@ -322,6 +322,17 @@ pub async fn list(ctx: &Context, all: bool) -> Result<Vec<MachineSummary>> {
     Ok(summaries)
 }
 
+/// Whether a machine of a listing is one of nspawn's machines: one it keeps a record of,
+/// and not a record pulled or built that never ran, which is an image.
+pub fn is_machine(store: &Store, summary: &MachineSummary) -> bool {
+    match &summary.record {
+        Some(record) => {
+            !(summary.state == "stopped" && crate::api::disk::image_only(store, record))
+        }
+        None => false,
+    }
+}
+
 fn listed(all: bool, state: &str) -> bool {
     all || state == "restarting"
 }

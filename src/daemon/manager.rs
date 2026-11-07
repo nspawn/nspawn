@@ -1441,6 +1441,15 @@ impl Manager {
         ]))
     }
 
+    /// Like `info`: the service's version, its machines by state and its images, where it
+    /// keeps them, its defaults and the host it runs on, as `values::info` has them.
+    async fn info(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Dict> {
+        let _busy = self.state.enter();
+        self.allow(&hdr, Action::Inspect).await?;
+        let info = api::info::info(self.ctx()).await?;
+        Ok(values::info(&info))
+    }
+
     /// Like `volume prune`: a job removing every volume no machine uses; its result lists
     /// them.
     async fn prune_volumes(&self, #[zbus(header)] hdr: Header<'_>) -> Result<OwnedObjectPath> {

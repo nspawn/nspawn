@@ -46,8 +46,8 @@ a client chooses the registry, never the policy.
 Every user may call; who may do what is polkit's answer. `ListImages`,
 `GetImage`, `ResolveImage`, `Generate`, `ListMachines`, `GetMachine`, `MachineStats`,
 `MachineProcesses`, `WaitMachine`, `Events`, `ListNetworks`, `GetNetwork`,
-`ListVolumes`, `GetVolume`, `ListSecrets`, `GetSecret`, `DiskUsage` and
-`BuildCacheUsage` ask for `org.nspawn.inspect`. Every other method asks for `org.nspawn.manage`: those
+`ListVolumes`, `GetVolume`, `ListSecrets`, `GetSecret`, `DiskUsage`,
+`BuildCacheUsage` and `Info` ask for `org.nspawn.inspect`. Every other method asks for `org.nspawn.manage`: those
 that change something, run something inside a machine, or use the registry
 credentials kept here, so `Logs`, `SearchImages`, `ListRepositories`,
 `ListTags` and `ImageDigest` among them. What inspect shows includes every
@@ -231,6 +231,12 @@ pull, and:
 | `remove` | b | removed once its run ends, from its first start on |
 
 The job's result `name` is the machine's name.
+
+### The service and its host
+
+| Method | Like | Notes |
+|---|---|---|
+| `Info() -> a{sv}` | `info` | version (s, the service's), machines (`a{st}`: total, running, paused, stopped; a record pulled or built that never ran is an image, not a machine), images (t, distinct images by their config: an image and the machines made from it count once), machines_dir, state_dir (s), backend (s, the configured default: auto, overlay, flat or mstack), auto_backend (s, what auto means here: overlay where the kernel has overlayfs, flat otherwise), log_driver (s, a machine's without `--log-driver`), registry (s, the configured one), architecture (s), systemd_version (s, `""` when it cannot be read), and the host's hostname, machine_id, kernel, os (s, PRETTY_NAME of os-release, `Linux` without one), cpus (t) and memory (t, bytes). The Docker API's `GET /info` answers from it |
 
 ### Images
 

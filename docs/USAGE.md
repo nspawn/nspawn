@@ -1006,6 +1006,16 @@ actions to a group with a polkit rule, as in `nspawn-wheel.rules` in the documen
 directory; doing that makes the group administrators of the host, since a machine's
 commands run as root and any host path can be mounted into one.
 
+`nspawn info` prints the command's version, then what the service answers: its
+version, its machines by state (a record pulled or built that never ran is an image),
+its images, the registry, the default storage backend (`auto (overlay)` says what auto
+picks on this host), the default log driver, where machines and state are kept,
+systemd's version and the host's kernel, OS, architecture, CPUs, memory, name and
+machine ID. It exits 1 with the error when the service does not answer, which is how a
+script checks that nspawn is usable. `--format json` (or `-f json`) prints the answer on
+one line, and `-f TEMPLATE` a Go template over its keys, those of `Info` in
+[DBUS.md](DBUS.md): `nspawn info -f '{{.machines.running}}'`.
+
 The service keeps running the binary it started with: after an upgrade it is the old
 one until it goes idle (a minute without work) or is restarted, so a command whose
 version differs from the service's warns and says to run `sudo systemctl restart

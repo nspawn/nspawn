@@ -1,12 +1,14 @@
-//! images prune, system df and system prune, their prompts and output as scripts that
-//! read them expect.
+//! info, images prune, system df and system prune, their prompts and output as scripts
+//! that read them expect.
 
 use std::collections::HashMap;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use zbus::zvariant::{OwnedValue, Value};
 
-use crate::cli::{BuilderDuArgs, BuilderPruneArgs, ImagesPruneArgs, SystemDfArgs, SystemPruneArgs};
+use crate::cli::{
+    BuilderDuArgs, BuilderPruneArgs, ImagesPruneArgs, InfoArgs, SystemDfArgs, SystemPruneArgs,
+};
 use crate::client::{self, Client, Dict, Options};
 use crate::output::table;
 
@@ -163,9 +165,7 @@ pub async fn images_prune(args: ImagesPruneArgs, client: &Client) -> Result<()> 
 }
 
 fn kind(dict: &Dict, key: &str) -> HashMap<String, u64> {
-    dict.get(key)
-        .and_then(|v| HashMap::<String, u64>::try_from(v.try_clone().ok()?).ok())
-        .unwrap_or_default()
+    client::numbers(dict, key)
 }
 
 fn rows(dict: &Dict, key: &str) -> Vec<Dict> {
@@ -399,6 +399,83 @@ pub async fn builder_prune(args: BuilderPruneArgs, client: &Client) -> Result<()
     Ok(())
 }
 
+/// `info`: the command's own version, then the service's answer as text, a template
+/// over it or JSON. The service's errors are this command's: a script reads its exit
+/// status to learn whether the service is there.
+pub async fn info(args: InfoArgs) -> Result<()> {
+    let format = args.format.as_deref().filter(|f| !f.is_empty());
+    // A template that does not parse is said before the service is asked.
+    let template = match format {
+        Some(f) if f != "json" => Some(
+            crate::gotemplate::Template::parse(f)
+                .map_err(|e| anyhow!("template parsing error: {e}"))?,
+        ),
+        _ => None,
+    };
+    if format.is_none() {
+        print!("{}", client_text(env!("CARGO_PKG_VERSION")));
+    }
+    let client = Client::connect().await?;
+    let answer = client.manager.info().await.map_err(client::error)?;
+    match (format, template) {
+        (_, Some(template)) => {
+            let text = template
+                .execute(&client::dict_to_json(&answer))
+                .map_err(|e| anyhow!("template parsing error: {e}"))?;
+            println!("{text}");
+        }
+        (Some(_), None) => println!("{}", client::dict_to_json(&answer)),
+        (None, None) => print!("{}", server_text(&answer)),
+    }
+    Ok(())
+}
+
+fn client_text(version: &str) -> String {
+    format!("Client:\n Version: {version}\n\n")
+}
+
+/// The service's answer to Info as `info` prints it.
+fn server_text(answer: &Dict) -> String {
+    let string = |key: &str| client::string(answer, key);
+    let machines = client::numbers(answer, "machines");
+    let count = |key: &str| machines.get(key).copied().unwrap_or(0);
+    let backend = match (string("backend"), string("auto_backend")) {
+        (backend, auto) if backend == "auto" && !auto.is_empty() => format!("auto ({auto})"),
+        (backend, _) => backend,
+    };
+    let mut lines = vec![
+        "Server:".to_string(),
+        format!(" Version: {}", string("version")),
+        format!(" Machines: {}", count("total")),
+        format!("  Running: {}", count("running")),
+        format!("  Paused: {}", count("paused")),
+        format!("  Stopped: {}", count("stopped")),
+        format!(" Images: {}", client::u64(answer, "images")),
+        format!(" Registry: {}", string("registry")),
+        format!(" Storage backend: {backend}"),
+        format!(" Log driver: {}", string("log_driver")),
+        format!(" Machines directory: {}", string("machines_dir")),
+        format!(" State directory: {}", string("state_dir")),
+    ];
+    let systemd = string("systemd_version");
+    if !systemd.is_empty() {
+        lines.push(format!(" systemd version: {systemd}"));
+    }
+    lines.extend([
+        format!(" Kernel version: {}", string("kernel")),
+        format!(" Operating system: {}", string("os")),
+        format!(" Architecture: {}", string("architecture")),
+        format!(" CPUs: {}", client::u64(answer, "cpus")),
+        format!(
+            " Total memory: {}",
+            crate::output::human_bytes(client::u64(answer, "memory"))
+        ),
+        format!(" Name: {}", string("hostname")),
+        format!(" ID: {}", string("machine_id")),
+    ]);
+    lines.join("\n") + "\n"
+}
+
 pub async fn builder_du(args: BuilderDuArgs, client: &Client) -> Result<()> {
     let rows = client
         .manager
@@ -587,6 +664,73 @@ mod tests {
         ] {
             assert_eq!(human_size(bytes), text, "{bytes}");
         }
+    }
+
+    fn info_answer(backend: &str, systemd: &str) -> Dict {
+        let info = crate::api::info::Info {
+            version: "3.0.0".into(),
+            machines: crate::api::info::Machines {
+                total: 5,
+                running: 2,
+                paused: 1,
+                stopped: 2,
+            },
+            images: 3,
+            machines_dir: "/var/lib/machines".into(),
+            state_dir: "/var/lib/nspawn".into(),
+            backend: backend.into(),
+            auto_backend: "overlay".into(),
+            log_driver: "local".into(),
+            registry: "hub.nspawn.org".into(),
+            architecture: "x86_64".into(),
+            systemd_version: systemd.into(),
+            host: crate::api::info::Host {
+                hostname: "box".into(),
+                machine_id: "0123456789abcdef0123456789abcdef".into(),
+                kernel: "6.17.1".into(),
+                os: "Fedora Linux 44".into(),
+                cpus: 4,
+                memory: 8 << 30,
+            },
+        };
+        crate::daemon::values::info(&info)
+    }
+
+    #[test]
+    fn info_prints_the_command_and_the_service() {
+        assert_eq!(client_text("3.0.1"), "Client:\n Version: 3.0.1\n\n");
+        assert_eq!(
+            server_text(&info_answer("auto", "259 (259.7-1.fc44)")),
+            "Server:\n Version: 3.0.0\n Machines: 5\n  Running: 2\n  Paused: 1\n  Stopped: 2\n \
+             Images: 3\n Registry: hub.nspawn.org\n Storage backend: auto (overlay)\n \
+             Log driver: local\n Machines directory: /var/lib/machines\n \
+             State directory: /var/lib/nspawn\n systemd version: 259 (259.7-1.fc44)\n \
+             Kernel version: 6.17.1\n Operating system: Fedora Linux 44\n \
+             Architecture: x86_64\n CPUs: 4\n Total memory: 8.0 GiB\n Name: box\n \
+             ID: 0123456789abcdef0123456789abcdef\n"
+        );
+        // A backend named in the configuration is that one; systemd's version is left
+        // out when it could not be read.
+        let named = server_text(&info_answer("flat", ""));
+        assert!(named.contains("\n Storage backend: flat\n"), "{named}");
+        assert!(!named.contains("systemd version"), "{named}");
+    }
+
+    #[test]
+    fn info_templates_read_the_service_s_keys() {
+        let answer = client::dict_to_json(&info_answer("auto", ""));
+        let run = |text: &str| {
+            crate::gotemplate::Template::parse(text)
+                .unwrap()
+                .execute(&answer)
+                .unwrap()
+        };
+        assert_eq!(run("{{.version}}"), "3.0.0");
+        assert_eq!(
+            run("{{.machines.running}} of {{.machines.total}}"),
+            "2 of 5"
+        );
+        assert_eq!(run("{{.backend}}/{{.auto_backend}}"), "auto/overlay");
     }
 
     #[test]

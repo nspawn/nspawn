@@ -105,6 +105,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         Command::AwaitDependencies { name } => {
             api::dependencies::await_all(&Context::new(config), &name).await
         }
+        // The command's own part is printed before the service is reached, which may fail.
+        Command::Info(args) => system::info(args).await,
         // The unit hooks must not depend on the service: a machine starts on its own.
         Command::Network(args) => match args.command {
             NetworkCommand::Prepare { name } => {
@@ -910,6 +912,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
         | Command::ApiServe { .. }
         | Command::PortProxy { .. }
         | Command::AwaitDependencies { .. }
+        | Command::Info(_)
         | Command::AttachExec { .. } => {
             unreachable!("handled before")
         }

@@ -137,6 +137,8 @@ pub trait Manager {
     #[zbus(allow_interactive_auth)]
     fn disk_usage(&self) -> zbus::Result<Dict>;
     #[zbus(allow_interactive_auth)]
+    fn info(&self) -> zbus::Result<Dict>;
+    #[zbus(allow_interactive_auth)]
     fn start_machine(
         &self,
         name: &str,
@@ -945,6 +947,13 @@ pub fn maybe_u64(dict: &Dict, key: &str) -> Option<u64> {
             .ok()
             .or_else(|| u32::try_from(v.clone()).ok().map(u64::from))
     })
+}
+
+/// An a{st}: counts or sizes by name, empty when absent.
+pub fn numbers(dict: &Dict, key: &str) -> HashMap<String, u64> {
+    dict.get(key)
+        .and_then(|v| HashMap::<String, u64>::try_from(v.try_clone().ok()?).ok())
+        .unwrap_or_default()
 }
 
 pub fn bool(dict: &Dict, key: &str) -> bool {

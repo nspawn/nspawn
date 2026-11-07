@@ -138,23 +138,6 @@ fn image_size(store: &Store, record: &ImageRecord) -> u64 {
     record.layers.iter().filter_map(|d| sizes.get(d)).sum()
 }
 
-/// How many images there are, as `list` makes them, without their sizes.
-pub fn count(ctx: &Context) -> anyhow::Result<usize> {
-    let store = &ctx.store;
-    let mut configs = BTreeSet::new();
-    for record in store.list_images()? {
-        let Ok(bytes) = store.load_manifest(&record.name) else {
-            continue;
-        };
-        if let Ok(manifest) =
-            serde_json::from_slice::<oci_client::manifest::OciImageManifest>(&bytes)
-        {
-            configs.insert(manifest.config.digest);
-        }
-    }
-    Ok(configs.len())
-}
-
 /// What the service resolves `key` to, read as clients of the Docker Engine API read the
 /// name of an image (ResolveImage with docker): None when nothing here goes by it, or it
 /// is no reference.
@@ -1086,7 +1069,13 @@ mod tests {
                 .save_manifest(name, manifest(config).as_bytes())
                 .unwrap();
         }
-        assert_eq!(count(&ctx).unwrap(), 2, "one image per config");
+        let count = crate::api::info::image_count(&ctx.store).unwrap();
+        assert_eq!(count, 2, "one image per config");
+        assert_eq!(
+            list(&ctx).unwrap().len() as u64,
+            count,
+            "the images the list has"
+        );
         let layer = "sha256:counted-once-e2e".to_string();
         let dir = ctx.store.layer_dir(&layer, crate::store::Ownership::Root);
         std::fs::create_dir_all(&dir).unwrap();

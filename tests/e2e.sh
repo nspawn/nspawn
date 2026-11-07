@@ -2756,7 +2756,7 @@ if command -v busctl >/dev/null 2>&1; then
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
   $NSPAWN ps 2>&1 >/dev/null | grep_q "warning: the nspawn service runs" && fail "the command and the service disagree on their version: $($NSPAWN ps 2>&1 >/dev/null)"
-  for m in ListImages GetImage Generate PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ImageDigest ResolveImage ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine PauseMachine UnpauseMachine MachineProcesses UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes AutoUpdate PruneImages DiskUsage ConnectNetwork DisconnectNetwork; do
+  for m in ListImages GetImage Generate PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ImageDigest ResolveImage ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine PauseMachine UnpauseMachine MachineProcesses UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes AutoUpdate PruneImages DiskUsage Info ConnectNetwork DisconnectNetwork; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do
@@ -2764,6 +2764,7 @@ if command -v busctl >/dev/null 2>&1; then
   done
   systemctl is-active nspawn.service >/dev/null || fail "the bus did not start nspawn.service"
   [ "$($B get-property $M Version)" = "s \"$($NSPAWN --version | awk '{print $2}')\"" ] || fail "Version property"
+  $B call $M Info | grep_q "\"version\" s \"$($NSPAWN --version | awk '{print $2}')\"" || fail "Info: $($B call $M Info 2>&1)"
   job=$($B call $M PullImage 'sa{sv}' "$IMAGE" 3 name s e2e-dbus backend s overlay force b true | awk '{print $2}' | tr -d '"')
   echo "pull job: $job"
   echo "$job" | grep_q "^/org/nspawn/job/" || fail "PullImage did not return a job path"
@@ -3296,6 +3297,29 @@ chmod +x "$dk_dir/dk"
 dk() { "$dk_dir/dk" "$@"; }
 $NSPAWN pull "$busybox_ref" --name e2e-dk-bb --force >/dev/null || fail "pull e2e-dk-bb"
 dk version --format '{{.Server.APIVersion}}' | grep_q '^1\.51$' || fail "docker version: $(dk version 2>&1 | tail -3)"
+# info: the service's Info, as nspawn info prints it, as the docker CLI reads it through
+# GET /info, and as a script calls nspawn by the name docker.
+out=$($NSPAWN info 2>&1) || fail "nspawn info: $out"
+{ echo "$out" | grep_q '^Client:' && echo "$out" | grep_q '^Server:' && echo "$out" | grep_q '^ Storage backend: '; } || fail "nspawn info printed: $out"
+nspawn_version=$($NSPAWN --version | awk '{print $2}')
+[ "$($NSPAWN info -f '{{.version}}' 2>&1)" = "$nspawn_version" ] || fail "info -f {{.version}}: $($NSPAWN info -f '{{.version}}' 2>&1)"
+$NSPAWN info --format json | python3 -c 'import json, sys
+d = json.load(sys.stdin)
+m = d["machines"]
+assert m["total"] == m["running"] + m["paused"] + m["stopped"], m
+assert d["state_dir"] and d["kernel"] and d["os"] and d["cpus"] >= 1 and d["memory"] > 0, d
+assert d["log_driver"] == "local" and d["backend"] in ("auto", "overlay", "flat", "mstack"), d' || fail "info --format json: $($NSPAWN info --format json 2>&1)"
+ours=$($NSPAWN info -f '{{.machines.total}} {{.machines.running}} {{.images}} {{.version}} {{.state_dir}} {{.kernel}}' 2>&1)
+theirs=$(dk info --format '{{.Containers}} {{.ContainersRunning}} {{.Images}} {{.ServerVersion}} {{.DockerRootDir}} {{.KernelVersion}}' 2>&1)
+[ "$ours" = "$theirs" ] || fail "nspawn info and docker info disagree: $ours against $theirs"
+mkdir -p "$dk_dir/as-docker"
+ln -sf "$(readlink -f "$(command -v "$NSPAWN")")" "$dk_dir/as-docker/docker"
+"$dk_dir/as-docker/docker" info >/dev/null 2>&1 || fail "docker info with docker a link to nspawn: $("$dk_dir/as-docker/docker" info 2>&1 | tail -3)"
+[ "$("$dk_dir/as-docker/docker" info -f '{{.version}}' 2>&1)" = "$nspawn_version" ] || fail "docker info -f through the link: $("$dk_dir/as-docker/docker" info -f '{{.version}}' 2>&1)"
+# Without the service, the exit status says so.
+out=$(DBUS_SYSTEM_BUS_ADDRESS=unix:path=/nonexistent/e2e-bus "$dk_dir/as-docker/docker" info 2>&1); rc=$?
+[ "$rc" = 1 ] || fail "info without a bus exited $rc: $out"
+echo "$out" | grep_q '^error: ' || fail "info without a bus did not say why: $out"
 # run -d: create, a wait sent before the start, start; the machine runs under its name.
 id=$(dk run -d --name e2e-dk-a --label e2e.dk=1 e2e-dk-bb sleep 600 2>&1) || fail "docker run -d: $id"
 [[ $id =~ ^[0-9a-f]{64}$ ]] || fail "docker run -d printed $id, not an ID"

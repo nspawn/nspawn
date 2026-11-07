@@ -109,6 +109,9 @@ pub enum Command {
     Secret(SecretArgs),
     /// What nspawn keeps on disk, and its prune.
     System(SystemArgs),
+    /// The service's version, machines, images and defaults, and the host it runs on;
+    /// fails when the service does not answer.
+    Info(InfoArgs),
     /// The cache of Dockerfile builds.
     Builder(BuilderArgs),
     /// Run docker compose files on nspawn machines.
@@ -1019,6 +1022,14 @@ pub struct ImagesPruneArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct InfoArgs {
+    /// A Go template over the service's answer ('{{.version}}', '{{.machines.running}}');
+    /// the keys are the ones of --format json, which prints the answer on one line.
+    #[arg(long, short = 'f', value_name = "FORMAT")]
+    pub format: Option<String>,
+}
+
+#[derive(Args, Debug)]
 pub struct SystemArgs {
     #[command(subcommand)]
     pub command: SystemCommand,
@@ -1687,6 +1698,25 @@ mod tests {
         ));
         // A flag of the list belongs before no subcommand.
         assert!(images(&["nspawn", "images", "--json", "rm", "web"]).is_err());
+    }
+
+    #[test]
+    fn info_takes_a_format() {
+        let format = |argv: &[&str]| match Cli::try_parse_from(argv).map(|c| c.command) {
+            Ok(Command::Info(a)) => Ok(a.format),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e.kind()),
+        };
+        assert_eq!(format(&["nspawn", "info"]), Ok(None));
+        assert_eq!(
+            format(&["nspawn", "info", "--format", "json"]),
+            Ok(Some("json".into()))
+        );
+        assert_eq!(
+            format(&["nspawn", "info", "-f", "{{.version}}"]),
+            Ok(Some("{{.version}}".into()))
+        );
+        assert!(format(&["nspawn", "info", "web"]).is_err());
     }
 
     #[test]
