@@ -928,7 +928,7 @@ Besides commands and flags, TAB completes names, asked from the service as it go
 example:
 
 - the running machines after `stop`, `exec`, `kill`, `pause`, `unpause`, `top`,
-  `shell`, `stats` and `port`;
+  `shell`, `stats`, `port` and `logs -f`;
 - the images that do not run after `start`;
 - every machine and image after `rm`, `inspect`, `logs`, `restart`, `update`,
   `images rm` and `images inspect`, and every machine after `wait`, `generate`,

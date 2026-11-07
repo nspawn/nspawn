@@ -1619,7 +1619,7 @@ fn log_lines(text: &str) -> Result<u32, String> {
 #[derive(Args, Debug, Default)]
 pub struct LogsArgs {
     /// Machine names; with several, every line carries its machine's name.
-    #[arg(required = true, add = candidates(Kind::Any))]
+    #[arg(required = true, add = candidates(Kind::Logs))]
     pub machines: Vec<String>,
     /// Keep printing new output (starts from the last 10 lines unless --lines says otherwise).
     #[arg(long, short = 'f')]

@@ -2857,6 +2857,10 @@ if command -v busctl >/dev/null 2>&1; then
     tab stop "" | grep_q '^-' && fail "TAB after stop offers flags among the names: $(tab stop "")"
     tab stop -- | grep_q -x -- --force || fail "TAB after stop -- does not offer the flags: $(tab stop --)"
     tab start "" | grep_q -x e2e-dbus && fail "TAB after start offers a running machine: $(tab start "")"
+    # logs -f follows what runs; logs alone takes any machine or image.
+    names() { tab "$@" | grep -v '^-'; }
+    [ "$(names logs -f "")" = "$(names stop "")" ] || fail "TAB after logs -f offers other than the running machines: $(names logs -f "")"
+    [ "$(names logs "" | wc -l)" -gt "$(names stop "" | wc -l)" ] || fail "TAB after logs offers the running machines alone: $(names logs "")"
     tab rm e2e-d | grep_q -x e2e-dbus || fail "TAB after rm e2e-d does not offer e2e-dbus: $(tab rm e2e-d)"
     tab network rm "" | grep_q -x bridge || fail "TAB after network rm misses bridge: $(tab network rm "")"
     tab secret rm "" | grep_q -v '^-' && fail "TAB after secret rm offers names: $(tab secret rm "")"

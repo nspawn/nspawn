@@ -33,8 +33,11 @@ pub enum Kind {
     Running,
     /// An image that does not run: start.
     Startable,
-    /// Any machine or image: rm, inspect, logs.
+    /// Any machine or image: rm, inspect.
     Any,
+    /// What logs follows: any machine or image, the running machines with -f, which
+    /// only they have output to follow of.
+    Logs,
     /// A local image: create, push.
     Image,
     /// The reference of a local image: run.
@@ -66,7 +69,7 @@ impl Kind {
         match self {
             Kind::Running => &[Query::Running],
             Kind::Startable => &[Query::Images, Query::Running],
-            Kind::Any => &[Query::Images, Query::Recorded],
+            Kind::Any | Kind::Logs => &[Query::Images, Query::Recorded],
             Kind::Image => &[Query::Images],
             Kind::Reference => &[Query::References],
             Kind::Network | Kind::NetworkChoice => &[Query::Networks],
@@ -85,7 +88,7 @@ impl Kind {
                     .filter(|n| !running.contains(n))
                     .collect()
             }
-            Kind::Any => [answer(Query::Images), answer(Query::Recorded)].concat(),
+            Kind::Any | Kind::Logs => [answer(Query::Images), answer(Query::Recorded)].concat(),
             Kind::NetworkChoice => [
                 answer(Query::Networks),
                 NETWORK_KINDS.map(String::from).to_vec(),
@@ -99,10 +102,65 @@ impl Kind {
     }
 }
 
+impl Kind {
+    /// The kind the words of the command line make of it: a candidate knows no other
+    /// argument, so logs reads its -f from them.
+    fn in_line(self, words: &[String]) -> Kind {
+        match self {
+            Kind::Logs if follows(words) => Kind::Running,
+            Kind::Logs => Kind::Any,
+            kind => kind,
+        }
+    }
+}
+
+/// Whether `logs` among `words` is given -f (--follow), alone or with other short flags;
+/// the values of --since and --until, which may start with a dash, are no flags.
+fn follows(words: &[String]) -> bool {
+    let mut after = words.iter().skip_while(|w| *w != "logs").skip(1);
+    while let Some(word) = after.next() {
+        match word.as_str() {
+            "--" => break,
+            "--follow" => return true,
+            "--since" | "--until" => {
+                after.next();
+            }
+            short
+                if short.starts_with('-')
+                    && !short.starts_with("--")
+                    && short[1..]
+                        .chars()
+                        .take_while(char::is_ascii_alphabetic)
+                        .any(|c| c == 'f') =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The words of the command line being completed, as the shell's script passes them.
+fn words() -> Vec<String> {
+    #[cfg(test)]
+    if let Some(words) = WORDS.with(|w| w.borrow().clone()) {
+        return words;
+    }
+    // A path that is no UTF-8 is a word like any other here, never a panic.
+    std::env::args_os()
+        .map(|w| w.to_string_lossy().into_owned())
+        .collect()
+}
+
 /// The candidates of an argument that takes a name of `kind`, asked when the shell
 /// completes it.
 pub fn candidates(kind: Kind) -> ArgValueCandidates {
     ArgValueCandidates::new(move || {
+        let kind = match kind {
+            Kind::Logs => kind.in_line(&words()),
+            kind => kind,
+        };
         kind.names(&ask(kind.queries()))
             .into_iter()
             .map(CompletionCandidate::new)
@@ -150,6 +208,8 @@ pub fn registration(shell: clap_complete::Shell) -> std::io::Result<Vec<u8>> {
 thread_local! {
     /// What the service would answer, for the tests.
     static ANSWERS: std::cell::RefCell<Option<Answers>> = const { std::cell::RefCell::new(None) };
+    /// The words of the command line, for the tests.
+    static WORDS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn ask(queries: &[Query]) -> Answers {
@@ -222,11 +282,14 @@ mod tests {
     fn complete(line: &str) -> Vec<String> {
         let words: Vec<std::ffi::OsString> = line.split(' ').map(Into::into).collect();
         let index = words.len() - 1;
-        clap_complete::engine::complete(&mut command(), words, index, None)
+        WORDS.with(|w| *w.borrow_mut() = Some(line.split(' ').map(String::from).collect()));
+        let offered = clap_complete::engine::complete(&mut command(), words, index, None)
             .unwrap()
             .iter()
             .map(|c| c.get_value().to_string_lossy().into_owned())
-            .collect()
+            .collect();
+        WORDS.with(|w| *w.borrow_mut() = None);
+        offered
     }
 
     #[test]
@@ -246,6 +309,15 @@ mod tests {
                 ("nspawn inspect ", &["db", "fedora-44", "old", "web"]),
                 ("nspawn generate ", &["db", "fedora-44", "old", "web"]),
                 ("nspawn logs ", &["db", "fedora-44", "old", "web"]),
+                ("nspawn logs -n 5 ", &["db", "fedora-44", "old", "web"]),
+                (
+                    "nspawn logs --since -1h ",
+                    &["db", "fedora-44", "old", "web"],
+                ),
+                ("nspawn logs -f ", &["db", "web"]),
+                ("nspawn logs --follow ", &["db", "web"]),
+                ("nspawn logs -tf ", &["db", "web"]),
+                ("nspawn logs web -f ", &["db", "web"]),
                 ("nspawn restart ", &["db", "fedora-44", "old", "web"]),
                 ("nspawn update ", &["db", "fedora-44", "old", "web"]),
                 ("nspawn images rm ", &["db", "fedora-44", "old", "web"]),
