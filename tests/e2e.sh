@@ -284,6 +284,10 @@ claim_names() {
 trap cleanup EXIT
 install_service
 claim_names
+# What the host's build cache held before any step built: a prune at the end runs only
+# when nothing, so that what the steps leave there (bases kept with their blobs) does not
+# reach the next run.
+cache_before=$($NSPAWN builder du --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null) || cache_before=unknown
 cleanup_machines
 
 # Docker Hub limits anonymous pulls by address, which the hosts that run the suite
@@ -4085,8 +4089,6 @@ step "build: Dockerfiles built as the reference builds them, the cache, the sand
 # builds it from the same bases (copies in the test registry) and the images must have
 # the same settings, history and layer contents.
 cases="$(dirname "$0")/build/cases"
-# What the host's build cache held before: a prune at the end runs only when nothing.
-cache_before=$($NSPAWN builder du --json 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null) || cache_before=unknown
 golden="$(dirname "$0")/build/golden"
 for dir in "$cases"/*/; do
   name=$(basename "$dir")
