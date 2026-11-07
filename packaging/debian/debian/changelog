@@ -1,3 +1,9 @@
+nspawn (3.1.0-1) unstable; urgency=medium
+
+  * --device-cgroup-rule for devices that come and go; an app given devices of the host runs without a user namespace; binds of file systems that take no idmapped mount (overlayfs, devtmpfs) no longer keep an app in a user namespace from starting.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Sat, 07 Nov 2026 00:37:11 -0500
+
 nspawn (3.0.0-1) unstable; urgency=medium
 
   * The Docker Engine API with its changes: containers made, run, attached to, exec'd in, copied to and from and removed, images pulled and removed, volumes and networks made and joined, on a host socket with polkit per client; -P/--publish-all; variables with line breaks; --timezone auto copies the host's zone into a root that lacks it; no output lost to journald's rate limit.
