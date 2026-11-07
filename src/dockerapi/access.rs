@@ -139,6 +139,11 @@ impl Client {
                         "the credentials of this socket's client could not be read".to_string(),
                     ));
                 };
+                // Root may do everything, so the bus and polkit are not asked: the
+                // answer stands where the system bus cannot be reached.
+                if process.uid == 0 {
+                    return Ok(());
+                }
                 // Held across the question, so that the requests of one connection
                 // are allowed once. A refusal is asked again: it may have been polkit
                 // out of reach.
