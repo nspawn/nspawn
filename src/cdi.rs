@@ -1041,6 +1041,7 @@ pub fn plan_with(registry: &Registry, tuning: &Tuning) -> Result<Option<Plan>> {
             source: PathBuf::from(&m.host_path),
             target: m.container_path.clone(),
             read_only: m.options.iter().any(|o| o == "ro"),
+            idmap: true,
         });
     }
     let depth = |b: &Bind| b.target.split('/').filter(|c| !c.is_empty()).count();
@@ -1744,6 +1745,7 @@ containerEdits:
                 source: lib.into(),
                 target: "/usr/lib/libcuda.so.1".into(),
                 read_only: true,
+                idmap: true,
             }]
         );
         assert_eq!(plan.hooks.len(), 1);

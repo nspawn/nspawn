@@ -103,6 +103,10 @@ pub struct Bind {
     pub source: PathBuf,
     pub target: String,
     pub read_only: bool,
+    /// Idmapped in a user namespace. A source on a file system that refuses an
+    /// idmapped mount (`volume::takes_idmap`: overlayfs, devtmpfs and the like) is bound
+    /// as it is instead, its owners unmapped, where `:idmap` would fail the start.
+    pub idmap: bool,
 }
 
 pub fn path(name: &str) -> PathBuf {
@@ -275,7 +279,11 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
     for bind in rendered_binds {
         // With private users the host's uid 0 is nobody inside; idmap makes root inside
         // the owner of what it writes.
-        let options = if private_users { ":idmap" } else { "" };
+        let options = if private_users && bind.idmap {
+            ":idmap"
+        } else {
+            ""
+        };
         files.push(format!(
             "{}={}:{}{options}",
             if bind.read_only {
@@ -1500,6 +1508,7 @@ mod tests {
                 source: PathBuf::from("/srv/www"),
                 target: "/www".into(),
                 read_only: false,
+                idmap: true,
             }],
             volume_units: None,
             network: Network::Bridge,
@@ -1524,6 +1533,7 @@ mod tests {
                 source: PathBuf::from("/srv/pg"),
                 target: "/var/lib/pgsql".into(),
                 read_only: false,
+                idmap: true,
             }],
             volume_units: Some(Path::new("/var/lib/nspawn/machines/db/units")),
             network: Network::Host,
@@ -1546,6 +1556,7 @@ mod tests {
                 source: PathBuf::from("/srv/pg"),
                 target: "/var/lib/pgsql".into(),
                 read_only: false,
+                idmap: true,
             }],
             volume_units: Some(Path::new("/var/lib/nspawn/machines/db/units")),
             network: Network::Host,
@@ -1678,11 +1689,20 @@ mod tests {
                 source: PathBuf::from("/srv/data"),
                 target: "/data".into(),
                 read_only: false,
+                idmap: true,
             },
             Bind {
                 source: PathBuf::from("/var/lib/nspawn/volumes/cfg"),
                 target: "/etc/app".into(),
                 read_only: true,
+                idmap: true,
+            },
+            // The image's own getent, a file of the overlay root, which takes no idmap.
+            Bind {
+                source: PathBuf::from("/var/lib/machines/x/usr/bin/getent"),
+                target: "/run/nspawn/getent".into(),
+                read_only: true,
+                idmap: false,
             },
         ];
         let text = render(&MachineSettings {
@@ -1709,8 +1729,9 @@ mod tests {
             "Parameters=/bin/sleep infinity\nEnvironment=GREETING=hi\nUser=1000\nKillSignal=SIGRTMIN+4\n"
         ));
         assert!(!text.contains("[Network]"));
-        // The template's -U applies here, so volumes are idmapped.
-        assert!(text.ends_with("[Files]\nBind=/srv/data:/data:idmap\nBindReadOnly=/var/lib/nspawn/volumes/cfg:/etc/app:idmap\n"));
+        // The template's -U applies here, so volumes are idmapped, where their file
+        // system takes it.
+        assert!(text.ends_with("[Files]\nBind=/srv/data:/data:idmap\nBindReadOnly=/var/lib/nspawn/volumes/cfg:/etc/app:idmap\nBindReadOnly=/var/lib/machines/x/usr/bin/getent:/run/nspawn/getent\n"));
     }
 
     #[test]

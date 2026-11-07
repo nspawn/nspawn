@@ -129,6 +129,7 @@ pub fn shim(store: &Store, name: &str, record: &ImageRecord) -> Result<Vec<Bind>
         source: write(&dir, &content)?,
         target: TARGET.to_string(),
         read_only: true,
+        idmap: true,
     }];
     // A bind follows a symlink on the host, so only a program of the image itself is
     // handed over, found through the image's links inside its root.
@@ -143,6 +144,7 @@ pub fn shim(store: &Store, name: &str, record: &ImageRecord) -> Result<Vec<Bind>
                 source,
                 target: REAL.to_string(),
                 read_only: true,
+                idmap: true,
             });
         }
     }
@@ -192,6 +194,7 @@ pub fn shim_in_dir(root: &Path, user: &str, dir: &Path) -> Result<Vec<Bind>> {
         source: write(dir, &content)?,
         target: TARGET.to_string(),
         read_only: true,
+        idmap: true,
     }];
     if let Some(real) = placement.real {
         // Inside the root whatever its links say: the step's image is anybody's.
@@ -203,6 +206,7 @@ pub fn shim_in_dir(root: &Path, user: &str, dir: &Path) -> Result<Vec<Bind>> {
                 source,
                 target: REAL.to_string(),
                 read_only: true,
+                idmap: true,
             });
         }
     }

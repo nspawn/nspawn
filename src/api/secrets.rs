@@ -298,6 +298,7 @@ pub fn materialize(store: &Store, record: &ImageRecord) -> Result<Vec<Bind>> {
             source: path,
             target: secret.target.clone(),
             read_only: true,
+            idmap: true,
         });
     }
     Ok(binds)

@@ -99,7 +99,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-hapi-made e2e-hapi-img e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc e2e-v6 e2e-v6b e2e-v6c e2e-v6d e2e-v6u e2e-v6low e2e-notify e2e-fwd e2e-cbind-w-1; do
+  for m in e2e-hapi-made e2e-hapi-img e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-nsuser e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc e2e-v6 e2e-v6b e2e-v6c e2e-v6d e2e-v6u e2e-v6low e2e-notify e2e-fwd e2e-cbind-w-1; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -1527,6 +1527,17 @@ $NSPAWN stop e2e-noshell >/dev/null || fail "stop e2e-noshell as 4242"
 out=$($NSPAWN start e2e-noshell -u ghost -- /bin/sleep 300 2>&1) && fail "a user the image lacks was started"
 echo "$out" | grep_q "unable to find user ghost" || fail "the unknown user was not explained: $out"
 $NSPAWN rm -f e2e-noshell >/dev/null || fail "rm e2e-noshell"
+# A user in a user namespace (--network none), with a getent of the image's own: a file
+# of the overlay root, which takes no idmapped bind, so it goes in as it is. Machines of
+# $app, so that no image is pulled ahead of the steps that pull their own.
+$NSPAWN create $app e2e-nsuser -- /bin/sleep 300 >/dev/null || fail "create e2e-nsuser"
+$NSPAWN start e2e-nsuser >/dev/null || fail "start e2e-nsuser"
+$NSPAWN exec e2e-nsuser -- /bin/sh -c 'mkdir -p /usr/bin && printf "#!/bin/sh\nexit 2\n" > /usr/bin/getent && chmod 755 /usr/bin/getent' </dev/null || fail "give e2e-nsuser a getent of its own"
+$NSPAWN stop e2e-nsuser >/dev/null || fail "stop e2e-nsuser"
+out=$($NSPAWN start e2e-nsuser -u 1000 --network none 2>&1) || fail "start as a user in a user namespace with the image's own getent: $out"
+[ "$($NSPAWN exec e2e-nsuser -- id -u </dev/null | tr -d '\r')" = 1000 ] || fail "e2e-nsuser does not run as 1000: $($NSPAWN exec e2e-nsuser -- id </dev/null 2>&1)"
+[ "$($NSPAWN exec -u root e2e-nsuser -- cat /proc/self/uid_map </dev/null | tr -s ' ' | tr -d '\r')" != " 0 0 4294967295" ] || fail "e2e-nsuser is not in a user namespace"
+$NSPAWN rm -f e2e-nsuser >/dev/null || fail "rm e2e-nsuser"
 out=$($NSPAWN start $app --sysctl kernel.shmmax=1 2>&1) && fail "a sysctl beyond net.* was accepted"
 # A refused combination is not remembered: the next start without flags must work.
 out=$($NSPAWN start $app --network none --sysctl net.ipv4.ip_forward=1 -- /bin/sleep 300 2>&1) && fail "--sysctl was accepted with --network none"

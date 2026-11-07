@@ -539,7 +539,7 @@ async fn check_interfaces(
 
 /// Where the CDI device nodes the host lacks are made for a machine.
 /// Whether the running kernel is MAJOR.MINOR or later.
-fn kernel_at_least(major: u32, minor: u32) -> bool {
+pub fn kernel_at_least(major: u32, minor: u32) -> bool {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .is_ok_and(|text| release_at_least(&text, major, minor))
 }
@@ -900,6 +900,7 @@ pub async fn prepare(
                 source: socket,
                 target: volume.target.clone(),
                 read_only: volume.read_only,
+                idmap: true,
             });
             continue;
         }
@@ -972,6 +973,7 @@ pub async fn prepare(
             source,
             target: volume.target.clone(),
             read_only: volume.read_only,
+            idmap: true,
         });
     }
     // /run is a tmpfs of every machine already, and one over it would hide what
@@ -1113,6 +1115,9 @@ pub async fn prepare(
     } else {
         None
     };
+    for bind in &mut binds {
+        bind.idmap = volume::takes_idmap(&bind.source);
+    }
     let route =
         settings::namespace_route(sd, name, record.mode, bridge::namespaced(&record)).await?;
     settings::write(

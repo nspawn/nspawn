@@ -654,7 +654,11 @@ for one through `Interface=`.
 ## Volumes
 
 `-v SOURCE:TARGET[:ro]` becomes a `Bind=` or `BindReadOnly=` line, idmapped
-when the machine runs with private users. mstack machines cannot idmap binds,
+when the machine runs with private users and the source's file system takes it
+(`volume::takes_idmap`, from mountinfo: not overlayfs, devtmpfs, proc, sysfs,
+NFS, CIFS or FUSE, nor tmpfs before Linux 6.3), as are the binds nspawn adds (the
+getent stand-in, secrets, the API socket); the image's own getent, a file of an
+overlay root, goes in as it is. mstack machines cannot idmap binds,
 so their volumes are attached from the host by the publish hook (`open_tree`,
 `mount_setattr` with the machine's user namespace, `move_mount`). Every booted
 machine with volumes gets `nspawn-volumes.service`, which holds

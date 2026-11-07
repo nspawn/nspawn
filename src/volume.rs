@@ -481,6 +481,90 @@ fn from_environment(name: &str) -> Option<String> {
         .map(|current| format!("{name}={current}"))
 }
 
+/// File systems that refuse an idmapped mount, from what the kernel lets be idmapped:
+/// overlayfs (a file of an overlay machine's own root), the kernel's own (devtmpfs for
+/// a -v of /dev, proc, sysfs), and network and FUSE ones.
+const NO_IDMAP: [&str; 15] = [
+    "overlay", "devtmpfs", "devpts", "proc", "sysfs", "ramfs", "mqueue", "cgroup", "cgroup2",
+    "nfs", "nfs4", "cifs", "smb3", "9p", "fuse",
+];
+
+/// Whether a bind of `source` may be idmapped in a user namespace: not on a file system
+/// that refuses it, where systemd-nspawn would fail the start with EINVAL, nor on tmpfs
+/// before Linux 6.3. A file system nspawn does not know is taken as one that does.
+pub fn takes_idmap(source: &Path) -> bool {
+    let (Ok(path), Ok(mountinfo)) = (
+        source.canonicalize(),
+        std::fs::read_to_string("/proc/self/mountinfo"),
+    ) else {
+        return true;
+    };
+    kind_takes_idmap(file_system_of(&mountinfo, &path), || {
+        crate::api::machines::kernel_at_least(6, 3)
+    })
+}
+
+/// Whether a file system of type `kind` takes an idmapped mount, `tmpfs_does` saying
+/// whether the kernel idmaps tmpfs.
+fn kind_takes_idmap(kind: Option<&str>, tmpfs_does: impl Fn() -> bool) -> bool {
+    match kind {
+        Some("tmpfs") => tmpfs_does(),
+        Some(kind) => !NO_IDMAP.contains(&kind) && !kind.starts_with("fuse."),
+        None => true,
+    }
+}
+
+/// The type of the file system `path` (canonical) is on, as `mountinfo` lists the
+/// mounts: the deepest mount point above it, the last of those on the same point.
+fn file_system_of<'a>(mountinfo: &'a str, path: &Path) -> Option<&'a str> {
+    let mut found: Option<(usize, &str)> = None;
+    for line in mountinfo.lines() {
+        let Some((mount, rest)) = line.split_once(" - ") else {
+            continue;
+        };
+        let (Some(point), Some(kind)) = (mount.split(' ').nth(4), rest.split(' ').next()) else {
+            continue;
+        };
+        let point = PathBuf::from(unescape_mountinfo(point));
+        if !path.starts_with(&point) {
+            continue;
+        }
+        let depth = point.components().count();
+        if found.is_none_or(|(deepest, _)| depth >= deepest) {
+            found = Some((depth, kind));
+        }
+    }
+    found.map(|(_, kind)| kind)
+}
+
+/// A mount point as mountinfo writes it, with space, tab, newline and backslash as
+/// three octal digits after a backslash.
+fn unescape_mountinfo(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes
+            .get(i + 1..i + 4)
+            .filter(|d| d.iter().all(|c| (b'0'..=b'7').contains(c)));
+        match (bytes[i], octal) {
+            (b'\\', Some(digits)) => {
+                out.push(
+                    digits
+                        .iter()
+                        .fold(0u8, |n, d| n.wrapping_mul(8) + (d - b'0')),
+                );
+                i += 4;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Copies the value of every bare `VAR` from this process's environment, so that a
 /// caller's variables reach a service that has an environment of its own, and leaves out
 /// a bare `VAR` the environment does not hold. `VAR=value` and "none" pass through as
@@ -568,6 +652,44 @@ pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bind_is_idmapped_where_its_file_system_takes_it() {
+        use std::path::Path;
+        let mountinfo = "\
+22 1 0:21 / / rw,relatime shared:1 - ext4 /dev/vda2 rw
+25 22 0:5 / /dev rw,nosuid shared:2 - devtmpfs devtmpfs rw,size=4096k
+26 25 0:23 / /dev/pts rw,nosuid shared:3 - devpts devpts rw
+30 22 0:25 / /run rw,nosuid shared:5 - tmpfs tmpfs rw,mode=755
+40 22 0:30 / /var/lib/machines/web rw,relatime shared:9 - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w
+41 22 0:31 / /srv/my\\040data rw shared:10 - btrfs /dev/vdb rw
+42 22 0:32 / /mnt rw shared:11 - nfs4 server:/export rw
+43 22 0:33 / /mnt rw shared:12 - xfs /dev/vdc rw
+44 22 0:34 / /media/box rw shared:13 - fuse.sshfs box: rw
+";
+        let kind = |path: &str| super::file_system_of(mountinfo, Path::new(path));
+        assert_eq!(
+            kind("/var/lib/machines/web/usr/bin/getent"),
+            Some("overlay")
+        );
+        assert_eq!(kind("/var/lib/machines/webby/x"), Some("ext4"));
+        assert_eq!(kind("/dev/bus/usb"), Some("devtmpfs"));
+        assert_eq!(kind("/dev/pts/0"), Some("devpts"));
+        assert_eq!(kind("/srv/my data/db"), Some("btrfs"));
+        // The last mount on a point is the one in use.
+        assert_eq!(kind("/mnt/share"), Some("xfs"));
+        assert_eq!(kind("/home/a"), Some("ext4"));
+        let takes = |path: &str, tmpfs: bool| super::kind_takes_idmap(kind(path), || tmpfs);
+        assert!(takes("/srv/my data/db", false));
+        assert!(takes("/home/a", false));
+        assert!(!takes("/var/lib/machines/web/usr/bin/getent", true));
+        assert!(!takes("/dev/bus/usb/001/002", true));
+        assert!(!takes("/media/box/f", true));
+        assert!(takes("/run/nspawn/api/web.sock", true));
+        assert!(!takes("/run/nspawn/api/web.sock", false));
+        // A file system nspawn does not know is idmapped, as every one was.
+        assert!(super::kind_takes_idmap(Some("zfs"), || false));
+        assert!(super::kind_takes_idmap(None, || false));
+    }
 
     #[test]
     fn the_api_socket_paths_and_the_host_s_socket_are_the_api_s() {

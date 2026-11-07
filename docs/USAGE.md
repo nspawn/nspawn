@@ -237,7 +237,9 @@ relabelling `z` and `Z` (the policy labels what a machine sees), a propagation
 `/var/lib/nspawn/volumes/NAME` and creates it on first use with what the image has at
 that path, owner and files included. In machines that run with private users the mount
 is idmapped, so a file root writes inside belongs to root on the host, and the other
-way round. `-e none` and `-v none` forget them.
+way round; a source on a file system that takes no idmapped mount (overlayfs, devtmpfs,
+proc, sysfs, NFS, CIFS, FUSE, tmpfs before Linux 6.3) goes in as it is, its owners
+unmapped inside. `-e none` and `-v none` forget them.
 
 Every booted machine with volumes gets a small unit mounted into it,
 `nspawn-volumes.service`, that holds `local-fs.target` until all of them are mounted and
