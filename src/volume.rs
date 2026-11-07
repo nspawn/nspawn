@@ -225,7 +225,7 @@ pub const API_SOCKET_PATHS: [&str; 2] = ["/var/run/docker.sock", "/run/docker.so
 pub const HOST_API_SOCKET: &str = "/run/nspawn/api.sock";
 
 /// Whether a bind's source is a socket of the Docker API, which the machine gets its
-/// own of instead: docker's paths, or the host's socket itself, which a client of it
+/// own of instead: API_SOCKET_PATHS, or the host's socket itself, which a client of it
 /// mounts into a container it makes (Testcontainers' reaper does).
 pub fn is_api_socket_path(source: &str) -> bool {
     API_SOCKET_PATHS.contains(&source)
@@ -238,7 +238,7 @@ impl Volume {
         !self.source.starts_with('/')
     }
 
-    /// A bind of docker's socket, which becomes the machine's Docker API socket.
+    /// A bind of the Docker API's socket, which becomes the machine's own.
     pub fn is_api_socket(&self) -> bool {
         is_api_socket_path(&self.source)
     }
@@ -570,7 +570,7 @@ pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
 mod tests {
 
     #[test]
-    fn docker_s_paths_and_the_host_s_socket_are_the_api_s() {
+    fn the_api_socket_paths_and_the_host_s_socket_are_the_api_s() {
         for source in [
             "/var/run/docker.sock",
             "/run/docker.sock",

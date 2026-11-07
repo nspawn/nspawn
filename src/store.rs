@@ -180,7 +180,7 @@ impl ImageRecord {
         self.mode == Mode::App && !self.program_is_pid1()
     }
 
-    /// Whether it mounts docker's socket, and so gets nspawn's Docker API.
+    /// Whether it mounts the Docker API's socket, and so gets nspawn's Docker API.
     pub fn takes_api_socket(&self) -> bool {
         self.volumes.iter().any(Volume::is_api_socket)
     }

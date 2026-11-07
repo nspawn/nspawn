@@ -480,14 +480,14 @@ mod tests {
     }
 
     #[test]
-    fn shapes_against_docker() {
+    fn shapes_match_the_recorded_answers() {
         use crate::dockerapi::shapes::{diff, golden};
-        let docker = golden(include_str!(
+        let recorded = golden(include_str!(
             "../../tests/dockerapi/golden/volumes-dangling.body"
         ));
         let ours = json!({ "Volumes": [json(&volume("loose", &[]))], "Warnings": null });
-        assert_eq!(diff(&ours, &docker), (vec![], vec![]), "list");
-        let docker = golden(include_str!(
+        assert_eq!(diff(&ours, &recorded), (vec![], vec![]), "list");
+        let recorded = golden(include_str!(
             "../../tests/dockerapi/golden/volume-kept.body"
         ));
         let ours = json(&labelled(
@@ -495,12 +495,12 @@ mod tests {
             &[("e2e", "yes"), ("tier", "data")],
             false,
         ));
-        assert_eq!(diff(&ours, &docker), (vec![], vec![]), "labelled");
-        assert_eq!(ours["Labels"], docker["Labels"]);
-        let docker = golden(include_str!(
+        assert_eq!(diff(&ours, &recorded), (vec![], vec![]), "labelled");
+        assert_eq!(ours["Labels"], recorded["Labels"]);
+        let recorded = golden(include_str!(
             "../../tests/dockerapi/golden/volume-missing.body"
         ));
-        assert_eq!(docker["message"], "get nope: no such volume");
+        assert_eq!(recorded["message"], "get nope: no such volume");
     }
 
     #[test]

@@ -327,7 +327,7 @@ pub struct HookSpec<'a> {
     pub remove_on_exit: bool,
     /// --device: DeviceAllow= for the unit's cgroup.
     pub tuning: &'a Tuning,
-    /// It mounts docker's socket: its socket unit serves nspawn's Docker API.
+    /// It mounts the Docker API's socket: its socket unit serves nspawn's Docker API.
     pub api_socket: bool,
 }
 

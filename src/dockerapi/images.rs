@@ -139,12 +139,15 @@ fn image_size(store: &Store, record: &ImageRecord) -> u64 {
 }
 
 /// What the service resolves `key` to, read as clients of the Docker Engine API read the
-/// name of an image (ResolveImage with docker): None when nothing here goes by it, or it
+/// name of an image (ResolveImage with docker_api): None when nothing here goes by it, or it
 /// is no reference.
 pub async fn resolve(key: &str) -> anyhow::Result<Option<Resolved>> {
     let client = crate::client::Client::connect().await?;
     let mut options = crate::client::Options::new();
-    options.insert("docker", zbus::zvariant::Value::from(true));
+    options.insert(
+        crate::api::resolve::DOCKER_API_OPTION,
+        zbus::zvariant::Value::from(true),
+    );
     match client.manager.resolve_image(key, options).await {
         Ok(found) => Ok(Some(Resolved {
             name: crate::client::string(&found, "name"),
@@ -1213,45 +1216,45 @@ mod tests {
     }
 
     #[test]
-    fn shapes_against_docker() {
+    fn shapes_match_the_recorded_answers() {
         use crate::dockerapi::shapes::{diff, golden};
         let (_tmp, ctx) = context();
         let image = busybox();
         let list = golden(include_str!("../../tests/dockerapi/golden/images.body"));
-        let docker = list
+        let recorded = list
             .as_array()
             .unwrap()
             .iter()
             .find(|i| i["Id"] == image.id.as_str())
             .unwrap();
         let ours = summary_json(&image);
-        assert_eq!(diff(&ours, docker), (vec![], vec![]), "summary");
-        assert_eq!(ours["Containers"], docker["Containers"]);
-        assert_eq!(ours["RepoTags"], docker["RepoTags"]);
-        let docker = golden(include_str!(
+        assert_eq!(diff(&ours, recorded), (vec![], vec![]), "summary");
+        assert_eq!(ours["Containers"], recorded["Containers"]);
+        assert_eq!(ours["RepoTags"], recorded["RepoTags"]);
+        let recorded = golden(include_str!(
             "../../tests/dockerapi/golden/image-busybox.body"
         ));
         let ours = inspect_json(&ctx.store, &image);
         // The engine's layers are mounted for the image; this store's are directories.
-        let (extra, missing) = diff(&ours, &docker);
+        let (extra, missing) = diff(&ours, &recorded);
         assert!(extra.is_empty(), "inspect: extra {extra:?}");
         assert_eq!(
             missing,
             [".GraphDriver.Data.MergedDir", ".GraphDriver.Data.WorkDir"],
             "inspect"
         );
-        assert_eq!(ours["Config"], docker["Config"]);
-        assert_eq!(ours["RootFS"], docker["RootFS"]);
-        assert_eq!(ours["Created"], docker["Created"]);
-        let docker = golden(include_str!(
+        assert_eq!(ours["Config"], recorded["Config"]);
+        assert_eq!(ours["RootFS"], recorded["RootFS"]);
+        assert_eq!(ours["Created"], recorded["Created"]);
+        let recorded = golden(include_str!(
             "../../tests/dockerapi/golden/history-busybox.body"
         ));
         let mut ours = history_json(&ctx, &image);
         // Sizes are of the layers here, which this store has none of.
-        ours[0]["Size"] = docker[0]["Size"].clone();
-        assert_eq!(ours, docker, "history");
-        let docker = golden(include_str!("../../tests/dockerapi/golden/system-df.body"));
-        let docker = docker["Images"]
+        ours[0]["Size"] = recorded[0]["Size"].clone();
+        assert_eq!(ours, recorded, "history");
+        let recorded = golden(include_str!("../../tests/dockerapi/golden/system-df.body"));
+        let recorded = recorded["Images"]
             .as_array()
             .unwrap()
             .iter()
@@ -1259,13 +1262,13 @@ mod tests {
             .unwrap()
             .clone();
         let (entries, _) = disk_usage(&ctx, std::slice::from_ref(&image));
-        assert_eq!(diff(&entries[0], &docker), (vec![], vec![]), "system df");
-        let docker = golden(include_str!(
+        assert_eq!(diff(&entries[0], &recorded), (vec![], vec![]), "system df");
+        let recorded = golden(include_str!(
             "../../tests/dockerapi/golden/image-missing.body"
         ));
         assert_eq!(
             find(&[image], "nope", None).unwrap_err(),
-            docker["message"].as_str().unwrap()
+            recorded["message"].as_str().unwrap()
         );
     }
 
@@ -1759,10 +1762,10 @@ mod changes {
             .any(|e| e.get("Deleted").is_some()));
         let body = pruned_body(&[image], &records, &[], REGISTRY, 0);
         assert_eq!(body, json!({ "ImagesDeleted": null, "SpaceReclaimed": 0 }));
-        let docker: Value =
+        let recorded: Value =
             serde_json::from_str(r#"{"ImagesDeleted":null,"SpaceReclaimed":0}"#).unwrap();
         assert_eq!(
-            crate::dockerapi::shapes::diff(&body, &docker),
+            crate::dockerapi::shapes::diff(&body, &recorded),
             (vec![], vec![])
         );
     }

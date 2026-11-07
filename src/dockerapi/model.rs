@@ -1365,7 +1365,7 @@ mod tests {
     }
 
     #[test]
-    fn shapes_against_docker() {
+    fn shapes_match_the_recorded_answers() {
         let (ctx, snapshot) = fixture();
         let m = &snapshot.machines[0];
         let image = ImageInfo {

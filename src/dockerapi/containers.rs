@@ -1784,9 +1784,9 @@ mod tests {
             );
         }
         assert!(prune_options(&f(r#"{"until":["soon"]}"#), now, 0).is_err());
-        let docker = golden(&file("golden/prune.body"));
+        let recorded = golden(&file("golden/prune.body"));
         let ours = prune_body(vec![LIFE.into(), CREATED.into()], 4096);
-        assert_eq!(diff(&ours, &docker), (vec![], vec![]));
+        assert_eq!(diff(&ours, &recorded), (vec![], vec![]));
         assert_eq!(prune_body(Vec::new(), 0)["ContainersDeleted"], Value::Null);
     }
 

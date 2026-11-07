@@ -1818,7 +1818,7 @@ impl Manager {
     /// The local record a reference means: name (s), the record, and reference (s), the
     /// reference it goes by there in full. Read as the command line reads a reference
     /// (a name without a registry under the configured one first, then as Docker Hub's),
-    /// or with docker (b) as clients of the Docker Engine API read one (Docker Hub's
+    /// or with docker_api (b) as clients of the Docker Engine API read one (Docker Hub's
     /// first, then an image built here under the configured registry); among the records
     /// of a reference, images before machines and the last made first. Options
     /// images_only (b), except (s, a record passed over), registry (s). NoSuchImage when
@@ -1832,13 +1832,13 @@ impl Manager {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Inspect).await?;
         let mut options = Options::new(&options);
-        let docker = options.bool("docker", false)?;
+        let docker_api = options.bool(api::resolve::DOCKER_API_OPTION, false)?;
         let images_only = options.bool("images_only", false)?;
         let except = options.string("except")?.filter(|e| !e.is_empty());
         let ctx = self.context_for(&mut options)?;
         options.finish()?;
-        let reading = if docker {
-            api::resolve::Reading::Docker
+        let reading = if docker_api {
+            api::resolve::Reading::DockerApi
         } else {
             api::resolve::Reading::Nspawn
         };

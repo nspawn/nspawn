@@ -857,7 +857,7 @@ pub async fn prepare(
         crate::backend::mount_root(sd, store, name).await?;
     }
     if record.takes_api_socket() && record.backend == BackendChoice::Mstack {
-        bail!("{name} mounts docker's socket, which nspawn's Docker API cannot reach into an mstack machine yet; make it with --backend overlay");
+        bail!("{name} mounts the Docker API's socket, which nspawn's Docker API cannot reach into an mstack machine yet; make it with --backend overlay");
     }
     let mut binds = Vec::new();
     duplicate_mount_points(&record)?;
@@ -880,8 +880,8 @@ pub async fn prepare(
                 note(
                     report,
                     format!(
-                        "note: {} in {name} is nspawn's Docker API, not this host's docker",
-                        volume.target
+                        "note: {} in {name} is nspawn's Docker API, not what this host has at {}",
+                        volume.target, volume.source
                     ),
                 );
             }

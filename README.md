@@ -78,7 +78,7 @@ and usage examples.
   (s6-overlay, as linuxserver.io's images and Home Assistant's), with the environment,
   user, working directory and stop signal of its OCI config. Both take the same flags
   and join the same networks.
-- **docker's socket for the tools that read it.** A machine that mounts
+- **`/var/run/docker.sock` for the tools that read it.** A machine that mounts
   `/var/run/docker.sock` gets nspawn's Docker API there, and clients on the host get it
   at `/run/nspawn/api.sock`, with polkit deciding for each user, so reverse proxies that
   route by labels (caddy-docker-proxy, Traefik, nginx-proxy) and dashboards find the

@@ -18,8 +18,11 @@ pub enum Reading {
     /// mean it; an image built here goes by it too, under the configured registry, while
     /// Docker Hub's of that name is not here (`nspawn build -t somos/app:1` files the image
     /// as `hub.nspawn.org/somos/app:1`, which a client asks for as `somos/app:1`).
-    Docker,
+    DockerApi,
 }
+
+/// The option of ResolveImage that asks for `Reading::DockerApi`.
+pub const DOCKER_API_OPTION: &str = "docker_api";
 
 /// The record a name means, and the reference it goes by there in full: a tag, or
 /// `repository@digest` for a name with a digest.
@@ -87,7 +90,7 @@ pub fn spellings(text: &str, registry: &str, reading: Reading) -> Result<Vec<(St
     let as_local = ImageRef::parse(text, registry).map(by_digest);
     let ordered = match reading {
         Reading::Nspawn => [(as_local, false), (as_hub, false)],
-        Reading::Docker => [(as_hub, false), (as_local, true)],
+        Reading::DockerApi => [(as_hub, false), (as_local, true)],
     };
     let mut out: Vec<(String, bool)> = Vec::new();
     let mut refused = None;
@@ -177,26 +180,26 @@ mod tests {
             ]
         );
         assert_eq!(
-            spellings("somos/app:1", REGISTRY, Reading::Docker).unwrap(),
+            spellings("somos/app:1", REGISTRY, Reading::DockerApi).unwrap(),
             [
                 ("docker.io/somos/app:1".to_string(), false),
                 ("hub.nspawn.org/somos/app:1".to_string(), true)
             ]
         );
         // A name with its registry is that one alone, whoever reads it.
-        for reading in [Reading::Nspawn, Reading::Docker] {
+        for reading in [Reading::Nspawn, Reading::DockerApi] {
             assert_eq!(
                 spellings("ghcr.io/x/y:2", REGISTRY, reading).unwrap(),
                 [("ghcr.io/x/y:2".to_string(), false)]
             );
         }
         assert_eq!(
-            spellings("busybox", "docker.io", Reading::Docker).unwrap(),
+            spellings("busybox", "docker.io", Reading::DockerApi).unwrap(),
             [("docker.io/library/busybox:latest".to_string(), false)]
         );
         let pinned = format!("busybox:1.37@sha256:{}", "a".repeat(64));
         assert_eq!(
-            spellings(&pinned, REGISTRY, Reading::Docker).unwrap()[0].0,
+            spellings(&pinned, REGISTRY, Reading::DockerApi).unwrap()[0].0,
             format!("docker.io/library/busybox@sha256:{}", "a".repeat(64))
         );
         let bad = spellings("Bad Name", REGISTRY, Reading::Nspawn).unwrap_err();
@@ -214,7 +217,7 @@ mod tests {
             &store,
             REGISTRY,
             &format!("busybox:1.37@{digest}"),
-            Reading::Docker,
+            Reading::DockerApi,
             false,
             None,
         )
@@ -225,14 +228,14 @@ mod tests {
             format!("docker.io/library/busybox@{digest}")
         );
         let other = format!("busybox:1.37@sha256:{}", "e".repeat(64));
-        assert!(resolve(&store, REGISTRY, &other, Reading::Docker, false, None).is_err());
+        assert!(resolve(&store, REGISTRY, &other, Reading::DockerApi, false, None).is_err());
         // The image before the machine made from it, though the machine is newer; the
         // machine when it alone goes by the reference, unless images only are asked for.
         let tagged = resolve(
             &store,
             REGISTRY,
             "busybox:1.37",
-            Reading::Docker,
+            Reading::DockerApi,
             false,
             None,
         );
@@ -242,7 +245,7 @@ mod tests {
             &store,
             REGISTRY,
             "busybox:1.37",
-            Reading::Docker,
+            Reading::DockerApi,
             false,
             None,
         );
@@ -251,7 +254,7 @@ mod tests {
             &store,
             REGISTRY,
             "busybox:1.37",
-            Reading::Docker,
+            Reading::DockerApi,
             true,
             None
         )
@@ -263,7 +266,7 @@ mod tests {
         let built = record("somos-app-1", "hub.nspawn.org/somos/app:1", "build", 1);
         let (_tmp, store) = store_of(std::slice::from_ref(&built));
         // Both readings find an image built here by its short name.
-        for reading in [Reading::Nspawn, Reading::Docker] {
+        for reading in [Reading::Nspawn, Reading::DockerApi] {
             let found = resolve(&store, REGISTRY, "somos/app:1", reading, false, None).unwrap();
             assert_eq!(found.name, "somos-app-1");
             assert_eq!(found.reference, "hub.nspawn.org/somos/app:1");
@@ -272,16 +275,16 @@ mod tests {
         // configured registry's for the command line.
         let hub = record("somos-app-hub", "docker.io/somos/app:1", "pull", 2);
         let (_tmp, store) = store_of(&[built.clone(), hub]);
-        let docker = resolve(
+        let api = resolve(
             &store,
             REGISTRY,
             "somos/app:1",
-            Reading::Docker,
+            Reading::DockerApi,
             false,
             None,
         )
         .unwrap();
-        assert_eq!(docker.name, "somos-app-hub");
+        assert_eq!(api.name, "somos-app-hub");
         let nspawn = resolve(
             &store,
             REGISTRY,
@@ -296,7 +299,8 @@ mod tests {
         // a client of the Docker API.
         let pulled = record("busybox", "hub.nspawn.org/busybox:latest", "pull", 3);
         let (_tmp, store) = store_of(&[pulled]);
-        let none = resolve(&store, REGISTRY, "busybox", Reading::Docker, false, None).unwrap_err();
+        let none =
+            resolve(&store, REGISTRY, "busybox", Reading::DockerApi, false, None).unwrap_err();
         assert_eq!(crate::api::kind_of(&none), Some(FailureKind::NoSuchImage));
         assert_eq!(
             resolve(&store, REGISTRY, "busybox", Reading::Nspawn, false, None)

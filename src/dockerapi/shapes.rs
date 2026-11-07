@@ -1,4 +1,4 @@
-//! The shape of a JSON document, to hold this API's answers against docker's: the paths
+//! The shape of a JSON document, to hold this API's answers against the recorded ones: the paths
 //! of its keys, whatever the values.
 
 use std::collections::BTreeSet;
@@ -44,18 +44,19 @@ pub fn paths(value: &Value, prefix: &str, out: &mut BTreeSet<String>) {
     }
 }
 
-/// The paths of `ours` that `docker` lacks, and those it has that `ours` lacks.
-pub fn diff(ours: &Value, docker: &Value) -> (Vec<String>, Vec<String>) {
+/// The paths of `ours` that `recorded` lacks, and those it has that `ours` lacks.
+pub fn diff(ours: &Value, recorded: &Value) -> (Vec<String>, Vec<String>) {
     let (mut a, mut b) = (BTreeSet::new(), BTreeSet::new());
     paths(ours, "", &mut a);
-    paths(docker, "", &mut b);
+    paths(recorded, "", &mut b);
     (
         a.difference(&b).cloned().collect(),
         b.difference(&a).cloned().collect(),
     )
 }
 
-/// docker's answer recorded under tests/dockerapi/golden.
+/// An answer of the Docker Engine recorded under tests/dockerapi/golden (HACKING.md says
+/// how).
 pub fn golden(text: &str) -> Value {
     serde_json::from_str(text).unwrap()
 }

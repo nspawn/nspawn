@@ -1861,7 +1861,7 @@ retry 10 bash -c "$NSPAWN logs $app | grep_q e2e-trap-$nonce" || fail "the progr
 [ "$($NSPAWN kill -s HUP $app)" = "$app" ] || fail "kill -s HUP does not print the machine's name"
 retry 5 bash -c "$NSPAWN logs $app | grep_q e2e-got-hup-$nonce" || fail "the program did not get SIGHUP"
 $NSPAWN ps | grep_q "^ *$app " || fail "SIGHUP, which the program handles, ended the machine"
-# As docker's kill: without a stop signal of its own, any signal counts as a stop, so
+# A kill without a stop signal of the machine's own counts any signal as a stop, so
 # the program that SIGUSR1 ends is not brought back by --restart always.
 $NSPAWN kill -s USR1 $app >/dev/null || fail "kill -s USR1"
 sleep 5
@@ -2868,10 +2868,10 @@ else
 fi
 
 step "a host that drops forwarded traffic, with and without iptables"
-# Only where nothing else owns that table: deleting it on a host running docker would
-# take docker's own rules with it.
+# Only where nothing else owns that table: deleting it on a host where another program
+# keeps its rules there would take them with it.
 if nft list table ip filter >/dev/null 2>&1; then
-  echo "an ip filter table is already there (docker? ufw?): skipping"
+  echo "an ip filter table is already there (another firewall?): skipping"
 else
   nft add table ip filter && forward_table_made=yes || fail "cannot make the test table"
   nft "add chain ip filter FORWARD { type filter hook forward priority filter; policy drop; }" || fail "cannot make the forward chain"
@@ -2900,7 +2900,7 @@ for p in /usr/bin/dockerd /usr/sbin/dockerd /usr/local/bin/dockerd /snap/bin/doc
   [ -e "$p" ] && dropper=$p
 done
 if nft list table ip filter >/dev/null 2>&1; then
-  echo "an ip filter table is already there (docker? ufw?): skipping"
+  echo "an ip filter table is already there (another firewall?): skipping"
 elif ! command -v iptables >/dev/null 2>&1; then
   echo "no iptables here: skipping"
 elif [ -z "$dropper" ]; then
@@ -3129,7 +3129,7 @@ printf 'services:\n  app:\n    image: %s/%s:missing\n' "$NSPAWN_REGISTRY" "$repo
 out=$($NSPAWN compose -f /tmp/e2e-compose/digests.yaml -p e2e-digests config --resolve-image-digests 2>&1) && fail "a tag the registry lacks was pinned: $out"
 echo "$out" | grep_q -F "failed to resolve digest for $NSPAWN_REGISTRY/$repo:missing" || fail "the missing tag was not explained: $out"
 
-step "Docker API: proxies and dashboards that read docker's socket find the machines"
+step "Docker API: proxies and dashboards that read /var/run/docker.sock find the machines"
 api() { curl -sS --unix-socket "/run/nspawn/api/$1.sock" "http://docker$2" "${@:3}"; }
 $NSPAWN network create e2e-api >/dev/null || fail "network create e2e-api"
 backend() {
@@ -3145,7 +3145,7 @@ backend e2e-api-web
 $NSPAWN run -d --name e2e-api-caddy --network e2e-api -p 18110:80 -e CADDY_DOCKER_POLLING_INTERVAL=1h \
   -v /var/run/docker.sock:/var/run/docker.sock "$caddy_image" >/dev/null || fail "run caddy-docker-proxy"
 [ -S /run/nspawn/api/e2e-api-caddy.sock ] || fail "no Docker API socket for e2e-api-caddy"
-[ -d /var/run/docker.sock ] && fail "a directory was made where docker's socket would be"
+[ -d /var/run/docker.sock ] && fail "a directory was made at /var/run/docker.sock"
 grep -q '^Wants=nspawn-api@e2e-api-caddy.socket' /etc/systemd/system/systemd-nspawn@e2e-api-caddy.service.d/*.conf || fail "the machine's unit does not want its socket"
 [ "$(api e2e-api-caddy /_ping)" = OK ] || fail "_ping on the Docker API: $(api e2e-api-caddy /_ping 2>&1)"
 api e2e-api-caddy /v1.51/version | grep_q '"ApiVersion":"1.51"' || fail "version on the Docker API"
@@ -3162,8 +3162,7 @@ sleep 2
 $NSPAWN ps | grep_q '^ *e2e-api-web2 ' || fail "the HUP the API sent ended e2e-api-web2"
 api e2e-api-caddy /containers/nope/json | grep_q 'No such container: nope' || fail "an unknown container on the Docker API"
 # A machine in a user namespace: its root reaches the socket through the idmapped bind,
-# sees every machine and their environment, as docker's socket shows them; another user
-# cannot connect.
+# sees every machine and their environment; another user cannot connect.
 # Under a name of the run's own, which run then finds by its reference.
 $NSPAWN pull "$curl_image" --name e2e-api-curl --force >/dev/null || fail "pull curl"
 out=$($NSPAWN run --rm --network none -u 0 -v /var/run/docker.sock:/var/run/docker.sock:ro "$curl_image" \
@@ -3206,7 +3205,7 @@ services:
 COMPOSE
 $NSPAWN compose -f /tmp/e2e-compose-api/compose.yaml -p e2e-capi up -d >/dev/null 2>&1 || fail "compose up with the Docker API"
 [ -S /run/nspawn/api/e2e-capi-a-1.sock ] && [ -S /run/nspawn/api/e2e-capi-b-1.sock ] || fail "compose's machines have no Docker API socket"
-[ -d /var/run/docker.sock ] && fail "compose made a directory where docker's socket would be"
+[ -d /var/run/docker.sock ] && fail "compose made a directory at /var/run/docker.sock"
 api e2e-capi-a-1 /containers/json | grep_q '"com.docker.compose.project":"e2e-capi"' || fail "the compose labels are not on the Docker API"
 # Bound read-only, the socket reads, follows logs and kills, and refuses the rest.
 out=$(api e2e-capi-b-1 /containers/create -X POST)
@@ -3992,7 +3991,7 @@ echo "$out" | grep_q -x "env two" || fail "the device's variable: $out"
 $NSPAWN create busybox-1.36 e2e-cdi-perm --device e2e.nspawn.test/dev=two -- /bin/sleep 300 >/dev/null && $NSPAWN start e2e-cdi-perm >/dev/null || fail "start e2e-cdi-perm"
 systemctl show -p DeviceAllow systemd-nspawn@e2e-cdi-perm.service | grep_q "/dev/zero r\b" || fail "the r of the spec is not the unit's: $(systemctl show -p DeviceAllow systemd-nspawn@e2e-cdi-perm.service)"
 $NSPAWN rm -f e2e-cdi-perm >/dev/null 2>&1
-# --gpus: the NVIDIA spec's devices, as docker's flag names them.
+# --gpus: the devices of the NVIDIA spec.
 out=$($NSPAWN run --rm --gpus all "$bb136" -- /bin/sh -c 'echo "$NVIDIA_VISIBLE_DEVICES"; for n in 0 1; do test -c /dev/nvidia$n && echo nvidia$n; done' 2>&1) || fail "run --gpus all: $out"
 echo "$out" | grep_q -x void && echo "$out" | grep_q -x nvidia1 || fail "--gpus all: $out"
 out=$($NSPAWN run --rm --gpus 1 "$bb136" -- /bin/sh -c 'for n in 0 1; do test -c /dev/nvidia$n && echo nvidia$n; done' 2>&1)
@@ -4030,7 +4029,7 @@ COMPOSE
 out=$($NSPAWN compose -f $d/compose/compose.yaml -p e2e-cdi up -d 2>&1) || fail "compose up with gpus: $out"
 $NSPAWN exec e2e-cdi-ml-1 -- /bin/sh -c 'test -c /dev/nvidia1 && test -c /dev/e2e-zero' </dev/null || fail "compose's gpus and CDI devices did not reach the machine"
 $NSPAWN compose -f $d/compose/compose.yaml -p e2e-cdi down >/dev/null 2>&1 || fail "compose down of e2e-cdi"
-# Without a spec of the vendor, docker's own words.
+# Without a spec of the vendor, an error that says no driver has the capability.
 rm -f /var/run/cdi/e2e-nspawn-gpu.json
 out=$($NSPAWN run --rm --gpus all "$bb136" -- true 2>&1) && fail "--gpus without a spec ran: $out"
 echo "$out" | grep_q 'could not select device driver "" with capabilities: \[\[gpu\]\]' || fail "--gpus without a spec was not explained: $out"
@@ -4298,7 +4297,7 @@ python3 -c 'import json; d = json.load(open("/tmp/e2e-rv/inspect.txt")); assert 
 grep_q e2e-rv-nope /tmp/e2e-rv/inspect.err || fail "inspect did not say which name it did not find"
 $NSPAWN inspect -f '' e2e-rv-web | python3 -c 'import json,sys; json.load(sys.stdin)' || fail "inspect -f '' does not print the JSON"
 out=$($NSPAWN inspect -f '{{.x' e2e-rv-web 2>&1) && fail "a template that does not parse was taken"
-echo "$out" | grep_q "template parsing error:" || fail "inspect's template error lacks docker's words: $out"
+echo "$out" | grep_q "template parsing error:" || fail "inspect's template error is not a template parsing error: $out"
 [ "$($NSPAWN ps --filter name=e2e-rv-web --format '{{$c := .}}{{$c.Label "rvkey"}}')" = rvval ] || fail "ps --format took no Label through a variable"
 
 step "review: cp writes where a destination link points and keeps the link; a device is refused"
@@ -4465,7 +4464,7 @@ $NSPAWN network ls | grep_q e2e-rvr_default && fail "compose down right after ru
 
 step "review: compose: one image written twice is pulled once; network labels; links; a second IPv4 subnet"
 mkdir -p /tmp/e2e-rv/rvn
-# A repository of this run's own: compose pull keeps the image it pulls, as docker does.
+# A repository of this run's own: compose pull keeps the image it pulls.
 rvn_repo=e2e-rvn-$nonce
 $NSPAWN pull "$rv" --name e2e-rvn-src --force >/dev/null 2>&1 && $NSPAWN push e2e-rvn-src --to "$NSPAWN_REGISTRY/$rvn_repo:latest" >/dev/null 2>&1 || fail "push $rvn_repo"
 $NSPAWN images rm e2e-rvn-src >/dev/null 2>&1
@@ -4515,7 +4514,7 @@ depths=$(timeout 300 $NSPAWN exec e2e-rv3-deep -- sh -c "$deep" </dev/null 2>/de
 echo "depths made: $depths"
 if [ "${depths%% *}" -gt 2048 ] 2>/dev/null; then
   # 2048 levels make a path longer than the host takes: the host's end gives up first,
-  # with the error of the name, as docker's would.
+  # with the error of the name.
   out=$(timeout 300 $NSPAWN cp e2e-rv3-deep:/deep /tmp/e2e-rv/deep-out 2>&1) && fail "a copy of a tree deeper than 2048 succeeded"
   echo "$out" | grep -qE "more than 2048 directories deep|File name too long" || fail "the deep copy said: $(echo "$out" | tail -3 | cut -c1-300)"
 else
@@ -4632,8 +4631,8 @@ out=$(cd /tmp/e2e-rv/jobs && timeout 300 $NSPAWN compose -p e2e-rv3j run --rm mi
 echo "$out" | grep_q "^url=postgres://e2e@db/e2e" || fail "the job did not get its env_file: $out"
 echo "$out" | grep_q "^[0-9]\{10,\}" || fail "the job's dependency did not run first: $out"
 sed -i "/^jobs:\$/a\\  nightly:\\n    image: $rv\\n    triggers: {schedule: [{cron: \"0 3 * * *\"}]}" /tmp/e2e-rv/jobs/compose.yaml
-# up reads the env files of every service it makes, as docker compose does: web's has to
-# be there for up to get as far as the jobs.
+# up reads the env files of every service it makes: web's has to be there for up to get
+# as far as the jobs.
 : > /tmp/e2e-rv/jobs/missing.env
 out=$(cd /tmp/e2e-rv/jobs && $NSPAWN compose -p e2e-rv3j up -d 2>&1) && fail "up with a scheduled job succeeded"
 echo "$out" | grep_q "scheduled jobs are not supported in this version: nightly" || fail "the scheduled job said: $out"
@@ -4839,7 +4838,8 @@ step "review: Docker API: bad escapes, health filters, kill signals and names an
 $NSPAWN run -d --name e2e-rv3-api -v /var/run/docker.sock:/var/run/docker.sock $rv -- sleep 600 >/dev/null || fail "run e2e-rv3-api"
 sock=/run/nspawn/api/e2e-rv3-api.sock
 retry 10 test -S $sock || fail "no Docker API socket for e2e-rv3-api"
-# docker's error bodies end with a newline: the code follows on the same line.
+# An error body of the API ends with a newline, which tr drops: the code follows on the
+# same line.
 out=$(curl -sS -w ' %{http_code}' --unix-socket $sock 'http://docker/containers/json?all=%zz' | tr -d '\n')
 echo "$out" | grep_q 'invalid URL escape \\"%zz\\".* 400$' || fail "a bad escape said: $out"
 out=$(curl -sS -G --unix-socket $sock --data-urlencode 'filters={"health":{"healthy":false}}' http://docker/containers/json)
@@ -5053,7 +5053,7 @@ out=$($NSPAWN run --rm e2e-rv3-ge:1 -- /bin/cat /run/nspawn/getent 2>/dev/null)
 echo "$out" | grep_q "image-getent" || fail "the getent bound in the machine is not the image's: $(echo "$out" | head -c 200 | od -c | head -3)"
 $NSPAWN images rm e2e-rv3-ge-1 >/dev/null 2>&1
 
-step "review: a negative stop timeout waits for the program, as docker's -1"
+step "review: a negative stop timeout (-1) waits for the program"
 trap_cmd='trap "sleep 12; exit 7" TERM; while :; do sleep 1; done'
 $NSPAWN run -d --name e2e-rv3-nt --stop-timeout -1 $rv -- sh -c "$trap_cmd" >/dev/null || fail "run --stop-timeout -1"
 $NSPAWN inspect e2e-rv3-nt | python3 -c 'import json,sys; assert json.load(sys.stdin)[0]["stop_timeout"] == 2**64 - 1' || fail "--stop-timeout -1 is not kept as none"
@@ -5243,7 +5243,7 @@ $NSPAWN volume ls --json | python3 -c 'import json,sys; assert all(v["name"] != 
 (cd /tmp/e2e-rv/jobv && $NSPAWN compose -p e2e-rv3b down -v >/dev/null 2>&1)
 $NSPAWN volume rm e2e-rv3b_pgdata pgdata >/dev/null 2>&1
 
-step "compose: a service others depend on is made anew or removed as with docker"
+step "compose: a service others depend on is made anew or removed on its own"
 mkdir -p /tmp/e2e-rv/deps
 cat > /tmp/e2e-rv/deps/compose.yaml <<COMPOSE
 services:
@@ -5312,7 +5312,7 @@ out=$($NSPAWN build --progress plain -f $d/Dockerfile.b -t e2e-share-b:1 $d 2>&1
 [ -n "$stamp" ] && [ "$($NSPAWN run --rm e2e-share-b:1 -- cat /stamp 2>/dev/null)" = "$stamp" ] || fail "the second image lost the step it was made on: $stamp"
 $NSPAWN images rm e2e-share-a-1 e2e-share-b-1 >/dev/null 2>&1
 
-step "run and create take a local image of a name as docker reads it when the registry's is not here"
+step "run and create take a local image of a name read as Docker Hub's when the registry's is not here"
 # Which of the two goes first, both being here, the unit tests say: their local names
 # would be the same.
 d=/tmp/e2e-rv/names && mkdir -p $d
@@ -5382,7 +5382,7 @@ s.bind(("::", 18144)); s.listen(); time.sleep(30)' &
   out=$($NSPAWN run -d --name e2e-v6c -p 18144:80 $rv -- sleep 600 2>&1) && fail "a port a host service takes on IPv6 was published"
   echo "$out" | grep_q "host port 18144/tcp is in use by a service on the host" || fail "the host service on IPv6 was not explained: $out"
   kill $v6_service 2>/dev/null; wait $v6_service 2>/dev/null
-  # Created and not running, as docker leaves the container of a refused run.
+  # A refused run leaves its machine created and not running.
   $NSPAWN ps -a --format '{{.Names}} {{.State}}' | grep_q -x 'e2e-v6c created' || fail "a refused run did not leave its machine created: $($NSPAWN ps -a --format '{{.Names}} {{.State}}' | grep e2e-v6c)"
   # UDP, the replies from the address written to; a port below 1024.
   $NSPAWN run -d --name e2e-v6u -p 18143:5353/udp $rv -- udpsvd -E 0 5353 cat >/dev/null || fail "run a UDP echo"

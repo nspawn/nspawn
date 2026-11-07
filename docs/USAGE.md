@@ -512,9 +512,9 @@ nspawn serves the Docker Engine API to machines and to clients on the host.
 A machine that mounts `/var/run/docker.sock`, `/run/docker.sock` or the host's own
 socket of the API, `/run/nspawn/api.sock`, from the host (`-v
 /var/run/docker.sock:/var/run/docker.sock[:ro]`, or compose's `use_api_socket`) gets
-nspawn's Docker API there instead of the host's docker. Tools that follow containers
-through it find nspawn's machines the same way: reverse proxies routing by labels
-(caddy-docker-proxy, Traefik, nginx-proxy with docker-gen and acme-companion),
+nspawn's Docker API there, whatever the host has at that path. Tools that follow
+containers through it find nspawn's machines the same way: reverse proxies routing by
+labels (caddy-docker-proxy, Traefik, nginx-proxy with docker-gen and acme-companion),
 dashboards (homepage) and log viewers (Dozzle). Only root inside can connect, and it
 sees every machine and their `-e` variables (`--secret` values never show). Bound with
 `:ro`, the socket reads, follows logs and kills, and refuses any other change with 403;
@@ -533,18 +533,18 @@ the bus service ([DBUS.md](DBUS.md)): reads and waits ask for `org.nspawn.inspec
 and changes for `org.nspawn.manage`, `_ping` and `version` for nothing. polkit is never
 asked to prompt, since nothing on a socket answers an authentication agent: a user who
 is not root needs a rule, such as the example the packages ship. Root may do
-everything. On a host without docker, clients that only look at `/run/docker.sock` or
-`/var/run/docker.sock` find the socket there with a drop-in:
+everything. Where nothing else on the host has `/run/docker.sock`, clients that only
+look there or at `/var/run/docker.sock` find the socket with a drop-in:
 
 ```
 sudo mkdir -p /etc/systemd/system/nspawn-api.socket.d
-printf '[Socket]\nSymlinks=/run/docker.sock\n' | sudo tee /etc/systemd/system/nspawn-api.socket.d/docker.conf
+printf '[Socket]\nSymlinks=/run/docker.sock\n' | sudo tee /etc/systemd/system/nspawn-api.socket.d/symlink.conf
 sudo systemctl daemon-reload && sudo systemctl restart nspawn-api.socket
 ```
 
-The API answers in the shapes of docker's API 1.51, and of the versions down to 1.24
-that clients ask for: `_ping`, `version` and `info`, the machines as containers with
-their labels, networks and addresses, inspect with the environment, events as they
+The API answers in the shapes of the Docker Engine API 1.51, and of the versions down
+to 1.24 that clients ask for: `_ping`, `version` and `info`, the machines as containers
+with their labels, networks and addresses, inspect with the environment, events as they
 happen, logs, stats and top, the networks, the images and the volumes. Clients make,
 start, attach to (their input too), exec in, copy files to and from, and remove
 containers, pull and remove images, and make, join and remove volumes and networks:

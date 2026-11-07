@@ -28,9 +28,9 @@ the networks, volumes, secrets and configs those use.
 
 ## How a project becomes nspawn's
 
-- **Machines.** Each replica of a service is a machine, `PROJECT-SERVICE-N`, the
-  name docker gives its container. machined takes no `_` in a name, so every `_`
-  is written `-`: `container_name: ejabberd_postgres` makes the machine
+- **Machines.** Each replica of a service is a machine, `PROJECT-SERVICE-N`.
+  machined takes no `_` in a name, so every `_` is written `-`:
+  `container_name: ejabberd_postgres` makes the machine
   `ejabberd-postgres`, and other services still reach it as `ejabberd_postgres` on
   the service's networks. A `run` machine is
   `PROJECT-SERVICE-run-HEX`.
@@ -43,29 +43,28 @@ the networks, volumes, secrets and configs those use.
   compose file, so `down SERVICE` also takes the services that depend on it, as their
   `depends_on` labels say. The config hash is docker compose's own: a machine is made
   anew when its service changes or a pull brings a new image.
-- **Images.** An image without a registry comes from Docker Hub, as with docker,
-  and is kept under its local name (`postgres:18-alpine` is `postgres-18-alpine`);
-  every machine of it is made from that image. `config --resolve-image-digests`
+- **Images.** An image without a registry comes from Docker Hub, and is kept under
+  its local name (`postgres:18-alpine` is `postgres-18-alpine`); every machine of it
+  is made from that image. `config --resolve-image-digests`
   and `--lock-image-digests` ask each registry for the digest a tag names now
-  through nspawn's service, with the credentials of `nspawn login`, where docker
-  compose asks the docker daemon. An image the project builds whose name has no
+  through nspawn's service, with the credentials of `nspawn login`.
+  An image the project builds whose name has no
   registry and no namespace (`app`, or `PROJECT-SERVICE` when it names none) is
   nspawn's own, under nspawn's configured registry as `nspawn build -t` puts it,
   so `nspawn run app` takes it; `user/app` stays Docker Hub's, where `build
   --push` sends it.
 - **Networks, volumes, secrets.** A network of the project is an nspawn network,
   `PROJECT_KEY`, a volume an nspawn volume, `PROJECT_KEY` as well, both made with the
-  file's labels and those docker compose puts on them (project, key, config hash,
+  file's labels and the `com.docker.compose.*` ones (project, key, config hash,
   version). A secret or config
-  from a file is bound read-only where the service reads it, as docker binds it;
+  from a file is bound read-only where the service reads it;
   one from the environment or written in the file is an nspawn secret,
   `PROJECT_secret_KEY` or `PROJECT_config_KEY`, removed by `down`.
-- **Dependencies.** `depends_on` orders what compose does, as in docker compose:
-  `up`, `start` and `run` bring the services up in order and wait for the
-  conditions, and `restart` takes along what asks for `restart: true`. The
-  machines know nothing of it, as docker's containers do not: they carry
-  no `--depends-on`, so a service that others depend on is made anew, scaled down
-  or removed as with docker, and a host that boots machines with a restart policy
+- **Dependencies.** `depends_on` orders what compose does: `up`, `start` and
+  `run` bring the services up in order and wait for the conditions, and `restart`
+  takes along what asks for `restart: true`. The machines know nothing of it: they
+  carry no `--depends-on`, so a service that others depend on is made anew, scaled
+  down or removed on its own, and a host that boots machines with a restart policy
   starts them in no particular order.
 
 ## Where it differs on purpose

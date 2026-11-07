@@ -2667,7 +2667,7 @@ mod tests {
         let p: PortMap = "127.0.0.1:8080:80".parse().unwrap();
         assert_eq!(p.host_ip, Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         assert_eq!(p.to_string(), "127.0.0.1:8080->80/tcp");
-        // 0.0.0.0 is every IPv4 address alone, :: every IPv6 one, as with docker.
+        // 0.0.0.0 is every IPv4 address alone, :: every IPv6 one.
         let v4: PortMap = "0.0.0.0:8080:80".parse().unwrap();
         assert_eq!(v4.to_string(), "0.0.0.0:8080->80/tcp");
         assert_eq!((v4.ipv4_side(), v4.ipv6_side()), (Some(None), None));
