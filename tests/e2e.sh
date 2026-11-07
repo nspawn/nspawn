@@ -3722,15 +3722,18 @@ d=/tmp/e2e-cli
 rm -rf $d && mkdir -p $d/bind
 # run takes a reference: the one of the local busybox-1.36, so that nothing is pulled.
 bb136=$($NSPAWN inspect -f '{{.reference}}' busybox-1.36) || fail "no local busybox-1.36"
-printf '# comment\nE2E_A=from file\nE2E_B=overridden\n' > $d/env
+printf '# comment\nE2E_A=from file\nE2E_B=overridden\nE2E_UNSET_FILE\n' > $d/env
 printf 'e2e.file=yes\n' > $d/labels
 echo bound > $d/bind/f
+# A variable named alone that is not set here is left out, in a file and in -e.
+unset E2E_UNSET_FILE E2E_UNSET_FLAG
 $NSPAWN network create e2e-cli-net >/dev/null || fail "network create e2e-cli-net"
-$NSPAWN run -d --name e2e-cli -p 18130:80 --env-file $d/env -e E2E_B=flag --label-file $d/labels \
+$NSPAWN run -d --name e2e-cli -p 18130:80 --env-file $d/env -e E2E_B=flag -e E2E_UNSET_FLAG --label-file $d/labels \
   --mount type=bind,source=$d/bind,target=/b,readonly --mount source=e2e-cli-vol,target=/v \
   --mount type=tmpfs,target=/t,tmpfs-size=1m "$bb136" \
-  -- /bin/sh -c 'mkdir -p /www; echo cli > /www/index.html; exec httpd -f -p 80 -h /www' >/dev/null || fail "run with --env-file, --label-file and --mount"
-[ "$($NSPAWN exec e2e-cli -- /bin/sh -c 'echo "$E2E_A/$E2E_B"' </dev/null | tr -d '\r')" = "from file/flag" ] || fail "--env-file and -e did not reach the program"
+  -- /bin/sh -c 'mkdir -p /www; echo cli > /www/index.html; exec httpd -f -p 80 -h /www' >/dev/null || fail "run with --env-file, --label-file, --mount and a -e not set here"
+[ "$($NSPAWN exec e2e-cli -- /bin/sh -c 'echo "$E2E_A/$E2E_B/${E2E_UNSET_FILE-unset}/${E2E_UNSET_FLAG-unset}"' </dev/null | tr -d '\r')" = "from file/flag/unset/unset" ] || fail "--env-file and -e did not reach the program, or a variable not set here did"
+[ "$($NSPAWN exec -e E2E_UNSET_FLAG -e E2E_X=1 e2e-cli -- /bin/sh -c 'echo "${E2E_UNSET_FLAG-unset}/$E2E_X"' </dev/null | tr -d '\r')" = "unset/1" ] || fail "exec -e of a variable not set here"
 [ "$($NSPAWN inspect -f '{{index .labels "e2e.file"}}' e2e-cli)" = yes ] || fail "--label-file, or inspect -f: $($NSPAWN inspect -f '{{json .labels}}' e2e-cli)"
 [ "$($NSPAWN exec e2e-cli -- cat /b/f </dev/null | tr -d '\r')" = bound ] || fail "the bind of --mount"
 $NSPAWN exec e2e-cli -- touch /b/x </dev/null 2>/dev/null && fail "a readonly --mount took a write"

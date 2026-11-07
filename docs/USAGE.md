@@ -218,7 +218,9 @@ entrypoint nor a cmd) is refused with `no command specified`. Both are remembere
 `start --image-command` goes back to the image's own.
 
 `-e VAR=value` adds environment on top of the image's (`-e VAR` copies it from your
-shell, and is refused when your shell does not have it). `-v SOURCE:TARGET[:MODE]` mounts a host directory, which has to exist, or a
+shell, and is left out when your shell does not have it, so `-e DEBUG` passes an
+optional setting on only where it is set; `exec -e` does the same).
+`-v SOURCE:TARGET[:MODE]` mounts a host directory, which has to exist, or a
 named volume, into any kind of machine. A source starting with `.` is a directory
 relative to the one the command runs in, and a host path is taken cleaned. MODE is `ro`
 or `rw`, and the other words a mode may hold are accepted and do nothing: the SELinux
@@ -341,7 +343,8 @@ command, and then removes it after them.
 
 `--env-file FILE` and `--label-file FILE` read variables and labels from files of
 KEY=VALUE lines (no quoting, no expansion, `#` comments, a KEY alone copied from here
-for a variable and left out for a label), before the `-e` and `--label` that follow and
+for a variable, or left out when it is not set here, and left out for a label), before
+the `-e` and `--label` that follow and
 win. A variable's value may hold a tab and line breaks but no other control character:
 the settings file that carries the machine's variables is read a line at a time, so a
 variable with a line break goes in encoded and reaches the program through the image's

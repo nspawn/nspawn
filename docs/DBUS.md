@@ -196,7 +196,7 @@ given is remembered for the machine.
 | `entrypoint` | s | replaces the image's and drops its cmd; `""` runs the command alone. `CreateMachine` also takes as: the whole entrypoint, program and arguments, `[]` for none |
 | `command` | as | replaces an app's cmd |
 | `image_command` | b | forgets the remembered entrypoint and command and runs the image's own |
-| `env`, `volume`, `label` | as | `VAR=value` or `VAR`; `SOURCE:TARGET[:ro]`; `KEY=VALUE` on top of the image's labels |
+| `env`, `volume`, `label` | as | `VAR=value` or `VAR` (the service's own value, left out when the service has none: the command line sends the caller's values instead; on a start, a list left with nothing keeps the remembered variables, `none` forgets them); `SOURCE:TARGET[:ro]`; `KEY=VALUE` on top of the image's labels |
 | `unset_env` | as | `CreateMachine` only: variables of the image's the machine goes without |
 | `restart` | s | no, on-failure[:N], always or unless-stopped |
 | `memory`, `pids_limit`, `memory_swap`, `cpus` | t, t, x, d | as in the record; 0 removes a limit |

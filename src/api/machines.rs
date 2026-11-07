@@ -1214,7 +1214,8 @@ pub struct StartRequest {
     pub publish_all: bool,
     /// An empty string runs the arguments alone.
     pub entrypoint: Option<String>,
-    /// VAR=value or VAR; "none" forgets them.
+    /// VAR=value or VAR (copied from the service's environment, left out when unset);
+    /// "none" forgets them, and a list that gives nothing keeps them.
     pub env: Vec<String>,
     /// SOURCE:TARGET[:ro]; "none" forgets them.
     pub volume: Vec<String>,
@@ -1596,8 +1597,15 @@ pub fn apply_flags(r: &mut ImageRecord, args: &StartRequest) -> Result<()> {
         r.entrypoint = None;
         r.cmd = None;
     }
+    // Bare names the service's environment lacks are left out; a list of nothing but
+    // those gives nothing, which keeps the remembered variables as no list does, while
+    // "none" forgets them.
+    let env = match volume::parse_env(&args.env)? {
+        env if env.is_empty() && args.env != ["none"] => None,
+        env => Some(env),
+    };
     if r.mode == Mode::Boot
-        && (!args.command.is_empty() || args.entrypoint.is_some() || !args.env.is_empty())
+        && (!args.command.is_empty() || args.entrypoint.is_some() || env.is_some())
     {
         bail!(
             "{} boots an init system; a command, an entrypoint and variables only apply to the program of an app image",
@@ -1620,8 +1628,8 @@ pub fn apply_flags(r: &mut ImageRecord, args: &StartRequest) -> Result<()> {
         }
         r.cmd = Some(args.command.clone());
     }
-    if !args.env.is_empty() {
-        r.env = volume::parse_env(&args.env)?;
+    if let Some(env) = env {
+        r.env = env;
     }
     if !args.volume.is_empty() {
         r.volumes = volume::parse_volumes(&args.volume)?;
@@ -3792,6 +3800,33 @@ mod tests {
         policy.restart = Restart::OnFailure;
         apply_flags(&mut policy, &StartRequest::keep("web")).unwrap();
         assert!(!policy.remove_on_exit);
+    }
+
+    #[test]
+    fn a_start_keeps_the_variables_unless_it_gives_some_or_forgets_them() {
+        let mut r: ImageRecord = serde_json::from_str(
+            r#"{"name": "web", "reference": "r", "manifest_digest": "d", "layers": [], "backend": "overlay", "created": 0, "mode": "app", "run": {"cmd": ["/bin/sh"]}, "env": ["A=1"]}"#,
+        )
+        .unwrap();
+        let start = |env: &[&str]| {
+            let mut req = StartRequest::keep("web");
+            req.env = env.iter().map(|v| v.to_string()).collect();
+            req
+        };
+        apply_flags(&mut r, &start(&[])).unwrap();
+        assert_eq!(r.env, ["A=1"]);
+        // Every bare name left out: nothing given, the variables kept.
+        apply_flags(&mut r, &start(&["NSPAWN_TEST_UNSET_XYZ"])).unwrap();
+        assert_eq!(r.env, ["A=1"]);
+        apply_flags(&mut r, &start(&["B=2", "NSPAWN_TEST_UNSET_XYZ"])).unwrap();
+        assert_eq!(r.env, ["B=2"]);
+        apply_flags(&mut r, &start(&["none"])).unwrap();
+        assert!(r.env.is_empty());
+        // A boot machine takes no variables, and nothing given is none.
+        let mut boot = r.clone();
+        boot.mode = Mode::Boot;
+        apply_flags(&mut boot, &start(&["NSPAWN_TEST_UNSET_XYZ"])).unwrap();
+        assert!(apply_flags(&mut boot, &start(&["B=2"])).is_err());
     }
 
     #[test]

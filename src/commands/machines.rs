@@ -477,9 +477,10 @@ fn start_options(mut args: StartOptions, command: Vec<String>) -> Result<Options
     if let Some(entrypoint) = args.entrypoint {
         options.insert("entrypoint", Value::from(entrypoint));
     }
-    if !args.env.is_empty() {
-        // A bare VAR means this environment, not the service's.
-        options.insert("env", Value::from(crate::volume::expand_env(&args.env)?));
+    // A bare VAR means this environment, not the service's; one it lacks is not given.
+    let env = crate::volume::expand_env(&args.env)?;
+    if !env.is_empty() {
+        options.insert("env", Value::from(env));
     }
     if !args.volume.is_empty() {
         options.insert("volume", Value::from(args.volume));
@@ -2076,6 +2077,52 @@ mod tests {
         assert!(!["wait", "remove", "image_command"]
             .iter()
             .any(|key| create.contains_key(key)));
+    }
+
+    #[test]
+    fn variables_named_without_a_value_here_are_left_out() {
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("app.env");
+        std::fs::write(&file, "NSPAWN_TEST_RUN_UNSET_FILE\nFROM_FILE=1\n").unwrap();
+        let env_file = file.display().to_string();
+        let env = |argv: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+            let crate::cli::Command::Run(args) = cli.command else {
+                panic!("not run");
+            };
+            start_options(args.options, args.command)
+                .unwrap()
+                .get("env")
+                .map(|v| Vec::<String>::try_from(v.try_clone().unwrap()).unwrap())
+        };
+        assert_eq!(
+            env(&[
+                "nspawn",
+                "run",
+                "--env-file",
+                &env_file,
+                "-e",
+                "NSPAWN_TEST_RUN_UNSET_DEBUG",
+                "-e",
+                "A=1",
+                "app",
+            ]),
+            Some(vec!["FROM_FILE=1".to_string(), "A=1".to_string()])
+        );
+        // Nothing left to give: no env option, which on a start keeps the remembered one.
+        assert_eq!(
+            env(&[
+                "nspawn",
+                "run",
+                "-e",
+                "NSPAWN_TEST_RUN_UNSET_DEBUG",
+                "--env",
+                "NSPAWN_TEST_RUN_UNSET_CCACHE",
+                "app",
+            ]),
+            None
+        );
     }
 
     #[test]

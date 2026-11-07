@@ -483,14 +483,14 @@ pub struct CreateArgs {
     /// Replace the image's entrypoint; an empty string runs the arguments alone.
     #[arg(long, value_name = "PROGRAM")]
     pub entrypoint: Option<String>,
-    /// Environment for the program, VAR=value or VAR (copied from here).
+    /// Environment for the program, VAR=value or VAR (copied from here, left out when unset).
     #[arg(long, short = 'e', value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
     /// Mount a host directory or a named volume, SOURCE:TARGET[:ro]; z, Z, a propagation, nocopy and cached are taken and do nothing.
     #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]", value_hint = clap::ValueHint::AnyPath)]
     pub volume: Vec<String>,
     /// Read variables from a file of VAR=value lines: no quoting or expansion, a VAR
-    /// alone copied from here; -e comes after and wins. Repeatable.
+    /// alone copied from here or left out when unset; -e comes after and wins. Repeatable.
     #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
     pub env_file: Vec<std::path::PathBuf>,
     /// Read labels from a file of KEY=VALUE lines; --label comes after and wins.
@@ -1424,7 +1424,7 @@ pub struct StartOptions {
     /// Replace the image's entrypoint; an empty string runs the arguments alone.
     #[arg(long, value_name = "PROGRAM")]
     pub entrypoint: Option<String>,
-    /// Environment for the program, VAR=value or VAR (copied from here).
+    /// Environment for the program, VAR=value or VAR (copied from here, left out when unset).
     /// Repeatable and remembered; "none" forgets them.
     #[arg(long, short = 'e', value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
@@ -1433,7 +1433,7 @@ pub struct StartOptions {
     #[arg(long, short = 'v', value_name = "SOURCE:TARGET[:ro]", value_hint = clap::ValueHint::AnyPath)]
     pub volume: Vec<String>,
     /// Read variables from a file of VAR=value lines: no quoting or expansion, a VAR
-    /// alone copied from here; -e comes after and wins. Repeatable.
+    /// alone copied from here or left out when unset; -e comes after and wins. Repeatable.
     #[arg(long, value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
     pub env_file: Vec<std::path::PathBuf>,
     /// Read labels from a file of KEY=VALUE lines; --label comes after and wins.
@@ -1558,7 +1558,8 @@ pub struct ExecArgs {
     /// own (its --user, else its image's USER), root on a booted machine.
     #[arg(long, short = 'u')]
     pub user: Option<String>,
-    /// Environment for the command, VAR=value or VAR (copied from here). Repeatable.
+    /// Environment for the command, VAR=value or VAR (copied from here, left out when
+    /// unset). Repeatable.
     #[arg(long, short = 'e', value_name = "VAR[=VALUE]")]
     pub env: Vec<String>,
     /// Working directory of the command, instead of the machine's.

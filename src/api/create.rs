@@ -42,7 +42,7 @@ pub struct CreateRequest {
     /// Replaces the image's entrypoint, program and arguments; an empty one runs the
     /// command alone.
     pub entrypoint: Option<Vec<String>>,
-    /// VAR=value or VAR (copied from the environment).
+    /// VAR=value or VAR (copied from the service's environment, left out when unset).
     pub env: Vec<String>,
     /// Variables of the image's that the machine goes without, as the engine drops one a
     /// container's environment names without a value.

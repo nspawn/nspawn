@@ -472,22 +472,32 @@ pub fn merge_env(base: &[String], extra: &[String]) -> Vec<String> {
     out
 }
 
+/// `VAR=value` for a bare `VAR` this process's environment holds, None when it holds
+/// none: a variable given by name alone is optional, so that `-e DEBUG` passes DEBUG on
+/// when it is set and nothing when it is not.
+fn from_environment(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|current| format!("{name}={current}"))
+}
+
 /// Copies the value of every bare `VAR` from this process's environment, so that a
-/// caller's variables reach a service that has an environment of its own. `VAR=value`
-/// and "none" pass through as they are.
+/// caller's variables reach a service that has an environment of its own, and leaves out
+/// a bare `VAR` the environment does not hold. `VAR=value` and "none" pass through as
+/// they are.
 pub fn expand_env(values: &[String]) -> Result<Vec<String>> {
-    values
-        .iter()
-        .map(|value| {
-            if value.contains('=') || value == "none" {
-                return Ok(value.clone());
-            }
-            match std::env::var(value) {
-                Ok(current) => Ok(format!("{value}={current}")),
-                Err(_) => bail!("{value} has no value here; give it as {value}=VALUE"),
-            }
-        })
-        .collect()
+    let mut out = Vec::new();
+    for value in values {
+        if value.is_empty() {
+            bail!("invalid environment variable: {value}");
+        }
+        if value.contains('=') || value == "none" {
+            out.push(value.clone());
+        } else if let Some(assignment) = from_environment(value) {
+            out.push(assignment);
+        }
+    }
+    Ok(out)
 }
 
 /// Whether a variable's value holds a line break, which the settings file cannot carry:
@@ -524,27 +534,32 @@ fn reject_env_control_characters(var: &str) -> Result<()> {
     Ok(())
 }
 
-/// Parses the -e values: VAR=value as given, VAR alone copied from this environment.
-/// "none" alone clears the list; a later value of the same variable wins.
+/// Parses the -e values: VAR=value as given, VAR alone copied from this environment and
+/// left out when it has none, as the clients do with theirs. "none" alone clears the
+/// list; a later value of the same variable wins.
 pub fn parse_env(values: &[String]) -> Result<Vec<String>> {
     if values.len() == 1 && values[0] == "none" {
         return Ok(Vec::new());
     }
     let mut out: Vec<String> = Vec::new();
     for value in values {
-        let (name, assignment) = match value.split_once('=') {
-            Some((name, _)) => (name, value.clone()),
-            None => match std::env::var(value) {
-                Ok(current) => (value.as_str(), format!("{value}={current}")),
-                Err(_) => bail!("{value} has no value here; give it as {value}=VALUE"),
-            },
-        };
-        reject_env_control_characters(&assignment)?;
+        let name = value
+            .split_once('=')
+            .map_or(value.as_str(), |(name, _)| name);
         // Any name but an empty one: Elasticsearch reads discovery.type, and the
         // settings file carries such names as they are.
         if name.is_empty() {
             bail!("invalid environment variable: {value}");
         }
+        let assignment = if name.len() < value.len() {
+            value.clone()
+        } else {
+            match from_environment(name) {
+                Some(assignment) => assignment,
+                None => continue,
+            }
+        };
+        reject_env_control_characters(&assignment)?;
         out.retain(|v| v.split_once('=').map(|(n, _)| n) != Some(name));
         out.push(assignment);
     }
@@ -654,8 +669,29 @@ mod tests {
             expand_env(&values).unwrap(),
             ["A=1", "NSPAWN_TEST_EXPAND=yes", "none"]
         );
-        let err = expand_env(&["NSPAWN_TEST_UNSET_XYZ".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("has no value here"));
+    }
+
+    #[test]
+    fn a_bare_variable_without_a_value_is_left_out() {
+        let unset = "NSPAWN_TEST_UNSET_XYZ".to_string();
+        assert_eq!(
+            expand_env(&[unset.clone(), "A=1".to_string(), unset.clone()]).unwrap(),
+            ["A=1"]
+        );
+        assert!(expand_env(std::slice::from_ref(&unset)).unwrap().is_empty());
+        // Given with a value, an empty one too, it goes on.
+        assert_eq!(
+            expand_env(&[format!("{unset}=")]).unwrap(),
+            ["NSPAWN_TEST_UNSET_XYZ="]
+        );
+        assert!(expand_env(&[String::new()]).is_err());
+        // The service does the same with its own environment.
+        assert_eq!(
+            parse_env(&[unset.clone(), "B=2".to_string()]).unwrap(),
+            ["B=2"]
+        );
+        assert!(parse_env(std::slice::from_ref(&unset)).unwrap().is_empty());
+        assert!(parse_env(&[String::new()]).is_err());
     }
 
     #[test]
@@ -732,7 +768,6 @@ mod tests {
         std::env::set_var("NSPAWN_TEST_VAR", "from-host");
         let env = parse_env(&["A=1".into(), "NSPAWN_TEST_VAR".into(), "A=2".into()]).unwrap();
         assert_eq!(env, vec!["NSPAWN_TEST_VAR=from-host", "A=2"]);
-        assert!(parse_env(&["NSPAWN_TEST_UNSET_VAR".into()]).is_err());
         assert_eq!(
             parse_env(&["discovery.type=single-node".into(), "1A=x".into()]).unwrap(),
             ["discovery.type=single-node", "1A=x"]
