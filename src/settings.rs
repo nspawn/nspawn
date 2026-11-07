@@ -76,6 +76,8 @@ pub struct MachineSettings<'a> {
     /// -e, after the image's environment.
     pub extra_env: &'a [String],
     pub binds: &'a [Bind],
+    /// Devices of the host: --device, device cgroup rules or a bind of devtmpfs.
+    pub host_devices: bool,
     /// The units that make a booted machine wait for its volumes (`volume_wait_units`).
     pub volume_units: Option<&'a Path>,
     pub network: Network,
@@ -126,7 +128,7 @@ pub fn render_with(s: &MachineSettings, route: &NamespaceRoute) -> String {
     let mut private_users = true;
     if s.managed_userns {
         out.push_str("PrivateUsers=managed\n");
-    } else if app_without_userns(s.mode, s.network, s.bridge.is_some()) {
+    } else if app_without_userns(s.mode, s.network, s.bridge.is_some(), s.host_devices) {
         out.push_str("PrivateUsers=no\n");
         private_users = false;
     }
@@ -539,10 +541,12 @@ pub fn render_hooks(
 /// alone does not. Without it both go, the settings file saying what the network is.
 /// Applied to its own output it gives the same lines.
 /// Whether a machine runs without a user namespace: an app in a network namespace prepared
-/// on the host, its own on the bridge or another machine's (`bridged`). A user namespace
-/// cannot join it (EPERM: it belongs to the initial user namespace).
-pub fn app_without_userns(mode: Mode, network: Network, bridged: bool) -> bool {
-    mode == Mode::App && network == Network::Bridge && bridged
+/// on the host, its own on the bridge or another machine's (`bridged`), which a user
+/// namespace cannot join (EPERM: it belongs to the initial user namespace), or an app
+/// given devices of the host (`devices`): their nodes are devtmpfs's, which takes no
+/// idmapped mount, so only there do they keep their owners and modes for root inside.
+pub fn app_without_userns(mode: Mode, network: Network, bridged: bool, devices: bool) -> bool {
+    mode == Mode::App && ((network == Network::Bridge && bridged) || devices)
 }
 
 pub fn exec_start_override(
@@ -879,15 +883,31 @@ fn replaced_binary(exe: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn only_an_app_in_a_network_prepared_on_the_host_goes_without_a_user_namespace() {
+    fn an_app_on_a_network_of_the_host_or_with_devices_goes_without_a_user_namespace() {
         use super::{app_without_userns, Mode, Network};
         // On the bridge, or in another machine's network (container:).
-        assert!(app_without_userns(Mode::App, Network::Bridge, true));
+        assert!(app_without_userns(Mode::App, Network::Bridge, true, false));
         // --network none, a booted machine, the host's network, veth.
-        assert!(!app_without_userns(Mode::App, Network::Bridge, false));
-        assert!(!app_without_userns(Mode::Boot, Network::Bridge, true));
-        assert!(!app_without_userns(Mode::App, Network::Host, false));
-        assert!(!app_without_userns(Mode::App, Network::Veth, false));
+        assert!(!app_without_userns(
+            Mode::App,
+            Network::Bridge,
+            false,
+            false
+        ));
+        assert!(!app_without_userns(
+            Mode::Boot,
+            Network::Bridge,
+            true,
+            false
+        ));
+        assert!(!app_without_userns(Mode::App, Network::Host, false, false));
+        assert!(!app_without_userns(Mode::App, Network::Veth, false, false));
+        // An app with devices of the host, whatever its network; a booted machine keeps
+        // its user namespace.
+        for network in [Network::Bridge, Network::Host, Network::Veth] {
+            assert!(app_without_userns(Mode::App, network, false, true));
+        }
+        assert!(!app_without_userns(Mode::Boot, Network::Host, false, true));
     }
 
     #[test]
@@ -1038,6 +1058,7 @@ mod tests {
             command: &run.argv(),
             extra_env: &[],
             binds: &[],
+            host_devices: false,
             volume_units: None,
             network: Network::Bridge,
             no_network: false,
@@ -1061,6 +1082,7 @@ mod tests {
             command: &run.argv(),
             extra_env: &[],
             binds: &[],
+            host_devices: false,
             volume_units: None,
             network: Network::Bridge,
             no_network: true,
@@ -1072,6 +1094,36 @@ mod tests {
         assert!(
             !none.contains("PrivateUsers=no"),
             "a user namespace goes with no network"
+        );
+        // With devices of the host it goes without one, and its binds without idmap.
+        let usb = [Bind {
+            source: PathBuf::from("/dev/bus/usb"),
+            target: "/dev/bus/usb".into(),
+            read_only: false,
+            idmap: false,
+        }];
+        let devices = render(&MachineSettings {
+            name: "web",
+            managed_userns: false,
+            mode: Mode::App,
+            pid1: false,
+            run: &run,
+            command: &run.argv(),
+            extra_env: &[],
+            binds: &usb,
+            host_devices: true,
+            volume_units: None,
+            network: Network::Bridge,
+            no_network: true,
+            hostname_file: None,
+            tuning: &Tuning::default(),
+            bridge: None,
+        });
+        assert!(devices.contains("[Exec]\nPrivateUsers=no\n"), "{devices}");
+        assert!(devices.contains("[Network]\nPrivate=yes\n"), "{devices}");
+        assert!(
+            devices.contains("\nBind=/dev/bus/usb:/dev/bus/usb\n"),
+            "{devices}"
         );
     }
 
@@ -1092,6 +1144,7 @@ mod tests {
             command: &command,
             extra_env: &[],
             binds: &[],
+            host_devices: false,
             volume_units: None,
             network,
             no_network,
@@ -1174,6 +1227,7 @@ mod tests {
                 command,
                 extra_env: &[],
                 binds: &[],
+                host_devices: false,
                 volume_units: None,
                 network: Network::Bridge,
                 no_network: false,
@@ -1314,6 +1368,7 @@ mod tests {
             command: &command,
             extra_env: &extra,
             binds: &[],
+            host_devices: false,
             volume_units: None,
             network: Network::Bridge,
             no_network: false,
@@ -1353,6 +1408,7 @@ mod tests {
                 command,
                 extra_env: &[],
                 binds: &[],
+                host_devices: false,
                 volume_units: None,
                 network: Network::Bridge,
                 no_network: false,
@@ -1407,6 +1463,7 @@ mod tests {
             command: &run.argv(),
             extra_env: &[],
             binds: &[],
+            host_devices: false,
             volume_units: None,
             network: Network::Veth,
             no_network: false,
@@ -1425,6 +1482,7 @@ mod tests {
             command: &run.argv(),
             extra_env: &[],
             binds: &[],
+            host_devices: false,
             volume_units: None,
             network: Network::Bridge,
             no_network: false,
@@ -1451,6 +1509,7 @@ mod tests {
             command: &run.argv(),
             extra_env: &[],
             binds: &[],
+            host_devices: false,
             volume_units: None,
             network: Network::Bridge,
             no_network: false,
@@ -1480,6 +1539,7 @@ mod tests {
                 command: &run.argv(),
                 extra_env: &[],
                 binds: &[],
+                host_devices: false,
                 volume_units: None,
                 network: Network::Bridge,
                 no_network: false,
@@ -1510,6 +1570,7 @@ mod tests {
                 read_only: false,
                 idmap: true,
             }],
+            host_devices: false,
             volume_units: None,
             network: Network::Bridge,
             no_network: false,
@@ -1535,6 +1596,7 @@ mod tests {
                 read_only: false,
                 idmap: true,
             }],
+            host_devices: false,
             volume_units: Some(Path::new("/var/lib/nspawn/machines/db/units")),
             network: Network::Host,
             no_network: false,
@@ -1558,6 +1620,7 @@ mod tests {
                 read_only: false,
                 idmap: true,
             }],
+            host_devices: false,
             volume_units: Some(Path::new("/var/lib/nspawn/machines/db/units")),
             network: Network::Host,
             no_network: false,
@@ -1607,6 +1670,7 @@ mod tests {
             command: &run.argv(),
             extra_env: &[],
             binds: &[],
+            host_devices: false,
             volume_units: None,
             network: Network::Host,
             no_network: false,
@@ -1632,6 +1696,7 @@ mod tests {
             command: &run.argv(),
             extra_env: &notify,
             binds: &[],
+            host_devices: false,
             volume_units: None,
             network: Network::Host,
             no_network: false,
@@ -1660,6 +1725,7 @@ mod tests {
                 command: &run.argv(),
                 extra_env: &[],
                 binds: &[],
+                host_devices: false,
                 volume_units: None,
                 network: Network::Host,
                 no_network: false,
@@ -1714,6 +1780,7 @@ mod tests {
             command: &["/bin/sleep".to_string(), "infinity".to_string()],
             extra_env: &["GREETING=hi".to_string()],
             binds: &binds,
+            host_devices: false,
             volume_units: None,
             network: Network::Veth,
             no_network: false,

@@ -475,6 +475,9 @@ fn tuning_flags(t: &crate::tuning::Tuning) -> Vec<Vec<String>> {
     for name in &t.cdi_devices {
         flag(&mut out, "--device", name);
     }
+    for rule in &t.device_cgroup_rules {
+        flag(&mut out, "--device-cgroup-rule", rule);
+    }
     for request in &t.gpus {
         flag(&mut out, "--gpus", &request.to_string());
     }
@@ -609,6 +612,26 @@ mod tests {
         assert_eq!(size_text(3 << 30), "3g");
         assert_eq!(size_text(1536 << 10), "1536k");
         assert_eq!(size_text(1000), "1000");
+    }
+
+    #[test]
+    fn devices_come_back_as_their_flags() {
+        let t = crate::tuning::Tuning {
+            devices: vec![crate::tuning::Device {
+                host: "/dev/ttyUSB0".into(),
+                container: "/dev/ttyUSB0".into(),
+                permissions: "rw".into(),
+            }],
+            device_cgroup_rules: vec!["c 189:* rwm".into()],
+            ..crate::tuning::Tuning::default()
+        };
+        assert_eq!(
+            tuning_flags(&t),
+            [
+                option("--device", "/dev/ttyUSB0:/dev/ttyUSB0:rw"),
+                option("--device-cgroup-rule", "c 189:* rwm")
+            ]
+        );
     }
 
     #[test]

@@ -192,6 +192,10 @@ pub fn record(r: &ImageRecord) -> Dict {
             ),
         ),
         (
+            "device_cgroup_rules".to_string(),
+            strings(&r.tuning.device_cgroup_rules),
+        ),
+        (
             "gpus".to_string(),
             strings(
                 &r.tuning

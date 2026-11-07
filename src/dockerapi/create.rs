@@ -1191,7 +1191,6 @@ pub fn resources(host: &Object, create: bool) -> Result<(Opts, Vec<String>), Ref
         ("CpuRealtimeRuntime", "nspawn sets no realtime scheduling"),
         ("CpusetCpus", "nspawn pins no CPUs"),
         ("CpusetMems", "nspawn pins no memory nodes"),
-        ("DeviceCgroupRules", "devices are given by Devices"),
         ("MemoryReservation", "nspawn sets no soft memory limit"),
     ];
     for (field, why) in ignored {
@@ -1277,6 +1276,10 @@ pub fn resources(host: &Object, create: bool) -> Result<(Opts, Vec<String>), Ref
     }
     if !gpus.is_empty() {
         opts.insert("gpus", Opt::Texts(gpus));
+    }
+    let rules = host.texts("DeviceCgroupRules")?;
+    if !rules.is_empty() {
+        opts.insert("device_cgroup_rules", Opt::Texts(rules));
     }
     let mut ulimits = Vec::new();
     for limit in host.objects("Ulimits", "container.Ulimit")? {
@@ -1901,6 +1904,7 @@ mod tests {
             "Memory": 67108864, "MemorySwap": -1, "NanoCpus": 1500000000, "PidsLimit": 64,
             "Ulimits": [{ "Name": "nofile", "Soft": 1024, "Hard": 2048 }],
             "Devices": [{ "PathOnHost": "/dev/fuse", "PathInContainer": "", "CgroupPermissions": "" }],
+            "DeviceCgroupRules": ["c 189:* rmw"],
             "DeviceRequests": [
                 { "Driver": "nvidia", "Count": -1, "Capabilities": [["gpu"]] },
                 { "Driver": "cdi", "DeviceIDs": ["vendor.com/class=x"] },
@@ -1922,6 +1926,7 @@ mod tests {
             o["devices"],
             texts(&["/dev/fuse:/dev/fuse:rwm", "vendor.com/class=x"])
         );
+        assert_eq!(o["device_cgroup_rules"], texts(&["c 189:* rmw"]));
         let all = crate::cdi::GpuRequest {
             driver: "nvidia".into(),
             count: -1,

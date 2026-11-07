@@ -362,7 +362,10 @@ root that has it.
 
 Apps on a bridge, or in another machine's network namespace, run with
 `PrivateUsers=no`, since a user namespace cannot join a network namespace made
-on the host. With no user namespace, systemd-nspawn's capability set would leave
+on the host. So do apps given devices of the host on any network (`--device`,
+`--device-cgroup-rule`, a bind of devtmpfs; `settings::app_without_userns`): a
+device node cannot be idmapped, so only outside a user namespace does root
+inside open it as its owner and mode allow. With no user namespace, systemd-nspawn's capability set would leave
 `CAP_SYS_ADMIN` to root in the app, and its seccomp filter allows `@mount`, so
 root could remount `/proc/sys` writable and reach the host through
 `kernel.core_pattern`. Such an app gets `tuning::DEFAULT_CAPABILITIES`
@@ -421,8 +424,8 @@ systemd-nspawn's; and since `nspawn_t` executes `bin_t` programs as
 
 ### Ownership
 
-A booted overlay machine, and an app off the bridge, runs in the user namespace
-the template's `-U` picks. No released kernel lets an overlayfs mount be
+A booted overlay machine, and an app off the bridge without devices, runs in the
+user namespace the template's `-U` picks. No released kernel lets an overlayfs mount be
 idmapped, so systemd-nspawn shifts the tree with a recursive chown at the first
 start. The mount carries `metacopy=on` so that this chown copies inodes rather
 than file contents into the upper directory and the layers stay shared.

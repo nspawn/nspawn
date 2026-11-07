@@ -514,6 +514,17 @@ fn kind_takes_idmap(kind: Option<&str>, tmpfs_does: impl Fn() -> bool) -> bool {
     }
 }
 
+/// Whether `path` is on devtmpfs: a node or a directory of the host's /dev.
+pub fn on_devtmpfs(path: &Path) -> bool {
+    let (Ok(path), Ok(mountinfo)) = (
+        path.canonicalize(),
+        std::fs::read_to_string("/proc/self/mountinfo"),
+    ) else {
+        return false;
+    };
+    file_system_of(&mountinfo, &path) == Some("devtmpfs")
+}
+
 /// The type of the file system `path` (canonical) is on, as `mountinfo` lists the
 /// mounts: the deepest mount point above it, the last of those on the same point.
 fn file_system_of<'a>(mountinfo: &'a str, path: &Path) -> Option<&'a str> {

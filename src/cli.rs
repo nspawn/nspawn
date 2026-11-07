@@ -553,7 +553,8 @@ pub struct TuningArgs {
     #[arg(long, short = 'w', value_name = "DIR")]
     pub workdir: Option<String>,
     /// Capability to keep on top of the default set (NET_ADMIN, ALL): the least an app
-    /// on a bridge network needs, systemd-nspawn's for a machine in a user namespace.
+    /// on a bridge network or with devices needs, systemd-nspawn's for a machine in a
+    /// user namespace.
     /// Repeatable; "none" forgets them.
     #[arg(long, value_name = "CAP")]
     pub cap_add: Vec<String>,
@@ -578,6 +579,11 @@ pub struct TuningArgs {
     /// them.
     #[arg(long, value_name = "HOST[:CONTAINER[:rwm]]", value_hint = clap::ValueHint::AnyPath)]
     pub device: Vec<String>,
+    /// A rule of the machine's device cgroup, TYPE MAJOR:MINOR PERMISSIONS ('c 189:*
+    /// rwm'): every node of a major, those that appear while it runs included, for a
+    /// bind of their directory under /dev. Repeatable; "none" forgets them.
+    #[arg(long, value_name = "RULE")]
+    pub device_cgroup_rule: Vec<String>,
     /// GPUs from the CDI spec of their vendor: all, a count, or device=0,1 (nvidia-ctk
     /// cdi generate writes NVIDIA's). Repeatable; "none" forgets them.
     #[arg(long, value_name = "REQUEST")]
@@ -2204,6 +2210,43 @@ mod tests {
             assert_eq!(env_file, [std::path::PathBuf::from("a.env")], "{args:?}");
             assert_eq!(label_file, [std::path::PathBuf::from("l")], "{args:?}");
             assert_eq!(mount, ["type=tmpfs,dst=/t"], "{args:?}");
+        }
+        // --device-cgroup-rule is one word with spaces, repeatable, on all three.
+        for args in [
+            &[
+                "nspawn",
+                "run",
+                "--device-cgroup-rule",
+                "c 189:* rwm",
+                "--device-cgroup-rule=b 8:* r",
+                "img",
+            ][..],
+            &[
+                "nspawn",
+                "create",
+                "--device-cgroup-rule",
+                "c 189:* rwm",
+                "--device-cgroup-rule=b 8:* r",
+                "img",
+                "m",
+            ],
+            &[
+                "nspawn",
+                "start",
+                "--device-cgroup-rule",
+                "c 189:* rwm",
+                "--device-cgroup-rule=b 8:* r",
+                "m",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let rules = match cli.command {
+                Command::Run(a) => a.options.tuning.device_cgroup_rule,
+                Command::Create(a) => a.tuning.device_cgroup_rule,
+                Command::Start(a) => a.options.tuning.device_cgroup_rule,
+                _ => panic!("{args:?}"),
+            };
+            assert_eq!(rules, ["c 189:* rwm", "b 8:* r"], "{args:?}");
         }
         let cli = Cli::try_parse_from(["nspawn", "rm", "-f", "a", "b"]).unwrap();
         let Command::Rm(rm) = cli.command else {

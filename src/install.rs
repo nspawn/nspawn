@@ -209,6 +209,7 @@ pub async fn install(
             command: &run.argv(),
             extra_env: &[],
             binds: &[],
+            host_devices: false,
             volume_units: None,
             network,
             no_network: false,

@@ -155,6 +155,7 @@ with their objects).
 | `cap_add`, `cap_drop`, `tmpfs`, `dns`, `dns_search`, `interfaces`, `gpus` | as | as the flags take them |
 | `extra_hosts` | as | `HOST:IP` |
 | `devices` | as | `HOST:CONTAINER:PERMISSIONS`, then the CDI device names |
+| `device_cgroup_rules` | as | `TYPE MAJOR:MINOR PERMISSIONS`, as `--device-cgroup-rule` takes them |
 | `privileged`, `read_only` | b | `--privileged`, `--read-only` |
 | `init`, `pid1` | b | `--init` given; the program of an app runs as PID 1 (its image carries s6-overlay, or `--init=false`) |
 | `shm_size` | t | bytes, 0 for the default |
@@ -208,6 +209,7 @@ given is remembered for the machine.
 | `log_driver` | s | local (the default) writes to nspawn's own journal namespace, journal to the system journal, none drops the output, though an attached `RunMachine` still passes it straight through |
 | `cap_add`, `cap_drop`, `tmpfs`, `dns`, `dns_search`, `interfaces` | as | as the flags take them |
 | `devices` | as | `HOST[:CONTAINER[:PERMISSIONS]]` or a CDI device name, `VENDOR/CLASS=NAME` |
+| `device_cgroup_rules` | as | `TYPE MAJOR:MINOR PERMISSIONS` (`c 189:* rwm`): DeviceAllow= by the numbers, a major's every minor by its groups in the host's /proc/devices, refused at the start when it has none; an app given devices, these or `devices` or a bind of `/dev`, runs without a user namespace |
 | `gpus` | as | as `--gpus` takes them: all, a count, `device=IDS`, `driver=`, `capabilities=` |
 | `extra_hosts`, `ulimits`, `sysctls` | as | `HOST:IP`; `NAME=SOFT[:HARD]`; `KEY=VALUE` |
 | `secrets` | as | `NAME[:TARGET[:MODE[:UID:GID]]]` |

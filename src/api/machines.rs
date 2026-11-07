@@ -859,6 +859,16 @@ pub async fn prepare(
     if record.takes_api_socket() && record.backend == BackendChoice::Mstack {
         bail!("{name} mounts the Docker API's socket, which nspawn's Docker API cannot reach into an mstack machine yet; make it with --backend overlay");
     }
+    if let Some(rule) = record.tuning.unresolved_device_rule() {
+        bail!("{name}: --device-cgroup-rule {rule}: this host's /proc/devices has no device group of that major, whose driver is not loaded; load it, or give the node's minor");
+    }
+    // Devices of the host make an app go without a user namespace
+    // (settings::app_without_userns): its nodes, its rules, or a bind of devtmpfs.
+    let host_devices = record.tuning.has_host_devices()
+        || record
+            .volumes
+            .iter()
+            .any(|v| v.source.starts_with('/') && volume::on_devtmpfs(Path::new(&v.source)));
     let mut binds = Vec::new();
     duplicate_mount_points(&record)?;
     for volume in &record.volumes {
@@ -889,8 +899,12 @@ pub async fn prepare(
             // /run takes from Linux 6.3 on. As the settings file has it: an app on a
             // bridge or in another machine's network runs without one, --network none
             // and a booted machine with one.
-            let private_users =
-                !crate::settings::app_without_userns(record.mode, record.network, files.is_some());
+            let private_users = !crate::settings::app_without_userns(
+                record.mode,
+                record.network,
+                files.is_some(),
+                host_devices,
+            );
             if private_users && !kernel_at_least(6, 3) {
                 bail!(
                     "{name} runs in a user namespace, where the Docker API socket is bound idmapped, which needs Linux 6.3 or later; run it as an app on a bridge network, or on a newer kernel"
@@ -1130,6 +1144,7 @@ pub async fn prepare(
             command: &record.effective_command(),
             extra_env: &extra_env,
             binds: &binds,
+            host_devices,
             volume_units: volume_units.as_deref(),
             network: record.network,
             no_network: record.no_network,

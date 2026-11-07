@@ -277,7 +277,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.deploy.rollback_config` and below | ignored | deploy.rollback_config only applies to rolling updates in Swarm mode |
 | `services.*.deploy.update_config` and below | ignored | deploy.update_config only applies to rolling updates in Swarm mode |
 | `services.*.develop` and below | ignored | it is for watch, which nspawn compose does not have |
-| `services.*.device_cgroup_rules` | ignored | a device reaches a machine through devices |
+| `services.*.device_cgroup_rules` | yes |  |
 | `services.*.devices` | yes |  |
 | `services.*.devices.[].permissions` | yes |  |
 | `services.*.devices.[].source` | partly | a device node of the host, or a CDI device of the host's specs |
@@ -406,7 +406,7 @@ Decided on docker compose v5.6.0, whose Compose Specification is that of compose
 | `services.*.ulimits` and below | yes |  |
 | `services.*.use_api_socket` | partly | nspawn's Docker API, bound read-write, which takes every request the API serves (a `:ro` bind of the socket in `volumes` reads, follows logs and kills only), and no registry credentials with it |
 | `services.*.user` | partly | refused for an image that boots, whose init runs as it is |
-| `services.*.userns_mode` | ignored | a machine always has a user namespace of its own |
+| `services.*.userns_mode` | ignored | nspawn decides: an app on a bridge or with devices of the host runs without one, any other machine in one of its own |
 | `services.*.uts` | ignored | a machine always has a UTS namespace of its own |
 | `services.*.volumes` | yes |  |
 | `services.*.volumes.[].bind` | yes |  |

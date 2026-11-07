@@ -268,10 +268,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
         "it is for watch, which nspawn compose does not have",
     )
     .and_below(),
-    ignored(
-        "services.*.device_cgroup_rules",
-        "a device reaches a machine through devices",
-    ),
+    full("services.*.device_cgroup_rules"),
     full("services.*.devices"),
     full("services.*.devices.[].permissions"),
     partly(
@@ -506,7 +503,7 @@ pub static ATTRIBUTES: &[Attribute] = &[
     partly("services.*.user", BOOTED),
     ignored(
         "services.*.userns_mode",
-        "a machine always has a user namespace of its own",
+        "nspawn decides: an app on a bridge or with devices of the host runs without one, any other machine in one of its own",
     ),
     ignored(
         "services.*.uts",

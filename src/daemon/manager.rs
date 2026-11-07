@@ -398,6 +398,7 @@ fn tuning_overrides(options: &mut Options<'_>) -> anyhow::Result<crate::tuning::
         tmpfs: options.strings("tmpfs")?,
         shm_size: options.maybe_u64("shm_size")?,
         devices: options.strings("devices")?,
+        device_cgroup_rules: options.strings("device_cgroup_rules")?,
         gpus: options.strings("gpus")?,
         interfaces: options.strings("interfaces")?,
         dns: options.strings("dns")?,

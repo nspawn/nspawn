@@ -322,6 +322,7 @@ pub fn put_tuning(options: &mut Options<'_>, t: crate::cli::TuningArgs) {
         ("cap_drop", t.cap_drop),
         ("tmpfs", t.tmpfs),
         ("devices", t.device),
+        ("device_cgroup_rules", t.device_cgroup_rule),
         ("gpus", t.gpus),
         ("interfaces", t.interface),
         ("dns", t.dns),

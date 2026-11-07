@@ -2263,6 +2263,7 @@ mod tests {
             tmpfs: vec!["/tmp:size=64m".into()],
             shm_size: Some(64 << 20),
             devices: vec!["/dev/null:/dev/nullo:r".into(), "nvidia.com/gpu=all".into()],
+            device_cgroup_rules: Vec::new(),
             gpus: vec![r#"count=2,"capabilities=compute,utility""#.into()],
             interfaces: vec!["eth9".into()],
             dns: vec!["10.0.0.53".into()],

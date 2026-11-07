@@ -99,7 +99,7 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-hapi-made e2e-hapi-img e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-nsuser e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc e2e-v6 e2e-v6b e2e-v6c e2e-v6d e2e-v6u e2e-v6low e2e-notify e2e-fwd e2e-cbind-w-1; do
+  for m in e2e-hapi-made e2e-hapi-img e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-nsuser e2e-dev e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc e2e-v6 e2e-v6b e2e-v6c e2e-v6d e2e-v6u e2e-v6low e2e-notify e2e-fwd e2e-cbind-w-1; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -123,6 +123,7 @@ cleanup_machines() {
   $NSPAWN network rm e2e-cli-net e2e-cli-pnet e2e-ip-net e2e-ip-net2 e2e-cip_fixed e2e-v6net >/dev/null 2>&1 || true
   rm -rf /tmp/e2e-cli /tmp/e2e-cdi
   rm -f /etc/cdi/e2e-nspawn.yaml /etc/cdi/e2e-nspawn-bad.yaml /var/run/cdi/e2e-nspawn-gpu.json /usr/local/bin/e2e-cdi-hook
+  rm -rf /dev/e2e-null /dev/e2e-devdir
   $NSPAWN network rm e2e-cdi_default e2e-cbind_default >/dev/null 2>&1 || true
   $NSPAWN images rm e2e-mirror e2e-api-curl >/dev/null 2>&1 || true
   # What the docker client of the Docker API step made, under names of the API's.
@@ -1538,6 +1539,36 @@ out=$($NSPAWN start e2e-nsuser -u 1000 --network none 2>&1) || fail "start as a 
 [ "$($NSPAWN exec e2e-nsuser -- id -u </dev/null | tr -d '\r')" = 1000 ] || fail "e2e-nsuser does not run as 1000: $($NSPAWN exec e2e-nsuser -- id </dev/null 2>&1)"
 [ "$($NSPAWN exec -u root e2e-nsuser -- cat /proc/self/uid_map </dev/null | tr -s ' ' | tr -d '\r')" != " 0 0 4294967295" ] || fail "e2e-nsuser is not in a user namespace"
 $NSPAWN rm -f e2e-nsuser >/dev/null || fail "rm e2e-nsuser"
+# A device of the host makes an app go without a user namespace on any network: root
+# inside writes to a node only root may open, which in a user namespace it could not.
+rm -rf /dev/e2e-null /dev/e2e-devdir
+mknod -m 0600 /dev/e2e-null c 1 3 || fail "mknod /dev/e2e-null"
+mkdir -p /dev/e2e-devdir
+dv() { $NSPAWN exec e2e-dev -- /bin/sh -c "$1" </dev/null 2>&1 | tr -d '\r'; }
+$NSPAWN create $app e2e-dev -- /bin/sleep 300 >/dev/null || fail "create e2e-dev"
+out=$($NSPAWN start e2e-dev --network none --device /dev/e2e-null 2>&1) || fail "start with a device and --network none: $out"
+[ "$(dv 'cat /proc/self/uid_map' | tr -s ' ')" = " 0 0 4294967295" ] || fail "an app with a device kept a user namespace: $(dv 'cat /proc/self/uid_map')"
+[ "$(dv 'echo x > /dev/e2e-null && echo wrote')" = wrote ] || fail "root in an app with a device could not write to its node: $(dv 'ls -l /dev/e2e-null; echo x > /dev/e2e-null')"
+$NSPAWN stop e2e-dev >/dev/null || fail "stop e2e-dev"
+# A device cgroup rule takes the nodes of a bind of /dev that appear after the start
+# (kmsg's numbers, 1:11, which the cgroup's own pseudo devices leave out; opened, not
+# written); without one the cgroup refuses them.
+out=$($NSPAWN start e2e-dev --device none -v /dev/e2e-devdir:/dev/e2e-devdir --device-cgroup-rule 'c 1:* rw' 2>&1) || fail "start with a device cgroup rule: $out"
+systemctl show -p DeviceAllow systemd-nspawn@e2e-dev.service | grep_q 'char-mem rw' || fail "the rule is not the unit's: $(systemctl show -p DeviceAllow systemd-nspawn@e2e-dev.service)"
+mknod -m 0600 /dev/e2e-devdir/late c 1 11 || fail "mknod /dev/e2e-devdir/late"
+[ "$(dv ': > /dev/e2e-devdir/late && echo opened')" = opened ] || fail "a node that appeared after the start was not taken by the rule: $(dv ': > /dev/e2e-devdir/late')"
+$NSPAWN inspect -f '{{json .device_cgroup_rules}}' e2e-dev | grep_q '"c 1:\* rw"' || fail "inspect does not show the rule: $($NSPAWN inspect -f '{{json .device_cgroup_rules}}' e2e-dev)"
+$NSPAWN stop e2e-dev >/dev/null || fail "stop e2e-dev"
+out=$($NSPAWN start e2e-dev --device-cgroup-rule none 2>&1) || fail "start without the rule: $out"
+$NSPAWN exec e2e-dev -- /bin/sh -c ': > /dev/e2e-devdir/late' </dev/null >/dev/null 2>&1 && fail "the cgroup let a node in without a rule"
+$NSPAWN rm -f e2e-dev >/dev/null || fail "rm e2e-dev"
+out=$($NSPAWN create $app e2e-dev --device-cgroup-rule 'c 1 r' -- /bin/true 2>&1) && fail "a malformed rule was taken"
+echo "$out" | grep_q "TYPE MAJOR:MINOR PERMISSIONS" || fail "the malformed rule was not explained: $out"
+$NSPAWN rm -f e2e-dev >/dev/null 2>&1
+out=$( { $NSPAWN create $app e2e-dev --device-cgroup-rule 'c 4093:* r' -- /bin/sleep 300 && $NSPAWN start e2e-dev; } 2>&1) && fail "a rule for a major without a device group was taken"
+echo "$out" | grep_q "has no device group of that major" || fail "the rule without a group was not explained: $out"
+$NSPAWN rm -f e2e-dev >/dev/null 2>&1
+rm -rf /dev/e2e-null /dev/e2e-devdir
 out=$($NSPAWN start $app --sysctl kernel.shmmax=1 2>&1) && fail "a sysctl beyond net.* was accepted"
 # A refused combination is not remembered: the next start without flags must work.
 out=$($NSPAWN start $app --network none --sysctl net.ipv4.ip_forward=1 -- /bin/sleep 300 2>&1) && fail "--sysctl was accepted with --network none"

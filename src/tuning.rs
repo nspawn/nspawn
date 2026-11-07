@@ -124,6 +124,11 @@ pub struct Tuning {
     /// driver update rewrites them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cdi_devices: Vec<String>,
+    /// --device-cgroup-rule, TYPE MAJOR:MINOR PERMISSIONS ('c 189:* rwm'), turned into
+    /// DeviceAllow= at every start: a major's group names come from the host's
+    /// /proc/devices then.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_cgroup_rules: Vec<String>,
     /// --gpus: the devices of a GPU vendor's CDI spec.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpus: Vec<crate::cdi::GpuRequest>,
@@ -365,24 +370,197 @@ impl Tuning {
 
     /// DeviceAllow= for the unit, so that the machine's cgroup may open the nodes: each
     /// node under a directory given as a device (/dev/dri, /dev/snd), since DeviceAllow=
-    /// takes a node and not a directory.
+    /// takes a node and not a directory, then what the device cgroup rules allow.
     pub fn unit_lines(&self) -> Vec<String> {
-        self.unit_lines_with(device_nodes)
+        let devices = std::fs::read_to_string("/proc/devices").unwrap_or_default();
+        self.unit_lines_with(device_nodes, |kind, major| {
+            device_groups(&devices, kind, major)
+        })
     }
 
-    /// `unit_lines`, with `nodes` saying what device nodes a host path stands for.
-    pub fn unit_lines_with(&self, nodes: impl Fn(&str) -> Vec<String>) -> Vec<String> {
+    /// `unit_lines`, with `nodes` saying what device nodes a host path stands for and
+    /// `groups` what device groups /proc/devices names after a major (`'c'` or `'b'`).
+    pub fn unit_lines_with(
+        &self,
+        nodes: impl Fn(&str) -> Vec<String>,
+        groups: impl Fn(char, u32) -> Vec<String>,
+    ) -> Vec<String> {
         // No permissions: a CDI node the cgroup gives no access to.
-        self.devices
+        let nodes = self
+            .devices
             .iter()
             .filter(|d| !d.permissions.is_empty())
             .flat_map(|d| {
                 nodes(&d.host)
                     .into_iter()
                     .map(move |node| format!("DeviceAllow={node} {}", d.permissions))
+            });
+        let rules = self
+            .device_cgroup_rules
+            .iter()
+            .filter_map(|text| device_rule(text).ok())
+            .flat_map(|rule| {
+                rule.allows(&groups)
+                    .into_iter()
+                    .map(|allow| format!("DeviceAllow={allow}"))
+            });
+        nodes.chain(rules).collect()
+    }
+
+    /// Whether the machine is given devices of the host: nodes, or device cgroup rules
+    /// for the nodes of a bind of /dev.
+    pub fn has_host_devices(&self) -> bool {
+        !self.devices.is_empty() || !self.device_cgroup_rules.is_empty()
+    }
+
+    /// The first device cgroup rule for every minor of a major that this host's
+    /// /proc/devices has no group of, which DeviceAllow= could not express: its driver
+    /// is not loaded.
+    pub fn unresolved_device_rule(&self) -> Option<String> {
+        let devices = std::fs::read_to_string("/proc/devices").unwrap_or_default();
+        self.device_cgroup_rules
+            .iter()
+            .find(|text| {
+                device_rule(text).is_ok_and(|rule| {
+                    rule.allows(&|kind, major| device_groups(&devices, kind, major))
+                        .is_empty()
+                })
             })
+            .cloned()
+    }
+}
+
+/// A rule of a machine's device cgroup, as --device-cgroup-rule takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceRule<'a> {
+    /// 'c', 'b' or 'a' for both.
+    kind: char,
+    /// None for every one.
+    major: Option<u32>,
+    minor: Option<u32>,
+    permissions: &'a str,
+}
+
+impl std::fmt::Display for DeviceRule<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let number = |n: Option<u32>| n.map_or_else(|| "*".to_string(), |n| n.to_string());
+        write!(
+            f,
+            "{} {}:{} {}",
+            self.kind,
+            number(self.major),
+            number(self.minor),
+            self.permissions
+        )
+    }
+}
+
+impl DeviceRule<'_> {
+    /// What DeviceAllow= takes for the rule: /dev/char/MAJOR:MINOR for one node, the
+    /// device groups `groups` names after a major for all of its minors (char-NAME, the
+    /// nodes that appear later included), char-* for every node; block- alike, both
+    /// kinds for 'a'. Each with the permissions.
+    fn allows(&self, groups: &impl Fn(char, u32) -> Vec<String>) -> Vec<String> {
+        let kinds: &[(char, &str)] = match self.kind {
+            'c' => &[('c', "char")],
+            'b' => &[('b', "block")],
+            _ => &[('c', "char"), ('b', "block")],
+        };
+        let mut out = Vec::new();
+        for &(letter, kind) in kinds {
+            match (self.major, self.minor) {
+                (None, _) => out.push(format!("{kind}-*")),
+                (Some(major), None) => out.extend(
+                    groups(letter, major)
+                        .into_iter()
+                        .map(|name| format!("{kind}-{name}")),
+                ),
+                (Some(major), Some(minor)) => out.push(format!("/dev/{kind}/{major}:{minor}")),
+            }
+        }
+        out.into_iter()
+            .map(|spec| format!("{spec} {}", self.permissions))
             .collect()
     }
+}
+
+/// --device-cgroup-rule TYPE MAJOR:MINOR PERMISSIONS: TYPE c, b or a (both), MAJOR and
+/// MINOR a number or *, PERMISSIONS r, w and m each once.
+pub fn device_rule(text: &str) -> Result<DeviceRule<'_>> {
+    let invalid = || {
+        anyhow::anyhow!(
+            "--device-cgroup-rule {text}: TYPE MAJOR:MINOR PERMISSIONS, as in 'c 189:* rwm'"
+        )
+    };
+    let fields: Vec<&str> = text.split_whitespace().collect();
+    let [kind, numbers, permissions] = fields[..] else {
+        return Err(invalid());
+    };
+    let kind = match kind {
+        "c" | "b" | "a" => kind.chars().next().unwrap_or('a'),
+        _ => return Err(invalid()),
+    };
+    let (major, minor) = numbers.split_once(':').ok_or_else(invalid)?;
+    let number = |n: &str| -> Result<Option<u32>> {
+        match n {
+            "*" => Ok(None),
+            n if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+                Ok(Some(n.parse().map_err(|_| invalid())?))
+            }
+            _ => Err(invalid()),
+        }
+    };
+    let (major, minor) = (number(major)?, number(minor)?);
+    if major.is_none() && minor.is_some() {
+        bail!("--device-cgroup-rule {text}: a rule for one minor names its major too");
+    }
+    let mode_ok = !permissions.is_empty()
+        && permissions.chars().all(|c| matches!(c, 'r' | 'w' | 'm'))
+        && permissions
+            .chars()
+            .enumerate()
+            .all(|(i, c)| !permissions[..i].contains(c));
+    if !mode_ok {
+        bail!("--device-cgroup-rule {text}: permissions are r, w and m, each once");
+    }
+    Ok(DeviceRule {
+        kind,
+        major,
+        minor,
+        permissions,
+    })
+}
+
+/// The device groups `devices` (/proc/devices) lists for `major`, among the character
+/// devices for 'c' and the block devices for 'b'.
+pub fn device_groups(devices: &str, kind: char, major: u32) -> Vec<String> {
+    let section = match kind {
+        'c' => "Character devices:",
+        _ => "Block devices:",
+    };
+    let mut inside = false;
+    let mut out = Vec::new();
+    for line in devices.lines() {
+        let line = line.trim();
+        if line.ends_with("devices:") {
+            inside = line == section;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        if let Some((number, name)) = line.split_once(char::is_whitespace) {
+            let name = name.trim();
+            // A glob character in a name would widen what DeviceAllow= matches.
+            if number.parse() == Ok(major)
+                && !name.is_empty()
+                && !name.contains(['*', '?', '[', ']'])
+            {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// The device nodes a --device path stands for: the node itself, or every character
@@ -574,6 +752,7 @@ pub struct Overrides {
     pub shm_size: Option<u64>,
     /// Nodes of the host and CDI device names alike, as --device takes them.
     pub devices: Vec<String>,
+    pub device_cgroup_rules: Vec<String>,
     pub gpus: Vec<String>,
     pub interfaces: Vec<String>,
     pub dns: Vec<String>,
@@ -660,6 +839,11 @@ impl Overrides {
                     t.cdi_devices.push(name);
                 }
             }
+        }
+        if !self.device_cgroup_rules.is_empty() {
+            t.device_cgroup_rules = list(&self.device_cgroup_rules, |r| {
+                device_rule(r).map(|rule| rule.to_string())
+            })?;
         }
         if !self.gpus.is_empty() {
             t.gpus = list(&self.gpus, |g| {
@@ -1139,6 +1323,7 @@ mod tests {
             tmpfs: vec!["/run:size=64m".into(), "/tmp".into()],
             shm_size: Some(1 << 26),
             devices: vec!["/dev/null:/dev/nullo:r".into(), "/dev/dri".into()],
+            device_cgroup_rules: vec!["c  189:* rwm".into(), "a 1:3 r".into()],
             gpus: Vec::new(),
             interfaces: vec!["wlan0".into(), "eth1".into(), "wlan0".into()],
             dns: vec!["10.0.0.53".into()],
@@ -1206,12 +1391,22 @@ mod tests {
             ],
             other => vec![other.to_string()],
         };
+        // A rule for every minor of a major goes by the device groups of that major, so
+        // that the nodes that appear later are taken too; one node by its numbers.
+        assert_eq!(t.device_cgroup_rules, ["c 189:* rwm", "a 1:3 r"]);
+        let groups = |kind: char, major: u32| match (kind, major) {
+            ('c', 189) => vec!["usb_device".to_string()],
+            _ => Vec::new(),
+        };
         assert_eq!(
-            t.unit_lines_with(nodes),
+            t.unit_lines_with(nodes, groups),
             [
                 "DeviceAllow=/dev/null r",
                 "DeviceAllow=/dev/dri/card0 rwm",
-                "DeviceAllow=/dev/dri/renderD128 rwm"
+                "DeviceAllow=/dev/dri/renderD128 rwm",
+                "DeviceAllow=char-usb_device rwm",
+                "DeviceAllow=/dev/char/1:3 r",
+                "DeviceAllow=/dev/block/1:3 r"
             ]
         );
         assert_eq!(device_nodes("/dev/null"), ["/dev/null"]);
@@ -1631,6 +1826,55 @@ mod tests {
         .apply(&mut t)
         .unwrap();
         assert!(t.depends_on.is_empty() && t.is_default());
+    }
+
+    #[test]
+    fn a_device_cgroup_rule_is_read_and_goes_by_numbers_or_groups() {
+        let rule = |text: &str| device_rule(text).map(|r| r.to_string());
+        assert_eq!(rule("c 189:* rwm").unwrap(), "c 189:* rwm");
+        assert_eq!(rule(" b   8:16  r ").unwrap(), "b 8:16 r");
+        assert_eq!(rule("a *:* rwm").unwrap(), "a *:* rwm");
+        for bad in [
+            "c 189:*",
+            "x 189:* rwm",
+            "c 189 rwm",
+            "c :1 rwm",
+            "c 189:-1 rwm",
+            "c 189:* rwx",
+            "c 189:* rr",
+            "c 189:* ",
+            "c 1:2 r extra",
+        ] {
+            let e = rule(bad).unwrap_err();
+            assert!(e.to_string().contains("--device-cgroup-rule"), "{bad}: {e}");
+        }
+        let one_minor = rule("c *:3 rw").unwrap_err();
+        assert!(
+            one_minor.to_string().contains("names its major"),
+            "{one_minor}"
+        );
+
+        let devices = "Character devices:\n  1 mem\n  4 /dev/vc/0\n  4 tty\n189 usb_device\n\nBlock devices:\n  8 sd\n259 blkext\n";
+        assert_eq!(device_groups(devices, 'c', 189), ["usb_device"]);
+        assert_eq!(device_groups(devices, 'c', 4), ["/dev/vc/0", "tty"]);
+        assert_eq!(device_groups(devices, 'b', 8), ["sd"]);
+        assert!(device_groups(devices, 'b', 189).is_empty());
+        assert!(device_groups(devices, 'c', 7).is_empty());
+        let groups = |kind, major| device_groups(devices, kind, major);
+        let allows = |text: &str| device_rule(text).unwrap().allows(&groups);
+        assert_eq!(allows("c 189:* rwm"), ["char-usb_device rwm"]);
+        assert_eq!(allows("b 8:* r"), ["block-sd r"]);
+        assert_eq!(allows("c *:* rwm"), ["char-* rwm"]);
+        assert_eq!(allows("a *:* rwm"), ["char-* rwm", "block-* rwm"]);
+        assert_eq!(allows("c 189:3 rw"), ["/dev/char/189:3 rw"]);
+        // A major this host has no group of: nothing DeviceAllow= could take.
+        assert!(allows("c 7:* rw").is_empty());
+        let t = Tuning {
+            device_cgroup_rules: vec!["c 189:3 rw".into()],
+            ..Tuning::default()
+        };
+        assert!(t.has_host_devices());
+        assert!(!Tuning::default().has_host_devices());
     }
 
     #[test]

@@ -652,6 +652,11 @@ impl Machine {
                 "CgroupPermissions": d.permissions,
             })).collect::<Vec<_>>(),
             "Ulimits": ulimits_json(t),
+            "DeviceCgroupRules": if t.device_cgroup_rules.is_empty() {
+                Value::Null
+            } else {
+                json!(t.device_cgroup_rules)
+            },
         });
         // What the API writes for the settings nspawn has no counterpart of.
         let unset = json!({
@@ -672,7 +677,6 @@ impl Machine {
             "CpuShares": 0,
             "CpusetCpus": "",
             "CpusetMems": "",
-            "DeviceCgroupRules": null,
             "DeviceRequests": null,
             "IOMaximumBandwidth": 0,
             "IOMaximumIOps": 0,

@@ -868,6 +868,12 @@ fn settings(spec: &Spec, service: &Map, made: &mut Made) {
         })
         .collect();
     put_list(o, "devices", devices);
+    let rules: Vec<String> = seq(service, "device_cgroup_rules")
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    put_list(o, "device_cgroup_rules", rules);
     // GPUs and the devices deploy reserves, both device requests.
     let reserved = sub(service, "deploy")
         .and_then(|d| sub(d, "resources"))
@@ -1913,6 +1919,8 @@ services:
     devices:
       - /dev/null:/dev/nullo:r
       - e2e.nspawn.test/dev=one
+    device_cgroup_rules:
+      - "c 189:* rmw"
     gpus: all
   train:
     image: busybox
@@ -1929,6 +1937,7 @@ services:
 "#,
         );
         let ml = made(&project, "ml", 1);
+        assert_eq!(list(&ml, "device_cgroup_rules"), ["c 189:* rmw"]);
         assert_eq!(
             list(&ml, "devices"),
             ["/dev/null:/dev/nullo:r", "e2e.nspawn.test/dev=one"]

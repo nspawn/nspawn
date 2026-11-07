@@ -394,6 +394,17 @@ More flags, remembered like the rest:
 - `--device HOST[:CONTAINER][:rwm]`: a node, or a directory such as `/dev/dri`, whose
   nodes are allowed one by one, or a CDI name such as `nvidia.com/gpu=all` (see
   [GPUs and CDI devices](#gpus-and-cdi-devices)), and `--gpus`.
+- `--device-cgroup-rule 'TYPE MAJOR:MINOR PERMISSIONS'` (`c`, `b` or `a` for both; a
+  number or `*`; `r`, `w` and `m`) lets the machine's cgroup open nodes by their
+  numbers, the nodes that appear while it runs included: `-v /dev/bus/usb:/dev/bus/usb
+  --device-cgroup-rule 'c 189:* rwm'` reaches a USB device that comes and goes, as a
+  flasher's does. A rule for every minor of a major goes by the device groups the host's
+  `/proc/devices` names after it at each start (`char-usb_device`), so a major without
+  one (its driver not loaded) is refused then; one node goes by `/dev/char/189:3`.
+- An app given devices of the host (`--device`, `--device-cgroup-rule`, or a `-v` of a
+  node or directory of `/dev`) runs without a user namespace whatever its network, as an
+  app on a bridge does: device nodes cannot be idmapped, so only there does root inside
+  open them as their owner and mode allow. A booted machine keeps its user namespace.
 - `--dns` and `--dns-search`; a search domain needs a letter and is 254 characters at
   most, a trailing dot is dropped and `.` stands for no search domain. `--dns-option`
   (`--dns-opt`) and `--expose` are accepted and ignored with a warning: the
@@ -1200,8 +1211,9 @@ systemd 259 or newer, `--network-namespace-path=` before), together with a gener
 namespace goes away when the machine stops.
 
 One consequence: a user namespace cannot join a network namespace that belongs to the
-host, so app machines on the bridge run without one (`PrivateUsers=no`); capabilities,
-seccomp and the other namespaces still apply. Such an app keeps the capabilities images
+host, so app machines on the bridge run without one (`PrivateUsers=no`), as do apps given
+devices of the host on any network; capabilities, seccomp and the other namespaces still
+apply. Such an app keeps the capabilities images
 need to run as written (CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, MKNOD,
 NET_BIND_SERVICE, NET_RAW, SETFCAP, SETGID, SETPCAP, SETUID, SYS_CHROOT, AUDIT_WRITE)
 plus SYS_BOOT, not systemd-nspawn's set: without a user namespace that
