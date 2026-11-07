@@ -134,8 +134,9 @@ a reference of no image here is `NoSuchImage` to `GetImage`, `RemoveImages` and
 `PushImage`, and `NoSuchMachine` (`no machine or image of REFERENCE`) to
 `RemoveMachines` and every method that takes a machine. The command line asks
 `ResolveImage` with names for every reference it is given first, under the registry it
-was given, and sends one nothing here goes by in full under that registry; `run` and
-`create` read a name nothing here has as a reference too (`nspawn run busybox`). The
+was given, and sends one nothing here goes by in full under that registry; `run`,
+`create`, `images rm` and `images inspect` read a name nothing here has as a reference
+too (`nspawn images rm busybox`). The
 names a method makes (`CreateMachine`'s, `PullImage`'s name, a build's tags) are taken as
 they are.
 

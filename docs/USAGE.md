@@ -31,9 +31,10 @@ image of the configured registry's is here), and names the image pulled or built
 the last one made of several: `busybox:1.37`, `docker.io/library/busybox:1.37` and
 `busybox-1.37`, the name it was pulled under, are one image to `run`, `create`, `push`,
 `rm`, `images rm`, `inspect`, `images inspect`, `start`, `exec`, `logs`, `network
-connect` and the rest. `run`, `create` and `push` take an image, and read a name nothing
-here has as a reference too (`nspawn run busybox`). The MACHINE of `cp`'s MACHINE:PATH is
-a name.
+connect` and the rest. The commands that take an image, `run`, `create`, `push`, `images
+rm` and `images inspect`, read a name nothing here has as a reference too: `nspawn run
+busybox` and `nspawn images rm busybox` take the image of `busybox:latest`, whatever its
+name. The MACHINE of `cp`'s MACHINE:PATH is a name.
 
 A reference never names a machine made from the image, which has a name of its own: `rm
 nginx:latest` removes the image and leaves the machines made from it, and `stop

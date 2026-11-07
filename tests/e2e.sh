@@ -5408,7 +5408,11 @@ $NSPAWN rm -f e2e-same-$nonce >/dev/null 2>&1 || fail "rm -f e2e-same-$nonce"
 out=$($NSPAWN rm -f e2e-same-$nonce 2>&1) && fail "rm -f of a machine that went took something: $out"
 echo "$out" | grep_q "no machine or image named e2e-same-$nonce" || fail "rm -f of a machine that went was not refused as no name: $out"
 [ "$(image_only e2e-same-$nonce-2)" = true ] || fail "rm -f of a machine that went removed the image of its name's reference"
-$NSPAWN images rm e2e-same-$nonce-2 >/dev/null 2>&1 || fail "images rm e2e-same-$nonce-2"
+# The commands of images read a name nothing has as the reference it is too.
+out=$($NSPAWN images inspect -f '{{.name}}' e2e-same-$nonce 2>&1)
+[ "$out" = e2e-same-$nonce-2 ] || fail "images inspect of a name nothing has did not take the image of its reference: $out"
+$NSPAWN images rm e2e-same-$nonce >/dev/null 2>&1 || fail "images rm of a name nothing has"
+[ -z "$(image_only e2e-same-$nonce-2)" ] || fail "images rm of a name nothing has left the image of its reference"
 # The name run gives the machine is the image's own: the machine goes beside it, and the
 # image stays one.
 out=$($NSPAWN run -d --pull never $img -- sleep 300 2>&1) || fail "run -d of the image by its local name: $out"

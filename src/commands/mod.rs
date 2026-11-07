@@ -232,7 +232,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 ip,
             } => {
                 let client = Client::connect().await?;
-                let machine = read_name(&machine, true, &client, &config).await;
+                let machine = read_name(&machine, MACHINES, &client, &config).await;
                 let mut options = Options::new();
                 put_all(&mut options, "aliases", alias);
                 put_opt(&mut options, "address", ip);
@@ -247,7 +247,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 force,
             } => {
                 let client = Client::connect().await?;
-                let machine = read_name(&machine, true, &client, &config).await;
+                let machine = read_name(&machine, MACHINES, &client, &config).await;
                 let mut options = Options::new();
                 put(&mut options, "force", force);
                 client
@@ -928,18 +928,18 @@ enum CreateSource {
 /// before, read their machine with `read_name` too; cp's MACHINE of MACHINE:PATH can only
 /// be a name, which the service takes as it is.
 async fn read_names(command: &mut Command, client: &Client, config: &Config) {
-    let (texts, images_only) = names_in(command);
+    let (texts, reads) = names_in(command);
     for text in texts {
-        *text = read_name(text, images_only, client, config).await;
+        *text = read_name(text, reads, client, config).await;
     }
 }
 
-/// The record `text` names, as ResolveImage with names answers it (`record_name`), the
-/// image alone for a reference with `images_only`.
-async fn read_name(text: &str, images_only: bool, client: &Client, config: &Config) -> String {
+/// The record `text` names, as ResolveImage with names answers it (`record_name`), as
+/// `reads` says.
+async fn read_name(text: &str, reads: Reads, client: &Client, config: &Config) -> String {
     let mut options = client::registry_options(config);
     options.insert("names", Value::from(true));
-    options.insert("images_only", Value::from(images_only));
+    options.insert("images_only", Value::from(reads.images_only));
     let resolve = |text: String| async move { client.manager.resolve_image(&text, options).await };
     let registry = config.registry_set.then_some(config.registry.as_str());
     let listed = || async {
@@ -950,50 +950,78 @@ async fn read_name(text: &str, images_only: bool, client: &Client, config: &Conf
             .map(|images| images.iter().map(|i| client::string(i, "name")).collect())
             .unwrap_or_default()
     };
-    record_name(text, registry, resolve, listed).await
+    record_name(text, reads.bare_references, registry, resolve, listed).await
 }
 
-/// The names of machines and images `command` takes whole, and whether a reference among
-/// them names the image alone: where the image is only read, a machine made from it holds
-/// it too.
-fn names_in(command: &mut Command) -> (Vec<&mut String>, bool) {
+/// How a command reads the names it takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reads {
+    /// A reference names the image alone: where the image is only read, a machine made
+    /// from it holds it too.
+    images_only: bool,
+    /// A name nothing here has is the reference of an image too, as for the commands that
+    /// take an image (`images rm busybox` is the image of busybox:latest, whatever its
+    /// name).
+    bare_references: bool,
+}
+
+/// The commands that take a machine: a name is that record or none.
+const MACHINES: Reads = Reads {
+    images_only: true,
+    bare_references: false,
+};
+
+/// The names of machines and images `command` takes whole, and how it reads them.
+fn names_in(command: &mut Command) -> (Vec<&mut String>, Reads) {
+    let of_images = |images_only| Reads {
+        images_only,
+        bare_references: true,
+    };
     match command {
-        Command::Inspect(a) => (a.names.iter_mut().collect(), false),
+        Command::Inspect(a) => (
+            a.names.iter_mut().collect(),
+            Reads {
+                images_only: false,
+                ..MACHINES
+            },
+        ),
         Command::Images(images) => match &mut images.command {
-            Some(ImagesCommand::Inspect(a)) => (a.names.iter_mut().collect(), false),
-            Some(ImagesCommand::Rm(a)) => (a.names.iter_mut().collect(), true),
-            _ => (Vec::new(), true),
+            Some(ImagesCommand::Inspect(a)) => (a.names.iter_mut().collect(), of_images(false)),
+            Some(ImagesCommand::Rm(a)) => (a.names.iter_mut().collect(), of_images(true)),
+            _ => (Vec::new(), MACHINES),
         },
-        Command::Rm(a) => (a.names.iter_mut().collect(), true),
-        Command::Generate(a) => (a.names.iter_mut().collect(), true),
-        Command::Start(a) => (vec![&mut a.name], true),
-        Command::Stop(a) => (a.names.iter_mut().collect(), true),
-        Command::Restart(a) => (a.names.iter_mut().collect(), true),
-        Command::Kill(a) => (a.names.iter_mut().collect(), true),
-        Command::Pause(a) | Command::Unpause(a) => (a.names.iter_mut().collect(), true),
-        Command::Top(a) => (vec![&mut a.machine], true),
-        Command::Wait(a) => (a.names.iter_mut().collect(), true),
-        Command::Port(a) => (vec![&mut a.name], true),
-        Command::Update(a) => (a.names.iter_mut().collect(), true),
-        Command::Stats(a) => (a.names.iter_mut().collect(), true),
-        Command::AutoUpdate(a) => (a.names.iter_mut().collect(), true),
-        Command::Exec(a) => (vec![&mut a.machine], true),
-        Command::Shell(a) => (vec![&mut a.machine], true),
-        Command::Logs(a) => (a.machines.iter_mut().collect(), true),
-        _ => (Vec::new(), true),
+        Command::Rm(a) => (a.names.iter_mut().collect(), MACHINES),
+        Command::Generate(a) => (a.names.iter_mut().collect(), MACHINES),
+        Command::Start(a) => (vec![&mut a.name], MACHINES),
+        Command::Stop(a) => (a.names.iter_mut().collect(), MACHINES),
+        Command::Restart(a) => (a.names.iter_mut().collect(), MACHINES),
+        Command::Kill(a) => (a.names.iter_mut().collect(), MACHINES),
+        Command::Pause(a) | Command::Unpause(a) => (a.names.iter_mut().collect(), MACHINES),
+        Command::Top(a) => (vec![&mut a.machine], MACHINES),
+        Command::Wait(a) => (a.names.iter_mut().collect(), MACHINES),
+        Command::Port(a) => (vec![&mut a.name], MACHINES),
+        Command::Update(a) => (a.names.iter_mut().collect(), MACHINES),
+        Command::Stats(a) => (a.names.iter_mut().collect(), MACHINES),
+        Command::AutoUpdate(a) => (a.names.iter_mut().collect(), MACHINES),
+        Command::Exec(a) => (vec![&mut a.machine], MACHINES),
+        Command::Shell(a) => (vec![&mut a.machine], MACHINES),
+        Command::Logs(a) => (a.machines.iter_mut().collect(), MACHINES),
+        _ => (Vec::new(), MACHINES),
     }
 }
 
 /// The record `text` names, as the methods of the bus read it (`api::resolve::name_of`):
 /// a name that can be a machine's as it is, the record of that name or none, so that a
-/// machine that went meanwhile is never taken for another image by its reference; any
-/// other text as `resolve` (ResolveImage) answers it. A reference nothing here goes by is
+/// machine that went meanwhile is never taken for another image by its reference, but
+/// with `bare_references` (the commands of images), where a name nothing has is the
+/// reference of an image too; any other text as `resolve` (ResolveImage) answers it. A reference nothing here goes by is
 /// sent on in full under `registry`, the one the command line was given, for the service
 /// to read the same reference, unless an image of `listed` (machined's, say
 /// `my_box`) has that very name; a text that gets no answer goes on as it is, for the
 /// command's own call to say what is wrong with it.
 async fn record_name<R, RF, L, LF>(
     text: &str,
+    bare_references: bool,
     registry: Option<&str>,
     resolve: R,
     listed: L,
@@ -1004,14 +1032,17 @@ where
     L: FnOnce() -> LF,
     LF: std::future::Future<Output = Vec<String>>,
 {
-    if crate::reference::validate_machine_name(text).is_ok() {
+    let name = crate::reference::validate_machine_name(text).is_ok();
+    if name && !bare_references {
         return text.to_string();
     }
     let e = match resolve(text.to_string()).await {
         Ok(found) => return client::string(&found, "name"),
         Err(e) => client::error(e),
     };
+    // A name nothing has goes on as the name it is, which the service takes as such.
     match (client::error_name(&e), registry) {
+        _ if name => text.to_string(),
         (Some("NoSuchImage"), Some(registry)) if !listed().await.iter().any(|n| n == text) => {
             crate::reference::ImageRef::parse(text, registry)
                 .map_or_else(|_| text.to_string(), |r| r.to_string())
@@ -1234,7 +1265,8 @@ mod tests {
             resolved: Default::default(),
         };
         let nothing = || std::future::ready(Vec::new());
-        let name = |text: &'static str| record_name(text, None, |t| service.resolve(t), nothing);
+        let name =
+            |text: &'static str| record_name(text, false, None, |t| service.resolve(t), nothing);
         // A name that can be a machine's is that record or none, as the service takes it:
         // asked of nobody, so that a machine that went is never read as a reference.
         for text in ["web", "busybox-1.37", "gone", "busybox"] {
@@ -1249,13 +1281,27 @@ mod tests {
         // command line was given; what is no reference or gets no answer as it is.
         assert_eq!(name("alpine:3").await, "alpine:3");
         assert_eq!(
-            record_name("alpine:3", Some("zot.lan"), |t| service.resolve(t), nothing).await,
+            record_name(
+                "alpine:3",
+                false,
+                Some("zot.lan"),
+                |t| service.resolve(t),
+                nothing
+            )
+            .await,
             "zot.lan/alpine:3"
         );
         // An image machined has under that very name goes on as it is.
         let machined = || std::future::ready(vec!["my_box".to_string()]);
         assert_eq!(
-            record_name("my_box", Some("zot.lan"), |t| service.resolve(t), machined).await,
+            record_name(
+                "my_box",
+                false,
+                Some("zot.lan"),
+                |t| service.resolve(t),
+                machined
+            )
+            .await,
             "my_box"
         );
         assert_eq!(name("Bad Name").await, "Bad Name");
@@ -1268,10 +1314,27 @@ mod tests {
             std::future::ready(Err(service_error("NotAuthorized", "refused")))
         };
         assert_eq!(
-            record_name("x:1", Some("zot.lan"), denied, nothing).await,
+            record_name("x:1", false, Some("zot.lan"), denied, nothing).await,
             "x:1"
         );
         assert_eq!(service.resolved.borrow().len(), 6);
+        // The commands of images read a name nothing has as the reference it is too: `images
+        // rm busybox` is the image of busybox:latest, whatever its name; a name nothing is
+        // behind goes on as the name it is, whatever registry was given.
+        let image = |text: &'static str| {
+            record_name(text, true, Some("zot.lan"), |t| service.resolve(t), nothing)
+        };
+        assert_eq!(image("web").await, "web");
+        assert_eq!(image("busybox:1.37").await, "busybox-1.37");
+        let bare = Service {
+            resolves: vec![("busybox", "busybox-latest")],
+            resolved: Default::default(),
+        };
+        let image = |text: &'static str| {
+            record_name(text, true, Some("zot.lan"), |t| bare.resolve(t), nothing)
+        };
+        assert_eq!(image("busybox").await, "busybox-latest");
+        assert_eq!(image("gone").await, "gone");
     }
 
     #[test]
@@ -1281,21 +1344,28 @@ mod tests {
             let mut command = Cli::try_parse_from([&["nspawn"], args].concat())
                 .unwrap()
                 .command;
-            let (texts, images_only) = names_in(&mut command);
+            let (texts, reads) = names_in(&mut command);
             let texts: Vec<String> = texts.into_iter().map(|t| t.clone()).collect();
-            (texts, images_only)
+            (texts, reads)
         };
-        // Where the image is only read, a reference takes a machine made from it too.
-        for args in [&["inspect", "a", "b"][..], &["images", "inspect", "a", "b"]] {
-            assert_eq!(
-                read(args),
-                (vec!["a".into(), "b".into()], false),
-                "{args:?}"
-            );
-        }
+        let two = || vec!["a".to_string(), "b".to_string()];
+        // Where the image is only read, a reference takes a machine made from it too; the
+        // commands of images read a name nothing has as a reference.
+        let reads = |images_only, bare_references| Reads {
+            images_only,
+            bare_references,
+        };
+        assert_eq!(read(&["inspect", "a", "b"]), (two(), reads(false, false)));
+        assert_eq!(
+            read(&["images", "inspect", "a", "b"]),
+            (two(), reads(false, true))
+        );
+        assert_eq!(
+            read(&["images", "rm", "a", "b"]),
+            (two(), reads(true, true))
+        );
         for args in [
             &["rm", "a", "b"][..],
-            &["images", "rm", "a", "b"],
             &["generate", "a", "b"],
             &["stop", "a", "b"],
             &["restart", "a", "b"],
@@ -1308,7 +1378,7 @@ mod tests {
             &["auto-update", "a", "b"],
             &["logs", "a", "b"],
         ] {
-            assert_eq!(read(args), (vec!["a".into(), "b".into()], true), "{args:?}");
+            assert_eq!(read(args), (two(), MACHINES), "{args:?}");
         }
         for args in [
             &["start", "a"][..],
@@ -1317,7 +1387,7 @@ mod tests {
             &["exec", "a", "true"],
             &["shell", "a"],
         ] {
-            assert_eq!(read(args), (vec!["a".into()], true), "{args:?}");
+            assert_eq!(read(args), (vec!["a".into()], MACHINES), "{args:?}");
         }
         // cp's MACHINE of MACHINE:PATH is a name, as the service takes it; network connect
         // and disconnect read theirs where they are dispatched.
