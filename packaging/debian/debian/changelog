@@ -1,3 +1,9 @@
+nspawn (3.2.0-1) unstable; urgency=medium
+
+  * Every command takes an image by its local name or its reference, a reference never a machine made from it; run of an image whose name its machine would get makes the machine beside it; TAB after logs -f offers the running machines.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Sat, 07 Nov 2026 03:50:00 -0500
+
 nspawn (3.1.0-1) unstable; urgency=medium
 
   * --device-cgroup-rule for devices that come and go; an app given devices of the host runs without a user namespace; binds of file systems that take no idmapped mount (overlayfs, devtmpfs) no longer keep an app in a user namespace from starting.

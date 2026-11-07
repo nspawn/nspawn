@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 3.1.0
+%global upstream_version 3.2.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -169,6 +169,9 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Sat Nov 07 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 3.2.0-1
+- Every command takes an image by its local name or its reference, a reference never a machine made from it; run of an image whose name its machine would get makes the machine beside it; TAB after logs -f offers the running machines.
+
 * Sat Nov 07 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 3.1.0-1
 - --device-cgroup-rule for devices that come and go; an app given devices of the host runs without a user namespace; binds of file systems that take no idmapped mount (overlayfs, devtmpfs) no longer keep an app in a user namespace from starting.
 
