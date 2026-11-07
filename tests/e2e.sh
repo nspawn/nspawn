@@ -3561,10 +3561,12 @@ dk run -d --name e2e-dk-lg --label e2e.dk=1 e2e-dk-bb seq 1 50000 >/dev/null || 
 dkt wait e2e-dk-lg >/dev/null
 [ "$(timeout 60 "$dk_dir/dk" logs -f e2e-dk-lg 2>&1 | wc -l)" = 50000 ] || fail "docker logs -f of a container that ended: $(dk logs e2e-dk-lg 2>&1 | wc -l) lines without -f"
 dk rm e2e-dk-lg >/dev/null || fail "docker rm e2e-dk-lg"
-# No rate limit of the journal takes lines away, on the journald driver either.
+# No rate limit of the journal takes lines away, on the journald driver either. The
+# system's journald writes the last of them a moment after the run ends: a line lost is
+# one that never comes.
 dk run -d --name e2e-dk-lj --log-driver journald --label e2e.dk=1 e2e-dk-bb seq 1 50000 >/dev/null || fail "docker run -d e2e-dk-lj"
 dkt wait e2e-dk-lj >/dev/null
-[ "$(timeout 60 "$dk_dir/dk" logs e2e-dk-lj 2>&1 | wc -l)" = 50000 ] || fail "docker logs of the journald driver lost lines: $(dk logs e2e-dk-lj 2>&1 | wc -l)"
+retry 10 bash -c "[ \"\$(timeout 60 '$dk_dir/dk' logs e2e-dk-lj 2>&1 | wc -l)\" = 50000 ]" || fail "docker logs of the journald driver lost lines: $(dk logs e2e-dk-lj 2>&1 | wc -l)"
 dk rm e2e-dk-lj >/dev/null || fail "docker rm e2e-dk-lj"
 # cp both ways: modes, owners, links, directories, a tar on stdout, a container that does
 # not run.
