@@ -51,6 +51,7 @@ pub enum Command {
     /// Upload a local image to the hub.
     Push(PushArgs),
     /// Manage local images; without a subcommand, list them.
+    #[command(alias = "image")]
     Images(ImagesArgs),
     /// Manage running machines.
     Machines(MachinesArgs),
@@ -1003,9 +1004,23 @@ pub enum ImagesCommand {
     Ls(OutputArgs),
     /// Remove local images (and the layers nobody uses any more).
     Rm(ImagesRmArgs),
+    /// Everything nspawn keeps about local images, as JSON, by name or by reference.
+    Inspect(ImagesInspectArgs),
     /// Remove images no machine uses: with -a every image no machine was made from;
     /// without, none (an image keeps the name it was pulled or built under).
     Prune(ImagesPruneArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ImagesInspectArgs {
+    /// Image names or references: a name is the record's of that name, a reference the
+    /// record the service resolves it to (an image, else a machine made from it).
+    #[arg(required = true, add = candidates(Kind::Any))]
+    pub names: Vec<String>,
+    /// A Go template over each image: '{{.reference}}', '{{json .image_labels}}'; the
+    /// keys are the ones images inspect prints.
+    #[arg(long, short = 'f', value_name = "FORMAT")]
+    pub format: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -1698,6 +1713,62 @@ mod tests {
         ));
         // A flag of the list belongs before no subcommand.
         assert!(images(&["nspawn", "images", "--json", "rm", "web"]).is_err());
+    }
+
+    #[test]
+    fn image_is_the_images_group_and_inspects_by_name_or_reference() {
+        let images = |argv: &[&str]| match Cli::try_parse_from(argv).map(|c| c.command) {
+            Ok(Command::Images(a)) => Ok(a),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => Err(e.kind()),
+        };
+        assert!(images(&["nspawn", "image"]).unwrap().command.is_none());
+        assert!(matches!(
+            images(&["nspawn", "image", "ls"]).unwrap().command,
+            Some(ImagesCommand::Ls(_))
+        ));
+        assert!(matches!(
+            images(&["nspawn", "image", "rm", "web"]).unwrap().command,
+            Some(ImagesCommand::Rm(_))
+        ));
+        assert!(matches!(
+            images(&["nspawn", "image", "prune", "-a", "-f"])
+                .unwrap()
+                .command,
+            Some(ImagesCommand::Prune(_))
+        ));
+        for group in ["image", "images"] {
+            match images(&[
+                "nspawn",
+                group,
+                "inspect",
+                "-f",
+                "{{.reference}}",
+                "web",
+                "busybox:1.37",
+            ])
+            .unwrap()
+            .command
+            {
+                Some(ImagesCommand::Inspect(a)) => {
+                    assert_eq!(a.names, ["web", "busybox:1.37"]);
+                    assert_eq!(a.format.as_deref(), Some("{{.reference}}"));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        match images(&["nspawn", "image", "inspect", "--format", "json", "web"])
+            .unwrap()
+            .command
+        {
+            Some(ImagesCommand::Inspect(a)) => assert_eq!(a.format.as_deref(), Some("json")),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            images(&["nspawn", "image", "inspect"]).unwrap_err(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "an image to inspect is required"
+        );
     }
 
     #[test]

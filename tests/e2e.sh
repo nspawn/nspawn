@@ -3591,9 +3591,29 @@ mkdir -p "$dk_dir/built"
 printf 'FROM %s\nCMD ["echo", "built-short"]\n' "$busybox_ref" > "$dk_dir/built/Dockerfile"
 $NSPAWN build -t e2e-dk-built:1 "$dk_dir/built" >/dev/null 2>&1 || fail "nspawn build -t e2e-dk-built:1"
 dk image inspect e2e-dk-built:1 >/dev/null 2>&1 || fail "docker image inspect by the short name of an image built here"
+# images inspect (image is the same group): a record by its name, an image by a
+# reference the service resolves, a missing one said after the others and exit 1.
+out=$($NSPAWN images inspect -f '{{.name}}' e2e-dk-built:1 2>&1)
+[ "$out" = e2e-dk-built-1 ] || fail "images inspect by the short reference of an image built here: $out"
+out=$($NSPAWN image inspect -f '{{.reference}}' e2e-dk-built-1 2>&1)
+case "$out" in */e2e-dk-built:1) ;; *) fail "image inspect by the record's name: $out" ;; esac
+$NSPAWN image inspect e2e-dk-built:1 | python3 -c "import json,sys; d = json.load(sys.stdin); assert len(d) == 1 and d[0]['name'] == 'e2e-dk-built-1' and d[0]['digest'].startswith('sha256:'), d" || fail "image inspect does not print the record as JSON"
+out=$($NSPAWN image inspect -f '{{.name}}' e2e-dk-nonexistent:9 e2e-dk-built:1 2>&1); rc=$?
+[ "$rc" -eq 1 ] || fail "image inspect of a missing image exited with $rc: $out"
+echo "$out" | grep_q '^e2e-dk-built-1$' || fail "image inspect did not print the image found beside a missing one: $out"
+echo "$out" | grep_q 'no local image of e2e-dk-nonexistent:9' || fail "image inspect did not name the missing image: $out"
+out=$($NSPAWN image inspect 'Bad Name' 2>&1) && fail "image inspect of what is no reference: $out"
+echo "$out" | grep_q 'no local image of Bad Name' || fail "image inspect of what is no reference was not said: $out"
 [ "$(dkt run --rm --label e2e.dk=1 e2e-dk-built:1 2>&1)" = built-short ] || fail "docker run by the short name of an image built here: $(dkt run --rm e2e-dk-built:1 2>&1)"
 dkt rmi e2e-dk-built:1 >/dev/null 2>&1 || fail "docker rmi by the short name of an image built here"
 $NSPAWN images ls | grep_q '^ *e2e-dk-built-1 ' && fail "docker rmi left the record e2e-dk-built-1"
+# A machine made from an image holds its reference once the image is gone.
+$NSPAWN build -t e2e-dk-built:1 "$dk_dir/built" >/dev/null 2>&1 || fail "nspawn build -t e2e-dk-built:1 again"
+$NSPAWN create e2e-dk-built:1 e2e-dk-built-m >/dev/null || fail "create from the image built here"
+$NSPAWN images rm e2e-dk-built-1 >/dev/null || fail "images rm of the image a machine was made from"
+out=$($NSPAWN image inspect -f '{{.name}}' e2e-dk-built:1 2>&1)
+[ "$out" = e2e-dk-built-m ] || fail "image inspect of a reference only a machine holds: $out"
+$NSPAWN rm e2e-dk-built-m >/dev/null || fail "rm e2e-dk-built-m"
 # rmi of the image the step above pulled: refused while a container was made from it.
 # Docker Hub's busybox:1.37 may be the very image the mirror of busybox:latest holds,
 # whose tags and containers the checks would then count too.

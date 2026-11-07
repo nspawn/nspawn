@@ -907,9 +907,9 @@ example:
 - the running machines after `stop`, `exec`, `kill`, `pause`, `unpause`, `top`,
   `shell`, `stats` and `port`;
 - the images that do not run after `start`;
-- every machine and image after `rm`, `inspect`, `logs`, `restart`, `update` and
-  `images rm`, and every machine after `wait`, `generate`, `auto-update`,
-  `--depends-on`, `network connect` and `network disconnect`;
+- every machine and image after `rm`, `inspect`, `logs`, `restart`, `update`,
+  `images rm` and `images inspect`, and every machine after `wait`, `generate`,
+  `auto-update`, `--depends-on`, `network connect` and `network disconnect`;
 - the local images after `create` and `push`, and their references after `run`;
 - the networks after `--network`, `network rm`, `network inspect`, `network connect`
   and `network disconnect`, and the volumes after `volume rm`.
@@ -925,6 +925,18 @@ the word starts with `-`, or where there is no name to offer.
 the whole record of machines or images (running or not) as a JSON array: what a script
 reads. The keys are the ones of the D-Bus interface (see [DBUS.md](DBUS.md)), so the
 command line and the bus never disagree.
+
+`nspawn images inspect NAME|REFERENCE...` prints the records of images as a JSON array
+too, the ones `GetImage` returns: the keys under Records in DBUS.md, without the ones
+`inspect` adds for a machine (state, started, leader, health, bindings, exit_code and
+the like). It takes `-f` as `inspect` does (below), with those keys. A record's name is that record; anything else
+is a reference, and the image it means is the one the service resolves it to
+(`ResolveImage`, which `run` and `create` ask too): `busybox:1.37` is the configured
+registry's `busybox:1.37` when there is one here, `docker.io/library/busybox:1.37`
+otherwise; an image goes before a machine made from it, and a machine is shown when it
+alone holds the image. One that is not here is said as `no local image of NAME` after
+the others are printed, and the command exits with 1. `image` is the same group as
+`images`: `nspawn image ls`, `image rm`, `image prune` and `image inspect`.
 
 `ps` also takes flags for scripts:
 

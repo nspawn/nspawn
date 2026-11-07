@@ -32,7 +32,7 @@ nspawn compose down -v
 `nspawn --help` lists the rest: `login`, `hub ls`, `inspect`, `info` (the service's
 version and state), `update`, `stats`, `top`, `cp`, `kill`, `restart`, `pause`, `wait`,
 `port`, `volume`, `secret`, `network` (with `connect` and `disconnect`), `system df` and
-`system prune`, `images prune`, `builder`
+`system prune`, `images prune`, `images inspect` (by name or reference), `builder`
 (the build cache), `auto-update` (moves labelled machines to the image their tag names
 now), `generate` (the commands that make the same machines on another host), and
 `completions` for the shells, which complete the names of machines, images, networks

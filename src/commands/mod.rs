@@ -685,6 +685,28 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 client.run_job(|| manager.remove_images(&a.names)).await?;
                 Ok(())
             }
+            ImagesCommand::Inspect(a) => {
+                let mut found = Vec::new();
+                let mut missing = Vec::new();
+                for name in &a.names {
+                    let record = image_record(
+                        name,
+                        |name| async move { manager.get_image(&name).await },
+                        |reference| async move {
+                            manager
+                                .resolve_image(&reference, client::registry_options(config))
+                                .await
+                        },
+                    )
+                    .await;
+                    match record {
+                        Ok(record) => found.push(client::dict_to_json(&record)),
+                        Err(e) => missing.push(e),
+                    }
+                }
+                print!("{}", inspected(&found, a.format.as_deref(), &mut missing)?);
+                last_error(missing)
+            }
             ImagesCommand::Prune(a) => system::images_prune(a, client).await,
         },
         Command::System(args) => match args.command {
@@ -857,32 +879,8 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                     Err(e) => missing.push(client::error(e)),
                 }
             }
-            match args.format.as_deref() {
-                // A template per object, a line each; an empty one is no template.
-                Some(format) if !format.is_empty() && format != "json" => {
-                    let template = crate::gotemplate::Template::parse(format)
-                        .map_err(|e| anyhow::anyhow!("template parsing error: {e}"))?;
-                    // An object the template fails on is said with the missing ones,
-                    // the others printed still.
-                    for object in &out {
-                        match template.execute(object) {
-                            Ok(text) => println!("{text}"),
-                            Err(e) => missing.push(anyhow::anyhow!("template parsing error: {e}")),
-                        }
-                    }
-                }
-                Some("json") => println!("{}", serde_json::Value::Array(out)),
-                _ => client::print_json(&serde_json::Value::Array(out)),
-            }
-            match missing.pop() {
-                Some(last) => {
-                    for e in missing {
-                        eprintln!("error: {e:#}");
-                    }
-                    Err(last)
-                }
-                None => Ok(()),
-            }
+            print!("{}", inspected(&out, args.format.as_deref(), &mut missing)?);
+            last_error(missing)
         }
         Command::Start(args) => machines::start(args, client).await,
         Command::Run(args) => machines::run(args, client, config).await,
@@ -926,6 +924,83 @@ enum CreateSource {
     Local(String),
     /// Not local: pulled first under `base`, the image's own name, as run does.
     Pull { reference: String, base: String },
+}
+
+/// The record images inspect shows for `name`: the record of that name, else the one the
+/// service resolves it to as a reference (ResolveImage, the command line's reading), read
+/// with GetImage. A name the service finds neither way fails as `no local image of NAME`.
+async fn image_record<G, GF, R, RF>(name: &str, get: G, resolve: R) -> Result<client::Dict>
+where
+    G: Fn(String) -> GF,
+    GF: std::future::Future<Output = zbus::Result<client::Dict>>,
+    R: FnOnce(String) -> RF,
+    RF: std::future::Future<Output = zbus::Result<client::Dict>>,
+{
+    match get(name.to_string()).await.map_err(client::error) {
+        Ok(record) => return Ok(record),
+        Err(e) if client::error_name(&e) == Some("NoSuchImage") => {}
+        Err(e) => return Err(e.context(format!("reading the image {name}"))),
+    }
+    let found = match resolve(name.to_string()).await.map_err(client::error) {
+        Ok(found) => client::string(&found, "name"),
+        // What is no record's name and no reference is no image here either.
+        Err(e) if matches!(client::error_name(&e), Some("NoSuchImage" | "Invalid")) => {
+            bail!("no local image of {name}")
+        }
+        Err(e) => return Err(e.context(format!("resolving the image {name}"))),
+    };
+    get(found.clone())
+        .await
+        .map_err(client::error)
+        .with_context(|| format!("reading the image {found}, which {name} names"))
+}
+
+/// What inspect prints of the objects it found: JSON, or a line per object of a Go
+/// template. An object the template fails on joins `missing`, the others printed still;
+/// a template that does not parse fails the command before anything is printed.
+fn inspected(
+    found: &[serde_json::Value],
+    format: Option<&str>,
+    missing: &mut Vec<anyhow::Error>,
+) -> Result<String> {
+    let array = || serde_json::Value::Array(found.to_vec());
+    Ok(match format {
+        // An empty template is no template.
+        Some(format) if !format.is_empty() && format != "json" => {
+            let template = crate::gotemplate::Template::parse(format)
+                .map_err(|e| anyhow::anyhow!("template parsing error: {e}"))?;
+            let mut text = String::new();
+            for object in found {
+                match template.execute(object) {
+                    Ok(line) => {
+                        text.push_str(&line);
+                        text.push('\n');
+                    }
+                    Err(e) => missing.push(anyhow::anyhow!("template parsing error: {e}")),
+                }
+            }
+            text
+        }
+        Some("json") => format!("{}\n", array()),
+        _ => format!(
+            "{}\n",
+            serde_json::to_string_pretty(&array()).unwrap_or_else(|_| "null".to_string())
+        ),
+    })
+}
+
+/// What was not found is said after what was printed, the last error failing the command
+/// so that it exits with 1.
+fn last_error(mut missing: Vec<anyhow::Error>) -> Result<()> {
+    match missing.pop() {
+        Some(last) => {
+            for e in missing {
+                eprintln!("error: {e:#}");
+            }
+            Err(last)
+        }
+        None => Ok(()),
+    }
 }
 
 fn cleaning_up(command: &Command) -> bool {
@@ -1030,6 +1105,150 @@ fn confirmed(answer: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn service_error(name: &str, message: &str) -> zbus::Error {
+        let call = zbus::message::Message::method_call("/org/nspawn", "Test")
+            .unwrap()
+            .build(&())
+            .unwrap();
+        zbus::Error::MethodError(
+            zbus::names::OwnedErrorName::try_from(format!("org.nspawn.Error.{name}")).unwrap(),
+            Some(message.to_string()),
+            call,
+        )
+    }
+
+    fn dict(pairs: &[(&str, &str)]) -> client::Dict {
+        pairs
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string(),
+                    zbus::zvariant::OwnedValue::try_from(Value::from(*v)).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// GetImage and ResolveImage as the service answers them over a few records, and the
+    /// calls made to each.
+    struct Service {
+        records: Vec<(&'static str, &'static str)>,
+        resolves: Vec<(&'static str, &'static str)>,
+        gets: std::cell::RefCell<Vec<String>>,
+        resolved: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Service {
+        fn get(&self, name: String) -> std::future::Ready<zbus::Result<client::Dict>> {
+            self.gets.borrow_mut().push(name.clone());
+            std::future::ready(match self.records.iter().find(|(n, _)| *n == name) {
+                Some((n, reference)) => Ok(dict(&[("name", n), ("reference", reference)])),
+                None => Err(service_error(
+                    "NoSuchImage",
+                    &format!("no image named {name}"),
+                )),
+            })
+        }
+
+        fn resolve(&self, reference: String) -> std::future::Ready<zbus::Result<client::Dict>> {
+            self.resolved.borrow_mut().push(reference.clone());
+            std::future::ready(if reference.contains(' ') {
+                Err(service_error("Invalid", "invalid reference format"))
+            } else if reference == "denied" {
+                Err(service_error("NotAuthorized", "org.nspawn.inspect refused"))
+            } else {
+                match self.resolves.iter().find(|(r, _)| *r == reference) {
+                    Some((_, name)) => Ok(dict(&[("name", name), ("reference", "full")])),
+                    None => Err(service_error(
+                        "NoSuchImage",
+                        &format!("no local image of {reference}"),
+                    )),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn images_inspect_takes_a_name_as_it_is_and_asks_the_service_for_a_reference() {
+        let service = Service {
+            records: vec![
+                ("busybox-1.37", "docker.io/library/busybox:1.37"),
+                ("web", "docker.io/library/nginx:1.27"),
+            ],
+            // The service's answers: which record a reference means is its own to say.
+            resolves: vec![("busybox:1.37", "busybox-1.37"), ("nginx:1.27", "web")],
+            gets: Default::default(),
+            resolved: Default::default(),
+        };
+        let inspect =
+            |name: &'static str| image_record(name, |n| service.get(n), |r| service.resolve(r));
+        // A record's name is read as it is, the service never asked to resolve it.
+        let web = inspect("web").await.unwrap();
+        assert_eq!(client::string(&web, "name"), "web");
+        assert!(service.resolved.borrow().is_empty());
+        // A reference is the record ResolveImage names, read with GetImage; a machine
+        // made from an image holds it as well as the image does.
+        let busybox = inspect("busybox:1.37").await.unwrap();
+        assert_eq!(client::string(&busybox, "name"), "busybox-1.37");
+        assert_eq!(
+            client::string(&inspect("nginx:1.27").await.unwrap(), "name"),
+            "web"
+        );
+        assert_eq!(*service.resolved.borrow(), ["busybox:1.37", "nginx:1.27"]);
+        assert_eq!(
+            *service.gets.borrow(),
+            ["web", "busybox:1.37", "busybox-1.37", "nginx:1.27", "web"]
+        );
+        // Neither a record nor a reference of one: an error naming it, also for what is
+        // no reference at all.
+        for absent in ["alpine:3", "Bad Name"] {
+            let e = inspect(absent).await.unwrap_err();
+            assert_eq!(e.to_string(), format!("no local image of {absent}"));
+        }
+        // Any other failure is the service's, with the image it was about.
+        let refused = inspect("denied").await.unwrap_err();
+        assert_eq!(client::error_name(&refused), Some("NotAuthorized"));
+        assert!(format!("{refused:#}").contains("denied"), "{refused:#}");
+    }
+
+    #[test]
+    fn inspect_prints_json_or_a_template_line_per_object() {
+        let found = vec![
+            serde_json::json!({"name": "web", "labels": "none"}),
+            serde_json::json!({"name": "db", "labels": {"a": "b"}}),
+        ];
+        let mut missing = Vec::new();
+        let pretty = inspected(&found, None, &mut missing).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&pretty).unwrap(),
+            serde_json::Value::Array(found.clone())
+        );
+        assert!(pretty.ends_with("]\n") && pretty.lines().count() > 2);
+        assert_eq!(inspected(&found, Some(""), &mut missing).unwrap(), pretty);
+        let compact = inspected(&found, Some("json"), &mut missing).unwrap();
+        assert_eq!(compact.lines().count(), 1);
+        assert_eq!(
+            inspected(&found, Some("{{.name}}"), &mut missing).unwrap(),
+            "web\ndb\n"
+        );
+        assert!(missing.is_empty());
+        // An object the template fails on is said with the missing ones, the others
+        // printed still.
+        assert_eq!(
+            inspected(&found, Some("{{.labels.a}}"), &mut missing).unwrap(),
+            "b\n"
+        );
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].to_string().starts_with("template parsing error"));
+        assert!(inspected(&found, Some("{{.name"), &mut missing)
+            .unwrap_err()
+            .to_string()
+            .starts_with("template parsing error"));
+        assert!(last_error(Vec::new()).is_ok());
+        let last = last_error(vec![anyhow::anyhow!("one"), anyhow::anyhow!("two")]).unwrap_err();
+        assert_eq!(last.to_string(), "two");
+    }
 
     #[test]
     fn only_the_cleanup_goes_on_without_its_configuration() {
