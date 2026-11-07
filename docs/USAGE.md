@@ -18,20 +18,61 @@ guides: [getting started](https://nspawn.org/docs/getting-started/),
 [command reference](https://nspawn.org/docs/reference/) and a
 [FAQ](https://nspawn.org/docs/faq/).
 
+## Names
+
+Every command that takes a machine or an image reads its name one way, the way the
+methods of the bus read one (see [DBUS.md](DBUS.md)). A machine and an image pulled or
+built here are both records, with a name of their own. A text that can be a machine's
+name (letters, digits, `.` and `-`) is a name: the record of that name or nothing, so
+that `rm -f app` run again never takes an image of `app:latest` for the machine that
+went. Any other text is the reference of an image, under the configured registry first
+and then as a Docker Hub name (`nginx:1.27` is `docker.io/library/nginx:1.27` when no
+image of the configured registry's is here), and names the image pulled or built for it,
+the last one made of several: `busybox:1.37`, `docker.io/library/busybox:1.37` and
+`busybox-1.37`, the name it was pulled under, are one image to `run`, `create`, `push`,
+`rm`, `images rm`, `inspect`, `images inspect`, `start`, `exec`, `logs`, `network
+connect` and the rest. `run`, `create` and `push` take an image, and read a name nothing
+here has as a reference too (`nspawn run busybox`). The MACHINE of `cp`'s MACHINE:PATH is
+a name.
+
+A reference never names a machine made from the image, which has a name of its own: `rm
+nginx:latest` removes the image and leaves the machines made from it, and `stop
+nginx:latest` stops none. Where the image is only read (`inspect`, `images inspect`,
+`push`), a machine made from it holds it too and is taken when no image of it is left.
+`run` and `create` make the machine from the image, and pull it again when only
+machines made from it are here. A text that names nothing here goes to the command as
+it is (a reference in full under `--registry`, when the command line is given one, for
+the service to read the same), which refuses it: a reference of no image here is `no
+local image of REFERENCE` to `images rm`, `images inspect`, `push` and `run --pull
+never`, and `no machine or image of REFERENCE` to the commands that take a machine
+(`rm`, `inspect`, `stop`, `exec`, `logs` and the rest; `start` adds how to pull it).
+
 ## run and build
 
 `run` is `pull` followed by `start`, with the flags of both; when an image of the same
 reference is here, it is `create` from that image instead of the pull
 (`--pull missing`, the default). `--pull always` asks the registry every time and
-`--pull never` never does. A name without a registry is looked for here under the
-configured registry first, then as a Docker Hub name (`app` is `docker.io/library/app`,
-the name of an image compose pulled from Docker Hub), and only then pulled from the
-configured registry; `create` looks for its source the same way.
+`--pull never` never does. The image is looked for here as every command looks for one
+(see [Names](#names)): a record's name (an image's, or a machine's, which gives the image
+it was made from, its layers and not what changed inside it, as `create` takes it), or a
+reference under the configured registry first, then as a Docker Hub name (`app` is
+`docker.io/library/app`, the name of an image compose pulled from Docker Hub), and only
+then pulled from the configured registry; `create` looks for its source the same way. A
+pull of a record's name (`--pull always`, or `--force` on the record itself) asks for the
+reference that record goes by.
 
 A machine made from a local image is checked against the start's flags as it is made,
 so a start that would be refused (a mount point given twice, an app with nothing to
-run) leaves no machine behind. A name that is taken is refused unless `--force`, which
-makes the machine anew. What follows the image replaces an app's command
+run) leaves no machine behind. Without `--name`, where an image has the name `run` gives
+the machine, the image run makes it from (`nspawn build -t app:1 .`, then `nspawn run
+app:1` or `nspawn run app-1`) or another (`nspawn run app:latest` after a build that went
+beside an image named `app`), the machine goes beside it under the first free `NAME-N`
+(`app-1-2`), which a note says, and the image stays for the next run, whatever
+`--force`, `--pull` and `--mode` say: run never consumes or replaces an image. The image
+keeps its name for every command, so `stop`, `logs` and `rm` take the machine as
+`app-1-2`. A machine that has the name, or an image that has the name given with
+`--name`, is refused unless `--force`, which makes the machine anew. What follows the
+image replaces an app's command
 (`nspawn run -it alpine sh`; after `--` as well). An argument may hold newlines, as
 a script for `sh -c` does: the settings file systemd-nspawn reads takes none, so the
 program is then started through the image's `/bin/sh`, which gets the arguments
@@ -90,9 +131,11 @@ pulled or built as: the tag moves to the new build, so a script that builds and 
 image builds it again. A machine that has the name (one that ran, starts or runs), or an
 image of another reference, keeps it, and the build goes beside it with the same
 reference, into the image an earlier build of the tag put there or else under a free
-name (`app-2`), which a note says; `run`, `create`, compose and the Docker API find it by
-the reference, the image before the machine. An mkosi build given `--name` is refused
-instead when a machine or an image of another reference has that name. `--force`
+name (`app-2`), which a note and the build's last line say. The name stays with the
+record that has it (see [Names](#names)): `run` and `create` take the build by the name
+the build gave or by the reference (`app:latest`), and compose and the Docker API find
+it by the reference, the image before the machine. An mkosi build given `--name` is
+refused instead when a machine or an image of another reference has that name. `--force`
 replaces whatever has the name, a machine that ran included, and refuses one that runs.
 `-f` names the Dockerfile, so `--force` has no short form.
 
@@ -891,10 +934,13 @@ and gets a writable layer, an address, settings and ports of its own (`-p`,
 
 A pulled image is a machine too, so `nspawn rm NAME` and `nspawn images rm NAME` remove
 the same thing: the record, the tree, the unit files and whatever layers nobody else
-uses. `rm --force` stops a running machine first (SIGKILL) where both refuse
-otherwise. A name with nothing behind it (no record, no image machined
-knows, no leftovers of a failed install) is refused with `no machine or image named
-NAME`; the other names of the same command are still tried.
+uses. Both take a reference as well, which removes the image of it and never a machine
+made from it (see [Names](#names)). `rm --force` stops a running machine first
+(SIGKILL) where both refuse otherwise. A name with nothing behind it (no record, no
+image machined knows, no leftovers of a failed install) is refused with `no machine or
+image named NAME`, a reference of no image here with `no local image of REFERENCE`
+(`no machine or image of REFERENCE` from `rm`); the other names of the same command
+are still tried.
 
 ### The same machines on another host
 
@@ -933,7 +979,7 @@ example:
 - every machine and image after `rm`, `inspect`, `logs`, `restart`, `update`,
   `images rm` and `images inspect`, and every machine after `wait`, `generate`,
   `auto-update`, `--depends-on`, `network connect` and `network disconnect`;
-- the local images after `create` and `push`, and their references after `run`;
+- the local images after `create` and `push`, and after `run` with their references;
 - the networks after `--network`, `network rm`, `network inspect`, `network connect`
   and `network disconnect`, and the volumes after `volume rm`.
 
@@ -952,13 +998,12 @@ command line and the bus never disagree.
 `nspawn images inspect NAME|REFERENCE...` prints the records of images as a JSON array
 too, the ones `GetImage` returns: the keys under Records in DBUS.md, without the ones
 `inspect` adds for a machine (state, started, leader, health, bindings, exit_code and
-the like). It takes `-f` as `inspect` does (below), with those keys. A record's name is that record; anything else
-is a reference, and the image it means is the one the service resolves it to
-(`ResolveImage`, which `run` and `create` ask too): `busybox:1.37` is the configured
-registry's `busybox:1.37` when there is one here, `docker.io/library/busybox:1.37`
-otherwise; an image goes before a machine made from it, and a machine is shown when it
-alone holds the image. One that is not here is said as `no local image of NAME` after
-the others are printed, and the command exits with 1. `image` is the same group as
+the like). It takes `-f` as `inspect` does (below), with those keys. Each name is read
+as everywhere (see [Names](#names)): `busybox:1.37` is the configured registry's
+`busybox:1.37` when there is one here, `docker.io/library/busybox:1.37` otherwise; an
+image goes before a machine made from it, and a machine is shown when it alone holds the
+image. One that is not here is said as `no local image of NAME` after the others are
+printed, and the command exits with 1. `image` is the same group as
 `images`: `nspawn image ls`, `image rm`, `image prune` and `image inspect`.
 
 `ps` also takes flags for scripts:

@@ -1022,8 +1022,8 @@ pub enum ImagesCommand {
 
 #[derive(Args, Debug)]
 pub struct ImagesInspectArgs {
-    /// Image names or references: a name is the record's of that name, a reference the
-    /// record the service resolves it to (an image, else a machine made from it).
+    /// Image names or references: a name is the record of that name, a reference the
+    /// image of it (else a machine made from it).
     #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
     /// A Go template over each image: '{{.reference}}', '{{json .image_labels}}'; the
@@ -1135,19 +1135,21 @@ pub struct BuilderDuArgs {
 
 #[derive(Args, Debug)]
 pub struct CpArgs {
-    /// What to copy: a local path, or MACHINE:PATH (a local path with a colon is
-    /// written ./a:b). DIR/. copies the contents of DIR.
+    /// What to copy: a local path, or MACHINE:PATH, MACHINE the name of a machine or an
+    /// image (a local path with a colon is written ./a:b). DIR/. copies the contents of
+    /// DIR.
     #[arg(value_name = "SOURCE", value_hint = clap::ValueHint::AnyPath)]
     pub source: String,
-    /// Where to: MACHINE:PATH, or a local path. An existing directory receives the source
-    /// under its own name; otherwise the copy takes this name.
+    /// Where to: MACHINE:PATH (a name), or a local path. An existing directory receives the
+    /// source under its own name; otherwise the copy takes this name.
     #[arg(value_name = "DESTINATION", value_hint = clap::ValueHint::AnyPath)]
     pub destination: String,
 }
 
 #[derive(Args, Debug)]
 pub struct RmArgs {
-    /// Machine names.
+    /// Names of machines or images, or references of images (never a machine made from
+    /// one).
     #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
     /// Stop a running machine first (SIGKILL) instead of refusing.
@@ -1249,7 +1251,7 @@ pub struct EventsArgs {
 
 #[derive(Args, Debug)]
 pub struct ImagesRmArgs {
-    /// Image names.
+    /// Image names or references (a reference never removes a machine made from it).
     #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
 }
@@ -1302,7 +1304,7 @@ pub struct OutputArgs {
 
 #[derive(Args, Debug)]
 pub struct InspectArgs {
-    /// Machine or image names.
+    /// Names of machines or images, or references of images.
     #[arg(required = true, add = candidates(Kind::Any))]
     pub names: Vec<String>,
     /// A Go template over each object: '{{.state}}', '{{json .labels}}'; the keys are
@@ -1321,7 +1323,7 @@ pub struct GenerateArgs {
 
 #[derive(Args, Debug)]
 pub struct StartArgs {
-    /// Image name.
+    /// Name of a machine or an image, or the reference of an image.
     #[arg(add = candidates(Kind::Startable))]
     pub name: String,
     #[command(flatten)]
@@ -1348,10 +1350,12 @@ pub enum PullPolicy {
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// Image reference: [registry/]repository[:tag|@digest], for example nginx:1.27.
+    /// Image: a local image's name, or a reference,
+    /// [registry/]repository[:tag|@digest], for example nginx:1.27.
     #[arg(add = candidates(Kind::Reference))]
     pub reference: String,
-    /// Name of the machine (default: derived from the reference, e.g. nginx-1.27).
+    /// Name of the machine (default: derived from the image's name or reference, e.g.
+    /// nginx-1.27, or the first free NAME-N beside an image that has that name).
     #[arg(long, short = 'n')]
     pub name: Option<String>,
     /// When to ask the registry: missing (a local image with the reference is reused),

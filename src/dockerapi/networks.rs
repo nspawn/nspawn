@@ -428,6 +428,11 @@ pub fn connect_failed(
                 network.shown
             ),
         ),
+        // The client's words for a container that went meanwhile.
+        Some("NoSuchMachine") => says(
+            StatusCode::NOT_FOUND,
+            format!("No such container: {}", machine.api_name()),
+        ),
         kind => says(status_of(kind), message),
     }
 }
@@ -1057,7 +1062,7 @@ mod tests {
                 Some("NoSuchMachine"),
                 &bridged,
                 &ci,
-                "No such container: web"
+                "no machine or image named web"
             ),
             says(StatusCode::NOT_FOUND, "No such container: web")
         );

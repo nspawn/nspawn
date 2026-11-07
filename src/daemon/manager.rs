@@ -153,6 +153,27 @@ impl Manager {
         &self.state.ctx
     }
 
+    /// The record `text` names, as every method that takes a machine or an image reads it
+    /// (`api::resolve::name_of`): `text` as it is when nothing here goes by it.
+    fn name_of(&self, text: &str, images_only: bool) -> anyhow::Result<String> {
+        let ctx = self.ctx();
+        api::resolve::name_of(&ctx.store, &ctx.config.registry, text, images_only)
+    }
+
+    /// The machine `text` names, for a method that takes a machine
+    /// (`api::resolve::machine_of`): a reference of no image here is refused as `rm`
+    /// refuses it.
+    fn machine_of(&self, text: &str, images_only: bool) -> anyhow::Result<String> {
+        let ctx = self.ctx();
+        api::resolve::machine_of(&ctx.store, &ctx.config.registry, text, images_only)
+    }
+
+    /// `machine_of` for each of `texts`, each name once.
+    fn machines_of(&self, texts: &[String]) -> anyhow::Result<Vec<String>> {
+        let ctx = self.ctx();
+        api::resolve::machines_of(&ctx.store, &ctx.config.registry, texts)
+    }
+
     /// polkit's answer, or root only on a host without polkit. Returns the caller, whose
     /// uid owns what is started here and whose bus name gets its signals.
     async fn allow(&self, header: &Header<'_>, action: Action) -> Result<polkit::Caller> {
@@ -489,11 +510,12 @@ impl Manager {
     async fn get_image(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<Dict> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Inspect).await?;
+        let name = self.name_of(&name, false)?;
         let record = self
             .ctx()
             .store
             .load_image(&name)?
-            .ok_or_else(|| Error::NoSuchImage(format!("no image named {name}")))?;
+            .ok_or_else(|| Error::NoSuchImage(format!("no local image of {name}")))?;
         Ok(values::record(&record))
     }
 
@@ -508,6 +530,7 @@ impl Manager {
     ) -> Result<String> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Inspect).await?;
+        let names = self.machines_of(&names)?;
         Options::new(&options).finish()?;
         Ok(api::generate::generate(self.ctx(), &names)?.render())
     }
@@ -942,9 +965,15 @@ impl Manager {
             "rm",
             &target,
             move |ctx, reporter| async move {
-                let removal =
-                    api::images::remove_machines(&ctx, &names, force, jobs::report(&reporter))
-                        .await?;
+                let missing = |text: &str| api::resolve::no_machine_of(text);
+                let removal = api::images::remove_named(
+                    &ctx,
+                    &names,
+                    force,
+                    jobs::report(&reporter),
+                    missing,
+                )
+                .await?;
                 for name in &removal.removed {
                     if let Ok(emitter) = state.emitter() {
                         let _ = Manager::image_removed(&emitter, name).await;
@@ -973,6 +1002,7 @@ impl Manager {
     ) -> Result<Dict> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Manage).await?;
+        let machine = self.machine_of(&machine, true)?;
         let stat = api::copy::stat_path(self.ctx(), &machine, &path).await?;
         Ok(HashMap::from([
             ("name".to_string(), values::v(stat.name)),
@@ -996,6 +1026,7 @@ impl Manager {
     ) -> Result<(zbus::zvariant::OwnedFd, OwnedObjectPath)> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;
+        let machine = self.machine_of(&machine, true)?;
         let mut options = Options::new(&options);
         let entry_name = options.string("name")?;
         options.finish()?;
@@ -1045,6 +1076,7 @@ impl Manager {
     ) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;
+        let machine = self.machine_of(&machine, true)?;
         let request = copy_to_options(&options)?;
         let contents = request.contents;
         let extraction = if request.extract {
@@ -1176,6 +1208,7 @@ impl Manager {
     ) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;
+        let names = self.machines_of(&names)?;
         let mut options = Options::new(&options);
         let dry_run = options.bool("dry_run", false)?;
         options.finish()?;
@@ -1646,6 +1679,7 @@ impl Manager {
     ) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;
+        let machine = self.machine_of(&machine, true)?;
         let mut options = Options::new(&options);
         let aliases = options.strings("aliases")?;
         let address = match options.string("address")?.filter(|a| !a.is_empty()) {
@@ -1692,6 +1726,12 @@ impl Manager {
         let mut options = Options::new(&options);
         let force = options.bool("force", false)?;
         options.finish()?;
+        // With force, a machine that is not there, by its name or its reference, has
+        // nothing to take off.
+        let machine = match self.machine_of(&machine, true) {
+            Err(e) if force && api::kind_of(&e) == Some(FailureKind::NoSuchMachine) => machine,
+            read => read?,
+        };
         Ok(jobs::spawn(
             &self.state,
             owner,
@@ -1821,9 +1861,10 @@ impl Manager {
     /// (a name without a registry under the configured one first, then as Docker Hub's),
     /// or with docker_api (b) as clients of the Docker Engine API read one (Docker Hub's
     /// first, then an image built here under the configured registry); among the records
-    /// of a reference, images before machines and the last made first. Options
-    /// images_only (b), except (s, a record passed over), registry (s). NoSuchImage when
-    /// nothing here goes by it.
+    /// of a reference, images before machines and the last made first. With names (b) a
+    /// record of that name goes first, as everywhere nspawn takes an image
+    /// (`api::resolve::find`). Options images_only (b, for a reference), except (s, a
+    /// record passed over), registry (s). NoSuchImage when nothing here goes by it.
     async fn resolve_image(
         &self,
         #[zbus(header)] hdr: Header<'_>,
@@ -1835,22 +1876,33 @@ impl Manager {
         let mut options = Options::new(&options);
         let docker_api = options.bool(api::resolve::DOCKER_API_OPTION, false)?;
         let images_only = options.bool("images_only", false)?;
+        let names = options.bool("names", false)?;
         let except = options.string("except")?.filter(|e| !e.is_empty());
         let ctx = self.context_for(&mut options)?;
         options.finish()?;
-        let reading = if docker_api {
-            api::resolve::Reading::DockerApi
+        if names && docker_api {
+            return Err(FailureKind::Invalid
+                .error("names and docker_api read a name each their own way; ask with one")
+                .into());
+        }
+        let (store, registry) = (&ctx.store, ctx.config.registry.as_str());
+        let found = if names {
+            api::resolve::find(store, registry, &reference, images_only, except.as_deref())?
         } else {
-            api::resolve::Reading::Nspawn
+            let reading = if docker_api {
+                api::resolve::Reading::DockerApi
+            } else {
+                api::resolve::Reading::Nspawn
+            };
+            api::resolve::resolve(
+                store,
+                registry,
+                &reference,
+                reading,
+                images_only,
+                except.as_deref(),
+            )?
         };
-        let found = api::resolve::resolve(
-            &ctx.store,
-            &ctx.config.registry,
-            &reference,
-            reading,
-            images_only,
-            except.as_deref(),
-        )?;
         Ok(HashMap::from([
             ("name".to_string(), values::v(found.name)),
             ("reference".to_string(), values::v(found.reference)),
@@ -1896,6 +1948,7 @@ impl Manager {
     ) -> Result<Vec<Dict>> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Inspect).await?;
+        let names = self.machines_of(&names)?;
         let samples = api::stats::sample(self.ctx(), &names).await?;
         Ok(samples.iter().map(values::sample).collect())
     }
@@ -1905,6 +1958,7 @@ impl Manager {
     async fn get_machine(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<Dict> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Inspect).await?;
+        let name = self.machine_of(&name, true)?;
         let machine = api::machines::get(self.ctx(), &name).await?;
         Ok(values::machine(&machine))
     }
@@ -1921,6 +1975,7 @@ impl Manager {
     ) -> Result<(String, Vec<String>)> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Manage).await?;
+        let name = self.name_of(&name, true)?;
         let mut options = Options::new(&options);
         let request = start_request(name, &mut options, true)?;
         options.finish()?;
@@ -1950,6 +2005,7 @@ impl Manager {
     )> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;
+        let name = self.machine_of(&name, true)?;
         let mut options = Options::new(&options);
         let tty = options.bool("tty", false)?;
         let straight = options.bool("straight", false)?;
@@ -2022,6 +2078,7 @@ impl Manager {
     ) -> Result<(String, Vec<String>)> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Manage).await?;
+        let name = self.machine_of(&name, true)?;
         let mut options = Options::new(&options);
         let request = api::machines::StopRequest {
             name,
@@ -2051,6 +2108,7 @@ impl Manager {
     ) -> Result<(String, Vec<String>)> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Manage).await?;
+        let name = self.machine_of(&name, true)?;
         let mut options = Options::new(&options);
         let timeout = stop_timeout(&mut options)?;
         let signal = signal_option(&mut options)?;
@@ -2076,6 +2134,7 @@ impl Manager {
     ) -> Result<OwnedObjectPath> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Inspect).await?;
+        let name = self.machine_of(&name, true)?;
         let mut options = Options::new(&options);
         let condition = api::wait::Condition::parse(
             options.string("condition")?.as_deref().unwrap_or_default(),
@@ -2113,6 +2172,7 @@ impl Manager {
     ) -> Result<bool> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Manage).await?;
+        let name = self.machine_of(&name, true)?;
         let mut options = Options::new(&options);
         let request = api::machines::UpdateRequest {
             name,
@@ -2139,6 +2199,7 @@ impl Manager {
     ) -> Result<Vec<String>> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Manage).await?;
+        let name = self.machine_of(&name, true)?;
         let mut options = Options::new(&options);
         let request = api::machines::KillRequest {
             name,
@@ -2156,6 +2217,7 @@ impl Manager {
     async fn pause_machine(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<()> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Manage).await?;
+        let name = self.machine_of(&name, true)?;
         Ok(api::machines::pause(self.ctx(), &name, true).await?)
     }
 
@@ -2163,6 +2225,7 @@ impl Manager {
     async fn unpause_machine(&self, #[zbus(header)] hdr: Header<'_>, name: String) -> Result<()> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Manage).await?;
+        let name = self.machine_of(&name, true)?;
         Ok(api::machines::pause(self.ctx(), &name, false).await?)
     }
 
@@ -2175,6 +2238,7 @@ impl Manager {
     ) -> Result<Vec<Dict>> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Inspect).await?;
+        let name = self.machine_of(&name, true)?;
         let processes = api::machines::processes(self.ctx(), &name).await?;
         Ok(processes.iter().map(values::process).collect())
     }
@@ -2192,6 +2256,7 @@ impl Manager {
     ) -> Result<(zbus::zvariant::OwnedFd, String)> {
         let _busy = self.state.enter();
         self.allow(&hdr, Action::Manage).await?;
+        let machine = self.machine_of(&machine, true)?;
         let mut options = Options::new(&options);
         let mut env = options.strings("env")?;
         options.finish()?;
@@ -2221,6 +2286,7 @@ impl Manager {
     ) -> Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;
+        let machine = self.machine_of(&machine, true)?;
         let mut options = Options::new(&options);
         let request = api::machines::LogsRequest {
             machine,
@@ -2433,6 +2499,7 @@ impl Manager {
     ) -> Result<(HashMap<String, zbus::zvariant::OwnedFd>, OwnedObjectPath)> {
         let _busy = self.state.enter();
         let owner = self.allow(&hdr, Action::Manage).await?;
+        let machine = self.machine_of(&machine, true)?;
         let mut options = Options::new(&options);
         let detach = options.bool("detach", false)?;
         let tty = options.bool("tty", true)? && !detach;

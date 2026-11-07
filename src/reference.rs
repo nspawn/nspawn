@@ -29,6 +29,9 @@ impl ImageRef {
             }
             _ => (default_registry.to_string(), input),
         };
+        if registry.starts_with('.') {
+            bail!("reference {input:?} names no registry host: {registry:?}");
+        }
         // Docker Hub's old name is Docker Hub, as the reference's splitDockerDomain has it.
         let registry = if registry == "index.docker.io" {
             "docker.io".to_string()
@@ -461,6 +464,9 @@ mod tests {
         assert!(valid_tag("1.36") && valid_tag("_x") && !valid_tag("a\0") && !valid_tag(""));
         assert!(valid_repository("library/busybox") && !valid_repository("a\0b"));
         assert!(!valid_repository(""));
+        assert!(valid_repository("somos/rust-libusb") && valid_repository("a.b_c__d---e/f9"));
+        // A record's reference read back as written, a compose service's `proj-web_` too.
+        assert!(valid_repository("proj-web_") && valid_repository("app-"));
     }
 
     #[test]

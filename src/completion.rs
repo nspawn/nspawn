@@ -40,7 +40,7 @@ pub enum Kind {
     Logs,
     /// A local image: create, push.
     Image,
-    /// The reference of a local image: run.
+    /// A local image by its name or its reference: run.
     Reference,
     /// A network.
     Network,
@@ -71,7 +71,7 @@ impl Kind {
             Kind::Startable => &[Query::Images, Query::Running],
             Kind::Any | Kind::Logs => &[Query::Images, Query::Recorded],
             Kind::Image => &[Query::Images],
-            Kind::Reference => &[Query::References],
+            Kind::Reference => &[Query::Images, Query::References],
             Kind::Network | Kind::NetworkChoice => &[Query::Networks],
             Kind::Volume => &[Query::Volumes],
         }
@@ -89,6 +89,7 @@ impl Kind {
                     .collect()
             }
             Kind::Any | Kind::Logs => [answer(Query::Images), answer(Query::Recorded)].concat(),
+            Kind::Reference => [answer(Query::Images), answer(Query::References)].concat(),
             Kind::NetworkChoice => [
                 answer(Query::Networks),
                 NETWORK_KINDS.map(String::from).to_vec(),
@@ -323,7 +324,17 @@ mod tests {
                 ("nspawn images rm ", &["db", "fedora-44", "old", "web"]),
                 ("nspawn create ", &["db", "fedora-44", "old", "web"]),
                 ("nspawn push ", &["db", "fedora-44", "old", "web"]),
-                ("nspawn run ", &["docker.io/library/nginx:1.27"]),
+                // run takes a local image by its name or its reference.
+                (
+                    "nspawn run ",
+                    &[
+                        "db",
+                        "docker.io/library/nginx:1.27",
+                        "fedora-44",
+                        "old",
+                        "web",
+                    ],
+                ),
                 ("nspawn network rm ", &["backend", "bridge"]),
                 ("nspawn network inspect ", &["backend", "bridge"]),
                 ("nspawn volume rm ", &["pgdata"]),

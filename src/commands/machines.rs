@@ -23,7 +23,7 @@ use crate::pty;
 use crate::reference::ImageRef;
 use crate::store::now_unix;
 
-pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
+pub async fn ls(args: PsArgs, client: &Client, config: &Config) -> Result<()> {
     let now = now_unix();
     let filters = crate::dockerapi::filters::Filters::from_pairs(&args.filters)
         .map_err(|e| anyhow::anyhow!("{}", e.0))?;
@@ -61,9 +61,13 @@ pub async fn ls(args: PsArgs, client: &Client) -> Result<()> {
             bail!("No such container: {missing}");
         }
     }
+    let ancestors = match filters.values("ancestor") {
+        Some(values) => ancestors_of(client, config, values).await?,
+        None => Vec::new(),
+    };
     let machines: Vec<Dict> = listed
         .iter()
-        .filter(|m| ps_matches(&filters, m, &created))
+        .filter(|m| ps_matches(&filters, m, &created, &ancestors))
         .map(|m| {
             m.iter()
                 .map(|(k, v)| {
@@ -176,10 +180,36 @@ fn exit_code(machine: &Dict) -> Option<i32> {
         .and_then(|v| i32::try_from(v.clone()).ok())
 }
 
+/// The references an `ancestor=` filter of ps means besides the ones written, in full: a
+/// local image's by its name, and a reference read as every command reads one (the
+/// configured registry's, then Docker Hub's).
+async fn ancestors_of(
+    client: &Client,
+    config: &Config,
+    values: &std::collections::BTreeSet<String>,
+) -> Result<Vec<String>> {
+    let images = Listed::all(&client.manager.list_images().await.map_err(client::error)?);
+    let registry = super::registry_name(client, config).await;
+    let mut out = Vec::new();
+    for value in values {
+        out.extend(
+            images
+                .iter()
+                .filter(|i| i.name == *value)
+                .filter_map(|i| crate::api::resolve::full_tag(&i.reference, &registry)),
+        );
+        let spelled =
+            crate::api::resolve::spellings(value, &registry, crate::api::resolve::Reading::Nspawn);
+        out.extend(spelled.unwrap_or_default().into_iter().map(|(r, _)| r));
+    }
+    Ok(out)
+}
+
 fn ps_matches(
     filters: &crate::dockerapi::filters::Filters,
     m: &Dict,
     created: &HashMap<String, u64>,
+    ancestors: &[String],
 ) -> bool {
     let name = client::string(m, "name");
     let json = client::dict_to_json(m);
@@ -219,7 +249,7 @@ fn ps_matches(
         && filters.values("ancestor").is_none_or(|images| {
             images.iter().any(|i| {
                 *i == familiar || *i == reference || familiar.starts_with(&format!("{i}:"))
-            })
+            }) || ancestors.contains(&reference)
         })
         && filters.values("volume").is_none_or(|volumes| {
             client::strings(m, "volumes")
@@ -564,36 +594,54 @@ impl Listed {
     }
 }
 
-/// An existing machine of that name is started with start, or made anew with --force; a
-/// mode other than auto can only come with a pull.
-/// The image a new machine named `name` is made from, of `reference` as the command line
-/// reads it (ResolveImage): one never run, the last pulled of several, never the machine
-/// itself; None when nothing here goes by the reference, which is then pulled.
+/// The record a new machine named `name` is made from, for `reference` as everywhere
+/// nspawn takes an image (ResolveImage with names): the record of that name, else an
+/// image of the reference, one never run, the last pulled of several, never the machine
+/// itself; None when nothing here goes by it, which is then pulled. With the record, the
+/// reference it goes by.
 pub(crate) async fn local_image(
     client: &Client,
     config: &Config,
     reference: &str,
     name: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, String)>> {
     let mut options = client::registry_options(config);
     options.insert("images_only", Value::from(true));
+    options.insert("names", Value::from(true));
     options.insert("except", Value::from(name));
     match client.manager.resolve_image(reference, options).await {
-        Ok(found) => Ok(Some(client::string(&found, "name"))),
+        Ok(found) => Ok(Some((
+            client::string(&found, "name"),
+            client::string(&found, "reference"),
+        ))),
         Err(e) => {
             let e = client::error(e);
-            // What is no reference is left to the service to refuse with the machine.
-            if matches!(client::error_name(&e), Some("NoSuchImage" | "Invalid")) {
-                Ok(None)
-            } else {
-                Err(e)
+            // What is no reference is left to the service to refuse with the machine; a
+            // reference refused is the service's failure (one too old for the option
+            // names, say), never "nothing here".
+            let no_reference = || ImageRef::parse(reference, &config.registry).is_err();
+            match client::error_name(&e) {
+                Some("NoSuchImage") => Ok(None),
+                Some("Invalid") if no_reference() => Ok(None),
+                _ => Err(e),
             }
         }
     }
 }
 
+/// What run pulls, and looks for when the machine replaces the record the text names:
+/// the reference given, or for the name of a record (`named`, the record and the
+/// reference it goes by), that record's reference.
+fn lookup_of(text: &str, named: Option<&(String, String)>) -> String {
+    match named {
+        Some((found, reference)) if found == text => reference.clone(),
+        _ => text.to_string(),
+    }
+}
+
 /// Where run takes its machine from: `local`, the image `reference` names here, or the
-/// registry, as the pull policy says.
+/// registry, as the pull policy says. An existing machine of that name is started with
+/// start, or made anew with --force; a mode other than auto can only come with a pull.
 fn run_source(
     images: &[Listed],
     local: Option<String>,
@@ -603,7 +651,10 @@ fn run_source(
     pull: PullPolicy,
     mode_given: bool,
 ) -> Result<Source> {
-    if !force && images.iter().any(|i| i.name == name) {
+    if let Some(held) = images.iter().find(|i| i.name == name).filter(|_| !force) {
+        if held.image_only {
+            bail!("{name} is an image: give the machine another --name, or replace the image with --force");
+        }
         bail!("machine {name} exists: nspawn start {name}, or nspawn run --force to make it anew");
     }
     Ok(match (pull, local) {
@@ -617,6 +668,22 @@ fn run_source(
         (_, Some(source)) if !mode_given => Source::Local(source),
         _ => Source::Registry,
     })
+}
+
+/// Where run puts the machine whose name it derived, `name`, when an image holds that
+/// name: beside it, under the first free NAME-N, so that a run never consumes or replaces
+/// an image, the one it runs (`named`) or another; with the note that says so. None when
+/// no image holds the name; a machine that has it is run_source's to refuse.
+fn beside_image(images: &[Listed], name: &str, named: Option<&str>) -> Option<(String, String)> {
+    images.iter().find(|i| i.name == name && i.image_only)?;
+    let taken: std::collections::BTreeSet<String> = images.iter().map(|i| i.name.clone()).collect();
+    let free = crate::reference::free_name(name, &taken);
+    let note = if named == Some(name) {
+        format!("note: {name} is the image; the machine made from it is {free}, the name stop, logs and rm take")
+    } else {
+        format!("note: {name} is another image, which keeps its name; the machine is {free}")
+    };
+    Some((free, note))
 }
 
 /// The name of a machine of run --rm without --name: the image's local name and a random
@@ -643,20 +710,49 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
     // variable that is not there must not leave a machine behind.
     let options_of_start = start_options(args.options, args.command)?;
     let registry = super::registry_name(client, config).await;
-    let image = ImageRef::parse(&args.reference, &registry)?;
-    let name = match &args.name {
+    let images = Listed::all(&client.manager.list_images().await.map_err(client::error)?);
+    // What the text names here, as everywhere nspawn takes an image: the record of that
+    // name (whatever its name looks like), else the image of the reference.
+    let named = local_image(client, config, &args.reference, "").await?;
+    let lookup = lookup_of(&args.reference, named.as_ref());
+    // The name the machine takes after the record, or after the reference.
+    let (shown, base) = match &named {
+        Some((found, _)) if *found == args.reference => (lookup.clone(), found.clone()),
+        _ => {
+            let image = ImageRef::parse(&args.reference, &registry)?;
+            (image.to_string(), image.local_name())
+        }
+    };
+    let mut name = match &args.name {
         Some(name) => name.clone(),
         // run --rm keeps the image (see below): the machine it removes
         // gets a name of its own.
-        None if args.rm => run_name(&image.local_name())?,
-        None => image.local_name(),
+        None if args.rm => run_name(&base)?,
+        None => base.clone(),
     };
-    let images = Listed::all(&client.manager.list_images().await.map_err(client::error)?);
-    let local = local_image(client, config, &args.reference, &name).await?;
+    // An image holds the name run derived (`nspawn build -t app:1`, then `nspawn run
+    // app:1`): the machine goes beside it, as build and create put what they make beside
+    // what holds a name, and the image stays for the next run.
+    if args.name.is_none() {
+        let found = named.as_ref().map(|(found, _)| found.as_str());
+        if let Some((free, note)) = beside_image(&images, &name, found) {
+            eprintln!("{note}");
+            name = free;
+        }
+    }
+    // The record the text names, unless the machine replaces that very record (--force,
+    // or --name with its name): then another image of its reference, or a pull.
+    let local = match &named {
+        Some((found, _)) if *found != name => Some(found.clone()),
+        _ => local_image(client, config, &lookup, &name)
+            .await?
+            .map(|(found, _)| found),
+    };
+    let pull_reference = lookup;
     let source = run_source(
         &images,
         local,
-        &image.to_string(),
+        &shown,
         &name,
         args.force,
         args.pull,
@@ -675,7 +771,6 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
     // would download it again: it is pulled under its own name and kept, and the machine
     // is made from it, when that name is free. A machine of that name, stopped or not,
     // is somebody's: it is neither replaced (--pull always) nor given another mode.
-    let base = image.local_name();
     let keep_image = args.rm
         && matches!(source, Source::Registry)
         && base != name
@@ -702,7 +797,7 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
                 options.insert("verify", Value::from(false));
             }
             client
-                .run_job_to_stderr(|| manager.pull_image(&args.reference, options))
+                .run_job_to_stderr(|| manager.pull_image(&pull_reference, options))
                 .await?;
             let create = with_start_flags(create, &options_of_start);
             client
@@ -721,7 +816,7 @@ pub async fn run(args: RunArgs, client: &Client, config: &Config) -> Result<()> 
                 options.insert("verify", Value::from(false));
             }
             client
-                .run_job_to_stderr(|| manager.pull_image(&args.reference, options))
+                .run_job_to_stderr(|| manager.pull_image(&pull_reference, options))
                 .await?;
         }
     }
@@ -1971,14 +2066,28 @@ mod tests {
             .unwrap()
         };
         let created = HashMap::from([("db".to_string(), 10u64), ("dns".to_string(), 20)]);
-        assert!(ps_matches(&f(&["network=host"]), &m, &created));
+        assert!(ps_matches(&f(&["network=host"]), &m, &created, &[]));
         assert!(
-            !ps_matches(&f(&["publish=53"]), &m, &created),
+            !ps_matches(&f(&["publish=53"]), &m, &created, &[]),
             "a bare port is tcp"
         );
-        assert!(ps_matches(&f(&["publish=53/udp"]), &m, &created));
-        assert!(ps_matches(&f(&["since=db"]), &m, &created));
-        assert!(!ps_matches(&f(&["before=db"]), &m, &created));
+        assert!(ps_matches(&f(&["publish=53/udp"]), &m, &created, &[]));
+        assert!(ps_matches(&f(&["since=db"]), &m, &created, &[]));
+        assert!(!ps_matches(&f(&["before=db"]), &m, &created, &[]));
+        // ancestor= by a local image's name or a reference of the configured registry:
+        // the references ancestors_of found for it.
+        let mut made = m.clone();
+        let hub = "hub.nspawn.org/busybox:1.37";
+        made.insert("reference".to_string(), value(hub.into()));
+        let ancestor = f(&["ancestor=busybox-1.37"]);
+        assert!(!ps_matches(&ancestor, &made, &created, &[]));
+        assert!(ps_matches(&ancestor, &made, &created, &[hub.to_string()]));
+        assert!(!ps_matches(
+            &ancestor,
+            &made,
+            &created,
+            &["docker.io/library/busybox:1.37".into()]
+        ));
         // As FilterOpt: an empty one is none, one of blanks is no key=value.
         let pairs = |p: &[&str]| p.iter().map(|p| p.to_string()).collect::<Vec<_>>();
         assert!(crate::dockerapi::filters::Filters::from_pairs(&pairs(&[""])).is_ok());
@@ -2415,7 +2524,13 @@ mod tests {
             Source::Registry,
             "a mode of its own takes a pull"
         );
+        // A name given that an image has is refused as the image's.
         let taken = source("web", false, PullPolicy::Missing, false).unwrap_err();
+        assert!(taken.to_string().contains("web is an image"), "{taken}");
+        let mut ran = images.clone();
+        ran[0].image_only = false;
+        let taken =
+            run_source(&ran, web(), nginx, "web", false, PullPolicy::Missing, false).unwrap_err();
         assert!(taken.to_string().contains("nspawn start web"), "{taken}");
         assert!(
             source("vm", false, PullPolicy::Missing, false).is_err(),
@@ -2457,5 +2572,55 @@ mod tests {
             Source::Local("web".to_string())
         );
         assert!(source("web2", false, PullPolicy::Never, true).is_err());
+    }
+
+    #[test]
+    fn a_machine_goes_beside_the_image_that_holds_its_name() {
+        let listed = |name: &str, image_only: bool| Listed {
+            name: name.into(),
+            reference: "hub.nspawn.org/hello:1".into(),
+            image_only,
+            pulled: 1,
+        };
+        // The image run makes the machine from holds the name: the machine goes beside it.
+        let (free, note) =
+            beside_image(&[listed("hello-1", true)], "hello-1", Some("hello-1")).unwrap();
+        assert_eq!(free, "hello-1-2");
+        assert!(
+            note.contains("hello-1 is the image; the machine made from it is hello-1-2"),
+            "{note}"
+        );
+        let images = [listed("hello-1", true), listed("hello-1-2", false)];
+        assert_eq!(
+            beside_image(&images, "hello-1", Some("hello-1")).unwrap().0,
+            "hello-1-3"
+        );
+        // Another image that holds it keeps it too (`run app:latest` after a build that went
+        // beside a pulled `app`), whatever the run's flags.
+        let (free, note) = beside_image(&images, "hello-1", Some("hello-1-9")).unwrap();
+        assert_eq!(free, "hello-1-3");
+        assert!(
+            note.contains("another image, which keeps its name"),
+            "{note}"
+        );
+        // A machine that has the name, or nothing, is not this rule's.
+        assert_eq!(beside_image(&images, "hello-1-2", Some("hello-1")), None);
+        assert_eq!(beside_image(&images, "free", None), None);
+        // The name stays a machine's name, cut as it must be.
+        let long = format!("{}.{}", "a".repeat(53), "b".repeat(10));
+        let free = beside_image(&[listed(&long, true)], &long, None).unwrap().0;
+        crate::reference::validate_machine_name(&free).unwrap();
+    }
+
+    #[test]
+    fn run_of_a_record_s_name_pulls_the_reference_it_goes_by() {
+        let nginx = "docker.io/library/nginx:1.27";
+        let web = ("web".to_string(), nginx.to_string());
+        // `run --pull always web`, `run --force web`: web's image, whatever the machine is
+        // named.
+        assert_eq!(lookup_of("web", Some(&web)), nginx);
+        // A reference is pulled as it was given, the record found by it or not.
+        assert_eq!(lookup_of("nginx:1.27", Some(&web)), "nginx:1.27");
+        assert_eq!(lookup_of("nginx:1.27", None), "nginx:1.27");
     }
 }

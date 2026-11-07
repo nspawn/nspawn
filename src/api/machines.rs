@@ -1304,10 +1304,13 @@ pub enum StartOutcome {
 
 pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Result<StartOutcome> {
     let config = &ctx.config;
-    if args.name.contains(':') || args.name.contains('/') {
-        return Err(FailureKind::Invalid.error(format!(
-            "{} looks like an image reference; machines are started by name. Pull it (nspawn pull {}) or make a machine from a local image (nspawn create IMAGE NAME)",
-            args.name,
+    // A reference reaches here only when no image of it is here: it is read as every
+    // name is before (`api::resolve::name_of`).
+    if validate_machine_name(&args.name).is_err()
+        && crate::reference::ImageRef::parse(&args.name, &config.registry).is_ok()
+    {
+        return Err(FailureKind::NoSuchMachine.error(format!(
+            "no machine or image of {0}; pull it (nspawn pull {0}) or make a machine from a local image (nspawn create IMAGE NAME)",
             args.name
         )));
     }

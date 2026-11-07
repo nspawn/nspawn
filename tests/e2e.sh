@@ -2912,7 +2912,7 @@ if command -v busctl >/dev/null 2>&1; then
   out=$($B call $M StartMachine 'sa{sv}' e2e-dbus 1 bogus s x 2>&1) && fail "an unknown option was accepted"
   echo "$out" | grep_q "unknown option" || fail "unknown option not named: $out"
   out=$($B call $M GetImage s e2e-nonexistent 2>&1) && fail "GetImage of a missing image succeeded"
-  echo "$out" | grep_q "no image named" || fail "missing image not explained: $out"
+  echo "$out" | grep_q "no local image of e2e-nonexistent" || fail "missing image not explained: $out"
 else
   echo "busctl not installed: skipping the D-Bus section"
 fi
@@ -3652,7 +3652,7 @@ $NSPAWN image inspect e2e-dk-built:1 | python3 -c "import json,sys; d = json.loa
 out=$($NSPAWN image inspect -f '{{.name}}' e2e-dk-nonexistent:9 e2e-dk-built:1 2>&1); rc=$?
 [ "$rc" -eq 1 ] || fail "image inspect of a missing image exited with $rc: $out"
 echo "$out" | grep_q '^e2e-dk-built-1$' || fail "image inspect did not print the image found beside a missing one: $out"
-echo "$out" | grep_q 'no local image of e2e-dk-nonexistent:9' || fail "image inspect did not name the missing image: $out"
+echo "$out" | grep_q -E "no local image of ($NSPAWN_REGISTRY/)?e2e-dk-nonexistent:9" || fail "image inspect did not name the missing image: $out"
 out=$($NSPAWN image inspect 'Bad Name' 2>&1) && fail "image inspect of what is no reference: $out"
 echo "$out" | grep_q 'no local image of Bad Name' || fail "image inspect of what is no reference was not said: $out"
 [ "$(dkt run --rm --label e2e.dk=1 e2e-dk-built:1 2>&1)" = built-short ] || fail "docker run by the short name of an image built here: $(dkt run --rm e2e-dk-built:1 2>&1)"
@@ -4191,8 +4191,8 @@ ip netns list | grep_q -F 'nspawn-.build-' && fail "a build left its network nam
 rm -rf $work
 # A tag built again replaces the image of its reference under its name while nothing ran
 # from it; an image of another reference or a machine of the name keeps it, and the build
-# goes beside it with the same reference, which run finds, and again into the same image;
-# --force takes the machine.
+# goes beside it with the same reference, which run finds by the reference (the name stays
+# the record that has it), and again into the same image; --force takes the machine.
 work=/tmp/e2e-build-again && rm -rf $work && mkdir -p $work
 again() {
   printf 'ARG BUSYBOX\nFROM ${BUSYBOX}\nRUN echo %s-%s > /which\nCMD ["cat", "/which"]\n' "$1" $nonce > $work/Dockerfile
@@ -4203,7 +4203,14 @@ $NSPAWN pull "$busybox137_ref" --name e2e-build-again --force >/dev/null || fail
 out=$(again one) || fail "a build over a pulled image of another reference: $out"
 echo "$out" | grep_q "image e2e-build-again is of another reference, which keeps its name" || fail "the build beside an image of another reference said nothing: $out"
 [ "$($NSPAWN inspect -f '{{.reference}}' e2e-build-again 2>/dev/null)" = "$($NSPAWN inspect -f '{{.reference}}' e2e-build-again-2 2>/dev/null)" ] && fail "the build replaced the pulled image of another reference"
-[ "$($NSPAWN run --rm e2e-build-again 2>/dev/null)" = one-$nonce ] || fail "run does not find the build beside an image of another reference: $($NSPAWN run --rm e2e-build-again 2>&1)"
+echo "$out" | grep_q "image e2e-build-again-2 is ready: nspawn run e2e-build-again-2" || fail "the build beside an image of another reference does not name it: $out"
+[ "$($NSPAWN run --rm e2e-build-again-2 2>/dev/null)" = one-$nonce ] || fail "run of the name the build gave does not run it: $($NSPAWN run --rm e2e-build-again-2 2>&1)"
+[ "$($NSPAWN run --rm e2e-build-again:latest 2>/dev/null)" = one-$nonce ] || fail "run does not find the build beside an image of another reference by the reference: $($NSPAWN run --rm e2e-build-again:latest 2>&1)"
+# The machine of that run goes beside the image that has the name, which stays.
+out=$($NSPAWN run e2e-build-again:latest 2>&1 | tr -d '\r')
+echo "$out" | grep_q "e2e-build-again is another image, which keeps its name; the machine is e2e-build-again-3" || fail "run of the build's reference did not go beside the image that has the name: $out"
+echo "$out" | grep_q "^one-$nonce$" || fail "run of the build's reference did not run the build: $out"
+$NSPAWN rm -f e2e-build-again-3 >/dev/null 2>&1 || fail "rm -f e2e-build-again-3"
 $NSPAWN images rm e2e-build-again e2e-build-again-2 >/dev/null || fail "images rm of the pulled image and the build beside it"
 out=$(again two) || fail "a build of a tag whose name is free: $out"
 out=$(again three) || fail "a tag built again without --force: $out"
@@ -4213,10 +4220,11 @@ retry 20 bash -c "! $NSPAWN ps | grep_q '^ *e2e-build-again '" || $NSPAWN stop e
 out=$(again four) || fail "a build of a tag whose name a machine has: $out"
 echo "$out" | grep_q "e2e-build-again is a machine, which keeps its name" || fail "the build beside a machine said nothing: $out"
 $NSPAWN inspect e2e-build-again-2 >/dev/null 2>&1 || fail "the build beside the machine is not e2e-build-again-2: $out"
-[ "$($NSPAWN run --rm e2e-build-again 2>/dev/null)" = four-$nonce ] || fail "run does not find the image beside the machine: $($NSPAWN run --rm e2e-build-again 2>&1)"
+[ "$($NSPAWN run --rm e2e-build-again:latest 2>/dev/null)" = four-$nonce ] || fail "run does not find the image beside the machine by the reference: $($NSPAWN run --rm e2e-build-again:latest 2>&1)"
+[ "$($NSPAWN run --rm e2e-build-again 2>/dev/null)" = three-$nonce ] || fail "run of the machine's name does not make the machine from that machine: $($NSPAWN run --rm e2e-build-again 2>&1)"
 out=$(again five) || fail "a build again beside the machine: $out"
 $NSPAWN inspect e2e-build-again-3 >/dev/null 2>&1 && fail "a build again beside the machine made another image instead of replacing e2e-build-again-2"
-[ "$($NSPAWN run --rm e2e-build-again 2>/dev/null)" = five-$nonce ] || fail "the image beside the machine was not replaced"
+[ "$($NSPAWN run --rm e2e-build-again:latest 2>/dev/null)" = five-$nonce ] || fail "the image beside the machine was not replaced"
 out=$(again six --force) || fail "build --force over a machine that ran: $out"
 echo "$out" | grep_q "keeps its name" && fail "build --force went beside the machine: $out"
 $NSPAWN images rm e2e-build-again e2e-build-again-2 >/dev/null || fail "images rm of the rebuilt images"
@@ -5375,6 +5383,82 @@ $NSPAWN rm -f e2e-names-m >/dev/null 2>&1
 out=$($NSPAWN run --rm --pull never e2e-names-none-$nonce:1 -- true 2>&1) && fail "run --pull never of a name nothing has: $out"
 echo "$out" | grep_q "no local image of $NSPAWN_REGISTRY/e2e-names-none-$nonce:1" || fail "run --pull never of a missing image was not explained: $out"
 for m in $($NSPAWN images ls | awk -v n="e2e-names-$nonce" '$1 ~ n {print $1}'); do $NSPAWN images rm "$m" >/dev/null 2>&1; done
+step "every command reads a name one way: an image by its local name or its reference, which never names a machine made from it"
+d=/tmp/e2e-rv/same && mkdir -p $d
+tag=e2e-same-$nonce:1
+ref=$NSPAWN_REGISTRY/$tag
+img=e2e-same-$nonce-1
+image_only() { $NSPAWN images ls --json | python3 -c 'import json, sys; print(" ".join(str(i["image_only"]).lower() for i in json.load(sys.stdin) if i["name"] == sys.argv[1]))' "$1"; }
+printf 'FROM %s\nRUN echo same-%s > /which\n' "$rv" "$nonce" > $d/Dockerfile
+$NSPAWN build -q -t $tag $d >/dev/null 2>&1 || fail "build of $tag"
+for text in $img $tag $ref; do
+  out=$($NSPAWN images inspect -f '{{.name}}' $text 2>&1)
+  [ "$out" = $img ] || fail "images inspect $text: $out"
+  out=$($NSPAWN inspect -f '{{.name}}' $text 2>&1)
+  [ "$out" = $img ] || fail "inspect $text: $out"
+  out=$($NSPAWN run --rm --pull never $text -- cat /which 2>/dev/null | tr -d '\r')
+  [ "$out" = same-$nonce ] || fail "run --rm --pull never $text did not take the local image: $out"
+done
+# A name is that record or nothing: rm -f run again never takes the image of NAME:latest,
+# which a build put beside the machine of that name.
+$NSPAWN create $img e2e-same-$nonce >/dev/null 2>&1 || fail "create e2e-same-$nonce"
+out=$($NSPAWN build -t e2e-same-$nonce $d 2>&1) || fail "build beside the machine e2e-same-$nonce: $out"
+echo "$out" | grep_q "image e2e-same-$nonce-2 is ready" || fail "the build did not go beside the machine: $(echo "$out" | tail -1)"
+$NSPAWN rm -f e2e-same-$nonce >/dev/null 2>&1 || fail "rm -f e2e-same-$nonce"
+out=$($NSPAWN rm -f e2e-same-$nonce 2>&1) && fail "rm -f of a machine that went took something: $out"
+echo "$out" | grep_q "no machine or image named e2e-same-$nonce" || fail "rm -f of a machine that went was not refused as no name: $out"
+[ "$(image_only e2e-same-$nonce-2)" = true ] || fail "rm -f of a machine that went removed the image of its name's reference"
+$NSPAWN images rm e2e-same-$nonce-2 >/dev/null 2>&1 || fail "images rm e2e-same-$nonce-2"
+# The name run gives the machine is the image's own: the machine goes beside it, and the
+# image stays one.
+out=$($NSPAWN run -d --pull never $img -- sleep 300 2>&1) || fail "run -d of the image by its local name: $out"
+echo "$out" | grep_q "$img is the image; the machine made from it is $img-2" || fail "run did not say where the machine went: $out"
+[ "$($NSPAWN inspect -f '{{.state}}' $img-2 2>&1)" = running ] || fail "$img-2 does not run"
+[ "$(image_only $img)" = true ] || fail "run of the image's name took the image itself: $(image_only $img)"
+# Again by its reference, with --force: beside it again, never the image itself.
+out=$($NSPAWN run -d --force --pull never $tag -- sleep 300 2>&1) || fail "run -d --force of the image by its reference: $out"
+echo "$out" | grep_q "$img is the image; the machine made from it is $img-3" || fail "run --force did not go beside the image: $out"
+[ "$(image_only $img)" = true ] || fail "run --force took the image itself: $(image_only $img)"
+$NSPAWN rm -f $img-3 >/dev/null 2>&1 || fail "rm -f $img-3"
+# A reference names the image, never a machine made from it.
+$NSPAWN stop $tag >/dev/null 2>&1
+[ "$($NSPAWN inspect -f '{{.state}}' $img-2 2>&1)" = running ] || fail "stop of the image's reference stopped a machine made from it"
+out=$($NSPAWN images rm $tag 2>&1) || fail "images rm of the reference: $out"
+[ -z "$(image_only $img)" ] || fail "images rm of the reference left the image"
+[ "$($NSPAWN inspect -f '{{.state}}' $img-2 2>&1)" = running ] || fail "images rm of the reference touched the machine made from it"
+# Only a machine holds the image now: read through it, never removed by the reference.
+out=$($NSPAWN images inspect -f '{{.name}}' $ref 2>&1)
+[ "$out" = $img-2 ] || fail "images inspect of a reference only a machine holds: $out"
+out=$($NSPAWN images rm $ref 2>&1) && fail "images rm of a reference only a machine holds: $out"
+echo "$out" | grep_q "no local image of $ref" || fail "images rm of a reference only a machine holds was not explained: $out"
+out=$($NSPAWN rm $tag 2>&1) && fail "rm of a reference only a machine holds: $out"
+# The command line sends a reference nothing here goes by in full under the registry it
+# was given, as the service is to read it.
+echo "$out" | grep_q -E "no machine or image of ($NSPAWN_REGISTRY/)?$tag" || fail "rm of a reference only a machine holds was not explained: $out"
+for cmd in stop port wait; do
+  out=$(timeout 30 $NSPAWN $cmd $tag 2>&1) && fail "$cmd of a reference only a machine holds: $out"
+  echo "$out" | grep_q -E "no machine or image of ($NSPAWN_REGISTRY/)?$tag" || fail "$cmd of a reference only a machine holds was not explained: $out"
+done
+[ "$($NSPAWN inspect -f '{{.state}}' $img-2 2>&1)" = running ] || fail "a removal by the reference touched the machine made from it"
+# The same build again brings the image back under its name; rm takes its reference too.
+$NSPAWN build -q -t $tag $d >/dev/null 2>&1 || fail "second build of $tag"
+[ "$(image_only $img)" = true ] || fail "the second build is not $img: $(image_only $img)"
+out=$($NSPAWN rm $ref 2>&1) || fail "rm of the reference: $out"
+[ -z "$(image_only $img)" ] || fail "rm of the reference left the image"
+[ "$($NSPAWN exec $img-2 -- cat /which </dev/null 2>&1 | tr -d '\r')" = same-$nonce ] || fail "the machine made from the image is not whole"
+# A reference of no image here is said as such by every command that takes a machine.
+none=e2e-same-none-$nonce:1
+for cmd in stop inspect logs exec start; do
+  args=$none; [ $cmd = exec ] && args="$none true"
+  out=$($NSPAWN $cmd $args </dev/null 2>&1) && fail "$cmd of a reference of no image here: $out"
+  echo "$out" | grep_q -E "no machine or image of ($NSPAWN_REGISTRY/)?$none" || fail "$cmd of a reference of no image here was not explained: $out"
+done
+echo "$out" | grep_q -E "pull it \(nspawn pull ($NSPAWN_REGISTRY/)?$none\)" || fail "start of a reference of no image here gave no hint: $out"
+out=$($NSPAWN network connect bridge $none 2>&1) && fail "network connect of a reference of no image here: $out"
+echo "$out" | grep_q -E "no machine or image of ($NSPAWN_REGISTRY/)?$none" || fail "network connect of a reference of no image here was not explained: $out"
+$NSPAWN rm -f $img-2 >/dev/null 2>&1 || fail "rm -f $img-2"
+for m in $($NSPAWN images ls | awk -v n="e2e-same-$nonce" '$1 ~ n {print $1}'); do $NSPAWN rm -f "$m" >/dev/null 2>&1; done
+
 
 step "an app's own network takes docker's sysctls: another user binds a low port, --sysctl wins and takes a value with a space, the host keeps its own"
 $NSPAWN run -d --name e2e-sc -u 65534 $rv -- sleep 600 >/dev/null || fail "run e2e-sc"

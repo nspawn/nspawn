@@ -1234,42 +1234,6 @@ impl Store {
         Ok(())
     }
 
-    /// Finds a record by local name or by the reference it was pulled from or built as.
-    pub fn find_image(
-        &self,
-        name_or_reference: &str,
-        default_registry: &str,
-    ) -> Result<Option<ImageRecord>> {
-        if let Some(record) = self.load_image(name_or_reference)? {
-            return Ok(Some(record));
-        }
-        let wanted = match crate::reference::ImageRef::parse(name_or_reference, default_registry) {
-            Ok(r) => r.to_string(),
-            Err(_) => return Ok(None),
-        };
-        // By reference: the image itself before a machine that was made from it or ran,
-        // whose network and settings are its own; of several, the last one pulled, as a
-        // tag names the last pull. A reference recorded in another spelling of Docker
-        // Hub's names is read again.
-        let same = |recorded: &str| {
-            recorded == wanted
-                || crate::reference::ImageRef::parse(recorded, default_registry)
-                    .is_ok_and(|r| r.to_string() == wanted)
-        };
-        let mut of: Vec<ImageRecord> = self
-            .list_images()?
-            .into_iter()
-            .filter(|r| same(&r.reference))
-            .collect();
-        of.sort_by_key(|r| {
-            (
-                !crate::api::disk::image_only(self, r),
-                std::cmp::Reverse(r.created),
-            )
-        });
-        Ok(of.into_iter().next())
-    }
-
     /// Deletes layers that no image record references, in each layer store separately:
     /// overlay machines use the root-owned copies, mstack machines the foreign-owned ones
     /// and flat machines none at all. Returns the digests removed.
@@ -3333,14 +3297,9 @@ mod tests {
         }
         assert_eq!(store.gc_blobs().unwrap(), vec!["sha256:orphan".to_string()]);
         assert!(store.has_blob("sha256:cfg") && store.has_blob("sha256:lay"));
-        assert_eq!(
-            store
-                .find_image("img", "hub.example")
-                .unwrap()
-                .unwrap()
-                .origin,
-            "build"
-        );
+        let find = |text: &str| crate::api::resolve::find(&store, "hub.example", text, false, None);
+        let found = find("img").unwrap().name;
+        assert_eq!(store.load_image(&found).unwrap().unwrap().origin, "build");
         // A rollback cut short keeps nothing and stops no collection.
         store.save_rollback(&rec, b"{}").unwrap();
         fs::remove_file(store.rollback_dir("img").join("manifest.json")).unwrap();
@@ -3359,14 +3318,7 @@ mod tests {
         ran.name = "aaa".to_string();
         ran.started = Some(1);
         store.record_image(&ran).unwrap();
-        assert_eq!(
-            store
-                .find_image("img:1", "hub.example")
-                .unwrap()
-                .unwrap()
-                .name,
-            "img"
-        );
+        assert_eq!(find("img:1").unwrap().name, "img");
         store.remove_record("aaa").unwrap();
         // A reference recorded under Docker Hub's old name is found by its name under
         // docker.io.
@@ -3374,19 +3326,9 @@ mod tests {
         old.name = "nginx".to_string();
         old.reference = "index.docker.io/library/nginx:latest".to_string();
         store.record_image(&old).unwrap();
-        assert_eq!(
-            store
-                .find_image("docker.io/nginx", "hub.example")
-                .unwrap()
-                .unwrap()
-                .name,
-            "nginx"
-        );
+        assert_eq!(find("docker.io/nginx").unwrap().name, "nginx");
         store.remove_record("nginx").unwrap();
-        assert!(store
-            .find_image("other:1", "hub.example")
-            .unwrap()
-            .is_none());
+        assert!(find("other:1").is_err());
         store.remove_record("img").unwrap();
         assert!(store.load_manifest("img").is_err());
     }

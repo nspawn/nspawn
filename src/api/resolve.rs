@@ -1,5 +1,6 @@
-//! ResolveImage: which local record the name of an image means. The command line and the
-//! Docker API read a name without a registry each their own way, and both ask this.
+//! ResolveImage: which local record the name of a machine or an image means. Every command
+//! and every method of the bus that takes one reads it with `find` (`name_of`); the Docker
+//! API reads a name without a registry as its clients mean it, through `resolve`.
 
 use anyhow::Result;
 
@@ -86,6 +87,11 @@ pub fn by_digest(reference: ImageRef) -> ImageRef {
 /// The references `text` stands for, in the order they are looked for, each with
 /// whether only an image built here goes by it.
 pub fn spellings(text: &str, registry: &str, reading: Reading) -> Result<Vec<(String, bool)>> {
+    // Parsing trims a reference: a name with a stray space or a CR, from a file or a
+    // variable, is no reference to look for in its place.
+    if text.trim() != text || text.chars().any(char::is_control) {
+        return Err(FailureKind::Invalid.error(format!("invalid reference {text:?}")));
+    }
     let as_hub = ImageRef::normalized(text).map(by_digest);
     let as_local = ImageRef::parse(text, registry).map(by_digest);
     let ordered = match reading {
@@ -113,7 +119,9 @@ pub fn spellings(text: &str, registry: &str, reading: Reading) -> Result<Vec<(St
 
 /// The record `text`, a reference, means as `reading` reads it: among the records of the
 /// first spelling that has any, the images (never run) before the machines made from
-/// them and the last made first; with `images_only`, the images alone; never `except`.
+/// them and the last made first; with `images_only`, the images alone, and none when that
+/// spelling has machines only (never an image of the next spelling, another registry's);
+/// never `except`.
 pub fn resolve(
     store: &Store,
     registry: &str,
@@ -134,16 +142,111 @@ pub fn resolve(
                     || full_digest(r, registry).as_deref() == Some(wanted.as_str())
             })
             .map(|r| (crate::api::disk::image_only(store, r), r))
-            .filter(|(image, _)| !images_only || *image)
             .max_by_key(|(image, r)| (*image, r.created));
-        if let Some((_, record)) = found {
-            return Ok(Resolved {
-                name: record.name.clone(),
-                reference: wanted.clone(),
-            });
+        // The images go first: the best of the spelling is a machine only when it has
+        // no image.
+        match found {
+            Some((image, record)) if image || !images_only => {
+                return Ok(Resolved {
+                    name: record.name.clone(),
+                    reference: wanted.clone(),
+                })
+            }
+            Some(_) => break,
+            None => {}
         }
     }
     Err(FailureKind::NoSuchImage.error(format!("no local image of {text}")))
+}
+
+/// The record `text` names wherever nspawn takes a machine or an image: the record of
+/// that name when there is one, as a name says which record it is; else the record of the
+/// reference `text` is, read as `Reading::Nspawn` reads one, the images alone with
+/// `images_only`. `except` is never the answer.
+pub fn find(
+    store: &Store,
+    registry: &str,
+    text: &str,
+    images_only: bool,
+    except: Option<&str>,
+) -> Result<Resolved> {
+    if except != Some(text) {
+        if let Some(record) = store.load_image(text)? {
+            let reference = ImageRef::parse(&record.reference, registry)
+                .map_or(record.reference, |r| r.to_string());
+            return Ok(Resolved {
+                name: record.name,
+                reference,
+            });
+        }
+    }
+    resolve(store, registry, text, Reading::Nspawn, images_only, except)
+}
+
+/// The name of the record `text` names, as every method of the bus that takes a machine
+/// or an image reads it: a name as it is, the record of that name or none, so that the
+/// names a program gives (and those of machines that went meanwhile) never come to mean
+/// an image of a reference; a text that can be no machine's name by `find`, or as it is
+/// when nothing here goes by it, for the method to say so. A reference names the image
+/// pulled or built for it, never a machine made from it, but where the image is only read
+/// (`images_only` false: inspect, the source of create, push), which such a machine still
+/// holds when no image of it is left. The command line reads every text by `find` first
+/// (ResolveImage with names), a bare name as a reference too.
+pub fn name_of(store: &Store, registry: &str, text: &str, images_only: bool) -> Result<String> {
+    if crate::reference::validate_machine_name(text).is_ok() {
+        return Ok(text.to_string());
+    }
+    match find(store, registry, text, images_only, None) {
+        Ok(found) => Ok(found.name),
+        Err(e)
+            if matches!(
+                crate::api::kind_of(&e),
+                Some(FailureKind::NoSuchImage | FailureKind::Invalid)
+            ) =>
+        {
+            Ok(text.to_string())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `name_of` for a method that takes a machine: a reference of no image here is refused
+/// as `rm` refuses it (`no_machine_of`), not as no machine's name; a text that is no
+/// reference either goes on as it is, for the method to refuse the name.
+pub fn machine_of(store: &Store, registry: &str, text: &str, images_only: bool) -> Result<String> {
+    if crate::reference::validate_machine_name(text).is_ok() {
+        return Ok(text.to_string());
+    }
+    match find(store, registry, text, images_only, None) {
+        Ok(found) => Ok(found.name),
+        Err(e) => match crate::api::kind_of(&e) {
+            Some(FailureKind::NoSuchImage) => Err(no_machine_of(text)),
+            Some(FailureKind::Invalid) => Ok(text.to_string()),
+            _ => Err(e),
+        },
+    }
+}
+
+/// `machine_of` for each of `texts`, the images alone for a reference, each name once.
+pub fn machines_of(store: &Store, registry: &str, texts: &[String]) -> Result<Vec<String>> {
+    once_each(texts, |text| machine_of(store, registry, text, true))
+}
+
+/// What a method that takes a machine says of a reference of no image here.
+pub fn no_machine_of(text: &str) -> anyhow::Error {
+    FailureKind::NoSuchMachine.error(format!("no machine or image of {text}"))
+}
+
+/// The name `read` gives each of `texts`, each name once, in the order given.
+fn once_each(texts: &[String], read: impl Fn(&str) -> Result<String>) -> Result<Vec<String>> {
+    let mut names: Vec<String> = Vec::new();
+    for text in texts {
+        let name = read(text)?;
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
 }
 
 #[cfg(test)]
@@ -204,6 +307,44 @@ mod tests {
         );
         let bad = spellings("Bad Name", REGISTRY, Reading::Nspawn).unwrap_err();
         assert_eq!(crate::api::kind_of(&bad), Some(FailureKind::Invalid));
+        // A stray space or a CR, and a first component that starts with a dot, make no
+        // reference.
+        for text in [
+            "web\r",
+            " web",
+            "web ",
+            "busybox:1.37\n",
+            "../../../tmp/x",
+            ".x/foo",
+        ] {
+            let refused = spellings(text, REGISTRY, Reading::Nspawn).unwrap_err();
+            assert_eq!(
+                crate::api::kind_of(&refused),
+                Some(FailureKind::Invalid),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spelling_with_machines_only_is_no_image_and_never_the_next_registry_s() {
+        // The configured registry's nginx went into machine web; Docker Hub's nginx is an
+        // image pulled under another name.
+        let mut web = record("web", "hub.nspawn.org/nginx:latest", "pull", 2);
+        web.started = Some(2);
+        let hub = record("hubnginx", "docker.io/library/nginx:latest", "pull", 1);
+        let (_tmp, store) = store_of(&[web, hub]);
+        let read = |images_only| find(&store, REGISTRY, "nginx", images_only, None);
+        assert_eq!(read(false).unwrap().name, "web");
+        let none = read(true).unwrap_err();
+        assert_eq!(crate::api::kind_of(&none), Some(FailureKind::NoSuchImage));
+        // Written with its registry, Docker Hub's is that one.
+        assert_eq!(
+            find(&store, REGISTRY, "docker.io/nginx", true, None)
+                .unwrap()
+                .name,
+            "hubnginx"
+        );
     }
 
     #[test]
@@ -259,6 +400,149 @@ mod tests {
             None
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_record_name_goes_before_a_reference_and_each_command_reads_both() {
+        let built = record(
+            "somos-rust-libusb-bookworm",
+            "hub.nspawn.org/somos/rust-libusb:bookworm",
+            "build",
+            1,
+        );
+        let hub = record("nginx", "docker.io/library/nginx:latest", "pull", 2);
+        let mut machine = record("web", "docker.io/library/nginx:latest", "pull", 3);
+        machine.started = Some(3);
+        // A record named like a reference of another image: its name wins.
+        let named = record("app", "hub.nspawn.org/other:1", "pull", 4);
+        let (_tmp, store) = store_of(&[built, hub, machine, named]);
+        let find = |text: &str, images_only: bool, except: Option<&str>| {
+            find(&store, REGISTRY, text, images_only, except).map(|r| (r.name, r.reference))
+        };
+        let pair = |name: &str, reference: &str| (name.to_string(), reference.to_string());
+        let built = pair(
+            "somos-rust-libusb-bookworm",
+            "hub.nspawn.org/somos/rust-libusb:bookworm",
+        );
+        // The local name and the reference, short or in full, are the same image.
+        for text in [
+            "somos-rust-libusb-bookworm",
+            "somos/rust-libusb:bookworm",
+            "hub.nspawn.org/somos/rust-libusb:bookworm",
+        ] {
+            assert_eq!(find(text, false, None).unwrap(), built, "{text}");
+            assert_eq!(find(text, true, None).unwrap(), built, "{text}");
+        }
+        // Docker Hub's, by its short name too, after the configured registry's.
+        assert_eq!(
+            find("nginx:latest", false, None).unwrap(),
+            pair("nginx", "docker.io/library/nginx:latest")
+        );
+        assert_eq!(
+            find("docker.io/nginx", false, None).unwrap().0,
+            "nginx",
+            "Docker Hub's names spelled another way"
+        );
+        assert_eq!(
+            find("app", false, None).unwrap(),
+            pair("app", "hub.nspawn.org/other:1")
+        );
+        // A machine by its name; by a reference only when no image goes by it, and never
+        // with images_only.
+        assert_eq!(find("web", true, None).unwrap().0, "web");
+        let (_tmp, store) = store_of(&[{
+            let mut m = record("db", "docker.io/library/postgres:18", "pull", 5);
+            m.started = Some(5);
+            m
+        }]);
+        assert_eq!(
+            super::find(&store, REGISTRY, "postgres:18", false, None)
+                .unwrap()
+                .name,
+            "db"
+        );
+        let images = super::find(&store, REGISTRY, "postgres:18", true, None).unwrap_err();
+        assert_eq!(crate::api::kind_of(&images), Some(FailureKind::NoSuchImage));
+        // `except`, the machine about to be made, is read as a reference instead.
+        let excepted = super::find(&store, REGISTRY, "db", false, Some("db")).unwrap_err();
+        assert_eq!(
+            crate::api::kind_of(&excepted),
+            Some(FailureKind::NoSuchImage)
+        );
+        let none = super::find(&store, REGISTRY, "nothing-here", false, None).unwrap_err();
+        assert_eq!(crate::api::kind_of(&none), Some(FailureKind::NoSuchImage));
+    }
+
+    #[test]
+    fn every_command_reads_a_name_with_name_of() {
+        let image = record("busybox-1.37", "docker.io/library/busybox:1.37", "pull", 1);
+        let mut machine = record("web", "docker.io/library/nginx:latest", "pull", 2);
+        machine.started = Some(2);
+        let (_tmp, store) = store_of(&[image, machine]);
+        let name_of =
+            |text: &str, images_only: bool| name_of(&store, REGISTRY, text, images_only).unwrap();
+        // A record by its name, an image by its reference, short or in full.
+        for text in [
+            "busybox-1.37",
+            "busybox:1.37",
+            "docker.io/library/busybox:1.37",
+        ] {
+            assert_eq!(name_of(text, true), "busybox-1.37", "{text}");
+        }
+        assert_eq!(name_of("web", true), "web");
+        // A name is that record's or nothing's, never an image's by its reference: what
+        // `find` reads `busybox` as, for the command line, a method takes as it is.
+        let (_tmp2, other) =
+            store_of(&[record("bb", "docker.io/library/busybox:latest", "pull", 3)]);
+        assert_eq!(
+            super::name_of(&other, REGISTRY, "busybox", true).unwrap(),
+            "busybox"
+        );
+        assert_eq!(
+            find(&other, REGISTRY, "busybox", true, None).unwrap().name,
+            "bb"
+        );
+        assert_eq!(
+            super::name_of(&other, REGISTRY, "busybox:latest", true).unwrap(),
+            "bb"
+        );
+        // A reference never names a machine made from the image, but to read the image.
+        assert_eq!(name_of("nginx:latest", true), "nginx:latest");
+        assert_eq!(name_of("nginx:latest", false), "web");
+        // What nothing here goes by stays as it is, for the command to say so; so does
+        // what is no reference at all.
+        for text in ["gone", "alpine:3.22", "Bad Name", ""] {
+            assert_eq!(name_of(text, true), text, "{text:?}");
+        }
+        let texts = ["busybox:1.37", "web", "busybox-1.37", "gone"].map(String::from);
+        // A method that takes a machine reads a name the same way, and refuses a reference
+        // of no image here as rm does; what is no reference is the method's to refuse.
+        let machine_of =
+            |text: &str, images_only: bool| super::machine_of(&store, REGISTRY, text, images_only);
+        assert_eq!(machine_of("busybox:1.37", true).unwrap(), "busybox-1.37");
+        assert_eq!(machine_of("nginx:latest", false).unwrap(), "web");
+        for text in ["gone", "Bad Name", "../../../tmp/x", ""] {
+            assert_eq!(machine_of(text, true).unwrap(), text, "{text:?}");
+        }
+        for (text, images_only) in [("alpine:3.22", true), ("nginx:latest", true)] {
+            let refused = machine_of(text, images_only).unwrap_err();
+            assert_eq!(
+                crate::api::kind_of(&refused),
+                Some(FailureKind::NoSuchMachine),
+                "{text}"
+            );
+            assert_eq!(
+                refused.to_string(),
+                format!("no machine or image of {text}")
+            );
+        }
+        // Each name once, in the order given.
+        assert_eq!(
+            machines_of(&store, REGISTRY, &texts).unwrap(),
+            ["busybox-1.37", "web", "gone"]
+        );
+        let missing = ["web", "alpine:3.22"].map(String::from);
+        assert!(machines_of(&store, REGISTRY, &missing).is_err());
     }
 
     #[test]

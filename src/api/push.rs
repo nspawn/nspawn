@@ -3,7 +3,7 @@
 use anyhow::{bail, Context as _, Result};
 use oci_client::manifest::OciImageManifest;
 
-use crate::api::{line, Context, Report};
+use crate::api::{line, Context, FailureKind, Report};
 use crate::hub::{short_digest, Hub};
 use crate::reference::ImageRef;
 
@@ -26,14 +26,31 @@ pub struct Pushed {
 pub async fn push(ctx: &Context, request: &PushRequest, report: Report<'_>) -> Result<Pushed> {
     let config = &ctx.config;
     let store = &ctx.store;
-    let record = store
-        .find_image(&request.image, &config.registry)?
-        .with_context(|| {
-            format!(
-                "no local image named {} (see nspawn images ls)",
-                request.image
-            )
+    let found = crate::api::resolve::find(store, &config.registry, &request.image, false, None)
+        .map_err(|e| match crate::api::kind_of(&e) {
+            Some(FailureKind::NoSuchImage | FailureKind::Invalid) => FailureKind::NoSuchImage
+                .error(format!(
+                    "no local image of {} (see nspawn images ls)",
+                    request.image
+                )),
+            _ => e,
         })?;
+    // A reference without a registry pushes to the configured one: an image found under
+    // Docker Hub's spelling of it is not sent there unless the text or --to says so.
+    if request.to.is_none() && found.name != request.image {
+        if let Ok(named) = ImageRef::parse(&request.image, &config.registry) {
+            let named = crate::api::resolve::by_digest(named).to_string();
+            if named != found.reference {
+                return Err(FailureKind::NoSuchImage.error(format!(
+                    "no local image of {named}; image {} is {}: push it by that reference, or with --to",
+                    found.name, found.reference
+                )));
+            }
+        }
+    }
+    let record = store
+        .load_image(&found.name)?
+        .with_context(|| format!("image {} went while it was pushed", found.name))?;
     let destination = match &request.to {
         Some(to) => ImageRef::parse(to, &config.registry)?,
         None => ImageRef::parse(&record.reference, &config.registry)?,

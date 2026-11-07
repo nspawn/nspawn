@@ -232,6 +232,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 ip,
             } => {
                 let client = Client::connect().await?;
+                let machine = read_name(&machine, true, &client, &config).await;
                 let mut options = Options::new();
                 put_all(&mut options, "aliases", alias);
                 put_opt(&mut options, "address", ip);
@@ -246,6 +247,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 force,
             } => {
                 let client = Client::connect().await?;
+                let machine = read_name(&machine, true, &client, &config).await;
                 let mut options = Options::new();
                 put(&mut options, "force", force);
                 client
@@ -398,7 +400,8 @@ fn mode(options: &mut Options<'_>, choice: ModeChoice) {
     }
 }
 
-async fn through_the_service(command: Command, client: &Client, config: &Config) -> Result<()> {
+async fn through_the_service(mut command: Command, client: &Client, config: &Config) -> Result<()> {
+    read_names(&mut command, client, config).await;
     let manager = &client.manager;
     match command {
         Command::Hub(args) => match args.command {
@@ -598,7 +601,9 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             let images =
                 machines::Listed::all(&manager.list_images().await.map_err(client::error)?);
             let registry = registry_name(client, config).await;
-            let local = machines::local_image(client, config, &a.source, &a.name).await?;
+            let local = machines::local_image(client, config, &a.source, &a.name)
+                .await?
+                .map(|(found, _)| found);
             let source =
                 match create_source(&images, &a.source, &a.name, &registry, a.force, local)? {
                     CreateSource::Local(source) => source,
@@ -690,17 +695,7 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
                 let mut found = Vec::new();
                 let mut missing = Vec::new();
                 for name in &a.names {
-                    let record = image_record(
-                        name,
-                        |name| async move { manager.get_image(&name).await },
-                        |reference| async move {
-                            manager
-                                .resolve_image(&reference, client::registry_options(config))
-                                .await
-                        },
-                    )
-                    .await;
-                    match record {
+                    match manager.get_image(name).await.map_err(client::error) {
                         Ok(record) => found.push(client::dict_to_json(&record)),
                         Err(e) => missing.push(e),
                     }
@@ -859,9 +854,9 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             }
         },
         Command::Machines(args) => match args.command {
-            MachinesCommand::Ls(a) => machines::ls(a, client).await,
+            MachinesCommand::Ls(a) => machines::ls(a, client, config).await,
         },
-        Command::Ps(args) => machines::ls(args, client).await,
+        Command::Ps(args) => machines::ls(args, client, config).await,
         Command::Generate(args) => {
             let script = manager
                 .generate(&args.names, Options::new())
@@ -875,9 +870,9 @@ async fn through_the_service(command: Command, client: &Client, config: &Config)
             let mut out = Vec::new();
             let mut missing = Vec::new();
             for name in &args.names {
-                match manager.get_machine(name).await {
+                match manager.get_machine(name).await.map_err(client::error) {
                     Ok(machine) => out.push(client::dict_to_json(&machine)),
-                    Err(e) => missing.push(client::error(e)),
+                    Err(e) => missing.push(e),
                 }
             }
             print!("{}", inspected(&out, args.format.as_deref(), &mut missing)?);
@@ -927,33 +922,102 @@ enum CreateSource {
     Pull { reference: String, base: String },
 }
 
-/// The record images inspect shows for `name`: the record of that name, else the one the
-/// service resolves it to as a reference (ResolveImage, the command line's reading), read
-/// with GetImage. A name the service finds neither way fails as `no local image of NAME`.
-async fn image_record<G, GF, R, RF>(name: &str, get: G, resolve: R) -> Result<client::Dict>
+/// Every name of a machine or an image `command` was given, as the record it names
+/// (`read_name`). What the command compares with the service's answers (wait, stats) is
+/// then that record's name. `network connect` and `network disconnect`, dispatched
+/// before, read their machine with `read_name` too; cp's MACHINE of MACHINE:PATH can only
+/// be a name, which the service takes as it is.
+async fn read_names(command: &mut Command, client: &Client, config: &Config) {
+    let (texts, images_only) = names_in(command);
+    for text in texts {
+        *text = read_name(text, images_only, client, config).await;
+    }
+}
+
+/// The record `text` names, as ResolveImage with names answers it (`record_name`), the
+/// image alone for a reference with `images_only`.
+async fn read_name(text: &str, images_only: bool, client: &Client, config: &Config) -> String {
+    let mut options = client::registry_options(config);
+    options.insert("names", Value::from(true));
+    options.insert("images_only", Value::from(images_only));
+    let resolve = |text: String| async move { client.manager.resolve_image(&text, options).await };
+    let registry = config.registry_set.then_some(config.registry.as_str());
+    let listed = || async {
+        client
+            .manager
+            .list_images()
+            .await
+            .map(|images| images.iter().map(|i| client::string(i, "name")).collect())
+            .unwrap_or_default()
+    };
+    record_name(text, registry, resolve, listed).await
+}
+
+/// The names of machines and images `command` takes whole, and whether a reference among
+/// them names the image alone: where the image is only read, a machine made from it holds
+/// it too.
+fn names_in(command: &mut Command) -> (Vec<&mut String>, bool) {
+    match command {
+        Command::Inspect(a) => (a.names.iter_mut().collect(), false),
+        Command::Images(images) => match &mut images.command {
+            Some(ImagesCommand::Inspect(a)) => (a.names.iter_mut().collect(), false),
+            Some(ImagesCommand::Rm(a)) => (a.names.iter_mut().collect(), true),
+            _ => (Vec::new(), true),
+        },
+        Command::Rm(a) => (a.names.iter_mut().collect(), true),
+        Command::Generate(a) => (a.names.iter_mut().collect(), true),
+        Command::Start(a) => (vec![&mut a.name], true),
+        Command::Stop(a) => (a.names.iter_mut().collect(), true),
+        Command::Restart(a) => (a.names.iter_mut().collect(), true),
+        Command::Kill(a) => (a.names.iter_mut().collect(), true),
+        Command::Pause(a) | Command::Unpause(a) => (a.names.iter_mut().collect(), true),
+        Command::Top(a) => (vec![&mut a.machine], true),
+        Command::Wait(a) => (a.names.iter_mut().collect(), true),
+        Command::Port(a) => (vec![&mut a.name], true),
+        Command::Update(a) => (a.names.iter_mut().collect(), true),
+        Command::Stats(a) => (a.names.iter_mut().collect(), true),
+        Command::AutoUpdate(a) => (a.names.iter_mut().collect(), true),
+        Command::Exec(a) => (vec![&mut a.machine], true),
+        Command::Shell(a) => (vec![&mut a.machine], true),
+        Command::Logs(a) => (a.machines.iter_mut().collect(), true),
+        _ => (Vec::new(), true),
+    }
+}
+
+/// The record `text` names, as the methods of the bus read it (`api::resolve::name_of`):
+/// a name that can be a machine's as it is, the record of that name or none, so that a
+/// machine that went meanwhile is never taken for another image by its reference; any
+/// other text as `resolve` (ResolveImage) answers it. A reference nothing here goes by is
+/// sent on in full under `registry`, the one the command line was given, for the service
+/// to read the same reference, unless an image of `listed` (machined's, say
+/// `my_box`) has that very name; a text that gets no answer goes on as it is, for the
+/// command's own call to say what is wrong with it.
+async fn record_name<R, RF, L, LF>(
+    text: &str,
+    registry: Option<&str>,
+    resolve: R,
+    listed: L,
+) -> String
 where
-    G: Fn(String) -> GF,
-    GF: std::future::Future<Output = zbus::Result<client::Dict>>,
     R: FnOnce(String) -> RF,
     RF: std::future::Future<Output = zbus::Result<client::Dict>>,
+    L: FnOnce() -> LF,
+    LF: std::future::Future<Output = Vec<String>>,
 {
-    match get(name.to_string()).await.map_err(client::error) {
-        Ok(record) => return Ok(record),
-        Err(e) if client::error_name(&e) == Some("NoSuchImage") => {}
-        Err(e) => return Err(e.context(format!("reading the image {name}"))),
+    if crate::reference::validate_machine_name(text).is_ok() {
+        return text.to_string();
     }
-    let found = match resolve(name.to_string()).await.map_err(client::error) {
-        Ok(found) => client::string(&found, "name"),
-        // What is no record's name and no reference is no image here either.
-        Err(e) if matches!(client::error_name(&e), Some("NoSuchImage" | "Invalid")) => {
-            bail!("no local image of {name}")
-        }
-        Err(e) => return Err(e.context(format!("resolving the image {name}"))),
+    let e = match resolve(text.to_string()).await {
+        Ok(found) => return client::string(&found, "name"),
+        Err(e) => client::error(e),
     };
-    get(found.clone())
-        .await
-        .map_err(client::error)
-        .with_context(|| format!("reading the image {found}, which {name} names"))
+    match (client::error_name(&e), registry) {
+        (Some("NoSuchImage"), Some(registry)) if !listed().await.iter().any(|n| n == text) => {
+            crate::reference::ImageRef::parse(text, registry)
+                .map_or_else(|_| text.to_string(), |r| r.to_string())
+        }
+        _ => text.to_string(),
+    }
 }
 
 /// What inspect prints of the objects it found: JSON, or a line per object of a Go
@@ -1131,39 +1195,25 @@ mod tests {
             .collect()
     }
 
-    /// GetImage and ResolveImage as the service answers them over a few records, and the
-    /// calls made to each.
+    /// ResolveImage with names as the service answers it, and the texts it was asked.
     struct Service {
-        records: Vec<(&'static str, &'static str)>,
         resolves: Vec<(&'static str, &'static str)>,
-        gets: std::cell::RefCell<Vec<String>>,
         resolved: std::cell::RefCell<Vec<String>>,
     }
 
     impl Service {
-        fn get(&self, name: String) -> std::future::Ready<zbus::Result<client::Dict>> {
-            self.gets.borrow_mut().push(name.clone());
-            std::future::ready(match self.records.iter().find(|(n, _)| *n == name) {
-                Some((n, reference)) => Ok(dict(&[("name", n), ("reference", reference)])),
-                None => Err(service_error(
-                    "NoSuchImage",
-                    &format!("no image named {name}"),
-                )),
-            })
-        }
-
-        fn resolve(&self, reference: String) -> std::future::Ready<zbus::Result<client::Dict>> {
-            self.resolved.borrow_mut().push(reference.clone());
-            std::future::ready(if reference.contains(' ') {
+        fn resolve(&self, text: String) -> std::future::Ready<zbus::Result<client::Dict>> {
+            self.resolved.borrow_mut().push(text.clone());
+            std::future::ready(if text.contains(' ') {
                 Err(service_error("Invalid", "invalid reference format"))
-            } else if reference == "denied" {
+            } else if text == "denied" {
                 Err(service_error("NotAuthorized", "org.nspawn.inspect refused"))
             } else {
-                match self.resolves.iter().find(|(r, _)| *r == reference) {
+                match self.resolves.iter().find(|(r, _)| *r == text) {
                     Some((_, name)) => Ok(dict(&[("name", name), ("reference", "full")])),
                     None => Err(service_error(
                         "NoSuchImage",
-                        &format!("no local image of {reference}"),
+                        &format!("no local image of {text}"),
                     )),
                 }
             })
@@ -1171,46 +1221,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn images_inspect_takes_a_name_as_it_is_and_asks_the_service_for_a_reference() {
+    async fn every_name_a_command_takes_is_the_record_the_service_reads_it_as() {
         let service = Service {
-            records: vec![
-                ("busybox-1.37", "docker.io/library/busybox:1.37"),
-                ("web", "docker.io/library/nginx:1.27"),
+            // The service's answers: a record's name is that record, a reference the
+            // image of it; which one is the service's to say.
+            resolves: vec![
+                ("web", "web"),
+                ("busybox-1.37", "busybox-1.37"),
+                ("busybox:1.37", "busybox-1.37"),
+                ("docker.io/library/busybox:1.37", "busybox-1.37"),
             ],
-            // The service's answers: which record a reference means is its own to say.
-            resolves: vec![("busybox:1.37", "busybox-1.37"), ("nginx:1.27", "web")],
-            gets: Default::default(),
             resolved: Default::default(),
         };
-        let inspect =
-            |name: &'static str| image_record(name, |n| service.get(n), |r| service.resolve(r));
-        // A record's name is read as it is, the service never asked to resolve it.
-        let web = inspect("web").await.unwrap();
-        assert_eq!(client::string(&web, "name"), "web");
-        assert!(service.resolved.borrow().is_empty());
-        // A reference is the record ResolveImage names, read with GetImage; a machine
-        // made from an image holds it as well as the image does.
-        let busybox = inspect("busybox:1.37").await.unwrap();
-        assert_eq!(client::string(&busybox, "name"), "busybox-1.37");
-        assert_eq!(
-            client::string(&inspect("nginx:1.27").await.unwrap(), "name"),
-            "web"
-        );
-        assert_eq!(*service.resolved.borrow(), ["busybox:1.37", "nginx:1.27"]);
-        assert_eq!(
-            *service.gets.borrow(),
-            ["web", "busybox:1.37", "busybox-1.37", "nginx:1.27", "web"]
-        );
-        // Neither a record nor a reference of one: an error naming it, also for what is
-        // no reference at all.
-        for absent in ["alpine:3", "Bad Name"] {
-            let e = inspect(absent).await.unwrap_err();
-            assert_eq!(e.to_string(), format!("no local image of {absent}"));
+        let nothing = || std::future::ready(Vec::new());
+        let name = |text: &'static str| record_name(text, None, |t| service.resolve(t), nothing);
+        // A name that can be a machine's is that record or none, as the service takes it:
+        // asked of nobody, so that a machine that went is never read as a reference.
+        for text in ["web", "busybox-1.37", "gone", "busybox"] {
+            assert_eq!(name(text).await, text);
         }
-        // Any other failure is the service's, with the image it was about.
-        let refused = inspect("denied").await.unwrap_err();
-        assert_eq!(client::error_name(&refused), Some("NotAuthorized"));
-        assert!(format!("{refused:#}").contains("denied"), "{refused:#}");
+        assert!(service.resolved.borrow().is_empty());
+        // A reference is the image the service says.
+        for text in ["busybox:1.37", "docker.io/library/busybox:1.37"] {
+            assert_eq!(name(text).await, "busybox-1.37", "{text}");
+        }
+        // One nothing here goes by goes on as it is, or in full under the registry the
+        // command line was given; what is no reference or gets no answer as it is.
+        assert_eq!(name("alpine:3").await, "alpine:3");
+        assert_eq!(
+            record_name("alpine:3", Some("zot.lan"), |t| service.resolve(t), nothing).await,
+            "zot.lan/alpine:3"
+        );
+        // An image machined has under that very name goes on as it is.
+        let machined = || std::future::ready(vec!["my_box".to_string()]);
+        assert_eq!(
+            record_name("my_box", Some("zot.lan"), |t| service.resolve(t), machined).await,
+            "my_box"
+        );
+        assert_eq!(name("Bad Name").await, "Bad Name");
+        let refused = Service {
+            resolves: Vec::new(),
+            resolved: Default::default(),
+        };
+        let denied = |t: String| {
+            refused.resolved.borrow_mut().push(t);
+            std::future::ready(Err(service_error("NotAuthorized", "refused")))
+        };
+        assert_eq!(
+            record_name("x:1", Some("zot.lan"), denied, nothing).await,
+            "x:1"
+        );
+        assert_eq!(service.resolved.borrow().len(), 6);
+    }
+
+    #[test]
+    fn every_command_that_takes_a_machine_or_an_image_has_its_names_read() {
+        use clap::Parser;
+        let read = |args: &[&str]| {
+            let mut command = Cli::try_parse_from([&["nspawn"], args].concat())
+                .unwrap()
+                .command;
+            let (texts, images_only) = names_in(&mut command);
+            let texts: Vec<String> = texts.into_iter().map(|t| t.clone()).collect();
+            (texts, images_only)
+        };
+        // Where the image is only read, a reference takes a machine made from it too.
+        for args in [&["inspect", "a", "b"][..], &["images", "inspect", "a", "b"]] {
+            assert_eq!(
+                read(args),
+                (vec!["a".into(), "b".into()], false),
+                "{args:?}"
+            );
+        }
+        for args in [
+            &["rm", "a", "b"][..],
+            &["images", "rm", "a", "b"],
+            &["generate", "a", "b"],
+            &["stop", "a", "b"],
+            &["restart", "a", "b"],
+            &["kill", "a", "b"],
+            &["pause", "a", "b"],
+            &["unpause", "a", "b"],
+            &["wait", "a", "b"],
+            &["update", "--memory", "1g", "a", "b"],
+            &["stats", "a", "b"],
+            &["auto-update", "a", "b"],
+            &["logs", "a", "b"],
+        ] {
+            assert_eq!(read(args), (vec!["a".into(), "b".into()], true), "{args:?}");
+        }
+        for args in [
+            &["start", "a"][..],
+            &["top", "a"],
+            &["port", "a"],
+            &["exec", "a", "true"],
+            &["shell", "a"],
+        ] {
+            assert_eq!(read(args), (vec!["a".into()], true), "{args:?}");
+        }
+        // cp's MACHINE of MACHINE:PATH is a name, as the service takes it; network connect
+        // and disconnect read theirs where they are dispatched.
+        for args in [
+            &["cp", "a:/etc/hosts", "."][..],
+            &["network", "connect", "net", "a"],
+            &["images", "ls"],
+            &["ps"],
+        ] {
+            assert!(read(args).0.is_empty(), "{args:?}");
+        }
     }
 
     #[test]

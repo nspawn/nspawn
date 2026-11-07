@@ -412,9 +412,9 @@ pub async fn connect(
         .map_err(|_| FailureKind::NoSuchNetwork.error(format!("network {network} not found")))?;
     // The record names networks by their own names; messages by the one given.
     let own = net.name.as_str();
-    let mut record = store
-        .load_image(machine)?
-        .ok_or_else(|| FailureKind::NoSuchMachine.error(format!("No such container: {machine}")))?;
+    let mut record = store.load_image(machine)?.ok_or_else(|| {
+        FailureKind::NoSuchMachine.error(format!("no machine or image named {machine}"))
+    })?;
     joins_bridges(&record, "connected to")?;
     if bridge::networks_of(&record).contains(&own) {
         return Err(FailureKind::Exists.error(format!(
@@ -517,7 +517,9 @@ pub async fn disconnect(
         if force {
             return Ok(());
         }
-        return Err(FailureKind::NoSuchMachine.error(format!("No such container: {machine}")));
+        return Err(
+            FailureKind::NoSuchMachine.error(format!("no machine or image named {machine}"))
+        );
     };
     joins_bridges(&record, "disconnected from")?;
     let networks: Vec<String> = bridge::networks_of(&record)

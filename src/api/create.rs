@@ -227,14 +227,26 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
     ensure_replaceable(store, sd, name, request.force).await?;
     let api_name = request.api_name.as_deref().filter(|a| *a != name);
     check_api_name(store, &records, name, request.api_name.as_deref())?;
-    let source = store
-        .find_image(&request.source, &config.registry)?
-        .ok_or_else(|| {
-            FailureKind::NoSuchImage.error(format!(
-                "{}: no such local image; pull or build it first",
-                request.source
-            ))
-        })?;
+    let missing = || {
+        FailureKind::NoSuchImage.error(format!(
+            "{}: no such local image; pull or build it first",
+            request.source
+        ))
+    };
+    // A name is that record or none, as every method takes one: a program's record that
+    // went meanwhile is never another image by its reference. A reference is the image of
+    // it, else a machine made from it, never the record this replaces.
+    let found = if crate::reference::validate_machine_name(&request.source).is_ok() {
+        request.source.clone()
+    } else {
+        crate::api::resolve::find(store, &config.registry, &request.source, false, Some(name))
+            .map_err(|e| match crate::api::kind_of(&e) {
+                Some(FailureKind::NoSuchImage | FailureKind::Invalid) => missing(),
+                _ => e,
+            })?
+            .name
+    };
+    let source = store.load_image(&found)?.ok_or_else(missing)?;
     if source.name == name {
         return Err(FailureKind::Invalid.error(format!(
             "{name} is the source image itself; pick another name"

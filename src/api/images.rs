@@ -173,11 +173,102 @@ impl Removal {
     }
 }
 
-/// Removes every name it can: one that cannot be removed does not stop
-/// the others, and is reported in the result.
-pub async fn remove(ctx: &Context, names: &[String], report: Report<'_>) -> Result<Removal> {
+/// images rm: removes every image `texts` name that it can, as `remove_named` does.
+pub async fn remove(ctx: &Context, texts: &[String], report: Report<'_>) -> Result<Removal> {
     require_root("images rm")?;
-    remove_machines(ctx, names, false, report).await
+    remove_named(ctx, texts, false, report, |text| {
+        FailureKind::NoSuchImage.error(format!("no local image of {text}"))
+    })
+    .await
+}
+
+/// rm and images rm: the records `texts` name, as everywhere nspawn takes a machine or an
+/// image (`records_named`), removed as `remove_machines` removes them; a reference of no
+/// image here is refused as `missing` says. A record found by a reference goes only while
+/// it is still an image under the lock: one that ran meanwhile is a machine made from
+/// it, which a reference never names.
+pub async fn remove_named(
+    ctx: &Context,
+    texts: &[String],
+    force: bool,
+    report: Report<'_>,
+    missing: impl Fn(&str) -> anyhow::Error,
+) -> Result<Removal> {
+    let named = records_named(&ctx.store, &ctx.config.registry, texts)?;
+    let mut names = named.names;
+    let mut unknown = Vec::new();
+    // What no record goes by may be an image machined has of that very name (a name with
+    // '_' is no machine's name, but parses as a reference).
+    if !named.unfound.is_empty() {
+        let listed = ctx.sd().await?.list_images().await?;
+        for text in named.unfound {
+            if listed.iter().any(|i| i.name == text) {
+                if !names.contains(&text) {
+                    names.push(text);
+                }
+            } else {
+                unknown.push(text);
+            }
+        }
+    }
+    let by_reference = named.by_reference;
+    let keep =
+        move |store: &crate::store::Store, records: &[crate::store::ImageRecord], name: &str| {
+            let text = by_reference.get(name)?;
+            let record = records.iter().find(|r| r.name == name)?;
+            (!crate::api::disk::image_only(store, record))
+                .then(|| format!("{name}, the image {text} named, became a machine meanwhile"))
+        };
+    let mut removal = remove_machines_if(ctx, &names, force, report, &keep).await?;
+    for text in unknown {
+        removal.refuse(&text, missing(&text));
+    }
+    Ok(removal)
+}
+
+/// What the texts of a removal name.
+#[derive(Debug, Default, PartialEq)]
+struct Named {
+    /// The records, each once, and the names given that no record has, for the removal
+    /// to look for what is left of them or to refuse them as no name.
+    names: Vec<String>,
+    /// The records found by a reference, with the text that named them.
+    by_reference: std::collections::HashMap<String, String>,
+    /// The references no record goes by.
+    unfound: Vec<String>,
+}
+
+/// The records `texts` name, as the methods of the bus read them (`resolve::name_of`): a
+/// name as it is, any other text the image of the reference it is.
+fn records_named(store: &crate::store::Store, registry: &str, texts: &[String]) -> Result<Named> {
+    let mut named = Named::default();
+    let mut given = Vec::new();
+    for text in texts {
+        if crate::reference::validate_machine_name(text).is_ok() {
+            if !named.names.contains(text) {
+                named.names.push(text.clone());
+            }
+            given.push(text.clone());
+            continue;
+        }
+        match crate::api::resolve::find(store, registry, text, true, None) {
+            Ok(found) => {
+                if !named.names.contains(&found.name) {
+                    named.names.push(found.name.clone());
+                }
+                named.by_reference.insert(found.name, text.clone());
+            }
+            Err(e) => match crate::api::kind_of(&e) {
+                Some(FailureKind::NoSuchImage) => named.unfound.push(text.clone()),
+                // No reference either: the removal refuses it as no name.
+                Some(FailureKind::Invalid) => named.names.push(text.clone()),
+                _ => return Err(e),
+            },
+        }
+    }
+    // A record also given by its name goes as that name says, whatever it is now.
+    named.by_reference.retain(|name, _| !given.contains(name));
+    Ok(named)
 }
 
 /// `remove`, and with `force` a running machine is stopped first (SIGKILL) instead of
@@ -429,6 +520,69 @@ pub async fn remove_machines_if(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rm_and_images_rm_take_a_name_or_the_reference_of_an_image() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::new(&tmp.path().join("m"), &tmp.path().join("s"));
+        store.init().unwrap();
+        let record = |name: &str, reference: &str, started: Option<u64>| {
+            let mut r: crate::store::ImageRecord = serde_json::from_value(serde_json::json!({
+                "name": name, "reference": reference, "manifest_digest": "sha256:m",
+                "layers": [], "backend": "overlay", "created": 1, "origin": "build",
+            }))
+            .unwrap();
+            r.started = started;
+            store.record_image(&r).unwrap();
+        };
+        record("somos-app-1", "hub.nspawn.org/somos/app:1", None);
+        record("web", "docker.io/library/nginx:latest", Some(2));
+        let texts = |list: &[&str]| list.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        let named = records_named(
+            &store,
+            "hub.nspawn.org",
+            &texts(&[
+                "somos/app:1",
+                "hub.nspawn.org/somos/app:1",
+                "web",
+                "nginx:latest",
+                "gone",
+                "gone/app:2",
+                "my_box",
+                "../../../tmp/x",
+            ]),
+        )
+        .unwrap();
+        // A record by its name, an image by its reference, each once; a machine never by
+        // the reference of its image; a plain name nothing is behind and what is no
+        // reference at all are the removal's to refuse as no name.
+        assert_eq!(
+            names_of(&named),
+            ["somos-app-1", "web", "gone", "../../../tmp/x"]
+        );
+        assert_eq!(
+            named.by_reference,
+            [("somos-app-1", "hub.nspawn.org/somos/app:1")]
+                .map(|(n, t)| (n.to_string(), t.to_string()))
+                .into()
+        );
+        // Given by its name too, it goes as the name says.
+        let both = records_named(
+            &store,
+            "hub.nspawn.org",
+            &texts(&["somos/app:1", "somos-app-1"]),
+        )
+        .unwrap();
+        assert_eq!(names_of(&both), ["somos-app-1"]);
+        assert!(both.by_reference.is_empty());
+        // The references no record goes by, a machined image's name with '_' among them,
+        // which the removal looks for in machined's list.
+        assert_eq!(named.unfound, ["nginx:latest", "gone/app:2", "my_box"]);
+    }
+
+    fn names_of(named: &Named) -> Vec<&str> {
+        named.names.iter().map(String::as_str).collect()
+    }
 
     #[test]
     fn machines_others_need_stay() {
