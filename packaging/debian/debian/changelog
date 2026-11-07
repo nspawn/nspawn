@@ -1,3 +1,9 @@
+nspawn (3.0.0-1) unstable; urgency=medium
+
+  * The Docker Engine API with its changes: containers made, run, attached to, exec'd in, copied to and from and removed, images pulled and removed, volumes and networks made and joined, on a host socket with polkit per client; -P/--publish-all; variables with line breaks; --timezone auto copies the host's zone into a root that lacks it; no output lost to journald's rate limit.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Fri, 06 Nov 2026 15:18:46 -0500
+
 nspawn (2.4.0-1) unstable; urgency=medium
 
   * A port published without a host port takes a free one; image index entries are chosen by the platforms the host runs; -p, --dns-search and --add-host read more forms.

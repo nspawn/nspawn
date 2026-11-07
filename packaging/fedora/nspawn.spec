@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 2.4.0
+%global upstream_version 3.0.0
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -169,6 +169,9 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Fri Nov 06 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 3.0.0-1
+- The Docker Engine API with its changes: containers made, run, attached to, exec'd in, copied to and from and removed, images pulled and removed, volumes and networks made and joined, on a host socket with polkit per client; -P/--publish-all; variables with line breaks; --timezone auto copies the host's zone into a root that lacks it; no output lost to journald's rate limit.
+
 * Wed Oct 28 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 2.4.0-1
 - A port published without a host port takes a free one; image index entries are chosen by the platforms the host runs; -p, --dns-search and --add-host read more forms.
 
