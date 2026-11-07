@@ -84,10 +84,17 @@ a `Dockerfile` (or `dockerfile`, `Containerfile`), `-f` naming one, `-` on stand
 input or any of the Dockerfile flags below make it a Dockerfile build; a directory with
 `mkosi.conf` or `mkosi.conf.d` and no Dockerfile, or the mkosi flags, an mkosi build.
 Either result is stored like a pulled image (blobs, manifest, assembled machine) and
-can be started right away or pushed. A Dockerfile build of a tag replaces the image it
-built or pulled under that reference before, as long as no machine ran from it;
-`--force` replaces any other image of the name, an mkosi build's included. `-f` names
-the Dockerfile, so `--force` has no short form.
+can be started right away or pushed. A build of a tag replaces the image of that
+reference under the tag's local name as long as nothing ran from it, whatever it was
+pulled or built as: the tag moves to the new build, so a script that builds and runs its
+image builds it again. A machine that has the name (one that ran, starts or runs), or an
+image of another reference, keeps it, and the build goes beside it with the same
+reference, into the image an earlier build of the tag put there or else under a free
+name (`app-2`), which a note says; `run`, `create`, compose and the Docker API find it by
+the reference, the image before the machine. An mkosi build given `--name` is refused
+instead when a machine or an image of another reference has that name. `--force`
+replaces whatever has the name, a machine that ran included, and refuses one that runs.
+`-f` names the Dockerfile, so `--force` has no short form.
 
 ### Dockerfiles
 

@@ -724,7 +724,9 @@ pub struct BuildArgs {
     /// Repeatable for a Dockerfile; an mkosi build takes one.
     #[arg(long, short = 't')]
     pub tag: Vec<String>,
-    /// Replace an existing image with the same name.
+    /// Replace whatever has the image's name, a machine that ran included. Without it,
+    /// an image of the reference that never ran is replaced, and a machine or an image of
+    /// another reference keeps the name while the image goes beside it.
     #[arg(long)]
     pub force: bool,
     /// How to assemble the image on this host: auto is overlay, or flat without overlayfs;
@@ -945,7 +947,8 @@ impl DockerfileArgs {
 /// The flags of an mkosi build.
 #[derive(Args, Debug, Default)]
 pub struct MkosiArgs {
-    /// Local image name of an mkosi build (default: derived from the tag).
+    /// Local image name of an mkosi build (default: derived from the tag). A machine or
+    /// an image of another reference that has it is not replaced without --force.
     #[arg(long, short = 'n')]
     pub name: Option<String>,
     /// Distribution to build (mkosi --distribution).

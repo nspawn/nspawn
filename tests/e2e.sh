@@ -4140,6 +4140,39 @@ grep -q '/var/lib/nspawn/builds/df-' /proc/self/mountinfo && fail "a build left 
 ls /var/lib/nspawn/builds/ 2>/dev/null | grep_q '^df-' && fail "a build left its directory: $(ls /var/lib/nspawn/builds/)"
 ip netns list | grep_q -F 'nspawn-.build-' && fail "a build left its network namespace: $(ip netns list)"
 rm -rf $work
+# A tag built again replaces the image of its reference under its name while nothing ran
+# from it; an image of another reference or a machine of the name keeps it, and the build
+# goes beside it with the same reference, which run finds, and again into the same image;
+# --force takes the machine.
+work=/tmp/e2e-build-again && rm -rf $work && mkdir -p $work
+again() {
+  printf 'ARG BUSYBOX\nFROM ${BUSYBOX}\nRUN echo %s-%s > /which\nCMD ["cat", "/which"]\n' "$1" $nonce > $work/Dockerfile
+  $NSPAWN build -t e2e-build-again "${@:2}" --build-arg BUSYBOX="$busybox137_ref" $work 2>&1
+}
+$NSPAWN images rm e2e-build-again e2e-build-again-2 e2e-build-again-3 >/dev/null 2>&1
+$NSPAWN pull "$busybox137_ref" --name e2e-build-again --force >/dev/null || fail "pull under the name a build takes"
+out=$(again one) || fail "a build over a pulled image of another reference: $out"
+echo "$out" | grep_q "image e2e-build-again is of another reference, which keeps its name" || fail "the build beside an image of another reference said nothing: $out"
+[ "$($NSPAWN inspect -f '{{.reference}}' e2e-build-again 2>/dev/null)" = "$($NSPAWN inspect -f '{{.reference}}' e2e-build-again-2 2>/dev/null)" ] && fail "the build replaced the pulled image of another reference"
+[ "$($NSPAWN run --rm e2e-build-again 2>/dev/null)" = one-$nonce ] || fail "run does not find the build beside an image of another reference: $($NSPAWN run --rm e2e-build-again 2>&1)"
+$NSPAWN images rm e2e-build-again e2e-build-again-2 >/dev/null || fail "images rm of the pulled image and the build beside it"
+out=$(again two) || fail "a build of a tag whose name is free: $out"
+out=$(again three) || fail "a tag built again without --force: $out"
+[ "$($NSPAWN run --rm e2e-build-again 2>/dev/null)" = three-$nonce ] || fail "the tag built again does not run the new build: $($NSPAWN run --rm e2e-build-again 2>&1)"
+$NSPAWN start e2e-build-again >/dev/null || fail "start the built image as a machine"
+retry 20 bash -c "! $NSPAWN ps | grep_q '^ *e2e-build-again '" || $NSPAWN stop e2e-build-again --force >/dev/null 2>&1
+out=$(again four) || fail "a build of a tag whose name a machine has: $out"
+echo "$out" | grep_q "e2e-build-again is a machine, which keeps its name" || fail "the build beside a machine said nothing: $out"
+$NSPAWN inspect e2e-build-again-2 >/dev/null 2>&1 || fail "the build beside the machine is not e2e-build-again-2: $out"
+[ "$($NSPAWN run --rm e2e-build-again 2>/dev/null)" = four-$nonce ] || fail "run does not find the image beside the machine: $($NSPAWN run --rm e2e-build-again 2>&1)"
+out=$(again five) || fail "a build again beside the machine: $out"
+$NSPAWN inspect e2e-build-again-3 >/dev/null 2>&1 && fail "a build again beside the machine made another image instead of replacing e2e-build-again-2"
+[ "$($NSPAWN run --rm e2e-build-again 2>/dev/null)" = five-$nonce ] || fail "the image beside the machine was not replaced"
+out=$(again six --force) || fail "build --force over a machine that ran: $out"
+echo "$out" | grep_q "keeps its name" && fail "build --force went beside the machine: $out"
+$NSPAWN images rm e2e-build-again e2e-build-again-2 >/dev/null || fail "images rm of the rebuilt images"
+unset -f again
+rm -rf $work
 # Two builds at once, each with its own steps, both whole.
 work=/tmp/e2e-build-two && rm -rf $work && mkdir -p $work/a $work/b
 for x in a b; do printf 'ARG BUSYBOX\nFROM ${BUSYBOX}\nRUN echo %s-%s > /which && sleep 2\nCMD ["cat", "/which"]\n' $x $nonce > $work/$x/Dockerfile; done

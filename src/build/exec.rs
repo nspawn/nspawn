@@ -1524,30 +1524,34 @@ impl<'a> Builder<'a> {
         // Every name is looked at before one is replaced: a refused tag leaves the others
         // as they were. What changes between the look and the install is said by name.
         for (name, reference) in &tags {
-            let rebuilt = store
-                .load_image(name)?
-                .is_some_and(|r| replaced_by_build(store, &r, reference));
-            crate::install::ensure_no_pending_rollback(store, name, self.req.force)?;
-            crate::install::ensure_replaceable(store, sd, name, self.req.force || rebuilt).await?;
+            crate::install::build_destination(
+                store,
+                sd,
+                name,
+                reference,
+                self.req.force,
+                true,
+                &others(&tags, name),
+                &|_| {},
+            )
+            .await?;
         }
-        for (name, reference) in tags {
+        for (name, reference) in &tags {
             let installed = self
                 .install_tag(
                     sd,
                     &manifest,
                     &manifest_bytes,
                     &manifest_digest,
-                    &name,
-                    &reference,
+                    (name, reference),
+                    &others(&tags, name),
                 )
                 .await;
-            if let Err(e) = installed {
-                if names.is_empty() {
-                    return Err(e);
-                }
-                return Err(e.context(format!("{} installed already", names.join(", "))));
+            match installed {
+                Ok(into) => names.push(into),
+                Err(e) if names.is_empty() => return Err(e),
+                Err(e) => return Err(e.context(format!("{} installed already", names.join(", ")))),
             }
-            names.push(name);
         }
         if names.is_empty() {
             note(
@@ -1562,16 +1566,17 @@ impl<'a> Builder<'a> {
         })
     }
 
-    /// One tag's image installed under the store lock, replacing what had the name.
+    /// One tag's image installed under the store lock where build_destination puts it,
+    /// which `reserved`, the other tags' names, leaves alone; the name it got.
     async fn install_tag(
         &self,
         sd: &crate::systemd::Systemd,
         manifest: &oci_client::manifest::OciImageManifest,
         manifest_bytes: &[u8],
         manifest_digest: &str,
-        name: &str,
-        reference: &str,
-    ) -> Result<()> {
+        (own, reference): (&str, &str),
+        reserved: &std::collections::BTreeSet<String>,
+    ) -> Result<String> {
         let ctx = self.ctx;
         let store = &ctx.store;
         let choice = if self.req.backend == BackendChoice::Auto {
@@ -1581,13 +1586,18 @@ impl<'a> Builder<'a> {
         };
         let backend = Backend::choose(choice, sd).await?;
         let _lock = store.lock().await?;
-        // A tag built again replaces the image of that reference it built or pulled
-        // before, as long as nothing ran from it: a machine goes only with --force.
-        let rebuilt = store
-            .load_image(name)?
-            .is_some_and(|r| replaced_by_build(store, &r, reference));
-        crate::install::ensure_no_pending_rollback(store, name, self.req.force)?;
-        crate::install::ensure_replaceable(store, sd, name, self.req.force || rebuilt).await?;
+        let destination = crate::install::build_destination(
+            store,
+            sd,
+            own,
+            reference,
+            self.req.force,
+            true,
+            reserved,
+            self.report,
+        )
+        .await?;
+        let name = destination.name.as_str();
         crate::install::stage_layers(store, backend, manifest, self.req.mode, name).await?;
         crate::install::remove_existing(store, sd, name, self.report).await?;
         store.forget_rollback(name)?;
@@ -1617,8 +1627,16 @@ impl<'a> Builder<'a> {
             name,
             &[("image", reference), ("reference", reference)],
         );
-        Ok(())
+        Ok(destination.name)
     }
+}
+
+/// The names of the tags other than `name`.
+fn others(tags: &[(String, String)], name: &str) -> std::collections::BTreeSet<String> {
+    tags.iter()
+        .map(|(n, _)| n.clone())
+        .filter(|n| n != name)
+        .collect()
 }
 
 /// The local name and the reference of each tag, refused before anything is built when
@@ -1642,14 +1660,6 @@ pub fn tag_names(tags: &[String], registry: &str) -> Result<Vec<(String, String)
         out.push((name, reference));
     }
     Ok(out)
-}
-
-/// Whether a build tagged `reference` replaces `record` without --force: an image of
-/// that reference built or pulled before, that nothing ran from.
-fn replaced_by_build(store: &crate::store::Store, record: &ImageRecord, reference: &str) -> bool {
-    matches!(record.origin.as_str(), "build" | "pull")
-        && record.reference == reference
-        && crate::api::disk::image_only(store, record)
 }
 
 fn short(digest: &str) -> String {
@@ -2953,48 +2963,6 @@ mod tests {
         ] {
             assert!(heredoc_file(name).is_err(), "{name}");
         }
-    }
-
-    #[test]
-    fn a_tag_built_again_replaces_only_an_image_nothing_ran_from() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::Store::new(&dir.path().join("m"), &dir.path().join("s"));
-        let record = |json: serde_json::Value| -> ImageRecord {
-            let mut base = serde_json::json!({
-                "name": "app-1", "reference": "hub.nspawn.org/app:1", "manifest_digest": "sha256:a",
-                "layers": [], "backend": "overlay", "created": 1, "origin": "build", "mode": "app",
-            });
-            for (k, v) in json.as_object().unwrap() {
-                base[k] = v.clone();
-            }
-            serde_json::from_value(base).unwrap()
-        };
-        let reference = "hub.nspawn.org/app:1";
-        assert!(replaced_by_build(
-            &store,
-            &record(serde_json::json!({})),
-            reference
-        ));
-        assert!(replaced_by_build(
-            &store,
-            &record(serde_json::json!({ "origin": "pull" })),
-            reference
-        ));
-        assert!(!replaced_by_build(
-            &store,
-            &record(serde_json::json!({})),
-            "hub.nspawn.org/app:2"
-        ));
-        assert!(!replaced_by_build(
-            &store,
-            &record(serde_json::json!({ "started": 5 })),
-            reference
-        ));
-        assert!(!replaced_by_build(
-            &store,
-            &record(serde_json::json!({ "origin": "create" })),
-            reference
-        ));
     }
 
     #[test]

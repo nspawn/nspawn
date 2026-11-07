@@ -171,17 +171,27 @@ pub fn free_name(base: &str, taken: &std::collections::BTreeSet<String>) -> Stri
         return base.to_string();
     }
     (2u64..)
-        .map(|n| {
-            let suffix = format!("-{n}");
-            let mut cut = base.len().min(MAX_MACHINE_NAME - suffix.len());
-            while !base.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            let stem = base[..cut].trim_end_matches(['-', '.']);
-            format!("{stem}{suffix}")
-        })
+        .map(|n| numbered(base, n))
         .find(|name| !taken.contains(name))
         .expect("a free name")
+}
+
+/// `base-n`, the base cut so that the name stays a machine name.
+fn numbered(base: &str, n: u64) -> String {
+    let suffix = format!("-{n}");
+    let mut cut = base.len().min(MAX_MACHINE_NAME - suffix.len());
+    while !base.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let stem = base[..cut].trim_end_matches(['-', '.']);
+    format!("{stem}{suffix}")
+}
+
+/// Whether `name` is one free_name gives `base` when `base` is taken.
+pub fn numbered_from(base: &str, name: &str) -> bool {
+    name.rsplit_once('-')
+        .and_then(|(_, n)| n.parse::<u64>().ok())
+        .is_some_and(|n| n >= 2 && numbered(base, n) == name)
 }
 
 fn looks_like_registry(component: &str) -> bool {
@@ -299,6 +309,13 @@ mod tests {
         let taken: BTreeSet<String> = ["web".to_string(), "web-2".to_string()].into();
         assert_eq!(free_name("web", &taken), "web-3");
         assert_eq!(free_name("db", &taken), "db");
+        assert!(numbered_from("web", "web-3"));
+        assert!(numbered_from(&dashed, &free));
+        assert!(!numbered_from("web", "web"));
+        assert!(!numbered_from("web", "web-1"));
+        assert!(!numbered_from("web", "web-03"));
+        assert!(!numbered_from("web", "webx-3"));
+        assert!(!numbered_from("web", "web-stable"));
     }
 
     const HUB: &str = "hub.nspawn.org";

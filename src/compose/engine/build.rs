@@ -96,14 +96,15 @@ pub struct Flags {
 }
 
 /// Builds the image of `name`, tagged with `image` and the section's tags; the local
-/// name it is kept under.
+/// names it is kept under, one per tag, as the service chose them: beside a machine or
+/// an image of another reference that holds a tag's own name, the image goes by another.
 pub async fn build(
     e: &Engine<'_>,
     name: &str,
     service: &Map,
     image: &str,
     flags: &Flags,
-) -> Result<String> {
+) -> Result<Vec<String>> {
     let project = e.project();
     let build = service
         .get("build")
@@ -267,9 +268,9 @@ pub async fn build(
     match crate::commands::build::send(&e.client, options, context, dockerfile_path, flags.quiet)
         .await
     {
-        Ok(_) => {
+        Ok(done) => {
             e.progress.event(&id, "Built", "", Status::Done);
-            Ok(reference.local_name())
+            Ok(crate::client::strings(&done, "names"))
         }
         Err(err) => {
             e.progress.event(&id, "Error", "", Status::Error);
@@ -308,26 +309,15 @@ pub async fn run(e: &mut Engine<'_>, a: &crate::compose::cli::BuildArgs) -> Resu
             continue;
         }
         let image = image_of(&project.name, &name, service);
-        build(e, &name, service, &image, &flags).await?;
+        let built = build(e, &name, service, &image, &flags).await?;
+        // Each tag's image goes to the reference it was built as.
         if a.push && !s(service, "image").is_empty() {
-            let mut tags = vec![image.clone()];
-            tags.extend(
-                service
-                    .get("build")
-                    .and_then(|b| b.get(&["tags"]))
-                    .and_then(Value::as_seq)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string),
-            );
-            for tag in tags {
-                let local = super::built_reference(&tag, &e.registry)?.local_name();
+            for local in built {
                 let manager = &e.client.manager;
                 e.client
                     .run_job_silent(|| manager.push_image(&local, Options::new()), a.quiet)
                     .await
-                    .with_context(|| format!("pushing {tag}"))?;
+                    .with_context(|| format!("pushing image {local}"))?;
             }
         }
     }

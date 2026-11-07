@@ -1,6 +1,7 @@
 //! build, with mkosi: an OCI layout built into a private directory, its blobs
 //! copied into the store, the image assembled and recorded, ready to push.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -11,7 +12,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, BufReader};
 use crate::api::{line, note, require_root, Context, Report};
 use crate::backend::{Backend, BackendChoice};
 use crate::hub::short_digest;
-use crate::install::{ensure_replaceable, install, remove_existing, Install};
+use crate::install::{build_destination, install, remove_existing, Install};
 use crate::layout::{sha256_digest, sha256_file, Layout};
 use crate::oci::Mode;
 use crate::reference::{validate_machine_name, ImageRef};
@@ -54,8 +55,9 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
     if image.digest.is_some() {
         bail!("a build tag cannot carry a digest");
     }
-    let name = request.name.clone().unwrap_or_else(|| image.local_name());
-    validate_machine_name(&name)?;
+    let own_name = request.name.clone().unwrap_or_else(|| image.local_name());
+    validate_machine_name(&own_name)?;
+    let reference = image.to_string();
     let directory = fs::canonicalize(&request.directory)
         .with_context(|| format!("build directory {}", request.directory.display()))?;
     if !directory.join("mkosi.conf").is_file() && !directory.join("mkosi.conf.d").is_dir() {
@@ -66,7 +68,19 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
     let sd = ctx.sd().await?;
     let store = &ctx.store;
     store.init()?;
-    ensure_replaceable(store, sd, &name, request.force).await?;
+    // What refuses the name refuses it before mkosi runs; where the image goes is decided
+    // once the store is locked, and said then.
+    build_destination(
+        store,
+        sd,
+        &own_name,
+        &reference,
+        request.force,
+        request.name.is_none(),
+        &BTreeSet::new(),
+        &|_| {},
+    )
+    .await?;
     let choice = if request.backend == BackendChoice::Auto {
         config.backend
     } else {
@@ -78,7 +92,7 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
     }
 
     let build_id = format!(
-        "mkosi-{name}-{}-{}",
+        "mkosi-{own_name}-{}-{}",
         now_unix(),
         crate::store::unique_suffix()
     );
@@ -127,9 +141,19 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
     }
     let _lock = store.lock().await.inspect_err(|_| drop_output())?;
     // The name may have been taken while mkosi ran.
-    ensure_replaceable(store, sd, &name, request.force)
-        .await
-        .inspect_err(|_| drop_output())?;
+    let name = build_destination(
+        store,
+        sd,
+        &own_name,
+        &reference,
+        request.force,
+        request.name.is_none(),
+        &BTreeSet::new(),
+        report,
+    )
+    .await
+    .inspect_err(|_| drop_output())?
+    .name;
     let outcome: Result<Mode> = async {
         let layout = Layout::find_below(&output_dir)?;
         let mut manifest = layout.manifest.clone();
@@ -180,7 +204,7 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
             backend,
             Install {
                 name: &name,
-                reference: &image.to_string(),
+                reference: &reference,
                 manifest_bytes: &manifest_bytes,
                 manifest: &manifest,
                 manifest_digest: &manifest_digest,
@@ -213,14 +237,11 @@ pub async fn build(ctx: &Context, request: &BuildRequest, report: Report<'_>) ->
         store,
         "build",
         &name,
-        &[
-            ("image", &image.to_string()),
-            ("reference", &image.to_string()),
-        ],
+        &[("image", &reference), ("reference", &reference)],
     );
     Ok(Built {
         name,
-        reference: image.to_string(),
+        reference,
         mode,
         output,
     })

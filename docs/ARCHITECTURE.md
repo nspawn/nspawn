@@ -23,7 +23,7 @@ hooks.
 | `verify.rs` | image signatures: the policy per registry, the Sigstore bundles among an image's referrers, checked with sigstore-verify |
 | `layout.rs`, `oci.rs` | OCI image layout reader, image config, boot or app detection |
 | `store.rs` | layers, blobs, records, manifests, gc, the store lock |
-| `install.rs`, `backend.rs` | turning blobs into a machine (overlay by default, flat without overlayfs, mstack only by name: experimental) |
+| `install.rs`, `backend.rs` | turning blobs into a machine (overlay by default, flat without overlayfs, mstack only by name: experimental); whether a name may be replaced, and where a build's image goes (`build_destination`, for both builders) |
 | `settings.rs` | the `.nspawn` settings file and the unit hook drop-in |
 | `attach.rs` | `attach-exec`, a machine's `ExecStart=`: the terminal, input or output an attached run hands over on its socket, or the stream into the journal namespace |
 | `policy.rs` | restart policies and resource limits (`--restart`, `-m`, `--cpus`, `--pids-limit`), written into the hook drop-in |

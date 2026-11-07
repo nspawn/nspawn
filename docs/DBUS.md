@@ -247,8 +247,8 @@ The job's result `name` is the machine's name.
 | `PullImage(s reference, a{sv} options) -> o` | `pull` | options name, backend (auto, overlay, flat, mstack), mode (auto, boot, app), force, image_only (b: with force, the record of the name is replaced only while it never ran, `Exists` once it did), verify (b, default true: the signature check the registry's policy asks for; `--no-verify` sends false), registry, ca_cert; a job |
 | `CreateMachine(s source, s name, a{sv} options) -> o` | `create` | the machine options (see Machine options); a job |
 | `PushImage(s image, a{sv} options) -> o` | `push` | options to, registry, ca_cert; a job |
-| `BuildImage(s directory, s tag, a{sv} options) -> o` | mkosi `build` | options name, distribution, release, profile, backend, mode, force, keep_output, mkosi_args, registry, ca_cert; a job whose output includes mkosi's |
-| `BuildDockerfile(h context, a{sv} options) -> o` | Dockerfile `build`, `compose build` | `context` a tar stream of the build context; options dockerfile (ay, required), tags (as), build_args (as, KEY=VALUE), target (s), no_cache (b), no_cache_filter (as, stages), pull (b), labels (as, KEY=VALUE), network (s: default, none or host), add_hosts (as, HOST:IP or HOST=IP), allow (as: network.host), secrets (a{say}, by id), shm_size (t, bytes), ulimits (as, NAME=SOFT[:HARD]), verify (b, default true), backend, mode, force, registry, ca_cert; a job whose output is the steps' progress; the build stops when its caller leaves the bus |
+| `BuildImage(s directory, s tag, a{sv} options) -> o` | mkosi `build` | options name, distribution, release, profile, backend, mode, force, keep_output, mkosi_args, registry, ca_cert; the image goes where a tag of `BuildDockerfile` goes, but a `name` given that a machine or an image of another reference has is `Exists` without force; a job whose output includes mkosi's |
+| `BuildDockerfile(h context, a{sv} options) -> o` | Dockerfile `build`, `compose build` | `context` a tar stream of the build context; options dockerfile (ay, required), tags (as), build_args (as, KEY=VALUE), target (s), no_cache (b), no_cache_filter (as, stages), pull (b), labels (as, KEY=VALUE), network (s: default, none or host), add_hosts (as, HOST:IP or HOST=IP), allow (as: network.host), secrets (a{say}, by id), shm_size (t, bytes), ulimits (as, NAME=SOFT[:HARD]), verify (b, default true), backend, mode, force, registry, ca_cert; a job whose output is the steps' progress; the build stops when its caller leaves the bus. Each tag's image replaces what has the tag's local name while that is an image of the tag's reference that never ran (pulled or built); a machine there (one that ran, starts, runs or shuts down, one an update cut short keeps, or an image machined lists without a record), or an image of another reference, keeps the name, and the image goes beside it with the same reference, into the last image of the reference a build put beside it before (built, never run, named `NAME-N`) or else a free name (`NAME-2`), a note in the output saying so. With force, whatever has the name is replaced, a running machine refused |
 | `PruneBuildCache(a{sv} options) -> o` | `builder prune` | options all (b: what images take too), until (t: entries last used before), keep_storage (t, bytes: the least recently used go until what the cache holds of its own fits); a job |
 | `BuildCacheUsage() -> aa{sv}` | `builder du` | what the build cache holds, most recently used first: id, kind (layer, base or mount), description, size (t), used (t), shared (b, an image takes it too) |
 | `PruneImages(a{sv} options) -> o` | `images prune` | option all (b): every image (a record pulled or built and never started) no machine was made from; without it nothing qualifies; labels (as, KEY or KEY=VALUE), until (t: made before) and names (as: these records only) narrow it; a job |
@@ -411,7 +411,7 @@ prints.
 | `NoSuchNetwork` | a network named that does not exist |
 | `NoSuchVolume` | `RemoveVolumes` and `GetVolume` of a volume that does not exist |
 | `NoSuchPath` | a path inside a machine that is not there: `StatPath`, `CopyFrom` (its job), `CopyTo` with extract |
-| `Exists` | a name taken: `CreateMachine` and `PullImage` without force, or with image_only over a record that ran, an API name in use, `CreateNetwork` (an own or API name another network has), `CreateSecret`, a second `ConnectNetwork`, `CreateVolume` of a name whose path is not a directory |
+| `Exists` | a name taken: `CreateMachine` and `PullImage` without force, or with image_only over a record that ran, `BuildImage` without force of a `name` a machine or an image of another reference has, an API name in use, `CreateNetwork` (an own or API name another network has), `CreateSecret`, a second `ConnectNetwork`, `CreateVolume` of a name whose path is not a directory |
 | `InUse` | a removal refused because something uses what it names: a machine that runs (without force) or that another one needs, a volume, a network or a secret a machine names |
 | `NotRunning` | what needs a running machine, of one that does not run (`KillMachine`, `PauseMachine`, `UnpauseMachine`, `MachineProcesses`, `Exec`, `Shell`) |
 | `AlreadyRunning` | `StartMachine` and `RunMachine` of a machine that runs, or is starting |
@@ -472,8 +472,8 @@ A job is returned by the long operations and keeps what happened. Properties:
 | Kind | Result |
 |---|---|
 | pull | name, reference, mode, signed_by |
-| build (mkosi) | name, reference, mode, output |
-| build (Dockerfile) | id (the config digest), manifest_digest, names (as, an image per tag) |
+| build (mkosi) | name (where the image went), reference, mode, output |
+| build (Dockerfile) | id (the config digest), manifest_digest, names (as, an image per tag, where each went) |
 | push | name, destination, url |
 | create | name, mode |
 | rm, volume-rm, volume-prune, secret-rm, network-rm, network-prune | removed (as) |
