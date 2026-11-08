@@ -3,7 +3,7 @@
 A release is a tag. The `packages` workflow builds the RPM, the deb and the
 Arch package from it, and the RPM and the deb for aarch64 as well, attaches them
 to the GitHub release together with the plain binary of each architecture and a
-`SHA256SUMS`, and has apt.nspawn.org and rpm.nspawn.org import the deb and the
+`SHA256SUMS`, and has apt.nspawn.org and rpm.nspawn.org import the debs and the
 RPMs, so the only things done by hand are the version and the documentation; the
 AUR packages are the maintainer's.
 

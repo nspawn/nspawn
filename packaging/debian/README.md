@@ -26,11 +26,11 @@ binaries at the machine's next start.
 ## The APT repository
 
 Every stable release is published at <https://apt.nspawn.org>. Once the
-`release` job has attached the deb, the `packages` job tells the server to look:
-the server takes the deb and `SHA256SUMS` from the GitHub release, checks the
-one against the other and the package's name, version and architecture
-against its file name, and keeps the last five releases in the suite `stable`,
-component `main`, for amd64. Pre-releases are left out. The indexes are signed
+`release` job has attached the debs, the `packages` job tells the server to look:
+the server takes the debs and `SHA256SUMS` from the GitHub release, checks each
+deb against its checksum and its name, version and architecture against its
+file name, and keeps the last five releases in the suite `stable`, component
+`main`, for amd64 and arm64 (experimental). Pre-releases are left out. The indexes are signed
 with the Ed25519 key `1294612AB2DC4AE2F6118240FC5E133778B4B3B3`.
 
 A host adds it with one file, which carries the key itself:

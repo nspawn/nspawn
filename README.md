@@ -40,7 +40,7 @@ and volumes too; `man nspawn` is the same reference the packages install.
 
 ## Installation
 
-Debian 13 or later and Ubuntu 24.04 or later (amd64):
+Debian 13 or later and Ubuntu 24.04 or later (amd64 and arm64):
 
 ```
 sudo curl -fsSLo /etc/apt/sources.list.d/nspawn.sources https://apt.nspawn.org/nspawn.sources
@@ -48,7 +48,7 @@ sudo apt update
 sudo apt install nspawn
 ```
 
-Fedora 44 or later (x86_64):
+Fedora 44 or later (x86_64 and aarch64):
 
 ```
 sudo curl -fsSLo /etc/yum.repos.d/nspawn.repo https://rpm.nspawn.org/nspawn.repo
@@ -59,9 +59,9 @@ Arch Linux: [nspawn](https://aur.archlinux.org/packages/nspawn) or
 [nspawn-git](https://aur.archlinux.org/packages/nspawn-git) from the AUR.
 
 Both repositories keep the last five releases and are signed with the key
-`1294612AB2DC4AE2F6118240FC5E133778B4B3B3`. Every
-[release](https://github.com/nspawn/nspawn/releases) also has the plain binary, and the
-deb, the RPM and the binary for aarch64, which are experimental;
+`1294612AB2DC4AE2F6118240FC5E133778B4B3B3`; the arm64 and aarch64 packages are
+experimental. Every [release](https://github.com/nspawn/nspawn/releases) also has the
+plain binary of each architecture;
 [Getting started](https://nspawn.org/docs/getting-started/) covers it, the requirements
 and usage examples.
 

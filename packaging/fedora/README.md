@@ -27,10 +27,10 @@ package built on Fedora 44 runs on later releases and not the other way round.
 
 Every stable release is published at <https://rpm.nspawn.org>. Once the
 `release` job has attached the RPMs, the `packages` job tells the server to
-look: the server takes `nspawn`, `nspawn-selinux` and `SHA256SUMS` from the
-GitHub release, checks each RPM against its checksum and its name, version,
-release and architecture against its file name, signs it, and keeps the last
-five releases. Pre-releases are left out. The RPMs and the repository metadata
+look: the server takes `nspawn` (x86_64, and aarch64, experimental),
+`nspawn-selinux` and `SHA256SUMS` from the GitHub release, checks each RPM
+against its checksum and its name, version, release and architecture against
+its file name, signs it, and keeps the last five releases. Pre-releases are left out. The RPMs and the repository metadata
 are signed with the Ed25519 key `1294612AB2DC4AE2F6118240FC5E133778B4B3B3`,
 the key of apt.nspawn.org; an RPM of the repository therefore differs from the
 one attached to the release by its signature.
