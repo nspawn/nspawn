@@ -9,8 +9,17 @@ on:
 
 jobs:
   checks:
-    name: fmt, clippy, tests
-    runs-on: ubuntu-latest
+    name: fmt, clippy, tests (${{ matrix.arch }})
+    strategy:
+      # The aarch64 build is experimental: its result never stops the x86_64 one.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-26.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

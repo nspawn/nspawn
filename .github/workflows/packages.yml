@@ -7,8 +7,18 @@ on:
 
 jobs:
   rpm:
-    name: Fedora RPM
-    runs-on: ubuntu-latest
+    name: Fedora RPM (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-26.04-arm
+    # The aarch64 packages are experimental: their failure does not fail the run.
+    continue-on-error: ${{ matrix.arch == 'aarch64' }}
+    runs-on: ${{ matrix.runner }}
     container:
       image: registry.fedoraproject.org/fedora:44
       options: --privileged
@@ -33,16 +43,31 @@ jobs:
       - name: Collect
         run: |
           mkdir -p dist
-          cp ~/rpmbuild/RPMS/*/*.rpm dist/
+          cp ~/rpmbuild/RPMS/${{ matrix.arch }}/*.rpm dist/
+          # nspawn-selinux is noarch and the same from either build: the x86_64 one
+          # attaches it.
+          if [ "${{ matrix.arch }}" = x86_64 ]; then
+              cp ~/rpmbuild/RPMS/noarch/*.rpm dist/
+          fi
           ls -l dist
       - uses: actions/upload-artifact@v7
         with:
-          name: fedora-rpms
+          name: fedora-rpms-${{ matrix.arch }}
           path: dist/*.rpm
 
   deb:
-    name: Ubuntu 24.04 deb
-    runs-on: ubuntu-latest
+    name: Ubuntu 24.04 deb (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-26.04-arm
+    # The aarch64 packages are experimental: their failure does not fail the run.
+    continue-on-error: ${{ matrix.arch == 'aarch64' }}
+    runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:24.04
     steps:
@@ -76,17 +101,18 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           mkdir -p dist/nspawn-${version}
           cp target/release/nspawn README.md LICENSE LICENSE-MIT LICENSE-APACHE dist/nspawn-${version}/
-          tar -czf dist/nspawn-${version}-x86_64-linux.tar.gz -C dist nspawn-${version}
+          tar -czf dist/nspawn-${version}-${{ matrix.arch }}-linux.tar.gz -C dist nspawn-${version}
           rm -rf dist/nspawn-${version}
           cp ../*.deb dist/
           ls -l dist
       - uses: actions/upload-artifact@v7
         with:
-          name: ubuntu-debs
+          name: ubuntu-debs-${{ matrix.arch }}
           path: dist/*
 
   arch:
     name: Arch package
+    # Arch Linux is x86_64 only; on Arch Linux ARM the AUR recipe builds for aarch64.
     runs-on: ubuntu-latest
     container:
       image: archlinux:latest

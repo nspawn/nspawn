@@ -1,10 +1,11 @@
 # Releasing
 
 A release is a tag. The `packages` workflow builds the RPM, the deb and the
-Arch package from it, attaches them to the GitHub release together with the
-plain binary and a `SHA256SUMS`, and has apt.nspawn.org and rpm.nspawn.org
-import the deb and the RPMs, so the only things done by hand are the version
-and the documentation; the AUR packages are the maintainer's.
+Arch package from it, and the RPM and the deb for aarch64 as well, attaches them
+to the GitHub release together with the plain binary of each architecture and a
+`SHA256SUMS`, and has apt.nspawn.org and rpm.nspawn.org import the deb and the
+RPMs, so the only things done by hand are the version and the documentation; the
+AUR packages are the maintainer's.
 
 ## Before the tag
 
@@ -12,7 +13,9 @@ and the documentation; the AUR packages are the maintainer's.
    pass on every commit, and `tests/e2e.sh` passes on every host of the matrix:
    Ubuntu 24.04 (systemd 255, the oldest supported), Fedora 44 (SELinux
    enforcing) and Arch Linux (systemd 262). The mstack pass needs systemd 261 or a
-   release after 262, which no host of the matrix has.
+   release after 262, which no host of the matrix has. The matrix is x86_64: the
+   aarch64 builds are experimental, tested by the unit tests alone, which the `ci`
+   workflow, the RPM's `%check` and the deb's build run on an aarch64 runner.
 
    The suite runs against the packages of the last commit that changed what the
    binary or the packages do (the code, the tests, the unit, bus, polkit and

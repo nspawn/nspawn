@@ -22,6 +22,8 @@ Unit tests need no root and touch nothing outside temporary directories. The
 `[lints.clippy]` table of Cargo.toml turns on a few lints about clones and
 allocations beyond clippy's default set; they are part of the same check.
 
+The `ci` workflow runs them on x86_64 and on aarch64; aarch64 is tested there alone.
+
 ### The getent program
 
 `src/getent.rs` carries the getent nspawn hands an image without a shell as
@@ -235,9 +237,12 @@ on Arch (pacman does not take files it does not own) and silently overwrites the
 elsewhere, so remove what `--install` listed before going from a build to a package.
 
 The `packages` workflow builds all three in their own containers on every tag and on
-demand, keeps them as artifacts, and on a tag attaches them to the GitHub release
-together with the plain binary tarball (built on the oldest supported distribution,
-so that it runs on the later ones) and a `SHA256SUMS` over the lot; the deb and the
-RPMs of a stable release then go to apt.nspawn.org and rpm.nspawn.org. The suite on the
-VMs of the matrix is where the packages get tested, each on its own distribution,
-since a container has neither SELinux enforcing nor machined.
+demand, the RPM and the deb on x86_64 and on aarch64 (experimental: a failed aarch64
+build does not fail the run) and the Arch package on x86_64, the only architecture of
+Arch Linux. It keeps them as
+artifacts, and on a tag attaches them to the GitHub release together with the plain
+binary tarball of each architecture (built on the oldest supported distribution, so
+that it runs on the later ones) and a `SHA256SUMS` over the lot; the deb and the RPMs
+of a stable release then go to apt.nspawn.org and rpm.nspawn.org. The suite on the VMs
+of the matrix is where the packages get tested, each on its own distribution, since a
+container has neither SELinux enforcing nor machined; the matrix is x86_64.

@@ -60,7 +60,8 @@ Arch Linux: [nspawn](https://aur.archlinux.org/packages/nspawn) or
 
 Both repositories keep the last five releases and are signed with the key
 `1294612AB2DC4AE2F6118240FC5E133778B4B3B3`. Every
-[release](https://github.com/nspawn/nspawn/releases) also has the plain binary;
+[release](https://github.com/nspawn/nspawn/releases) also has the plain binary, and the
+deb, the RPM and the binary for aarch64, which are experimental;
 [Getting started](https://nspawn.org/docs/getting-started/) covers it, the requirements
 and usage examples.
 
