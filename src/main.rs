@@ -42,6 +42,7 @@ mod settings;
 mod store;
 mod systemd;
 mod tuning;
+mod uidshift;
 mod unitname;
 mod verify;
 mod volmount;

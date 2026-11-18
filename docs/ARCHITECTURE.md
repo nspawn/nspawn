@@ -46,6 +46,7 @@ hooks.
 | `api/dependencies.rs` | `--depends-on`: the checks (machines of nspawn's, no cycle), the hook that waits for each condition (`await-dependencies`), the verdict on a dependency as its unit and healthcheck show it |
 | `api/copy.rs` | cp, and the Docker API's archive (`StatPath`, CopyTo's extract): tar streams packed and unpacked relative to directory descriptors, paths resolved with openat2 inside the machine's root, tried again when a `..` crossed a rename or mount on the host (EAGAIN) |
 | `api/disk.rs`, `commands/system.rs` | what is an image and what a machine (a record pulled or built and never started is an image only), sizes by kind for `system df`, the prunes of images and of stopped machines, and `system prune` on top of the prunes of the service |
+| `uidshift.rs` | an overlay machine's tree shifted into its user namespace by nspawn before its first start, in the hook before systemd-nspawn: owners as systemd-nspawn's chown sets them, ACL entries too, modes and file capabilities kept; the range picked free of the ones running systemd-nspawn instances hold and of other machines' trees |
 | `api/failure.rs` | the kinds of failure an error carries in its chain (no such machine, in use, not running, a bad argument and the others), which the service answers with as error names (`org.nspawn.Error.*`) and a job keeps as its `ErrorName` |
 | `api/wait.rs` | `WaitMachine`: the end of a machine's run from systemd's changes of its unit, the removal of its record from an inotify watch of the records' directory |
 | `api/resolve.rs` | `ResolveImage`: the local record the name of a machine or an image means. `find` reads a record's name, else a reference under the configured registry first, then as Docker Hub's, which never names a machine made from the image but where the image is only read: ResolveImage with names, the image of `run`, `create` and `push`; `name_of` and `machine_of` are how every method of the bus reads one (a name that can be a machine's as it is, any other text by `find`; `machine_of` refuses a reference of no image here as no machine); `resolve` reads a reference as clients of the Docker API do too (Docker Hub's first, then an image built here) |
@@ -208,7 +209,9 @@ collection refuses to run when a record cannot be read.
 `start` takes the store lock, applies the flags to the record, runs `prepare`
 (checks, bridge, address, generated files, settings, hooks), releases the
 lock, starts `systemd-nspawn@NAME.service` and waits for machined to register
-the machine. The unit's hooks repeat the preparation (`network prepare`),
+the machine. The unit's hooks repeat the preparation (`network prepare`, which
+after the lock also shifts the tree of an overlay machine starting for the first time
+in a user namespace, see [Ownership](#ownership)),
 publish ports and attach mstack volumes once it runs (`network publish`) and
 release everything however it ends (`network release`), so `machinectl start`,
 enabled units and programs that exit on their own behave the same.
@@ -424,11 +427,26 @@ systemd-nspawn's; and since `nspawn_t` executes `bin_t` programs as
 
 ### Ownership
 
-A booted overlay machine, and an app off the bridge without devices, runs in the
-user namespace the template's `-U` picks. No released kernel lets an overlayfs mount be
-idmapped, so systemd-nspawn shifts the tree with a recursive chown at the first
-start. The mount carries `metacopy=on` so that this chown copies inodes rather
-than file contents into the upper directory and the layers stay shared.
+A booted overlay machine, and an app off the bridge without devices, runs in the user
+namespace the template's `-U` picks. No released kernel lets an overlayfs mount be
+idmapped, so the tree is shifted into the namespace's range at the first start, a
+change of every owner. systemd-nspawn would do it with a recursive chown, after which
+the kernel clears every file capability, so the `network prepare` hook does it first
+(`uidshift.rs`), outside the store lock, when the unit's command line picks the range
+(`-U`, `--private-users=pick`) and the tree's root is still owned by 0. It picks a
+base in systemd-nspawn's span (0x80000 to 0x6fff0000) from a hash of the machine's
+name, skipping one whose lock under `/run/systemd/nspawn-uid` a running systemd-nspawn
+holds and one another machine's upper directory is owned by. The user database, which
+systemd-nspawn asks about both ends of the range, is not asked (`nspawn_t` reads
+neither `/etc/passwd` nor userdb). Every entry gets the base plus the low 16 bits of
+its IDs, ACL entries included; the setuid and setgid bits the chown clears and the
+file capability are put back. A stop of the start ends the shift between two entries,
+and the root goes last, so that a shift cut short is done again. systemd-nspawn reads
+the base off the root's owner, takes that range, and
+finds nothing to change. Should the base be taken by the time it starts or known to
+the user database, or the shift fail (a warning in the unit's journal), it picks
+another and does its own chown. The mount carries `metacopy=on` so that a chown copies
+inodes rather than file contents into the upper directory and the layers stay shared.
 Attributes in overlayfs's own namespace (`trusted.overlay.*`, `user.overlay.*`)
 are dropped from every layer on extraction, and so is every other `trusted.*`
 attribute, so an image cannot redirect a file or its data.

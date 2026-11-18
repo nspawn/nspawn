@@ -523,6 +523,39 @@ for backend in overlay flat mstack; do
   $NSPAWN exec "$name" -- /usr/bin/cat /etc/os-release </dev/null | tr -d '\r' | grep_q PRETTY_NAME || fail "exec cat os-release"
   $NSPAWN exec "$name" -- /bin/sh -c 'exit 7' </dev/null; [ $? -eq 7 ] || fail "exec did not propagate the exit code of a booted machine"
   $NSPAWN exec "$name" -- /bin/sh -c 'echo $PATH' </dev/null | tr -d '\r' | grep_q "/usr/bin" || fail "exec has no PATH"
+  if [ "$backend" = overlay ]; then
+    step "a booted machine in a user namespace keeps its files' capabilities ($backend)"
+    # nspawn shifts the tree into the namespace before systemd-nspawn starts, whose chown
+    # would clear them: each file of the merged tree has the capability of the layer it
+    # comes from (arping, newuidmap).
+    systemctl show -P Options "$(systemd-escape -p --suffix=mount "/var/lib/machines/$name")" | python3 -c '
+import os, sys
+root = sys.argv[1]
+lowers = [o.split("=", 1)[1] for o in sys.stdin.read().strip().split(",") if o.startswith("lowerdir")]
+def cap(path):
+    try:
+        return os.getxattr(path, "security.capability", follow_symlinks=False)
+    except OSError:
+        return None
+checked, lost = 0, []
+for lower in lowers:
+    for top, dirs, files in os.walk(lower):
+        for f in files:
+            rel = os.path.relpath(os.path.join(top, f), lower)
+            want = cap(os.path.join(lower, rel))
+            # Only where this layer is the topmost with the file, and the machine has it.
+            if want is None or any(os.path.lexists(os.path.join(l, rel)) for l in lowers[:lowers.index(lower)]):
+                continue
+            if not os.path.lexists(os.path.join(root, rel)):
+                continue
+            checked += 1
+            if cap(os.path.join(root, rel)) != want:
+                lost.append(rel)
+print(f"files with a capability: {checked}, lost: {lost[:5]}")
+sys.exit(1 if lost else 0)
+' "/var/lib/machines/$name" || fail "$name lost file capabilities its image has"
+    [ "$(stat -c %u "/var/lib/machines/$name")" -ge 65536 ] || fail "the tree of $name is not shifted into a user namespace: root owned by $(stat -c %u "/var/lib/machines/$name")"
+  fi
   step "terminal: exec with a pty, shell through machined, the machine's own journal"
   out=$(python3 "$(dirname "$0")/terminal.py" $NSPAWN exec "$name" -- /bin/sh -c 'tty; echo term=$TERM; exit 3' </dev/null 2>&1 | tr -d '\r'); rc=${PIPESTATUS[0]}
   [ "$rc" = 3 ] || fail "exec on a pty did not propagate the exit code (got $rc)"

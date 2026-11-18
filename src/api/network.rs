@@ -874,7 +874,7 @@ pub async fn prepare(ctx: &Context, name: &str) -> Result<()> {
     crate::reference::validate_entry_name(name)?;
     let sd = ctx.sd().await?;
     let store = &ctx.store;
-    let _lock = store.lock_for(Duration::from_secs(60)).await?;
+    let lock = store.lock_for(Duration::from_secs(60)).await?;
     let record = store.load_image(name)?;
     let before = record.clone();
     let publishes = record
@@ -890,21 +890,30 @@ pub async fn prepare(ctx: &Context, name: &str) -> Result<()> {
         &to_journal,
     )
     .await;
-    if let Err(e) = prepared {
-        // As start: prepare writes the record before all of its checks, its first start
-        // among them, which the next start would then not take as one (a volume
-        // emptied after a seed that failed would not be filled again).
-        let made = store.load_image(name).ok().flatten();
-        let _ = machines::release_machine(name, made.as_ref().or(before.as_ref()));
-        if let Some(before) = &before {
-            let _ = store.record_image(before);
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            // As start: prepare writes the record before all of its checks, its first
+            // start among them, which the next start would then not take as one (a
+            // volume emptied after a seed that failed would not be filled again).
+            let made = store.load_image(name).ok().flatten();
+            let _ = machines::release_machine(name, made.as_ref().or(before.as_ref()));
+            if let Some(before) = &before {
+                let _ = store.record_image(before);
+            }
+            return Err(e);
         }
-        return Err(e);
-    }
+    };
     // Checked under the lock: the claim is what the next unit's check sees of these
     // ports until this machine registers.
     if publishes {
         store.claim_ports(name)?;
+    }
+    // A first start's shift reads every file of the machine: other starts need not wait
+    // for it.
+    drop(lock);
+    if prepared.shifted_root {
+        machines::shift_root(sd, store, name, &to_journal).await?;
     }
     Ok(())
 }

@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
@@ -691,6 +693,15 @@ fn mounts_volumes(state: &UnitState) -> bool {
     state.busy() && !matches!(state.sub.as_str(), "condition" | "start-pre")
 }
 
+/// What `prepare` found out for the start it prepared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Prepared {
+    pub network: Network,
+    /// An overlay root the template's user namespace runs on: its tree is shifted into
+    /// the range before systemd-nspawn starts (`shift_root`).
+    pub shifted_root: bool,
+}
+
 /// Everything a machine needs before its unit starts. Shared by `start` and the
 /// ExecStartPre hook, so idempotent; the caller holds the store lock.
 pub async fn prepare(
@@ -701,11 +712,14 @@ pub async fn prepare(
     record: Option<ImageRecord>,
     pass: Pass,
     report: Report<'_>,
-) -> Result<Network> {
+) -> Result<Prepared> {
     let Some(mut record) = record else {
         // Not ours: the stock template uses --network-veth.
         hostnet::ensure_networkd(sd, report).await?;
-        return Ok(Network::Veth);
+        return Ok(Prepared {
+            network: Network::Veth,
+            shifted_root: false,
+        });
     };
     // A start systemd makes (a dependent's Wants=, machinectl) while an update swaps the
     // machine's image would run it from a half-made record.
@@ -1212,7 +1226,83 @@ pub async fn prepare(
         // Last: nothing that could fail is left to leave an interface in the namespace.
         move_interfaces(name, hook_interfaces(&record))?;
     }
-    Ok(record.network)
+    Ok(Prepared {
+        network: record.network,
+        shifted_root: record.backend == BackendChoice::Overlay
+            && !settings::app_without_userns(
+                record.mode,
+                record.network,
+                files.is_some(),
+                host_devices,
+            ),
+    })
+}
+
+/// Shifts an overlay machine's tree into the range of its user namespace before its first
+/// start, file capabilities kept (src/uidshift.rs), when its unit runs systemd-nspawn
+/// with a range it picks. A tree shifted already is left as it is, and one that cannot be
+/// shifted to systemd-nspawn's chown, with a warning; a stop of the start ends the shift
+/// with an error.
+pub async fn shift_root(sd: &Systemd, store: &Store, name: &str, report: Report<'_>) -> Result<()> {
+    let root = store.machines_dir.join(name);
+    let unshifted = nix::sys::stat::lstat(&root).is_ok_and(|st| (st.st_uid, st.st_gid) == (0, 0));
+    if !unshifted || !crate::backend::is_mountpoint(&root).unwrap_or(false) {
+        return Ok(());
+    }
+    let unit = format!("systemd-nspawn@{name}.service");
+    match sd.exec_start(&unit).await {
+        Ok(argv) if crate::uidshift::picks_range(&argv) => {}
+        _ => return Ok(()),
+    }
+    let uppers: Vec<PathBuf> = store
+        .list_images()
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.name != name && r.backend == BackendChoice::Overlay)
+        .map(|r| store.machines_private_dir().join(&r.name).join("upper"))
+        .collect();
+    let taken = crate::uidshift::bases_of(&uppers);
+    let Some(base) = crate::uidshift::pick(name, &taken) else {
+        note(
+            report,
+            format!("warning: no free range of user IDs found for {name}: systemd-nspawn picks one and shifts its files, which drops their capabilities"),
+        );
+        return Ok(());
+    };
+    // A stop of the start (its SIGTERM, a timeout's) ends the shift between two entries:
+    // one cut in its chown would keep the owner it got and lose its capability.
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut terminate = signal(SignalKind::terminate()).context("taking SIGTERM")?;
+    let mut interrupt = signal(SignalKind::interrupt()).context("taking SIGINT")?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let walking = {
+        let stop = stop.clone();
+        tokio::task::spawn_blocking(move || crate::uidshift::shift_tree(&root, base, &stop))
+    };
+    tokio::pin!(walking);
+    let shifted = tokio::select! {
+        done = &mut walking => done,
+        _ = terminate.recv() => {
+            stop.store(true, Ordering::Relaxed);
+            let _ = walking.await;
+            bail!("stopped while shifting the files of {name}; its next start goes on with it");
+        }
+        _ = interrupt.recv() => {
+            stop.store(true, Ordering::Relaxed);
+            let _ = walking.await;
+            bail!("stopped while shifting the files of {name}; its next start goes on with it");
+        }
+    };
+    if let Err(e) = shifted
+        .map_err(anyhow::Error::from)
+        .and_then(|shifted| shifted)
+    {
+        note(
+            report,
+            format!("warning: shifting the files of {name} into its user namespace: {e:#}; systemd-nspawn shifts the rest, which drops their capabilities"),
+        );
+    }
+    Ok(())
 }
 
 /// Everything but the name is remembered.
@@ -1401,7 +1491,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
         .map(|r| r.tuning.depends_on.clone())
         .unwrap_or_default();
     let network = match prepare(sd, store, config, &args.name, record, Pass::Ahead, report).await {
-        Ok(network) => network,
+        Ok(prepared) => prepared.network,
         Err(e) => {
             // Nothing runs, under the lock and the start mark: what the pass made for a
             // run that never came goes (its namespace and veths, decrypted secrets), by

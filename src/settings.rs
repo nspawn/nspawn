@@ -596,7 +596,9 @@ pub fn exec_start_override(
     )
 }
 
-fn unwrapped(argv: &[String]) -> &[String] {
+/// systemd-nspawn's argv in a loaded ExecStart=: the one behind `nspawn attach-exec`, or
+/// the whole of it where nothing wraps it.
+pub fn unwrapped(argv: &[String]) -> &[String] {
     match argv.iter().position(|a| a == "--") {
         Some(end) if argv[..end].iter().any(|a| a == "attach-exec") => &argv[end + 1..],
         _ => argv,
