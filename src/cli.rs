@@ -50,6 +50,19 @@ pub enum Command {
     Create(CreateArgs),
     /// Upload a local image to the hub.
     Push(PushArgs),
+    /// Write images to a tar archive (an OCI image layout, which load and docker load
+    /// read), on standard output or into a file.
+    Save(SaveArgs),
+    /// Add the images of an archive save or docker save wrote, read from standard input
+    /// or a file.
+    Load(LoadArgs),
+    /// Make an image of what a machine changed over its image, with the machine's
+    /// settings.
+    Commit(CommitArgs),
+    /// Write a machine's files to a tar archive, on standard output or into a file.
+    Export(ExportArgs),
+    /// Make an image of one layer from the tar archive of a root filesystem.
+    Import(ImportArgs),
     /// Manage local images; without a subcommand, list them.
     #[command(alias = "image")]
     Images(ImagesArgs),
@@ -994,6 +1007,89 @@ pub struct PushArgs {
     /// Push under a different reference than the one recorded for the image.
     #[arg(long, value_name = "REFERENCE")]
     pub to: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct SaveArgs {
+    /// Local image names, or the references they were pulled from or built as.
+    #[arg(required = true, add = candidates(Kind::Image))]
+    pub images: Vec<String>,
+    /// Write the archive into this file rather than on standard output.
+    #[arg(long, short = 'o', value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct LoadArgs {
+    /// Read the archive from this file rather than from standard input; gzip, zstd and
+    /// bzip2 are read as they are.
+    #[arg(long, short = 'i', value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+    pub input: Option<PathBuf>,
+    /// Print only the images loaded.
+    #[arg(long, short = 'q')]
+    pub quiet: bool,
+}
+
+/// What --change takes, for its help.
+const CHANGE_HELP: &str = "A Dockerfile instruction that sets the image's settings: CMD, ENTRYPOINT, ENV, EXPOSE, HEALTHCHECK, LABEL, ONBUILD, STOPSIGNAL, USER, VOLUME or WORKDIR (repeatable)";
+
+#[derive(Args, Debug)]
+pub struct CommitArgs {
+    /// The machine.
+    #[arg(add = candidates(Kind::Any))]
+    pub machine: String,
+    /// The image to make, REPOSITORY[:TAG]: a local image of that name that never ran
+    /// gives way to it; a machine, or an image of another reference, keeps the name and
+    /// the image goes beside it.
+    #[arg(value_name = "REPOSITORY[:TAG]")]
+    pub reference: String,
+    /// The image's author.
+    #[arg(long, short = 'a')]
+    pub author: Option<String>,
+    /// The comment of the image's history entry.
+    #[arg(long, short = 'm')]
+    pub message: Option<String>,
+    #[arg(long, short = 'c', value_name = "INSTRUCTION", help = CHANGE_HELP)]
+    pub change: Vec<String>,
+    /// Freeze a running machine while its files are read; with --pause=false what it
+    /// removes meanwhile is left out, and a file whose size changes goes in at the size
+    /// it had, cut or filled with zeros.
+    #[arg(
+        long,
+        short = 'p',
+        num_args = 0..=1,
+        require_equals = true,
+        default_value = "true",
+        default_missing_value = "true",
+        value_name = "BOOL"
+    )]
+    pub pause: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ExportArgs {
+    /// The machine.
+    #[arg(add = candidates(Kind::Any))]
+    pub machine: String,
+    /// Write the archive into this file rather than on standard output.
+    #[arg(long, short = 'o', value_name = "FILE", value_hint = clap::ValueHint::FilePath)]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ImportArgs {
+    /// The tar archive of the root filesystem, - for standard input; gzip, zstd and
+    /// bzip2 are read as they are.
+    #[arg(value_name = "FILE|-", value_hint = clap::ValueHint::FilePath)]
+    pub source: String,
+    /// The image to make, REPOSITORY[:TAG], placed as commit places it.
+    #[arg(value_name = "REPOSITORY[:TAG]")]
+    pub reference: String,
+    /// The comment of the image's history entry.
+    #[arg(long, short = 'm')]
+    pub message: Option<String>,
+    #[arg(long, short = 'c', value_name = "INSTRUCTION", help = CHANGE_HELP)]
+    pub change: Vec<String>,
 }
 
 #[derive(Args, Debug)]

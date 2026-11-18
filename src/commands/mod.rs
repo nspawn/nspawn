@@ -2,6 +2,7 @@
 //! org.nspawn service on the system bus; only the service itself, its installation and
 //! the hooks the machine units call run the library in this process.
 
+mod archive;
 pub(crate) mod build;
 pub(crate) mod copy;
 mod login;
@@ -896,6 +897,11 @@ async fn through_the_service(mut command: Command, client: &Client, config: &Con
         Command::Shell(args) => machines::shell(args, client).await,
         Command::Logs(args) => machines::logs(args, client).await,
         Command::Cp(args) => copy::cp(args, client).await,
+        Command::Save(args) => archive::save(args, client, config).await,
+        Command::Load(args) => archive::load(args, client, config).await,
+        Command::Commit(args) => archive::commit(args, client, config).await,
+        Command::Export(args) => archive::export(args, client).await,
+        Command::Import(args) => archive::import(args, client, config).await,
         Command::Daemon(_)
         | Command::Compose(_)
         | Command::Network(_)
@@ -1006,6 +1012,9 @@ fn names_in(command: &mut Command) -> (Vec<&mut String>, Reads) {
         Command::Exec(a) => (vec![&mut a.machine], MACHINES),
         Command::Shell(a) => (vec![&mut a.machine], MACHINES),
         Command::Logs(a) => (a.machines.iter_mut().collect(), MACHINES),
+        Command::Save(a) => (a.images.iter_mut().collect(), of_images(false)),
+        Command::Commit(a) => (vec![&mut a.machine], MACHINES),
+        Command::Export(a) => (vec![&mut a.machine], MACHINES),
         _ => (Vec::new(), MACHINES),
     }
 }
@@ -1364,6 +1373,7 @@ mod tests {
             read(&["images", "rm", "a", "b"]),
             (two(), reads(true, true))
         );
+        assert_eq!(read(&["save", "a", "b"]), (two(), reads(false, true)));
         for args in [
             &["rm", "a", "b"][..],
             &["generate", "a", "b"],
@@ -1386,6 +1396,8 @@ mod tests {
             &["port", "a"],
             &["exec", "a", "true"],
             &["shell", "a"],
+            &["commit", "a", "img:1"],
+            &["export", "a"],
         ] {
             assert_eq!(read(args), (vec!["a".into()], MACHINES), "{args:?}");
         }

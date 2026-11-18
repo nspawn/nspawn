@@ -340,7 +340,7 @@ pub async fn create(ctx: &Context, request: &CreateRequest, report: Report<'_>) 
         address: None,
         fixed_addresses: Default::default(),
         // A machine of a built image keeps saying so once the build's record is gone.
-        built: source.built || source.origin == "build",
+        built: source.built || source.made_here(),
         extra_networks: Vec::new(),
         aliases: BTreeMap::new(),
         network_container: None,

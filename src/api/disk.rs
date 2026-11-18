@@ -1,6 +1,6 @@
 //! What the store holds by kind, as system df counts it, and the image prune:
-//! records are both images and machines, so an image here is a record pulled or built
-//! and never started, and a machine is anything else.
+//! records are both images and machines, so an image here is a record pulled, built,
+//! committed, loaded or imported and never started, and a machine is anything else.
 
 use std::collections::{BTreeMap, HashSet};
 use std::os::unix::fs::MetadataExt;
@@ -12,12 +12,12 @@ use crate::api::{line, note, Context, Report};
 use crate::backend::BackendChoice;
 use crate::store::{ImageRecord, Ownership, Store};
 
-/// A record pulled or built and never run as a machine. Records of releases that did not
-/// keep the first start (written again by one after a downgrade too) say nothing of it:
-/// an address, options only start gives (a network among them), or a writable layer with
-/// something in it say it ran, whatever else does. A flat one writes into the image's own
-/// tree: made since the first starts are kept, its record says; before, it is taken for a
-/// machine.
+/// A record of an image (no create made it) never run as a machine. Records of releases
+/// that did not keep the first start (written again by one after a downgrade too) say
+/// nothing of it: an address, options only start gives (a network among them), or a
+/// writable layer with something in it say it ran, whatever else does. A flat one writes
+/// into the image's own tree: made since the first starts are kept, its record says;
+/// before, it is taken for a machine.
 pub fn image_only(store: &Store, record: &ImageRecord) -> bool {
     if record.origin == "create" || record.started.is_some() || record.address.is_some() {
         return false;

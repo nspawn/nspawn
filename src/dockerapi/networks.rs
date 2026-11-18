@@ -1137,10 +1137,8 @@ mod routes {
             assert_eq!(route.need(), Need::Manage, "{method} {path}");
         }
         for (method, path) in [
-            (Method::POST, "/images/load"),
             (Method::POST, "/images/nginx/tag"),
             (Method::POST, "/images/nginx/push"),
-            (Method::POST, "/commit"),
             (Method::POST, "/build"),
             (Method::PUT, "/volumes/data"),
         ] {

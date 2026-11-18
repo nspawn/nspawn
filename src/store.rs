@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -36,7 +36,8 @@ pub struct ImageRecord {
     pub layers: Vec<String>,
     pub backend: BackendChoice,
     pub created: u64,
-    /// "pull" or "build".
+    /// How the image came: "pull", "build", "commit", "load" or "import", or "create"
+    /// for a machine made from another record's image.
     #[serde(default = "default_origin")]
     pub origin: String,
     /// Booted with an init system, or a single program.
@@ -45,7 +46,7 @@ pub struct ImageRecord {
     /// An app whose image wants its program to be PID 1 (s6-overlay), found at install.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pid1: bool,
-    /// Made from an image built on this host, which no registry has a newer one of.
+    /// Made from an image made on this host, which no registry has a newer one of.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub built: bool,
     /// When it first started, in unix seconds: a record that never did is an image only.
@@ -140,7 +141,16 @@ pub struct ImageRecord {
     pub signed_at: Option<u64>,
 }
 
+/// The origins of images made on this host, which no registry has.
+pub const MADE_HERE: [&str; 4] = ["build", "commit", "load", "import"];
+
 impl ImageRecord {
+    /// Whether the image was made on this host (built, committed, loaded or imported)
+    /// rather than pulled: no registry has a newer one of it, or this one.
+    pub fn made_here(&self) -> bool {
+        MADE_HERE.contains(&self.origin.as_str())
+    }
+
     /// The machine's healthcheck, or the image's.
     pub fn effective_healthcheck(&self) -> Option<&Healthcheck> {
         self.healthcheck.as_ref().or(self.run.healthcheck.as_ref())
@@ -369,6 +379,16 @@ impl Drop for Starting {
     }
 }
 
+/// A machine a commit froze, from its freeze until its thaw: a service that ends in
+/// between leaves the marker, and the next one thaws the machine.
+pub struct Pausing(PathBuf);
+
+impl Drop for Pausing {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// A restart's marker, taken away with its machine's directory of markers once that is
 /// empty.
 pub struct Restarting(PathBuf);
@@ -454,7 +474,7 @@ impl Store {
     /// Root's alone: layers hold setuid programs and device nodes that would work for any
     /// local user reaching them, records hold the machines' environment, volumes and
     /// builds their data.
-    fn private_dirs(&self) -> [PathBuf; 14] {
+    fn private_dirs(&self) -> [PathBuf; 15] {
         [
             self.layers_dir(Ownership::Root),
             self.layers_dir(Ownership::Foreign),
@@ -466,6 +486,7 @@ impl Store {
             self.root.join("builds"),
             self.root.join("cache"),
             self.root.join("starting"),
+            self.root.join("pausing"),
             self.root.join("claims"),
             self.networks_dir(),
             self.secrets_dir(),
@@ -847,11 +868,26 @@ impl Store {
     pub fn forget_holds(&self) {
         if let Ok(entries) = fs::read_dir(self.blobs_dir()) {
             for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with(".hold-") {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(".hold-") {
                     let _ = fs::remove_file(entry.path());
+                } else if name.starts_with(LOAD_PREFIX) {
+                    // What a load of a service that was killed received.
+                    let _ = remove_tree(entry.path());
                 }
             }
         }
+    }
+
+    /// A directory of its own under the blobs for what a load receives: the collector
+    /// leaves it alone however long the load takes, and the service's start removes one
+    /// a killed service left.
+    pub fn load_dir(&self) -> Result<PathBuf> {
+        let dir = self
+            .blobs_dir()
+            .join(format!("{LOAD_PREFIX}{}", unique_suffix()));
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        Ok(dir)
     }
 
     /// The blob file names held by pulls in flight; stale holds are removed on the way.
@@ -880,6 +916,10 @@ impl Store {
 
     fn starting_path(&self, name: &str) -> PathBuf {
         self.root.join("starting").join(name)
+    }
+
+    fn pausing_path(&self, name: &str) -> PathBuf {
+        self.root.join("pausing").join(name)
     }
 
     /// The directory of a machine's restart markers, one per restart under way.
@@ -938,6 +978,55 @@ impl Store {
         }
         fs::write(&path, boot_id()).with_context(|| format!("writing {}", path.display()))?;
         Ok(Starting(path))
+    }
+
+    /// Marks `name` as frozen by a commit until the guard is dropped; None while another
+    /// commit has it frozen.
+    pub fn mark_pausing(&self, name: &str) -> Result<Option<Pausing>> {
+        crate::reference::validate_entry_name(name)?;
+        let path = self.pausing_path(name);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("writing {}", path.display())),
+        };
+        let mark = Pausing(path);
+        file.write_all(boot_id().as_bytes())
+            .with_context(|| format!("writing {}", mark.0.display()))?;
+        Ok(Some(mark))
+    }
+
+    /// The machines commits froze this boot and left frozen, as an end of their service
+    /// cut them short; the markers of another boot, whose freeze went with it, go.
+    pub fn left_paused(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        if let Ok(entries) = fs::read_dir(self.root.join("pausing")) {
+            for entry in entries.flatten() {
+                let this_boot = fs::read_to_string(entry.path())
+                    .is_ok_and(|of| !of.trim().is_empty() && of.trim() == boot_id());
+                if this_boot {
+                    names.push(entry.file_name().to_string_lossy().into_owned());
+                } else {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+        names.sort();
+        names
+    }
+
+    /// Takes away the marker of a machine a commit left frozen, once it is thawed.
+    pub fn forget_paused(&self, name: &str) {
+        if crate::reference::validate_entry_name(name).is_ok() {
+            let _ = fs::remove_file(self.pausing_path(name));
+        }
     }
 
     /// Whether a start of `name` is in progress (a marker left by a start that died with
@@ -1454,6 +1543,9 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// A suffix for temporary names that repeats neither inside this process (the service
 /// runs several downloads and writes at once) nor across processes.
+/// The directories of loads in flight, under the blobs.
+const LOAD_PREFIX: &str = ".load-";
+
 pub fn unique_suffix() -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     format!(
@@ -3974,6 +4066,32 @@ mod tests {
         store.forget_starts();
         assert!(!store.is_restarting("left"));
         assert!(store.mark_restarting("../x").is_err());
+    }
+
+    #[test]
+    fn a_machine_a_commit_froze_is_marked_until_its_thaw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        let mark = store.mark_pausing("web").unwrap().unwrap();
+        assert_eq!(store.left_paused(), ["web"]);
+        // One commit at a time freezes a machine.
+        assert!(store.mark_pausing("web").unwrap().is_none());
+        drop(mark);
+        assert!(store.left_paused().is_empty());
+        // A service that went left it; the next one thaws it and takes the marker away.
+        std::mem::forget(store.mark_pausing("web").unwrap());
+        std::mem::forget(store.mark_pausing("db").unwrap());
+        assert_eq!(store.left_paused(), ["db", "web"]);
+        store.forget_paused("web");
+        assert_eq!(store.left_paused(), ["db"]);
+        // One of another boot froze nothing that is still frozen.
+        fs::write(
+            store.pausing_path("db"),
+            "00000000-0000-0000-0000-000000000000",
+        )
+        .unwrap();
+        assert!(store.left_paused().is_empty());
+        assert!(!store.pausing_path("db").exists());
     }
 
     #[test]

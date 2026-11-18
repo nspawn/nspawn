@@ -16,6 +16,7 @@
 // The port keeps the reference's API whole; its tests use what the builder does not.
 #![allow(dead_code)]
 
+pub mod change;
 mod expose;
 mod gofmt;
 mod platform;

@@ -490,10 +490,10 @@ async fn put(ctx: &Context, key: &str, query: &Query, body: Incoming) -> Served 
 
 /// How long the rest of a refused stream is read: a client still sending it when the
 /// answer comes would otherwise get an error of its own write instead of the answer.
-const DISCARD: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) const DISCARD: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Reads what is left of a request's body and drops it, for `DISCARD` at most.
-async fn discard_body<B>(mut body: B)
+pub(super) async fn discard_body<B>(mut body: B)
 where
     B: hyper::body::Body + Unpin,
 {

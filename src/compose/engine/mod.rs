@@ -38,6 +38,21 @@ pub mod label {
     pub const VERSION: &str = "com.docker.compose.version";
     pub const NETWORK: &str = "com.docker.compose.network";
     pub const VOLUME: &str = "com.docker.compose.volume";
+
+    /// The labels a project gives each of its machines, which place it in the project.
+    pub const OF_MACHINE: [&str; 11] = [
+        PROJECT,
+        SERVICE,
+        NUMBER,
+        ONEOFF,
+        CONFIG_HASH,
+        WORKING_DIR,
+        CONFIG_FILES,
+        ENV_FILE,
+        DEPENDS_ON,
+        IMAGE,
+        VERSION,
+    ];
 }
 
 /// The docker compose release nspawn compose stamps its machines with.

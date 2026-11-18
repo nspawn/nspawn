@@ -222,7 +222,7 @@ fn epoch_time(epoch: i64) -> String {
     crate::dockerapi::util::rfc3339_nano(usec, false)
 }
 
-fn timestamp_now() -> String {
+pub(crate) fn timestamp_now() -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -236,7 +236,7 @@ fn layer_dir(ctx: &Context, digest: &str) -> PathBuf {
 }
 
 /// A layer of a base image under the OCI media type of the same bytes.
-fn oci_media_type(media_type: &str) -> String {
+pub(crate) fn oci_media_type(media_type: &str) -> String {
     match media_type {
         "application/vnd.docker.image.rootfs.diff.tar.gzip" => LAYER_MEDIA_TYPE.to_string(),
         "application/vnd.docker.image.rootfs.diff.tar" => {
@@ -1987,7 +1987,7 @@ fn local_base<'a>(
         .or_else(|| {
             records
                 .iter()
-                .find(|r| Some(r.reference.as_str()) == built && r.origin == "build")
+                .find(|r| Some(r.reference.as_str()) == built && r.made_here())
         })
 }
 

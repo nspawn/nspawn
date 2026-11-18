@@ -86,15 +86,15 @@ impl Stat {
         self.mode & S_IFMT
     }
 
-    fn is_dir(&self) -> bool {
+    pub fn is_dir(&self) -> bool {
         self.kind() == S_IFDIR
     }
 
-    fn is_regular(&self) -> bool {
+    pub fn is_regular(&self) -> bool {
         self.kind() == S_IFREG
     }
 
-    fn is_symlink(&self) -> bool {
+    pub fn is_symlink(&self) -> bool {
         self.kind() == S_IFLNK
     }
 
@@ -235,13 +235,25 @@ pub fn commit<B: Write, T: Write>(
     blob: B,
     extract: T,
 ) -> Result<Committed> {
+    compressed(blob, extract, |tee| {
+        write_layer(upper, lowers, tee)?;
+        Ok(())
+    })
+}
+
+/// A tar written by `write`, compressed to `blob` and copied as it is to `extract`.
+fn compressed<B: Write, T: Write>(
+    blob: B,
+    extract: T,
+    write: impl FnOnce(&mut Tee<B, T>) -> Result<()>,
+) -> Result<Committed> {
     let mut tee = Tee {
         diff: Sha256::new(),
         size: 0,
         gzip: GzEncoder::new(Hashing::new(blob), Compression::new(GZIP_LEVEL)),
         extract,
     };
-    write_layer(upper, lowers, &mut tee)?;
+    write(&mut tee)?;
     let Tee {
         diff,
         size,
@@ -261,6 +273,296 @@ pub fn commit<B: Write, T: Write>(
         digest: sha256_id(blob.hash),
         size: blob.size,
     })
+}
+
+/// One change of a machine's tree over its image.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Change {
+    pub kind: ChangeKind,
+    pub path: PathBuf,
+    /// The entry as it is now; None for a deletion.
+    pub stat: Option<Stat>,
+}
+
+/// What a machine changed over the image it was made of. `merged` is its tree as it
+/// sees it, owned as in the image; `lowers` are the image's layers, topmost first. For an
+/// overlay machine, `upper` is the upper directory of that tree's mount: every path the
+/// machine touched is in it, if only as metadata (metacopy) or renamed (redirect_dir),
+/// so it says where to look while `merged` says what is there. Without one, every entry
+/// of both trees is compared. A machine whose tree was chowned into a user namespace
+/// (`shifted`) lost its files' capabilities with it: a file that differs from the
+/// image's in that alone is no change of the machine's. With `tolerant`, the machine
+/// runs meanwhile: what goes while it is looked at is left out, and what goes while it
+/// is compared is a change.
+pub fn machine_changes(
+    upper: Option<&dyn Tree>,
+    merged: &dyn Tree,
+    lowers: &[&dyn Tree],
+    shifted: bool,
+    tolerant: bool,
+) -> Result<Vec<Change>> {
+    let base = Merged::new(lowers);
+    let mut out = Vec::new();
+    let mut f = |kind: ChangeKind, path: &Path, stat: Option<&Stat>| -> Result<()> {
+        out.push(Change {
+            kind,
+            path: path.to_path_buf(),
+            stat: stat.copied(),
+        });
+        Ok(())
+    };
+    match upper {
+        None => double_walk(
+            &base,
+            Path::new(""),
+            merged,
+            Path::new(""),
+            tolerant,
+            &mut f,
+        )?,
+        Some(upper) => diff_machine_upper(upper, merged, &base, tolerant, &mut f)?,
+    }
+    if !shifted {
+        return Ok(out);
+    }
+    let mut kept = Vec::with_capacity(out.len());
+    for change in out {
+        let lost = match (change.kind, change.stat) {
+            (ChangeKind::Modify, Some(now)) if now.is_regular() => {
+                match capability_lost(&base, merged, &change.path, &now) {
+                    Err(e) if tolerant && vanished(&e) => false,
+                    other => other?,
+                }
+            }
+            _ => false,
+        };
+        if !lost {
+            kept.push(change);
+        }
+    }
+    Ok(kept)
+}
+
+/// Whether the file at `path` is the image's but for the capability the image gives it,
+/// which `merged` lacks.
+fn capability_lost(base: &dyn Tree, merged: &dyn Tree, path: &Path, now: &Stat) -> Result<bool> {
+    let before = match base.lstat(path) {
+        Ok(before) => before,
+        Err(e) if gone(&e) => return Ok(false),
+        Err(e) => {
+            return Err(e).with_context(|| format!("looking up {} in the lowers", shown(path)))
+        }
+    };
+    if !before.is_regular()
+        || before.mode != now.mode
+        || before.uid != now.uid
+        || before.gid != now.gid
+        || before.size != now.size
+        || before.mtime != now.mtime
+        || before.mtime_nsec != now.mtime_nsec
+    {
+        return Ok(false);
+    }
+    let had = base
+        .xattr(path, CAPABILITY)
+        .with_context(|| format!("reading the capabilities of {}", shown(path)))?;
+    let has = merged
+        .xattr(path, CAPABILITY)
+        .with_context(|| format!("reading the capabilities of {}", shown(path)))?;
+    if had.as_ref().is_none_or(|c| c.is_empty()) || has.is_some_and(|c| !c.is_empty()) {
+        return Ok(false);
+    }
+    same_content(base, path, merged, path)
+}
+
+/// Writes the layer tar of `changes` (as [`machine_changes`] gives them, in its order),
+/// contents read from `source`, compressed to `blob`. Returns the paths `lenient` let
+/// through as a running machine changed them while they were read: a file whose size
+/// changed, at the size it had, and what went (or its directory, or another kind of entry
+/// took its place), left out.
+pub fn commit_changes<B: Write>(
+    source: &dyn Tree,
+    changes: &[Change],
+    lenient: bool,
+    blob: B,
+) -> Result<(Committed, TarSummary, Vec<String>)> {
+    let mut summary = None;
+    let mut changed = Vec::new();
+    let committed = compressed(blob, io::sink(), |tee| {
+        let mut writer = ChangeWriter::new(tee, source);
+        writer.lenient = lenient;
+        for change in changes {
+            writer.handle_change(change.kind, &change.path, change.stat.as_ref())?;
+        }
+        changed = std::mem::take(&mut writer.changed);
+        summary = Some(writer.tw.finish()?);
+        Ok(())
+    })?;
+    Ok((committed, summary.expect("the tar was written"), changed))
+}
+
+/// Writes every entry of `source` to `out` as a tar, owners and modes as `source` gives
+/// them, sockets left out. An entry that is gone by the time it is looked at is left out
+/// and a file whose size changes while it is read goes in at the size it had, as the tree
+/// may belong to a machine that runs; those files are returned.
+pub fn write_tree<W: Write>(source: &dyn Tree, out: W) -> Result<(TarSummary, Vec<String>)> {
+    let mut writer = ChangeWriter::new(out, source);
+    writer.lenient = true;
+    let mut walk = Walker::new(source, Path::new(""))?;
+    walk.tolerant = true;
+    while let Some((path, stat)) = walk.next()? {
+        writer.handle_change(ChangeKind::Add, &path, Some(&stat))?;
+    }
+    let changed = std::mem::take(&mut writer.changed);
+    Ok((writer.tw.finish()?, changed))
+}
+
+/// The changes of an overlay machine (overlay_linux.go's Changes, with what a machine's
+/// mount adds: metacopy entries whose data is the lowers', and directories renamed
+/// whose contents come from where they were).
+fn diff_machine_upper(
+    upper: &dyn Tree,
+    merged: &dyn Tree,
+    base: &dyn Tree,
+    tolerant: bool,
+    f: &mut ChangeFn<'_>,
+) -> Result<()> {
+    let absent = |e: &io::Error| {
+        matches!(
+            e.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+        )
+    };
+    let mut walk = Walker::new(upper, Path::new(""))?;
+    walk.tolerant = tolerant;
+    while let Some((path, stat)) = walk.next()? {
+        if stat.is_whiteout() {
+            match base.lstat(&path) {
+                Ok(_) => f(ChangeKind::Delete, &path, None)?,
+                Err(e) if absent(&e) => {}
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("looking up {} in the lowers", shown(&path)))
+                }
+            }
+            continue;
+        }
+        let now = match merged.lstat(&path) {
+            Ok(now) => now,
+            // Gone since the upper directory was listed: the machine runs.
+            Err(e) if absent(&e) => {
+                if stat.is_dir() {
+                    walk.skip_dir();
+                }
+                continue;
+            }
+            Err(e) => return Err(e).with_context(|| format!("looking at {}", shown(&path))),
+        };
+        let lower = match base.lstat(&path) {
+            Ok(lower) => Some(lower),
+            Err(e) if absent(&e) => None,
+            Err(e) => {
+                return Err(e).with_context(|| format!("looking up {} in the lowers", shown(&path)))
+            }
+        };
+        // What the upper directory says of the entry, which a running machine may have
+        // taken away meanwhile.
+        let attributes = (|| -> Result<(bool, bool, bool)> {
+            let renamed = has_xattr(upper, &path, &REDIRECT, true)?;
+            let metacopy = stat.is_regular() && has_xattr(upper, &path, &METACOPY, false)?;
+            let opaque = stat.is_dir()
+                && is_opaque(upper, &path)
+                    .with_context(|| format!("reading the opaque attribute of {}", shown(&path)))?;
+            Ok((renamed, metacopy, opaque))
+        })();
+        let (renamed, metacopy, opaque) = match attributes {
+            Ok(attributes) => attributes,
+            Err(e) if tolerant && vanished(&e) => {
+                if stat.is_dir() {
+                    walk.skip_dir();
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        let kind = match &lower {
+            None => Some(ChangeKind::Add),
+            Some(lower) => {
+                // The data of a metacopy entry is the lower's at the same path, unless
+                // it was renamed from another one.
+                let same = if now.is_regular() && lower.is_regular() && !renamed && metacopy {
+                    same_metadata(base, &path, lower, merged, &path, &now)
+                } else {
+                    same_entry(base, &path, lower, merged, &path, &now)
+                };
+                let same = match same {
+                    Err(e) if tolerant && vanished(&e) => false,
+                    other => other?,
+                };
+                (!same).then_some(ChangeKind::Modify)
+            }
+        };
+        if let Some(kind) = kind {
+            f(kind, &path, Some(&now))?;
+        }
+        if stat.is_dir() && (renamed || opaque) && now.is_dir() {
+            // What is under it is not in the upper directory, or not only there.
+            match lower {
+                Some(lower) if lower.is_dir() => {
+                    double_walk(
+                        base,
+                        &path,
+                        merged,
+                        &path,
+                        tolerant,
+                        &mut |kind, sub, stat| f(kind, &join(&path, sub), stat),
+                    )?;
+                }
+                _ => {
+                    let mut under = match Walker::new(merged, &path) {
+                        Err(e) if tolerant && vanished(&e) => {
+                            walk.skip_dir();
+                            continue;
+                        }
+                        other => other?,
+                    };
+                    under.tolerant = tolerant;
+                    while let Some((sub, stat)) = under.next()? {
+                        f(ChangeKind::Add, &join(&path, &sub), Some(&stat))?;
+                    }
+                }
+            }
+            walk.skip_dir();
+        }
+    }
+    Ok(())
+}
+
+/// Whether two entries are the same but for their data, which the caller knows is.
+fn same_metadata(
+    a: &dyn Tree,
+    pa: &Path,
+    sa: &Stat,
+    b: &dyn Tree,
+    pb: &Path,
+    sb: &Stat,
+) -> Result<bool> {
+    if sa.mode != sb.mode
+        || sa.uid != sb.uid
+        || sa.gid != sb.gid
+        || sa.size != sb.size
+        || sa.mtime != sb.mtime
+        || sa.mtime_nsec != sb.mtime_nsec
+    {
+        return Ok(false);
+    }
+    let ca = a
+        .xattr(pa, CAPABILITY)
+        .with_context(|| format!("reading the capabilities of {}", shown(pa)))?;
+    let cb = b
+        .xattr(pb, CAPABILITY)
+        .with_context(|| format!("reading the capabilities of {}", shown(pb)))?;
+    Ok(ca.unwrap_or_default() == cb.unwrap_or_default())
 }
 
 fn sha256_id(hash: Sha256) -> String {
@@ -561,6 +863,9 @@ struct Walker<'a> {
     tree: &'a dyn Tree,
     root: PathBuf,
     stack: Vec<(PathBuf, std::vec::IntoIter<OsString>)>,
+    /// Leaves out an entry that is gone by the time it is looked at, as in a tree that
+    /// changes while it is walked.
+    tolerant: bool,
 }
 
 impl<'a> Walker<'a> {
@@ -572,6 +877,7 @@ impl<'a> Walker<'a> {
             tree,
             root: root.to_path_buf(),
             stack: Vec::new(),
+            tolerant: false,
         };
         if stat.is_dir() {
             walker.descend(PathBuf::new())?;
@@ -581,10 +887,10 @@ impl<'a> Walker<'a> {
 
     fn descend(&mut self, dir: PathBuf) -> Result<()> {
         let full = join(&self.root, &dir);
-        let mut names = self
-            .tree
-            .read_dir(&full)
-            .with_context(|| format!("reading the directory {}", shown(&full)))?;
+        let mut names = match self.tree.read_dir(&full) {
+            Err(e) if self.tolerant && gone(&e) => Vec::new(),
+            listed => listed.with_context(|| format!("reading the directory {}", shown(&full)))?,
+        };
         names.sort();
         self.stack.push((dir, names.into_iter()));
         Ok(())
@@ -602,10 +908,10 @@ impl<'a> Walker<'a> {
             };
             let path = join(dir, Path::new(&name));
             let full = join(&self.root, &path);
-            let stat = self
-                .tree
-                .lstat(&full)
-                .with_context(|| format!("looking at {}", shown(&full)))?;
+            let stat = match self.tree.lstat(&full) {
+                Err(e) if self.tolerant && gone(&e) => continue,
+                found => found.with_context(|| format!("looking at {}", shown(&full)))?,
+            };
             if stat.is_dir() {
                 self.descend(path.clone())?;
             }
@@ -617,6 +923,20 @@ impl<'a> Walker<'a> {
     fn skip_dir(&mut self) {
         self.stack.pop();
     }
+}
+
+/// Whether a lookup failed because the entry, or a directory on its way, is not there.
+fn gone(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+/// `gone` for an error with its context.
+fn vanished(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<io::Error>().is_some_and(gone))
 }
 
 /// The order of two walks: by path with '/' sorting before any other byte.
@@ -718,16 +1038,24 @@ fn read_full(r: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
 type ChangeFn<'f> = dyn FnMut(ChangeKind, &Path, Option<&Stat>) -> Result<()> + 'f;
 
 /// The changes from `a` at `a_root` to `b` at `b_root`, found by walking both (diff.go).
-/// A deleted directory is reported alone, without what was under it.
+/// A deleted directory is reported alone, without what was under it. With `tolerant`, `b`
+/// may change meanwhile: what goes from it is no longer there, and an entry that goes
+/// while it is compared is a change.
 fn double_walk(
     a: &dyn Tree,
     a_root: &Path,
     b: &dyn Tree,
     b_root: &Path,
+    tolerant: bool,
     f: &mut ChangeFn<'_>,
 ) -> Result<()> {
     let mut wa = Walker::new(a, a_root)?;
-    let mut wb = Walker::new(b, b_root)?;
+    let mut wb = match Walker::new(b, b_root) {
+        Err(e) if tolerant && vanished(&e) => return Ok(()),
+        other => other?,
+    };
+    wa.tolerant = tolerant;
+    wb.tolerant = tolerant;
     let (mut f1, mut f2) = (None, None);
     let (mut done1, mut done2) = (false, false);
     let mut rmdir: Option<Vec<u8>> = None;
@@ -770,7 +1098,11 @@ fn double_walk(
             _ => {
                 let (p1, s1) = f1.take().expect("a lower entry");
                 let (p2, s2) = f2.take().expect("an upper entry");
-                let same = same_entry(a, &join(a_root, &p1), &s1, b, &join(b_root, &p2), &s2)?;
+                let same = match same_entry(a, &join(a_root, &p1), &s1, b, &join(b_root, &p2), &s2)
+                {
+                    Err(e) if tolerant && vanished(&e) => false,
+                    other => other?,
+                };
                 rmdir = (s1.is_dir() && !s2.is_dir())
                     .then(|| [p1.as_os_str().as_bytes(), b"/"].concat());
                 if same {
@@ -870,7 +1202,7 @@ fn diff_upper(
             f(kind, &path, Some(&stat))?;
         }
         if stat.is_dir() && opaque_over(upper, base, &path)? {
-            double_walk(base, &path, view, &path, &mut |kind, sub, stat| {
+            double_walk(base, &path, view, &path, false, &mut |kind, sub, stat| {
                 f(kind, &join(&path, sub), stat)
             })?;
             walk.skip_dir();
@@ -1000,6 +1332,13 @@ struct ChangeWriter<'a, W: Write> {
     inode_src: HashMap<u64, Vec<u8>>,
     inode_refs: HashMap<u64, Vec<Vec<u8>>>,
     added_dirs: HashSet<Vec<u8>>,
+    /// Directories left out, and so what is in them.
+    gone_dirs: HashSet<Vec<u8>>,
+    /// A file whose size changes while it is read goes in at the size it had, filled
+    /// with zeros or cut, and an entry that went by the time it is read is left out; both
+    /// are named in `changed`, rather than failing the tar.
+    lenient: bool,
+    changed: Vec<String>,
 }
 
 impl<'a, W: Write> ChangeWriter<'a, W> {
@@ -1010,6 +1349,9 @@ impl<'a, W: Write> ChangeWriter<'a, W> {
             inode_src: HashMap::new(),
             inode_refs: HashMap::new(),
             added_dirs: HashSet::new(),
+            gone_dirs: HashSet::new(),
+            lenient: false,
+            changed: Vec::new(),
         }
     }
 
@@ -1017,7 +1359,10 @@ impl<'a, W: Write> ChangeWriter<'a, W> {
         let p = path.as_os_str().as_bytes();
         if kind == ChangeKind::Delete {
             let hdr = Header::whiteout(whiteout_name(p));
-            self.include_parents(&hdr)?;
+            match self.include_parents(&hdr) {
+                Err(e) if self.lenient && vanished(&e) => return self.left_out(path),
+                other => other?,
+            }
             return self.tw.write_header(&hdr);
         }
         let Some(stat) = stat else {
@@ -1027,11 +1372,13 @@ impl<'a, W: Write> ChangeWriter<'a, W> {
             return Ok(());
         }
         let linkname = if stat.is_symlink() {
-            self.source
-                .read_link(path)
-                .with_context(|| format!("reading the link {}", shown(path)))?
-                .into_os_string()
-                .into_vec()
+            match self.source.read_link(path) {
+                Ok(target) => target.into_os_string().into_vec(),
+                Err(e) if self.lenient && gone(&e) => return self.left_out(path),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("reading the link {}", shown(path)))
+                }
+            }
         } else {
             Vec::new()
         };
@@ -1042,31 +1389,62 @@ impl<'a, W: Write> ChangeWriter<'a, W> {
         let mut hdr = Header::from_stat(stat, name, linkname)
             .with_context(|| format!("archiving {}", shown(path)))?;
 
-        let mut additional_links = Vec::new();
-        if stat.is_linked() {
-            if let Some(source) = self.inode_src.get(&stat.ino) {
-                hdr.typeflag = TYPE_LINK;
-                hdr.linkname.clone_from(source);
-                hdr.size = 0;
-            } else {
-                if kind == ChangeKind::Unmodified {
-                    self.inode_refs
-                        .entry(stat.ino)
-                        .or_default()
-                        .push(hdr.name.clone());
-                    return Ok(());
-                }
-                self.inode_src.insert(stat.ino, hdr.name.clone());
-                additional_links = self.inode_refs.remove(&stat.ino).unwrap_or_default();
+        let earlier = if stat.is_linked() {
+            self.inode_src.get(&stat.ino).cloned()
+        } else {
+            None
+        };
+        if kind == ChangeKind::Unmodified && earlier.is_none() {
+            if stat.is_linked() {
+                self.inode_refs
+                    .entry(stat.ino)
+                    .or_default()
+                    .push(hdr.name.clone());
             }
-        } else if kind == ChangeKind::Unmodified {
             return Ok(());
         }
 
-        let capability = self
-            .source
-            .xattr(path, CAPABILITY)
-            .with_context(|| format!("reading the capabilities of {}", shown(path)))?;
+        // What the entry needs read is read before anything of it is written: an entry
+        // gone by now is left out of a lenient tar.
+        let capability = match self.source.xattr(path, CAPABILITY) {
+            Ok(capability) => capability,
+            Err(e) if self.lenient && gone(&e) => return self.left_out(path),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("reading the capabilities of {}", shown(path)))
+            }
+        };
+        let file = if earlier.is_none() && hdr.typeflag == TYPE_REG && hdr.size > 0 {
+            match self.source.open(path) {
+                Ok(file) => Some(file),
+                Err(e) if self.lenient && gone(&e) => return self.left_out(path),
+                Err(e) => return Err(e).with_context(|| format!("opening {}", shown(path))),
+            }
+        } else {
+            None
+        };
+
+        // The parents go first: an entry left out for want of its parent is no link
+        // source.
+        match self.include_parents(&hdr) {
+            Err(e) if self.lenient && vanished(&e) => return self.left_out(path),
+            other => other?,
+        }
+
+        let mut additional_links = Vec::new();
+        if stat.is_linked() {
+            match earlier {
+                Some(source) => {
+                    hdr.typeflag = TYPE_LINK;
+                    hdr.linkname = source;
+                    hdr.size = 0;
+                }
+                None => {
+                    self.inode_src.insert(stat.ino, hdr.name.clone());
+                    additional_links = self.inode_refs.remove(&stat.ino).unwrap_or_default();
+                }
+            }
+        }
         if let Some(capability) = capability.filter(|c| !c.is_empty()) {
             hdr.records.insert(
                 format!("{PAX_SCHILY_XATTR}{CAPABILITY}").into_bytes(),
@@ -1074,10 +1452,9 @@ impl<'a, W: Write> ChangeWriter<'a, W> {
             );
         }
 
-        self.include_parents(&hdr)?;
         self.tw.write_header(&hdr)?;
-        if hdr.typeflag == TYPE_REG && hdr.size > 0 {
-            self.copy_file(path, hdr.size as u64)?;
+        if let Some(file) = file {
+            self.copy_file(file, path, hdr.size as u64)?;
         }
 
         // Unmodified names of this inode seen before it: the reference links them here,
@@ -1088,7 +1465,13 @@ impl<'a, W: Write> ChangeWriter<'a, W> {
             hdr.typeflag = TYPE_LINK;
             hdr.linkname.clone_from(&source);
             hdr.size = 0;
-            self.include_parents(&hdr)?;
+            match self.include_parents(&hdr) {
+                Err(e) if self.lenient && vanished(&e) => {
+                    self.left_out(bytes_path(trim_trailing_slashes(&hdr.name)))?;
+                    continue;
+                }
+                other => other?,
+            }
             self.tw.write_header(&hdr)?;
         }
         Ok(())
@@ -1100,15 +1483,32 @@ impl<'a, W: Write> ChangeWriter<'a, W> {
         if let Some(i) = name.iter().rposition(|&c| c == b'/').filter(|&i| i > 0) {
             let parent = &name[..i];
             if !self.added_dirs.contains(parent) {
-                self.added_dirs.insert(parent.to_vec());
-                let parent = bytes_path(parent);
+                let path = bytes_path(parent);
+                let gone =
+                    || Err(not_found()).with_context(|| format!("looking at {}", shown(path)));
+                // A parent gone meanwhile takes the entry with it.
+                if self.gone_dirs.contains(parent) {
+                    return gone();
+                }
                 // The reference uses stat, which only differs from lstat on a symlink, and
-                // the parent of an entry of the walk is a directory.
+                // the parent of an entry of the walk is a directory, unless a running
+                // machine put something else there since.
                 let stat = self
                     .source
-                    .lstat(parent)
-                    .with_context(|| format!("looking at {}", shown(parent)))?;
-                self.handle_change(ChangeKind::Modify, parent, Some(&stat))?;
+                    .lstat(path)
+                    .with_context(|| format!("looking at {}", shown(path)))?;
+                if !stat.is_dir() {
+                    self.gone_dirs.insert(parent.to_vec());
+                    return gone();
+                }
+                self.added_dirs.insert(parent.to_vec());
+                let left_out = self.changed.len();
+                self.handle_change(ChangeKind::Modify, path, Some(&stat))?;
+                if self.changed.len() > left_out {
+                    self.added_dirs.remove(parent);
+                    self.gone_dirs.insert(parent.to_vec());
+                    return gone();
+                }
             }
         }
         if hdr.typeflag == TYPE_DIR {
@@ -1117,11 +1517,13 @@ impl<'a, W: Write> ChangeWriter<'a, W> {
         Ok(())
     }
 
-    fn copy_file(&mut self, path: &Path, size: u64) -> Result<()> {
-        let mut file = self
-            .source
-            .open(path)
-            .with_context(|| format!("opening {}", shown(path)))?;
+    /// An entry gone by the time it is read, left out of a lenient tar and named.
+    fn left_out(&mut self, path: &Path) -> Result<()> {
+        self.changed.push(shown(path));
+        Ok(())
+    }
+
+    fn copy_file(&mut self, mut file: Box<dyn Read + 'a>, path: &Path, size: u64) -> Result<()> {
         let mut buf = vec![0u8; 32 * 1024];
         let mut left = size;
         while left > 0 {
@@ -1129,7 +1531,12 @@ impl<'a, W: Write> ChangeWriter<'a, W> {
             let n = read_full(&mut file, &mut buf[..want])
                 .with_context(|| format!("reading {}", shown(path)))?;
             if n == 0 {
-                bail!("{} is shorter than the {size} bytes it had", shown(path));
+                if !self.lenient {
+                    bail!("{} is shorter than the {size} bytes it had", shown(path));
+                }
+                self.changed.push(shown(path));
+                self.zeros(left)?;
+                return self.tw.pad(size);
             }
             self.tw.put(&buf[..n])?;
             left -= n as u64;
@@ -1138,9 +1545,22 @@ impl<'a, W: Write> ChangeWriter<'a, W> {
             .with_context(|| format!("reading {}", shown(path)))?
             != 0
         {
-            bail!("{} grew past the {size} bytes it had", shown(path));
+            if !self.lenient {
+                bail!("{} grew past the {size} bytes it had", shown(path));
+            }
+            self.changed.push(shown(path));
         }
         self.tw.pad(size)
+    }
+
+    fn zeros(&mut self, mut n: u64) -> Result<()> {
+        let block = [0u8; 32 * 1024];
+        while n > 0 {
+            let k = block.len().min(usize::try_from(n).unwrap_or(usize::MAX));
+            self.tw.put(&block[..k])?;
+            n -= k as u64;
+        }
+        Ok(())
     }
 }
 
@@ -2236,6 +2656,325 @@ upper {W*97} whiteout
         out
     }
 
+    // ---- a machine's changes ----
+
+    /// The changes of a machine whose tree is "merged": through its "upper" directory
+    /// over "lower", or by both trees whole without one.
+    fn machine_change_list(spec: &str, with_upper: bool) -> Vec<String> {
+        let t = trees(spec);
+        let merged = &t["merged"];
+        let upper: Option<&dyn Tree> = with_upper.then_some(&t["upper"] as &dyn Tree);
+        machine_changes(upper, merged, &[&t["lower"]], false, false)
+            .unwrap()
+            .iter()
+            .map(|c| {
+                if c.kind != ChangeKind::Delete {
+                    assert_eq!(c.stat, merged.lstat(&c.path).ok(), "{:?}", c.path);
+                }
+                format!("{} /{}", kind_name(c.kind), c.path.display())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_machine_s_metadata_copies_are_no_changes() {
+        // A user namespace's chown copied up every entry as metadata; one file changed.
+        let spec = "
+            lower etc dir
+            lower etc/a file data=aaa mtime=1700000000.000000000
+            lower etc/b file data=bbb mtime=1700000000.000000000
+            lower etc/gone file data=x
+            upper etc dir uid=100000
+            upper etc/a file metacopy=y uid=100000 mtime=1700000000.000000000
+            upper etc/b file data=BBB mtime=1700000100.000000000
+            upper etc/gone whiteout
+            upper etc/new file data=n
+            merged etc dir
+            merged etc/a file data=aaa mtime=1700000000.000000000
+            merged etc/b file data=BBB mtime=1700000100.000000000
+            merged etc/new file data=n
+        ";
+        assert_eq!(
+            machine_change_list(spec, true),
+            ["modify /etc/b", "delete /etc/gone", "add /etc/new"]
+        );
+        // The same trees compared whole, as a flat machine's are.
+        assert_eq!(
+            machine_change_list(spec, false),
+            ["modify /etc/b", "delete /etc/gone", "add /etc/new"]
+        );
+    }
+
+    #[test]
+    fn a_metadata_copy_with_other_metadata_is_a_change() {
+        let spec = "
+            lower a file data=aaa mtime=1700000000.000000000
+            upper a file metacopy=y mode=0600 mtime=1700000000.000000000
+            merged a file data=aaa mode=0600 mtime=1700000000.000000000
+        ";
+        assert_eq!(machine_change_list(spec, true), ["modify /a"]);
+    }
+
+    #[test]
+    fn under_an_opaque_directory_both_trees_are_walked() {
+        let spec = "
+            lower d dir
+            lower d/x file data=x
+            lower d/y file data=y mtime=1700000000.000000000
+            upper d dir opaque=trusted
+            upper d/y file data=y2 mtime=1700000000.000000000
+            merged d dir
+            merged d/y file data=y2 mtime=1700000000.000000000
+        ";
+        assert_eq!(
+            machine_change_list(spec, true),
+            ["delete /d/x", "modify /d/y"]
+        );
+    }
+
+    #[test]
+    fn a_renamed_directory_brings_what_it_had() {
+        // redirect_dir: the upper directory names where its contents are.
+        let spec = "
+            lower old dir
+            lower old/f file data=f
+            upper new dir redirect=/old
+            upper old whiteout
+            merged new dir
+            merged new/f file data=f
+        ";
+        assert_eq!(
+            machine_change_list(spec, true),
+            ["add /new", "add /new/f", "delete /old"]
+        );
+    }
+
+    #[test]
+    fn a_machine_s_layer_reads_the_merged_tree() {
+        let t = trees(
+            "
+            lower a file data=aaa mtime=1700000000.000000000
+            upper a file metacopy=y mode=0600 mtime=1700000000.000000000
+            merged a file data=aaa mode=0600 mtime=1700000000.000000000
+            ",
+        );
+        let changes = machine_changes(
+            Some(&t["upper"]),
+            &t["merged"],
+            &[&t["lower"]],
+            false,
+            false,
+        )
+        .unwrap();
+        let mut blob = Vec::new();
+        let (committed, summary, changed) =
+            commit_changes(&t["merged"], &changes, false, &mut blob).unwrap();
+        assert_eq!(summary.entries, 1);
+        assert!(changed.is_empty());
+        let mut tar = Vec::new();
+        flate2::read::GzDecoder::new(&blob[..])
+            .read_to_end(&mut tar)
+            .unwrap();
+        assert_eq!(committed.diff_id, format!("sha256:{}", sha256_hex(&tar)));
+        // The data is the merged tree's: the upper's metadata copy has none.
+        assert_eq!(&tar[512..515], b"aaa");
+    }
+
+    #[test]
+    fn a_capability_the_namespace_s_chown_took_is_no_change() {
+        // cap_net_raw=p, as the image has it; the chown into the namespace dropped it.
+        let spec = "
+            lower ping file data=elf mtime=1700000000.000000000 cap=0000000200200000000000000000000000000000
+            lower other file data=x mtime=1700000000.000000000 cap=0000000200200000000000000000000000000000
+            upper ping file metacopy=y mtime=1700000000.000000000
+            upper other file data=y mtime=1700000000.000000000
+            merged ping file data=elf mtime=1700000000.000000000
+            merged other file data=y mtime=1700000000.000000000
+        ";
+        let t = trees(spec);
+        let list = |shifted| -> Vec<String> {
+            machine_changes(
+                Some(&t["upper"]),
+                &t["merged"],
+                &[&t["lower"]],
+                shifted,
+                false,
+            )
+            .unwrap()
+            .iter()
+            .map(|c| format!("{} /{}", kind_name(c.kind), c.path.display()))
+            .collect()
+        };
+        assert_eq!(list(true), ["modify /other"]);
+        assert_eq!(list(false), ["modify /other", "modify /ping"]);
+    }
+
+    #[test]
+    fn a_lenient_tar_leaves_out_what_went() {
+        let t = trees(
+            "
+            merged a file data=aaa mtime=1700000000.000000000
+            merged b file data=bbb mtime=1700000000.000000000
+            ",
+        );
+        let stat = t["merged"].lstat(Path::new("a")).unwrap();
+        let changes = [
+            Change {
+                kind: ChangeKind::Add,
+                path: PathBuf::from("a"),
+                stat: Some(stat),
+            },
+            // Listed, then gone before it was read.
+            Change {
+                kind: ChangeKind::Add,
+                path: PathBuf::from("gone"),
+                stat: Some(stat),
+            },
+        ];
+        let mut blob = Vec::new();
+        let (_, summary, changed) =
+            commit_changes(&t["merged"], &changes, true, &mut blob).unwrap();
+        assert_eq!(summary.entries, 1);
+        assert_eq!(changed, ["/gone"]);
+        assert!(commit_changes(&t["merged"], &changes, false, Vec::new()).is_err());
+    }
+
+    /// A tree a running machine changes while it is read: its directories `gone` went
+    /// once their entries were opened, and `half_gone` once they were looked at.
+    struct Racing<'a> {
+        tree: &'a MemTree,
+        gone: &'a [&'a str],
+        half_gone: &'a [&'a str],
+    }
+
+    impl Racing<'_> {
+        fn went(list: &[&str], path: &Path) -> bool {
+            list.iter().any(|g| Path::new(g) == path)
+        }
+    }
+
+    impl Tree for Racing<'_> {
+        fn lstat(&self, path: &Path) -> io::Result<Stat> {
+            if Self::went(self.gone, path) {
+                return Err(not_found());
+            }
+            self.tree.lstat(path)
+        }
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<OsString>> {
+            self.tree.read_dir(path)
+        }
+        /// A link gone, another kind of entry in its place, is not found, as a machine's
+        /// tree tells it.
+        fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
+            self.tree.read_link(path).map_err(|e| match e.kind() {
+                io::ErrorKind::InvalidInput => not_found(),
+                _ => e,
+            })
+        }
+        fn xattr(&self, path: &Path, name: &str) -> io::Result<Option<Vec<u8>>> {
+            if Self::went(self.half_gone, path) {
+                return Err(not_found());
+            }
+            self.tree.xattr(path, name)
+        }
+        fn open(&self, path: &Path) -> io::Result<Box<dyn Read + '_>> {
+            self.tree.open(path)
+        }
+    }
+
+    #[test]
+    fn a_lenient_tar_leaves_out_what_lost_its_parent() {
+        let t = trees(
+            "
+            merged d0 dir
+            merged d1 dir
+            merged d1/f file data=x
+            merged d2 dir
+            merged d2/g link of=d1/f
+            merged d2/k file data=y
+            merged d4 dir
+            merged d4/a file data=a
+            merged d4/b file data=b
+            merged d5 dir
+            merged d5/m file data=m
+            merged d0/n link of=d5/m
+            ",
+        );
+        let source = Racing {
+            tree: &t["merged"],
+            gone: &["d0", "d1", "d3"],
+            half_gone: &["d4"],
+        };
+        let stat = |path: &str| t["merged"].lstat(Path::new(path)).unwrap();
+        assert!(stat("d1/f").is_linked() && stat("d0/n").is_linked());
+        // Listed as a symlink, a file by the time it is read.
+        let mut was_link = stat("d2/k");
+        was_link.mode = (was_link.mode & !S_IFMT) | S_IFLNK;
+        let change = |kind, path: &str, stat| Change {
+            kind,
+            path: PathBuf::from(path),
+            stat,
+        };
+        let changes = [
+            // A name of d5/m the reference links to it once d5/m is written.
+            change(ChangeKind::Unmodified, "d0/n", Some(stat("d0/n"))),
+            // d1/f, linked as d2/g, lost its directory: d2/g is no link to what the tar
+            // lacks.
+            change(ChangeKind::Add, "d1/f", Some(stat("d1/f"))),
+            change(ChangeKind::Add, "d2/g", Some(stat("d2/g"))),
+            change(ChangeKind::Delete, "d3/h", None),
+            change(ChangeKind::Add, "d2/k", Some(was_link)),
+            // d4 went once it was looked at: it is left out, and all that is in it.
+            change(ChangeKind::Add, "d4/a", Some(stat("d4/a"))),
+            change(ChangeKind::Add, "d4/b", Some(stat("d4/b"))),
+            change(ChangeKind::Add, "d5/m", Some(stat("d5/m"))),
+        ];
+        let mut blob = Vec::new();
+        let (_, _, changed) = commit_changes(&source, &changes, true, &mut blob).unwrap();
+        assert_eq!(
+            changed,
+            ["/d1/f", "/d3/h", "/d2/k", "/d4", "/d4/a", "/d4/b", "/d0/n"]
+        );
+        let mut tar = Vec::new();
+        flate2::read::GzDecoder::new(&blob[..])
+            .read_to_end(&mut tar)
+            .unwrap();
+        assert_eq!(
+            listing(&tar),
+            [
+                "dir d2/ 755",
+                "file d2/g 644 x",
+                "dir d5/ 755",
+                "file d5/m 644 m"
+            ]
+        );
+        assert!(commit_changes(&source, &changes, false, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn a_tree_is_written_whole() {
+        let t = trees(
+            "
+            merged etc dir
+            merged etc/hosts file data=x
+            merged etc/link symlink target=hosts
+            merged sock socket
+            ",
+        );
+        let mut out = Vec::new();
+        let (summary, changed) = write_tree(&t["merged"], &mut out).unwrap();
+        assert!(changed.is_empty());
+        assert_eq!(
+            listing(&out),
+            [
+                "dir etc/ 755",
+                "file etc/hosts 644 x",
+                "symlink etc/link -> hosts"
+            ]
+        );
+        assert_eq!(summary.entries, 3);
+    }
+
     // ---- against the reference ----
 
     #[test]
@@ -3062,6 +3801,7 @@ lower2 o/k file data=k
             Path::new(""),
             &t["b"],
             Path::new(""),
+            false,
             &mut |k, p, s| writer.handle_change(k, p, s),
         )
         .unwrap();

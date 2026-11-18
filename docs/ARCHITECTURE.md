@@ -45,18 +45,20 @@ hooks.
 | `api/generate.rs` | `generate`: the `network create` and `run -d` commands that make machines again from their records, in the order of their dependencies, quoted for a shell |
 | `api/dependencies.rs` | `--depends-on`: the checks (machines of nspawn's, no cycle), the hook that waits for each condition (`await-dependencies`), the verdict on a dependency as its unit and healthcheck show it |
 | `api/copy.rs` | cp, and the Docker API's archive (`StatPath`, CopyTo's extract): tar streams packed and unpacked relative to directory descriptors, paths resolved with openat2 inside the machine's root, tried again when a `..` crossed a rename or mount on the host (EAGAIN) |
-| `api/disk.rs`, `commands/system.rs` | what is an image and what a machine (a record pulled or built and never started is an image only), sizes by kind for `system df`, the prunes of images and of stopped machines, and `system prune` on top of the prunes of the service |
+| `api/disk.rs`, `commands/system.rs` | what is an image and what a machine (a record pulled, built, committed, loaded or imported and never started is an image only), sizes by kind for `system df`, the prunes of images and of stopped machines, and `system prune` on top of the prunes of the service |
+| `api/save.rs`, `api/load.rs` | `save`: images as one tar, an OCI image layout with the Docker image archive's manifest.json beside it, the blobs and manifests as the store keeps them; `load`: such an archive, or a Docker image archive, read once into the store's blobs with their digests taken on the way, its images checked (digests, sizes, platform, a name each) before any is installed as an image made here; `import`: a root filesystem's tar as the gzip layer of a new image |
+| `api/snapshot.rs`, `api/commit.rs`, `api/export.rs` | a machine's tree for `commit` and `export`: its overlay mount or flat directory on the host (never its init's root, which brings its volumes along), read beneath a descriptor of it with openat2, owners shifted back from its user namespace and file capabilities of revision 3 made revision 2; what nspawn and systemd-nspawn wrote or made to mount on left out of a commit; the commit's config (the image's, the machine's settings, `--change` through the Dockerfile dispatcher) and its image installed as a build's is |
 | `uidshift.rs` | an overlay machine's tree shifted into its user namespace by nspawn before its first start, in the hook before systemd-nspawn: owners as systemd-nspawn's chown sets them, ACL entries too, modes and file capabilities kept; the range picked free of the ones running systemd-nspawn instances hold and of other machines' trees |
 | `api/failure.rs` | the kinds of failure an error carries in its chain (no such machine, in use, not running, a bad argument and the others), which the service answers with as error names (`org.nspawn.Error.*`) and a job keeps as its `ErrorName` |
 | `api/wait.rs` | `WaitMachine`: the end of a machine's run from systemd's changes of its unit, the removal of its record from an inotify watch of the records' directory |
-| `api/resolve.rs` | `ResolveImage`: the local record the name of a machine or an image means. `find` reads a record's name, else a reference under the configured registry first, then as Docker Hub's, which never names a machine made from the image but where the image is only read: ResolveImage with names, the image of `run`, `create` and `push`; `name_of` and `machine_of` are how every method of the bus reads one (a name that can be a machine's as it is, any other text by `find`; `machine_of` refuses a reference of no image here as no machine); `resolve` reads a reference as clients of the Docker API do too (Docker Hub's first, then an image built here) |
+| `api/resolve.rs` | `ResolveImage`: the local record the name of a machine or an image means. `find` reads a record's name, else a reference under the configured registry first, then as Docker Hub's, which never names a machine made from the image but where the image is only read: ResolveImage with names, the image of `run`, `create`, `push` and `save`; `name_of` and `machine_of` are how every method of the bus reads one (a name that can be a machine's as it is, any other text by `find`; `machine_of` refuses a reference of no image here as no machine); `resolve` reads a reference as clients of the Docker API do too (Docker Hub's first, then an image built here) |
 | `api/info.rs` | `Info`: the service's version, its machines by state and its images (counted as the Docker API lists them), its defaults and the host's kernel, OS, CPUs and memory; `nspawn info` prints it and the Docker API's `GET /info` maps it into the Engine's shape |
 | `api/recreate.rs`, `api/autoupdate.rs` | a machine made anew from a newer image with its options, and put back from its rollback when the new one does not come up; `auto-update`: candidates by label, the registry asked once per reference, dependents restarted |
-| `dockerapi/` | the Docker Engine API (`api-serve`), served on a machine's own socket and on the host's: who may do what (`access`: a machine's bind, polkit for a host client), routing and versions, containers, images, volumes and networks in the Docker Engine API's shapes, filters, events, logs, stats; the containers' changes through the service (`containers`: create, start, stop, restart, pause, wait, update, remove, prune; `create`: a create's settings as CreateMachine's options), a container's output from the journal until its run ends, and its input kept for its next start, which runs it with RunMachine and holds its terminal for resizes (`attach`, on the connection upgraded or as a body), commands run in a container (`exec`: instances kept in the server's memory, run with Exec, their streams on the connection, their terminals resized, their exit codes kept), a container's files (`archive`: StatPath for a HEAD and the stat header, CopyFrom for a GET, CopyTo's extract for a PUT), pulls (`pull`: the registry's digest first, then PullImage into the image of the reference), the changes of volumes (`volumes`: CreateVolume with labels and the anonymous mark, RemoveVolumes, a prune chosen from ListVolumes), networks (`networks`: CreateNetwork with the API's name, ConnectNetwork, DisconnectNetwork, RemoveNetworks, a prune chosen from the list) and images (`images`: RemoveImages of the records an image's reference or ID names, PruneImages) |
+| `dockerapi/` | the Docker Engine API (`api-serve`), served on a machine's own socket and on the host's: who may do what (`access`: a machine's bind, polkit for a host client), routing and versions, containers, images, volumes and networks in the Docker Engine API's shapes, filters, events, logs, stats; the containers' changes through the service (`containers`: create, start, stop, restart, pause, wait, update, remove, prune; `create`: a create's settings as CreateMachine's options), a container's output from the journal until its run ends, and its input kept for its next start, which runs it with RunMachine and holds its terminal for resizes (`attach`, on the connection upgraded or as a body), commands run in a container (`exec`: instances kept in the server's memory, run with Exec, their streams on the connection, their terminals resized, their exit codes kept), a container's files (`archive`: StatPath for a HEAD and the stat header, CopyFrom for a GET, CopyTo's extract for a PUT), pulls (`pull`: the registry's digest first, then PullImage into the image of the reference), saves, loads, commits, exports and imports (`transfer`: SaveImages and ExportMachine streamed as the body, the body sent to LoadImages and ImportImage, CommitMachine), the changes of volumes (`volumes`: CreateVolume with labels and the anonymous mark, RemoveVolumes, a prune chosen from ListVolumes), networks (`networks`: CreateNetwork with the API's name, ConnectNetwork, DisconnectNetwork, RemoveNetworks, a prune chosen from the list) and images (`images`: RemoveImages of the records an image's reference or ID names, PruneImages) |
 | `build/dockerfile/`, `build/dispatch/` | ports of BuildKit's frontend: the parser, the shell lexer, instructions and flags; stages, build arguments, the steps with their history lines and the image's settings |
 | `build/plan.rs` | the stages and steps of a build, worked out before a step runs |
 | `build/ignore.rs`, `walk.rs`, `copy.rs`, `untar.rs` | the build context: `.dockerignore` patterns and their `!` exceptions, the walk of a context in lexical order without following symlinks, COPY and ADD with every path resolved inside its root, the context's tar and ADD's archives unpacked with every name resolved inside their destination |
-| `build/layer.rs` | a step's layer: what its overlay upper directory changed over the layers below, as an OCI tar (deletions as `.wh.` whiteouts, file capabilities as PAX records), and its gzip blob |
+| `build/layer.rs` | a step's layer: what its overlay upper directory changed over the layers below, as an OCI tar (deletions as `.wh.` whiteouts, file capabilities as PAX records), and its gzip blob; a machine's changes the same way, its upper directory saying where to look (metacopy entries compared by their metadata, renamed and opaque directories walked whole) and its mounted tree what is there, or both trees whole for a flat machine; a whole tree as a tar for `export` |
 | `build/root.rs`, `sandbox.rs` | the overlay mount of a step; the systemd-nspawn of a RUN and the mount points it leaves |
 | `build/cache.rs`, `image.rs`, `exec.rs` | the build cache; the config and manifest; the steps run in order, the layers committed into the store and the images installed |
 | `commands/build.rs`, `compose/engine/build.rs` | `build` of a Dockerfile on the client: the builder picked, the context packed as the user with its ignore file, secrets read; compose's `build` sections, image names and labels |
@@ -78,13 +80,15 @@ hooks.
                      directory of an image without layers
   layers-foreign/    layers shifted into the foreign UID range (mstack)
   blobs/             compressed blobs, kept for push; .hold-* lists the blobs
-                     of a pull, push or build in flight, which the collector
+                     of a pull, push, build, save, load, commit or import in
+                     flight, which the collector
                      leaves alone; the service removes every hold left when
                      it starts, since only it makes them
   .holds             flock between the holds and the collector
   images/NAME.json   the record: reference, manifest_digest, index_digest
                      (the index a tag named at the pull), layers, created,
-                     origin (pull, build or create), built, backend, mode,
+                     origin (pull, build, commit, load, import or create),
+                     built, backend, mode,
                      pid1, started (its first start), run (the image
                      config's command, environment and the rest), network
                      (and network_name for a user-defined one), address,
@@ -121,6 +125,9 @@ hooks.
   starting/NAME      a start in progress, until the machine is registered:
                      nothing removes or replaces the image meanwhile; the
                      service removes every marker left when it starts
+  pausing/NAME       a machine a commit froze, until it thaws it: a service
+                     that ends in between leaves the marker, and the next one
+                     thaws the machine; a marker holds for the boot that made it
   claims/NAME        the host ports of a machine whose ExecStartPre hook
                      passed, until its ExecStartPost or ExecStopPost: the
                      next unit's check sees them before machined does; a
@@ -441,8 +448,8 @@ systemd-nspawn asks about both ends of the range, is not asked (`nspawn_t` reads
 neither `/etc/passwd` nor userdb). Every entry gets the base plus the low 16 bits of
 its IDs, ACL entries included; the setuid and setgid bits the chown clears and the
 file capability are put back. A stop of the start ends the shift between two entries,
-and the root goes last, so that a shift cut short is done again. systemd-nspawn reads
-the base off the root's owner, takes that range, and
+and the root goes last, so that a shift cut short is done again; until then `commit`
+and `export` read an ID in a range by its low 16 bits. systemd-nspawn reads the base off the root's owner, takes that range, and
 finds nothing to change. Should the base be taken by the time it starts or known to
 the user database, or the shift fail (a warning in the unit's journal), it picks
 another and does its own chown. The mount carries `metacopy=on` so that a chown copies
@@ -470,7 +477,8 @@ nothing. Every method is a thin conversion around an `api` function: options
 come as `a{sv}` and are read by name and type (an unknown key is an error), and
 results go back as dictionaries with the command line's spellings.
 
-Pull, push, build, create, cp, auto-update, network connect and disconnect, and
+Pull, push, build, create, cp, save, load, commit, export, import, auto-update,
+network connect and disconnect, and
 every removal and prune (images, machines, volumes, networks, secrets, the
 build cache) run as jobs: the method returns `/org/nspawn/job/N` at once, the
 job's report events become `JobOutput` signals and the object's `Output`, the
@@ -515,8 +523,10 @@ The command line is a client of that service, so one code path does the work:
 `commands/` turns arguments into calls and prints what comes back, follows jobs
 line by line (with a bar for each transfer under way when standard error is a
 terminal, as the progress signals name the blob), attaches the terminal to the
-descriptors `Exec`, `Shell`, `RunMachine`, `Logs` and `Events` hand over, and
-packs or unpacks the tar streams of `CopyTo` and `CopyFrom`. The registry and
+descriptors `Exec`, `Shell`, `RunMachine`, `Logs` and `Events` hand over, packs
+or unpacks the tar streams of `CopyTo` and `CopyFrom`, and moves the archives of
+`SaveImages`, `ExportMachine`, `LoadImages` and `ImportImage` between their pipes
+and standard input and output or a file. The registry and
 CA certificate the command line was given travel as options of the calls that
 reach a registry, so `--registry`, `--ca-cert` and the environment keep their
 meaning.

@@ -113,6 +113,38 @@ pub trait Manager {
         options: Options<'_>,
     ) -> zbus::Result<OwnedObjectPath>;
     #[zbus(allow_interactive_auth)]
+    fn save_images(
+        &self,
+        names: &[String],
+        options: Options<'_>,
+    ) -> zbus::Result<(zbus::zvariant::OwnedFd, OwnedObjectPath)>;
+    #[zbus(allow_interactive_auth)]
+    fn load_images(
+        &self,
+        stream: zbus::zvariant::Fd<'_>,
+        options: Options<'_>,
+    ) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
+    fn commit_machine(
+        &self,
+        machine: &str,
+        reference: &str,
+        options: Options<'_>,
+    ) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
+    fn export_machine(
+        &self,
+        machine: &str,
+        options: Options<'_>,
+    ) -> zbus::Result<(zbus::zvariant::OwnedFd, OwnedObjectPath)>;
+    #[zbus(allow_interactive_auth)]
+    fn import_image(
+        &self,
+        stream: zbus::zvariant::Fd<'_>,
+        reference: &str,
+        options: Options<'_>,
+    ) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn list_secrets(&self) -> zbus::Result<Vec<Dict>>;
     #[zbus(allow_interactive_auth)]
     fn get_secret(&self, name: &str) -> zbus::Result<Dict>;

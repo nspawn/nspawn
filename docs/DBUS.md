@@ -99,7 +99,8 @@ Where SELinux is enforcing (Fedora, RHEL) the service needs a domain of its
 own, `nspawn_t`, as machined and the container runtimes have: the base policy
 lets no domain use the pipes of an unconfined service, so the bus drops the
 service as soon as it passes a descriptor (`Exec`, `Shell`, `RunMachine`,
-`Logs`, `Events`, `CopyFrom`, `CopyTo`), and the client sees a disconnect. The
+`Logs`, `Events`, `CopyFrom`, `CopyTo`, `SaveImages`, `LoadImages`,
+`ImportImage`, `ExportMachine`), and the client sees a disconnect. The
 policy lives in `packaging/selinux` and the `nspawn-selinux` package loads it.
 `--install` warns when SELinux is enabled and the module is not loaded, and,
 with the module loaded, when the binary is not labelled `nspawn_exec_t`, which
@@ -123,22 +124,21 @@ failed (see Errors).
 
 Every method that takes the name of a machine or an image takes the reference of an
 image too. A text that can be a machine's name is a name: the record of that name, or
-nothing, so that a program's names never come to mean an image by chance, a machine
-that went meanwhile included; only `PushImage` reads a name nothing here has as a
-reference. Any other text (`busybox:1.37`, `somos/app:1`) is read as
-`ResolveImage` with names reads it, and names the image pulled or built for it, never a
-machine made from it; `GetImage`, the source of `CreateMachine` and `PushImage` only read
-the image, and take a machine made from it when no image of it is left. A text that names
+nothing, so that a program's names never come to mean an image by chance, a machine that
+went meanwhile included; only `PushImage` reads a name nothing here has as a reference.
+Any other text (`busybox:1.37`, `somos/app:1`) is read as `ResolveImage` with names
+reads it, and names the image pulled or built for it, never a machine made from it;
+`GetImage`, the source of `CreateMachine`, `PushImage` and `SaveImages` only read the
+image, and take a machine made from it when no image of it is left. A text that names
 nothing here reaches the method as it is, which refuses it as any name it does not know;
-a reference of no image here is `NoSuchImage` to `GetImage`, `RemoveImages` and
-`PushImage`, and `NoSuchMachine` (`no machine or image of REFERENCE`) to
+a reference of no image here is `NoSuchImage` to `GetImage`, `RemoveImages`, `PushImage`
+and `SaveImages`, and `NoSuchMachine` (`no machine or image of REFERENCE`) to
 `RemoveMachines` and every method that takes a machine. The command line asks
 `ResolveImage` with names for every reference it is given first, under the registry it
 was given, and sends one nothing here goes by in full under that registry; `run`,
-`create`, `images rm` and `images inspect` read a name nothing here has as a reference
-too (`nspawn images rm busybox`). The
-names a method makes (`CreateMachine`'s, `PullImage`'s name, a build's tags) are taken as
-they are.
+`create`, `save`, `images rm` and `images inspect` read a name nothing here has as a
+reference too (`nspawn images rm busybox`). The names a method makes (`CreateMachine`'s,
+`PullImage`'s name, a build's tags) are taken as they are.
 
 Properties: `Version` (the command line compares it with its own and warns when
 they differ, since the service keeps running the binary it started with),
@@ -154,7 +154,7 @@ with their objects).
 | Key | Type | Meaning |
 |---|---|---|
 | `name`, `reference`, `digest` | s | the local name, the reference pulled or built, the manifest digest |
-| `backend`, `origin`, `mode` | s | overlay, flat or mstack; pull, build or create; boot or app |
+| `backend`, `origin`, `mode` | s | overlay, flat or mstack; pull, build, commit, load, import or create; boot or app |
 | `created` | t | when this record was made here, by a pull, a build or a create; with the name, which machine of the name it is, as events carry it |
 | `signed_by`, `signed_at` | s, t | who signed the image and when, as the pull verified it; empty and 0 without a verified signature |
 | `network` | s | bridge, veth, host, none, `container:NAME` or the primary network's name |
@@ -257,13 +257,13 @@ The job's result `name` is the machine's name.
 
 | Method | Like | Notes |
 |---|---|---|
-| `Info() -> a{sv}` | `info` | version (s, the service's), machines (`a{st}`: total, running, paused, stopped; a record pulled or built that never ran is an image, not a machine), images (t, distinct images by their config: an image and the machines made from it count once), machines_dir, state_dir (s), backend (s, the configured default: auto, overlay, flat or mstack), auto_backend (s, what auto means here: overlay where the kernel has overlayfs, flat otherwise), log_driver (s, a machine's without `--log-driver`), registry (s, the configured one), architecture (s), systemd_version (s, `""` when it cannot be read), and the host's hostname, machine_id, kernel, os (s, PRETTY_NAME of os-release, `Linux` without one), cpus (t) and memory (t, bytes). The Docker API's `GET /info` answers from it |
+| `Info() -> a{sv}` | `info` | version (s, the service's), machines (`a{st}`: total, running, paused, stopped; a record of an image that never ran is an image, not a machine), images (t, distinct images by their config: an image and the machines made from it count once), machines_dir, state_dir (s), backend (s, the configured default: auto, overlay, flat or mstack), auto_backend (s, what auto means here: overlay where the kernel has overlayfs, flat otherwise), log_driver (s, a machine's without `--log-driver`), registry (s, the configured one), architecture (s), systemd_version (s, `""` when it cannot be read), and the host's hostname, machine_id, kernel, os (s, PRETTY_NAME of os-release, `Linux` without one), cpus (t) and memory (t, bytes). The Docker API's `GET /info` answers from it |
 
 ### Images
 
 | Method | Like | Notes |
 |---|---|---|
-| `ListImages() -> aa{sv}` | `images ls` | name, kind, size, read_only (b, machined's read-only flag), and for the images nspawn installed backend, origin, reference, signed_by, image_only (b: a record pulled or built that never ran as a machine, which pulls and prunes may replace), created (t: when the image was made, as its config says; 0 when it says nothing), pulled (t: when it was pulled or built here, the record's created) |
+| `ListImages() -> aa{sv}` | `images ls` | name, kind, size, read_only (b, machined's read-only flag), and for the images nspawn installed backend, origin, reference, signed_by, image_only (b: a record pulled, built, committed, loaded or imported that never ran as a machine, which pulls and prunes may replace), created (t: when the image was made, as its config says; 0 when it says nothing), pulled (t: when it was pulled or built here, the record's created) |
 | `GetImage(s name) -> a{sv}` | `images inspect` | the record (see Records); `NoSuchImage` (`no local image of NAME`) for a name or reference no record has |
 | `PullImage(s reference, a{sv} options) -> o` | `pull` | options name, backend (auto, overlay, flat, mstack), mode (auto, boot, app), force, image_only (b: with force, the record of the name is replaced only while it never ran, `Exists` once it did), verify (b, default true: the signature check the registry's policy asks for; `--no-verify` sends false), registry, ca_cert; a job |
 | `CreateMachine(s source, s name, a{sv} options) -> o` | `create` | the machine options (see Machine options); a job |
@@ -272,8 +272,11 @@ The job's result `name` is the machine's name.
 | `BuildDockerfile(h context, a{sv} options) -> o` | Dockerfile `build`, `compose build` | `context` a tar stream of the build context; options dockerfile (ay, required), tags (as), build_args (as, KEY=VALUE), target (s), no_cache (b), no_cache_filter (as, stages), pull (b), labels (as, KEY=VALUE), network (s: default, none or host), add_hosts (as, HOST:IP or HOST=IP), allow (as: network.host), secrets (a{say}, by id), shm_size (t, bytes), ulimits (as, NAME=SOFT[:HARD]), verify (b, default true), backend, mode, force, registry, ca_cert; a job whose output is the steps' progress; the build stops when its caller leaves the bus. Each tag's image replaces what has the tag's local name while that is an image of the tag's reference that never ran (pulled or built); a machine there (one that ran, starts, runs or shuts down, one an update cut short keeps, or an image machined lists without a record), or an image of another reference, keeps the name, and the image goes beside it with the same reference, into the last image of the reference a build put beside it before (built, never run, named `NAME-N`) or else a free name (`NAME-2`), a note in the output saying so. With force, whatever has the name is replaced, a running machine refused |
 | `PruneBuildCache(a{sv} options) -> o` | `builder prune` | options all (b: what images take too), until (t: entries last used before), keep_storage (t, bytes: the least recently used go until what the cache holds of its own fits); a job |
 | `BuildCacheUsage() -> aa{sv}` | `builder du` | what the build cache holds, most recently used first: id, kind (layer, base or mount), description, size (t), used (t), shared (b, an image takes it too) |
-| `PruneImages(a{sv} options) -> o` | `images prune` | option all (b): every image (a record pulled or built and never started) no machine was made from; without it nothing qualifies; labels (as, KEY or KEY=VALUE), until (t: made before) and names (as: these records only, by their names) narrow it; a job |
+| `PruneImages(a{sv} options) -> o` | `images prune` | option all (b): every image (a record pulled, built, committed, loaded or imported and never started) no machine was made from; without it nothing qualifies; labels (as, KEY or KEY=VALUE), until (t: made before) and names (as: these records only, by their names) narrow it; a job |
 | `DiskUsage() -> a{sv}` | `system df` | images, containers (machines), local_volumes and build_cache, each `a{st}` of total, active, size and reclaimable (bytes); image_rows (`aa{sv}`: name, reference, created, size, containers), container_rows (name, reference, size, running, made: made from an image by create or run, which system prune removes once stopped), volume_rows (name, links, size) |
+| `SaveImages(as names, a{sv} options) -> (h, o)` | `save` | the images the names or references name, as one tar on the pipe: an OCI image layout (`oci-layout`, `index.json`, `blobs/sha256/`) with the `manifest.json` of a Docker image archive beside it, each image under its reference by its tag (`io.containerd.image.name` and the tag as `org.opencontainers.image.ref.name` in the index, `RepoTags` in manifest.json, Docker Hub's without its host and `library/`), its manifest, config and layers as the store keeps them; and a job whose result is names (as). The call itself fails with `NoSuchImage` for a name or reference no record has, and `Invalid` for an image pulled by its digest alone, which no tag names; options: registry (s, the one the images' references are read under) and ca_cert (s) |
+| `LoadImages(h stream, a{sv} options) -> o` | `load` | the images of the archive read from `stream`, plain or compressed with gzip, zstd or bzip2: an OCI image layout, whose index names each image (`io.containerd.image.name`, or `org.opencontainers.image.ref.name` when it is a reference, else the archive's manifest.json tags of its config) and may name an index of several platforms, of which the best one this host runs that the archive holds is taken; or a Docker image archive without an index (`manifest.json`: Config, RepoTags and Layers, links followed). Every image is checked before one is installed (its blobs by their digests and sizes, its config's layers, a platform this host runs, a name) and a failure is `Invalid`; each goes where a tag of `BuildDockerfile` goes, under the name its reference gives, origin load; a job whose result has names (as, where each went), references (as) and ids (as, the config digests), in the same order, its output a `Loaded image: REFERENCE` line per image; a name without a registry is Docker Hub's, but for one whose first part is the registry option's (the service's own without it), which is that registry; options: registry (s), ca_cert (s) |
+| `ImportImage(h stream, s reference, a{sv} options) -> o` | `import` | the tar of a root filesystem read from `stream`, plain or compressed with gzip, zstd or bzip2, read through entry by entry and refused when it does not end with the end of the tar (a stream cut short), as the one layer (gzip) of a new image of this host's platform under `reference` (REPOSITORY[:TAG], read as `pull` reads one; a digest is `Invalid`), which goes where a tag of `BuildDockerfile` goes, origin import; options message (s, the comment of its history entry; "Imported from -" without one), changes (as: Dockerfile instructions that set its settings, as for `CommitMachine`), registry and ca_cert, as for `CommitMachine`; a job whose result has id (the config digest), name and reference |
 | `RemoveImages(as names) -> o` | `images rm` | a job: every name or reference is tried, each record once, and it fails at the end when one could not be removed; a name with nothing behind it fails with `no machine or image named NAME`, a reference of no image here with `no local image of REFERENCE` |
 | `RemoveMachines(as names, a{sv} options) -> o` | `rm` | `RemoveImages` with the option force, which stops a running machine first (SIGKILL) instead of refusing it; a reference of no image here fails with `no machine or image of REFERENCE` |
 
@@ -310,10 +313,12 @@ error that says so.
 | `UpdateMachine(s name, a{sv} options) -> b` | `update` | options restart, memory, memory_swap, cpus, pids_limit, no_healthcheck and the health_* ones, as for `StartMachine` (0 removes a limit, absent keeps it); a running machine gets the limits at once and its probes start over; true when it was running. A machine removed once it ends takes no restart policy but no |
 | `MachineStats(as names) -> aa{sv}` | `stats` | one sample of each named machine that runs (every running container when none is named; names that do not run are left out; a reference of no image here fails with `NoSuchMachine`): name, time_usec (CLOCK_MONOTONIC), cpu_usec, memory (memory.current without inactive_file), memory_limit (the host's memory without a limit), pids, io_read, io_write, net_rx, net_tx; a counter that cannot be read is left out, the network ones on the host's network; rates come from two samples |
 | `MachineProcesses(s name) -> aa{sv}` | `top` | the processes in the machine's PID namespace, from its cgroup: pid (u), user (s, the uid as the machine sees it, root for 0), time (s, CPU time HH:MM:SS), command (s) |
-| `Generate(as names, a{sv} options) -> s` | `generate` | a shell script that makes the named machines again, every machine of nspawn's when none is named: `network create` for the networks they join, then `run -d` with every flag a machine keeps (`pull` for an image without flags of its own), each after the machines it depends on or takes its network from, which come along; what the flags cannot carry (secrets, host directories, images built on this host, a healthcheck in exec form) as comments at the top; options: none (any key is an error) |
+| `Generate(as names, a{sv} options) -> s` | `generate` | a shell script that makes the named machines again, every machine of nspawn's when none is named: `network create` for the networks they join, then `run -d` with every flag a machine keeps (`pull` for an image without flags of its own), each after the machines it depends on or takes its network from, which come along; what the flags cannot carry (secrets, host directories, images made on this host, a healthcheck in exec form) as comments at the top; options: none (any key is an error) |
 | `AutoUpdate(as names, a{sv} options) -> o` | `auto-update` | the machines labelled org.nspawn.auto-update=registry (or io.containers.autoupdate=registry), or the ones named, are made anew from the image their reference names now at its registry, with every option they had, started when they ran, and put back when they do not come up (healthy, with a healthcheck). Option dry_run (b) only looks. A job; each machine's outcome is an `auto-update` event |
 | `Exec(s machine, as argv, s user, a{sv} options) -> (a{sh}, o)` | `exec` | user `""` for the machine's own (its --user, else its image's USER; root without either, and on a booted machine); options tty (default true), rows and cols (t, 24 and 80), env (as, the caller's `TERM=` among them; xterm otherwise on a terminal), workdir (s, instead of the machine's), detach (b: no streams come back, the output is discarded and the command runs on); returns the streams ("tty", or "stdin", "stdout", "stderr") and a process object |
 | `Shell(s machine, s user, a{sv} options) -> (h, s)` | `shell` | user `""` for root; the login session machined offers for a booted machine: its pseudo terminal and the terminal's path; options env, as for `Exec`; apps get `Exec` of a shell with a tty instead |
+| `CommitMachine(s machine, s reference, a{sv} options) -> o` | `commit` | what the machine (an overlay or flat one, running or not) changed over its image, as a new image under `reference` (REPOSITORY[:TAG], read as `pull` reads one; a digest is `Invalid`): the image's layers and one more (gzip) with the changes, none when there are none; its settings the image's with the machine's on top (environment, entrypoint and command when given, user, working directory, stop signal, labels but the ones that place a machine in a compose project, healthcheck flags, published ports as exposed ones), its mode the machine's unless the changes give another entrypoint or command, and a history entry. Volumes, binds and tmpfs are no part of it; nor are changes to `/etc/hosts`, `/etc/resolv.conf`, `/etc/hostname`, `/etc/machine-id` and `/etc/localtime`, the empty files and directories made to mount on, the links to `/usr` systemd-nspawn makes where the image has none, the journal directory of the machine's ID, or a file capability that systemd-nspawn's own chown into a user namespace took; owners are the image's, whatever user namespace the machine ran in. Options author (s), message (s, the comment of the history entry), changes (as: Dockerfile instructions CMD, ENTRYPOINT, ENV, EXPOSE, HEALTHCHECK, LABEL, ONBUILD, STOPSIGNAL, USER, VOLUME or WORKDIR, applied to the settings in order; any other is `Invalid`), pause (b, default true: a running machine's cgroup is frozen while its files are read, and thawed after, by the next start of the service should it end in between; without it, what the machine removes before it is read is left out, and a file whose size changes while it is read goes in at the size it had, cut or filled with zeros), registry and ca_cert (the registry a reference without one is read under). The image goes where a tag of `BuildDockerfile` goes, origin commit; an mstack machine fails; a job whose result has id (the config digest), name and reference |
+| `ExportMachine(s machine, a{sv} options) -> (h, o)` | `export` | `NoSuchMachine` from the call itself for a name nothing has; the machine's tree (an overlay or flat one, running or not) as a tar on the pipe, owners as its image has them; volumes, binds and tmpfs are no part of it; a running machine runs on, what it removes before it is read is left out, and a file whose size changes while it is read goes in at the size it had, cut or filled with zeros; an mstack machine fails; a job whose result is name; options: none |
 | `StatPath(s machine, s path) -> a{sv}` | | what lstat says of `path` inside a running machine, or a stopped overlay or flat one, its last component not followed unless `path` ends in `/`, `/.` or `/..`: name (s, the last element of `path`, slashes at the end left out: `/` for the root, `.` for `DIR/.`), size (t), mode (u, st_mode, its type bits included), mtime (x, unix nanoseconds), link_target (s: for a link, where it leads inside the machine as an absolute path, every link on the way followed and what is missing taken as written; empty for anything else); `NoSuchPath` when the path, or a directory on the way, is not there; `Invalid` for an empty path, and for a path at or below a volume of a stopped machine, which is mounted only while it runs |
 | `CopyFrom(s machine, s path, a{sv} options) -> (h, o)` | `cp NAME:PATH ...` | a tar stream of `path` on the pipe, owners as the machine sees them, and a job with the outcome; a running machine, or a stopped overlay or flat one; option name (s): the name of the stream's top entry, the entries below it named under it byte for byte and a directory with a slash after it: one name of a path, `.` (entries `./` and `./NAME`) or `/` (entries `/` and `/NAME`); without it the top is named as `cp` names it. A path that is not there fails the job with `NoSuchPath`; one at or below a volume of a stopped machine, mounted only while it runs, or holding one, is `Invalid` |
 | `CopyTo(s machine, s path, h stream, a{sv} options) -> o` | `cp ... NAME:PATH` | the tar stream read from `stream` unpacked at `path` by `cp`'s rules (see USAGE.md), everything root's inside; option contents (b: the source was `DIR/.`); a job. Option extract (b), which excludes contents: the stream, plain or compressed with gzip, bzip2, xz or zstd, written beneath `path`, an existing directory once its links are followed (`NoSuchPath` when nothing is there, `Invalid` for anything else), each entry by its own name: a leading `/` dropped, a name or a relative link that leads above `path` refused, the directories an entry implies made with mode 0755 and root's owner, owners (on a machine with a user namespace, those outside its 65536 IDs as 65534) and modes from the headers, a directory of the stream merged into one that is there and giving it its owner and mode, anything else there replaced (a directory with all it holds, never across a mount); sockets, devices and fifos are left out with a note. With extract: owner (s, USER[:GROUP], each a name the machine's /etc/passwd or /etc/group lists or a number, as the user a container's files get: every entry's owner instead of its header's; empty is none) and no_overwrite_dir_non_dir (b: a directory never replaces anything else, nor anything else a directory). A read-only root where no writable volume is mounted over `path`, a volume mounted read-only there, or any read-only mount at `path`, is `Invalid`, and so is a path at or below a volume of a stopped machine (mounted only while it runs; an entry that would land there, by its name or through a link, fails the job, with extract or without). These checks answer the call itself, before the job starts |
@@ -386,7 +391,7 @@ API name can be (one with a `.`, or longer than 64 bytes) that no network has is
 | `JobOutput(o job, s kind, s line)` | a job said a line: kind "line" (progress, a result) or "note" (a remark); lines queued back to back go out in one signal, joined by newlines, up to 64 KiB |
 | `JobProgress(o job, s item, t done, t total)` | how far a blob transfer of a job got (a pull, a push, a build fetching a base image, an auto-update): `done` bytes of `total` (0 when unknown) of blob `item` (its short digest); when the transfer starts, a few times a second, and when it ends. Not kept in `Output` |
 | `JobRemoved(o job, s result)` | a job ended, "done" or "failed" |
-| `ImageAdded(s name)` | after `PullImage`, `CreateMachine`, `BuildImage`, and `BuildDockerfile` (one per tag) |
+| `ImageAdded(s name)` | after `PullImage`, `CreateMachine`, `BuildImage`, `BuildDockerfile` (one per tag), `LoadImages` (one per image), `ImportImage` and `CommitMachine` |
 | `ImageRemoved(s name)` | after `RemoveImages`, `RemoveMachines` and `PruneImages`; a `--rm` machine removed by its transient unit sends none |
 | `MachineStarted(s name)`, `MachineStopped(s name)` | machined's own events, for the machines nspawn installed |
 
@@ -412,7 +417,7 @@ entries are PID 1's about `systemd-nspawn@` units and nspawn's own (message ID
 
 | Type | Actions | Attributes of every action | The action's own |
 |---|---|---|---|
-| `machine` | `start`, `die`, `stop`, `restart`, `oom`, `fail` (systemd's, for every `systemd-nspawn@` unit), `pull`, `build`, `create`, `push`, `kill`, `update`, `pause`, `unpause`, `health_status`, `auto-update`, `remove` (nspawn's) | `image` (the record's reference), `created` (which machine of the name it was), `api_name` (nspawn's actions, when the record has one) | `die`: `code` (`exited`, `killed`, `dumped`), `exit_code` (that run's exit code, the program's or 128 plus its signal: from the signal nspawn sent to it while the record exists, from the status systemd logged once it is gone), `signal`; `restart`: `restarts`; `fail`: `result`; `pull`: `reference`, `signed_by` (when a signature was verified); `build`: `reference`; `create`: `from`, `reference`; `push`: `reference` (the destination); `kill`: `signal`; `health_status`: `status`; `auto-update`: `result`, `from`, `to` |
+| `machine` | `start`, `die`, `stop`, `restart`, `oom`, `fail` (systemd's, for every `systemd-nspawn@` unit), `pull`, `build`, `commit`, `load`, `import`, `create`, `push`, `kill`, `update`, `pause`, `unpause`, `health_status`, `auto-update`, `remove` (nspawn's) | `image` (the record's reference), `created` (which machine of the name it was), `api_name` (nspawn's actions, when the record has one) | `die`: `code` (`exited`, `killed`, `dumped`), `exit_code` (that run's exit code, the program's or 128 plus its signal: from the signal nspawn sent to it while the record exists, from the status systemd logged once it is gone), `signal`; `restart`: `restarts`; `fail`: `result`; `pull`: `reference`, `signed_by` (when a signature was verified); `build`, `commit`, `load`, `import`: `reference`; `create`: `from`, `reference`; `push`: `reference` (the destination); `kill`: `signal`; `health_status`: `status`; `auto-update`: `result`, `from`, `to` |
 | `network` | `create`, `remove`, `connect`, `disconnect` | `subnet`, `interface`, `internal`, `created`, `api_name` (when the network has one); the event's name is the network's own | `connect`, `disconnect`: `container`, `container_created` |
 | `volume` | `create`, `remove` | `path` | |
 | `secret` | `create`, `remove` | `size` (bytes of the plaintext) | |
@@ -472,13 +477,15 @@ property lists them.
 
 A job is returned by the long operations and keeps what happened. Properties:
 
-- `Kind`: pull, create, push, build, rm, cp, volume-rm, volume-prune, secret-rm,
-  network-rm, network-connect, network-disconnect, network-prune, image-prune,
-  machine-prune, builder-prune, auto-update or wait.
+- `Kind`: pull, create, push, build, rm, cp, save, load, commit, export, import,
+  volume-rm, volume-prune, secret-rm, network-rm, network-connect,
+  network-disconnect, network-prune, image-prune, machine-prune, builder-prune,
+  auto-update or wait.
 - `Target`: the image name, reference or tag it works on (the API name of a
   create whose machine's name is made of it), `MACHINE:PATH` for cp, the machine
-  for network-connect, network-disconnect and wait, the names joined by spaces
-  for a removal, empty for the prunes and auto-update.
+  for network-connect, network-disconnect, wait, commit and export, the names
+  joined by spaces for a removal or a save, empty for the prunes, auto-update and
+  load.
 - `State`: running, done or failed. A removal or prune that failed for some
   names is failed with its `Result` still listing what it removed.
 - `Output`: its last thousand lines, at most 1 MiB of them; lines that come
@@ -503,6 +510,10 @@ A job is returned by the long operations and keeps what happened. Properties:
 | wait | exit_code (i) |
 | auto-update | machines (aa{ss}: name, image, policy, updated (false, pending, true, failed, rolled back or skipped), reason, from, to) |
 | cp | entries, bytes |
+| save | names (as) |
+| load | names (as), references (as), ids (as) |
+| commit, import | id, name, reference |
+| export | name |
 | network-connect, network-disconnect | empty |
 
 The service does not go idle before a job or a process has announced its end.

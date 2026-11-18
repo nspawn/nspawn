@@ -771,6 +771,60 @@ fn choose_entries(manifests: &[ImageIndexEntry], host: &HostPlatform) -> IndexCh
     }
 }
 
+/// The entries of an index this host runs, best first: those of the platforms it runs by
+/// rank, equals in the index's order, then those naming no platform, whose configs say.
+/// A load tries them in turn, as an archive may lack the blobs of some.
+pub(crate) fn host_entries(manifests: &[ImageIndexEntry]) -> Vec<usize> {
+    ranked_entries(manifests, &HostPlatform::current())
+}
+
+fn ranked_entries(manifests: &[ImageIndexEntry], host: &HostPlatform) -> Vec<usize> {
+    let vector = platform_vector(host);
+    let mut listed = Vec::new();
+    let mut unlisted = Vec::new();
+    for (index, entry) in manifests.iter().enumerate() {
+        let Some(platform) = &entry.platform else {
+            unlisted.push(index);
+            continue;
+        };
+        let rank = platform_rank(
+            &vector,
+            host,
+            &platform.os.to_string(),
+            &platform.architecture.to_string(),
+            platform.variant.as_deref().unwrap_or(""),
+        );
+        if let Some(rank) = rank {
+            listed.push((rank, index));
+        }
+    }
+    listed.sort_unstable();
+    listed
+        .into_iter()
+        .map(|(_, index)| index)
+        .chain(unlisted)
+        .collect()
+}
+
+/// Whether this host runs an image whose config is `config`; the platform it names
+/// either way, "unknown" for a config that names none.
+pub(crate) fn host_runs_config(config: &[u8]) -> (bool, String) {
+    let host = HostPlatform::current();
+    match config_platform(config) {
+        Some((os, architecture, variant)) => (
+            platform_rank(&platform_vector(&host), &host, &os, &architecture, &variant).is_some(),
+            platform_name(&os, &architecture, &variant),
+        ),
+        None => (false, "unknown".to_string()),
+    }
+}
+
+/// This host's platform, as an image names its own.
+pub(crate) fn host_platform_name() -> String {
+    let host = HostPlatform::current();
+    platform_name(&host.os, &host.architecture, &host.variant)
+}
+
 /// The OS, architecture and variant an image's config gives; None for a config that is
 /// no image's, an artifact's.
 fn config_platform(config: &[u8]) -> Option<(String, String, String)> {
@@ -941,6 +995,23 @@ mod platform_tests {
             choose_entries(&entries[4..], &host("amd64", "")),
             IndexChoice::Unlisted(Vec::new())
         );
+    }
+
+    #[test]
+    fn every_entry_a_host_runs_is_ranked_best_first() {
+        let entries = [
+            without_platform(),
+            entry("linux", "arm", "v7"),
+            entry("linux", "amd64", ""),
+            entry("linux", "arm64", "v8"),
+            entry("linux", "arm", "v6"),
+            entry("linux", "arm64", ""),
+        ];
+        assert_eq!(
+            ranked_entries(&entries, &host("arm64", "v8")),
+            [3, 5, 1, 4, 0]
+        );
+        assert_eq!(ranked_entries(&entries, &host("amd64", "")), [2, 0]);
     }
 
     #[test]

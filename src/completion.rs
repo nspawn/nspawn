@@ -324,6 +324,10 @@ mod tests {
                 ("nspawn images rm ", &["db", "fedora-44", "old", "web"]),
                 ("nspawn create ", &["db", "fedora-44", "old", "web"]),
                 ("nspawn push ", &["db", "fedora-44", "old", "web"]),
+                ("nspawn save ", &["db", "fedora-44", "old", "web"]),
+                ("nspawn save web ", &["db", "fedora-44", "old", "web"]),
+                ("nspawn commit ", &["db", "fedora-44", "old", "web"]),
+                ("nspawn export ", &["db", "fedora-44", "old", "web"]),
                 // run takes a local image by its name or its reference.
                 (
                     "nspawn run ",

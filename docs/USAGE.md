@@ -31,22 +31,22 @@ image of the configured registry's is here), and names the image pulled or built
 the last one made of several: `busybox:1.37`, `docker.io/library/busybox:1.37` and
 `busybox-1.37`, the name it was pulled under, are one image to `run`, `create`, `push`,
 `rm`, `images rm`, `inspect`, `images inspect`, `start`, `exec`, `logs`, `network
-connect` and the rest. The commands that take an image, `run`, `create`, `push`, `images
-rm` and `images inspect`, read a name nothing here has as a reference too: `nspawn run
-busybox` and `nspawn images rm busybox` take the image of `busybox:latest`, whatever its
-name. The MACHINE of `cp`'s MACHINE:PATH is a name.
+connect` and the rest. The commands that take an image, `run`, `create`, `push`, `save`,
+`images rm` and `images inspect`, read a name nothing here has as a reference too:
+`nspawn run busybox` and `nspawn images rm busybox` take the image of `busybox:latest`,
+whatever its name. The MACHINE of `cp`'s MACHINE:PATH is a name.
 
 A reference never names a machine made from the image, which has a name of its own: `rm
 nginx:latest` removes the image and leaves the machines made from it, and `stop
 nginx:latest` stops none. Where the image is only read (`inspect`, `images inspect`,
-`push`), a machine made from it holds it too and is taken when no image of it is left.
-`run` and `create` make the machine from the image, and pull it again when only
-machines made from it are here. A text that names nothing here goes to the command as
-it is (a reference in full under `--registry`, when the command line is given one, for
-the service to read the same), which refuses it: a reference of no image here is `no
-local image of REFERENCE` to `images rm`, `images inspect`, `push` and `run --pull
-never`, and `no machine or image of REFERENCE` to the commands that take a machine
-(`rm`, `inspect`, `stop`, `exec`, `logs` and the rest; `start` adds how to pull it).
+`push`, `save`), a machine made from it holds it too and is taken when no image of it is
+left. `run` and `create` make the machine from the image, and pull it again when only
+machines made from it are here. A text that names nothing here goes to the command as it
+is (a reference in full under `--registry`, when the command line is given one, for the
+service to read the same), which refuses it: a reference of no image here is `no local
+image of REFERENCE` to `images rm`, `images inspect`, `push` and `run --pull never`, and
+`no machine or image of REFERENCE` to the commands that take a machine (`rm`, `inspect`,
+`stop`, `exec`, `logs` and the rest; `start` adds how to pull it).
 
 ## run and build
 
@@ -549,10 +549,10 @@ or between `--since` and `--until` (a duration ago such as `42m`, an RFC
 3339 time, or journalctl's `-1h` or `today`), filtered by name, type, event or label,
 as text or `--json`. The actions of a machine are systemd's `start`, `die` (with its
 exit code), `stop`, `restart`, `oom` and `fail`, and nspawn's own `pull`, `build`,
-`create`, `push`, `kill`, `update`, `pause`, `unpause`, `health_status`, `auto-update`
-(with `result=`, `from=` and `to=`) and `remove`; those of a network `create`,
-`remove`, `connect` and `disconnect`; those of a volume or a secret `create` and
-`remove`.
+`commit`, `load`, `import`, `create`, `push`, `kill`, `update`, `pause`, `unpause`,
+`health_status`, `auto-update` (with `result=`, `from=` and `to=`) and `remove`; those
+of a network `create`, `remove`, `connect` and `disconnect`; those of a volume or a
+secret `create` and `remove`.
 
 nspawn's own events of a type carry the same attributes whatever the action, so a
 `remove` says as much as a `create`: `image=` and `created=` (which machine of the name
@@ -601,25 +601,25 @@ printf '[Socket]\nSymlinks=/run/docker.sock\n' | sudo tee /etc/systemd/system/ns
 sudo systemctl daemon-reload && sudo systemctl restart nspawn-api.socket
 ```
 
-The API answers in the shapes of the Docker Engine API 1.51, and of the versions down
-to 1.24 that clients ask for: `_ping`, `version` and `info`, the machines as containers
+The API answers in the shapes of the Docker Engine API 1.51, and of the versions down to
+1.24 that clients ask for: `_ping`, `version` and `info`, the machines as containers
 with their labels, networks and addresses, inspect with the environment, events as they
 happen, logs, stats and top, the networks, the images and the volumes. Clients make,
 start, attach to (their input too), exec in, copy files to and from, and remove
-containers, pull and remove images, and make, join and remove volumes and networks:
-GitLab Runner's docker executor runs its jobs through it, and the `docker` command works
-with `DOCKER_HOST` set to it. Builds, loads, tags, pushes and commits of images, swarm
-and plugins are not served. A record pulled
-or built that never ran is an image there, not a container, and a machine made from it
-is a container. Images are told apart by their config: an image's ID is its config's
-digest, its tags are the references its records were pulled or built as, and a
-reference names the image of the last record pulled with it. An image built here with
-a name without a registry, which nspawn files under the configured registry
-(`hub.nspawn.org/somos/app:1` for `nspawn build -t somos/app:1`), goes by that short
-name too while Docker Hub's image of it is not here: `docker run somos/app:1` and
-`docker image inspect somos/app:1` find it. The service decides which local image a name
-means, for the command line and the API alike (`ResolveImage`), each reading a name
-without a registry its own way.
+containers, commit and export them, pull, remove, save and load images, import them, and
+make, join and remove volumes and networks: GitLab Runner's docker executor runs its
+jobs through it, and the `docker` command works with `DOCKER_HOST` set to it. Builds,
+tags and pushes of images, swarm and plugins are not served. A record pulled or built
+that never ran is an image there, not a container, and a machine made from it is a
+container. Images are told apart by their config: an image's ID is its config's digest,
+its tags are the references its records were pulled or built as, and a reference names
+the image of the last record pulled with it. An image made here (built, committed,
+loaded or imported) with a name without a registry, which nspawn files under the
+configured registry (`hub.nspawn.org/somos/app:1` for `nspawn build -t somos/app:1`),
+goes by that short name too while Docker Hub's image of it is not here: `docker run
+somos/app:1` and `docker image inspect somos/app:1` find it. The service decides which
+local image a name means, for the command line and the API alike (`ResolveImage`), each
+reading a name without a registry its own way.
 
 Containers are made and run through the bus service, as the command line's requests
 are: `POST /containers/create`, `start`, `stop`, `restart`, `kill`, `pause`, `unpause`,
@@ -651,8 +651,10 @@ answers 404 before anything is pulled. Otherwise it replaces the record of the r
 never ran, or makes a new one under a free name (`busybox-1.37-2`), as `compose pull`
 does, and the containers made from an image keep it. Its messages are the engine's
 progress stream; the credentials are those of `nspawn login`, and `X-Registry-Auth` is
-not read. A pull of every tag of a repository, an import (`fromSrc`) and a platform
-other than the host's are refused.
+not read. A pull of every tag of a repository and a platform other than the host's are
+refused. With `fromSrc=-` the request imports the tar in its body, as `nspawn import`
+does, under `repo` and `tag`, with `message` and `changes`, and answers the image's ID
+in the stream; an import from a URL is refused with 501.
 
 An attach streams what the container writes from then on (from its creation with
 `logs`) until its run ends, the one under way or the next: a client attaches to a
@@ -752,9 +754,21 @@ containers keep their image, which stays listed under their references. `POST
 (pulled by digest alone, or whose tag went to a newer image), with `dangling=false`
 every image no container was made from; `label` and `until` (counted from the pull or
 the build on this host) narrow them, and `label!` is refused with 400. `POST
-/build/prune` removes nothing, as the build cache the API shows is empty. Loads,
-imports, tags, pushes, commits and builds of images answer 501 with "not supported", as
-reads of swarm objects and of a plugin do; the list of plugins is empty.
+/build/prune` removes nothing, as the build cache the API shows is empty. Tags, pushes
+and builds of images answer 501 with "not supported", as reads of swarm objects and of
+a plugin do; the list of plugins is empty.
+
+`GET /images/get` (with `names`) and `GET /images/{name}/get` answer the archive
+`nspawn save` writes, and `POST /images/load` loads one as `nspawn load` does,
+answering a `Loaded image:` line per image (or the error) in a JSON stream. `POST
+/commit` commits a container as `nspawn commit` does, `repo` and `tag` naming the image
+(read as the engine's clients name images: one without a registry is Docker Hub's),
+with `author`, `comment`, `changes` and `pause`, and answers 201 with its ID; a config
+in the request's body that sets anything is refused with 400, and so is a commit
+without `repo`, since nspawn keeps an image under its name. `GET
+/containers/{id}/export` answers the tar `nspawn export` writes. A `platform` other
+than the host's is refused with 400 by a save, a load and an import, as by a pull. All
+of them ask for `org.nspawn.manage`.
 
 Each machine has its own socket, `/run/nspawn/api/NAME.sock`, opened by systemd
 (`nspawn-api@NAME.socket`) before the machine starts and closed after it stops; the
@@ -797,12 +811,12 @@ volumes. Machines that share its network (`--network container:`) start again wi
 and so do compose services whose `depends_on` asks for `restart: true`; a compose
 machine's image label follows, so that `compose up` does not take it back.
 
-These are left alone as `skipped`: built images, references pinned by digest, `run
---rm` machines, booted machines (their state is their writable layer), flat and mstack
-ones, the `local` policy, and machines whose image declares a volume no `-v` covers.
-The reason goes to standard error for the machines named on the command line, and is in
-`--json` for all. A policy that is none of these (a misspelt one) is `failed`, so that
-the run and its timer show it.
+These are left alone as `skipped`: images made on this host (built, committed, loaded or
+imported), references pinned by digest, `run --rm` machines, booted machines (their
+state is their writable layer), flat and mstack ones, the `local` policy, and machines
+whose image declares a volume no `-v` covers. The reason goes to standard error for the
+machines named on the command line, and is in `--json` for all. A policy that is none of
+these (a misspelt one) is `failed`, so that the run and its timer show it.
 
 An update cut short (a crash, a stop of the service) is put back at the next run (not
 `--dry-run`) or start of the service, unless its new image was in place and the machine
@@ -945,6 +959,80 @@ image named NAME`, a reference of no image here with `no local image of REFERENC
 (`no machine or image of REFERENCE` from `rm`); the other names of the same command
 are still tried.
 
+### save, load, commit, export and import
+
+`nspawn save IMAGE...` writes images to one tar archive, on standard output or into a
+file with `-o` (a terminal is refused): an OCI image layout (`oci-layout`,
+`index.json`, `blobs/sha256/`) with the `manifest.json` of the Docker image archive
+beside it, so that `nspawn load` and `docker load` both read it. Each image goes under
+its reference, and its manifest, config and layers go as the store keeps them: an
+image pulled keeps the digests its registry gave it, and nothing is compressed again.
+An image pulled by its digest alone is refused, as an archive names an image by a
+tag.
+
+`nspawn load` reads such an archive from standard input or from a file (`-i`), plain
+or compressed with gzip, zstd or bzip2: an OCI image layout, whose index names the
+images (an index of several platforms gives the image of the best platform this host
+runs that the archive holds), or a Docker image archive, whose `manifest.json` names
+them and says where their layers are. A name without a registry is Docker Hub's, but
+for one under the configured registry where its host has no dot or port. Everything
+is checked before an image is installed: the blobs against their digests, the
+platform, a name for every image. Each image goes
+under the name its reference gives, as `build -t` places one: an image of the same
+reference that never ran gives way, and a machine or an image of another reference
+keeps the name while the new image goes beside it. `-q` prints only the images
+loaded.
+
+`nspawn commit MACHINE REPOSITORY[:TAG]` makes an image of what a machine changed over
+its image: the image's layers and one more with the changes, and the image's settings
+with the machine's on top (environment, entrypoint and command when given, user,
+working directory, stop signal, labels but the ones that place a machine in a compose
+project, healthcheck flags, and its published ports as exposed ones). `-c` applies a
+Dockerfile instruction to the settings (`CMD`, `ENTRYPOINT`, `ENV`, `EXPOSE`,
+`HEALTHCHECK`, `LABEL`, `ONBUILD`, `STOPSIGNAL`, `USER`, `VOLUME` or `WORKDIR`), `-a`
+and `-m` give the author and the comment of its history entry. The image boots, or runs
+its command, as the machine does, unless `-c` gives it another entrypoint or command,
+which then says. A running machine is frozen while its files are read and thawed after
+(by the next start of the service, should the service end in between); with
+`--pause=false` it runs on: what it removes before it is read is left out, and a
+file whose size changes while it is read goes in at the size it had when it was
+listed, cut or filled with zeros. The image goes where `load` puts one, and `commit`
+prints its ID.
+
+The new layer holds what the machine itself changed, owned as the image owns its
+files whatever user namespace the machine runs in. Volumes, binds and tmpfs are no
+part of a machine's tree, so of the layer either. What nspawn and systemd-nspawn
+write into the tree for the machine (`/etc/hosts`, `/etc/resolv.conf`,
+`/etc/hostname`, `/etc/machine-id` and `/etc/localtime`) keeps the image's version,
+and what systemd-nspawn makes for the machine is left out: the empty files and
+directories made to mount something on (a volume's target the image lacks, the getent
+stand-in, `/run`), the links to `/usr` (`/sbin`, `/lib64`) an image without them gets,
+and the journal directory of the machine's ID. A tree that systemd-nspawn shifted
+into a user namespace with its own chown lost its files' capabilities (`arping`,
+`newuidmap`), and a file that differs from the image's in that alone keeps the image's,
+capability included.
+
+`nspawn export MACHINE` writes a machine's whole tree as a tar, on standard output or
+into a file with `-o`, owned as the image owns its files, without its volumes, binds
+and tmpfs; its files' capabilities are the machine's. A running machine runs on, as for `commit --pause=false`: what it
+removes before it is read is left out, and a file whose size changes while it is read
+goes in at the size it had when it was listed, cut or filled with zeros. `nspawn
+import FILE|- REPOSITORY[:TAG]`
+makes an image of one layer from the tar of a root filesystem, plain or compressed
+with gzip, zstd or bzip2, for this host's platform; a tar that ends before its end (a
+stream cut short) is refused; `-c` and `-m` work as for
+`commit`, and without a `CMD` or an `ENTRYPOINT` a machine of it needs its command
+given to `run`.
+
+`commit` and `export` work on overlay and flat machines; an mstack machine is
+refused, since its root exists only inside it while it runs. A flat machine keeps no
+record of what came from its image, so its changes are found by comparing its whole
+tree with the image's layers, which takes as long as reading both.
+
+An image committed, loaded or imported is made on this host, as one built is:
+`auto-update` leaves it alone, and `generate` says to push it before its script runs
+elsewhere.
+
 ### The same machines on another host
 
 `nspawn generate [NAME...]` prints the commands that make machines again, on another
@@ -962,11 +1050,13 @@ the script starts the machines as they were brought up here.
 
 What a flag cannot carry is said in comments at the top: a secret is encrypted for this
 host, so `nspawn secret create` it there first; a host directory a machine mounts has to
-exist there; an image built here has to be pushed first; a healthcheck in exec form
-comes back as `--health-cmd`, which runs it through `/bin/sh`, so the image needs one.
-The contents of named volumes and of a machine's writable layer stay behind, and so do
-the addresses nspawn handed out: volumes are seeded again from the image, and only
-addresses fixed with `--ip` come along.
+exist there; an image made here has to be pushed first, or carried over with `save`
+and `load`; a healthcheck in exec form comes back as `--health-cmd`, which runs it
+through `/bin/sh`, so the image needs one. The contents of named volumes and of a
+machine's writable layer stay behind (`commit` makes an image of the writable layer,
+which goes the way of any image made here), and so do the addresses nspawn handed out:
+volumes are seeded again from the image, and only addresses fixed with `--ip` come
+along.
 
 ### Completions, the man page and JSON
 

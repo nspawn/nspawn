@@ -310,7 +310,7 @@ pub enum Ids {
 impl Ids {
     /// The ID inside the machine of a file the host sees owned by `id`: the same with no
     /// shift, nobody's for one outside the machine's 65536 IDs.
-    fn outward(self, id: u32) -> u32 {
+    pub(crate) fn outward(self, id: u32) -> u32 {
         match self {
             Ids::Keep | Ids::Shift(0) => id,
             Ids::Shift(base) if id >= base && id - base < 65536 => id - base,
@@ -356,7 +356,7 @@ fn nix_error(e: Errno, what: &Path) -> anyhow::Error {
     }
 }
 
-fn scoped_raw(root: BorrowedFd<'_>, path: &Path, flags: OFlag) -> nix::Result<OwnedFd> {
+pub(crate) fn scoped_raw(root: BorrowedFd<'_>, path: &Path, flags: OFlag) -> nix::Result<OwnedFd> {
     let lookup: &Path = if path.as_os_str().is_empty() {
         Path::new(".")
     } else {

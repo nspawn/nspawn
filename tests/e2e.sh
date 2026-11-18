@@ -38,6 +38,17 @@ export -f grep_q
 host_ipv6=$(python3 -c 'import socket; socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)' 2>/dev/null && echo yes || true)
 # Runs a command on a pseudo terminal of its own (script(1) is not on every host).
 pyrun() { python3 -c 'import os, pty, sys; sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' "$@"; }
+# The entries of the last layer of a local image, owner, size and name, a line each.
+last_layer() {
+  python3 - "$1" <<'EOF'
+import gzip, json, sys, tarfile
+m = json.load(open(f"/var/lib/nspawn/manifests/{sys.argv[1]}.json"))
+blob = "/var/lib/nspawn/blobs/" + m["layers"][-1]["digest"].replace(":", "-")
+with tarfile.open(fileobj=gzip.open(blob)) as t:
+    for e in t:
+        print(f"{e.uid}:{e.gid} {e.size} {e.name}")
+EOF
+}
 # A machine's address on its network, as inspect has it.
 addr_of() { $NSPAWN inspect "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)[0].get('address') or '')"; }
 # What inspect says of a machine that generate's script must give again: not what a new
@@ -103,7 +114,7 @@ cleanup_machines() {
   if rm -f /etc/systemd/system/systemd-nspawn@e2e-cphold.service.d/e2e-hold.conf 2>/dev/null; then
     systemctl daemon-reload
   fi
-  for m in e2e-hapi-made e2e-hapi-img e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-nsuser e2e-dev e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wexit e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc e2e-v6 e2e-v6b e2e-v6c e2e-v6d e2e-v6u e2e-v6low e2e-notify e2e-fwd e2e-cbind-w-1 e2e-cphold; do
+  for m in e2e-hapi-made e2e-hapi-img e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-nsuser e2e-dev e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wexit e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc e2e-v6 e2e-v6b e2e-v6c e2e-v6d e2e-v6u e2e-v6low e2e-notify e2e-fwd e2e-cbind-w-1 e2e-slce-1 e2e-slce-imp-1 e2e-slce-held e2e-bcommit-overlay e2e-bcommit-flat e2e-bcommit-mstack e2e-dk-commit-1 e2e-dk-import-1 e2e-cphold; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -560,6 +571,31 @@ sys.exit(1 if lost else 0)
 ' "/var/lib/machines/$name" || fail "$name lost file capabilities its image has"
     [ "$(stat -c %u "/var/lib/machines/$name")" -ge 65536 ] || fail "the tree of $name is not shifted into a user namespace: root owned by $(stat -c %u "/var/lib/machines/$name")"
   fi
+  step "commit and export of a booted machine ($backend)"
+  if [ "$backend" = mstack ]; then
+    out=$($NSPAWN commit "$name" e2e-bcommit:mstack 2>&1) && fail "commit of an mstack machine"
+    echo "$out" | grep_q "mstack" || fail "the commit of an mstack machine was refused without saying why: $out"
+  else
+    # Owned by 1:1 inside the user namespace; the volume's file stays out of both.
+    $NSPAWN exec "$name" -- /bin/sh -c "echo bc-$nonce > /etc/e2e-bcommit && chown 1:1 /etc/e2e-bcommit && { [ ! -d /srv/vol ] || echo v > /srv/vol/e2e-in-vol; }" </dev/null || fail "change $name for its commit"
+    $NSPAWN commit "$name" "e2e-bcommit:$backend" > /tmp/e2e-bcommit.txt || fail "commit $name"
+    grep_q '^sha256:[0-9a-f]\{64\}$' /tmp/e2e-bcommit.txt || fail "commit printed $(cat /tmp/e2e-bcommit.txt)"
+    [ "$($NSPAWN inspect "$name" -f '{{.state}}' 2>&1)" = running ] || fail "$name does not run after its commit: $($NSPAWN inspect "$name" -f '{{.state}}' 2>&1)"
+    last_layer "e2e-bcommit-$backend" > /tmp/e2e-bcommit-layer.txt || fail "read the layer of the commit of $name"
+    echo "the commit of $name: $(wc -l < /tmp/e2e-bcommit-layer.txt) entries"
+    grep_q "^1:1 [0-9]* etc/e2e-bcommit$" /tmp/e2e-bcommit-layer.txt || fail "the commit of $name lacks etc/e2e-bcommit owned by 1:1: $(grep e2e-bcommit /tmp/e2e-bcommit-layer.txt)"
+    grep -E 'e2e-in-vol| etc/(machine-id|hostname|resolv\.conf|localtime)$| var/log/journal/[0-9a-f]{32}' /tmp/e2e-bcommit-layer.txt && fail "the commit of $name has a volume's file, its journal or what nspawn writes for the machine"
+    # Shifted into the user namespace, the files kept their capabilities: no change of the machine's.
+    grep -E ' usr/bin/(arping|clockdiff|newuidmap|newgidmap)$' /tmp/e2e-bcommit-layer.txt && fail "the commit of $name has files whose capabilities only the shift touched"
+    awk '{split($1, o, ":"); if (o[1] >= 65536 || o[2] >= 65536) print}' /tmp/e2e-bcommit-layer.txt | grep_q . && fail "the commit of $name has owners of the user namespace: $(awk '{split($1, o, ":"); if (o[1] >= 65536) print}' /tmp/e2e-bcommit-layer.txt | head -3)"
+    [ "$(wc -l < /tmp/e2e-bcommit-layer.txt)" -lt 2000 ] || fail "the commit of $name holds $(wc -l < /tmp/e2e-bcommit-layer.txt) entries: more than it changed"
+    $NSPAWN export "$name" | tar tv --numeric-owner > /tmp/e2e-bexport.txt || fail "export $name"
+    grep_q " 1/1 .* etc/e2e-bcommit$" /tmp/e2e-bexport.txt || fail "the export of $name: $(grep e2e-bcommit /tmp/e2e-bexport.txt)"
+    grep_q "e2e-in-vol" /tmp/e2e-bexport.txt && fail "the export of $name has a volume's file"
+    awk '{split($2, o, "/"); if (o[1] >= 65536 || o[2] >= 65536) print}' /tmp/e2e-bexport.txt | grep_q . && fail "the export of $name has owners of the user namespace"
+    $NSPAWN images rm "e2e-bcommit-$backend" >/dev/null || fail "images rm e2e-bcommit-$backend"
+    $NSPAWN exec "$name" -- /bin/sh -c 'rm -f /etc/e2e-bcommit /srv/vol/e2e-in-vol' </dev/null
+  fi
   step "terminal: exec with a pty, shell through machined, the machine's own journal"
   out=$(python3 "$(dirname "$0")/terminal.py" $NSPAWN exec "$name" -- /bin/sh -c 'tty; echo term=$TERM; exit 3' </dev/null 2>&1 | tr -d '\r'); rc=${PIPESTATUS[0]}
   [ "$rc" = 3 ] || fail "exec on a pty did not propagate the exit code (got $rc)"
@@ -942,7 +978,39 @@ echo "app-$nonce" > /tmp/e2e-cp-app
 $NSPAWN cp /tmp/e2e-cp-app "$app:/tmp/" || fail "cp into an app"
 [ "$($NSPAWN exec $app -- stat -c %u /tmp/e2e-cp-app </dev/null | tr -d '\r')" = 0 ] || fail "a file copied into an app is not root's"
 $NSPAWN cp "$app:/etc/passwd" /tmp/e2e-cp-app-passwd && grep -q "^root:" /tmp/e2e-cp-app-passwd || fail "cp out of an app"
-step "cp waits for a start systemd makes"
+step "commit, save, load, export and import: an app's images without a registry"
+$NSPAWN exec $app -- /bin/sh -c "echo slce-$nonce > /root/e2e-slce" </dev/null || fail "write into $app for its commit"
+id=$($NSPAWN commit -m e2e -c 'ENV E2E_SLCE=1' $app e2e-slce:1 2>/tmp/e2e-slce.err) || fail "commit $app: $(cat /tmp/e2e-slce.err)"
+[[ $id =~ ^sha256:[0-9a-f]{64}$ ]] || fail "commit printed $id"
+[ "$($NSPAWN inspect $app -f '{{.state}}')" = running ] || fail "$app does not run after its commit"
+[ "$($NSPAWN run --rm e2e-slce:1 -- /bin/sh -c 'cat /root/e2e-slce; echo $E2E_SLCE' 2>/dev/null | tr -d '\r' | tr '\n' ' ')" = "slce-$nonce 1 " ] || fail "a machine of the commit lacks the file or the variable"
+last_layer e2e-slce-1 > /tmp/e2e-slce-layer.txt
+grep -E ' etc/(hosts|resolv\.conf|hostname)$| usr/bin/getent$| sbin$| var/log/journal' /tmp/e2e-slce-layer.txt && fail "the commit of $app has what nspawn and systemd-nspawn made for the machine"
+$NSPAWN commit -c 'RUN true' $app e2e-slce:2 >/dev/null 2>&1 && fail "commit with a RUN change"
+$NSPAWN save -o /tmp/e2e-slce.tar e2e-slce:1 || fail "save -o"
+for f in oci-layout index.json manifest.json; do tar tf /tmp/e2e-slce.tar | grep_q -x "$f" || fail "save wrote no $f"; done
+[ "$($NSPAWN save e2e-slce-1 | sha256sum)" = "$(sha256sum < /tmp/e2e-slce.tar)" ] || fail "two saves of one image differ"
+$NSPAWN images rm e2e-slce-1 >/dev/null || fail "images rm e2e-slce-1"
+out=$($NSPAWN load -i /tmp/e2e-slce.tar 2>&1) || fail "load -i: $out"
+[ "$out" = "Loaded image: $NSPAWN_REGISTRY/e2e-slce:1" ] || fail "load said: $out"
+$NSPAWN images ls | grep "^ *e2e-slce-1 " | grep_q " load " || fail "the loaded image's origin: $($NSPAWN images ls | grep e2e-slce)"
+[ "$(gzip -c /tmp/e2e-slce.tar | $NSPAWN load -q 2>&1)" = "Loaded image: $NSPAWN_REGISTRY/e2e-slce:1" ] || fail "load -q of gzip on standard input"
+[ "$($NSPAWN run --rm e2e-slce:1 cat /root/e2e-slce 2>/dev/null | tr -d '\r')" = "slce-$nonce" ] || fail "a machine of the loaded image lacks the file"
+$NSPAWN export $app > /tmp/e2e-slce-export.tar || fail "export $app"
+tar tf /tmp/e2e-slce-export.tar | grep_q "^root/e2e-slce$" || fail "the export of $app lacks root/e2e-slce"
+id=$($NSPAWN import -c 'CMD ["cat", "/root/e2e-slce"]' - e2e-slce-imp:1 < /tmp/e2e-slce-export.tar 2>/tmp/e2e-slce.err) || fail "import: $(cat /tmp/e2e-slce.err)"
+[[ $id =~ ^sha256: ]] || fail "import printed $id"
+[ "$($NSPAWN run --rm e2e-slce-imp:1 2>/dev/null | tr -d '\r')" = "slce-$nonce" ] || fail "a machine of the imported image"
+ls -a /var/lib/nspawn/blobs/ | grep_q "^\.part-" && fail "parts left in the blobs: $(ls -a /var/lib/nspawn/blobs/ | grep '^\.part-')"
+# save only reads the image, so a machine made from it holds it when no image of it is left.
+$NSPAWN create e2e-slce:1 e2e-slce-held >/dev/null || fail "create e2e-slce-held"
+$NSPAWN images rm e2e-slce-1 >/dev/null || fail "images rm e2e-slce-1 beside e2e-slce-held"
+$NSPAWN save "$NSPAWN_REGISTRY/e2e-slce:1" | tar t | grep_q -x manifest.json || fail "save of an image a machine made from it alone holds"
+$NSPAWN rm e2e-slce-held >/dev/null || fail "rm e2e-slce-held"
+$NSPAWN images rm e2e-slce-imp-1 >/dev/null || fail "images rm of the image imported"
+$NSPAWN exec $app -- rm -f /root/e2e-slce </dev/null
+rm -f /tmp/e2e-slce.tar /tmp/e2e-slce-export.tar
+step "cp, commit and export wait for a start systemd makes"
 # A start held in its first hook, before nspawn's own: the tree may be shifted then.
 hold=e2e-cphold
 $NSPAWN create $app $hold -- /bin/sleep 300 >/dev/null || fail "create $hold"
@@ -951,7 +1019,7 @@ printf '[Service]\nExecStartPre=/bin/sleep 120\n' > /etc/systemd/system/systemd-
 systemctl daemon-reload
 systemctl start --no-block systemd-nspawn@$hold.service || fail "systemctl start of $hold"
 retry 10 bash -c "systemctl show -P ActiveState systemd-nspawn@$hold.service | grep -qx activating" || fail "the start of $hold: $(systemctl show -P ActiveState systemd-nspawn@$hold.service)"
-for cmd in "cp $hold:/etc/passwd /tmp/e2e-cphold" "cp /tmp/e2e-cp-app $hold:/tmp/"; do
+for cmd in "cp $hold:/etc/passwd /tmp/e2e-cphold" "cp /tmp/e2e-cp-app $hold:/tmp/" "commit $hold e2e-cphold:1" "export $hold -o /tmp/e2e-cphold.tar"; do
   out=$($NSPAWN $cmd 2>&1) && fail "$cmd went on while systemd started the machine"
   echo "$out" | grep_q "machine $hold is starting" || fail "$cmd was refused without saying why: $out"
 done
@@ -961,7 +1029,7 @@ systemctl daemon-reload
 $NSPAWN cp "$hold:/etc/passwd" /tmp/e2e-cphold || fail "cp out of $hold once its start was stopped"
 $NSPAWN rm $hold >/dev/null || fail "rm $hold"
 [ -e /etc/systemd/system/systemd-nspawn@$hold.service.d ] && fail "rm left the drop-in directory of $hold: $(ls /etc/systemd/system/systemd-nspawn@$hold.service.d)"
-rm -f /tmp/e2e-cphold
+rm -f /tmp/e2e-cphold /tmp/e2e-cphold.tar
 step "app on the bridge: address, DNS, internet and published port (no networkd anywhere)"
 if [ "$networkd_was" != active ]; then
   systemctl is-active systemd-networkd >/dev/null && fail "systemd-networkd is running during the app section"
@@ -2859,7 +2927,7 @@ if command -v busctl >/dev/null 2>&1; then
   M="org.nspawn /org/nspawn org.nspawn.Manager"
   $B introspect $M > /tmp/e2e-introspect.txt || fail "org.nspawn not reachable; the bus should have started it"
   $NSPAWN ps 2>&1 >/dev/null | grep_q "warning: the nspawn service runs" && fail "the command and the service disagree on their version: $($NSPAWN ps 2>&1 >/dev/null)"
-  for m in ListImages GetImage Generate PullImage CreateMachine PushImage BuildImage RemoveImages SearchImages ListRepositories ListTags ImageDigest ResolveImage ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine PauseMachine UnpauseMachine MachineProcesses UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes AutoUpdate PruneImages DiskUsage Info ConnectNetwork DisconnectNetwork; do
+  for m in ListImages GetImage Generate PullImage CreateMachine PushImage BuildImage SaveImages LoadImages ImportImage CommitMachine ExportMachine RemoveImages SearchImages ListRepositories ListTags ImageDigest ResolveImage ListMachines GetMachine MachineStats StartMachine RunMachine StopMachine KillMachine PauseMachine UnpauseMachine MachineProcesses UpdateMachine Exec Events Shell Logs ListSecrets GetSecret CreateSecret RemoveSecrets ListNetworks GetNetwork CreateNetwork RemoveNetworks PruneNetworks NetworkUp Login Logout RemoveMachines CopyFrom CopyTo ListVolumes CreateVolume RemoveVolumes PruneVolumes AutoUpdate PruneImages DiskUsage Info ConnectNetwork DisconnectNetwork; do
     grep -q "^\.$m  *method" /tmp/e2e-introspect.txt || fail "method $m missing from org.nspawn.Manager"
   done
   for sig in JobOutput JobProgress JobRemoved ImageAdded ImageRemoved MachineStarted MachineStopped; do
@@ -3738,6 +3806,23 @@ elif [ -n "$pulled" ]; then
   [ -n "$(of_hub_busybox)" ] && fail "a record of busybox:1.37 stayed after docker rmi: $(of_hub_busybox)"
   pulled=
 fi
+# commit, save, load, export and import, with the archives of nspawn's own commands.
+dkt exec e2e-dk-x sh -c "echo dk-$nonce > /root/e2e-dk" || fail "docker exec for the commit"
+out=$(dkt commit -c 'ENV E2E_DK=1' e2e-dk-x e2e-dk-commit:1 2>&1) || fail "docker commit: $out"
+[[ $out =~ ^sha256:[0-9a-f]{64}$ ]] || fail "docker commit printed $out"
+[ "$(dkt run --rm --label e2e.dk=1 e2e-dk-commit:1 sh -c 'cat /root/e2e-dk; echo $E2E_DK' 2>&1 | tr -d '\r' | tr '\n' ' ')" = "dk-$nonce 1 " ] || fail "docker run of the committed image: $(dkt run --rm e2e-dk-commit:1 sh -c 'cat /root/e2e-dk; echo $E2E_DK' 2>&1)"
+dkt save -o "$dk_dir/commit.tar" e2e-dk-commit:1 || fail "docker save"
+dkt rmi e2e-dk-commit:1 >/dev/null 2>&1 || fail "docker rmi of the committed image"
+out=$(dkt load -i "$dk_dir/commit.tar" 2>&1) || fail "docker load: $out"
+echo "$out" | grep_q "Loaded image: e2e-dk-commit:1" || fail "docker load said: $out"
+dkt export e2e-dk-x > "$dk_dir/export.tar" || fail "docker export"
+tar tf "$dk_dir/export.tar" | grep_q "^root/e2e-dk$" || fail "docker export lacks root/e2e-dk"
+out=$(dkt import - e2e-dk-import:1 < "$dk_dir/export.tar" 2>&1) || fail "docker import: $out"
+[[ $out =~ ^sha256: ]] || fail "docker import printed $out"
+[ "$(dkt run --rm --label e2e.dk=1 e2e-dk-import:1 cat /root/e2e-dk 2>&1 | tr -d '\r')" = "dk-$nonce" ] || fail "docker run of the imported image: $(dkt run --rm e2e-dk-import:1 cat /root/e2e-dk 2>&1)"
+out=$(dkt export e2e-dk-nonexistent 2>&1 >/dev/null) && fail "docker export of no container"
+echo "$out" | grep_q -i "no such container" || fail "docker export of no container said: $out"
+dkt rmi e2e-dk-commit:1 e2e-dk-import:1 >/dev/null 2>&1 || fail "docker rmi of the images made"
 # system prune, narrowed to the step's own, to its last part, the build cache.
 out=$(dkt system prune -f --filter label=e2e.dk=1 2>&1) || fail "docker system prune: $out"
 echo "$out" | grep_q "Total reclaimed space" || fail "docker system prune: $out"

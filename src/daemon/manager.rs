@@ -1124,6 +1124,239 @@ impl Manager {
         .await?)
     }
 
+    /// Like `save`: the images `names` name, as one tar on the returned pipe (an OCI
+    /// image layout with the manifest.json of a Docker image archive, the blobs as the
+    /// store keeps them), and a job that ends once it is written, its result names (as,
+    /// the images). Options: registry (s, the one the images' references are read
+    /// under), ca_cert (s).
+    async fn save_images(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        names: Vec<String>,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<(zbus::zvariant::OwnedFd, OwnedObjectPath)> {
+        let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
+        options.finish()?;
+        if names.is_empty() {
+            return Err(FailureKind::Invalid
+                .error("save takes at least one image")
+                .into());
+        }
+        let names = names
+            .iter()
+            .map(|n| self.name_of(n, false).map_err(images_named))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        // What the archive cannot hold is refused before it is begun.
+        for name in &names {
+            api::save::check(&ctx.store, name, &ctx.config.registry)?;
+        }
+        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .map_err(|e| Error::Failed(format!("creating a pipe: {e}")))?;
+        let target = names.join(" ");
+        let job = jobs::spawn(
+            &self.state,
+            owner,
+            ctx,
+            "save",
+            &target,
+            move |ctx, reporter| async move {
+                api::save::save(&ctx, &names, write, jobs::report(&reporter)).await?;
+                Ok(HashMap::from([(
+                    "names".to_string(),
+                    values::strings(&names),
+                )]))
+            },
+        )
+        .await?;
+        Ok((zbus::zvariant::OwnedFd::from(read), job))
+    }
+
+    /// Like `load`: the images of the archive read from `stream` (an OCI image layout or
+    /// a Docker image archive, as a tar, compressed or not), installed as images made
+    /// here, each under the name its reference gives. A job, whose result has names (as,
+    /// the images installed), references (as) and ids (as, their config digests), in
+    /// the same order. Options: registry (s, the one whose names the archive may give
+    /// without a dot or a port), ca_cert (s).
+    async fn load_images(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        stream: zbus::zvariant::OwnedFd,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<OwnedObjectPath> {
+        let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
+        options.finish()?;
+        let input = std::os::fd::OwnedFd::from(stream);
+        let state = self.state.clone();
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            ctx,
+            "load",
+            "",
+            move |ctx, reporter| async move {
+                let loaded = api::load::load(&ctx, input, jobs::report(&reporter)).await?;
+                if let Ok(emitter) = state.emitter() {
+                    for image in &loaded {
+                        let _ = Manager::image_added(&emitter, &image.name).await;
+                    }
+                }
+                let field = |f: fn(&api::load::Loaded) -> &String| {
+                    loaded.iter().map(|l| f(l).clone()).collect::<Vec<_>>()
+                };
+                Ok(HashMap::from([
+                    ("names".to_string(), values::strings(&field(|l| &l.name))),
+                    (
+                        "references".to_string(),
+                        values::strings(&field(|l| &l.reference)),
+                    ),
+                    ("ids".to_string(), values::strings(&field(|l| &l.id))),
+                ]))
+            },
+        )
+        .await?)
+    }
+
+    /// Like `commit`: what the machine changed over its image, as image `reference`
+    /// (REPOSITORY[:TAG]) with one more layer, the machine's settings on top of the
+    /// image's. Options: author (s), message (s), changes (as, Dockerfile instructions
+    /// that set the image's settings), pause (b, default true: a running machine is
+    /// frozen while its files are read), registry (s, the one a reference without
+    /// one is read under), ca_cert (s). A job, whose result has id (the config digest),
+    /// name and reference.
+    async fn commit_machine(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        machine: String,
+        reference: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<OwnedObjectPath> {
+        let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let machine = self.machine_of(&machine, true)?;
+        let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
+        let request = api::commit::Request {
+            machine: machine.clone(),
+            reference,
+            author: options.string("author")?.filter(|a| !a.is_empty()),
+            message: options.string("message")?.filter(|m| !m.is_empty()),
+            changes: options.strings("changes")?,
+            pause: options.bool("pause", true)?,
+        };
+        options.finish()?;
+        let state = self.state.clone();
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            ctx,
+            "commit",
+            &machine,
+            move |ctx, reporter| async move {
+                let committed =
+                    api::commit::commit(&ctx, &request, jobs::report(&reporter)).await?;
+                if let Ok(emitter) = state.emitter() {
+                    let _ = Manager::image_added(&emitter, &committed.name).await;
+                }
+                Ok(HashMap::from([
+                    ("id".to_string(), values::v(committed.id)),
+                    ("name".to_string(), values::v(committed.name)),
+                    ("reference".to_string(), values::v(committed.reference)),
+                ]))
+            },
+        )
+        .await?)
+    }
+
+    /// Like `export`: the files of the machine (running, or a stopped overlay or flat
+    /// one), owners as its image has them, as a tar on the returned pipe, and a job that
+    /// ends once it is written. Its volumes, binds and tmpfs are not part of it.
+    /// Options: none.
+    async fn export_machine(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        machine: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<(zbus::zvariant::OwnedFd, OwnedObjectPath)> {
+        let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let machine = self.machine_of(&machine, true)?;
+        Options::new(&options).finish()?;
+        if self.ctx().store.load_image(&machine)?.is_none() {
+            return Err(FailureKind::NoSuchMachine
+                .error(format!("no machine or image named {machine}"))
+                .into());
+        }
+        let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .map_err(|e| Error::Failed(format!("creating a pipe: {e}")))?;
+        let target = machine.clone();
+        let job = jobs::spawn(
+            &self.state,
+            owner,
+            self.state.ctx.clone(),
+            "export",
+            &target,
+            move |ctx, reporter| async move {
+                api::export::export(&ctx, &machine, write, jobs::report(&reporter)).await?;
+                Ok(HashMap::from([("name".to_string(), values::v(machine))]))
+            },
+        )
+        .await?;
+        Ok((zbus::zvariant::OwnedFd::from(read), job))
+    }
+
+    /// Like `import`: the tar of a root filesystem read from `stream` (compressed or
+    /// not), as the one layer of image `reference` (REPOSITORY[:TAG]). Options: message
+    /// (s, the comment of its history), changes (as, Dockerfile instructions that set
+    /// its settings), registry (s, the one a reference without one is read under),
+    /// ca_cert (s). A job, whose result has id (the config digest), name and
+    /// reference.
+    async fn import_image(
+        &self,
+        #[zbus(header)] hdr: Header<'_>,
+        stream: zbus::zvariant::OwnedFd,
+        reference: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<OwnedObjectPath> {
+        let _busy = self.state.enter();
+        let owner = self.allow(&hdr, Action::Manage).await?;
+        let mut options = Options::new(&options);
+        let ctx = self.context_for(&mut options)?;
+        let request = api::load::ImportRequest {
+            reference: reference.clone(),
+            message: options.string("message")?.filter(|m| !m.is_empty()),
+            changes: options.strings("changes")?,
+        };
+        options.finish()?;
+        let input = std::os::fd::OwnedFd::from(stream);
+        let state = self.state.clone();
+        Ok(jobs::spawn(
+            &self.state,
+            owner,
+            ctx,
+            "import",
+            &reference,
+            move |ctx, reporter| async move {
+                let imported =
+                    api::load::import(&ctx, input, &request, jobs::report(&reporter)).await?;
+                if let Ok(emitter) = state.emitter() {
+                    let _ = Manager::image_added(&emitter, &imported.name).await;
+                }
+                Ok(HashMap::from([
+                    ("id".to_string(), values::v(imported.id)),
+                    ("name".to_string(), values::v(imported.name)),
+                    ("reference".to_string(), values::v(imported.reference)),
+                ]))
+            },
+        )
+        .await?)
+    }
+
     /// Like `volume ls`: every named volume with name, path, used_by (the machines whose
     /// records mount it), created (unix seconds), labels (a{ss}) and anonymous (b).
     async fn list_volumes(&self, #[zbus(header)] hdr: Header<'_>) -> Result<Vec<Dict>> {

@@ -107,8 +107,8 @@ pub fn skip_reason(record: &ImageRecord, built: &BTreeSet<&str>) -> Option<Strin
             ))
         }
     }
-    if record.origin == "build" || record.built || built.contains(record.reference.as_str()) {
-        return Some("its image was built on this host".to_string());
+    if record.made_here() || record.built || built.contains(record.reference.as_str()) {
+        return Some("its image was made on this host".to_string());
     }
     if record.reference.contains('@') {
         return Some("its reference names a digest, which does not change".to_string());
@@ -214,7 +214,7 @@ pub async fn run(ctx: &Context, request: &Request, report: Report<'_>) -> Result
     let records = store.list_images()?;
     let built: BTreeSet<&str> = records
         .iter()
-        .filter(|r| r.origin == "build")
+        .filter(|r| r.made_here())
         .map(|r| r.reference.as_str())
         .collect();
     let mut chosen = Vec::new();

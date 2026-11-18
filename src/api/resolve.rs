@@ -54,7 +54,7 @@ pub fn full_tag(reference: &str, registry: &str) -> Option<String> {
 /// `repository@digest` of the manifest a record was pulled by, in full; a built image,
 /// and a container made from one, was pulled by none.
 pub fn full_digest(record: &ImageRecord, registry: &str) -> Option<String> {
-    if record.origin == "build" || record.built {
+    if record.made_here() || record.built {
         return None;
     }
     let parsed = ImageRef::parse(&record.reference, registry).ok()?;
@@ -136,7 +136,7 @@ pub fn resolve(
         let found = records
             .iter()
             .filter(|r| Some(r.name.as_str()) != except)
-            .filter(|r| !built_only || r.origin == "build" || r.built)
+            .filter(|r| !built_only || r.made_here() || r.built)
             .filter(|r| {
                 full_tag(&r.reference, registry).as_deref() == Some(wanted.as_str())
                     || full_digest(r, registry).as_deref() == Some(wanted.as_str())
@@ -189,9 +189,9 @@ pub fn find(
 /// an image of a reference; a text that can be no machine's name by `find`, or as it is
 /// when nothing here goes by it, for the method to say so. A reference names the image
 /// pulled or built for it, never a machine made from it, but where the image is only read
-/// (`images_only` false: inspect, the source of create, push), which such a machine still
-/// holds when no image of it is left. The command line reads every text by `find` first
-/// (ResolveImage with names), a bare name as a reference too.
+/// (`images_only` false: inspect, the source of create, push, save), which such a machine
+/// still holds when no image of it is left. The command line reads every text by `find`
+/// first (ResolveImage with names), a bare name as a reference too.
 pub fn name_of(store: &Store, registry: &str, text: &str, images_only: bool) -> Result<String> {
     if crate::reference::validate_machine_name(text).is_ok() {
         return Ok(text.to_string());

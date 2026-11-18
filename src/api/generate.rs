@@ -102,12 +102,12 @@ pub fn generate(ctx: &Context, names: &[String]) -> Result<Script> {
         .iter()
         .filter_map(|r| r.network_container.as_deref())
         .collect();
-    // An image built here, which another host can only pull once it is pushed: its
-    // record says build, a machine made from it says it was built, its build's record
-    // gone or not.
+    // An image made here, which another host can only pull once it is pushed: its
+    // record says so by its origin, a machine made from it says it was built, the
+    // image's record gone or not.
     let built: BTreeSet<&str> = records
         .iter()
-        .filter(|r| r.origin == "build")
+        .filter(|r| r.made_here())
         .map(|r| r.reference.as_str())
         .collect();
     let mut secrets = BTreeSet::new();
@@ -138,7 +138,7 @@ pub fn generate(ctx: &Context, names: &[String]) -> Result<Script> {
         if (r.built || built.contains(r.reference.as_str())) && pushed.insert(r.reference.as_str())
         {
             script.notes.push(format!(
-                "{} was built on this host: push it (nspawn push {}) before this script runs elsewhere",
+                "{} was made on this host: push it (nspawn push {}) before this script runs elsewhere",
                 r.reference, r.name
             ));
         }

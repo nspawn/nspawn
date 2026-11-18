@@ -149,7 +149,7 @@ pub(super) fn dispatch_stage(
 
 /// NormalizeWorkdir on Linux: a relative path joined to the current one, an absolute
 /// one kept as written.
-fn normalize_workdir(current: &str, wd: &str) -> String {
+pub(super) fn normalize_workdir(current: &str, wd: &str) -> String {
     let mut parent = if current.is_empty() { "/" } else { current }.to_string();
     if !parent.starts_with('/') {
         parent = gofmt::join(&["/", &parent]);
@@ -163,7 +163,7 @@ fn normalize_workdir(current: &str, wd: &str) -> String {
 }
 
 /// withShell: the image's SHELL, else the default shell of its os, with the command line.
-fn with_shell(config: &Config, args: &[String]) -> Vec<String> {
+pub(super) fn with_shell(config: &Config, args: &[String]) -> Vec<String> {
     let mut shell = if config.config.shell.is_empty() {
         if config.os == "windows" {
             vec!["cmd".to_string(), "/S".to_string(), "/C".to_string()]
@@ -252,7 +252,7 @@ impl EnvGetter for SecretMask<'_> {
 }
 
 /// moby/sys/signal's ParseSignal on Linux, for its verdict.
-fn check_signal(raw: &str) -> Result<(), Error> {
+pub(super) fn check_signal(raw: &str) -> Result<(), Error> {
     const NAMES: [&str; 34] = [
         "ABRT", "ALRM", "BUS", "CHLD", "CLD", "CONT", "FPE", "HUP", "ILL", "INT", "IO", "IOT",
         "KILL", "PIPE", "POLL", "PROF", "PWR", "QUIT", "SEGV", "STKFLT", "STOP", "SYS", "TERM",

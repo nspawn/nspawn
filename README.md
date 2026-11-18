@@ -25,12 +25,15 @@ nspawn images rm fedora-44          # also frees layers and blobs nobody referen
 nspawn network create backend       # a network of its own: --network backend on start
 nspawn build -t team/app:1 ./app    # its Dockerfile built (or its mkosi.conf), a local image
 nspawn push team/app:1              # upload it to the hub, layers already there skipped
+nspawn save team/app:1 -o app.tar   # images as a tar archive; nspawn load reads it back
+nspawn commit web team/web:2        # an image of what a machine changed, its settings kept
 nspawn compose up -d                # the services of this directory's compose.yaml, detached
 nspawn compose down -v
 ```
 
 `nspawn --help` lists the rest: `login`, `hub ls`, `inspect`, `info` (the service's
-version and state), `update`, `stats`, `top`, `cp`, `kill`, `restart`, `pause`, `wait`,
+version and state), `update`, `stats`, `top`, `cp`, `export` and `import` (a machine's
+files as a tar, and an image of one), `kill`, `restart`, `pause`, `wait`,
 `port`, `volume`, `secret`, `network` (with `connect` and `disconnect`), `system df` and
 `system prune`, `images prune`, `images inspect` (by name or reference), `builder`
 (the build cache), `auto-update` (moves labelled machines to the image their tag names
@@ -114,6 +117,11 @@ and usage examples.
   build too.
 - **One image, many machines.** A pulled image is a machine; `create` makes more from
   it, sharing its layers, each with settings, ports and an address of its own.
+- **Images without a registry.** `save` writes images as an OCI image layout that `load`
+  and `docker load` read, the blobs as pulled; `load` takes `docker save`'s archives
+  too. `commit` makes an image of what a machine changed, owners as in its image
+  whatever user namespace it runs in; `export` and `import` carry a machine's files as
+  a tar.
 - **Signed images.** Every image on hub.nspawn.org is signed by its build workflow,
   with the project's key and keyless through Sigstore; `pull` verifies one of the two
   before downloading anything, refuses an image without a valid signature and

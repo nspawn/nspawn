@@ -268,10 +268,10 @@ pub fn progress_messages(event: JobEvent<'_>) -> Vec<Value> {
 
 async fn pull(ctx: &Arc<Context>, query: &Query) -> Result<Response<Body>, Answer> {
     let from_image = query.get("fromImage").unwrap_or_default();
-    if from_image.is_empty() || !query.get("fromSrc").unwrap_or_default().is_empty() {
+    if from_image.is_empty() {
         return Err(says(
-            StatusCode::NOT_IMPLEMENTED,
-            "importing an image is not supported by nspawn's Docker API",
+            StatusCode::BAD_REQUEST,
+            "fromImage or fromSrc is required",
         ));
     }
     let wanted = pull_reference(from_image, query.get("tag").unwrap_or_default())?;

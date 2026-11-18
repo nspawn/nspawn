@@ -39,6 +39,8 @@ mod value;
 mod variables;
 mod yaml;
 
+pub(crate) use engine::label::OF_MACHINE as MACHINE_LABELS;
+
 /// The first YAML document of `input` as JSON, read by the YAML loader compose files go
 /// through: CDI specs are YAML or JSON. A null in a mapping is left out, as go-yaml
 /// leaves the field it would fill at its zero value. A document deeper than `levels`,

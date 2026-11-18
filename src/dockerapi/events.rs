@@ -32,8 +32,12 @@ pub fn translate(event: &Event, networks: &[(String, String)]) -> Vec<Value> {
         })
     };
     match event.kind.as_str() {
-        // A record pulled, or one that never ran removed, is an image to the API.
-        "machine" if event.action == "pull" || event.attributes.contains_key("image_id") => {
+        // A record pulled, loaded or imported, or one that never ran removed, is an
+        // image to the API.
+        "machine"
+            if matches!(event.action.as_str(), "pull" | "load" | "import")
+                || event.attributes.contains_key("image_id") =>
+        {
             let reference = event
                 .attributes
                 .get("image")
@@ -41,7 +45,9 @@ pub fn translate(event: &Event, networks: &[(String, String)]) -> Vec<Value> {
                 .unwrap_or_default();
             let (action, id) = match event.attributes.get("image_id") {
                 Some(image_id) if event.action == "remove" => ("untag", image_id.clone()),
-                _ if event.action == "pull" => ("pull", reference.clone()),
+                _ if matches!(event.action.as_str(), "pull" | "load" | "import") => {
+                    (event.action.as_str(), reference.clone())
+                }
                 _ => return Vec::new(),
             };
             let mut attributes = Map::new();
@@ -323,6 +329,20 @@ mod tests {
         assert_eq!(pull[0]["Action"], "pull");
         assert_eq!(pull[0]["Actor"]["ID"], "busybox:1.37");
         assert_eq!(pull[0]["Actor"]["Attributes"]["name"], "busybox");
+        for action in ["load", "import"] {
+            let made = translate(
+                &event("machine", action, &[("image", image), ("created", "100")]),
+                &[],
+            );
+            assert_eq!(made[0]["Type"], "image");
+            assert_eq!(made[0]["Action"], action);
+        }
+        // A commit is the machine's image, not a container's event of the API.
+        assert!(translate(
+            &event("machine", "commit", &[("image", image), ("created", "100")]),
+            &[]
+        )
+        .is_empty());
         let untag = translate(
             &event(
                 "machine",

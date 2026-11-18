@@ -21,6 +21,7 @@ mod pull;
 #[cfg(test)]
 pub(crate) mod shapes;
 pub(crate) mod streams;
+mod transfer;
 pub mod util;
 pub mod volumes;
 
@@ -515,6 +516,14 @@ enum Route {
     ImageChange(images::Call),
     /// POST /images/create.
     Pull,
+    /// GET /images/get and /images/{name}/get: the names of the images to save.
+    Save(Vec<String>),
+    /// POST /images/load.
+    Load,
+    /// POST /commit.
+    Commit,
+    /// GET /containers/{id}/export.
+    Export(String),
     /// POST /build/prune: the build cache the API shows is empty, and stays so.
     BuildPrune,
     /// The plugins, of which there are none.
@@ -547,6 +556,9 @@ impl Route {
             // StatPath, CopyFrom and CopyTo ask org.nspawn.manage.
             Route::Archive(_) => Need::Manage,
             Route::Pull => Need::Manage,
+            // SaveImages, LoadImages, CommitMachine and ExportMachine ask
+            // org.nspawn.manage.
+            Route::Save(_) | Route::Load | Route::Commit | Route::Export(_) => Need::Manage,
             Route::VolumeChange(_) | Route::NetworkChange(_) | Route::ImageChange(_) => {
                 Need::Manage
             }
@@ -598,6 +610,7 @@ fn classify(method: &Method, path: &str) -> Route {
         (true, ["info"]) => Route::Info,
         (true, ["system", "df"]) => Route::DiskUsage,
         (true, ["containers", "json"]) => Route::Containers,
+        (true, ["containers", id, "export"]) => Route::Export(id.to_string()),
         (true, ["containers", id, what]) => Route::Container(id.to_string(), what.to_string()),
         (false, ["containers", "create"]) if *method == Method::POST => Route::Create,
         (false, ["containers", "prune"]) if *method == Method::POST => Route::Prune,
@@ -608,6 +621,8 @@ fn classify(method: &Method, path: &str) -> Route {
             Route::Attach(id.to_string())
         }
         (false, ["images", "create"]) if *method == Method::POST => Route::Pull,
+        (false, ["images", "load"]) if *method == Method::POST => Route::Load,
+        (false, ["commit"]) if *method == Method::POST => Route::Commit,
         (false, ["build", "prune"]) if *method == Method::POST => Route::BuildPrune,
         (false, ["containers", id, what]) if *method == Method::POST => match Act::of(what) {
             Some(act) => Route::Lifecycle(id.to_string(), act),
@@ -615,6 +630,11 @@ fn classify(method: &Method, path: &str) -> Route {
         },
         (false, ["containers", id]) if *method == Method::DELETE => Route::Remove(id.to_string()),
         (true, ["images", "json"]) => Route::Images,
+        // The names come from the query, filled in by route_request.
+        (true, ["images", "get"]) => Route::Save(Vec::new()),
+        (true, ["images", name @ .., "get"]) if !name.is_empty() => {
+            Route::Save(vec![name.join("/")])
+        }
         (true, ["images", name @ .., what @ ("json" | "history")]) if !name.is_empty() => {
             Route::Image(name.join("/"), what.to_string())
         }
@@ -672,7 +692,11 @@ async fn route_request(
         | Route::VolumeChange(_)
         | Route::NetworkChange(_)
         | Route::ImageChange(_)
-        | Route::Pull => true,
+        | Route::Pull
+        | Route::Save(_)
+        | Route::Load
+        | Route::Commit
+        | Route::Export(_) => true,
         Route::Exec(call) => call.parses_form(),
         Route::Container(_, what) => what != "json",
         _ => false,
@@ -731,7 +755,21 @@ async fn route_request(
         Route::NetworkChange(call) => networks::serve(ctx, call, query, sent).await,
         Route::ImageChange(call) => images::serve(ctx, call, query).await,
         Route::Archive(call) => archive::serve(ctx, call, query, sent).await,
+        Route::Pull if !query.get("fromSrc").unwrap_or_default().is_empty() => {
+            transfer::import(query, sent).await
+        }
         Route::Pull => pull::create(ctx, query).await,
+        Route::Save(names) => {
+            let names = if names.is_empty() {
+                query.all("names").map(str::to_string).collect()
+            } else {
+                names
+            };
+            transfer::save(names, query).await
+        }
+        Route::Load => transfer::load(query, sent.body).await,
+        Route::Commit => transfer::commit(ctx, query, sent).await,
+        Route::Export(id) => transfer::export(ctx, &id).await,
         Route::Plugins => json_response(StatusCode::OK, &json!([])),
         Route::Images => list_images(ctx, query).await,
         Route::Image(name, what) => image_read(ctx, &name, &what).await,
@@ -1174,7 +1212,7 @@ async fn container_read(
         }
         "logs" => logs(ctx, machine, query, holder).await,
         "stats" => stats(ctx, machine, query).await,
-        "changes" | "export" => error(
+        "changes" => error(
             StatusCode::NOT_IMPLEMENTED,
             format!("/containers/{{id}}/{what} is not supported by nspawn's Docker API"),
         ),
@@ -2021,7 +2059,33 @@ mod tests {
             classify(&get, "/images/busybox/history"),
             Route::Image("busybox".into(), "history".into())
         );
-        assert_eq!(classify(&get, "/images/busybox/get"), Route::Unserved);
+        assert_eq!(
+            classify(&get, "/images/busybox/get"),
+            Route::Save(vec!["busybox".into()])
+        );
+        assert_eq!(
+            classify(&get, "/images/ghcr.io/x/y:1/get"),
+            Route::Save(vec!["ghcr.io/x/y:1".into()])
+        );
+        assert_eq!(classify(&get, "/images/get"), Route::Save(Vec::new()));
+        assert_eq!(classify(&Method::POST, "/images/load"), Route::Load);
+        assert_eq!(classify(&Method::POST, "/commit"), Route::Commit);
+        assert_eq!(
+            classify(&get, "/containers/web/export"),
+            Route::Export("web".into())
+        );
+        for (method, path) in [
+            (Method::GET, "/images/get"),
+            (Method::POST, "/images/load"),
+            (Method::POST, "/commit"),
+            (Method::GET, "/containers/web/export"),
+        ] {
+            assert_eq!(
+                classify(&method, path).need(),
+                Need::Manage,
+                "{method} {path}"
+            );
+        }
         assert_eq!(classify(&get, "/volumes"), Route::Volumes);
         assert_eq!(
             classify(&get, "/volumes/data"),

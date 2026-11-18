@@ -64,7 +64,7 @@ fn local_kind(path: &Path) -> Result<Option<Kind>> {
 
 /// Which failure to show when both ends failed: the one that is not merely the other
 /// end having gone away, or having broken the stream on purpose when it failed.
-fn first_cause(local: anyhow::Error, remote: anyhow::Error) -> anyhow::Error {
+pub(crate) fn first_cause(local: anyhow::Error, remote: anyhow::Error) -> anyhow::Error {
     let broken = |e: &anyhow::Error| {
         let text = format!("{e:#}");
         text.contains("Broken pipe")

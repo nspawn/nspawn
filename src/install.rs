@@ -391,7 +391,7 @@ fn kept_beside(
         .list_images()?
         .into_iter()
         .filter(|r| {
-            r.origin == "build"
+            r.made_here()
                 && r.reference == reference
                 && crate::reference::numbered_from(name, &r.name)
                 && !reserved.contains(&r.name)
@@ -511,6 +511,64 @@ pub async fn build_destination(
         );
     }
     Ok(destination)
+}
+
+/// An image made on this host (a commit, a load, an import), its blobs in the store,
+/// installed under the name its reference gives as a build installs one of its tags:
+/// there, replacing an image of the reference that never ran, or beside a machine or an
+/// image of another reference that holds the name. `reserved` are names other images
+/// of the same operation take; `mode` is the image's, None to tell it by its command.
+/// The name it got.
+#[allow(clippy::too_many_arguments)]
+pub async fn install_made_here(
+    store: &Store,
+    sd: &Systemd,
+    config: &Config,
+    backend: Backend,
+    (own, reference): (&str, &str),
+    manifest_bytes: &[u8],
+    origin: &str,
+    mode: Option<Mode>,
+    reserved: &BTreeSet<String>,
+    report: Report<'_>,
+) -> Result<String> {
+    let manifest: OciImageManifest =
+        serde_json::from_slice(manifest_bytes).context("reading the image's manifest")?;
+    let manifest_digest = crate::layout::sha256_digest(manifest_bytes);
+    let _lock = store.lock().await?;
+    let destination =
+        build_destination(store, sd, own, reference, false, true, reserved, report).await?;
+    let name = destination.name.as_str();
+    stage_layers(store, backend, &manifest, mode, name).await?;
+    remove_existing(store, sd, name, report).await?;
+    store.forget_rollback(name)?;
+    install(
+        store,
+        sd,
+        config,
+        backend,
+        Install {
+            name,
+            reference,
+            manifest_bytes,
+            manifest: &manifest,
+            manifest_digest: &manifest_digest,
+            index_digest: None,
+            origin,
+            mode,
+            signed_by: None,
+            signed_at: None,
+        },
+        report,
+    )
+    .await?;
+    crate::api::events::emit_machine(
+        store,
+        origin,
+        name,
+        &[("image", reference), ("reference", reference)],
+    );
+    Ok(destination.name)
 }
 
 /// Refuses a name an update cut short left a rollback of, its old machine's record and

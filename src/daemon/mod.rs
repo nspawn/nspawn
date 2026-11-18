@@ -125,6 +125,8 @@ pub async fn run(config: Config, idle_exit: Option<Duration>) -> Result<()> {
     // A build of a service that went away left its step roots and network namespace.
     crate::build::exec::sweep(&state.ctx).await;
     state.ctx.store.sweep_trash();
+    // A commit the end of an earlier service cut short left its machine paused.
+    crate::api::commit::thaw_left(&state.ctx).await;
     if let Err(e) = crate::api::network::remove_ended(&state.ctx).await {
         eprintln!("warning: removing the machines of run --rm that ended: {e:#}");
     }
