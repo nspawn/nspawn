@@ -52,12 +52,14 @@ impl RootTree {
     }
 }
 
+// nlink_t is u64 on x86_64 and u32 on aarch64.
+#[allow(clippy::useless_conversion)]
 fn stat_of(st: &FileStat) -> Stat {
     Stat {
         dev: st.st_dev,
         ino: st.st_ino,
         mode: st.st_mode,
-        nlink: st.st_nlink,
+        nlink: u64::from(st.st_nlink),
         uid: st.st_uid,
         gid: st.st_gid,
         rdev: st.st_rdev,
