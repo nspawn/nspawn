@@ -13,10 +13,11 @@
 
 nspawn is a docker-like command line tool built on systemd-nspawn and
 systemd-machined: images come from an OCI registry, machines are driven over
-D-Bus, and the tool runs its own bridge network. Read these before changing
-anything:
+D-Bus, and the tool runs its own bridge network. Each file below covers one
+part of it; read the ones that touch what you change:
 
 - README.md: what the tool does; docs/USAGE.md: how it is used, command by command.
+- docs/COMPOSE.md: nspawn compose, and what of compose files it supports.
 - docs/ARCHITECTURE.md: modules, on-disk layout, networking, unit hooks.
 - docs/DBUS.md: the org.nspawn interface on the system bus.
 - docs/HACKING.md: building, unit tests, clippy, the end-to-end suite, the test VM.
@@ -25,9 +26,10 @@ anything:
 
 ## Rules of the road
 
-- Rust 2021. `unsafe` stays inside the namespace and mount helpers
-  (`nsenter.rs`, `volmount.rs`). Errors use `anyhow` with a context that names
-  the path, unit or machine involved.
+- Rust 2021. `unsafe` stays inside the namespace, mount and terminal helpers
+  (`nsenter.rs`, `volmount.rs`, `pty.rs`) and the SIGPIPE setup in `main.rs`.
+  Errors use `anyhow` with a context that names the path, unit or machine
+  involved.
 - Every behaviour change comes with a unit test, and with an e2e step when it
   touches machines, the network or a registry.
 - `cargo fmt`, `cargo clippy --all-targets -- -D warnings` and `cargo test`
@@ -36,8 +38,8 @@ anything:
 - Anything that changes host state (bridge, nftables, firewalld, iptables,
   unit drop-ins, files under /etc) must be idempotent and undone by `stop`, `rm`
   or `images rm`.
-- Commit messages: short imperative subject, a body only for the why. No tool
-  names, no signatures, no trailers.
+- Commit messages follow CONTRIBUTING.md: no tool names, no signatures, no
+  trailers.
 - Do not push, tag or release unless asked.
 - The website (github.com/nspawn/nspawn.org, checked out next to this repository)
   is maintained from here, since this is where the change is made: a stable
@@ -49,7 +51,8 @@ anything:
   the host has no Hugo or Go, so building it any other way fails. Its
   formatting pass and its workflows belong to that repository: write the
   content, leave those alone.
-- Documentation and messages are plain ASCII English without emojis.
+- Documentation, help texts, error messages and commit messages are plain
+  ASCII English without emojis.
 - Code, comments, help texts and documentation say what nspawn does. Another
   tool (docker, docker compose, BuildKit, Podman and the like) is named only
   where it is strictly needed: the name of a real thing (Docker Hub, a
