@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 3.3.0
+%global upstream_version 3.3.1
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -169,6 +169,9 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Wed Nov 18 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 3.3.1-1
+- The aarch64 build, which 3.3.0 lacked: a file's link count read for commit and export compiles on aarch64.
+
 * Wed Nov 18 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 3.3.0-1
 - save and load carry images as tar archives, commit makes an image of what a machine changed, export and import carry a machine's files as a tar, through the Docker API too; a machine in a user namespace keeps its files' capabilities; wait and run give the exit code once the machine is down; cp refuses a machine systemd is starting.
 

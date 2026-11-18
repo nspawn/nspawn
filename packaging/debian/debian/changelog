@@ -1,3 +1,9 @@
+nspawn (3.3.1-1) unstable; urgency=medium
+
+  * The aarch64 build, which 3.3.0 lacked: a file's link count read for commit and export compiles on aarch64.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Wed, 18 Nov 2026 18:32:00 -0500
+
 nspawn (3.3.0-1) unstable; urgency=medium
 
   * save and load carry images as tar archives, commit makes an image of what a machine changed, export and import carry a machine's files as a tar, through the Docker API too; a machine in a user namespace keeps its files' capabilities; wait and run give the exit code once the machine is down; cp refuses a machine systemd is starting.
