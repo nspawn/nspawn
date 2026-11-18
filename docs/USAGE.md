@@ -85,7 +85,9 @@ config.
 together, a line at a time. It is read from the journal (nspawn's own with the default
 `--log-driver local`, the system's with `journal`), so `logs` shows it later too; with
 `--log-driver none` it comes straight from the program and nothing is kept. `run` exits
-with the program's exit code, or 128 plus the signal it died of. Ctrl-C, SIGTERM,
+with the program's exit code, or 128 plus the signal it died of, once the machine is
+down: its unit's hooks after the end are done, so `ps` and `inspect` show it ended (a
+machine of `--rm` goes right after). Ctrl-C, SIGTERM,
 SIGHUP and SIGQUIT go to the program; a third Ctrl-C within a second leaves it running
 and returns.
 
@@ -871,9 +873,9 @@ home, as the machine's own program does.
 - `pause` and `unpause` freeze and thaw a machine's cgroup (`ps` shows it paused).
 - `top` lists a machine's processes, and `inspect` of a stopped machine shows the exit
   code of its last run.
-- `wait NAME...` waits for machines to stop and prints each one's exit code, and `port
-  NAME [PORT[/PROTO]]` the ports a running machine publishes (`80/tcp ->
-  0.0.0.0:8080`).
+- `wait NAME...` waits for machines to stop and prints each one's exit code once it is
+  down, as `run` exits, and `port NAME [PORT[/PROTO]]` the ports a running machine
+  publishes (`80/tcp -> 0.0.0.0:8080`).
 
 ### The unit hooks
 

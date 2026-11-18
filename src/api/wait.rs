@@ -100,7 +100,7 @@ impl Main {
 }
 
 /// How long the answer of an end waits for the unit's hooks after it.
-const SETTLING: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const SETTLING: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Whether a unit whose run ended is done with it: stopped, waiting to restart, or
 /// starting anew, its hooks after the end (ExecStopPost=) gone by.

@@ -200,6 +200,36 @@ impl UnitWatch {
         self.main.saw(pid, started_usec)
     }
 
+    /// Waits, for a while at most, until the unit is through with the hooks after its
+    /// run's end (ExecStopPost=), which release what the machine held: until then it
+    /// reads as closing. A machine of run --rm is removed after that, by a unit of its
+    /// own.
+    pub async fn down(&mut self, sd: &Systemd) {
+        let down = async {
+            if !sd
+                .unit_status(&self.unit)
+                .await
+                .is_ok_and(|state| state.shutting_down())
+            {
+                return;
+            }
+            while let Some(signal) = self.changes.next().await {
+                let Ok(args) = signal.args() else { continue };
+                if args.interface_name().as_str() != "org.freedesktop.systemd1.Unit" {
+                    continue;
+                }
+                let active = args
+                    .changed_properties()
+                    .get("ActiveState")
+                    .and_then(|v| <&str>::try_from(v).ok());
+                if active.is_some_and(|active| active != "deactivating") {
+                    return;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(crate::api::wait::SETTLING, down).await;
+    }
+
     /// Waits for the main process of this run to end.
     pub async fn ended(&mut self) -> Result<Ending> {
         while let Some(signal) = self.changes.next().await {
@@ -704,6 +734,13 @@ impl Attached {
             .or_else(|| ctx.store.last_signal(&self.name));
         if let Some(follower) = self.follower.take() {
             follower.finish().await;
+        }
+        // The code is the caller's once the machine is down: what looks at it then sees
+        // it ended.
+        if ending.is_ok() {
+            if let Ok(sd) = ctx.sd().await {
+                self.watch.down(sd).await;
+            }
         }
         match ending {
             Ok(ending) => exit_code(&ending, sent, self.app && !self.pid1),

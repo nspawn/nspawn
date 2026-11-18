@@ -1311,9 +1311,10 @@ pub async fn wait(args: WaitArgs, client: &Client) -> Result<()> {
                 }
             }
         };
-        // The record has the program's own code, when it is still there and done.
-        let code = match client.manager.get_machine(name).await {
-            Ok(m) if client::string(&m, "state") == "stopped" => exit_code_of(&m),
+        // The code is said once the machine is down, and the record has the program's
+        // own then, when it is still there.
+        let code = match down(client, name).await {
+            Some(m) if client::string(&m, "state") == "stopped" => exit_code_of(&m),
             _ => code,
         };
         println!("{code}");
@@ -1322,6 +1323,21 @@ pub async fn wait(args: WaitArgs, client: &Client) -> Result<()> {
         bail!("{}", failed.join("\n"));
     }
     Ok(())
+}
+
+/// A machine whose program ended, once it no longer reads as closing: its unit's hooks
+/// after the end (ExecStopPost=) release what it held, and until they are done `ps` and
+/// `inspect` show it running. Looked at again and again, for 30 seconds at most; None
+/// when it is gone.
+async fn down(client: &Client, name: &str) -> Option<Dict> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let machine = client.manager.get_machine(name).await.ok()?;
+        if client::string(&machine, "state") != "closing" || std::time::Instant::now() > deadline {
+            return Some(machine);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// Whether a lookup failed because the machine is gone, not for another reason.
