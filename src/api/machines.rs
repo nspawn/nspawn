@@ -133,6 +133,15 @@ pub async fn refuse_foreign(sd: &Systemd, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether systemd is starting machine `name`, which machined does not list yet: a start
+/// nspawn did not make (machinectl start, the Wants= of a machine that depends on it, a
+/// restart of its unit) leaves no marker, and its hooks shift the tree into the machine's
+/// user namespace before it registers.
+pub async fn starting_unit(sd: &Systemd, name: &str) -> Result<bool> {
+    let unit = format!("systemd-nspawn@{name}.service");
+    Ok(sd.unit_status(&unit).await?.busy() || sd.start_queued(&unit).await?)
+}
+
 /// "machine NAME is not running", said of a machine that does not run, or of a name
 /// nothing has: nspawn keeps no record of it, and machined no image.
 pub(crate) async fn not_running(sd: &Systemd, store: &Store, name: &str) -> anyhow::Error {
@@ -1422,9 +1431,9 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     if sd.machine_exists(&args.name).await? {
         return Err(running_already(sd, &args.name).await);
     }
-    // systemd may have begun it meanwhile (machinectl start, the Wants= of a machine
-    // that depends on it): its own hooks prepare it, and this pass would tear that down.
-    if sd.unit_status(&unit).await?.busy() || sd.start_queued(&unit).await? {
+    // systemd may have begun it meanwhile: its own hooks prepare it, and this pass would
+    // tear that down.
+    if starting_unit(sd, &args.name).await? {
         return Err(
             FailureKind::AlreadyRunning.error(format!("machine {} is starting already", args.name))
         );

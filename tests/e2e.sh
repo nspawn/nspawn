@@ -99,7 +99,11 @@ install_service() {
 # Leftovers of an aborted run would make pulls and creates fail; the same at the end.
 cleanup_machines() {
   local m
-  for m in e2e-hapi-made e2e-hapi-img e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-nsuser e2e-dev e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wexit e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc e2e-v6 e2e-v6b e2e-v6c e2e-v6d e2e-v6u e2e-v6low e2e-notify e2e-fwd e2e-cbind-w-1; do
+  # The drop-in that holds the start of e2e-cphold, which rm would leave with its directory.
+  if rm -f /etc/systemd/system/systemd-nspawn@e2e-cphold.service.d/e2e-hold.conf 2>/dev/null; then
+    systemctl daemon-reload
+  fi
+  for m in e2e-hapi-made e2e-hapi-img e2e-overlay e2e-flat e2e-mstack e2e-a e2e-b e2e-c e2e-built e2e-roundtrip e2e-busybox e2e-relogs e2e-run e2e-dbus e2e-digest e2e-restart e2e-caps e2e-tz e2e-noshell e2e-nsuser e2e-dev e2e-quiet e2e-drain e2e-twin-a e2e-twin-b e2e-na-web e2e-na-cli e2e-nb-web e2e-nc-web e2e-nc-pub e2e-def-cli e2e-nab e2e-none e2e-boot2 e2e-pclash e2e-cpull e2e-mix-app e2e-mix-boot e2e-auto e2e-run-boot e2e-multi e2e-side e2e-side-net e2e-side-p e2e-side-boot e2e-mix-side e2e-cshort e2e-signed e2e-unsigned e2e-nv e2e-nvc e2e-phys-b e2e-phys-boot e2e-dep-web e2e-dep-db e2e-dep-job e2e-gen-web e2e-gen-db e2e-gen-side e2e-gen-own e2e-s6 e2e-s6u e2e-pid1 e2e-api-caddy e2e-api-web e2e-api-web2 e2e-api-boot e2e-capi-a-1 e2e-capi-b-1 e2e-au e2e-au-side e2e-au-137 e2e-cli e2e-cli-peer e2e-cli-boot e2e-cli-wait e2e-cli-wexit e2e-cli-wrm e2e-cli-wrs e2e-cli-img e2e-cli-keep e2e-ip e2e-ip2 e2e-cip-app-1 e2e-cdi-bad e2e-cdi-boot e2e-cdi-ml-1 e2e-cdi-perm e2e-bb e2e-case-settings e2e-case-layers e2e-case-multistage e2e-case-copy-rules e2e-case-mounts e2e-case-add e2e-case-expansion e2e-case-user-workdir e2e-case-run-fails e2e-build-sandbox e2e-build-two-a e2e-build-two-b e2e-build-cancel e2e-build-url e2e-cb-pulled e2e-share-a-1 e2e-share-b-1 e2e-names-m e2e-sc e2e-v6 e2e-v6b e2e-v6c e2e-v6d e2e-v6u e2e-v6low e2e-notify e2e-fwd e2e-cbind-w-1 e2e-cphold; do
     $NSPAWN stop "$m" --force >/dev/null 2>&1 || true
     $NSPAWN images rm "$m" >/dev/null 2>&1 || true
   done
@@ -938,6 +942,26 @@ echo "app-$nonce" > /tmp/e2e-cp-app
 $NSPAWN cp /tmp/e2e-cp-app "$app:/tmp/" || fail "cp into an app"
 [ "$($NSPAWN exec $app -- stat -c %u /tmp/e2e-cp-app </dev/null | tr -d '\r')" = 0 ] || fail "a file copied into an app is not root's"
 $NSPAWN cp "$app:/etc/passwd" /tmp/e2e-cp-app-passwd && grep -q "^root:" /tmp/e2e-cp-app-passwd || fail "cp out of an app"
+step "cp waits for a start systemd makes"
+# A start held in its first hook, before nspawn's own: the tree may be shifted then.
+hold=e2e-cphold
+$NSPAWN create $app $hold -- /bin/sleep 300 >/dev/null || fail "create $hold"
+mkdir -p /etc/systemd/system/systemd-nspawn@$hold.service.d
+printf '[Service]\nExecStartPre=/bin/sleep 120\n' > /etc/systemd/system/systemd-nspawn@$hold.service.d/e2e-hold.conf
+systemctl daemon-reload
+systemctl start --no-block systemd-nspawn@$hold.service || fail "systemctl start of $hold"
+retry 10 bash -c "systemctl show -P ActiveState systemd-nspawn@$hold.service | grep -qx activating" || fail "the start of $hold: $(systemctl show -P ActiveState systemd-nspawn@$hold.service)"
+for cmd in "cp $hold:/etc/passwd /tmp/e2e-cphold" "cp /tmp/e2e-cp-app $hold:/tmp/"; do
+  out=$($NSPAWN $cmd 2>&1) && fail "$cmd went on while systemd started the machine"
+  echo "$out" | grep_q "machine $hold is starting" || fail "$cmd was refused without saying why: $out"
+done
+systemctl stop systemd-nspawn@$hold.service
+rm -f /etc/systemd/system/systemd-nspawn@$hold.service.d/e2e-hold.conf
+systemctl daemon-reload
+$NSPAWN cp "$hold:/etc/passwd" /tmp/e2e-cphold || fail "cp out of $hold once its start was stopped"
+$NSPAWN rm $hold >/dev/null || fail "rm $hold"
+[ -e /etc/systemd/system/systemd-nspawn@$hold.service.d ] && fail "rm left the drop-in directory of $hold: $(ls /etc/systemd/system/systemd-nspawn@$hold.service.d)"
+rm -f /tmp/e2e-cphold
 step "app on the bridge: address, DNS, internet and published port (no networkd anywhere)"
 if [ "$networkd_was" != active ]; then
   systemctl is-active systemd-networkd >/dev/null && fail "systemd-networkd is running during the app section"

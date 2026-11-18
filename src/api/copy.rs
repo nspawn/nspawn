@@ -1287,6 +1287,10 @@ pub async fn open_root(ctx: &Context, name: &str, report: Report<'_>) -> Result<
             unmounted: Vec::new(),
         });
     }
+    // Its tree may be half shifted into the user namespace the start gives it.
+    if crate::api::machines::starting_unit(sd, name).await? {
+        bail!("machine {name} is starting; wait for it");
+    }
     let record = store.load_image(name)?.ok_or_else(|| {
         crate::api::FailureKind::NoSuchMachine.error(format!("no machine or image named {name}"))
     })?;
