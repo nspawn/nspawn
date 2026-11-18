@@ -5,6 +5,7 @@
 use std::fmt::Write as _;
 
 use crate::build::ignore::lexical;
+use crate::compose::gostr::is_print;
 
 /// strconv.Quote, which is also %q of a string.
 pub(super) fn quote(s: &str) -> String {
@@ -41,18 +42,6 @@ pub(super) fn quote(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-/// unicode.IsPrint. Debug escaping leaves exactly the printable categories alone once
-/// the char does not start the string (a leading grapheme extender is escaped).
-fn is_print(c: char) -> bool {
-    if c.is_ascii() {
-        return (' '..='~').contains(&c);
-    }
-    let mut s = String::with_capacity(5);
-    s.push('a');
-    s.push(c);
-    s.escape_debug().eq(s.chars())
 }
 
 /// %q of a []string.
@@ -263,6 +252,7 @@ mod tests {
             "\"a\\\"b\\\\c\\n\\x7f\\u200b\""
         );
         assert_eq!(quote("\u{e9}"), "\"\u{e9}\"");
+        assert_eq!(quote("e\u{301}\u{378}"), "\"e\u{301}\\u0378\"");
         assert_eq!(
             quote_list(&["a b".to_string(), "c".to_string()]),
             "[\"a b\" \"c\"]"

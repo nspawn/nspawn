@@ -1717,8 +1717,8 @@ RUN [\"<<EOF\"]
 RUN [\"<<'EOF'\"]
 \t";
         let result = parse(dockerfile.as_bytes()).unwrap();
-        for i in 1..=3 {
-            assert!(result.ast.children[i].heredocs.is_empty());
+        for child in &result.ast.children[1..=3] {
+            assert!(child.heredocs.is_empty());
         }
     }
 

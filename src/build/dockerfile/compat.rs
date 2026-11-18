@@ -6,6 +6,8 @@
 
 use std::fmt::Write as _;
 
+use crate::compose::gostr::is_print;
+
 /// strconv.Quote.
 pub(crate) fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -47,20 +49,6 @@ pub(crate) fn quote(s: &str) -> String {
 pub(crate) fn quote_list(items: &[String]) -> String {
     let quoted: Vec<String> = items.iter().map(|s| quote(s)).collect();
     format!("[{}]", quoted.join(" "))
-}
-
-/// unicode.IsPrint: letters, marks, numbers, punctuation, symbols and the
-/// ASCII space. The standard library's Debug escaping leaves exactly those
-/// categories alone; a char placed after another one is not escaped as a
-/// grapheme extender, so the check only depends on the category.
-pub(crate) fn is_print(c: char) -> bool {
-    if c.is_ascii() {
-        return (' '..='~').contains(&c);
-    }
-    let mut s = String::with_capacity(5);
-    s.push('a');
-    s.push(c);
-    s.escape_debug().eq(s.chars())
 }
 
 fn lower_char(c: char) -> char {
