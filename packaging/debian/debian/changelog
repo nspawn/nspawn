@@ -1,3 +1,9 @@
+nspawn (3.3.0-1) unstable; urgency=medium
+
+  * save and load carry images as tar archives, commit makes an image of what a machine changed, export and import carry a machine's files as a tar, through the Docker API too; a machine in a user namespace keeps its files' capabilities; wait and run give the exit code once the machine is down; cp refuses a machine systemd is starting.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Wed, 18 Nov 2026 17:40:00 -0500
+
 nspawn (3.2.1-1) unstable; urgency=medium
 
   * Packages for aarch64, experimental: the deb, the RPM and the binary.
