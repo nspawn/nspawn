@@ -105,7 +105,10 @@ fn state(m: &Machine) -> &'static str {
 fn status(m: &Machine, now: u64) -> String {
     match state(m) {
         "running" | "paused" => {
-            let mut text = format!("Up {}", human_duration(now.saturating_sub(m.started)));
+            let mut text = match m.started {
+                0 => "Up".to_string(),
+                t => format!("Up {}", human_duration(now.saturating_sub(t))),
+            };
             // State.String: a paused container says so, and not its health.
             if m.state == "paused" {
                 text.push_str(" (Paused)");
@@ -1441,6 +1444,16 @@ mod tests {
         assert_eq!(state(&m("closing")), "running");
         assert_eq!(state(&m("restarting")), "restarting");
         assert_eq!(state(&m("stopped")), "exited");
+        assert_eq!(status(&m("running"), 61), "Up About a minute");
+        let unknown = Machine {
+            started: 0,
+            ..m("running")
+        };
+        assert_eq!(
+            status(&unknown, 1_800_000_000),
+            "Up",
+            "no start time, no 1970"
+        );
     }
 
     #[test]

@@ -330,13 +330,18 @@ fn ps_row(m: &Dict, now: u64, trunc: bool) -> serde_json::Value {
     };
     let state = ps_state(m);
     let since = |t: u64| crate::dockerapi::util::human_duration(now.saturating_sub(t));
+    // A machine machined lists without a start time (going away as it was read).
+    let up = match started {
+        0 => "Up".to_string(),
+        t => format!("Up {}", since(t)),
+    };
     let status = match state {
         "running" => match client::string(m, "health").as_str() {
-            "" => format!("Up {}", since(started)),
-            "starting" => format!("Up {} (health: starting)", since(started)),
-            h => format!("Up {} ({h})", since(started)),
+            "" => up,
+            "starting" => format!("{up} (health: starting)"),
+            h => format!("{up} ({h})"),
         },
-        "paused" => format!("Up {} (Paused)", since(started)),
+        "paused" => format!("{up} (Paused)"),
         "restarting" | "exited" => {
             let word = if state == "exited" {
                 "Exited"
@@ -2127,6 +2132,18 @@ mod tests {
             "com.docker.compose.project.config_files=/x/compose.yaml,com.docker.compose.project=demo"
         );
         assert_eq!(ps_row(&m, 0, true)["CreatedAt"], "", "no record, no 1970");
+        let value = |v: zbus::zvariant::Value| zbus::zvariant::OwnedValue::try_from(v).unwrap();
+        let mut running = Dict::from([("state".to_string(), value("running".into()))]);
+        assert_eq!(
+            ps_row(&running, 1_800_000_000, true)["Status"],
+            "Up",
+            "no start time, no 1970"
+        );
+        running.insert("started".to_string(), value(1_799_999_000u64.into()));
+        assert_eq!(
+            ps_row(&running, 1_800_000_000, true)["Status"],
+            "Up 16 minutes"
+        );
     }
 
     #[test]
