@@ -25,6 +25,54 @@ use crate::verify::{Candidate, BUNDLE_ARTIFACT_TYPE, BUNDLE_MAX_SIZE};
 /// enough that the bus signals cost nothing next to the transfer.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
+/// How many times a read is asked of a registry that answers it is busy, and the wait
+/// before the second time; each later wait doubles, 15 seconds in all.
+const BUSY_TRIES: u32 = 5;
+const BUSY_FIRST_WAIT: Duration = Duration::from_secs(1);
+
+/// Whether the registry answered that it cannot serve the request now, which asked
+/// again a moment later it may: 429, with the TOOMANYREQUESTS envelope (ghcr.io and the
+/// registries in front of it) or without one, and the 5xx answers. oci-client keeps
+/// neither the status of an envelope nor a Retry-After header.
+fn busy(e: &oci_client::errors::OciDistributionError) -> bool {
+    use oci_client::errors::{OciDistributionError as Oci, OciErrorCode as Code};
+    match e {
+        Oci::RegistryError { envelope, .. } => envelope
+            .errors
+            .iter()
+            .any(|e| e.code == Code::Toomanyrequests),
+        Oci::ServerError { code, .. } => *code == 429 || (500..600).contains(code),
+        _ => false,
+    }
+}
+
+/// `request`, asked again while the registry answers it is busy (`busy`), `first_wait`
+/// before the second time and twice as long before each later one. Any other answer
+/// is the result, an error with its kind kept in the chain.
+async fn patiently<T, F>(first_wait: Duration, mut request: impl FnMut() -> F) -> Result<T>
+where
+    F: std::future::Future<Output = oci_client::errors::Result<T>>,
+{
+    let mut wait = first_wait;
+    let mut tries = 1;
+    loop {
+        match request().await {
+            Ok(value) => return Ok(value),
+            Err(e) if busy(&e) && tries < BUSY_TRIES => {
+                tokio::time::sleep(wait).await;
+                wait *= 2;
+                tries += 1;
+            }
+            Err(e) if busy(&e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "the registry was still busy after {BUSY_TRIES} tries"
+                )))
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// The progress of one transfer, reported when it starts, every `interval` while it
 /// runs and when it ends.
 struct Progress<'a> {
@@ -228,16 +276,13 @@ impl Hub {
         let mut all = Vec::new();
         let mut last: Option<String> = None;
         loop {
-            let page = self
-                .client(image.registry())
-                .list_tags(
-                    image,
-                    &self.auth(image.registry()),
-                    Some(100),
-                    last.as_deref(),
-                )
-                .await
-                .with_context(|| format!("listing tags of {}", image.repository()))?;
+            let auth = self.auth(image.registry());
+            let page = patiently(BUSY_FIRST_WAIT, || {
+                self.client(image.registry())
+                    .list_tags(image, &auth, Some(100), last.as_deref())
+            })
+            .await
+            .with_context(|| format!("listing tags of {}", image.repository()))?;
             let n = page.tags.len();
             all.extend(
                 page.tags
@@ -257,10 +302,13 @@ impl Hub {
     /// The digest a reference names on its registry now, as the registry gives it without
     /// a download: an index's for a tag of several platforms.
     pub async fn digest(&self, image: &Reference) -> Result<String> {
-        self.client(image.registry())
-            .fetch_manifest_digest(image, &self.auth(image.registry()))
-            .await
-            .with_context(|| format!("fetching the digest of {image}"))
+        let auth = self.auth(image.registry());
+        patiently(BUSY_FIRST_WAIT, || {
+            self.client(image.registry())
+                .fetch_manifest_digest(image, &auth)
+        })
+        .await
+        .with_context(|| format!("fetching the digest of {image}"))
     }
 
     /// Resolves a reference to the image manifest for this host and returns it with its
@@ -330,10 +378,11 @@ impl Hub {
 
     /// What a reference names, an image's manifest or an index, with its digest.
     async fn manifest(&self, image: &Reference) -> Result<(OciManifest, String)> {
-        Ok(self
-            .client(image.registry())
-            .pull_manifest(image, &self.auth(image.registry()))
-            .await?)
+        let auth = self.auth(image.registry());
+        patiently(BUSY_FIRST_WAIT, || {
+            self.client(image.registry()).pull_manifest(image, &auth)
+        })
+        .await
     }
 
     /// The manifest an entry of the image's index names, by its digest.
@@ -358,11 +407,12 @@ impl Hub {
             image.repository().to_string(),
             subject.to_string(),
         );
-        let index = self
-            .client(by_digest.registry())
-            .pull_referrers(&by_digest, Some(BUNDLE_ARTIFACT_TYPE))
-            .await
-            .with_context(|| format!("fetching the signatures of {image}"))?;
+        let index = patiently(BUSY_FIRST_WAIT, || {
+            self.client(by_digest.registry())
+                .pull_referrers(&by_digest, Some(BUNDLE_ARTIFACT_TYPE))
+        })
+        .await
+        .with_context(|| format!("fetching the signatures of {image}"))?;
         let mut bundles = Vec::new();
         for entry in index
             .manifests
@@ -423,11 +473,11 @@ impl Hub {
             .digest
             .strip_prefix("sha256:")
             .with_context(|| format!("blob digest {} is not sha256", layer.digest))?;
-        let sized = self
-            .client(image.registry())
-            .pull_blob_stream(image, layer)
-            .await
-            .with_context(|| format!("fetching blob {}", layer.digest))?;
+        let sized = patiently(BUSY_FIRST_WAIT, || {
+            self.client(image.registry()).pull_blob_stream(image, layer)
+        })
+        .await
+        .with_context(|| format!("fetching blob {}", layer.digest))?;
         let mut stream = sized.stream;
         let mut bytes = Vec::new();
         let mut hasher = Sha256::new();
@@ -463,11 +513,11 @@ impl Hub {
             .strip_prefix("sha256:")
             .with_context(|| format!("layer digest {} is not sha256", layer.digest))?
             .to_string();
-        let sized = self
-            .client(image.registry())
-            .pull_blob_stream(image, layer)
-            .await
-            .with_context(|| format!("fetching layer {}", layer.digest))?;
+        let sized = patiently(BUSY_FIRST_WAIT, || {
+            self.client(image.registry()).pull_blob_stream(image, layer)
+        })
+        .await
+        .with_context(|| format!("fetching layer {}", layer.digest))?;
         let total = sized
             .content_length
             .unwrap_or_else(|| layer.size.max(0) as u64);
@@ -1274,11 +1324,13 @@ impl Hub {
             oci_client::manifest::OCI_IMAGE_MEDIA_TYPE,
             oci_client::manifest::OCI_IMAGE_INDEX_MEDIA_TYPE,
         ];
-        let (bytes, fetched_digest) = self
-            .client(by_digest.registry())
-            .pull_manifest_raw(&by_digest, &self.auth(by_digest.registry()), &accepted)
-            .await
-            .with_context(|| format!("fetching manifest {digest}"))?;
+        let auth = self.auth(by_digest.registry());
+        let (bytes, fetched_digest) = patiently(BUSY_FIRST_WAIT, || {
+            self.client(by_digest.registry())
+                .pull_manifest_raw(&by_digest, &auth, &accepted)
+        })
+        .await
+        .with_context(|| format!("fetching manifest {digest}"))?;
         if fetched_digest != digest {
             bail!("registry returned manifest {fetched_digest} instead of {digest}");
         }
@@ -1391,6 +1443,85 @@ pub fn short_digest(digest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registry_that_asks_for_a_moment_is_told_from_one_that_refused() {
+        use oci_client::errors::{OciDistributionError as Oci, OciEnvelope};
+        let envelope = |json: &str| Oci::RegistryError {
+            envelope: serde_json::from_str::<OciEnvelope>(json).unwrap(),
+            url: "https://r/v2/x/blobs/sha256:1".into(),
+        };
+        // What lscr.io (ghcr.io behind it) answered two pulls at once.
+        assert!(busy(&envelope(
+            r#"{"errors":[{"code":"TOOMANYREQUESTS","message":"retry-after: 79.572µs, allowed: 44000/minute"}]}"#
+        )));
+        assert!(!busy(&envelope(
+            r#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown"}]}"#
+        )));
+        assert!(!busy(&envelope(r#"{"errors":[{"code":"DENIED"}]}"#)));
+        let status = |code| Oci::ServerError {
+            code,
+            url: String::new(),
+            message: String::new(),
+        };
+        for code in [429, 500, 502, 503, 504] {
+            assert!(busy(&status(code)), "{code}");
+        }
+        for code in [400, 403, 404] {
+            assert!(!busy(&status(code)), "{code}");
+        }
+        assert!(!busy(&Oci::UnauthorizedError { url: String::new() }));
+        assert!(!busy(&Oci::GenericError(Some("connection refused".into()))));
+    }
+
+    #[tokio::test]
+    async fn a_busy_registry_is_asked_again_and_any_other_answer_stands() {
+        use oci_client::errors::OciDistributionError as Oci;
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        let busy_answer = || Oci::ServerError {
+            code: 429,
+            url: String::new(),
+            message: String::new(),
+        };
+        let calls = &AtomicU32::new(0);
+        let answer = |busy_for: u32| {
+            calls.store(0, Relaxed);
+            patiently(Duration::ZERO, move || {
+                let n = calls.fetch_add(1, Relaxed) + 1;
+                async move {
+                    if n <= busy_for {
+                        Err(busy_answer())
+                    } else {
+                        Ok(n)
+                    }
+                }
+            })
+        };
+        assert_eq!(answer(2).await.unwrap(), 3);
+        assert_eq!(calls.load(Relaxed), 3);
+        let gave_up = answer(BUSY_TRIES).await.unwrap_err();
+        assert_eq!(calls.load(Relaxed), BUSY_TRIES);
+        assert!(
+            format!("{gave_up:#}").starts_with("the registry was still busy after 5 tries: "),
+            "{gave_up:#}"
+        );
+        assert!(gave_up.chain().any(|c| c.downcast_ref::<Oci>().is_some()));
+        calls.store(0, Relaxed);
+        let refused = patiently(Duration::ZERO, || {
+            calls.fetch_add(1, Relaxed);
+            async {
+                Err::<u32, _>(Oci::ServerError {
+                    code: 404,
+                    url: String::new(),
+                    message: String::new(),
+                })
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(Relaxed), 1, "a refusal is not asked again");
+        assert!(refused.downcast_ref::<Oci>().is_some());
+    }
 
     #[test]
     fn an_upload_ends_once_asked_past_its_last_part() {

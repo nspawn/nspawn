@@ -111,10 +111,12 @@ stay.
 
 `pull` fetches the layers the store lacks three at a time and says of each blob
 whether it was already present, is downloading or has been downloaded; on a terminal a
-bar follows every transfer under way. An image of hub.nspawn.org is verified before any
-layer comes down (see [Signed images](#signed-images)): `pull` says who signed it,
-refuses it without a valid signature, and `--no-verify` skips the check for that
-command, on `run` and `create` too. Docker Hub's short names are expanded:
+bar follows every transfer under way. A registry that answers it is busy, with 429 Too
+Many Requests or a 5xx error, is asked again after 1, 2, 4 and 8 seconds before the pull
+gives up and says so; any other refusal ends it at once. An image of hub.nspawn.org is
+verified before any layer comes down (see [Signed images](#signed-images)): `pull` says
+who signed it, refuses it without a valid signature, and `--no-verify` skips the check
+for that command, on `run` and `create` too. Docker Hub's short names are expanded:
 `docker.io/alpine` is `docker.io/library/alpine`, and `index.docker.io` is `docker.io`.
 A reference by digest takes a sha256 digest; sha384 and sha512 ones are refused, in a
 Dockerfile's `FROM` before anything is built. Of an image index, nspawn takes the entry
