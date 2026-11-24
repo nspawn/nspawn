@@ -427,7 +427,9 @@ More flags, remembered like the rest:
 - `--cap-add` and `--cap-drop`, on top of the default set: the one
   [App machines](#app-machines) lists, SYS_BOOT included, for an app on a bridge
   network, which runs without a user namespace, systemd-nspawn's for a machine in one.
-  `--cap-drop ALL --cap-add NET_BIND_SERVICE` keeps NET_BIND_SERVICE alone.
+  `--cap-drop ALL --cap-add NET_BIND_SERVICE` keeps NET_BIND_SERVICE alone. Whatever
+  the set, a program may lock memory (mlock, mlockall) up to its memlock limit, 8 MiB
+  under systemd's default, which `--ulimit memlock=` changes.
 - `--privileged` and `--read-only`.
 - `--tmpfs PATH[:OPTIONS]`. Given without options it is mode 1777, so a program of any
   user writes to it. The options are tmpfs's own (`size`, `mode`, `uid`, `gid`,

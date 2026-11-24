@@ -243,11 +243,11 @@ impl Tuning {
         (!root_has(&format!("usr/share/zoneinfo/{zone}"))).then(|| "copy".to_string())
     }
 
-    /// The [Exec] lines: Hostname=, Capability=, DropCapability=, OOMScoreAdjust=, the
-    /// rlimits, LinkJournal=. User= and WorkingDirectory= are the caller's, image
-    /// defaults included. `confined`: the machine runs without a user namespace (an app
-    /// on a bridge network), so it keeps the default capabilities instead of
-    /// systemd-nspawn's.
+    /// The [Exec] lines: Hostname=, Capability=, DropCapability=, SystemCallFilter=,
+    /// OOMScoreAdjust=, the rlimits, LinkJournal=. User= and WorkingDirectory= are the
+    /// caller's, image defaults included. `confined`: the machine runs without a user
+    /// namespace (an app on a bridge network), so it keeps the default capabilities
+    /// instead of systemd-nspawn's.
     pub fn exec_lines(&self, confined: bool) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(hostname) = &self.hostname {
@@ -305,6 +305,9 @@ impl Tuning {
             if !dropped.is_empty() {
                 out.push(format!("DropCapability={}", dropped.join(" ")));
             }
+        }
+        if !self.privileged {
+            out.push(MEMLOCK_SYSCALL_FILTER.to_string());
         }
         if confined && !self.privileged {
             out.push(DEFAULT_SYSCALL_FILTER.to_string());
@@ -645,6 +648,12 @@ pub const DEFAULT_CAPABILITIES: [&str; 15] = [
 /// CAP_SYS_BOOT in the initial user namespace they would load a kernel into the host
 /// for its next kexec or crash.
 pub const DEFAULT_SYSCALL_FILTER: &str = "SystemCallFilter=~kexec_load kexec_file_load";
+
+/// Allowed to every machine that is not privileged: systemd-nspawn's filter refuses
+/// mlock and its kin with EPERM unless CAP_IPC_LOCK is kept, while without the
+/// capability the kernel already bounds them by RLIMIT_MEMLOCK. A program that locks a
+/// few pages (mongod's secure allocator) fails to start without them.
+pub const MEMLOCK_SYSCALL_FILTER: &str = "SystemCallFilter=@memlock";
 
 /// What systemd-nspawn retains by default (systemd-nspawn(1), --capability=), the
 /// CAP_NET_ADMIN of a private network included.
@@ -1365,6 +1374,7 @@ mod tests {
                 "Hostname=web-1",
                 "Capability=CAP_NET_ADMIN CAP_SYS_PTRACE",
                 &format!("DropCapability={dropped}"),
+                MEMLOCK_SYSCALL_FILTER,
                 "OOMScoreAdjust=-500",
                 "Timezone=off",
                 "LimitNOFILE=64:128",
@@ -1470,7 +1480,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             both.exec_lines(false),
-            ["Capability=CAP_NET_ADMIN", "DropCapability=CAP_MKNOD"]
+            [
+                "Capability=CAP_NET_ADMIN",
+                "DropCapability=CAP_MKNOD",
+                MEMLOCK_SYSCALL_FILTER
+            ]
         );
         // ALL on both sides keeps every capability.
         let mut caps = Tuning::default();
@@ -1480,14 +1494,20 @@ mod tests {
         }
         .apply(&mut caps)
         .unwrap();
-        assert_eq!(caps.exec_lines(false), ["DropCapability=all"]);
+        assert_eq!(
+            caps.exec_lines(false),
+            ["DropCapability=all", MEMLOCK_SYSCALL_FILTER]
+        );
         Overrides {
             cap_add: vec!["ALL".into()],
             ..Default::default()
         }
         .apply(&mut caps)
         .unwrap();
-        assert_eq!(caps.exec_lines(false), ["Capability=all"]);
+        assert_eq!(
+            caps.exec_lines(false),
+            ["Capability=all", MEMLOCK_SYSCALL_FILTER]
+        );
     }
 
     #[test]
@@ -1498,6 +1518,7 @@ mod tests {
             plain.exec_lines(true),
             [
                 format!("DropCapability={beyond_default}"),
+                MEMLOCK_SYSCALL_FILTER.to_string(),
                 DEFAULT_SYSCALL_FILTER.to_string()
             ]
         );
@@ -1505,9 +1526,10 @@ mod tests {
             DEFAULT_CAPABILITIES.contains(&"CAP_SYS_BOOT"),
             "a reboot from inside ends the machine"
         );
-        assert!(
-            plain.exec_lines(false).is_empty(),
-            "with a user namespace, systemd-nspawn's set stays"
+        assert_eq!(
+            plain.exec_lines(false),
+            [MEMLOCK_SYSCALL_FILTER],
+            "with a user namespace, systemd-nspawn's set stays; mlock is allowed to every machine"
         );
         for cap in NSPAWN_CAPABILITIES {
             assert!(
@@ -1532,6 +1554,7 @@ mod tests {
                     "DropCapability=CAP_NET_RAW {}",
                     beyond_default.replace(" CAP_SYS_PTRACE", "")
                 ),
+                MEMLOCK_SYSCALL_FILTER.to_string(),
                 DEFAULT_SYSCALL_FILTER.to_string()
             ]
         );
@@ -1550,6 +1573,7 @@ mod tests {
                     "DropCapability={}",
                     beyond_default.replace(" CAP_NET_ADMIN", "")
                 ),
+                MEMLOCK_SYSCALL_FILTER.to_string(),
                 DEFAULT_SYSCALL_FILTER.to_string()
             ]
         );
@@ -1561,6 +1585,7 @@ mod tests {
                 vec!["ALL".into()],
                 vec![
                     "DropCapability=all".to_string(),
+                    MEMLOCK_SYSCALL_FILTER.to_string(),
                     DEFAULT_SYSCALL_FILTER.to_string(),
                 ],
             ),
@@ -1570,6 +1595,7 @@ mod tests {
                 vec![
                     "Capability=all".to_string(),
                     "DropCapability=CAP_SYS_ADMIN".to_string(),
+                    MEMLOCK_SYSCALL_FILTER.to_string(),
                     DEFAULT_SYSCALL_FILTER.to_string(),
                 ],
             ),
@@ -1587,6 +1613,7 @@ mod tests {
                             .collect::<Vec<_>>()
                             .join(" ")
                     ),
+                    MEMLOCK_SYSCALL_FILTER.to_string(),
                     DEFAULT_SYSCALL_FILTER.to_string(),
                 ],
             ),

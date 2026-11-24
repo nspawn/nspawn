@@ -387,6 +387,12 @@ reboot(2) only signals the machine's init while kexec_load would load a kernel
 into the host. An app image is assembled with overlay even when mstack is asked
 for.
 
+Every machine that is not privileged, in a user namespace or not, gets
+`SystemCallFilter=@memlock` (`tuning::MEMLOCK_SYSCALL_FILTER`): systemd-nspawn's
+filter allows mlock and its kin only with `CAP_IPC_LOCK`, and without the
+capability the kernel holds them to `RLIMIT_MEMLOCK` anyway. A `RUN` step of a
+build gets it as `--system-call-filter=@memlock`.
+
 The namespace is named with `NamespacePath=` in the settings file on systemd
 259 or newer; before that the key does not exist, and the unit's `ExecStart=`
 gets `--network-namespace-path=` instead (minus the options that conflict).
