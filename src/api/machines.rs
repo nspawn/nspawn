@@ -843,7 +843,10 @@ pub async fn prepare(
             pass == Pass::Ahead && record.tuning.depends_on.iter().any(|d| d.name == *owner);
         if !sd.machine_exists(owner).await? && !later {
             if record.tuning.depends_on.iter().any(|d| d.name == *owner) {
-                bail!("{name} shares the network of {owner}, which is not running; see journalctl -u systemd-nspawn@{owner}.service");
+                bail!(
+                    "{name} shares the network of {owner}, which is not running; see {}",
+                    logs_hint(owner, Some(&owner_record))
+                );
             }
             bail!(
                 "{name} shares the network of {owner}, which is not running; start {owner} first, or give {name} --depends-on {owner}"
@@ -1417,10 +1420,10 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     let sd = ctx.sd().await?;
     let unit = format!("systemd-nspawn@{}.service", args.name);
     let store = &ctx.store;
-    let stub = store
-        .load_image(&args.name)?
-        .is_some_and(|r| r.under_stub_init());
-    wait_for_previous(sd, &args.name, &unit, stub).await?;
+    let current = store.load_image(&args.name)?;
+    let stub = current.as_ref().is_some_and(|r| r.under_stub_init());
+    let logs = logs_hint(&args.name, current.as_ref());
+    wait_for_previous(sd, &args.name, &unit, stub, &logs).await?;
     let lock = store.lock().await?;
     // Again under the lock: another start may be preparing it, or it may be up by now.
     if store.is_starting(&args.name) {
@@ -1551,7 +1554,9 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
             down.push((dep, ran));
         }
     }
-    let restarting = match sd.start_machine(&args.name, patient).await {
+    // As the preparation left the record, with the start's log driver.
+    let logs = logs_hint_in(store, &args.name);
+    let restarting = match sd.start_machine(&args.name, patient, &logs).await {
         Ok(restarting) => restarting,
         Err(e) => {
             // A start job cancelled before its unit ran (a stop while it waited in the
@@ -1595,7 +1600,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
         } else if dep.optional {
             note(
                 report,
-                format!("warning: {} failed to start; it is optional, so {} started anyway (journalctl -u {unit} says why)", dep.name, args.name),
+                format!("warning: {} failed to start; it is optional, so {} started anyway ({} says why)", dep.name, args.name, logs_hint_in(store, &dep.name)),
             );
         }
     }
@@ -1621,14 +1626,14 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
                     return Ok(StartOutcome::Ended)
                 }
                 "failed" => bail!(
-                    "{} ended right after starting with an error; see journalctl -u {unit}",
+                    "{} ended right after starting with an error; see {logs}",
                     args.name
                 ),
                 _ => return Ok(StartOutcome::Ended),
             }
             if Instant::now() > deadline {
                 bail!(
-                    "machine {} did not register within 30 seconds; see journalctl -u {unit}",
+                    "machine {} did not register within 30 seconds; see {logs}",
                     args.name
                 );
             }
@@ -1645,7 +1650,7 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     // The publish hook starts the port proxy once the unit is up, which for a booted
     // machine is when its init is.
     let outcome = if args.wait && booted {
-        wait_for_init(sd, &args.name).await?
+        wait_for_init(sd, &args.name, &logs).await?
     } else {
         StartOutcome::Started
     };
@@ -1836,7 +1841,7 @@ fn apply_limits(
 
 /// Registration comes early in a boot: waits, within reason, until the machine's systemd
 /// listens, so that a command run right after `start` finds it.
-async fn wait_for_init(sd: &Systemd, name: &str) -> Result<StartOutcome> {
+async fn wait_for_init(sd: &Systemd, name: &str, logs: &str) -> Result<StartOutcome> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let Ok(leader) = sd.machine_leader(name).await else {
@@ -1847,7 +1852,7 @@ async fn wait_for_init(sd: &Systemd, name: &str) -> Result<StartOutcome> {
                 return Ok(StartOutcome::Restarting);
             }
             if state.active == "failed" {
-                bail!("{name} died while booting; see journalctl -u systemd-nspawn@{name}.service");
+                bail!("{name} died while booting; see {logs}");
             }
             return Ok(StartOutcome::Started);
         };
@@ -2341,8 +2346,9 @@ pub async fn stop(ctx: &Context, args: &StopRequest, report: Report<'_>) -> Resu
         if !wait_gone(sd, &args.name, Duration::from_secs(60)).await? {
             if args.force {
                 bail!(
-                    "machine {} is still running 60 seconds after SIGKILL; see journalctl -u {unit}",
-                    args.name
+                    "machine {} is still running 60 seconds after SIGKILL; see {}",
+                    args.name,
+                    logs_hint_in(&ctx.store, &args.name)
                 );
             }
             bail!(
@@ -2717,21 +2723,21 @@ pub(crate) async fn wait_for_previous(
     name: &str,
     unit: &str,
     stub: bool,
+    logs: &str,
 ) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let state = sd.unit_status(unit).await?;
         if state.restarting() {
-            bail!("machine {name} is restarting after its program ended; stop it first, or see journalctl -u {unit}");
+            bail!("machine {name} is restarting after its program ended; stop it first, or see {logs}");
         }
         let active = state.active;
         let registered = sd.machine_exists(name).await?;
         // Its unit runs the hooks of a start already, which may wait for the machines it
         // depends on for as long as they take.
         if active == "activating" && state.sub == "start-pre" && !registered {
-            return Err(FailureKind::AlreadyRunning.error(format!(
-                "machine {name} is already starting; see journalctl -u {unit}"
-            )));
+            return Err(FailureKind::AlreadyRunning
+                .error(format!("machine {name} is already starting; see {logs}")));
         }
         match active.as_str() {
             "active" | "activating" if registered && machine_alive(sd, name, stub).await => {
@@ -2746,7 +2752,7 @@ pub(crate) async fn wait_for_previous(
             _ => return Ok(()),
         }
         if Instant::now() > deadline {
-            bail!("machine {name} is still going away; see journalctl -u {unit}");
+            bail!("machine {name} is still going away; see {logs}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -3166,6 +3172,21 @@ pub fn check_logs_kept(record: &ImageRecord, inside: bool) -> Result<()> {
         "{} keeps no output: its log driver is none (start it with --log-driver journal to keep it){hint}",
         record.name
     )
+}
+
+/// Where an error sends the reader for what a machine and systemd said of its run:
+/// `logs --all`, which needs no access to the system's journal, or the journal itself
+/// for a machine `logs` refuses, one without a record or whose output is dropped.
+pub(crate) fn logs_hint(name: &str, record: Option<&ImageRecord>) -> String {
+    match record {
+        Some(r) if !r.tuning.drops_output() => format!("nspawn logs --all {name}"),
+        _ => format!("journalctl -u systemd-nspawn@{name}.service"),
+    }
+}
+
+/// `logs_hint` for the machine of that name as the store has it now.
+pub(crate) fn logs_hint_in(store: &Store, name: &str) -> String {
+    logs_hint(name, store.load_image(name).ok().flatten().as_ref())
 }
 
 /// Starts logs where the machine began: the unit's journal also holds what machines of
@@ -3886,6 +3907,21 @@ mod tests {
         let boot = check_logs_kept(&record("boot", Some("none")), false).unwrap_err();
         assert!(boot.to_string().contains("--inside"), "{boot}");
         assert!(check_logs_kept(&record("boot", Some("none")), true).is_ok());
+        // Errors send the reader where the lines can be read.
+        assert_eq!(
+            logs_hint("quiet", Some(&record("app", None))),
+            "nspawn logs --all quiet"
+        );
+        assert_eq!(
+            logs_hint("quiet", Some(&record("app", Some("journal")))),
+            "nspawn logs --all quiet"
+        );
+        for refused in [Some(record("app", Some("none"))), None] {
+            assert_eq!(
+                logs_hint("quiet", refused.as_ref()),
+                "journalctl -u systemd-nspawn@quiet.service"
+            );
+        }
     }
 
     #[test]

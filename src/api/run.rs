@@ -539,7 +539,9 @@ pub async fn attach(
     // A run whose program ended keeps its machine until its unit's stop hooks are done,
     // and a wait for its end answers before that: the next start waits for it, as a
     // start without a run does.
-    crate::api::machines::wait_for_previous(sd, &name, &unit, record.under_stub_init()).await?;
+    let logs = crate::api::machines::logs_hint(&name, Some(&record));
+    crate::api::machines::wait_for_previous(sd, &name, &unit, record.under_stub_init(), &logs)
+        .await?;
     // Refused before binding: the socket would replace the one an earlier run waits on.
     if ctx.store.is_starting(&name) || sd.machine_exists(&name).await? {
         let kind = if crate::api::machines::frozen(sd, &name).await {

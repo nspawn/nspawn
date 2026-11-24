@@ -662,11 +662,10 @@ async fn ended(ctx: &Context, name: &str) -> String {
         },
         Err(_) => None,
     };
+    let logs = crate::api::machines::logs_hint_in(&ctx.store, name);
     match code {
-        Some(code) => {
-            format!("{name} exited with code {code} (journalctl -u systemd-nspawn@{name}.service)")
-        }
-        None => format!("{name} ended (journalctl -u systemd-nspawn@{name}.service)"),
+        Some(code) => format!("{name} exited with code {code} ({logs})"),
+        None => format!("{name} ended ({logs})"),
     }
 }
 

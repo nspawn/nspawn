@@ -337,12 +337,13 @@ impl Systemd {
     /// Starts a machine's unit. Returns true when its program ended during the start
     /// and the unit is waiting to start it again (Restart=): systemd keeps the start job
     /// open across restarts, so it is not waited for then. `patient`: the start waits for
-    /// other machines, as long as they take, so the job has no time limit.
-    pub async fn start_machine(&self, name: &str, patient: bool) -> Result<bool> {
+    /// other machines, as long as they take, so the job has no time limit. `logs` says
+    /// where to read why it failed.
+    pub async fn start_machine(&self, name: &str, patient: bool, logs: &str) -> Result<bool> {
         let unit = format!("systemd-nspawn@{name}.service");
         self.start_unit_or_restart(&unit, patient)
             .await
-            .with_context(|| format!("machine {name} failed to start; see journalctl -u {unit}"))
+            .with_context(|| format!("machine {name} failed to start; see {logs}"))
     }
 
     async fn start_unit_or_restart(&self, unit: &str, patient: bool) -> Result<bool> {

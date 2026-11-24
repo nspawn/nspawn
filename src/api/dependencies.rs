@@ -194,6 +194,8 @@ pub struct Observed {
     unit: UnitState,
     /// Its healthcheck's verdict while it runs: starting, healthy or unhealthy.
     health: Option<String>,
+    /// Where a failure's message sends the reader: `machines::logs_hint`.
+    logs: String,
     /// How its program ended, once it has.
     exit_code: Option<i32>,
     /// systemd's Result= of its last run, once it ended: "success" or why not.
@@ -241,7 +243,8 @@ pub fn verdict(name: &str, dep: &Dependency, seen: &Observed) -> Verdict {
     let other = &dep.name;
     let failed = || {
         Verdict::Failed(format!(
-            "{other}, which {name} depends on, failed; see journalctl -u systemd-nspawn@{other}.service"
+            "{other}, which {name} depends on, failed; see {}",
+            seen.logs
         ))
     };
     let Some(has_healthcheck) = seen.healthcheck else {
@@ -261,7 +264,8 @@ pub fn verdict(name: &str, dep: &Dependency, seen: &Observed) -> Verdict {
         // Brought back by its restart policy: its healthcheck starts over.
         Condition::Healthy if unit.restarting() => Verdict::Waiting,
         Condition::Healthy if !unit.busy() => Verdict::Failed(format!(
-            "{other} ended without being healthy, which {name} waits for; see journalctl -u systemd-nspawn@{other}.service"
+            "{other} ended without being healthy, which {name} waits for; see {}",
+            seen.logs
         )),
         Condition::Healthy => match seen.health.as_deref() {
             Some("healthy") => Verdict::Met,
@@ -302,6 +306,7 @@ pub async fn observe(sd: &Systemd, store: &Store, dep: &Dependency) -> Result<Ob
             .map(|r| r.effective_healthcheck().is_some_and(|h| h.active())),
         unit,
         health: crate::health::read_status(&dep.name).map(|s| s.status),
+        logs: crate::api::machines::logs_hint(&dep.name, record.as_ref()),
         exit_code: None,
         result: String::new(),
         started_this_boot: false,
@@ -392,6 +397,7 @@ mod tests {
             healthcheck: Some(true),
             unit: unit(active, sub),
             health: None,
+            logs: "nspawn logs --all db".into(),
             exit_code: None,
             result: String::new(),
             started_this_boot: true,
@@ -477,7 +483,7 @@ mod tests {
         }
         assert_eq!(
             failed_with(verdict("web", &d, &seen("failed", "failed"))),
-            "db, which web depends on, failed; see journalctl -u systemd-nspawn@db.service"
+            "db, which web depends on, failed; see nspawn logs --all db"
         );
         let gone = Observed {
             healthcheck: None,
