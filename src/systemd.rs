@@ -740,7 +740,6 @@ impl Systemd {
             .with_context(|| format!("reading when the main process of {unit} started"))
     }
 
-    /// The invocation ID of the unit's current or last run, in hex.
     /// Whether the unit's files changed since systemd loaded them.
     pub async fn needs_reload(&self, unit: &str) -> Result<bool> {
         let proxy = systemd1::UnitProxy::builder(&self.conn)
@@ -755,6 +754,7 @@ impl Systemd {
             .with_context(|| format!("reading whether {unit} needs a reload"))
     }
 
+    /// The invocation ID of the unit's current or last run, in hex.
     pub async fn invocation_id(&self, unit: &str) -> Result<String> {
         let proxy = systemd1::UnitProxy::builder(&self.conn)
             .path(self.unit_path(unit).await?)?

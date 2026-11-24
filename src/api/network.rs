@@ -999,6 +999,11 @@ pub async fn publish(ctx: &Context, name: &str) -> Result<()> {
     if record.effective_healthcheck().is_some_and(|h| h.active()) {
         crate::health::start_runner(ctx, name).await?;
     }
+    // From here a start job that fails failed because the program ended
+    // (`machines::start`); a note that cannot be written only loses that.
+    if let Ok(run) = std::env::var("INVOCATION_ID") {
+        let _ = store.mark_up(name, &run);
+    }
     Ok(())
 }
 

@@ -109,7 +109,9 @@ hooks.
                      volume wait unit, cdi/nodes/ (CDI device nodes the host
                      lacks), cdi/bundle/ (the config.json CDI hooks read the
                      root from), exit-on-next (a kill that counts as a stop),
-                     last-signal (what kill or stop sent the current run);
+                     last-signal (what kill or stop sent the current run),
+                     last-start (when the last run started), last-up (the
+                     InvocationID of the last run whose publish hook passed);
                      0700 with a writable layer, 0711 otherwise (an mstack
                      machine binds its files from inside its user namespace)
   volumes/NAME/      named volumes
@@ -222,6 +224,14 @@ in a user namespace, see [Ownership](#ownership)),
 publish ports and attach mstack volumes once it runs (`network publish`) and
 release everything however it ends (`network release`), so `machinectl start`,
 enabled units and programs that exit on their own behave the same.
+
+A program that ends while `network publish` still runs makes systemd fail the start
+job, which a start of many machines at once makes likely. `network publish` notes the
+run's `InvocationID` once it passes (`machines/NAME/last-up`), and `start` takes a
+failed job of a run noted there, whose program ended, as a start whose program ended
+at once: `run -d` succeeds and the machine shows as exited, an attached `run` gives
+the program's code. systemd keeps no exec status of the hook across a daemon-reload,
+which every `run` and `rm` makes, so the note is nspawn's own.
 
 When the machine has a healthcheck, `network publish` also starts
 `nspawn-health-NAME.service`, which runs `nspawn health-run NAME`. Its

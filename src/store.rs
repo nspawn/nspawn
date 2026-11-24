@@ -810,6 +810,28 @@ impl Store {
         Some((signal, parts.next().map(str::to_string)))
     }
 
+    fn up_path(&self, name: &str) -> PathBuf {
+        self.machine_files_dir(name).join("last-up")
+    }
+
+    /// Notes that the run `run` of `name` (its unit's InvocationID) came up: its publish
+    /// hook passed. systemd keeps no trace of that across a daemon-reload.
+    pub fn mark_up(&self, name: &str, run: &str) -> Result<()> {
+        crate::reference::validate_entry_name(name)?;
+        let path = self.up_path(name);
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        fs::write(&path, run).with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// Whether the run `run` of `name` came up, as `mark_up` noted.
+    pub fn came_up(&self, name: &str, run: &str) -> bool {
+        crate::reference::validate_entry_name(name).is_ok()
+            && !run.is_empty()
+            && fs::read_to_string(self.up_path(name)).is_ok_and(|marked| marked.trim() == run)
+    }
+
     /// Forgets the signal of the last run, as a new run begins.
     pub fn forget_signal(&self, name: &str) -> Result<()> {
         crate::reference::validate_entry_name(name)?;
@@ -4173,6 +4195,19 @@ mod tests {
         store.mark_start("web").unwrap();
         assert!(store.last_start("web").is_some_and(|t| t >= before));
         assert!(store.mark_start("../x").is_err());
+    }
+
+    #[test]
+    fn a_run_that_came_up_is_known_by_its_invocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(&tmp.path().join("machines"), &tmp.path().join("state"));
+        assert!(!store.came_up("web", "a1"));
+        store.mark_up("web", "a1").unwrap();
+        assert!(store.came_up("web", "a1"));
+        assert!(!store.came_up("web", "b2"), "another run of the name");
+        assert!(!store.came_up("web", ""));
+        assert!(!store.came_up("db", "a1"));
+        assert!(store.mark_up("../x", "a1").is_err());
     }
 
     #[test]

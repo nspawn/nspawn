@@ -1558,6 +1558,9 @@ pub async fn start(ctx: &Context, args: &StartRequest, report: Report<'_>) -> Re
     let logs = logs_hint_in(store, &args.name);
     let restarting = match sd.start_machine(&args.name, patient, &logs).await {
         Ok(restarting) => restarting,
+        // The machine came up and its program ended while the publish hook ran, which
+        // fails the start job: it goes on as a start whose program ended at once.
+        Err(_) if ended_after_up(sd, store, &args.name, &unit).await => false,
         Err(e) => {
             // A start job cancelled before its unit ran (a stop while it waited in the
             // queue) leaves what the preparation made, which no release hook takes.
@@ -1837,6 +1840,21 @@ fn apply_limits(
         limits.pids = pids;
     }
     Ok(())
+}
+
+/// Whether a start job that failed was of a run that came up (its publish hook passed,
+/// `Store::mark_up`) and whose program then ended: systemd fails the job when the program
+/// ends while that hook still runs, which a start of many machines at once makes likely.
+async fn ended_after_up(sd: &Systemd, store: &Store, name: &str, unit: &str) -> bool {
+    let Ok(run) = sd.invocation_id(unit).await else {
+        return false;
+    };
+    let Ok(state) = sd.unit_status(unit).await else {
+        return false;
+    };
+    store.came_up(name, &run)
+        && crate::api::run::unit_stopped(Some(&state.active), Some(&state.sub))
+        && sd.exec_main_exit(unit).await.is_ok_and(|e| e.is_some())
 }
 
 /// Registration comes early in a boot: waits, within reason, until the machine's systemd
