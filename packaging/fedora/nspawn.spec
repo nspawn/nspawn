@@ -3,7 +3,7 @@
 
 # The one version to change: the upstream tag (Cargo.toml's). A pre-release tag
 # like 1.0.0-beta.1 becomes Version 1.0.0, Release 0.1.beta1, as Fedora wants.
-%global upstream_version 3.3.1
+%global upstream_version 3.3.2
 %{lua:
   local tag = rpm.expand("%{upstream_version}")
   local base, pre = tag:match("^([%d.]+)%-beta%.(%d+)$")
@@ -169,6 +169,9 @@ fi
 %{_datadir}/selinux/devel/include/contrib/%{name}.if
 
 %changelog
+* Tue Nov 24 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 3.3.2-1
+- Programs may lock memory up to their memlock limit without CAP_IPC_LOCK; run -d of a program that ends at once succeeds when many machines start together; errors point to nspawn logs --all; ps says Up of a machine without a start time; a pull asks a busy registry again.
+
 * Wed Nov 18 2026 Eduard Tolosa <tolosaeduard@gmail.com> - 3.3.1-1
 - The aarch64 build, which 3.3.0 lacked: a file's link count read for commit and export compiles on aarch64.
 

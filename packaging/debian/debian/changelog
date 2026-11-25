@@ -1,3 +1,9 @@
+nspawn (3.3.2-1) unstable; urgency=medium
+
+  * Programs may lock memory up to their memlock limit without CAP_IPC_LOCK; run -d of a program that ends at once succeeds when many machines start together; errors point to nspawn logs --all; ps says Up of a machine without a start time; a pull asks a busy registry again.
+
+ -- Eduard Tolosa <tolosaeduard@gmail.com>  Tue, 24 Nov 2026 17:12:00 -0500
+
 nspawn (3.3.1-1) unstable; urgency=medium
 
   * The aarch64 build, which 3.3.0 lacked: a file's link count read for commit and export compiles on aarch64.
