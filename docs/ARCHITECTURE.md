@@ -314,6 +314,15 @@ until the next boot. The one runtime property nspawn sets is `DeviceAllow=` for
 CDI nodes the hook makes again with other numbers, which the drop-in grants
 only from the next start; `rm` removes its `50-DeviceAllow.conf`.
 
+The limits stay on the unit's cgroup, out of the machine's sight: systemd-nspawn
+moves the program into `payload` below it (`supervisor` holds systemd-nspawn
+itself), and that cgroup, whose `memory.max`, `cpu.max` and `pids.max` read
+`max`, is the root of the machine's cgroup namespace. They cannot be copied
+there before the program starts: a `payload` made by an `ExecStartPre=` hook,
+with the controllers enabled in the unit's cgroup, makes systemd fail to spawn
+the unit's next process with EBUSY, and nspawn keeps no process beside the
+machine that could write them in time (`attach-exec` execs systemd-nspawn).
+
 ### stats and exec
 
 `stats` reads the unit's cgroup (its `ControlGroup`, which holds

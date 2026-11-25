@@ -337,7 +337,13 @@ signal is not taken by systemd-nspawn's child, which would end the machine befor
 program ran.
 
 `-m/--memory`, `--cpus` and `--pids-limit` bound the whole machine (its unit's
-MemoryMax=, CPUQuota= and TasksMax=), which is why they cannot be seen from inside.
+MemoryMax=, CPUQuota= and TasksMax=), which is why they cannot be seen from inside:
+systemd-nspawn runs the program in a cgroup below its unit's, the root of the machine's
+cgroup namespace, where `/sys/fs/cgroup/memory.max`, `memory.swap.max`, `cpu.max` and
+`pids.max` read `max`. The kernel holds the machine to the limits all the same, but a
+program that sizes itself from those files, as Node.js and the JVM do, takes the host's
+memory and CPUs for its own and runs into the limit: give it its size, such as
+`--max-old-space-size` for Node.js or `-Xmx` and `-XX:ActiveProcessorCount` for a JVM.
 `--memory` also lets the machine use as much swap again (MemorySwapMax=), and no more,
 unless `--memory-swap` gives memory and swap together: equal to `--memory` for no swap,
 larger for more, `-1` for swap without a bound (a size needs `--memory`, and `0` goes
